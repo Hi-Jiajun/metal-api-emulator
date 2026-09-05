@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 /// Current version of the pure-value provider trace schema.
 pub const PROVIDER_SCHEMA_VERSION: u16 = 1;
@@ -974,11 +975,73 @@ pub struct BufferWriteback {
 }
 
 impl BufferWriteback {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("writeback view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("writeback allocation id"));
+        }
+        if self.bytes.is_empty() {
+            return Err(ContractError::ZeroLength("writeback"));
+        }
+        self.end().map(|_| ())
+    }
+
     pub fn end(&self) -> Result<u64, ContractError> {
         self.offset
             .checked_add(self.bytes.len() as u64)
             .ok_or(ContractError::ArithmeticOverflow("writeback range"))
     }
+}
+
+/// Result returned by a provider after a validated trace is submitted.
+///
+/// `completion` must be `Submitted` (or a provider-specific post-submit
+/// disposition for a synchronous implementation). A provider must not report
+/// `CompletedVisible` until every returned writeback is CPU-visible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSubmission {
+    pub completion: CompletionDisposition,
+    pub writebacks: Vec<BufferWriteback>,
+}
+
+impl ProviderSubmission {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.completion.validate()?;
+        let mut views = BTreeMap::new();
+        for writeback in &self.writebacks {
+            writeback.validate()?;
+            if views
+                .insert((writeback.allocation_id, writeback.view_id), ())
+                .is_some()
+            {
+                return Err(ContractError::DuplicateWriteback {
+                    allocation: writeback.allocation_id,
+                    view: writeback.view_id,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Backend-neutral execution boundary for a canonical Metal trace.
+///
+/// Implementations own compilation, provider handles, queue/encoder state and
+/// completion retirement. They receive only an admitted value trace and must
+/// keep provider-specific objects behind this trait. `wait` reports timeout as
+/// a non-terminal disposition; provider failures use `ProviderError`.
+pub trait ComputeProvider: Send + Sync {
+    fn capabilities(&self) -> ProviderCapabilities;
+
+    fn submit(&self, trace: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError>;
+
+    fn wait(
+        &self,
+        token: CompletionToken,
+        timeout: Duration,
+    ) -> Result<CompletionDisposition, ProviderError>;
 }
 
 /// Capabilities are captured once for a provider device context.
@@ -1434,6 +1497,10 @@ pub enum ContractError {
         first_pass: usize,
         second_pass: usize,
     },
+    DuplicateWriteback {
+        allocation: AllocationId,
+        view: ViewId,
+    },
     ViewIdentityMismatch(ViewId),
     LeaseMismatch {
         view: ViewId,
@@ -1550,6 +1617,11 @@ impl fmt::Display for ContractError {
                 formatter,
                 "writable views {:?} (pass {first_pass}) and {:?} (pass {second_pass}) overlap without an alias policy",
                 first, second
+            ),
+            Self::DuplicateWriteback { allocation, view } => write!(
+                formatter,
+                "duplicate writeback for allocation {:?}, view {:?}",
+                allocation, view
             ),
             Self::ViewIdentityMismatch(view) => {
                 write!(formatter, "view {:?} changes resource declaration across passes", view)
@@ -2301,5 +2373,39 @@ mod tests {
         let keys = error.fields.keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys, ["dimension", "maximum"]);
         assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+    }
+
+    #[test]
+    fn provider_submission_rejects_duplicate_or_empty_writebacks() {
+        let writeback = BufferWriteback {
+            view_id: ViewId::new(7),
+            allocation_id: AllocationId::new(9),
+            offset: 0,
+            bytes: vec![1, 2, 3, 4],
+        };
+        let token = CompletionToken {
+            submission_id: SubmissionId::new(12),
+            device_epoch: DeviceEpoch::new(1),
+        };
+        let duplicate = ProviderSubmission {
+            completion: CompletionDisposition::Submitted { token },
+            writebacks: vec![writeback.clone(), writeback.clone()],
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ContractError::DuplicateWriteback { .. })
+        ));
+
+        let empty = ProviderSubmission {
+            completion: CompletionDisposition::CompletedVisible { token },
+            writebacks: vec![BufferWriteback {
+                bytes: Vec::new(),
+                ..writeback
+            }],
+        };
+        assert_eq!(
+            empty.validate(),
+            Err(ContractError::ZeroLength("writeback"))
+        );
     }
 }
