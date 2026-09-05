@@ -121,8 +121,10 @@ impl BufferAccess {
 ///
 /// A completion token is deliberately not stored here: one lease can be
 /// borrowed by several passes or command buffers. The owner binds all active
-/// reservations to their completion tokens and releases the lease only after
-/// the final reservation reaches a terminal state.
+/// reservations to their completion tokens and releases the backing only after
+/// every reservation is known to be retired on the GPU. A terminal result such
+/// as `SubmittedUnknown` is not evidence of retirement; it cannot release the
+/// backing without a separate retirement or device teardown guarantee.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferLease {
     pub lease_id: LeaseId,
@@ -138,7 +140,7 @@ pub enum BufferSource {
     /// Contents and lifetime are supplied by an owner-issued staged lease.
     StagedLease(LeaseId),
     /// Provider may use the owner's backing without copying; the lease remains
-    /// valid until every associated completion reservation is terminal.
+    /// valid until every associated GPU reservation is known to be retired.
     BorrowedNoCopy(LeaseId),
 }
 
@@ -915,7 +917,9 @@ impl CompletionToken {
 }
 
 /// Explicit completion observation. A timeout is non-terminal and may be
-/// followed by another wait on the same token.
+/// followed by another wait on the same token. Terminal observations describe
+/// result availability, not permission to release GPU backing; in particular,
+/// `SubmittedUnknown` does not establish GPU retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionDisposition {
     NotSubmitted,
@@ -965,7 +969,9 @@ impl CompletionDisposition {
     }
 }
 
-/// A deterministic provider writeback keyed by view and allocation identity.
+/// A deterministic provider writeback keyed by allocation and view identity.
+/// `offset` is measured in bytes from the start of the allocation, like
+/// [`BufferView::offset`], rather than from the start of the view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BufferWriteback {
     pub view_id: ViewId,
@@ -989,17 +995,21 @@ impl BufferWriteback {
     }
 
     pub fn end(&self) -> Result<u64, ContractError> {
+        let length = u64::try_from(self.bytes.len())
+            .map_err(|_| ContractError::ArithmeticOverflow("writeback length"))?;
         self.offset
-            .checked_add(self.bytes.len() as u64)
+            .checked_add(length)
             .ok_or(ContractError::ArithmeticOverflow("writeback range"))
     }
 }
 
 /// Result returned by a provider after a validated trace is submitted.
 ///
-/// `completion` must be `Submitted` (or a provider-specific post-submit
-/// disposition for a synchronous implementation). A provider must not report
-/// `CompletedVisible` until every returned writeback is CPU-visible.
+/// A successful result must be `Submitted` or `CompletedVisible`; all failures
+/// use [`ProviderError`]. Writebacks are CPU-visible and may only accompany
+/// `CompletedVisible` with [`CompletionPolicy::HostReadback`]. They are ordered
+/// by `(allocation_id, view_id)`. The current single-pass contract requires one
+/// complete writeback for each writable view when host readback completes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSubmission {
     pub completion: CompletionDisposition,
@@ -1009,6 +1019,21 @@ pub struct ProviderSubmission {
 impl ProviderSubmission {
     pub fn validate(&self) -> Result<(), ContractError> {
         self.completion.validate()?;
+        if !matches!(
+            self.completion,
+            CompletionDisposition::Submitted { .. }
+                | CompletionDisposition::CompletedVisible { .. }
+        ) {
+            return Err(ContractError::InvalidSubmissionCompletion(self.completion));
+        }
+        if !self.writebacks.is_empty()
+            && !matches!(
+                self.completion,
+                CompletionDisposition::CompletedVisible { .. }
+            )
+        {
+            return Err(ContractError::WritebackBeforeCompletion);
+        }
         let mut views = BTreeMap::new();
         for writeback in &self.writebacks {
             writeback.validate()?;
@@ -1020,6 +1045,88 @@ impl ProviderSubmission {
                     allocation: writeback.allocation_id,
                     view: writeback.view_id,
                 });
+            }
+        }
+        if self.writebacks.windows(2).any(|pair| {
+            (pair[0].allocation_id, pair[0].view_id) > (pair[1].allocation_id, pair[1].view_id)
+        }) {
+            return Err(ContractError::NonCanonicalWritebackOrder);
+        }
+        Ok(())
+    }
+
+    /// Validate a result against the exact submitted trace. Multi-pass result
+    /// semantics are not defined by this contract and are explicitly refused.
+    pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
+        trace.validate()?;
+        self.validate()?;
+        let [pass] = trace.passes.as_slice() else {
+            return Err(ContractError::UnsupportedSubmissionPassCount(
+                trace.passes.len(),
+            ));
+        };
+        let token = self
+            .completion
+            .token()
+            .ok_or(ContractError::InvalidSubmissionCompletion(self.completion))?;
+        if token.device_epoch != trace.device_epoch {
+            return Err(ContractError::CompletionEpochMismatch {
+                expected: trace.device_epoch,
+                actual: token.device_epoch,
+            });
+        }
+        if !self.writebacks.is_empty() && trace.completion_policy != CompletionPolicy::HostReadback
+        {
+            return Err(ContractError::WritebackPolicyMismatch(
+                trace.completion_policy,
+            ));
+        }
+        for writeback in &self.writebacks {
+            let view = pass
+                .buffers
+                .iter()
+                .find(|view| {
+                    view.allocation_id == writeback.allocation_id
+                        && view.view_id == writeback.view_id
+                })
+                .ok_or(ContractError::UnknownWriteback {
+                    allocation: writeback.allocation_id,
+                    view: writeback.view_id,
+                })?;
+            if !view.access.is_writable() {
+                return Err(ContractError::ReadOnlyWriteback(view.view_id));
+            }
+            let view_end = view.validate_shape()?;
+            let end = writeback.end()?;
+            if writeback.offset < view.offset || end > view_end {
+                return Err(ContractError::WritebackRangeOutOfBounds {
+                    view: view.view_id,
+                    offset: writeback.offset,
+                    end,
+                    view_offset: view.offset,
+                    view_end,
+                });
+            }
+            if writeback.offset != view.offset || end != view_end {
+                return Err(ContractError::IncompleteWriteback(view.view_id));
+            }
+        }
+        if trace.completion_policy == CompletionPolicy::HostReadback
+            && matches!(
+                self.completion,
+                CompletionDisposition::CompletedVisible { .. }
+            )
+        {
+            for view in pass.buffers.iter().filter(|view| view.access.is_writable()) {
+                if !self.writebacks.iter().any(|writeback| {
+                    writeback.allocation_id == view.allocation_id
+                        && writeback.view_id == view.view_id
+                }) {
+                    return Err(ContractError::MissingWriteback {
+                        allocation: view.allocation_id,
+                        view: view.view_id,
+                    });
+                }
             }
         }
         Ok(())
@@ -1449,7 +1556,7 @@ impl ProviderError {
     }
 }
 
-/// Errors found before a provider has any opportunity to submit work.
+/// Structural errors in provider input values or returned submission values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
     EmptyField(&'static str),
@@ -1498,6 +1605,32 @@ pub enum ContractError {
         second_pass: usize,
     },
     DuplicateWriteback {
+        allocation: AllocationId,
+        view: ViewId,
+    },
+    InvalidSubmissionCompletion(CompletionDisposition),
+    WritebackBeforeCompletion,
+    CompletionEpochMismatch {
+        expected: DeviceEpoch,
+        actual: DeviceEpoch,
+    },
+    UnsupportedSubmissionPassCount(usize),
+    WritebackPolicyMismatch(CompletionPolicy),
+    NonCanonicalWritebackOrder,
+    UnknownWriteback {
+        allocation: AllocationId,
+        view: ViewId,
+    },
+    ReadOnlyWriteback(ViewId),
+    WritebackRangeOutOfBounds {
+        view: ViewId,
+        offset: u64,
+        end: u64,
+        view_offset: u64,
+        view_end: u64,
+    },
+    IncompleteWriteback(ViewId),
+    MissingWriteback {
         allocation: AllocationId,
         view: ViewId,
     },
@@ -1622,6 +1755,48 @@ impl fmt::Display for ContractError {
                 formatter,
                 "duplicate writeback for allocation {:?}, view {:?}",
                 allocation, view
+            ),
+            Self::InvalidSubmissionCompletion(completion) => write!(
+                formatter,
+                "successful submission requires Submitted or CompletedVisible, received {completion:?}"
+            ),
+            Self::WritebackBeforeCompletion => {
+                formatter.write_str("writebacks require CompletedVisible")
+            }
+            Self::CompletionEpochMismatch { expected, actual } => write!(
+                formatter,
+                "completion epoch mismatch: expected {expected:?}, received {actual:?}"
+            ),
+            Self::UnsupportedSubmissionPassCount(count) => write!(
+                formatter,
+                "submission result validation requires one pass, received {count}"
+            ),
+            Self::WritebackPolicyMismatch(policy) => write!(
+                formatter,
+                "writebacks require HostReadback, received {policy:?}"
+            ),
+            Self::NonCanonicalWritebackOrder => {
+                formatter.write_str("writebacks must be ordered by allocation and view identity")
+            }
+            Self::UnknownWriteback { allocation, view } => write!(
+                formatter,
+                "writeback for allocation {allocation:?}, view {view:?} has no matching bound view"
+            ),
+            Self::ReadOnlyWriteback(view) => write!(
+                formatter,
+                "writeback view {view:?} is not writable"
+            ),
+            Self::WritebackRangeOutOfBounds { view, offset, end, view_offset, view_end } => write!(
+                formatter,
+                "writeback view {view:?} range {offset}..{end} is outside view range {view_offset}..{view_end}"
+            ),
+            Self::IncompleteWriteback(view) => write!(
+                formatter,
+                "writeback must cover all of view {view:?}"
+            ),
+            Self::MissingWriteback { allocation, view } => write!(
+                formatter,
+                "completed host readback is missing allocation {allocation:?}, view {view:?}"
             ),
             Self::ViewIdentityMismatch(view) => {
                 write!(formatter, "view {:?} changes resource declaration across passes", view)
@@ -2388,7 +2563,7 @@ mod tests {
             device_epoch: DeviceEpoch::new(1),
         };
         let duplicate = ProviderSubmission {
-            completion: CompletionDisposition::Submitted { token },
+            completion: CompletionDisposition::CompletedVisible { token },
             writebacks: vec![writeback.clone(), writeback.clone()],
         };
         assert!(matches!(
@@ -2407,5 +2582,211 @@ mod tests {
             empty.validate(),
             Err(ContractError::ZeroLength("writeback"))
         );
+    }
+
+    fn completed_submission(trace: &ComputeTrace) -> ProviderSubmission {
+        let mut writebacks = trace.passes[0]
+            .buffers
+            .iter()
+            .filter(|view| view.access.is_writable())
+            .map(|view| BufferWriteback {
+                view_id: view.view_id,
+                allocation_id: view.allocation_id,
+                offset: view.offset,
+                bytes: vec![0x5a; usize::try_from(view.length).unwrap()],
+            })
+            .collect::<Vec<_>>();
+        writebacks.sort_by_key(|writeback| (writeback.allocation_id, writeback.view_id));
+        ProviderSubmission {
+            completion: CompletionDisposition::CompletedVisible {
+                token: CompletionToken {
+                    submission_id: SubmissionId::new(12),
+                    device_epoch: trace.device_epoch,
+                },
+            },
+            writebacks,
+        }
+    }
+
+    #[test]
+    fn submission_refuses_non_success_dispositions_and_unfinished_writebacks() {
+        let trace = trace(vec![pass(4, vec![buffer(7, 0)])]);
+        let mut submission = completed_submission(&trace);
+        let token = submission.completion.token().unwrap();
+        submission.completion = CompletionDisposition::Submitted { token };
+        assert_eq!(
+            submission.validate_for_trace(&trace),
+            Err(ContractError::WritebackBeforeCompletion)
+        );
+        submission.writebacks.clear();
+        submission.validate_for_trace(&trace).unwrap();
+        for completion in [
+            CompletionDisposition::NotSubmitted,
+            CompletionDisposition::TimedOut { token },
+            CompletionDisposition::Failed { token: Some(token) },
+            CompletionDisposition::DeviceLost { token: Some(token) },
+            CompletionDisposition::SubmittedUnknown { token: Some(token) },
+        ] {
+            submission.completion = completion;
+            assert_eq!(
+                submission.validate_for_trace(&trace),
+                Err(ContractError::InvalidSubmissionCompletion(completion))
+            );
+        }
+    }
+
+    #[test]
+    fn submission_requires_matching_epoch_and_single_pass() {
+        let trace = trace(vec![pass(4, vec![buffer(7, 0)])]);
+        let mut submission = completed_submission(&trace);
+        submission.validate_for_trace(&trace).unwrap();
+        submission.completion = CompletionDisposition::CompletedVisible {
+            token: CompletionToken {
+                device_epoch: DeviceEpoch::new(2),
+                ..submission.completion.token().unwrap()
+            },
+        };
+        assert_eq!(
+            submission.validate_for_trace(&trace),
+            Err(ContractError::CompletionEpochMismatch {
+                expected: DeviceEpoch::new(1),
+                actual: DeviceEpoch::new(2),
+            })
+        );
+
+        let mut multi_pass = trace;
+        multi_pass.passes.push(multi_pass.passes[0].clone());
+        assert_eq!(
+            completed_submission(&multi_pass).validate_for_trace(&multi_pass),
+            Err(ContractError::UnsupportedSubmissionPassCount(2))
+        );
+    }
+
+    #[test]
+    fn submission_only_writes_back_bound_writable_identities() {
+        let trace = trace(vec![pass(4, vec![buffer(7, 0)])]);
+        for (allocation_id, view_id) in [
+            (AllocationId::new(9), ViewId::new(8)),
+            (AllocationId::new(10), ViewId::new(7)),
+        ] {
+            let mut submission = completed_submission(&trace);
+            submission.writebacks[0].allocation_id = allocation_id;
+            submission.writebacks[0].view_id = view_id;
+            assert_eq!(
+                submission.validate_for_trace(&trace),
+                Err(ContractError::UnknownWriteback {
+                    allocation: allocation_id,
+                    view: view_id,
+                })
+            );
+        }
+        let submission = completed_submission(&trace);
+        for access in [BufferAccess::Read, BufferAccess::Unused] {
+            let mut read_only = trace.clone();
+            read_only.passes[0].buffers[0].access = access;
+            read_only.pipeline_contract.buffer_bindings[0].access = access;
+            assert_eq!(
+                submission.validate_for_trace(&read_only),
+                Err(ContractError::ReadOnlyWriteback(ViewId::new(7)))
+            );
+        }
+    }
+
+    #[test]
+    fn writeback_ranges_are_allocation_relative_and_cover_the_complete_view() {
+        let mut view = buffer(7, 0);
+        view.offset = 8;
+        let trace = trace(vec![pass(4, vec![view])]);
+        completed_submission(&trace)
+            .validate_for_trace(&trace)
+            .unwrap();
+        for (offset, length) in [(0, 4), (7, 4), (9, 4), (8, 5)] {
+            let mut submission = completed_submission(&trace);
+            submission.writebacks[0].offset = offset;
+            submission.writebacks[0].bytes.resize(length, 0);
+            assert_eq!(
+                submission.validate_for_trace(&trace),
+                Err(ContractError::WritebackRangeOutOfBounds {
+                    view: ViewId::new(7),
+                    offset,
+                    end: offset + u64::try_from(length).unwrap(),
+                    view_offset: 8,
+                    view_end: 12,
+                })
+            );
+        }
+        for (offset, length) in [(8, 3), (9, 3)] {
+            let mut submission = completed_submission(&trace);
+            submission.writebacks[0].offset = offset;
+            submission.writebacks[0].bytes.resize(length, 0);
+            assert_eq!(
+                submission.validate_for_trace(&trace),
+                Err(ContractError::IncompleteWriteback(ViewId::new(7)))
+            );
+        }
+    }
+
+    #[test]
+    fn completed_host_readback_requires_every_writable_view_once_in_identity_order() {
+        let first = buffer(7, 0);
+        let mut second = buffer(6, 1);
+        second.offset = 4;
+        let mut trace = trace(vec![pass(4, vec![first, second])]);
+        trace
+            .pipeline_contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                ..trace.pipeline_contract.buffer_bindings[0].clone()
+            });
+        let submission = completed_submission(&trace);
+        assert_eq!(submission.writebacks[0].view_id, ViewId::new(6));
+        submission.validate_for_trace(&trace).unwrap();
+
+        let mut missing = submission.clone();
+        missing.writebacks.remove(0);
+        assert_eq!(
+            missing.validate_for_trace(&trace),
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(6),
+            })
+        );
+        let mut duplicate = submission.clone();
+        duplicate
+            .writebacks
+            .insert(0, duplicate.writebacks[0].clone());
+        assert_eq!(
+            duplicate.validate_for_trace(&trace),
+            Err(ContractError::DuplicateWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(6),
+            })
+        );
+        let mut reversed = submission;
+        reversed.writebacks.reverse();
+        assert_eq!(
+            reversed.validate_for_trace(&trace),
+            Err(ContractError::NonCanonicalWritebackOrder)
+        );
+    }
+
+    #[test]
+    fn submit_only_never_returns_writebacks() {
+        let mut trace = trace(vec![pass(4, vec![buffer(7, 0)])]);
+        trace.completion_policy = CompletionPolicy::SubmitOnly;
+        let mut submission = completed_submission(&trace);
+        assert_eq!(
+            submission.validate_for_trace(&trace),
+            Err(ContractError::WritebackPolicyMismatch(
+                CompletionPolicy::SubmitOnly
+            ))
+        );
+        submission.writebacks.clear();
+        submission.validate_for_trace(&trace).unwrap();
+        submission.completion = CompletionDisposition::Submitted {
+            token: submission.completion.token().unwrap(),
+        };
+        submission.validate_for_trace(&trace).unwrap();
     }
 }

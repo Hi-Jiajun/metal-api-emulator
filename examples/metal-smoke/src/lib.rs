@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+mod provider_suite;
+
+pub use provider_suite::run_provider_suite;
+
 pub fn run_suite(
     label: &'static str,
     device_name: &str,
@@ -119,6 +123,15 @@ impl Drop for TemporaryFile {
 }
 
 fn run_indexed_boundary_dispatch(device: &Device) -> Result<(), Box<dyn Error>> {
+    let actual = execute_indexed_boundary_dispatch(device)?;
+    if actual != indexed_boundary_golden() {
+        return Err("indexed boundary dispatch did not match the Metal golden output".into());
+    }
+    println!("PASS indexed_boundary_dispatch words=30 regions=4");
+    Ok(())
+}
+
+fn execute_indexed_boundary_dispatch(device: &Device) -> Result<Vec<u8>, Box<dyn Error>> {
     let library = device.new_library_with_air(include_str!(
         "../shaders/kernel_dispatch_threads_boundary_barrier.ll"
     ))?;
@@ -135,6 +148,10 @@ fn run_indexed_boundary_dispatch(device: &Device) -> Result<(), Box<dyn Error>> 
     command.commit()?;
     command.wait_until_completed()?;
 
+    Ok(output.read()?)
+}
+
+fn indexed_boundary_golden() -> Vec<u8> {
     let mut expected = Vec::with_capacity(30 * size_of::<u32>());
     for y in 0..3 {
         for x in 0..10 {
@@ -143,10 +160,5 @@ fn run_indexed_boundary_dispatch(device: &Device) -> Result<(), Box<dyn Error>> 
             expected.extend_from_slice(&(local_y * 100 + local_x).to_le_bytes());
         }
     }
-    let actual = output.read()?;
-    if actual != expected {
-        return Err("indexed boundary dispatch did not match the Metal golden output".into());
-    }
-    println!("PASS indexed_boundary_dispatch words=30 regions=4");
-    Ok(())
+    expected
 }

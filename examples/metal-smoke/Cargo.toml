@@ -1,5 +1,6 @@
 [package]
 name = "metal-smoke"
+default-run = "metal-smoke"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

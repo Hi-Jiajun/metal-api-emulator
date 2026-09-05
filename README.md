@@ -25,12 +25,16 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 - Validation: API ordering, foreign pipeline rejection, bounded buffer access,
   device limits and CPU-visible readback. Multiple bindings of the same Buffer
   are detected and refused.
-- Experimental: `metal_api_core::provider` contains trace/resource values,
-  capability admission and a `ComputeProvider` trait declaration. **No backend
-  implements that trait yet.** Real GPU smoke still uses `ComputeExecutor`.
-- Open design work: compile/pipeline ownership, asynchronous result retrieval,
-  completion-driven resource retention and validation of provider writebacks
-  against the admitted trace. Resource snapshots do not hold live guest pages.
+- Experimental provider: `VulkanComputeProvider` implements `ComputeProvider`
+  for one synchronous, serial exact-thread pass with owned bytes and host
+  readback. It registers pipelines, revalidates each trace against its actual
+  device and artifact, and returns checked allocation-relative writebacks.
+- Completion: this provider's `submit` waits for GPU completion and readback;
+  `wait` observes the recorded terminal result. A submit timeout is terminal
+  unknown completion; resources remain retained and the executor is unusable.
+- Open design work: asynchronous submission/readback, native provider compile
+  integration, multi-pass commands, aliases and completion-driven live leases.
+  Resource snapshots do not hold live guest pages.
 - Not implemented: native Metal provider, general MTLB function-name resolution,
   MSL compilation, textures, rendering, presentation, heaps, ICBs or production
   reims integration. This is not a Metal.framework ABI implementation.
@@ -60,6 +64,7 @@ For live smoke, install a Vulkan 1.3 loader/ICD with maintenance4, `llvm-as`,
 
 ```sh
 cargo run --locked -p metal-smoke -- --executor standalone
+cargo run --locked -p metal-smoke --bin provider-smoke
 ```
 
 On Linux, select Lavapipe explicitly when needed by setting `VK_ICD_FILENAMES`
@@ -87,6 +92,12 @@ PASS binary_air_copy_word encoding=wrapper output=0x67452301
 PASS indexed_boundary_dispatch words=30 regions=4
 ```
 
+`provider-smoke` runs the same four cases through canonical traces and compares
+against the original snapshot executor on the same Vulkan device. It checks
+nonzero view offsets, immutable pipeline metadata, owner epochs, completion
+tokens and explicit registry release. This is a provider/legacy Vulkan
+comparison, not a native Metal oracle.
+
 The indexed case launches a 10x3 grid with an 8x2 nominal threadgroup, exercises
 a barrier and checks all 30 output words. Its source and reference output are
 attributed in [NOTICE.md](NOTICE.md). Generated AIR stays temporary.
@@ -95,9 +106,10 @@ attributed in [NOTICE.md](NOTICE.md). Generated AIR stays temporary.
 
 Earlier local checkpoints ran these four checks on Linux/Lavapipe and
 Windows/RTX 5060 with both Vulkan executors. Those runs validate the narrow
-snapshot executor path. They do not demonstrate native Metal parity or the
-new provider trait. The current publication-preparation checks are recorded in
-[docs/VALIDATION.md](docs/VALIDATION.md).
+snapshot executor path. They do not demonstrate native Metal parity.
+Publication-preparation checks are recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
+The subsequent provider implementation is described in
+[docs/PROVIDER-B1.md](docs/PROVIDER-B1.md).
 
 The standalone fence wait has a 20-second bound. Reims uses its explicit
 synchronous retirement entry. Neither interface provides an end-to-end

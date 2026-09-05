@@ -11,7 +11,10 @@ use metal2vulkan::reflect::{
     BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, ResourceAccess, ResourceKind,
     ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
-use metal_api_core::provider::{PipelineContract, ProviderCapabilities, SemanticDigest};
+use metal_api_core::provider::{
+    CompletionDisposition, PipelineContract, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderPhase, SemanticDigest,
+};
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
     Function, PipelineArtifact,
@@ -24,7 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod compute_provider;
 mod provider;
+
+pub use compute_provider::{CompiledComputePipeline, VulkanComputeProvider};
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +65,7 @@ impl VulkanExecutor {
     }
 }
 
-struct VulkanPipelineArtifact {
+pub(crate) struct VulkanPipelineArtifact {
     context: Arc<VulkanContext>,
     translated: TranslatedComputePipeline,
 }
@@ -187,7 +193,7 @@ impl ComputeExecutor for VulkanExecutor {
     }
 }
 
-struct VulkanContext {
+pub(crate) struct VulkanContext {
     entry: ManuallyDrop<Entry>,
     instance: Instance,
     device: AshDevice,
@@ -400,44 +406,116 @@ fn execute_submission(
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
 ) -> Result<Vec<BufferUpdate>, ExecutorError> {
+    execute_submission_with_status(context, artifact, submission)
+        .map_err(|error| failure(error.detail.unwrap_or(error.slug)))
+}
+
+/// Execute while preserving the phase and queue disposition for provider callers.
+/// The caller owns serialization and supplies its token after observing the result.
+pub(crate) fn execute_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    submission: ComputeSubmission,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let result = execute_submission_stages(context, artifact, submission);
+    if result
+        .as_ref()
+        .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
+    {
+        context.poisoned.store(true, Ordering::Release);
+    }
+    result
+}
+
+fn execute_submission_stages(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    submission: ComputeSubmission,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
     let grid = submission.threads_per_grid.dimensions();
     let local = submission.threads_per_threadgroup.dimensions();
-    validate_local_size(context, local)?;
+    let resolve_args = |error| {
+        ExecutionFailure::from(error).into_provider(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Args,
+            "vulkan-dispatch-args",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    let resolve_capability = |error| {
+        ExecutionFailure::from(error).into_provider(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "vulkan-dispatch-capability",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    validate_local_size(context, local).map_err(resolve_capability)?;
     let reflection = artifact.translated.reflection();
     artifact
         .translated
-        .validate_buffers(&submission.buffers, grid)?;
-    artifact.translated.validate_threadgroup(local)?;
+        .validate_buffers(&submission.buffers, grid)
+        .map_err(resolve_args)?;
+    artifact
+        .translated
+        .validate_threadgroup(local)
+        .map_err(resolve_capability)?;
     let reflected_contract = reflection
         .kernel_dispatch
-        .ok_or_else(|| failure("translated kernel has no dispatch contract"))?;
+        .ok_or_else(|| resolve_capability(failure("translated kernel has no dispatch contract")))?;
     if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
-        return Err(failure(format!(
+        return Err(resolve_capability(failure(format!(
             "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
-        )));
+        ))));
     }
     let plan = reflected_contract
         .plan(local, Some(grid))
-        .map_err(|error| failure(format!("plan exact dispatch: {error}")))?;
-    validate_dispatch_plan(context, reflected_contract, &plan)?;
+        .map_err(|error| resolve_args(failure(format!("plan exact dispatch: {error}"))))?;
+    validate_dispatch_plan(context, reflected_contract, &plan).map_err(resolve_capability)?;
     if plan.regions.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut resources = ExecutionResources::new(Arc::clone(context));
-    resources.create_pipeline_objects(artifact.translated.spirv(), reflection, &plan)?;
-    resources.create_buffers(reflection, &submission.buffers)?;
-    resources.create_descriptors(reflection)?;
-    resources.record(reflection, reflected_contract, &plan)?;
+    resources
+        .create_pipeline_objects(artifact.translated.spirv(), reflection, &plan)
+        .map_err(|error| {
+            error.into_provider(
+                ProviderPhase::Compile,
+                ProviderErrorClass::Compile,
+                "vulkan-pipeline-create",
+                CompletionDisposition::NotSubmitted,
+            )
+        })?;
+    let encode_error = |error: ExecutionFailure| {
+        error.into_provider(
+            ProviderPhase::Encode,
+            ProviderErrorClass::Resource,
+            "vulkan-encode",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    resources
+        .create_buffers(reflection, &submission.buffers)
+        .map_err(encode_error)?;
+    resources
+        .create_descriptors(reflection)
+        .map_err(encode_error)?;
+    resources
+        .record(reflection, reflected_contract, &plan)
+        .map_err(encode_error)?;
     match resources.submit_and_wait() {
         Ok(()) => {}
-        Err(SubmissionFailure::Safe(error)) => return Err(error),
-        Err(SubmissionFailure::Pending(error)) => {
-            context.abandon(resources);
-            return Err(error);
+        Err(error) => {
+            if error.is_pending() {
+                context.abandon(resources);
+            }
+            return Err(error.into_provider());
         }
     }
-    resources.read_updates(reflection)
+    resources
+        .read_updates(reflection)
+        .map_err(ExecutionFailure::into_readback_provider)
 }
 
 fn validate_local_size(context: &VulkanContext, local: [u32; 3]) -> Result<(), ExecutorError> {
@@ -793,12 +871,124 @@ struct ExecutionResources {
     buffers: Vec<GpuBuffer>,
 }
 
+struct ExecutionFailure {
+    result: Option<vk::Result>,
+    detail: String,
+}
+
+impl ExecutionFailure {
+    fn vulkan(result: vk::Result, detail: impl Into<String>) -> Self {
+        Self {
+            result: Some(result),
+            detail: detail.into(),
+        }
+    }
+
+    fn into_provider(
+        self,
+        phase: ProviderPhase,
+        class: ProviderErrorClass,
+        slug: &'static str,
+        completion: CompletionDisposition,
+    ) -> ProviderError {
+        let device_lost = self.result == Some(vk::Result::ERROR_DEVICE_LOST);
+        let class = if device_lost {
+            ProviderErrorClass::DeviceLost
+        } else {
+            class
+        };
+        let completion = if device_lost
+            && matches!(completion, CompletionDisposition::SubmittedUnknown { .. })
+        {
+            CompletionDisposition::DeviceLost { token: None }
+        } else {
+            completion
+        };
+        ProviderError::new(phase, class, slug)
+            .expect("static Vulkan error slug")
+            .with_completion(completion)
+            .with_detail(self.detail)
+    }
+
+    fn into_readback_provider(self) -> ProviderError {
+        self.into_provider(
+            ProviderPhase::Readback,
+            ProviderErrorClass::Execute,
+            "vulkan-readback",
+            CompletionDisposition::Failed { token: None },
+        )
+    }
+}
+
+impl From<ExecutorError> for ExecutionFailure {
+    fn from(error: ExecutorError) -> Self {
+        Self {
+            result: None,
+            detail: error.to_string(),
+        }
+    }
+}
+
 enum SubmissionFailure {
     /// Nothing reached the queue, so ordinary RAII cleanup is valid.
-    Safe(ExecutorError),
-    /// Queue submission succeeded but completion is unknown. Handles must stay
+    Safe {
+        phase: ProviderPhase,
+        error: ExecutionFailure,
+    },
+    /// Queue acceptance or completion is unknown. Handles must stay
     /// alive until process exit or an out-of-band reaper proves completion.
-    Pending(ExecutorError),
+    Pending {
+        phase: ProviderPhase,
+        error: ExecutionFailure,
+    },
+}
+
+impl SubmissionFailure {
+    fn from_queue_submit(error: ExecutionFailure) -> Self {
+        // Vulkan guarantees an unsuccessful allocation leaves referenced
+        // resources unaffected. Other failures do not prove queue rejection.
+        if matches!(
+            error.result,
+            Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        ) {
+            Self::Safe {
+                phase: ProviderPhase::Submit,
+                error,
+            }
+        } else {
+            Self::Pending {
+                phase: ProviderPhase::Submit,
+                error,
+            }
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    fn into_provider(self) -> ProviderError {
+        match self {
+            Self::Safe { phase, error } => error.into_provider(
+                phase,
+                ProviderErrorClass::Execute,
+                match phase {
+                    ProviderPhase::Encode => "vulkan-fence-create",
+                    _ => "vulkan-queue-submit",
+                },
+                CompletionDisposition::NotSubmitted,
+            ),
+            Self::Pending { phase, error } => error.into_provider(
+                phase,
+                ProviderErrorClass::Execute,
+                match phase {
+                    ProviderPhase::Submit => "vulkan-queue-submit",
+                    _ => "vulkan-wait",
+                },
+                CompletionDisposition::SubmittedUnknown { token: None },
+            ),
+        }
+    }
 }
 
 impl ExecutionResources {
@@ -825,9 +1015,9 @@ impl ExecutionResources {
         spv: &[u8],
         reflection: &ShaderReflection,
         plan: &metal2vulkan::reflect::KernelDispatchPlan,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<(), ExecutionFailure> {
         if !spv.len().is_multiple_of(4) {
-            return Err(failure("translated SPIR-V is not word aligned"));
+            return Err(failure("translated SPIR-V is not word aligned").into());
         }
         let buffer_count = u32::try_from(reflection.bindings.len())
             .map_err(|_| failure("reflected buffer count overflows u32"))?;
@@ -843,7 +1033,7 @@ impl ExecutionResources {
                 limits.max_descriptor_set_storage_buffers,
                 limits.max_per_stage_resources,
                 limits.max_bound_descriptor_sets
-            )));
+            )).into());
         }
         let words = spv
             .chunks_exact(4)
@@ -851,7 +1041,9 @@ impl ExecutionResources {
             .collect::<Vec<_>>();
         let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
         self.shader = unsafe { self.context.device.create_shader_module(&shader_info, None) }
-            .map_err(|error| failure(format!("create shader module: {error}")))?;
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create shader module: {error}"))
+            })?;
 
         let mut layout_bindings = reflection
             .bindings
@@ -873,7 +1065,9 @@ impl ExecutionResources {
                 .device
                 .create_descriptor_set_layout(&set_layout_info, None)
         }
-        .map_err(|error| failure(format!("create descriptor-set layout: {error}")))?;
+        .map_err(|error| {
+            ExecutionFailure::vulkan(error, format!("create descriptor-set layout: {error}"))
+        })?;
 
         let set_layouts = [self.set_layout];
         let contract = reflection
@@ -894,7 +1088,9 @@ impl ExecutionResources {
                 .device
                 .create_pipeline_layout(&pipeline_layout_info, None)
         }
-        .map_err(|error| failure(format!("create pipeline layout: {error}")))?;
+        .map_err(|error| {
+            ExecutionFailure::vulkan(error, format!("create pipeline layout: {error}"))
+        })?;
 
         for region in &plan.regions {
             if self.pipelines.contains_key(&region.local_size) {
@@ -906,7 +1102,10 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_compute_pipeline(&self, local_size: [u32; 3]) -> Result<vk::Pipeline, ExecutorError> {
+    fn create_compute_pipeline(
+        &self,
+        local_size: [u32; 3],
+    ) -> Result<vk::Pipeline, ExecutionFailure> {
         let main = CString::new("main").expect("static entry name");
         let entries: [vk::SpecializationMapEntry; 3] =
             std::array::from_fn(|index| vk::SpecializationMapEntry {
@@ -939,7 +1138,10 @@ impl ExecutionResources {
                 for pipeline in partial {
                     unsafe { self.context.device.destroy_pipeline(pipeline, None) };
                 }
-                Err(failure(format!("create compute pipeline: {error}")))
+                Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("create compute pipeline: {error}"),
+                ))
             }
         }
     }
@@ -948,7 +1150,7 @@ impl ExecutionResources {
         &mut self,
         reflection: &ShaderReflection,
         bindings: &[BufferBinding],
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<(), ExecutionFailure> {
         for reflected in &reflection.bindings {
             let supplied = bindings
                 .iter()
@@ -960,21 +1162,27 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutorError> {
+    fn create_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
         let size = u64::try_from(supplied.bytes.len())
             .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
         if size > self.context.properties.limits.max_storage_buffer_range as u64 {
             return Err(failure(format!(
                 "buffer {} length {size} exceeds maxStorageBufferRange {}",
                 supplied.index, self.context.properties.limits.max_storage_buffer_range
-            )));
+            ))
+            .into());
         }
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { self.context.device.create_buffer(&buffer_info, None) }
-            .map_err(|error| failure(format!("create buffer {}: {error}", supplied.index)))?;
+        let buffer =
+            unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(
+                    error,
+                    format!("create buffer {}: {error}", supplied.index),
+                )
+            })?;
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let memory_type = match self.context.memory_type(
             requirements.memory_type_bits,
@@ -983,7 +1191,7 @@ impl ExecutionResources {
             Ok(index) => index,
             Err(error) => {
                 unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(error);
+                return Err(error.into());
             }
         };
         let allocation = vk::MemoryAllocateInfo::default()
@@ -993,10 +1201,10 @@ impl ExecutionResources {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(failure(format!(
-                    "allocate buffer {} memory: {error}",
-                    supplied.index
-                )));
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate buffer {} memory: {error}", supplied.index),
+                ));
             }
         };
         if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
@@ -1004,10 +1212,10 @@ impl ExecutionResources {
                 self.context.device.destroy_buffer(buffer, None);
                 self.context.device.free_memory(memory, None);
             }
-            return Err(failure(format!(
-                "bind buffer {} memory: {error}",
-                supplied.index
-            )));
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind buffer {} memory: {error}", supplied.index),
+            ));
         }
         let mapped = match unsafe {
             self.context
@@ -1020,7 +1228,10 @@ impl ExecutionResources {
                     self.context.device.destroy_buffer(buffer, None);
                     self.context.device.free_memory(memory, None);
                 }
-                return Err(failure(format!("map buffer {}: {error}", supplied.index)));
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map buffer {}: {error}", supplied.index),
+                ));
             }
         };
         unsafe {
@@ -1040,7 +1251,10 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_descriptors(&mut self, reflection: &ShaderReflection) -> Result<(), ExecutorError> {
+    fn create_descriptors(
+        &mut self,
+        reflection: &ShaderReflection,
+    ) -> Result<(), ExecutionFailure> {
         let count = u32::try_from(self.buffers.len())
             .map_err(|_| failure("descriptor count overflows u32"))?;
         let sizes = [vk::DescriptorPoolSize {
@@ -1051,14 +1265,17 @@ impl ExecutionResources {
             .max_sets(1)
             .pool_sizes(&sizes);
         self.descriptor_pool =
-            unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }
-                .map_err(|error| failure(format!("create descriptor pool: {error}")))?;
+            unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }.map_err(
+                |error| ExecutionFailure::vulkan(error, format!("create descriptor pool: {error}")),
+            )?;
         let layouts = [self.set_layout];
         let allocation = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
         self.descriptor_set = unsafe { self.context.device.allocate_descriptor_sets(&allocation) }
-            .map_err(|error| failure(format!("allocate descriptor set: {error}")))?[0];
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("allocate descriptor set: {error}"))
+            })?[0];
 
         let infos = reflection
             .bindings
@@ -1096,25 +1313,31 @@ impl ExecutionResources {
         reflection: &ShaderReflection,
         contract: KernelDispatch,
         plan: &metal2vulkan::reflect::KernelDispatchPlan,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<(), ExecutionFailure> {
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.context.queue_family)
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
         self.command_pool = unsafe { self.context.device.create_command_pool(&pool_info, None) }
-            .map_err(|error| failure(format!("create command pool: {error}")))?;
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create command pool: {error}"))
+            })?;
         let allocation = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         self.command = unsafe { self.context.device.allocate_command_buffers(&allocation) }
-            .map_err(|error| failure(format!("allocate command buffer: {error}")))?[0];
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("allocate command buffer: {error}"))
+            })?[0];
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             self.context
                 .device
                 .begin_command_buffer(self.command, &begin)
-                .map_err(|error| failure(format!("begin command buffer: {error}")))?;
+                .map_err(|error| {
+                    ExecutionFailure::vulkan(error, format!("begin command buffer: {error}"))
+                })?;
             self.context.device.cmd_bind_descriptor_sets(
                 self.command,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1153,10 +1376,26 @@ impl ExecutionResources {
                     region.group_count[2],
                 );
             }
+            // Fence retirement establishes execution completion; this barrier
+            // makes compute writes available to coherent host readback.
+            let readback_barriers = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            self.context.device.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &readback_barriers,
+                &[],
+                &[],
+            );
             self.context
                 .device
                 .end_command_buffer(self.command)
-                .map_err(|error| failure(format!("end command buffer: {error}")))?;
+                .map_err(|error| {
+                    ExecutionFailure::vulkan(error, format!("end command buffer: {error}"))
+                })?;
         }
         Ok(())
     }
@@ -1167,8 +1406,9 @@ impl ExecutionResources {
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
         }
-        .map_err(|error| {
-            SubmissionFailure::Safe(failure(format!("create completion fence: {error}")))
+        .map_err(|error| SubmissionFailure::Safe {
+            phase: ProviderPhase::Encode,
+            error: ExecutionFailure::vulkan(error, format!("create completion fence: {error}")),
         })?;
         let commands = [self.command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
@@ -1178,9 +1418,12 @@ impl ExecutionResources {
                 .queue_submit(self.context.queue, &submits, self.fence)
         } {
             self.context.poisoned.store(true, Ordering::Release);
-            return Err(SubmissionFailure::Safe(failure(format!(
-                "submit compute command buffer: {error}"
-            ))));
+            let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                error,
+                format!("submit compute command buffer: {error}"),
+            ));
+            self.submitted = failure.is_pending();
+            return Err(failure);
         }
         self.submitted = true;
         let wait = unsafe {
@@ -1200,7 +1443,10 @@ impl ExecutionResources {
                 } else {
                     format!("wait for compute completion failed: {error}")
                 };
-                Err(SubmissionFailure::Pending(failure(message)))
+                Err(SubmissionFailure::Pending {
+                    phase: ProviderPhase::Wait,
+                    error: ExecutionFailure::vulkan(error, message),
+                })
             }
         }
     }
@@ -1208,7 +1454,7 @@ impl ExecutionResources {
     fn read_updates(
         &self,
         reflection: &ShaderReflection,
-    ) -> Result<Vec<BufferUpdate>, ExecutorError> {
+    ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
         let mut updates = Vec::new();
         for reflected in &reflection.bindings {
             if matches!(
@@ -1230,7 +1476,12 @@ impl ExecutionResources {
                     vk::MemoryMapFlags::empty(),
                 )
             }
-            .map_err(|error| failure(format!("map buffer {} for readback: {error}", gpu.index)))?;
+            .map_err(|error| {
+                ExecutionFailure::vulkan(
+                    error,
+                    format!("map buffer {} for readback: {error}", gpu.index),
+                )
+            })?;
             let bytes =
                 unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), gpu.len).to_vec() };
             unsafe { self.context.device.unmap_memory(gpu.memory) };
@@ -1299,6 +1550,138 @@ impl Drop for ExecutionResources {
 mod tests {
     use super::*;
     use metal2vulkan::reflect::{BufferStrideTerm, BufferStridedAccess};
+
+    #[test]
+    fn failures_before_queue_acceptance_are_not_submitted() {
+        for phase in [ProviderPhase::Encode, ProviderPhase::Submit] {
+            let failure = SubmissionFailure::Safe {
+                phase,
+                error: ExecutionFailure::vulkan(
+                    vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+                    "host allocation failed",
+                ),
+            };
+            assert!(!failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, phase);
+            assert_eq!(error.class, ProviderErrorClass::Execute);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert_eq!(error.detail.as_deref(), Some("host allocation failed"));
+        }
+    }
+
+    #[test]
+    fn queue_submit_only_allocation_errors_guarantee_safe_rejection() {
+        for result in [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ] {
+            let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                result,
+                "queue allocation failed",
+            ));
+            assert!(!failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, ProviderPhase::Submit);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+
+        let unknown = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+            vk::Result::ERROR_UNKNOWN,
+            "queue outcome unknown",
+        ));
+        assert!(unknown.is_pending());
+        let error = unknown.into_provider();
+        assert_eq!(error.phase, ProviderPhase::Submit);
+        assert_eq!(error.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::SubmittedUnknown { token: None }
+        );
+
+        let lost = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+            vk::Result::ERROR_DEVICE_LOST,
+            "queue device lost",
+        ));
+        assert!(lost.is_pending());
+        let error = lost.into_provider();
+        assert_eq!(error.phase, ProviderPhase::Submit);
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+    }
+
+    #[test]
+    fn wait_failures_preserve_unknown_completion_and_pending_resources() {
+        for result in [vk::Result::TIMEOUT, vk::Result::ERROR_OUT_OF_HOST_MEMORY] {
+            let failure = SubmissionFailure::Pending {
+                phase: ProviderPhase::Wait,
+                error: ExecutionFailure::vulkan(result, "wait did not establish completion"),
+            };
+            assert!(failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, ProviderPhase::Wait);
+            assert_eq!(error.class, ProviderErrorClass::Execute);
+            assert_eq!(
+                error.completion,
+                CompletionDisposition::SubmittedUnknown { token: None }
+            );
+        }
+    }
+
+    #[test]
+    fn device_loss_is_classified_from_vulkan_result() {
+        let error = SubmissionFailure::Pending {
+            phase: ProviderPhase::Wait,
+            error: ExecutionFailure::vulkan(
+                vk::Result::ERROR_DEVICE_LOST,
+                "arbitrary driver detail",
+            ),
+        }
+        .into_provider();
+        assert_eq!(error.phase, ProviderPhase::Wait);
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+
+        let misleading_detail = SubmissionFailure::Pending {
+            phase: ProviderPhase::Wait,
+            error: ExecutionFailure::vulkan(
+                vk::Result::TIMEOUT,
+                "ERROR_DEVICE_LOST appears only in diagnostics",
+            ),
+        }
+        .into_provider();
+        assert_eq!(misleading_detail.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            misleading_detail.completion,
+            CompletionDisposition::SubmittedUnknown { token: None }
+        );
+    }
+
+    #[test]
+    fn readback_failure_is_failed_after_queue_retirement() {
+        let error = ExecutionFailure::vulkan(vk::Result::ERROR_MEMORY_MAP_FAILED, "readback map")
+            .into_readback_provider();
+        assert_eq!(error.phase, ProviderPhase::Readback);
+        assert_eq!(error.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::Failed { token: None }
+        );
+
+        let lost = ExecutionFailure::vulkan(vk::Result::ERROR_DEVICE_LOST, "readback map")
+            .into_readback_provider();
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::Failed { token: None }
+        );
+    }
 
     fn spirv_bytes(instructions: &[&[u32]]) -> Vec<u8> {
         let mut words = vec![0x0723_0203, 0x0001_0400, 0, 1, 0];

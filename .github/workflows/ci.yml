@@ -34,3 +34,4 @@ jobs:
           test "${#icds[@]}" -eq 1
           export VK_ICD_FILENAMES="${icds[0]}"
           cargo run --locked -p metal-smoke -- --executor standalone
+          cargo run --locked -p metal-smoke --bin provider-smoke
