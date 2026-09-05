@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Current version of the pure-value provider trace schema.
@@ -42,6 +43,31 @@ id_type!(ViewId);
 id_type!(LeaseId);
 id_type!(PipelineId);
 id_type!(SubmissionId);
+
+static NEXT_DEVICE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a nonzero identity shared by all provider implementations in this
+/// process. Providers must use this allocator instead of choosing their own
+/// epoch or maintaining a separate counter. Epochs are never reused, including
+/// after a provider is dropped; serialized identities are not portable across
+/// processes. Exhaustion refuses device creation without wrapping the counter.
+pub fn allocate_device_epoch() -> Result<DeviceEpoch, ProviderError> {
+    NEXT_DEVICE_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(DeviceEpoch::new)
+        .map_err(|_| {
+            let mut error = ProviderError::new(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Internal,
+                "device_epoch_exhausted",
+            )
+            .expect("non-empty epoch exhaustion slug");
+            error.retryability = Retryability::Never;
+            error
+        })
+}
 
 /// A semantic module digest. The scheme is carried instead of being silently
 /// fixed to SHA-256; the normalization algorithm is still an open contract
@@ -82,7 +108,58 @@ impl SemanticDigest {
 pub enum FunctionSource {
     SanitizedLl,
     BinaryAir,
+    MetalSource,
     Metallib,
+}
+
+/// Backend input for the bounded compute compilation boundary. Providers may
+/// refuse a source representation they do not support with a typed capability
+/// error; accepting a representation does not imply support for all shaders.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShaderSource {
+    SanitizedLl(String),
+    BinaryAir(Vec<u8>),
+    MetalSource(String),
+}
+
+impl ShaderSource {
+    pub const fn kind(&self) -> FunctionSource {
+        match self {
+            Self::SanitizedLl(_) => FunctionSource::SanitizedLl,
+            Self::BinaryAir(_) => FunctionSource::BinaryAir,
+            Self::MetalSource(_) => FunctionSource::MetalSource,
+        }
+    }
+}
+
+/// Compile one entry point without exposing a backend artifact. The digest is
+/// supplied by the caller to align parity fixtures; it is not a cache key or a
+/// proof that differently represented source modules are equivalent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PipelineCompileRequest {
+    pub entry_name: String,
+    pub logical_digest: SemanticDigest,
+    pub source: ShaderSource,
+}
+
+impl PipelineCompileRequest {
+    /// Check only common shape requirements. The backend validates binary
+    /// containers, source syntax and its supported compute subset.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.entry_name.trim().is_empty() {
+            return Err(ContractError::EmptyField("function entry name"));
+        }
+        let empty = match &self.source {
+            ShaderSource::SanitizedLl(source) | ShaderSource::MetalSource(source) => {
+                source.trim().is_empty()
+            }
+            ShaderSource::BinaryAir(source) => source.is_empty(),
+        };
+        if empty {
+            return Err(ContractError::EmptyField("shader source"));
+        }
+        Ok(())
+    }
 }
 
 /// Logical identity used to align native and Vulkan parity cases.
@@ -346,6 +423,18 @@ pub struct PipelineContract {
     pub buffer_bindings: Vec<BufferBindingContract>,
     pub shader_capabilities: Vec<String>,
     pub translator_revision: Option<SemanticDigest>,
+}
+
+/// Neutral metadata for a pipeline registered by one provider context.
+/// The provider retains the actual artifact and checks this metadata at submit.
+/// This value neither owns the backend pipeline nor permits transfer between
+/// provider contexts; release is explicit through [`PipelineProvider`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledComputePipeline {
+    pub device_epoch: DeviceEpoch,
+    pub pipeline_id: PipelineId,
+    pub function: FunctionIdentity,
+    pub contract: PipelineContract,
 }
 
 impl PipelineContract {
@@ -1151,6 +1240,34 @@ pub trait ComputeProvider: Send + Sync {
     ) -> Result<CompletionDisposition, ProviderError>;
 }
 
+/// Shared compilation and retirement boundary for a compute provider.
+///
+/// Backend objects remain in the implementing provider. Every new provider
+/// context must obtain its epoch from [`allocate_device_epoch`], and every
+/// submitted pipeline or completion must be checked against that context.
+pub trait PipelineProvider: ComputeProvider {
+    fn device_epoch(&self) -> DeviceEpoch;
+
+    /// Validate the request and either register a compiled pipeline or return a
+    /// typed refusal. Unsupported source kinds use a compile-phase capability
+    /// error; malformed source uses an argument or compilation error.
+    fn compile(
+        &self,
+        request: PipelineCompileRequest,
+    ) -> Result<CompiledComputePipeline, ProviderError>;
+
+    /// Stop accepting submissions for this pipeline. Implementations must
+    /// verify both its epoch and registered identity/metadata before removing
+    /// it, and reject stale or foreign values. Already submitted work retains
+    /// its backing pipeline until the GPU is known to have retired it.
+    fn release_pipeline(&self, pipeline: &CompiledComputePipeline) -> Result<(), ProviderError>;
+
+    /// Release a retained completion record after verifying its epoch and
+    /// submission identity. Forgetting a record is not evidence of GPU
+    /// retirement and must not free resources still in use by submitted work.
+    fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError>;
+}
+
 /// Capabilities are captured once for a provider device context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCapabilities {
@@ -1880,6 +1997,202 @@ mod tests {
 
     fn digest() -> SemanticDigest {
         SemanticDigest::new("test-v1", [7, 3, 1]).expect("non-empty digest")
+    }
+
+    fn compile_request(source: ShaderSource) -> PipelineCompileRequest {
+        PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: digest(),
+            source,
+        }
+    }
+
+    #[test]
+    fn compilation_request_validates_common_shape_and_preserves_source_kind() {
+        for (source, kind) in [
+            (
+                ShaderSource::SanitizedLl("define void @copy_word() {}".into()),
+                FunctionSource::SanitizedLl,
+            ),
+            // Binary shape is deliberately delegated to the backend.
+            (ShaderSource::BinaryAir(vec![1]), FunctionSource::BinaryAir),
+            (
+                ShaderSource::MetalSource("kernel void copy_word() {}".into()),
+                FunctionSource::MetalSource,
+            ),
+        ] {
+            assert_eq!(source.kind(), kind);
+            assert_eq!(compile_request(source).validate(), Ok(()));
+        }
+        for source in [
+            ShaderSource::SanitizedLl(" \n\t".into()),
+            ShaderSource::BinaryAir(Vec::new()),
+            ShaderSource::MetalSource(String::new()),
+        ] {
+            assert_eq!(
+                compile_request(source).validate(),
+                Err(ContractError::EmptyField("shader source"))
+            );
+        }
+        let mut request = compile_request(ShaderSource::BinaryAir(vec![1]));
+        request.entry_name = " \t".into();
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::EmptyField("function entry name"))
+        );
+    }
+
+    #[test]
+    fn device_epochs_are_unique_across_concurrent_context_creation() {
+        let epochs = std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..32)
+                            .map(|_| allocate_device_epoch().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(epochs.iter().all(|epoch| !epoch.is_zero()));
+        let unique = epochs.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(epochs.len(), unique.len());
+    }
+
+    struct CompileOnlyProvider {
+        epoch: DeviceEpoch,
+        source: FunctionSource,
+        registered: std::sync::Mutex<Option<CompiledComputePipeline>>,
+    }
+
+    fn mock_refusal(class: ProviderErrorClass, slug: &str) -> ProviderError {
+        ProviderError::new(ProviderPhase::Compile, class, slug).unwrap()
+    }
+
+    impl ComputeProvider for CompileOnlyProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            capabilities()
+        }
+
+        fn submit(&self, _: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
+            Err(mock_refusal(ProviderErrorClass::Capability, "compile_only"))
+        }
+
+        fn wait(
+            &self,
+            _: CompletionToken,
+            _: Duration,
+        ) -> Result<CompletionDisposition, ProviderError> {
+            Err(mock_refusal(ProviderErrorClass::Capability, "compile_only"))
+        }
+    }
+
+    impl PipelineProvider for CompileOnlyProvider {
+        fn device_epoch(&self) -> DeviceEpoch {
+            self.epoch
+        }
+
+        fn compile(
+            &self,
+            request: PipelineCompileRequest,
+        ) -> Result<CompiledComputePipeline, ProviderError> {
+            request.validate().map_err(|error| {
+                mock_refusal(ProviderErrorClass::Args, "invalid_compile_request")
+                    .with_detail(error.to_string())
+            })?;
+            if request.source.kind() != self.source {
+                return Err(mock_refusal(
+                    ProviderErrorClass::Capability,
+                    "unsupported_shader_source",
+                ));
+            }
+            let metadata = CompiledComputePipeline {
+                device_epoch: self.epoch,
+                pipeline_id: PipelineId::new(1),
+                function: FunctionIdentity {
+                    logical_digest: request.logical_digest,
+                    entry_name: request.entry_name,
+                    source: request.source.kind(),
+                },
+                contract: trace(Vec::new()).pipeline_contract,
+            };
+            *self.registered.lock().unwrap() = Some(metadata.clone());
+            Ok(metadata)
+        }
+
+        fn release_pipeline(
+            &self,
+            pipeline: &CompiledComputePipeline,
+        ) -> Result<(), ProviderError> {
+            let mut registered = self.registered.lock().unwrap();
+            if registered.as_ref() != Some(pipeline) {
+                return Err(mock_refusal(
+                    ProviderErrorClass::Resource,
+                    "unknown_pipeline",
+                ));
+            }
+            *registered = None;
+            Ok(())
+        }
+
+        fn release_completion(&self, _: CompletionToken) -> Result<(), ProviderError> {
+            Err(mock_refusal(
+                ProviderErrorClass::Resource,
+                "unknown_completion",
+            ))
+        }
+    }
+
+    #[test]
+    fn shared_pipeline_trait_keeps_backend_sources_and_contexts_distinct() {
+        let providers: Vec<Box<dyn PipelineProvider>> =
+            [FunctionSource::SanitizedLl, FunctionSource::MetalSource]
+                .into_iter()
+                .map(|source| {
+                    Box::new(CompileOnlyProvider {
+                        epoch: allocate_device_epoch().unwrap(),
+                        source,
+                        registered: std::sync::Mutex::new(None),
+                    }) as Box<dyn PipelineProvider>
+                })
+                .collect();
+        let sources = [
+            ShaderSource::SanitizedLl("define void @copy_word() {}".into()),
+            ShaderSource::MetalSource("kernel void copy_word() {}".into()),
+        ];
+        let pipelines = providers
+            .iter()
+            .zip(sources)
+            .map(|(provider, source)| {
+                let kind = source.kind();
+                let metadata = provider.compile(compile_request(source)).unwrap();
+                assert_eq!(metadata.device_epoch, provider.device_epoch());
+                assert_eq!(metadata.function.source, kind);
+                assert_eq!(metadata.function.logical_digest, digest());
+                assert_eq!(metadata.function.entry_name, "copy_word");
+                assert!(metadata.contract.validate().is_ok());
+                metadata
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(pipelines[0].device_epoch, pipelines[1].device_epoch);
+        assert_eq!(pipelines[0].pipeline_id, pipelines[1].pipeline_id);
+        assert!(providers[1].release_pipeline(&pipelines[0]).is_err());
+        let refusal = providers[0]
+            .compile(compile_request(ShaderSource::MetalSource(
+                "kernel x".into(),
+            )))
+            .unwrap_err();
+        assert_eq!(refusal.phase, ProviderPhase::Compile);
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        for (provider, pipeline) in providers.iter().zip(&pipelines) {
+            assert!(provider.release_pipeline(pipeline).is_ok());
+            assert!(provider.release_pipeline(pipeline).is_err());
+        }
     }
 
     fn buffer(view_id: u64, binding: u32) -> BufferView {

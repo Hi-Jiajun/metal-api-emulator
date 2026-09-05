@@ -91,7 +91,7 @@ class CaptureTests(unittest.TestCase):
         self.reject("unknown backend")
 
     def test_allocation_observation_must_match_backend(self):
-        for backend in ("native-metal", "vulkan"):
+        for backend in compare.ALLOCATION_OBSERVATIONS:
             with self.subTest(backend=backend):
                 self.report = synthetic_report(self.suite, self.digest, backend)
                 self.report["allocation_observation"] = (
@@ -263,6 +263,100 @@ class CaptureTests(unittest.TestCase):
             path.write_text('{"backend":"native-metal","backend":"vulkan"}', encoding="utf-8")
             with self.assertRaisesRegex(compare.CaptureError, "duplicate object key 'backend'"):
                 compare._read_json(path)
+
+
+class SharedProviderTests(unittest.TestCase):
+    """Synthetic three-party captures test validation, never Metal execution."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.prepare_suite(SUITE_PATH)
+
+    def prepare_suite(self, path):
+        raw = path.read_bytes()
+        self.suite = json.loads(raw)
+        self.digest = hashlib.sha256(raw).hexdigest()
+        self.suite_path = self.root / "suite.json"
+        self.suite_path.write_bytes(raw)
+        self.paths = {}
+        for backend in compare.ALLOCATION_OBSERVATIONS:
+            self.paths[backend] = self.root / f"{backend}.json"
+            self.write_report(backend, synthetic_report(self.suite, self.digest, backend))
+
+    def write_report(self, backend, report):
+        self.paths[backend].write_text(json.dumps(report), encoding="utf-8")
+
+    def compare_args(self):
+        return ["--native", str(self.paths["native-metal"]),
+                "--vulkan", str(self.paths["vulkan"]),
+                "--metal-provider", str(self.paths["native-metal-provider"])]
+
+    def run_cli(self, arguments):
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            status = compare.main(["--suite", str(self.suite_path), *arguments])
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_three_captures_validate_for_both_suite_versions(self):
+        for name in ("suite.json", "suite-v2.json"):
+            with self.subTest(suite=name):
+                self.prepare_suite(SUITE_PATH.with_name(name))
+                status, output, errors = self.run_cli(self.compare_args())
+                self.assertEqual(status, 0, errors)
+                self.assertIn("PASS parity: native-metal / vulkan / native-metal-provider;", output)
+                self.assertIn("host-visible bytes agreement", output)
+                self.assertIn("Swift native GPU buffer readback", output)
+                self.assertIn("Rust Metal provider host writeback landing", output)
+                self.assertNotIn("full allocation GPU", output)
+
+    def test_single_metal_provider_capture_does_not_claim_parity(self):
+        status, output, errors = self.run_cli(["--check", str(self.paths["native-metal-provider"])])
+        self.assertEqual(status, 0, errors)
+        self.assertIn("PASS capture: native-metal-provider;", output)
+        self.assertIn("allocations=host-writeback-landing", output)
+        self.assertNotIn("parity", output)
+
+    def test_invalid_third_capture_prevents_any_success_message(self):
+        for mutation, expected in (
+                (lambda report: report.update(suite_sha256="0" * 64), "suite_sha256 mismatch"),
+                (lambda report: report["results"].pop(), "missing cases"),
+                (lambda report: report["results"][0]["writebacks"][0].update(bytes_hex="0123"),
+                 "length mismatch"),
+                (lambda report: report.update(allocation_observation="gpu-buffer-readback"),
+                 "native-metal-provider requires allocation_observation host-writeback-landing"),
+                (lambda report: report.update(backend="native-metal", allocation_observation="gpu-buffer-readback"),
+                 "expected backend native-metal-provider")):
+            with self.subTest(expected=expected):
+                report = synthetic_report(self.suite, self.digest, "native-metal-provider")
+                mutation(report)
+                self.write_report("native-metal-provider", report)
+                status, output, errors = self.run_cli(self.compare_args())
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertIn(expected, errors)
+
+    def test_provider_cannot_replace_swift_reference_or_vulkan(self):
+        for replaced in ("native-metal", "vulkan"):
+            with self.subTest(replaced=replaced):
+                paths = dict(self.paths)
+                paths[replaced] = self.paths["native-metal-provider"]
+                arguments = ["--native", str(paths["native-metal"]), "--vulkan", str(paths["vulkan"])]
+                status, output, errors = self.run_cli(arguments)
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertIn(f"expected backend {replaced}, got native-metal-provider", errors)
+
+    def test_third_capture_requires_both_original_reports(self):
+        for remaining in ([], ["--vulkan", str(self.paths["vulkan"])],
+                          ["--native", str(self.paths["native-metal"])],
+                          ["--check", str(self.paths["native-metal-provider"])]):
+            with self.subTest(remaining=remaining):
+                arguments = ["--metal-provider", str(self.paths["native-metal-provider"]), *remaining]
+                with self.assertRaises(SystemExit) as error:
+                    self.run_cli(arguments)
+                self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

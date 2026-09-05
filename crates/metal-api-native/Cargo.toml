@@ -1,0 +1,21 @@
+[package]
+name = "metal-api-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Bounded native Metal compute provider for offline comparison"
+
+[dependencies]
+metal-api-core = { path = "../metal-api-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "=0.33.0"
+objc = "0.2.7"
+foreign-types = "0.5"
+
+# objc 0.2's selector macros query a legacy caller feature during expansion.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

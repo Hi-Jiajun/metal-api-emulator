@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate captured compute results, or compare native Metal and Vulkan captures.
+"""Validate captures, or compare the Swift Metal oracle and compute providers.
 
 Passing checks establishes agreement of the supplied captures with this suite.
 It does not attest how a capture was produced or substitute for a native run.
@@ -18,6 +18,7 @@ U64_MAX = (1 << 64) - 1
 ALLOCATION_OBSERVATIONS = {
     "native-metal": "gpu-buffer-readback",
     "vulkan": "host-writeback-landing",
+    "native-metal-provider": "host-writeback-landing",
 }
 
 
@@ -151,7 +152,8 @@ def validate_capture(suite, digest, report, required_backend=None):
              "capture: unsupported schema_version")
     _require(report["suite"] == suite["suite"], "capture: suite name mismatch")
     _require(report["suite_sha256"] == digest, "capture: suite_sha256 mismatch (stale or different suite)")
-    _require(report["backend"] in ("native-metal", "vulkan"), "capture: unknown backend")
+    _require(isinstance(report["backend"], str) and report["backend"] in ALLOCATION_OBSERVATIONS,
+             "capture: unknown backend")
     _require(required_backend is None or report["backend"] == required_backend,
              f"capture: expected backend {required_backend}, got {report['backend']}")
     expected_observation = ALLOCATION_OBSERVATIONS[report["backend"]]
@@ -218,12 +220,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True, type=Path)
     parser.add_argument("--check", type=Path, help="validate one capture; does not establish parity")
-    parser.add_argument("--native", type=Path, help="capture produced by native Metal")
+    parser.add_argument("--native", type=Path, help="reference capture produced by the Swift Metal collector")
     parser.add_argument("--vulkan", type=Path, help="capture produced by Vulkan")
+    parser.add_argument("--metal-provider", type=Path,
+                        help="optional third capture produced by the Rust native Metal provider")
     args = parser.parse_args(argv)
     if args.check is not None:
-        if args.native is not None or args.vulkan is not None:
-            parser.error("--check cannot be combined with --native or --vulkan")
+        if args.native is not None or args.vulkan is not None or args.metal_provider is not None:
+            parser.error("--check cannot be combined with --native, --vulkan, or --metal-provider")
     elif args.native is None or args.vulkan is None:
         parser.error("provide --check, or both --native and --vulkan")
     try:
@@ -239,8 +243,15 @@ def main(argv=None):
             _, vulkan = _read_json(args.vulkan)
             validate_capture(suite, digest, native, required_backend="native-metal")
             validate_capture(suite, digest, vulkan, required_backend="vulkan")
-            print(f"PASS parity: native-metal / vulkan; {suite['suite']}; {len(suite['cases'])} cases; "
-                  "host-visible bytes agreement; native GPU buffer readback / Vulkan host writeback landing")
+            if args.metal_provider is not None:
+                _, metal_provider = _read_json(args.metal_provider)
+                validate_capture(suite, digest, metal_provider, required_backend="native-metal-provider")
+                print(f"PASS parity: native-metal / vulkan / native-metal-provider; "
+                      f"{suite['suite']}; {len(suite['cases'])} cases; host-visible bytes agreement; "
+                      "Swift native GPU buffer readback / Vulkan and Rust Metal provider host writeback landing")
+            else:
+                print(f"PASS parity: native-metal / vulkan; {suite['suite']}; {len(suite['cases'])} cases; "
+                      "host-visible bytes agreement; native GPU buffer readback / Vulkan host writeback landing")
         return 0
     except (CaptureError, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"FAIL: {error}", file=sys.stderr)

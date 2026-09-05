@@ -300,6 +300,16 @@ name = "metal-api-core"
 version = "0.1.0"
 
 [[package]]
+name = "metal-api-native"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "metal",
+ "metal-api-core",
+ "objc",
+]
+
+[[package]]
 name = "metal-api-reims-vulkan"
 version = "0.1.0"
 dependencies = [
@@ -325,6 +335,7 @@ name = "metal-smoke"
 version = "0.1.0"
 dependencies = [
  "metal-api-core",
+ "metal-api-native",
  "metal-api-vulkan",
  "serde",
  "serde_json",

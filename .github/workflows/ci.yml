@@ -56,6 +56,15 @@ jobs:
       capture_status: ${{ steps.capture.outputs.capture_status }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy
+          rustup override set 1.96.0
+      - name: Check Rust native provider
+        run: |
+          cargo test --locked -p metal-api-core -p metal-api-native
+          cargo clippy --locked -p metal-api-native --all-targets --no-deps -- -D warnings
+          cargo build --locked -p metal-smoke --bin provider-capture
       - name: Compile native Metal capture tool
         run: |
           xcrun swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
@@ -75,6 +84,13 @@ jobs:
               for status in statuses:
                   summary.write(status['suite'] + ': **' + status['capture_status'] + '**. ' + status['reason'] + '\n\n')
           PY
+      - name: Capture Rust Metal provider through shared interface
+        if: steps.capture.outputs.capture_status == 'captured'
+        run: |
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite.json --output /tmp/native-evidence/rust-provider-v1.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v2.json --output /tmp/native-evidence/rust-provider-v2.json
+          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/native-evidence/rust-provider-v1.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --check /tmp/native-evidence/rust-provider-v2.json
       - name: Preserve native probe, status and any completed capture
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,5 +115,5 @@ jobs:
           path: /tmp/native-evidence
       - name: Compare observed native and Vulkan results
         run: |
-          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json
-          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json
+          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json --metal-provider /tmp/native-evidence/rust-provider-v1.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json --metal-provider /tmp/native-evidence/rust-provider-v2.json

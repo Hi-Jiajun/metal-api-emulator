@@ -4,30 +4,23 @@ use crate::{
     execute_submission_with_status, TranslatedComputePipeline, VulkanExecutor,
     VulkanPipelineArtifact,
 };
+pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    BufferSource, BufferWriteback, CompletionDisposition, CompletionToken, ComputeProvider,
-    ComputeTrace, DeviceEpoch, FieldValue, FunctionIdentity, FunctionSource, PipelineContract,
-    PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase,
-    ProviderSubmission, Retryability, SemanticDigest, SubmissionId, ValidatedComputeTrace,
+    allocate_device_epoch, BufferSource, BufferWriteback, CompletionDisposition, CompletionToken,
+    ComputeProvider, ComputeTrace, DeviceEpoch, FieldValue, FunctionIdentity, FunctionSource,
+    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderPhase, ProviderSubmission, Retryability, SemanticDigest,
+    ShaderSource, SubmissionId, ValidatedComputeTrace,
 };
-use metal_api_core::{AirSource, BufferBinding, BufferUpdate, ComputeSubmission, Function, Size};
+use metal_api_core::{
+    AirSource, BufferBinding, BufferUpdate, ComputeSubmission, Device, Function, Size,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-static NEXT_DEVICE_EPOCH: AtomicU64 = AtomicU64::new(1);
 const TRANSLATOR_REVISION: &[u8] = b"9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c";
-
-/// Neutral metadata for a pipeline registered by one provider context.
-/// The provider retains the actual artifact and checks this metadata at submit.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompiledComputePipeline {
-    pub device_epoch: DeviceEpoch,
-    pub pipeline_id: PipelineId,
-    pub function: FunctionIdentity,
-    pub contract: PipelineContract,
-}
 
 struct RegisteredPipeline {
     metadata: CompiledComputePipeline,
@@ -66,7 +59,7 @@ impl VulkanComputeProvider {
 
     /// Use the same device and queue lock as an existing snapshot executor.
     pub fn with_executor(executor: Arc<VulkanExecutor>) -> Result<Self, ProviderError> {
-        let epoch = DeviceEpoch::new(next_identity(&NEXT_DEVICE_EPOCH, "device_epoch_exhausted")?);
+        let epoch = allocate_device_epoch()?;
         let capabilities = executor.provider_capabilities();
         Ok(Self {
             executor,
@@ -149,13 +142,11 @@ impl VulkanComputeProvider {
 
     /// Stop accepting new submissions using this pipeline. An in-flight submit
     /// retains its own Arc until completion, independent of registry removal.
-    pub fn release_pipeline(&self, pipeline: PipelineId) -> Result<(), ProviderError> {
-        self.pipelines
-            .lock()
-            .map_err(|_| registry_poisoned())?
-            .remove(&pipeline)
-            .ok_or_else(|| unknown_pipeline(pipeline))?;
-        Ok(())
+    pub fn release_pipeline(
+        &self,
+        pipeline: &CompiledComputePipeline,
+    ) -> Result<(), ProviderError> {
+        PipelineProvider::release_pipeline(self, pipeline)
     }
 
     /// Forget a terminal observation. This releases no GPU resources; unknown
@@ -194,6 +185,76 @@ impl VulkanComputeProvider {
             result.retryability = Retryability::RetryAfterRecreate;
             result
         })
+    }
+}
+
+impl PipelineProvider for VulkanComputeProvider {
+    fn device_epoch(&self) -> DeviceEpoch {
+        self.epoch
+    }
+
+    fn compile(
+        &self,
+        request: PipelineCompileRequest,
+    ) -> Result<CompiledComputePipeline, ProviderError> {
+        request.validate().map_err(|error| {
+            refusal(
+                ProviderPhase::Compile,
+                ProviderErrorClass::Args,
+                "invalid_compile_request",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let device = Device::new(self.executor.clone());
+        let library = match request.source {
+            ShaderSource::SanitizedLl(source) => device.new_library_with_air(source),
+            ShaderSource::BinaryAir(bytes) => device.new_library_with_binary_air(bytes),
+            ShaderSource::MetalSource(_) => {
+                return Err(refusal(
+                    ProviderPhase::Compile,
+                    ProviderErrorClass::Capability,
+                    "shader_source_unsupported",
+                ))
+            }
+        }
+        .map_err(|error| {
+            refusal(
+                ProviderPhase::Compile,
+                ProviderErrorClass::Args,
+                "invalid_library_source",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let function = library.function(request.entry_name).map_err(|error| {
+            refusal(
+                ProviderPhase::Compile,
+                ProviderErrorClass::Args,
+                "invalid_compile_request",
+            )
+            .with_detail(error.to_string())
+        })?;
+        self.compile_pipeline(&function, request.logical_digest)
+    }
+
+    fn release_pipeline(&self, metadata: &CompiledComputePipeline) -> Result<(), ProviderError> {
+        check_epoch(self.epoch, metadata.device_epoch)?;
+        let mut pipelines = self.pipelines.lock().map_err(|_| registry_poisoned())?;
+        let registered = pipelines
+            .get(&metadata.pipeline_id)
+            .ok_or_else(|| unknown_pipeline(metadata.pipeline_id))?;
+        if registered.metadata != *metadata {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "pipeline_identity_mismatch",
+            ));
+        }
+        pipelines.remove(&metadata.pipeline_id);
+        Ok(())
+    }
+
+    fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
+        VulkanComputeProvider::release_completion(self, token)
     }
 }
 

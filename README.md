@@ -32,11 +32,14 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 - Completion: this provider's `submit` waits for GPU completion and readback;
   `wait` observes the recorded terminal result. A submit timeout is terminal
   unknown completion; resources remain retained and the executor is unusable.
-- Open design work: asynchronous submission/readback, native provider compile
-  integration, multi-pass commands, aliases and completion-driven live leases.
+- Shared provider API: compilation, pipeline metadata and release now use
+  `PipelineProvider`. The new Rust native Metal backend accepts the three exact
+  reviewed MSL fixtures; its macOS execution validation is pending this increment.
+- Open design work: asynchronous submission/readback, general native shader
+  admission, multi-pass commands, aliases and completion-driven live leases.
   Resource snapshots do not hold live guest pages.
-- Not implemented: native Metal provider, general MTLB function-name resolution,
-  MSL compilation, textures, rendering, presentation, heaps, ICBs or production
+- Not implemented: general MTLB function-name resolution, Windows MSL compilation,
+  textures, rendering, presentation, heaps, ICBs or production
   reims integration. This is not a Metal.framework ABI implementation.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
@@ -44,8 +47,11 @@ shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift
 runner captured the two v1 cases on the cloud Apple Paravirtual device and
 matched Vulkan results in [CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33973870668).
 The [eight-case v2 matrix](conformance/SUITE-V2.md) expands offsets, dispatch
-boundaries and sparse read/write bindings; its native run is pending. The Swift
-harness is not a native Rust `ComputeProvider`, and this evidence does not
+boundaries and sparse read/write bindings. Its Swift/Vulkan native run also
+[passed](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33974824176). The Swift
+oracle remains separate from the new native Rust provider. The
+[shared-provider increment](docs/SHARED-PROVIDERS.md) adds a third comparison
+path; its macOS runtime validation is pending. Existing evidence does not
 establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;

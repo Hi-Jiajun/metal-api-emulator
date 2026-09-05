@@ -1,13 +1,15 @@
-//! Capture a Vulkan provider run of the shared, versioned native-oracle suite.
+//! Capture a provider run of the shared, versioned native-oracle suite.
 
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView, CompletionDisposition,
-    CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
-    DispatchType, FootprintProof, OperationId, ResourceTableSnapshot, SemanticDigest, ViewId,
+    AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView,
+    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
+    Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId, PipelineCompileRequest,
+    PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
-use metal_api_core::Device;
-use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
+#[cfg(target_os = "macos")]
+use metal_api_native::NativeMetalProvider;
+use metal_api_vulkan::VulkanComputeProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,11 +17,47 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Vulkan,
+    NativeMetalProvider,
+}
+
+impl Backend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vulkan => "vulkan",
+            Self::NativeMetalProvider => "native-metal-provider",
+        }
+    }
+}
+
+fn create_provider(backend: Backend) -> Result<(Box<dyn PipelineProvider>, String)> {
+    match backend {
+        Backend::Vulkan => {
+            let provider = VulkanComputeProvider::new()
+                .map_err(|error| format!("create Vulkan provider: {error:?}"))?;
+            let name = provider.device_name().to_owned();
+            Ok((Box::new(provider), name))
+        }
+        Backend::NativeMetalProvider => {
+            #[cfg(target_os = "macos")]
+            {
+                let provider = NativeMetalProvider::new()
+                    .map_err(|error| format!("create native Metal provider: {error:?}"))?;
+                let name = provider.device_name().to_owned();
+                Ok((Box::new(provider), name))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err("native-metal-provider requires macOS".into())
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,12 +140,24 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mut suite_path = None;
     let mut output_path = None;
+    let mut backend = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
-                "usage: provider-capture --suite conformance/suite.json [--output capture.json]"
+                "usage: provider-capture --suite conformance/suite.json [--output capture.json] \
+                 [--backend vulkan|native-metal-provider]"
             );
             return Ok(());
+        }
+        if flag == "--backend" && backend.is_none() {
+            backend = Some(
+                match args.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("vulkan") => Backend::Vulkan,
+                    Some("native-metal-provider") => Backend::NativeMetalProvider,
+                    _ => return Err("--backend requires vulkan or native-metal-provider".into()),
+                },
+            );
+            continue;
         }
         let destination = if flag == "--suite" && suite_path.is_none() {
             &mut suite_path
@@ -118,11 +168,12 @@ fn main() -> Result<()> {
         };
         *destination = Some(PathBuf::from(args.next().ok_or("missing argument value")?));
     }
+    let backend = backend.unwrap_or(Backend::Vulkan);
     let suite_path = suite_path.ok_or("--suite is required")?;
     if output_path.as_ref().is_some_and(|path| path.exists()) {
         return Err("refusing to overwrite an existing capture".into());
     }
-    // Validate every source and case before creating the Vulkan device.
+    // Validate every source and case before creating either provider device.
     let raw = read_bounded(&suite_path, 65536)?;
     let suite: Suite = serde_json::from_slice(&raw)?;
     validate_suite(&suite)?;
@@ -130,36 +181,40 @@ fn main() -> Result<()> {
     let mut sources = Vec::new();
     for case in &suite.cases {
         let air = verified_source(directory, &case.air)?;
-        let _metal = verified_source(directory, &case.metal)?;
-        sources.push(String::from_utf8(air)?);
+        let metal = verified_source(directory, &case.metal)?;
+        sources.push(match backend {
+            Backend::Vulkan => ShaderSource::SanitizedLl(String::from_utf8(air)?),
+            Backend::NativeMetalProvider => ShaderSource::MetalSource(String::from_utf8(metal)?),
+        });
     }
     let identity = hex(&Sha256::digest(&raw));
-    let executor = VulkanExecutor::new()?;
-    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
-        .map_err(|error| format!("create provider: {error:?}"))?;
-    let device = Device::new(executor);
+    let (provider, device_name) = create_provider(backend)?;
     let mut results = Vec::new();
     let mut pipelines = BTreeMap::new();
-    for (index, (case, air)) in suite.cases.iter().zip(sources).enumerate() {
+    for (index, (case, source)) in suite.cases.iter().zip(sources).enumerate() {
         if !pipelines.contains_key(&case.entry) {
-            let function = device.new_library_with_air(air)?.function(&case.entry)?;
             let pipeline = provider
-                .compile_pipeline(
-                    &function,
-                    SemanticDigest::new(
+                .compile(PipelineCompileRequest {
+                    entry_name: case.entry.clone(),
+                    logical_digest: SemanticDigest::new(
                         "suite-sha256-entry-v1",
                         format!("{identity}:{}", case.entry).into_bytes(),
                     )?,
-                )
+                    source,
+                })
                 .map_err(|error| format!("compile {}: {error:?}", case.entry))?;
-            if case.entry == "transform_3d" {
+            if backend == Backend::Vulkan && case.entry == "transform_3d" {
                 verify_transform_contract(&pipeline)?;
             }
-            eprintln!("Vulkan provider artifact registered: entry={}", case.entry);
+            eprintln!(
+                "{} artifact registered: entry={}",
+                backend.name(),
+                case.entry
+            );
             pipelines.insert(case.entry.clone(), pipeline);
         }
         results.push(run_case(
-            &provider,
+            provider.as_ref(),
             &pipelines[&case.entry],
             case,
             index as u64 + 1,
@@ -168,16 +223,16 @@ fn main() -> Result<()> {
     }
     for pipeline in pipelines.values() {
         provider
-            .release_pipeline(pipeline.pipeline_id)
+            .release_pipeline(pipeline)
             .map_err(|error| format!("release pipeline: {error:?}"))?;
     }
     let capture = Capture {
         schema_version: 1,
         suite: suite.suite,
         suite_sha256: identity,
-        backend: "vulkan",
+        backend: backend.name(),
         allocation_observation: "host-writeback-landing",
-        device: provider.device_name().to_owned(),
+        device: device_name,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         results,
     };
@@ -391,7 +446,7 @@ fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
 }
 
 fn run_case(
-    provider: &VulkanComputeProvider,
+    provider: &dyn PipelineProvider,
     pipeline: &CompiledComputePipeline,
     case: &Case,
     operation: u64,

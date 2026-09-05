@@ -7,7 +7,8 @@ for Apple silicon macOS 11+. The initial capture version at `a57c985` compiled
 and validated the shared suite in macOS CI. The subsequent probe run at
 `8579380` captured both v1 cases on an Apple Paravirtual device and successfully
 compared them to Vulkan. The current [eight-case v2 extension](SUITE-V2.md) is
-locally tested on Vulkan; its new native Metal coverage is pending.
+also passed Swift/Vulkan comparison in
+[CI run 33974824176](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33974824176).
 
 ## Shared input
 
@@ -163,5 +164,16 @@ also carry `--source-revision` for local capture provenance.
 
 The initial probe workflow completed real native v1 capture and comparison in
 [CI run 33973870668](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33973870668).
-The current v2 extension has not yet run remotely at this local checkpoint. No Swift compiler, macOS SDK or Apple GPU is available locally.
+The v2 extension also passed real native comparison in
+[CI run 33974824176](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33974824176).
+The new Rust-native provider path still needs its own remote run. No Swift compiler, macOS SDK or Apple GPU is available locally.
 Python orchestration tests use simulated commands and synthetic reports only.
+
+## Shared Rust-native interface (new local increment)
+
+The capture runner can also select `--backend native-metal-provider` on macOS.
+This uses the same Rust `PipelineProvider` interface as Vulkan and reports
+host writeback landing, while the independent Swift runner retains full GPU
+buffer observations. See [the shared-provider contract](../docs/SHARED-PROVIDERS.md).
+The updated workflow compares all three reports after real capture; the new
+Rust native implementation is not considered validated by earlier Swift runs.

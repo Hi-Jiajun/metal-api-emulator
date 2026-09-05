@@ -12,6 +12,7 @@ description = "Offline buffer-compute smoke fixtures"
 [dependencies]
 metal-api-core = { path = "../../crates/metal-api-core" }
 metal-api-vulkan = { path = "../../crates/metal-api-vulkan" }
+metal-api-native = { path = "../../crates/metal-api-native" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -7,8 +7,9 @@ use super::{
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferSource, BufferView, CompletionDisposition,
     CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FootprintProof, OperationId, ProviderError, ProviderSubmission,
-    ResourceTableSnapshot, SemanticDigest, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    DispatchKind, DispatchType, FootprintProof, OperationId, PipelineCompileRequest,
+    PipelineProvider, ProviderError, ProviderSubmission, ResourceTableSnapshot, SemanticDigest,
+    ShaderSource, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
@@ -93,7 +94,7 @@ fn run_copy(
     if reference.to_le_bytes() != expected {
         return Err("copy_word snapshot executor disagrees with the provider golden".into());
     }
-    release_case(provider, &trace, &result)?;
+    release_case(provider, &pipeline, &result)?;
     println!(
         "PASS provider_copy_word encoding={encoding} output={reference:#010x} writeback_offset=16 snapshot_parity=exact"
     );
@@ -169,8 +170,31 @@ fn run_indexed_and_refusals(
         .ok_or("completed result has no token")?;
     expect_refusal(peer.wait(token, Duration::ZERO), "device_epoch_mismatch")?;
     println!("PASS provider_refusal slug=device_epoch_mismatch shared_executor=trace_and_token");
+    // Compilation and release must carry owner identity through the shared API.
+    expect_refusal(
+        PipelineProvider::release_pipeline(peer, &pipeline),
+        "device_epoch_mismatch",
+    )?;
+    let mut changed_pipeline = pipeline.clone();
+    changed_pipeline.function.entry_name = "forged".into();
+    expect_refusal(
+        PipelineProvider::release_pipeline(provider, &changed_pipeline),
+        "pipeline_identity_mismatch",
+    )?;
+    expect_refusal(
+        PipelineProvider::compile(
+            provider,
+            PipelineCompileRequest {
+                entry_name: "unsupported_msl".into(),
+                logical_digest: SemanticDigest::new("fixture", vec![1])?,
+                source: ShaderSource::MetalSource("kernel void unsupported_msl() {}".into()),
+            },
+        ),
+        "shader_source_unsupported",
+    )?;
+    println!("PASS shared_compile_refusals foreign_release=checked metadata=checked msl=refused");
 
-    release_case(provider, &trace, &result)?;
+    release_case(provider, &pipeline, &result)?;
     expect_unknown_completion(provider.wait(token, Duration::ZERO), token)?;
     let admitted = provider
         .capabilities()
@@ -298,7 +322,7 @@ fn check_writeback(
 
 fn release_case(
     provider: &VulkanComputeProvider,
-    trace: &ComputeTrace,
+    pipeline: &CompiledComputePipeline,
     result: &ProviderSubmission,
 ) -> Result<(), Box<dyn Error>> {
     provider
@@ -310,7 +334,7 @@ fn release_case(
         )
         .map_err(provider_error)?;
     provider
-        .release_pipeline(trace.passes[0].pipeline)
+        .release_pipeline(pipeline)
         .map_err(provider_error)?;
     Ok(())
 }
