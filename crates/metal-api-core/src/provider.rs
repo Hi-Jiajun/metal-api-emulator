@@ -450,6 +450,143 @@ pub struct ProviderCapabilities {
     pub submit_only: bool,
 }
 
+impl ProviderCapabilities {
+    /// Admit a complete value trace without creating provider objects.
+    ///
+    /// Structural errors are reported as an `Args` refusal; selected-device
+    /// limits and unsupported storage/completion modes are reported as
+    /// `Capability` refusals. A provider implementation can perform the same
+    /// checks immediately before encode, while keeping Vulkan/Metal handles
+    /// out of the neutral contract.
+    pub fn admit(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        trace.validate().map_err(|error| {
+            ProviderError::new(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "trace_contract_invalid",
+            )
+            .expect("static provider refusal slug")
+            .with_detail(error.to_string())
+        })?;
+
+        if !self.supports_serial || trace.encoder_dispatch_type != DispatchType::Serial {
+            return Err(capability_error("dispatch_type_unsupported")
+                .with_detail("B0 admits only serial encoder dispatch"));
+        }
+        if !self.supports_concurrent && trace.encoder_dispatch_type == DispatchType::Concurrent {
+            return Err(capability_error("dispatch_type_unsupported"));
+        }
+        match trace.pipeline_contract.dispatch_kind {
+            DispatchKind::ThreadsExact if !self.supports_threads_exact => {
+                return Err(capability_error("dispatch_kind_unsupported"));
+            }
+            DispatchKind::Threadgroups if !self.supports_threadgroups => {
+                return Err(capability_error("dispatch_kind_unsupported"));
+            }
+            _ => {}
+        }
+        match trace.completion_policy {
+            CompletionPolicy::HostReadback if !self.host_readback => {
+                return Err(capability_error("host_readback_unsupported"));
+            }
+            CompletionPolicy::SubmitOnly if !self.submit_only => {
+                return Err(capability_error("submit_only_unsupported"));
+            }
+            _ => {}
+        }
+
+        for pass in &trace.passes {
+            let local = pass.dispatch.threads_per_threadgroup;
+            for (axis, requested) in local.into_iter().enumerate() {
+                if requested > self.max_local_size[axis] {
+                    return Err(capability_error("dispatch_local_size_limit")
+                        .with_field("axis", FieldValue::Unsigned(axis as u64))
+                        .with_field("requested", FieldValue::Unsigned(requested))
+                        .with_field("maximum", FieldValue::Unsigned(self.max_local_size[axis])));
+                }
+            }
+            let invocations = local
+                .into_iter()
+                .try_fold(1_u64, |total, value| total.checked_mul(value));
+            let Some(invocations) = invocations else {
+                return Err(capability_error("dispatch_invocation_overflow"));
+            };
+            if invocations > self.max_invocations {
+                return Err(capability_error("dispatch_invocation_limit")
+                    .with_field("requested", FieldValue::Unsigned(invocations))
+                    .with_field("maximum", FieldValue::Unsigned(self.max_invocations)));
+            }
+
+            let groups = match pass.dispatch.kind {
+                DispatchKind::Threadgroups => pass.dispatch.grid,
+                DispatchKind::ThreadsExact => {
+                    let mut groups = [0; 3];
+                    for axis in 0..3 {
+                        groups[axis] = ceil_div(pass.dispatch.grid[axis], local[axis])
+                            .ok_or_else(|| capability_error("dispatch_group_count_overflow"))?;
+                    }
+                    groups
+                }
+            };
+            for (axis, requested) in groups.into_iter().enumerate() {
+                if requested > self.max_group_count[axis] {
+                    return Err(capability_error("dispatch_group_count_limit")
+                        .with_field("axis", FieldValue::Unsigned(axis as u64))
+                        .with_field("requested", FieldValue::Unsigned(requested))
+                        .with_field("maximum", FieldValue::Unsigned(self.max_group_count[axis])));
+                }
+            }
+
+            if pass.buffers.len() > self.max_storage_buffer_descriptors as usize {
+                return Err(capability_error("storage_buffer_descriptor_limit")
+                    .with_field("requested", FieldValue::Unsigned(pass.buffers.len() as u64))
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(self.max_storage_buffer_descriptors as u64),
+                    ));
+            }
+            let mut allocations = BTreeMap::new();
+            for buffer in &pass.buffers {
+                if buffer.length > self.max_buffer_range {
+                    return Err(capability_error("storage_buffer_range_limit")
+                        .with_field("binding", FieldValue::Unsigned(buffer.metal_binding as u64))
+                        .with_field("requested", FieldValue::Unsigned(buffer.length))
+                        .with_field("maximum", FieldValue::Unsigned(self.max_buffer_range)));
+                }
+                let storage_mode = match &buffer.source {
+                    BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
+                    BufferSource::StagedLease(_) => StorageMode::StagedLease,
+                    BufferSource::BorrowedNoCopy(_) => StorageMode::BorrowedNoCopy,
+                };
+                if !self.storage_modes.contains(&storage_mode) {
+                    return Err(capability_error("storage_mode_unsupported")
+                        .with_field("binding", FieldValue::Unsigned(buffer.metal_binding as u64)));
+                }
+                if self.alias_mode != AliasMode::DistinctViews
+                    && allocations
+                        .insert(buffer.allocation_id, buffer.view_id)
+                        .is_some()
+                {
+                    return Err(capability_error("buffer_alias_unsupported")
+                        .with_field("binding", FieldValue::Unsigned(buffer.metal_binding as u64)));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ceil_div(value: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
+}
+
+fn capability_error(slug: &'static str) -> ProviderError {
+    ProviderError::new(ProviderPhase::Resolve, ProviderErrorClass::Capability, slug)
+        .expect("static provider refusal slug")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AliasMode {
     Refused,
@@ -698,6 +835,24 @@ mod tests {
         }
     }
 
+    fn capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_threads_exact: true,
+            supports_threadgroups: false,
+            supports_serial: true,
+            supports_concurrent: false,
+            max_local_size: [8, 8, 8],
+            max_invocations: 64,
+            max_group_count: [16, 16, 16],
+            max_storage_buffer_descriptors: 4,
+            max_buffer_range: 4096,
+            alias_mode: AliasMode::Refused,
+            storage_modes: vec![StorageMode::OwnedBytes],
+            host_readback: true,
+            submit_only: true,
+        }
+    }
+
     #[test]
     fn trace_accepts_ordered_passes_with_one_pipeline() {
         let result = trace(vec![
@@ -752,6 +907,53 @@ mod tests {
                 PROVIDER_SCHEMA_VERSION + 1
             ))
         );
+    }
+
+    #[test]
+    fn capabilities_admit_a_bounded_serial_trace() {
+        let value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        assert!(capabilities().admit(&value).is_ok());
+    }
+
+    #[test]
+    fn capabilities_report_limits_and_aliases_structurally() {
+        let mut too_wide = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        too_wide.passes[0].dispatch.threads_per_threadgroup = [9, 1, 1];
+        let error = capabilities().admit(&too_wide).unwrap_err();
+        assert_eq!(error.slug, "dispatch_local_size_limit");
+        assert_eq!(
+            error.fields.get("requested"),
+            Some(&FieldValue::Unsigned(9))
+        );
+
+        let mut alias = trace(vec![pass(
+            4,
+            vec![
+                buffer(1, 0),
+                BufferView {
+                    metal_binding: 1,
+                    ..buffer(2, 0)
+                },
+            ],
+        )]);
+        alias
+            .pipeline_contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: BufferAccess::Write,
+            });
+        let error = capabilities().admit(&alias).unwrap_err();
+        assert_eq!(error.slug, "buffer_alias_unsupported");
+    }
+
+    #[test]
+    fn capabilities_refuse_a_future_dispatch_kind_without_guessing() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.pipeline_contract.dispatch_kind = DispatchKind::Threadgroups;
+        value.passes[0].dispatch.kind = DispatchKind::Threadgroups;
+        let error = capabilities().admit(&value).unwrap_err();
+        assert_eq!(error.slug, "dispatch_kind_unsupported");
     }
 
     #[test]
