@@ -360,6 +360,109 @@ pub struct ComputeTrace {
     pub completion_policy: CompletionPolicy,
 }
 
+/// Explicit identities needed when the legacy snapshot API is converted into
+/// a provider trace. The snapshot API only carries a Metal binding index; it
+/// must not be treated as an allocation identity by inference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotBufferIdentity {
+    pub metal_binding: u32,
+    pub allocation_id: AllocationId,
+    pub view_id: ViewId,
+}
+
+/// Build a provider trace from the legacy owned-bytes snapshot contract.
+///
+/// This is a compatibility adapter, not a production provider entry point. It
+/// deliberately refuses threadgroups and any missing/extra identity record so
+/// future callers cannot silently lose alias or lifetime information.
+pub fn trace_from_snapshot(
+    submission: &crate::ComputeSubmission,
+    device_epoch: DeviceEpoch,
+    operation_id: OperationId,
+    function: FunctionIdentity,
+    pipeline_id: PipelineId,
+    pipeline_contract: PipelineContract,
+    identities: &[SnapshotBufferIdentity],
+) -> Result<ComputeTrace, ContractError> {
+    if pipeline_contract.dispatch_kind != DispatchKind::ThreadsExact {
+        return Err(ContractError::SnapshotDispatchUnsupported(
+            pipeline_contract.dispatch_kind,
+        ));
+    }
+    let mut identity_by_binding = BTreeMap::new();
+    for identity in identities {
+        if identity_by_binding
+            .insert(identity.metal_binding, *identity)
+            .is_some()
+        {
+            return Err(ContractError::DuplicateBinding(identity.metal_binding));
+        }
+    }
+    let reflected = pipeline_contract
+        .buffer_bindings
+        .iter()
+        .map(|binding| (binding.metal_binding, binding.access))
+        .collect::<BTreeMap<_, _>>();
+    let mut buffers = Vec::with_capacity(submission.buffers.len());
+    for binding in &submission.buffers {
+        let identity = identity_by_binding
+            .get(&binding.index)
+            .ok_or(ContractError::MissingSnapshotIdentity(binding.index))?;
+        let access = reflected
+            .get(&binding.index)
+            .copied()
+            .ok_or(ContractError::UnknownBinding(binding.index))?;
+        let length = u64::try_from(binding.bytes.len())
+            .map_err(|_| ContractError::ArithmeticOverflow("snapshot buffer length"))?;
+        buffers.push(BufferView {
+            view_id: identity.view_id,
+            metal_binding: binding.index,
+            allocation_id: identity.allocation_id,
+            offset: 0,
+            length,
+            access,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(binding.bytes.clone()),
+        });
+    }
+    for identity in identities {
+        if !submission
+            .buffers
+            .iter()
+            .any(|binding| binding.index == identity.metal_binding)
+        {
+            return Err(ContractError::UnknownSnapshotIdentity(
+                identity.metal_binding,
+            ));
+        }
+    }
+    let grid = submission.threads_per_grid.dimensions().map(u64::from);
+    let local = submission
+        .threads_per_threadgroup
+        .dimensions()
+        .map(u64::from);
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch,
+        operation_id,
+        function,
+        pipeline_contract,
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![ComputePass {
+            pipeline: pipeline_id,
+            buffers,
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid,
+                threads_per_threadgroup: local,
+            },
+        }],
+        completion_policy: CompletionPolicy::HostReadback,
+    };
+    trace.validate()?;
+    Ok(trace)
+}
+
 impl ComputeTrace {
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
@@ -740,6 +843,9 @@ pub enum ContractError {
     UnsupportedSchemaVersion(u16),
     MixedPipelines,
     UnsupportedDispatchType(DispatchType),
+    SnapshotDispatchUnsupported(DispatchKind),
+    MissingSnapshotIdentity(u32),
+    UnknownSnapshotIdentity(u32),
     DispatchKindMismatch {
         expected: DispatchKind,
         actual: DispatchKind,
@@ -788,6 +894,16 @@ impl fmt::Display for ContractError {
                     formatter,
                     "dispatch type {dispatch_type:?} is not supported by B0"
                 )
+            }
+            Self::SnapshotDispatchUnsupported(dispatch_kind) => write!(
+                formatter,
+                "snapshot adapter does not support dispatch kind {dispatch_kind:?}"
+            ),
+            Self::MissingSnapshotIdentity(binding) => {
+                write!(formatter, "snapshot binding {binding} has no explicit resource identity")
+            }
+            Self::UnknownSnapshotIdentity(binding) => {
+                write!(formatter, "snapshot identity {binding} has no matching buffer")
             }
             Self::DispatchKindMismatch { expected, actual } => write!(
                 formatter,
@@ -931,6 +1047,115 @@ mod tests {
             Err(ContractError::UnsupportedSchemaVersion(
                 PROVIDER_SCHEMA_VERSION + 1
             ))
+        );
+    }
+
+    fn snapshot_submission() -> crate::ComputeSubmission {
+        crate::ComputeSubmission {
+            pipeline: std::sync::Arc::new(()),
+            buffers: vec![crate::BufferBinding {
+                index: 0,
+                bytes: vec![1, 2, 3, 4],
+            }],
+            threads_per_grid: crate::Size::new(10, 3, 1).unwrap(),
+            threads_per_threadgroup: crate::Size::new(8, 2, 1).unwrap(),
+        }
+    }
+
+    fn snapshot_function() -> FunctionIdentity {
+        FunctionIdentity {
+            logical_digest: digest(),
+            entry_name: "copy_word".to_string(),
+            source: FunctionSource::BinaryAir,
+        }
+    }
+
+    #[test]
+    fn snapshot_adapter_preserves_explicit_resource_identity() {
+        let submission = snapshot_submission();
+        let contract = trace(Vec::new()).pipeline_contract;
+        let value = trace_from_snapshot(
+            &submission,
+            DeviceEpoch::new(3),
+            OperationId::new(4),
+            snapshot_function(),
+            PipelineId::new(5),
+            contract,
+            &[SnapshotBufferIdentity {
+                metal_binding: 0,
+                allocation_id: AllocationId::new(6),
+                view_id: ViewId::new(7),
+            }],
+        )
+        .unwrap();
+        assert_eq!(value.passes.len(), 1);
+        assert_eq!(value.passes[0].pipeline, PipelineId::new(5));
+        assert_eq!(
+            value.passes[0].buffers[0].allocation_id,
+            AllocationId::new(6)
+        );
+        assert_eq!(value.passes[0].buffers[0].view_id, ViewId::new(7));
+        assert_eq!(value.passes[0].dispatch.grid, [10, 3, 1]);
+    }
+
+    #[test]
+    fn snapshot_adapter_refuses_identity_and_dispatch_shape_gaps() {
+        let submission = snapshot_submission();
+        let contract = trace(Vec::new()).pipeline_contract;
+        let missing = trace_from_snapshot(
+            &submission,
+            DeviceEpoch::new(3),
+            OperationId::new(4),
+            snapshot_function(),
+            PipelineId::new(5),
+            contract.clone(),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(missing, ContractError::MissingSnapshotIdentity(0));
+
+        let extra = trace_from_snapshot(
+            &submission,
+            DeviceEpoch::new(3),
+            OperationId::new(4),
+            snapshot_function(),
+            PipelineId::new(5),
+            contract.clone(),
+            &[
+                SnapshotBufferIdentity {
+                    metal_binding: 0,
+                    allocation_id: AllocationId::new(6),
+                    view_id: ViewId::new(7),
+                },
+                SnapshotBufferIdentity {
+                    metal_binding: 9,
+                    allocation_id: AllocationId::new(8),
+                    view_id: ViewId::new(9),
+                },
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(extra, ContractError::UnknownSnapshotIdentity(9));
+
+        let mut future = contract;
+        future.dispatch_kind = DispatchKind::Threadgroups;
+        let unsupported = trace_from_snapshot(
+            &submission,
+            DeviceEpoch::new(3),
+            OperationId::new(4),
+            snapshot_function(),
+            PipelineId::new(5),
+            future,
+            &[SnapshotBufferIdentity {
+                metal_binding: 0,
+                allocation_id: AllocationId::new(6),
+                view_id: ViewId::new(7),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            unsupported,
+            ContractError::SnapshotDispatchUnsupported(DispatchKind::Threadgroups)
         );
     }
 
