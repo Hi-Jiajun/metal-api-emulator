@@ -12,4 +12,4 @@ name = "metal_api_reims_vulkan"
 metal-api-core = { path = "../metal-api-core" }
 metal-api-vulkan = { path = "../metal-api-vulkan" }
 metal2vulkan.workspace = true
-reims-vgpu = { path = "../../../worktrees/reims-metal-api-facade/crates/reims-vgpu", default-features = false, features = ["backend-vulkan"] }
+reims-vgpu = { path = "../../../worktrees/reims-metal-api-facade-upstream69/crates/reims-vgpu", default-features = false, features = ["backend-vulkan"] }

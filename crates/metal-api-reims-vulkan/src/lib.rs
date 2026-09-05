@@ -19,6 +19,7 @@ use reims_vgpu::backend::vulkan::engine::{
     execute_compute_request_sync, ComputeBufferOutput, ComputeBufferResource, ComputeDispatch,
     ComputeRequest,
 };
+use reims_vgpu::model::{DeviceId, DeviceState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -29,12 +30,14 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 /// Source-level executor backed by reims-vgpu's process-global Vulkan engine.
 pub struct ReimsVulkanExecutor {
     identity: Arc<()>,
+    state: Arc<DeviceState>,
 }
 
 impl ReimsVulkanExecutor {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             identity: Arc::new(()),
+            state: Arc::new(DeviceState::new(DeviceId(1), 12)),
         })
     }
 
@@ -134,7 +137,7 @@ impl ComputeExecutor for ReimsVulkanExecutor {
             storage_buffers,
             ..ComputeRequest::default()
         };
-        let output = execute_compute_request_sync(&request)
+        let output = execute_compute_request_sync(&self.state, &request)
             .map_err(|error| failure(format!("reims Vulkan compute: {error}")))?;
         if !output.images.is_empty() {
             return Err(failure(
