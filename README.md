@@ -94,5 +94,6 @@ PASS indexed_boundary_dispatch words=30 regions=4
 ```
 
 The reims adapter currently points at the isolated sibling worktree
-`worktrees/reims-metal-api-facade`; it does not modify the active display
-branch or select a different guest backend.
+`worktrees/reims-metal-api-facade-upstream69`; it is adapted to upstream
+`reims-vgpu@69a57dd`. It does not modify the active display branch or select a
+different guest backend.
