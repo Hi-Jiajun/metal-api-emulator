@@ -12,8 +12,8 @@ use metal2vulkan::reflect::{
     ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
 use metal_api_core::{
-    BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError, Function,
-    PipelineArtifact,
+    AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
+    Function, PipelineArtifact,
 };
 use spirv::{Capability, Op};
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,13 +71,34 @@ impl TranslatedComputePipeline {
             ..TransformOptions::default()
         };
         let scratch = ScratchDir::new()?;
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            function.air(),
-            Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .map_err(|error| failure(format!("translate {}: {error}", function.name())))?;
+        let translated = match function.air_source() {
+            AirSource::SanitizedLl(source) => metal2vulkan::translate_sanitized_native_reflected(
+                source,
+                Stage::Kernel,
+                scratch.path(),
+                options,
+            ),
+            AirSource::Binary(source) => {
+                let input = scratch.path().join("input.air");
+                std::fs::write(&input, source).map_err(|error| {
+                    failure(format!(
+                        "write binary AIR scratch {}: {error}",
+                        input.display()
+                    ))
+                })?;
+                let input = input
+                    .to_str()
+                    .ok_or_else(|| failure("binary AIR scratch path is not valid UTF-8"))?;
+                metal2vulkan::translate_reflected_with_options(
+                    input,
+                    Stage::Kernel,
+                    scratch.path(),
+                    options,
+                )
+            }
+        };
+        let (spv, reflection) = translated
+            .map_err(|error| failure(format!("translate {}: {error}", function.name())))?;
         validate_spirv_capabilities(&spv)?;
         validate_pipeline_reflection(function.name(), &reflection)?;
         Ok(Self { spv, reflection })

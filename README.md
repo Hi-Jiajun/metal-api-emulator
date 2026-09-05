@@ -12,10 +12,14 @@ Device -> CommandQueue -> CommandBuffer -> ComputeCommandEncoder
        -> Buffer bindings -> dispatchThreads -> commit/wait -> readback
 ```
 
-The application supplies sanitized Metal AIR/LLVM IR rather than MSL. Windows
-has no Metal shader compiler, so pretending that `newLibraryWithSource` exists
-would hide the largest missing component. `metal2vulkan` translates the AIR to
-SPIR-V when the compute pipeline state is created. The standalone Vulkan
+The application supplies sanitized Metal AIR/LLVM IR or one binary AIR module
+(raw LLVM bitcode or an offset-zero LLVM bitcode wrapper), rather than MSL.
+Windows has no Metal shader compiler, so pretending that
+`newLibraryWithSource` exists would hide the largest missing component.
+`metal2vulkan` translates the AIR to SPIR-V when the compute pipeline state is
+created. Ordinary MTLB containers remain an explicit refusal: selecting
+`Library.function(name)` from a multi-function metallib requires a real name
+table resolver, not a scan for the first embedded wrapper. The standalone Vulkan
 backend executes exact `dispatchThreads` regions with a finite 20-second fence
 timeout. The reims adapter uses the product engine's explicit synchronous
 entry; its fence waits are bounded, but lock acquisition, device creation and
@@ -24,6 +28,8 @@ pipeline compilation are not an end-to-end deadline.
 The same `metal-smoke` source runs two cases against either executor:
 
 - `copy_word` copies `0x67452301` from buffer slot 0 into a poisoned output.
+- The same owned source is assembled at run time and repeated through raw and
+  wrapped binary AIR; generated `.air` files remain temporary and uncommitted.
 - `indexed_boundary_dispatch` launches a `10x3x1` grid at nominal local size
   `8x2x1`. It exercises a barrier, two-dimensional global-thread indexing and
   all four full/tail regions, then checks all 30 words against the qualified
@@ -62,8 +68,9 @@ conformance.
 
 The standalone executor needs a Vulkan 1.3 loader/ICD with `maintenance4`.
 The reims executor follows the product engine's Vulkan capability floor. Both
-need `spirv-val`; put it on `PATH`, or set `METAL2VULKAN_SPIRV_VAL` to its
-absolute path.
+need `llvm-as`, `llvm-dis`, and `spirv-val`; put them on `PATH`, or set
+`METAL_API_LLVM_AS`, `METAL2VULKAN_LLVM_DIS`, and
+`METAL2VULKAN_SPIRV_VAL` to their absolute paths.
 
 ```sh
 cargo run --release -p metal-smoke -- --executor standalone
@@ -81,6 +88,8 @@ Each executor prints:
 
 ```text
 PASS copy_word output=0x67452301
+PASS binary_air_copy_word encoding=raw output=0x67452301
+PASS binary_air_copy_word encoding=wrapper output=0x67452301
 PASS indexed_boundary_dispatch words=30 regions=4
 ```
 

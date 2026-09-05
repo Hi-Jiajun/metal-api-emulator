@@ -64,6 +64,8 @@ impl StdError for ExecutorError {}
 pub enum ApiError {
     ZeroSize,
     EmptyLibrary,
+    InvalidBinaryAir,
+    MetallibUnsupported,
     EmptyFunctionName,
     EmptyBuffer,
     BufferOffsetOutOfBounds {
@@ -101,6 +103,12 @@ impl fmt::Display for ApiError {
         match self {
             Self::ZeroSize => formatter.write_str("grid dimensions must be non-zero"),
             Self::EmptyLibrary => formatter.write_str("AIR library source must not be empty"),
+            Self::InvalidBinaryAir => formatter.write_str(
+                "binary AIR must be one raw LLVM bitcode module or one offset-zero bitcode wrapper",
+            ),
+            Self::MetallibUnsupported => formatter.write_str(
+                "MTLB containers require a function-name resolver and are not supported yet",
+            ),
             Self::EmptyFunctionName => formatter.write_str("function name must not be empty"),
             Self::EmptyBuffer => formatter.write_str("buffer length must be non-zero"),
             Self::BufferOffsetOutOfBounds { offset, length } => {
@@ -164,10 +172,25 @@ impl From<ExecutorError> for ApiError {
     }
 }
 
+/// Borrowed representation of one function's AIR source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AirSource<'a> {
+    /// Already-sanitized textual LLVM IR.
+    SanitizedLl(&'a str),
+    /// One raw LLVM bitcode module or offset-zero LLVM bitcode wrapper.
+    Binary(&'a [u8]),
+}
+
+#[derive(Clone)]
+enum LibraryStorage {
+    SanitizedLl(Arc<str>),
+    Binary(Arc<[u8]>),
+}
+
 /// Immutable AIR library supplied by an application.
 #[derive(Clone)]
 pub struct Library {
-    air: Arc<str>,
+    source: LibraryStorage,
 }
 
 impl Library {
@@ -177,7 +200,7 @@ impl Library {
             return Err(ApiError::EmptyFunctionName);
         }
         Ok(Function {
-            air: Arc::clone(&self.air),
+            source: self.source.clone(),
             name,
         })
     }
@@ -186,13 +209,16 @@ impl Library {
 /// One named function in an AIR library.
 #[derive(Clone)]
 pub struct Function {
-    air: Arc<str>,
+    source: LibraryStorage,
     name: String,
 }
 
 impl Function {
-    pub fn air(&self) -> &str {
-        &self.air
+    pub fn air_source(&self) -> AirSource<'_> {
+        match &self.source {
+            LibraryStorage::SanitizedLl(source) => AirSource::SanitizedLl(source),
+            LibraryStorage::Binary(source) => AirSource::Binary(source),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -247,7 +273,20 @@ impl Device {
         if air.trim().is_empty() {
             return Err(ApiError::EmptyLibrary);
         }
-        Ok(Library { air })
+        Ok(Library {
+            source: LibraryStorage::SanitizedLl(air),
+        })
+    }
+
+    pub fn new_library_with_binary_air(
+        &self,
+        air: impl Into<Arc<[u8]>>,
+    ) -> Result<Library, ApiError> {
+        let air = air.into();
+        validate_binary_air(&air)?;
+        Ok(Library {
+            source: LibraryStorage::Binary(air),
+        })
     }
 
     pub fn new_compute_pipeline_state(
@@ -280,6 +319,45 @@ impl Device {
             executor: Arc::clone(&self.executor),
         }
     }
+}
+
+fn validate_binary_air(air: &[u8]) -> Result<(), ApiError> {
+    const RAW_BITCODE_MAGIC: [u8; 4] = [0x42, 0x43, 0xc0, 0xde];
+    const WRAPPED_BITCODE_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
+    const WRAPPER_HEADER_LEN: usize = 0x14;
+
+    if air.is_empty() {
+        return Err(ApiError::EmptyLibrary);
+    }
+    let Some(magic) = air.get(..4) else {
+        return Err(ApiError::InvalidBinaryAir);
+    };
+    if magic == b"MTLB" {
+        return Err(ApiError::MetallibUnsupported);
+    }
+    if magic == RAW_BITCODE_MAGIC {
+        return Ok(());
+    }
+    if magic != WRAPPED_BITCODE_MAGIC || air.len() < WRAPPER_HEADER_LEN {
+        return Err(ApiError::InvalidBinaryAir);
+    }
+    let offset = u32::from_le_bytes(
+        air[8..12]
+            .try_into()
+            .expect("wrapper header length checked"),
+    ) as usize;
+    let size = u32::from_le_bytes(
+        air[12..16]
+            .try_into()
+            .expect("wrapper header length checked"),
+    ) as usize;
+    let valid = offset >= WRAPPER_HEADER_LEN
+        && size != 0
+        && offset.checked_add(size).is_some_and(|end| end == air.len());
+    if !valid {
+        return Err(ApiError::InvalidBinaryAir);
+    }
+    Ok(())
 }
 
 /// Opaque pipeline returned by a device.
@@ -960,5 +1038,50 @@ mod tests {
                 second: 1
             })
         );
+    }
+
+    #[test]
+    fn binary_air_is_byte_exact_and_container_formats_are_refused() {
+        let device = device(false);
+        let raw = vec![0x42, 0x43, 0xc0, 0xde, 0xff, 0x80, 0x00];
+        let library = device.new_library_with_binary_air(raw.clone()).unwrap();
+        let function = library.function("copy_word").unwrap();
+        assert_eq!(function.air_source(), AirSource::Binary(&raw));
+
+        assert!(matches!(
+            device.new_library_with_binary_air(Vec::<u8>::new()),
+            Err(ApiError::EmptyLibrary)
+        ));
+        assert!(matches!(
+            device.new_library_with_binary_air(b"MTLB synthetic".as_slice()),
+            Err(ApiError::MetallibUnsupported)
+        ));
+        assert!(matches!(
+            device.new_library_with_binary_air([0xde, 0xc0, 0x17, 0x0b]),
+            Err(ApiError::InvalidBinaryAir)
+        ));
+        assert!(matches!(
+            device.new_library_with_binary_air([0xff, 0x80, 0x00, 0x01]),
+            Err(ApiError::InvalidBinaryAir)
+        ));
+    }
+
+    #[test]
+    fn offset_zero_air_wrapper_is_preserved() {
+        let device = device(false);
+        let mut wrapper = vec![0_u8; 0x18];
+        wrapper[0..4].copy_from_slice(&[0xde, 0xc0, 0x17, 0x0b]);
+        wrapper[8..12].copy_from_slice(&0x14_u32.to_le_bytes());
+        wrapper[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        wrapper[0x14..].copy_from_slice(&[0x42, 0x43, 0xc0, 0xde]);
+        let library = device.new_library_with_binary_air(wrapper.clone()).unwrap();
+        let function = library.function("copy_word").unwrap();
+        assert_eq!(function.air_source(), AirSource::Binary(&wrapper));
+
+        wrapper.push(0);
+        assert!(matches!(
+            device.new_library_with_binary_air(wrapper),
+            Err(ApiError::InvalidBinaryAir)
+        ));
     }
 }
