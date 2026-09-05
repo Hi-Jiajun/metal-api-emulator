@@ -1,0 +1,15 @@
+[package]
+name = "metal-api-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "metal_api_vulkan"
+
+[dependencies]
+ash.workspace = true
+metal2vulkan.workspace = true
+spirv.workspace = true
+metal-api-core = { path = "../metal-api-core" }

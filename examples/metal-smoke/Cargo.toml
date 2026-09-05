@@ -1,0 +1,11 @@
+[package]
+name = "metal-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+metal-api-core = { path = "../../crates/metal-api-core" }
+metal-api-reims-vulkan = { path = "../../crates/metal-api-reims-vulkan" }
+metal-api-vulkan = { path = "../../crates/metal-api-vulkan" }
