@@ -71,6 +71,12 @@ and structured provider errors. The existing `ComputeExecutor` remains a
 snapshot compatibility adapter; no production rail consumes the new contract
 yet.
 
+`metal-api-vulkan` additionally exposes metadata-only mapping helpers through
+`TranslatedComputePipeline::provider_contract()` and
+`VulkanExecutor::provider_capabilities()`. They preserve reflection and device
+limits for the v0 contract, but are intentionally not wired into
+`ComputeExecutor::execute()` yet.
+
 ## Running the smoke app
 
 The standalone executor needs a Vulkan 1.3 loader/ICD with `maintenance4`.
