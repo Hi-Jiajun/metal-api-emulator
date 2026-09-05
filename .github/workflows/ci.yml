@@ -21,6 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm spirv-tools libvulkan1 mesa-vulkan-drivers
       - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s conformance -p test_compare.py -v
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
       - name: Rustdoc
@@ -35,3 +36,16 @@ jobs:
           export VK_ICD_FILENAMES="${icds[0]}"
           cargo run --locked -p metal-smoke -- --executor standalone
           cargo run --locked -p metal-smoke --bin provider-smoke
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite.json --output /tmp/vulkan-capture.json
+          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/vulkan-capture.json
+
+  native-oracle-build:
+    # Compile and validate the fixture inputs; no GPU result is inferred here.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile native Metal capture tool
+        run: |
+          xcrun swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
+      - name: Validate shared suite without creating a Metal device
+        run: /tmp/native-oracle --suite conformance/suite.json --validate-suite

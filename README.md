@@ -39,6 +39,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   MSL compilation, textures, rendering, presentation, heaps, ICBs or production
   reims integration. This is not a Metal.framework ABI implementation.
 
+A [native Metal capture harness](conformance/README.md) is prepared for two
+shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift
+runner still needs macOS compilation and an actual Apple GPU capture; this is
+not yet a native `ComputeProvider` or a passing Metal/Vulkan parity result.
+
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this
 project's current scope. See the [collaboration draft](UPSTREAM-DISCUSSION-DRAFT.md).

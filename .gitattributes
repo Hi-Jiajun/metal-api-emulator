@@ -1,2 +1,6 @@
 # Unified-diff blank context lines contain a required single space.
 integration/reims/compute-facade.patch whitespace=-blank-at-eol
+# Source and suite hashes must survive Windows checkouts unchanged.
+conformance/suite.json text eol=lf
+conformance/shaders/*.metal text eol=lf
+examples/metal-smoke/shaders/*.ll text eol=lf
