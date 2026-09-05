@@ -34,3 +34,7 @@ Its original source is
 [the pinned public MSL fixture](https://github.com/steelbrain/metal2vulkan/blob/9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c/validation/fixtures/public/kernel_dispatch_threads_boundary_barrier.metal),
 under the same LGPL-3.0-or-later terms. `conformance/shaders/copy_word.metal`
 is owned synthetic source paired with the existing copy LLVM fixture.
+
+`conformance/shaders/transform_3d.ll` and `transform_3d.metal` are owned synthetic
+source counterparts for bounded 3D read/write and sparse-binding tests. They
+contain no extracted AIR or other Apple binary artifacts.

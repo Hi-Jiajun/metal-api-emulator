@@ -3,14 +3,14 @@
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView, CompletionDisposition,
     CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
-    DispatchType, OperationId, ResourceTableSnapshot, SemanticDigest, ViewId,
+    DispatchType, FootprintProof, OperationId, ResourceTableSnapshot, SemanticDigest, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
-use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
+use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -139,16 +139,37 @@ fn main() -> Result<()> {
         .map_err(|error| format!("create provider: {error:?}"))?;
     let device = Device::new(executor);
     let mut results = Vec::new();
+    let mut pipelines = BTreeMap::new();
     for (index, (case, air)) in suite.cases.iter().zip(sources).enumerate() {
+        if !pipelines.contains_key(&case.entry) {
+            let function = device.new_library_with_air(air)?.function(&case.entry)?;
+            let pipeline = provider
+                .compile_pipeline(
+                    &function,
+                    SemanticDigest::new(
+                        "suite-sha256-entry-v1",
+                        format!("{identity}:{}", case.entry).into_bytes(),
+                    )?,
+                )
+                .map_err(|error| format!("compile {}: {error:?}", case.entry))?;
+            if case.entry == "transform_3d" {
+                verify_transform_contract(&pipeline)?;
+            }
+            eprintln!("Vulkan provider artifact registered: entry={}", case.entry);
+            pipelines.insert(case.entry.clone(), pipeline);
+        }
         results.push(run_case(
             &provider,
-            &device,
+            &pipelines[&case.entry],
             case,
-            air,
             index as u64 + 1,
             suite.guard_byte,
-            &identity,
         )?);
+    }
+    for pipeline in pipelines.values() {
+        provider
+            .release_pipeline(pipeline.pipeline_id)
+            .map_err(|error| format!("release pipeline: {error:?}"))?;
     }
     let capture = Capture {
         schema_version: 1,
@@ -176,25 +197,50 @@ fn main() -> Result<()> {
 }
 
 fn validate_suite(suite: &Suite) -> Result<()> {
-    if suite.schema_version != 1 || suite.suite != "compute-buffer-v1" || suite.cases.len() != 2 {
-        return Err("unsupported suite identity/version/case count".into());
+    let case_ids: &[&str] = match (suite.schema_version, suite.suite.as_str()) {
+        (1, "compute-buffer-v1") => &["copy_word", "indexed_boundary"],
+        (1, "compute-buffer-v2") => &[
+            "copy_seed_a",
+            "copy_seed_b",
+            "indexed_tail",
+            "indexed_full",
+            "indexed_small_grid",
+            "indexed_unit",
+            "transform_tail",
+            "transform_small_grid",
+        ],
+        _ => return Err("unsupported suite identity/version".into()),
+    };
+    if suite.cases.len() != case_ids.len()
+        || suite
+            .cases
+            .iter()
+            .any(|case| !case_ids.contains(&case.id.as_str()))
+    {
+        return Err("incorrect case set for suite".into());
     }
     let mut ids = BTreeSet::new();
     for case in &suite.cases {
-        let (air_path, air_hash, metal_path, metal_hash) = match case.id.as_str() {
+        let (air_path, air_hash, metal_path, metal_hash) = match case.entry.as_str() {
             "copy_word" => (
                 "../examples/metal-smoke/shaders/kernel_copy_word.ll",
                 "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99",
                 "shaders/copy_word.metal",
                 "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc",
             ),
-            "indexed_boundary" => (
+            "kernel_dispatch_threads_boundary_barrier" => (
                 "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
                 "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945",
                 "shaders/indexed_boundary.metal",
                 "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06",
             ),
-            _ => return Err("unknown case identity".into()),
+            "transform_3d" => (
+                "shaders/transform_3d.ll",
+                "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2",
+                "shaders/transform_3d.metal",
+                "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b",
+            ),
+            _ => return Err("unknown shader entry".into()),
         };
         if case.air.path != air_path
             || case.air.sha256 != air_hash
@@ -206,28 +252,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         if !ids.insert(&case.id) {
             return Err("duplicate case identity".into());
         }
-        let (entry, grid, local, accesses, lengths): (_, _, _, &[&str], &[u64]) =
-            match case.id.as_str() {
-                "copy_word" => (
-                    "copy_word",
-                    [1, 1, 1],
-                    [1, 1, 1],
-                    &["read", "write"],
-                    &[4, 4],
-                ),
-                "indexed_boundary" => (
-                    "kernel_dispatch_threads_boundary_barrier",
-                    [10, 3, 1],
-                    [8, 2, 1],
-                    &["write"],
-                    &[120],
-                ),
-                _ => return Err("unknown case identity".into()),
-            };
+        let (entry, grid, local, buffers) = case_shape(&case.id)?;
         if case.entry != entry
             || case.grid != grid
             || case.local != local
-            || case.buffers.len() != accesses.len()
+            || case.buffers.len() != buffers.len()
         {
             return Err(
                 format!("case {} is outside the qualified dispatch subset", case.id).into(),
@@ -240,9 +269,9 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 .offset
                 .checked_add(buffer.length)
                 .ok_or("view range overflow")?;
-            if buffer.binding != index as u32
-                || buffer.access != accesses[index]
-                || buffer.length != lengths[index]
+            if buffer.binding != buffers[index].0
+                || buffer.access != buffers[index].1
+                || buffer.length != buffers[index].2
                 || buffer.allocation_size > MAX_BYTES as u64
                 || end > buffer.allocation_size
                 || buffer.offset < 4
@@ -259,11 +288,8 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 return Err("initial data length differs from declared view length".into());
             }
         }
-        let writable: Vec<_> = case
-            .buffers
-            .iter()
-            .filter(|b| b.access == "write")
-            .collect();
+        let mut writable: Vec<_> = case.buffers.iter().filter(|b| b.access != "read").collect();
+        writable.sort_by_key(|buffer| (buffer.allocation, buffer.view));
         if case.expected_writebacks.len() != writable.len() {
             return Err("expected result does not cover writable views".into());
         }
@@ -280,25 +306,97 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     Ok(())
 }
 
+type CaseShape = (
+    &'static str,
+    [u64; 3],
+    [u64; 3],
+    &'static [(u32, &'static str, u64)],
+);
+
+fn case_shape(id: &str) -> Result<CaseShape> {
+    let copy = (
+        "copy_word",
+        [1, 1, 1],
+        [1, 1, 1],
+        &[(0, "read", 4), (1, "write", 4)][..],
+    );
+    let indexed = |local| {
+        (
+            "kernel_dispatch_threads_boundary_barrier",
+            [10, 3, 1],
+            local,
+            &[(0, "write", 120)][..],
+        )
+    };
+    let transform = |local| {
+        (
+            "transform_3d",
+            [5, 3, 2],
+            local,
+            &[(0, "read_write", 120), (2, "read", 4), (5, "write", 120)][..],
+        )
+    };
+    Ok(match id {
+        "copy_word" | "copy_seed_a" | "copy_seed_b" => copy,
+        "indexed_boundary" | "indexed_tail" => indexed([8, 2, 1]),
+        "indexed_full" => indexed([5, 3, 1]),
+        "indexed_small_grid" => indexed([16, 4, 1]),
+        "indexed_unit" => indexed([1, 1, 1]),
+        "transform_tail" => transform([4, 2, 2]),
+        "transform_small_grid" => transform([8, 4, 4]),
+        _ => return Err("unknown case identity".into()),
+    })
+}
+
+fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
+    let bindings = &pipeline.contract.buffer_bindings;
+    if bindings
+        .iter()
+        .map(|b| (b.metal_binding, b.access))
+        .collect::<Vec<_>>()
+        != [
+            (0, BufferAccess::ReadWrite),
+            (2, BufferAccess::Read),
+            (5, BufferAccess::Write),
+        ]
+    {
+        return Err("3D fixture sparse/access reflection mismatch".into());
+    }
+    for binding in [&bindings[0], &bindings[2]] {
+        let FootprintProof::Affine { accesses } = &binding.footprint else {
+            return Err("3D fixture must carry an affine footprint".into());
+        };
+        if accesses.is_empty() {
+            return Err("3D fixture has no proven accesses".into());
+        }
+        for access in accesses {
+            let mut strides = [0u64; 3];
+            for term in &access.terms {
+                let slot = strides
+                    .get_mut(usize::from(term.axis))
+                    .ok_or("3D fixture unknown axis")?;
+                *slot = slot
+                    .checked_add(term.stride)
+                    .ok_or("3D fixture stride overflow")?;
+            }
+            if access.base_offset != 0 || access.access_size != 4 || strides != [4, 20, 60] {
+                return Err("3D fixture footprint must prove 120-byte XYZ reach".into());
+            }
+        }
+    }
+    if bindings[1].footprint != (FootprintProof::Static { max_bytes: 4 }) {
+        return Err("3D fixture scalar bias reach mismatch".into());
+    }
+    Ok(())
+}
+
 fn run_case(
     provider: &VulkanComputeProvider,
-    device: &Device,
+    pipeline: &CompiledComputePipeline,
     case: &Case,
-    air: String,
     operation: u64,
     guard: u8,
-    suite_digest: &str,
 ) -> Result<CaseResult> {
-    let function = device.new_library_with_air(air)?.function(&case.entry)?;
-    let pipeline = provider
-        .compile_pipeline(
-            &function,
-            SemanticDigest::new(
-                "suite-sha256-case-v1",
-                format!("{suite_digest}:{}", case.id).into_bytes(),
-            )?,
-        )
-        .map_err(|error| format!("compile {}: {error:?}", case.id))?;
     let mut resources = ResourceTableSnapshot::new();
     let mut views = Vec::new();
     let mut allocations = Vec::new();
@@ -306,6 +404,7 @@ fn run_case(
         let access = match buffer.access.as_str() {
             "read" => BufferAccess::Read,
             "write" => BufferAccess::Write,
+            "read_write" => BufferAccess::ReadWrite,
             _ => return Err("unsupported access".into()),
         };
         let reflected = pipeline
@@ -342,8 +441,8 @@ fn run_case(
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
         operation_id: OperationId::new(operation),
-        function: pipeline.function,
-        pipeline_contract: pipeline.contract,
+        function: pipeline.function.clone(),
+        pipeline_contract: pipeline.contract.clone(),
         encoder_dispatch_type: DispatchType::Serial,
         passes: vec![ComputePass {
             pipeline: pipeline.pipeline_id,
@@ -356,6 +455,17 @@ fn run_case(
         }],
         completion_policy: CompletionPolicy::HostReadback,
     };
+    if case.entry == "transform_3d" {
+        let mut short = trace.clone();
+        short.passes[0].buffers[0].length = 119;
+        if let BufferSource::OwnedBytes(bytes) = &mut short.passes[0].buffers[0].source {
+            bytes.truncate(119);
+        }
+        let rejected = provider.capabilities().admit(&short, &resources);
+        if !matches!(rejected, Err(ref error) if error.slug == "buffer_footprint_exceeds_view") {
+            return Err(format!("3D fixture must refuse 119-byte view: {rejected:?}").into());
+        }
+    }
     let admitted = provider
         .capabilities()
         .validate_trace(trace.clone(), resources)
@@ -392,9 +502,6 @@ fn run_case(
     provider
         .release_completion(token)
         .map_err(|error| format!("release completion: {error:?}"))?;
-    provider
-        .release_pipeline(pipeline.pipeline_id)
-        .map_err(|error| format!("release pipeline: {error:?}"))?;
     allocations.sort_by_key(|(id, _)| *id);
     Ok(CaseResult {
         id: case.id.clone(),
@@ -484,5 +591,44 @@ mod tests {
         assert!(validate_suite(&s).is_err());
         assert!(unhex("0aFF").is_err());
         assert!(unhex("0").is_err());
+    }
+
+    #[test]
+    fn v2_requires_sparse_bindings_read_write_access_and_ordered_outputs() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v2.json"))
+                .unwrap()
+        };
+        let s = load();
+        validate_suite(&s).unwrap();
+        let mut s = load();
+        s.cases[6].buffers[1].binding = 1;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[6].buffers[0].access = "write".into();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[6].expected_writebacks.reverse();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[6].buffers[0].length = 119;
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn v2_cases_cannot_be_mislabeled_as_v1_or_change_fixed_3d_shape() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v2.json"))
+                .unwrap()
+        };
+        let mut s = load();
+        s.suite = "compute-buffer-v1".into();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[7].grid = [6, 3, 2];
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].id = "copy_word".into();
+        assert!(validate_suite(&s).is_err());
     }
 }

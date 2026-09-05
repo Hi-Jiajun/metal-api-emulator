@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 suite.
+// Capture native Metal observations for the bounded compute-buffer-v1/v2 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -143,7 +143,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --probe
        native-metal-oracle --help
 
-Capture the two supported cases using native Metal on Apple silicon macOS 11+.
+Capture the supported suite using native Metal on Apple silicon macOS 11+.
 Without --output, the successful JSON report goes to stdout. Existing output
 files are never overwritten. Diagnostics go to stderr. --validate-suite checks
 the fixture and both shader source hashes without creating a Metal device.
@@ -273,7 +273,7 @@ private func validateShape(_ definition: CaseDefinition) throws {
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     switch definition.id {
-    case "copy_word":
+    case "copy_word", "copy_seed_a", "copy_seed_b":
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "copy_word: unsupported entry or dispatch shape")
@@ -281,14 +281,32 @@ private func validateShape(_ definition: CaseDefinition) throws {
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
-    case "indexed_boundary":
+    case "indexed_boundary", "indexed_tail", "indexed_full", "indexed_small_grid", "indexed_unit":
+        let expectedLocal: [UInt64]
+        switch definition.id {
+        case "indexed_boundary", "indexed_tail": expectedLocal = [8, 2, 1]
+        case "indexed_full": expectedLocal = [5, 3, 1]
+        case "indexed_small_grid": expectedLocal = [16, 4, 1]
+        case "indexed_unit": expectedLocal = [1, 1, 1]
+        default: throw OracleError("Unsupported indexed case: \(definition.id)")
+        }
         try require(definition.entry == "kernel_dispatch_threads_boundary_barrier"
-                    && definition.grid == [10, 3, 1] && definition.local == [8, 2, 1],
+                    && definition.grid == [10, 3, 1] && definition.local == expectedLocal,
                     "indexed_boundary: unsupported entry or dispatch shape")
         try require(definition.buffers.count == 1, "indexed_boundary: expected one buffer")
         let buffer = definition.buffers[0]
         try require(buffer.binding == 0 && buffer.access == "write" && buffer.length == 120,
                     "indexed_boundary: expected a 120-byte write buffer at 0")
+    case "transform_tail", "transform_small_grid":
+        let expectedLocal: [UInt64] = definition.id == "transform_tail" ? [4, 2, 2] : [8, 4, 4]
+        try require(definition.entry == "transform_3d"
+                    && definition.grid == [5, 3, 2] && definition.local == expectedLocal,
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3, "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read_write" && $0.length == 120 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 4 }
+                    && definition.buffers.contains { $0.binding == 5 && $0.access == "write" && $0.length == 120 },
+                    "\(definition.id): expected 120-byte read/write at 0, 4-byte read at 2, and 120-byte write at 5")
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
@@ -305,7 +323,8 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
         try require(allocations.insert(buffer.allocation).inserted, "\(context): duplicate allocation")
         try require(views.insert(buffer.view).inserted, "\(context): duplicate view")
         try require(buffer.allocation > 0 && buffer.view > 0, "\(context): zero resource identity")
-        try require(buffer.access == "read" || buffer.access == "write", "\(context): unsupported access")
+        try require(buffer.access == "read" || buffer.access == "write" || buffer.access == "read_write",
+                    "\(context): unsupported access")
         try require(buffer.length > 0 && buffer.allocation_size <= maximumAllocationBytes,
                     "\(context): allocation must be nonempty and at most 1 MiB")
         try require(buffer.offset <= buffer.allocation_size
@@ -324,7 +343,7 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
         buffers.append(ValidatedBuffer(definition: buffer, backing: backing))
     }
 
-    let writable = definition.buffers.filter { $0.access == "write" }
+    let writable = definition.buffers.filter { $0.access != "read" }
     try require(definition.expected_writebacks.count == writable.count,
                 "\(definition.id): expected writeback count mismatch")
     var expectedViews = Set<UInt64>()
@@ -347,30 +366,49 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
 private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     let raw = try readBoundedFile(url)
     let suite = try JSONDecoder().decode(SuiteDefinition.self, from: raw)
-    try require(suite.schema_version == 1 && suite.suite == "compute-buffer-v1",
-                "Only compute-buffer-v1 schema version 1 is supported")
-    try require(suite.cases.count == 2 && Set(suite.cases.map { $0.id }) == Set(["copy_word", "indexed_boundary"]),
-                "The suite must contain exactly copy_word and indexed_boundary")
+    try require(suite.schema_version == 1, "Only schema version 1 is supported")
+    let expectedIDs: Set<String>
+    switch suite.suite {
+    case "compute-buffer-v1":
+        expectedIDs = ["copy_word", "indexed_boundary"]
+    case "compute-buffer-v2":
+        expectedIDs = ["copy_seed_a", "copy_seed_b", "indexed_tail", "indexed_full",
+                       "indexed_small_grid", "indexed_unit", "transform_tail", "transform_small_grid"]
+    default:
+        throw OracleError("Only compute-buffer-v1 and compute-buffer-v2 are supported")
+    }
+    try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
+                "\(suite.suite): the suite must contain exactly the supported case IDs")
     let root = url.deletingLastPathComponent()
     var cases = [ValidatedCase]()
     for definition in suite.cases {
         try validateShape(definition)
         let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
         let metalBytes: Data
-        if definition.id == "copy_word" {
+        switch definition.entry {
+        case "copy_word":
             _ = try validateSource(definition.air, root: root,
                 path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",
                 digest: "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99")
             metalBytes = try validateSource(definition.metal, root: root,
                 path: "shaders/copy_word.metal",
                 digest: "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc")
-        } else {
+        case "kernel_dispatch_threads_boundary_barrier":
             _ = try validateSource(definition.air, root: root,
                 path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
                 digest: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
             metalBytes = try validateSource(definition.metal, root: root,
                 path: "shaders/indexed_boundary.metal",
                 digest: "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06")
+        case "transform_3d":
+            _ = try validateSource(definition.air, root: root,
+                path: "shaders/transform_3d.ll",
+                digest: "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2")
+            metalBytes = try validateSource(definition.metal, root: root,
+                path: "shaders/transform_3d.metal",
+                digest: "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b")
+        default:
+            throw OracleError("Unsupported entry: \(definition.entry)")
         }
         guard let metalSource = String(data: metalBytes, encoding: .utf8) else {
             throw OracleError("\(definition.id): MSL source is not UTF-8")
@@ -385,13 +423,9 @@ private func metalSize(_ dimensions: [UInt64]) -> MTLSize {
 }
 
 @available(macOS 11.0, *)
-private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLCommandQueue) throws -> CaseResult {
+private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLCommandQueue,
+                     pipeline: MTLComputePipelineState) throws -> CaseResult {
     let definition = fixture.definition
-    let library = try device.makeLibrary(source: fixture.metalSource, options: nil)
-    guard let function = library.makeFunction(name: definition.entry) else {
-        throw OracleError("\(definition.id): Metal function was not found")
-    }
-    let pipeline = try device.makeComputePipelineState(function: function)
     let local = metalSize(definition.local)
     let limits = device.maxThreadsPerThreadgroup
     try require(local.width <= limits.width && local.height <= limits.height && local.depth <= limits.depth,
@@ -462,6 +496,7 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         }
         allocations.append(AllocationResult(allocation: specification.allocation, bytes_hex: hex(observed)))
     }
+    writebacks.sort { ($0.allocation, $0.view) < ($1.allocation, $1.view) }
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
 }
 
@@ -493,8 +528,24 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
                 "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
     guard let queue = device.makeCommandQueue() else { throw OracleError("Cannot create a Metal command queue") }
     var results = [CaseResult]()
+    // loadSuite pins one reviewed source identity per entry. Reuse the pipeline
+    // across cases while runCase creates fresh commands and buffers each time.
+    var pipelines = [String: MTLComputePipelineState]()
     for fixture in suite.cases {
-        results.append(try runCase(fixture, device: device, queue: queue))
+        let entry = fixture.definition.entry
+        let pipeline: MTLComputePipelineState
+        if let cached = pipelines[entry] {
+            pipeline = cached
+        } else {
+            let library = try device.makeLibrary(source: fixture.metalSource, options: nil)
+            guard let function = library.makeFunction(name: entry) else {
+                throw OracleError("\(fixture.definition.id): Metal function was not found")
+            }
+            pipeline = try device.makeComputePipelineState(function: function)
+            pipelines[entry] = pipeline
+            diagnostic("native pipeline compiled: entry=\(entry)")
+        }
+        results.append(try runCase(fixture, device: device, queue: queue, pipeline: pipeline))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",

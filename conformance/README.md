@@ -1,12 +1,13 @@
 # Native Metal reference capture
 
-This directory prepares the first native Metal/Vulkan comparison for two small
+This directory contains the native Metal/Vulkan comparison harness for bounded
 buffer-compute cases. The native runner is a standalone Swift program using
 Metal; it is not a Rust `ComputeProvider` implementation. Its source is prepared
 for Apple silicon macOS 11+. The initial capture version at `a57c985` compiled
-and validated the shared suite in macOS CI. The current probe extension has
-only local static review until its next macOS CI run. A successful Metal GPU
-capture is still required.
+and validated the shared suite in macOS CI. The subsequent probe run at
+`8579380` captured both v1 cases on an Apple Paravirtual device and successfully
+compared them to Vulkan. The current [eight-case v2 extension](SUITE-V2.md) is
+locally tested on Vulkan; its new native Metal coverage is pending.
 
 ## Shared input
 
@@ -21,7 +22,9 @@ sizes, initial bytes, expected writebacks and an LLVM/MSL source pair with
 SHA-256 hashes. Both runners verify the source hashes and admit only the two
 reviewed source identities and dispatch shapes. The pairing is a manually
 reviewed semantic fixture, not evidence that MSL and AIR bytes are identical.
-Changing a source requires updating and reviewing both runners' source pins.
+The [v2 suite](SUITE-V2.md) adds input/offset variants, more group boundaries,
+and an owned 3D read/write fixture while keeping v1 unchanged. Changing a
+source requires updating and reviewing both runners' source pins.
 Git attributes keep hashed files at LF line endings on Windows too.
 
 Only the successful completion of all cases produces a report. Existing output
@@ -158,6 +161,7 @@ to the capture tool's GPU fence timeout. `captured` means a validated native
 report exists; cross-backend comparison is a separate check. The status may
 also carry `--source-revision` for local capture provenance.
 
-The current probe/workflow extension has not yet run remotely at this local
-checkpoint. No Swift compiler, macOS SDK or Apple GPU is available locally.
+The initial probe workflow completed real native v1 capture and comparison in
+[CI run 33973870668](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33973870668).
+The current v2 extension has not yet run remotely at this local checkpoint. No Swift compiler, macOS SDK or Apple GPU is available locally.
 Python orchestration tests use simulated commands and synthetic reports only.

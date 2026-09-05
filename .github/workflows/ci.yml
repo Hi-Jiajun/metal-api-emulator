@@ -36,14 +36,17 @@ jobs:
           export VK_ICD_FILENAMES="${icds[0]}"
           cargo run --locked -p metal-smoke -- --executor standalone
           cargo run --locked -p metal-smoke --bin provider-smoke
-          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite.json --output /tmp/vulkan-capture.json
-          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/vulkan-capture.json
+          mkdir -p /tmp/vulkan-captures
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite.json --output /tmp/vulkan-captures/vulkan-capture.json
+          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/vulkan-captures/vulkan-capture.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v2.json --output /tmp/vulkan-captures/vulkan-capture-v2.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --check /tmp/vulkan-captures/vulkan-capture-v2.json
 
       - name: Preserve Vulkan report
         uses: actions/upload-artifact@v4
         with:
           name: vulkan-capture
-          path: /tmp/vulkan-capture.json
+          path: /tmp/vulkan-captures/
           if-no-files-found: error
 
   native-oracle-build:
@@ -59,16 +62,18 @@ jobs:
       - name: Probe Metal and capture when eligible
         id: capture
         run: |
-          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite.json --output-dir /tmp/native-evidence --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite.json --output-dir /tmp/native-evidence/v1 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v2.json --output-dir /tmp/native-evidence/v2 --source-revision "$GITHUB_SHA"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
-          status = json.loads(Path('/tmp/native-evidence/status.json').read_text())
+          statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2')]
+          combined = 'captured' if all(s['capture_status'] == 'captured' for s in statuses) else 'unavailable'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('capture_status=' + status['capture_status'] + '\n')
+              output.write('capture_status=' + combined + '\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('Native Metal capture: **' + status['capture_status'] + '**.\n\n')
-              summary.write(status['reason'] + '\n')
+              for status in statuses:
+                  summary.write(status['suite'] + ': **' + status['capture_status'] + '**. ' + status['reason'] + '\n\n')
           PY
       - name: Preserve native probe, status and any completed capture
         if: always()
@@ -94,4 +99,5 @@ jobs:
           path: /tmp/native-evidence
       - name: Compare observed native and Vulkan results
         run: |
-          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json
+          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json
