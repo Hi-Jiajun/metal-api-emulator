@@ -5,8 +5,8 @@ use crate::{bounded_contract, refusal, unknown_completion};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef,
-    ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions,
-    MTLSize,
+    ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
+    MTLResourceOptions, MTLSize,
 };
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
@@ -33,7 +33,8 @@ struct State {
     abandoned: bool,
 }
 
-/// Synchronous, single-pass native provider for the exact conformance fixtures.
+/// Synchronous native provider with at most eight serial passes over one buffer
+/// set, for the exact conformance fixtures.
 ///
 /// A submission has a 20-second observation deadline. Unknown retirement or a
 /// GPU error permanently disables new work in this context and retains its
@@ -81,7 +82,7 @@ impl NativeMetalProvider {
             let dimensions = device.max_threads_per_threadgroup();
             let local = [dimensions.width, dimensions.height, dimensions.depth];
             let capabilities = ProviderCapabilities {
-                max_passes: 1,
+                max_passes: 8,
                 supports_threads_exact: true,
                 supports_threadgroups: false,
                 supports_serial: true,
@@ -278,16 +279,22 @@ impl ComputeProvider for NativeMetalProvider {
                 "metal_buffer_binding_limit",
             ));
         }
-        let local = pass.dispatch.threads_per_threadgroup;
-        let invocations = local.into_iter().try_fold(1_u64, u64::checked_mul);
-        if invocations
-            .is_none_or(|value| value > registered.pipeline.max_total_threads_per_threadgroup())
-        {
-            return Err(refusal(
-                ProviderPhase::Encode,
-                ProviderErrorClass::Capability,
-                "pipeline_local_size_limit",
-            ));
+        // Admission establishes identical pipeline/buffer tables for serial
+        // reuse. Dispatch dimensions can differ, so check every pipeline-local
+        // limit before allocating buffers or creating a command buffer.
+        for (pass_index, pass) in trace.passes.iter().enumerate() {
+            let local = pass.dispatch.threads_per_threadgroup;
+            let invocations = local.into_iter().try_fold(1_u64, u64::checked_mul);
+            if invocations
+                .is_none_or(|value| value > registered.pipeline.max_total_threads_per_threadgroup())
+            {
+                return Err(refusal(
+                    ProviderPhase::Encode,
+                    ProviderErrorClass::Capability,
+                    "pipeline_local_size_limit",
+                )
+                .with_field("pass_index", FieldValue::Unsigned(pass_index as u64)));
+            }
         }
         let token = CompletionToken {
             device_epoch: self.epoch,
@@ -387,6 +394,11 @@ fn execute(
         if buffer.contents().is_null() {
             return Err(resource_error("metal_buffer_mapping_failed"));
         }
+        // MTLDevice-created resources default to tracked hazards. This is the
+        // ordering guarantee used by the directly bound serial passes below.
+        if buffer.hazard_tracking_mode() != MTLHazardTrackingMode::Tracked {
+            return Err(resource_error("metal_buffer_hazard_tracking_unavailable"));
+        }
         buffers.push(buffer);
     }
     let command = unsafe {
@@ -408,22 +420,28 @@ fn execute(
         submitted: false,
     };
     let resources = pending.resources.as_ref().expect("pending resources");
-    let encoder = unsafe {
-        let pointer: *mut metal::MTLComputeCommandEncoder =
-            msg_send![resources.command.as_ref(), computeCommandEncoder];
-        if pointer.is_null() {
-            return Err(resource_error("metal_encoder_allocation_failed"));
+    // The default compute encoder dispatches serially. Directly bound tracked
+    // resources on MTLCommandQueue carry writes across encoder boundaries:
+    // https://developer.apple.com/documentation/metal/resource-synchronization
+    // Each pass sees earlier writes; the initial bytes are uploaded only once.
+    for pass in &trace.passes {
+        let encoder = unsafe {
+            let pointer: *mut metal::MTLComputeCommandEncoder =
+                msg_send![resources.command.as_ref(), computeCommandEncoder];
+            if pointer.is_null() {
+                return Err(resource_error("metal_encoder_allocation_failed"));
+            }
+            ComputeCommandEncoderRef::from_ptr(pointer)
+        };
+        encoder.set_compute_pipeline_state(&resources.pipeline);
+        for (view, buffer) in pass.buffers.iter().zip(&resources.buffers) {
+            encoder.set_buffer(u64::from(view.metal_binding), Some(buffer), 0);
         }
-        ComputeCommandEncoderRef::from_ptr(pointer)
-    };
-    encoder.set_compute_pipeline_state(&resources.pipeline);
-    for (view, buffer) in pass.buffers.iter().zip(&resources.buffers) {
-        encoder.set_buffer(u64::from(view.metal_binding), Some(buffer), 0);
+        let [gx, gy, gz] = pass.dispatch.grid;
+        let [lx, ly, lz] = pass.dispatch.threads_per_threadgroup;
+        encoder.dispatch_threads(MTLSize::new(gx, gy, gz), MTLSize::new(lx, ly, lz));
+        encoder.end_encoding();
     }
-    let [gx, gy, gz] = pass.dispatch.grid;
-    let [lx, ly, lz] = pass.dispatch.threads_per_threadgroup;
-    encoder.dispatch_threads(MTLSize::new(gx, gy, gz), MTLSize::new(lx, ly, lz));
-    encoder.end_encoding();
     pending.submitted = true;
     resources.command.commit();
     let started = Instant::now();

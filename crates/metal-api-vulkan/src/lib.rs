@@ -8,8 +8,8 @@
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
-    BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, ResourceAccess, ResourceKind,
-    ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
+    BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, KernelDispatchPlan,
+    ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
 use metal_api_core::provider::{
     CompletionDisposition, PipelineContract, ProviderCapabilities, ProviderError,
@@ -33,6 +33,7 @@ mod provider;
 pub use compute_provider::{CompiledComputePipeline, VulkanComputeProvider};
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
+const MAX_SERIAL_DISPATCHES: usize = 8;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 fn failure(message: impl Into<String>) -> ExecutorError {
@@ -417,7 +418,24 @@ pub(crate) fn execute_submission_with_status(
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let result = execute_submission_stages(context, artifact, submission);
+    let dispatch = (
+        submission.threads_per_grid.dimensions(),
+        submission.threads_per_threadgroup.dimensions(),
+    );
+    execute_serial_submission_with_status(context, artifact, submission, &[dispatch])
+}
+
+/// Execute one to eight ordered dispatches with one pipeline and buffer set.
+/// Tuples contain (grid, local size); the first must match the submission sizes.
+/// The caller owns serialization. All passes are validated before creating
+/// request resources, and share one upload, command buffer, fence, and readback.
+pub(crate) fn execute_serial_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    submission: ComputeSubmission,
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let result = execute_submission_stages(context, artifact, submission, dispatches);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -431,54 +449,29 @@ fn execute_submission_stages(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
+    dispatches: &[([u32; 3], [u32; 3])],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let grid = submission.threads_per_grid.dimensions();
-    let local = submission.threads_per_threadgroup.dimensions();
-    let resolve_args = |error| {
-        ExecutionFailure::from(error).into_provider(
-            ProviderPhase::Resolve,
-            ProviderErrorClass::Args,
-            "vulkan-dispatch-args",
-            CompletionDisposition::NotSubmitted,
-        )
-    };
-    let resolve_capability = |error| {
-        ExecutionFailure::from(error).into_provider(
-            ProviderPhase::Resolve,
-            ProviderErrorClass::Capability,
-            "vulkan-dispatch-capability",
-            CompletionDisposition::NotSubmitted,
-        )
-    };
-    validate_local_size(context, local).map_err(resolve_capability)?;
-    let reflection = artifact.translated.reflection();
-    artifact
-        .translated
-        .validate_buffers(&submission.buffers, grid)
-        .map_err(resolve_args)?;
-    artifact
-        .translated
-        .validate_threadgroup(local)
-        .map_err(resolve_capability)?;
-    let reflected_contract = reflection
-        .kernel_dispatch
-        .ok_or_else(|| resolve_capability(failure("translated kernel has no dispatch contract")))?;
-    if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
-        return Err(resolve_capability(failure(format!(
-            "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
-        ))));
-    }
-    let plan = reflected_contract
-        .plan(local, Some(grid))
-        .map_err(|error| resolve_args(failure(format!("plan exact dispatch: {error}"))))?;
-    validate_dispatch_plan(context, reflected_contract, &plan).map_err(resolve_capability)?;
-    if plan.regions.is_empty() {
+    let plans = plan_serial_submission(
+        &artifact.translated,
+        &submission.buffers,
+        &context.properties.limits,
+        (
+            submission.threads_per_grid.dimensions(),
+            submission.threads_per_threadgroup.dimensions(),
+        ),
+        dispatches,
+    )?;
+    if plans.iter().all(|plan| plan.regions.is_empty()) {
         return Ok(Vec::new());
     }
+    let reflection = artifact.translated.reflection();
+    let reflected_contract = reflection
+        .kernel_dispatch
+        .expect("validated dispatch contract");
 
     let mut resources = ExecutionResources::new(Arc::clone(context));
     resources
-        .create_pipeline_objects(artifact.translated.spirv(), reflection, &plan)
+        .create_pipeline_objects(artifact.translated.spirv(), reflection, &plans)
         .map_err(|error| {
             error.into_provider(
                 ProviderPhase::Compile,
@@ -502,7 +495,7 @@ fn execute_submission_stages(
         .create_descriptors(reflection)
         .map_err(encode_error)?;
     resources
-        .record(reflection, reflected_contract, &plan)
+        .record(reflection, reflected_contract, &plans)
         .map_err(encode_error)?;
     match resources.submit_and_wait() {
         Ok(()) => {}
@@ -518,8 +511,79 @@ fn execute_submission_stages(
         .map_err(ExecutionFailure::into_readback_provider)
 }
 
-fn validate_local_size(context: &VulkanContext, local: [u32; 3]) -> Result<(), ExecutorError> {
-    let limits = context.properties.limits;
+/// Pure preflight: no request-specific Vulkan objects exist until this returns.
+fn plan_serial_submission(
+    translated: &TranslatedComputePipeline,
+    buffers: &[BufferBinding],
+    limits: &vk::PhysicalDeviceLimits,
+    first_dispatch: ([u32; 3], [u32; 3]),
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Result<Vec<KernelDispatchPlan>, ProviderError> {
+    let resolve_args = |error| {
+        ExecutionFailure::from(error).into_provider(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Args,
+            "vulkan-dispatch-args",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    let resolve_capability = |error| {
+        ExecutionFailure::from(error).into_provider(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "vulkan-dispatch-capability",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    if !(1..=MAX_SERIAL_DISPATCHES).contains(&dispatches.len()) {
+        return Err(resolve_args(failure(format!(
+            "serial submission requires 1..={MAX_SERIAL_DISPATCHES} dispatches, got {}",
+            dispatches.len()
+        ))));
+    }
+    if dispatches[0] != first_dispatch {
+        return Err(resolve_args(failure(
+            "first serial dispatch sizes differ from the submission sizes",
+        )));
+    }
+    let reflection = translated.reflection();
+    let reflected_contract = reflection
+        .kernel_dispatch
+        .ok_or_else(|| resolve_capability(failure("translated kernel has no dispatch contract")))?;
+    if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
+        return Err(resolve_capability(failure(format!(
+            "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
+        ))));
+    }
+    let mut plans = Vec::with_capacity(dispatches.len());
+    for &(grid, local) in dispatches {
+        validate_local_size(limits, local).map_err(resolve_capability)?;
+        translated
+            .validate_buffers(buffers, grid)
+            .map_err(resolve_args)?;
+        translated
+            .validate_threadgroup(local)
+            .map_err(resolve_capability)?;
+        let plan = reflected_contract
+            .plan(local, Some(grid))
+            .map_err(|error| resolve_args(failure(format!("plan exact dispatch: {error}"))))?;
+        validate_dispatch_plan(limits, reflected_contract, &plan).map_err(resolve_capability)?;
+        plans.push(plan);
+    }
+    validate_descriptor_limits(limits, reflection).map_err(resolve_capability)?;
+    for buffer in buffers {
+        validate_storage_buffer_size(limits, buffer).map_err(resolve_capability)?;
+    }
+    Ok(plans)
+}
+
+fn validate_local_size(
+    limits: &vk::PhysicalDeviceLimits,
+    local: [u32; 3],
+) -> Result<(), ExecutorError> {
+    if local.contains(&0) {
+        return Err(failure("threadgroup dimensions must be nonzero"));
+    }
     for (dimension, &size) in local.iter().enumerate() {
         if size > limits.max_compute_work_group_size[dimension] {
             return Err(failure(format!(
@@ -542,11 +606,10 @@ fn validate_local_size(context: &VulkanContext, local: [u32; 3]) -> Result<(), E
 }
 
 fn validate_dispatch_plan(
-    context: &VulkanContext,
+    limits: &vk::PhysicalDeviceLimits,
     contract: KernelDispatch,
-    plan: &metal2vulkan::reflect::KernelDispatchPlan,
+    plan: &KernelDispatchPlan,
 ) -> Result<(), ExecutorError> {
-    let limits = context.properties.limits;
     let range = contract
         .push_constant_range()
         .ok_or_else(|| failure("exact dispatch has no push-constant range"))?;
@@ -561,7 +624,7 @@ fn validate_dispatch_plan(
         )));
     }
     for region in &plan.regions {
-        validate_local_size(context, region.local_size)?;
+        validate_local_size(limits, region.local_size)?;
         for (dimension, &count) in region.group_count.iter().enumerate() {
             if count > limits.max_compute_work_group_count[dimension] {
                 return Err(failure(format!(
@@ -570,6 +633,43 @@ fn validate_dispatch_plan(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_descriptor_limits(
+    limits: &vk::PhysicalDeviceLimits,
+    reflection: &ShaderReflection,
+) -> Result<(), ExecutorError> {
+    let buffer_count = u32::try_from(reflection.bindings.len())
+        .map_err(|_| failure("reflected buffer count overflows u32"))?;
+    if limits.max_bound_descriptor_sets == 0
+        || buffer_count > limits.max_per_stage_descriptor_storage_buffers
+        || buffer_count > limits.max_descriptor_set_storage_buffers
+        || buffer_count > limits.max_per_stage_resources
+    {
+        return Err(failure(format!(
+            "{buffer_count} storage buffers exceed Vulkan descriptor limits per-stage={} per-set={} all-resources={} bound-sets={}",
+            limits.max_per_stage_descriptor_storage_buffers,
+            limits.max_descriptor_set_storage_buffers,
+            limits.max_per_stage_resources,
+            limits.max_bound_descriptor_sets
+        )));
+    }
+    Ok(())
+}
+
+fn validate_storage_buffer_size(
+    limits: &vk::PhysicalDeviceLimits,
+    supplied: &BufferBinding,
+) -> Result<(), ExecutorError> {
+    let size = u64::try_from(supplied.bytes.len())
+        .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
+    if size > u64::from(limits.max_storage_buffer_range) {
+        return Err(failure(format!(
+            "buffer {} length {size} exceeds maxStorageBufferRange {}",
+            supplied.index, limits.max_storage_buffer_range
+        )));
     }
     Ok(())
 }
@@ -1014,26 +1114,10 @@ impl ExecutionResources {
         &mut self,
         spv: &[u8],
         reflection: &ShaderReflection,
-        plan: &metal2vulkan::reflect::KernelDispatchPlan,
+        plans: &[KernelDispatchPlan],
     ) -> Result<(), ExecutionFailure> {
         if !spv.len().is_multiple_of(4) {
             return Err(failure("translated SPIR-V is not word aligned").into());
-        }
-        let buffer_count = u32::try_from(reflection.bindings.len())
-            .map_err(|_| failure("reflected buffer count overflows u32"))?;
-        let limits = self.context.properties.limits;
-        if limits.max_bound_descriptor_sets == 0
-            || buffer_count > limits.max_per_stage_descriptor_storage_buffers
-            || buffer_count > limits.max_descriptor_set_storage_buffers
-            || buffer_count > limits.max_per_stage_resources
-        {
-            return Err(failure(format!(
-                "{buffer_count} storage buffers exceed Vulkan descriptor limits per-stage={} per-set={} all-resources={} bound-sets={}",
-                limits.max_per_stage_descriptor_storage_buffers,
-                limits.max_descriptor_set_storage_buffers,
-                limits.max_per_stage_resources,
-                limits.max_bound_descriptor_sets
-            )).into());
         }
         let words = spv
             .chunks_exact(4)
@@ -1092,7 +1176,7 @@ impl ExecutionResources {
             ExecutionFailure::vulkan(error, format!("create pipeline layout: {error}"))
         })?;
 
-        for region in &plan.regions {
+        for region in plans.iter().flat_map(|plan| &plan.regions) {
             if self.pipelines.contains_key(&region.local_size) {
                 continue;
             }
@@ -1165,13 +1249,6 @@ impl ExecutionResources {
     fn create_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
         let size = u64::try_from(supplied.bytes.len())
             .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
-        if size > self.context.properties.limits.max_storage_buffer_range as u64 {
-            return Err(failure(format!(
-                "buffer {} length {size} exceeds maxStorageBufferRange {}",
-                supplied.index, self.context.properties.limits.max_storage_buffer_range
-            ))
-            .into());
-        }
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
@@ -1312,7 +1389,7 @@ impl ExecutionResources {
         &mut self,
         reflection: &ShaderReflection,
         contract: KernelDispatch,
-        plan: &metal2vulkan::reflect::KernelDispatchPlan,
+        plans: &[KernelDispatchPlan],
     ) -> Result<(), ExecutionFailure> {
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(self.context.queue_family)
@@ -1350,31 +1427,54 @@ impl ExecutionResources {
                 .push_constant_range()
                 .expect("validated exact range")
                 .offset;
-            for region in &plan.regions {
-                let pipeline = self.pipelines[&region.local_size];
-                self.context.device.cmd_bind_pipeline(
-                    self.command,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline,
-                );
-                let words = plan.push_constants(*region);
-                let bytes = words
-                    .into_iter()
-                    .flat_map(u32::to_ne_bytes)
-                    .collect::<Vec<_>>();
-                self.context.device.cmd_push_constants(
-                    self.command,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    offset,
-                    &bytes,
-                );
-                self.context.device.cmd_dispatch(
-                    self.command,
-                    region.group_count[0],
-                    region.group_count[1],
-                    region.group_count[2],
-                );
+            for (pass_index, plan) in plans.iter().enumerate() {
+                if pass_index != 0 {
+                    // Order all earlier compute accesses and make their writes
+                    // visible to the next pass's reads and writes (RAW/WAW).
+                    // The execution dependency also covers WAR hazards.
+                    // Khronos legacy compute-to-compute synchronization:
+                    // https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples-(Legacy-synchronization-APIs)
+                    let barriers = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    self.context.device.cmd_pipeline_barrier(
+                        self.command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barriers,
+                        &[],
+                        &[],
+                    );
+                }
+                for region in &plan.regions {
+                    let pipeline = self.pipelines[&region.local_size];
+                    self.context.device.cmd_bind_pipeline(
+                        self.command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline,
+                    );
+                    let words = plan.push_constants(*region);
+                    let bytes = words
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect::<Vec<_>>();
+                    self.context.device.cmd_push_constants(
+                        self.command,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        offset,
+                        &bytes,
+                    );
+                    self.context.device.cmd_dispatch(
+                        self.command,
+                        region.group_count[0],
+                        region.group_count[1],
+                        region.group_count[2],
+                    );
+                }
             }
             // Fence retirement establishes execution completion; this barrier
             // makes compute writes available to coherent host readback.
@@ -1549,7 +1649,189 @@ impl Drop for ExecutionResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal2vulkan::meta::{KernMeta, KernRole};
     use metal2vulkan::reflect::{BufferStrideTerm, BufferStridedAccess};
+
+    fn serial_fixture() -> (
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+    ) {
+        let meta = KernMeta {
+            roles: vec![(0, KernRole::Buffer(0))],
+            max_work_group_size: Some(32),
+            ..KernMeta::default()
+        };
+        let mut reflection = ShaderReflection::from_kernel(&meta, Some("serial"), [1, 1, 1]);
+        reflection.kernel_dispatch = Some(KernelDispatch::safe_default());
+        reflection.bindings[0].footprint = Some(BufferFootprint {
+            static_ranges: Vec::new(),
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdX,
+                        stride: 4,
+                    },
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdY,
+                        stride: 40,
+                    },
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdZ,
+                        stride: 120,
+                    },
+                ],
+            }],
+            has_unbounded_access: false,
+        });
+        let limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_size: [128, 128, 64],
+            max_compute_work_group_invocations: 128,
+            max_compute_work_group_count: [65535; 3],
+            max_push_constants_size: 128,
+            max_bound_descriptor_sets: 4,
+            max_per_stage_descriptor_storage_buffers: 8,
+            max_descriptor_set_storage_buffers: 8,
+            max_per_stage_resources: 8,
+            max_storage_buffer_range: 4096,
+            ..vk::PhysicalDeviceLimits::default()
+        };
+        (
+            TranslatedComputePipeline {
+                spv: Vec::new(),
+                reflection,
+            },
+            vec![BufferBinding {
+                index: 0,
+                bytes: vec![0; 240],
+            }],
+            limits,
+        )
+    }
+
+    #[test]
+    fn serial_preflight_preserves_each_dispatch_grid_and_tail_specialization() {
+        let (translated, buffers, limits) = serial_fixture();
+        let dispatches = [([10, 3, 2], [8, 2, 1]), ([7, 2, 1], [4, 1, 1])];
+        let plans =
+            plan_serial_submission(&translated, &buffers, &limits, dispatches[0], &dispatches)
+                .unwrap();
+        assert_eq!(plans.len(), 2);
+        for (plan, (grid, _)) in plans.iter().zip(dispatches) {
+            let launched: u32 = plan
+                .regions
+                .iter()
+                .map(|region| {
+                    region.local_size.into_iter().product::<u32>()
+                        * region.group_count.into_iter().product::<u32>()
+                })
+                .sum();
+            assert_eq!(launched, grid.into_iter().product::<u32>());
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], grid);
+        }
+        let specializations = plans
+            .iter()
+            .flat_map(|plan| &plan.regions)
+            .map(|region| region.local_size)
+            .collect::<BTreeSet<_>>();
+        assert!(specializations.contains(&[8, 2, 1]));
+        assert!(specializations.contains(&[2, 1, 1]));
+        assert!(specializations.contains(&[4, 1, 1]));
+        assert!(specializations.contains(&[3, 1, 1]));
+    }
+
+    #[test]
+    fn serial_preflight_bounds_pass_count_and_rejects_ambiguous_first_sizes() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        assert_eq!(
+            plan_serial_submission(&translated, &buffers, &limits, first, &[first; 8])
+                .unwrap()
+                .len(),
+            8
+        );
+        for dispatches in [Vec::new(), vec![first; 9], vec![([1; 3], [1; 3])]] {
+            let error = plan_serial_submission(&translated, &buffers, &limits, first, &dispatches)
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
+
+    #[test]
+    fn serial_preflight_checks_later_buffer_reach_and_threadgroup_limits() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        let dispatches = [first, ([11, 3, 2], [8, 2, 1])];
+        let error =
+            plan_serial_submission(&translated, &buffers, &limits, first, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 244"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        for local in [[0, 1, 1], [129, 1, 1], [8, 8, 1]] {
+            let dispatches = [first, ([10, 3, 2], local)];
+            let error = plan_serial_submission(&translated, &buffers, &limits, first, &dispatches)
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
+
+    #[test]
+    fn serial_preflight_checks_later_dispatch_count_and_shared_resource_limits() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        let dispatches = [first, ([10, 3, 2], [1, 2, 1])];
+        let small_grid_limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_count: [2, 65535, 65535],
+            ..limits
+        };
+        let error = plan_serial_submission(
+            &translated,
+            &buffers,
+            &small_grid_limits,
+            first,
+            &dispatches,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("group count dimension 0=10"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        for reduced in [
+            vk::PhysicalDeviceLimits {
+                max_descriptor_set_storage_buffers: 0,
+                ..limits
+            },
+            vk::PhysicalDeviceLimits {
+                max_storage_buffer_range: 239,
+                ..limits
+            },
+            vk::PhysicalDeviceLimits {
+                max_push_constants_size: 47,
+                ..limits
+            },
+        ] {
+            let error = plan_serial_submission(&translated, &buffers, &reduced, first, &[first])
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
 
     #[test]
     fn failures_before_queue_acceptance_are_not_submitted() {

@@ -978,6 +978,28 @@ impl ComputeTrace {
         Ok(())
     }
 
+    /// Validate the serial resource-reuse subset supported by command-buffer
+    /// providers. Every pass uses the same pipeline and exact buffer table;
+    /// only dispatch dimensions may vary. The repeated source bytes describe
+    /// one initial upload, not an upload before each pass. Writes from earlier
+    /// passes remain visible to later passes, and readback happens after the
+    /// final pass. A single pass retains the ordinary structural contract.
+    pub fn validate_serial_buffer_reuse(&self) -> Result<(), ContractError> {
+        self.validate()?;
+        if self.passes.len() > 1 {
+            if self.encoder_dispatch_type != DispatchType::Serial {
+                return Err(ContractError::ConcurrentPassesUnsupported);
+            }
+            let initial_buffers = &self.passes[0].buffers;
+            for (pass_index, pass) in self.passes.iter().enumerate().skip(1) {
+                if &pass.buffers != initial_buffers {
+                    return Err(ContractError::SerialBufferRebinding { pass_index });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_with_resources(
         &self,
         resources: &ResourceTableSnapshot,
@@ -1097,8 +1119,10 @@ impl BufferWriteback {
 /// A successful result must be `Submitted` or `CompletedVisible`; all failures
 /// use [`ProviderError`]. Writebacks are CPU-visible and may only accompany
 /// `CompletedVisible` with [`CompletionPolicy::HostReadback`]. They are ordered
-/// by `(allocation_id, view_id)`. The current single-pass contract requires one
-/// complete writeback for each writable view when host readback completes.
+/// by `(allocation_id, view_id)`. A single pass or serial passes that reuse the
+/// exact buffer table require one complete final writeback for each writable
+/// view when host readback completes. Intermediate per-pass outputs are not
+/// returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSubmission {
     pub completion: CompletionDisposition,
@@ -1144,16 +1168,13 @@ impl ProviderSubmission {
         Ok(())
     }
 
-    /// Validate a result against the exact submitted trace. Multi-pass result
-    /// semantics are not defined by this contract and are explicitly refused.
+    /// Validate the final result against the exact submitted trace. Serial
+    /// passes must reuse the initial buffer table; each writable view has one
+    /// full writeback reflecting all passes, rather than one per pass.
     pub fn validate_for_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
-        trace.validate()?;
+        trace.validate_serial_buffer_reuse()?;
         self.validate()?;
-        let [pass] = trace.passes.as_slice() else {
-            return Err(ContractError::UnsupportedSubmissionPassCount(
-                trace.passes.len(),
-            ));
-        };
+        let pass = &trace.passes[0];
         let token = self
             .completion
             .token()
@@ -1271,8 +1292,8 @@ pub trait PipelineProvider: ComputeProvider {
 /// Capabilities are captured once for a provider device context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCapabilities {
-    /// Provider policy, not a physical-device limit. The current snapshot
-    /// adapters expose one pass; a future command-buffer provider can raise it.
+    /// Provider policy, not a physical-device limit. Snapshot adapters may
+    /// expose one pass; command-buffer providers can permit serial reuse.
     pub max_passes: u32,
     pub supports_threads_exact: bool,
     pub supports_threadgroups: bool,
@@ -1340,10 +1361,6 @@ impl ProviderCapabilities {
                 return Err(capability_error("dispatch_kind_unsupported"));
             }
             _ => {}
-        }
-        if trace.passes.len() != 1 {
-            return Err(capability_error("multiple_passes_unsupported")
-                .with_detail("B0 provider submission is one direct compute pass"));
         }
         match trace.completion_policy {
             CompletionPolicy::HostReadback if !self.host_readback => {
@@ -1501,6 +1518,9 @@ impl ProviderCapabilities {
         // Capability admission intentionally precedes backing/lease admission:
         // a malformed or unsupported dispatch must not be masked by a stale
         // resource handle, and the order matches the provider contract gates.
+        trace
+            .validate_serial_buffer_reuse()
+            .map_err(contract_error_refusal)?;
         resources
             .validate_trace(trace)
             .map_err(contract_error_refusal)?;
@@ -1731,7 +1751,10 @@ pub enum ContractError {
         expected: DeviceEpoch,
         actual: DeviceEpoch,
     },
-    UnsupportedSubmissionPassCount(usize),
+    ConcurrentPassesUnsupported,
+    SerialBufferRebinding {
+        pass_index: usize,
+    },
     WritebackPolicyMismatch(CompletionPolicy),
     NonCanonicalWritebackOrder,
     UnknownWriteback {
@@ -1884,9 +1907,12 @@ impl fmt::Display for ContractError {
                 formatter,
                 "completion epoch mismatch: expected {expected:?}, received {actual:?}"
             ),
-            Self::UnsupportedSubmissionPassCount(count) => write!(
+            Self::ConcurrentPassesUnsupported => formatter.write_str(
+                "multiple compute passes require serial dispatch"
+            ),
+            Self::SerialBufferRebinding { pass_index } => write!(
                 formatter,
-                "submission result validation requires one pass, received {count}"
+                "serial pass {pass_index} must reuse the initial buffer table and source bytes"
             ),
             Self::WritebackPolicyMismatch(policy) => write!(
                 formatter,
@@ -2310,6 +2336,80 @@ mod tests {
     }
 
     #[test]
+    fn serial_reuse_requires_exact_initial_buffer_declarations() {
+        let initial = buffer(1, 0);
+        let value = trace(vec![pass(4, vec![initial.clone()]); 2]);
+        value.validate_serial_buffer_reuse().unwrap();
+        resources().validate_trace(&value).unwrap();
+
+        let mut changed_bytes = initial.clone();
+        changed_bytes.source = BufferSource::OwnedBytes(vec![1; 4]);
+        let changed_length = BufferView {
+            length: 3,
+            source: BufferSource::OwnedBytes(vec![0; 3]),
+            ..initial.clone()
+        };
+        for changed in [
+            changed_bytes,
+            changed_length,
+            BufferView {
+                view_id: ViewId::new(2),
+                ..initial.clone()
+            },
+            BufferView {
+                allocation_id: AllocationId::new(10),
+                ..initial.clone()
+            },
+            BufferView {
+                offset: 1,
+                ..initial.clone()
+            },
+            BufferView {
+                source: BufferSource::StagedLease(LeaseId::new(11)),
+                ..initial
+            },
+        ] {
+            let mut rebound = value.clone();
+            rebound.passes[1].buffers[0] = changed;
+            assert_eq!(
+                rebound.validate_serial_buffer_reuse(),
+                Err(ContractError::SerialBufferRebinding { pass_index: 1 })
+            );
+        }
+
+        let mut changed_access = value.clone();
+        changed_access.passes[1].buffers[0].access = BufferAccess::Read;
+        assert!(matches!(
+            changed_access.validate_serial_buffer_reuse(),
+            Err(ContractError::AccessMismatch { binding: 0, .. })
+        ));
+
+        let mut changed_pipeline = value;
+        changed_pipeline.passes[1].pipeline = PipelineId::new(5);
+        assert_eq!(
+            changed_pipeline.validate_serial_buffer_reuse(),
+            Err(ContractError::MixedPipelines)
+        );
+    }
+
+    #[test]
+    fn serial_reuse_preserves_single_pass_dispatch_and_validates_structure_first() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.encoder_dispatch_type = DispatchType::Concurrent;
+        value.validate_serial_buffer_reuse().unwrap();
+        value.passes.push(value.passes[0].clone());
+        assert_eq!(
+            value.validate_serial_buffer_reuse(),
+            Err(ContractError::ConcurrentPassesUnsupported)
+        );
+        value.passes.clear();
+        assert_eq!(
+            value.validate_serial_buffer_reuse(),
+            Err(ContractError::EmptyTrace)
+        );
+    }
+
+    #[test]
     fn trace_rejects_mixed_pipelines_and_duplicate_bindings() {
         let mixed = trace(vec![
             pass(4, vec![buffer(1, 0)]),
@@ -2663,6 +2763,91 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_apply_provider_pass_limit_to_serial_reuse() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)]); 2]);
+        assert_eq!(
+            capabilities().admit(&value, &resources()).unwrap_err().slug,
+            "pass_count_limit"
+        );
+        let mut multi_pass = capabilities();
+        multi_pass.max_passes = 8;
+        multi_pass.admit(&value, &resources()).unwrap();
+        value.passes.resize(8, value.passes[0].clone());
+        multi_pass.admit(&value, &resources()).unwrap();
+        value.passes.push(value.passes[0].clone());
+        assert_eq!(
+            multi_pass.admit(&value, &resources()).unwrap_err().slug,
+            "pass_count_limit"
+        );
+    }
+
+    #[test]
+    fn capabilities_check_dispatch_and_footprint_in_each_serial_pass() {
+        let mut multi_pass = capabilities();
+        multi_pass.max_passes = 8;
+        let value = trace(vec![pass(4, vec![buffer(1, 0)]); 8]);
+        for pass_index in 0..8 {
+            for (local, grid, expected_slug) in [
+                ([9, 1, 1], [10, 3, 1], "dispatch_local_size_limit"),
+                ([8, 8, 2], [10, 3, 1], "dispatch_invocation_limit"),
+                ([8, 2, 1], [129, 3, 1], "dispatch_group_count_limit"),
+            ] {
+                let mut invalid = value.clone();
+                invalid.passes[pass_index].dispatch.threads_per_threadgroup = local;
+                invalid.passes[pass_index].dispatch.grid = grid;
+                assert_eq!(
+                    multi_pass.admit(&invalid, &resources()).unwrap_err().slug,
+                    expected_slug
+                );
+            }
+
+            let mut invalid = value.clone();
+            invalid.pipeline_contract.buffer_bindings[0].footprint = FootprintProof::Affine {
+                accesses: vec![AffineAccess {
+                    base_offset: 0,
+                    access_size: 4,
+                    terms: vec![AffineTerm { axis: 0, stride: 4 }],
+                }],
+            };
+            for pass in &mut invalid.passes {
+                pass.dispatch.grid = [1, 1, 1];
+            }
+            invalid.passes[pass_index].dispatch.grid = [2, 1, 1];
+            assert_eq!(
+                multi_pass.admit(&invalid, &resources()).unwrap_err().slug,
+                "buffer_footprint_exceeds_view"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_check_serial_reuse_before_resource_handles() {
+        let mut multi_pass = capabilities();
+        multi_pass.max_passes = 8;
+        multi_pass.supports_concurrent = true;
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)]); 2]);
+        value.encoder_dispatch_type = DispatchType::Concurrent;
+        let error = multi_pass
+            .admit(&value, &ResourceTableSnapshot::new())
+            .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(
+            error.detail,
+            Some(ContractError::ConcurrentPassesUnsupported.to_string())
+        );
+        value.encoder_dispatch_type = DispatchType::Serial;
+        value.passes[1].buffers[0].source = BufferSource::OwnedBytes(vec![1; 4]);
+        let error = multi_pass
+            .admit(&value, &ResourceTableSnapshot::new())
+            .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(
+            error.detail,
+            Some(ContractError::SerialBufferRebinding { pass_index: 1 }.to_string())
+        );
+    }
+
+    #[test]
     fn capabilities_report_limits_and_aliases_structurally() {
         let mut too_wide = trace(vec![pass(4, vec![buffer(1, 0)])]);
         too_wide.passes[0].dispatch.threads_per_threadgroup = [9, 1, 1];
@@ -2949,7 +3134,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_requires_matching_epoch_and_single_pass() {
+    fn submission_requires_matching_epoch_and_accepts_serial_reuse() {
         let trace = trace(vec![pass(4, vec![buffer(7, 0)])]);
         let mut submission = completed_submission(&trace);
         submission.validate_for_trace(&trace).unwrap();
@@ -2969,9 +3154,38 @@ mod tests {
 
         let mut multi_pass = trace;
         multi_pass.passes.push(multi_pass.passes[0].clone());
+        let final_result = completed_submission(&multi_pass);
+        assert_eq!(final_result.writebacks.len(), 1);
+        final_result.validate_for_trace(&multi_pass).unwrap();
+        multi_pass.passes[1].buffers[0].view_id = ViewId::new(8);
         assert_eq!(
-            completed_submission(&multi_pass).validate_for_trace(&multi_pass),
-            Err(ContractError::UnsupportedSubmissionPassCount(2))
+            final_result.validate_for_trace(&multi_pass),
+            Err(ContractError::SerialBufferRebinding { pass_index: 1 })
+        );
+    }
+
+    #[test]
+    fn serial_submission_requires_one_complete_final_writeback_per_writable_view() {
+        let value = trace(vec![pass(4, vec![buffer(7, 0)]); 8]);
+        let complete = completed_submission(&value);
+        complete.validate_for_trace(&value).unwrap();
+        let mut duplicate = complete.clone();
+        duplicate.writebacks.push(duplicate.writebacks[0].clone());
+        assert!(matches!(
+            duplicate.validate_for_trace(&value),
+            Err(ContractError::DuplicateWriteback { .. })
+        ));
+        let mut missing = complete.clone();
+        missing.writebacks.clear();
+        assert!(matches!(
+            missing.validate_for_trace(&value),
+            Err(ContractError::MissingWriteback { .. })
+        ));
+        let mut partial = complete;
+        partial.writebacks[0].bytes.pop();
+        assert_eq!(
+            partial.validate_for_trace(&value),
+            Err(ContractError::IncompleteWriteback(ViewId::new(7)))
         );
     }
 

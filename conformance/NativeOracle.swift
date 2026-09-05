@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1/v2 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1/v2/v3 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -10,6 +10,7 @@ import Darwin
 
 private let maximumFileBytes = 1_048_576
 private let maximumAllocationBytes: UInt64 = 1_048_576
+private let maximumPassCount = 8
 
 private struct OracleError: Error, CustomStringConvertible {
     let description: String
@@ -43,11 +44,17 @@ private struct Writeback: Codable {
     let bytes_hex: String
 }
 
+private struct DispatchDefinition: Decodable, Equatable {
+    let grid: [UInt64]
+    let local: [UInt64]
+}
+
 private struct CaseDefinition: Decodable {
     let id: String
     let entry: String
     let grid: [UInt64]
     let local: [UInt64]
+    let dispatches: [DispatchDefinition]?
     let air: SourceDefinition
     let metal: SourceDefinition
     let buffers: [BufferDefinition]
@@ -68,6 +75,7 @@ private struct ValidatedBuffer {
 
 private struct ValidatedCase {
     let definition: CaseDefinition
+    let dispatches: [DispatchDefinition]
     let metalSource: String
     let buffers: [ValidatedBuffer]
 }
@@ -264,7 +272,7 @@ private func validateSource(_ definition: SourceDefinition, root: URL,
     return bytes
 }
 
-private func validateShape(_ definition: CaseDefinition) throws {
+private func validateShape(_ definition: CaseDefinition, suite: String) throws -> [DispatchDefinition] {
     try require(definition.grid.count == 3 && definition.local.count == 3,
                 "\(definition.id): grid and local need three dimensions")
     try require(definition.grid.allSatisfy { $0 > 0 && $0 <= 1024 }
@@ -272,6 +280,33 @@ private func validateShape(_ definition: CaseDefinition) throws {
                 "\(definition.id): dimensions must be in 1...1024")
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
+    let dispatches: [DispatchDefinition]
+    if suite == "compute-buffer-v3" {
+        let expectedCount: Int
+        switch definition.id {
+        case "transform_twice": expectedCount = 2
+        case "transform_three_times": expectedCount = 3
+        case "transform_eight_times": expectedCount = 8
+        default: throw OracleError("Unsupported serial case: \(definition.id)")
+        }
+        guard let sequence = definition.dispatches else {
+            throw OracleError("\(definition.id): serial dispatches are required")
+        }
+        try require(sequence.count == expectedCount && sequence.count <= maximumPassCount,
+                    "\(definition.id): unsupported serial pass count")
+        let localSizes: [[UInt64]] = [[4, 2, 2], [8, 4, 4], [1, 1, 1]]
+        let expected = (0..<expectedCount).map {
+            DispatchDefinition(grid: [5, 3, 2], local: localSizes[$0 % localSizes.count])
+        }
+        try require(sequence == expected, "\(definition.id): unsupported serial dispatch sequence")
+        try require(sequence[0].grid == definition.grid && sequence[0].local == definition.local,
+                    "\(definition.id): grid/local must match the first serial dispatch")
+        dispatches = sequence
+    } else {
+        try require(definition.dispatches == nil,
+                    "\(definition.id): serial dispatches require compute-buffer-v3")
+        dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local)]
+    }
     switch definition.id {
     case "copy_word", "copy_seed_a", "copy_seed_b":
         try require(definition.entry == "copy_word"
@@ -297,8 +332,8 @@ private func validateShape(_ definition: CaseDefinition) throws {
         let buffer = definition.buffers[0]
         try require(buffer.binding == 0 && buffer.access == "write" && buffer.length == 120,
                     "indexed_boundary: expected a 120-byte write buffer at 0")
-    case "transform_tail", "transform_small_grid":
-        let expectedLocal: [UInt64] = definition.id == "transform_tail" ? [4, 2, 2] : [8, 4, 4]
+    case "transform_tail", "transform_small_grid", "transform_twice", "transform_three_times", "transform_eight_times":
+        let expectedLocal: [UInt64] = definition.id == "transform_small_grid" ? [8, 4, 4] : [4, 2, 2]
         try require(definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == expectedLocal,
                     "\(definition.id): unsupported entry or dispatch shape")
@@ -310,6 +345,7 @@ private func validateShape(_ definition: CaseDefinition) throws {
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
+    return dispatches
 }
 
 private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) throws -> [ValidatedBuffer] {
@@ -374,15 +410,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v2":
         expectedIDs = ["copy_seed_a", "copy_seed_b", "indexed_tail", "indexed_full",
                        "indexed_small_grid", "indexed_unit", "transform_tail", "transform_small_grid"]
+    case "compute-buffer-v3":
+        expectedIDs = ["transform_twice", "transform_three_times", "transform_eight_times"]
     default:
-        throw OracleError("Only compute-buffer-v1 and compute-buffer-v2 are supported")
+        throw OracleError("Only compute-buffer-v1, compute-buffer-v2, and compute-buffer-v3 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
     let root = url.deletingLastPathComponent()
     var cases = [ValidatedCase]()
     for definition in suite.cases {
-        try validateShape(definition)
+        let dispatches = try validateShape(definition, suite: suite.suite)
         let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
         let metalBytes: Data
         switch definition.entry {
@@ -413,7 +451,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         guard let metalSource = String(data: metalBytes, encoding: .utf8) else {
             throw OracleError("\(definition.id): MSL source is not UTF-8")
         }
-        cases.append(ValidatedCase(definition: definition, metalSource: metalSource, buffers: buffers))
+        cases.append(ValidatedCase(definition: definition, dispatches: dispatches,
+                                   metalSource: metalSource, buffers: buffers))
     }
     return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
 }
@@ -426,12 +465,17 @@ private func metalSize(_ dimensions: [UInt64]) -> MTLSize {
 private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLCommandQueue,
                      pipeline: MTLComputePipelineState) throws -> CaseResult {
     let definition = fixture.definition
-    let local = metalSize(definition.local)
+    try require(!fixture.dispatches.isEmpty && fixture.dispatches.count <= maximumPassCount,
+                "\(definition.id): runtime supports one to eight serial passes")
     let limits = device.maxThreadsPerThreadgroup
-    try require(local.width <= limits.width && local.height <= limits.height && local.depth <= limits.depth,
-                "\(definition.id): local dimensions exceed device limits")
-    try require(local.width * local.height * local.depth <= pipeline.maxTotalThreadsPerThreadgroup,
-                "\(definition.id): local thread count exceeds pipeline limit")
+    // Check every dispatch before allocating buffers or creating commands.
+    for (index, dispatch) in fixture.dispatches.enumerated() {
+        let local = metalSize(dispatch.local)
+        try require(local.width <= limits.width && local.height <= limits.height && local.depth <= limits.depth,
+                    "\(definition.id) pass \(index): local dimensions exceed device limits")
+        try require(local.width * local.height * local.depth <= pipeline.maxTotalThreadsPerThreadgroup,
+                    "\(definition.id) pass \(index): local thread count exceeds pipeline limit")
+    }
 
     // makeCommandBuffer() retains referenced resources until GPU completion.
     // In particular, a CPU timeout below must not release submitted buffers.
@@ -448,6 +492,8 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
             throw OracleError("\(definition.id): cannot allocate a shared Metal buffer")
         }
         try require(resource.storageMode == .shared, "\(definition.id): shared storage was not selected")
+        try require(resource.hazardTrackingMode == .tracked,
+                    "\(definition.id): automatic resource hazard tracking is required")
         buffer.backing.withUnsafeBytes { bytes in
             if let source = bytes.baseAddress {
                 resource.contents().copyMemory(from: source, byteCount: bytes.count)
@@ -455,15 +501,21 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         }
         resources.append(resource)
     }
-    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-        throw OracleError("\(definition.id): cannot create a compute encoder")
+    // The default encoder is serial. Direct bindings of device-created tracked
+    // buffers let MTLCommandQueue synchronize writes between successive passes:
+    // https://developer.apple.com/documentation/metal/resource-synchronization
+    // Keep one buffer set and command buffer so no CPU upload resets earlier writes.
+    for dispatch in fixture.dispatches {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw OracleError("\(definition.id): cannot create a compute encoder")
+        }
+        encoder.setComputePipelineState(pipeline)
+        for (buffer, resource) in zip(fixture.buffers, resources) {
+            encoder.setBuffer(resource, offset: Int(buffer.definition.offset), index: Int(buffer.definition.binding))
+        }
+        encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
+        encoder.endEncoding()
     }
-    encoder.setComputePipelineState(pipeline)
-    for (buffer, resource) in zip(fixture.buffers, resources) {
-        encoder.setBuffer(resource, offset: Int(buffer.definition.offset), index: Int(buffer.definition.binding))
-    }
-    encoder.dispatchThreads(metalSize(definition.grid), threadsPerThreadgroup: local)
-    encoder.endEncoding()
 
     let completed = DispatchSemaphore(value: 0)
     commandBuffer.addCompletedHandler { _ in completed.signal() }

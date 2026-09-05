@@ -177,3 +177,10 @@ host writeback landing, while the independent Swift runner retains full GPU
 buffer observations. See [the shared-provider contract](../docs/SHARED-PROVIDERS.md).
 The updated workflow compares all three reports after real capture; the new
 Rust native implementation is not considered validated by earlier Swift runs.
+
+## Serial-pass extension
+
+[suite-v3.json](suite-v3.json) adds three ordered read-modify-write cases with
+2, 3 and 8 dispatches, one upload and one final completion. The earlier suites
+remain unchanged. See [SERIAL-PASSES.md](SERIAL-PASSES.md) for the resource reuse
+contract, expected results and pending native verification.

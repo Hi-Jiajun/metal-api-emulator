@@ -97,3 +97,11 @@ The former concrete Vulkan `release_pipeline(PipelineId)` API is replaced by
 `release_pipeline(&CompiledComputePipeline)`, matching the shared trait and
 requiring epoch/metadata verification. This is an intentional API change in
 this experimental repository. Existing capture/smoke callers were updated.
+
+## Follow-up: bounded serial passes
+
+The current providers extend this single-pass checkpoint to at most eight
+serial dispatches on the same pipeline/buffer table, uploaded once and read
+back once. Only per-pass grid/local dimensions vary. See
+[the serial-pass contract](../conformance/SERIAL-PASSES.md). General rebinding,
+mixed pipelines and asynchronous command buffers remain unimplemented.

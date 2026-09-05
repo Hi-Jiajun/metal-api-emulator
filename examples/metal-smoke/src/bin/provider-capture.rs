@@ -79,6 +79,14 @@ struct Case {
     metal: Source,
     buffers: Vec<Buffer>,
     expected_writebacks: Vec<Writeback>,
+    dispatches: Option<Vec<CaseDispatch>>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CaseDispatch {
+    grid: [u64; 3],
+    local: [u64; 3],
 }
 
 #[derive(Deserialize)]
@@ -264,6 +272,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "transform_tail",
             "transform_small_grid",
         ],
+        (1, "compute-buffer-v3") => &[
+            "transform_twice",
+            "transform_three_times",
+            "transform_eight_times",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -276,6 +289,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     }
     let mut ids = BTreeSet::new();
     for case in &suite.cases {
+        validate_case_dispatches(case)?;
         let (air_path, air_hash, metal_path, metal_hash) = match case.entry.as_str() {
             "copy_word" => (
                 "../examples/metal-smoke/shaders/kernel_copy_word.ll",
@@ -397,10 +411,44 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         "indexed_full" => indexed([5, 3, 1]),
         "indexed_small_grid" => indexed([16, 4, 1]),
         "indexed_unit" => indexed([1, 1, 1]),
-        "transform_tail" => transform([4, 2, 2]),
+        "transform_tail"
+        | "transform_twice"
+        | "transform_three_times"
+        | "transform_eight_times" => transform([4, 2, 2]),
         "transform_small_grid" => transform([8, 4, 4]),
         _ => return Err("unknown case identity".into()),
     })
+}
+
+fn validate_case_dispatches(case: &Case) -> Result<()> {
+    let count = match case.id.as_str() {
+        "transform_twice" => 2,
+        "transform_three_times" => 3,
+        "transform_eight_times" => 8,
+        _ => {
+            if case.dispatches.is_some() {
+                return Err("single-pass fixture cannot carry a sequence".into());
+            }
+            return Ok(());
+        }
+    };
+    let dispatches = case
+        .dispatches
+        .as_ref()
+        .ok_or("sequence fixture requires dispatches")?;
+    if dispatches.len() != count {
+        return Err("wrong sequence dispatch count".into());
+    }
+    let locals = [[4, 2, 2], [8, 4, 4], [1, 1, 1]];
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        if dispatch.grid != [5, 3, 2] || dispatch.local != locals[i % locals.len()] {
+            return Err("unreviewed sequence dispatch shape".into());
+        }
+    }
+    if case.grid != dispatches[0].grid || case.local != dispatches[0].local {
+        return Err("sequence first dispatch does not match case".into());
+    }
+    Ok(())
 }
 
 fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
@@ -499,22 +547,35 @@ fn run_case(
         function: pipeline.function.clone(),
         pipeline_contract: pipeline.contract.clone(),
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![ComputePass {
-            pipeline: pipeline.pipeline_id,
-            buffers: views,
-            dispatch: Dispatch {
-                kind: DispatchKind::ThreadsExact,
-                grid: case.grid,
-                threads_per_threadgroup: case.local,
-            },
-        }],
+        passes: case
+            .dispatches
+            .clone()
+            .unwrap_or_else(|| {
+                vec![CaseDispatch {
+                    grid: case.grid,
+                    local: case.local,
+                }]
+            })
+            .into_iter()
+            .map(|dispatch| ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers: views.clone(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: dispatch.grid,
+                    threads_per_threadgroup: dispatch.local,
+                },
+            })
+            .collect(),
         completion_policy: CompletionPolicy::HostReadback,
     };
     if case.entry == "transform_3d" {
         let mut short = trace.clone();
-        short.passes[0].buffers[0].length = 119;
-        if let BufferSource::OwnedBytes(bytes) = &mut short.passes[0].buffers[0].source {
-            bytes.truncate(119);
+        for pass in &mut short.passes {
+            pass.buffers[0].length = 119;
+            if let BufferSource::OwnedBytes(bytes) = &mut pass.buffers[0].source {
+                bytes.truncate(119);
+            }
         }
         let rejected = provider.capabilities().admit(&short, &resources);
         if !matches!(rejected, Err(ref error) if error.slug == "buffer_footprint_exceeds_view") {
@@ -684,6 +745,41 @@ mod tests {
         assert!(validate_suite(&s).is_err());
         let mut s = load();
         s.cases[0].id = "copy_word".into();
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn serial_suite_admits_only_reviewed_dispatch_sequences() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v3.json"))
+                .unwrap()
+        };
+        let s = load();
+        validate_suite(&s).unwrap();
+        let mut s = load();
+        s.cases[0].dispatches = None;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].dispatches.as_mut().unwrap().pop();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[2].dispatches.as_mut().unwrap().push(CaseDispatch {
+            grid: [5, 3, 2],
+            local: [4, 2, 2],
+        });
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[1].dispatches.as_mut().unwrap()[1].grid = [6, 3, 2];
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn a_single_pass_case_cannot_silently_acquire_extra_gpu_work() {
+        let mut s = suite();
+        s.cases[0].dispatches = Some(vec![CaseDispatch {
+            grid: [1, 1, 1],
+            local: [1, 1, 1],
+        }]);
         assert!(validate_suite(&s).is_err());
     }
 }

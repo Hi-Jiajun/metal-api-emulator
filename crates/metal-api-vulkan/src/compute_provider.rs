@@ -1,7 +1,7 @@
 //! Synchronous, owned-byte implementation of the first compute provider slice.
 
 use crate::{
-    execute_submission_with_status, TranslatedComputePipeline, VulkanExecutor,
+    execute_serial_submission_with_status, TranslatedComputePipeline, VulkanExecutor,
     VulkanPipelineArtifact,
 };
 pub use metal_api_core::provider::CompiledComputePipeline;
@@ -29,8 +29,8 @@ struct RegisteredPipeline {
 
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
-/// This implementation admits one serial exact-thread dispatch with owned
-/// bytes and host readback. `submit` waits for GPU completion and readback;
+/// This implementation admits up to eight serial exact-thread dispatches
+/// sharing one pipeline and binding table, with owned bytes and host readback. `submit` waits for GPU completion and readback;
 /// `wait` only observes the recorded terminal result. Tokens and metadata are
 /// process-local, and no-copy leases and asynchronous submission are refused.
 /// Callers can explicitly release registered pipelines and completion records.
@@ -60,7 +60,8 @@ impl VulkanComputeProvider {
     /// Use the same device and queue lock as an existing snapshot executor.
     pub fn with_executor(executor: Arc<VulkanExecutor>) -> Result<Self, ProviderError> {
         let epoch = allocate_device_epoch()?;
-        let capabilities = executor.provider_capabilities();
+        let mut capabilities = executor.provider_capabilities();
+        capabilities.max_passes = 8;
         Ok(Self {
             executor,
             epoch,
@@ -278,6 +279,12 @@ impl ComputeProvider for VulkanComputeProvider {
             .cloned()
             .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
         validate_pipeline_identity(trace, &registered.metadata)?;
+        let mut dispatches = Vec::with_capacity(trace.passes.len());
+        for pass in &trace.passes {
+            let grid = narrow_dimensions(pass.dispatch.grid)?.dimensions();
+            let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?.dimensions();
+            dispatches.push((grid, local));
+        }
         let grid = narrow_dimensions(pass.dispatch.grid)?;
         let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?;
         let buffers = pass
@@ -318,10 +325,11 @@ impl ComputeProvider for VulkanComputeProvider {
                 .lock()
                 .map_err(|_| registry_poisoned())?;
             self.ensure_usable()?;
-            execute_submission_with_status(
+            execute_serial_submission_with_status(
                 &self.executor.context,
                 registered.artifact.clone(),
                 submission,
+                &dispatches,
             )
         };
         let result = result
