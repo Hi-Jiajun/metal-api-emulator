@@ -9,8 +9,8 @@ use metal2vulkan::reflect::{
     BufferFootprint, KernelDispatch, ResourceAccess, ResourceKind, ShaderReflection,
 };
 use metal_api_core::provider::{
-    AliasMode, BufferAccess, BufferBindingContract, DispatchKind, FootprintProof, PipelineContract,
-    ProviderCapabilities, SemanticDigest, StorageMode,
+    AffineAccess, AffineTerm, AliasMode, BufferAccess, BufferBindingContract, DispatchKind,
+    FootprintProof, PipelineContract, ProviderCapabilities, SemanticDigest, StorageMode,
 };
 use metal_api_core::ExecutorError;
 
@@ -20,6 +20,7 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 
 pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> ProviderCapabilities {
     ProviderCapabilities {
+        max_passes: 1,
         supports_threads_exact: true,
         supports_threadgroups: false,
         supports_serial: true,
@@ -32,6 +33,7 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
             .min(limits.max_descriptor_set_storage_buffers)
             .min(limits.max_per_stage_resources),
         max_buffer_range: u64::from(limits.max_storage_buffer_range),
+        max_push_constant_bytes: limits.max_push_constants_size,
         alias_mode: AliasMode::Refused,
         storage_modes: vec![StorageMode::OwnedBytes],
         host_readback: true,
@@ -50,14 +52,23 @@ pub(crate) fn pipeline_contract(
         Some(KernelDispatch::Workgroups) => DispatchKind::Threadgroups,
         None => return Err(failure("provider contract has no kernel dispatch kind")),
     };
-    let required_local_size = reflection
+    let reflected_local_size = reflection
         .local_size
         .ok_or_else(|| failure("provider contract has no reflected local size"))?
         .map(u64::from);
-    let push_constant_bytes = reflection
+    let (required_local_size, fixed_grid) = match reflection.kernel_dispatch {
+        Some(KernelDispatch::ThreadsFixed { threads_per_grid }) => (
+            Some(reflected_local_size),
+            Some(threads_per_grid.map(u64::from)),
+        ),
+        Some(KernelDispatch::Workgroups) => (Some(reflected_local_size), None),
+        Some(KernelDispatch::ThreadsDynamic { .. }) => (None, None),
+        None => return Err(failure("provider contract has no kernel dispatch kind")),
+    };
+    let (push_constant_offset, push_constant_bytes) = reflection
         .kernel_dispatch
         .and_then(KernelDispatch::push_constant_range)
-        .map_or(0, |range| range.size);
+        .map_or((0, 0), |range| (range.offset, range.size));
 
     let mut buffer_bindings = Vec::with_capacity(reflection.bindings.len());
     for binding in &reflection.bindings {
@@ -79,9 +90,12 @@ pub(crate) fn pipeline_contract(
         });
     }
 
+    buffer_bindings.sort_by_key(|binding| binding.metal_binding);
     let contract = PipelineContract {
         dispatch_kind,
         required_local_size,
+        fixed_grid,
+        push_constant_offset,
         push_constant_bytes,
         buffer_bindings,
         // Capability names are provider admission metadata. A normalized
@@ -115,7 +129,40 @@ fn map_footprint(footprint: &BufferFootprint, index: u32) -> Result<FootprintPro
         return Ok(FootprintProof::Unbounded);
     }
     if !footprint.strided_accesses.is_empty() {
-        return Ok(FootprintProof::Affine);
+        let mut accesses =
+            Vec::with_capacity(footprint.static_ranges.len() + footprint.strided_accesses.len());
+        for range in &footprint.static_ranges {
+            accesses.push(AffineAccess {
+                base_offset: range.offset,
+                access_size: range.size,
+                terms: Vec::new(),
+            });
+        }
+        for access in &footprint.strided_accesses {
+            let mut terms = Vec::with_capacity(access.terms.len());
+            for term in &access.terms {
+                let axis = match term.source {
+                    metal2vulkan::reflect::BufferIndexSource::GlobalInvocationIdX => 0,
+                    metal2vulkan::reflect::BufferIndexSource::GlobalInvocationIdY => 1,
+                    metal2vulkan::reflect::BufferIndexSource::GlobalInvocationIdZ => 2,
+                    other => {
+                        return Err(failure(format!(
+                            "buffer {index} uses unsupported affine index source {other:?}"
+                        )))
+                    }
+                };
+                terms.push(AffineTerm {
+                    axis,
+                    stride: term.stride,
+                });
+            }
+            accesses.push(AffineAccess {
+                base_offset: access.base_offset,
+                access_size: access.access_size,
+                terms,
+            });
+        }
+        return Ok(FootprintProof::Affine { accesses });
     }
     let mut max_bytes = 0_u64;
     for range in &footprint.static_ranges {
@@ -160,7 +207,10 @@ mod tests {
             }],
             has_unbounded_access: false,
         };
-        assert_eq!(map_footprint(&affine, 0).unwrap(), FootprintProof::Affine);
+        assert!(matches!(
+            map_footprint(&affine, 0).unwrap(),
+            FootprintProof::Affine { .. }
+        ));
 
         let unbounded = BufferFootprint {
             has_unbounded_access: true,
@@ -243,13 +293,13 @@ mod tests {
         };
         let contract = pipeline_contract(&reflection, None).unwrap();
         assert_eq!(contract.dispatch_kind, DispatchKind::ThreadsExact);
-        assert_eq!(contract.required_local_size, [8, 2, 1]);
+        assert_eq!(contract.required_local_size, None);
         assert_eq!(contract.push_constant_bytes, 48);
         assert_eq!(contract.buffer_bindings[0].access, BufferAccess::Write);
-        assert_eq!(
+        assert!(matches!(
             contract.buffer_bindings[0].footprint,
-            FootprintProof::Affine
-        );
+            FootprintProof::Affine { .. }
+        ));
     }
 
     #[test]
@@ -262,6 +312,7 @@ mod tests {
             max_descriptor_set_storage_buffers: 10,
             max_per_stage_resources: 14,
             max_storage_buffer_range: 4096,
+            max_push_constants_size: 128,
             ..Default::default()
         };
         let capabilities = capabilities_from_limits(&limits);
@@ -270,6 +321,7 @@ mod tests {
         assert_eq!(capabilities.max_group_count, [16, 8, 4]);
         assert_eq!(capabilities.max_storage_buffer_descriptors, 10);
         assert_eq!(capabilities.max_buffer_range, 4096);
+        assert_eq!(capabilities.max_push_constant_bytes, 128);
         assert_eq!(capabilities.storage_modes, vec![StorageMode::OwnedBytes]);
         assert!(!capabilities.supports_threadgroups);
         assert!(!capabilities.submit_only);
