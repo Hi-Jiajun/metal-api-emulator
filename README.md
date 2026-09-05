@@ -64,6 +64,13 @@ golden (`SHA-256 36d912d3995f7a5448c6008ef4aef6635a354e0a6a104377ee0a5c23d7b11b9
 The milestone does not claim `Metal.framework` compatibility or broad Metal
 conformance.
 
+The next contract slice is exposed as `metal_api_core::provider`. It contains
+only backend-neutral value types for a validated compute trace, buffer leases
+and views, dispatch policy, completion disposition, capabilities, writebacks,
+and structured provider errors. The existing `ComputeExecutor` remains a
+snapshot compatibility adapter; no production rail consumes the new contract
+yet.
+
 ## Running the smoke app
 
 The standalone executor needs a Vulkan 1.3 loader/ICD with `maintenance4`.
