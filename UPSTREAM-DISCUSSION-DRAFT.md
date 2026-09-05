@@ -1,68 +1,47 @@
-# Upstream Discussion Draft
+# Proposal: offline Metal API provider prototype and first parity case
 
-Suggested title:
+Hello! Following steel-brain's Discord suggestion to use a shared Metal
+semantic path with a Windows Metal API emulator, I have been prototyping an
+independent host-side compute workspace:
 
-> Proposal: standalone Metal API provider emulator for offline Metal/Vulkan parity
+Proposed repository: https://github.com/Hi-Jiajun/metal-api-emulator
 
-Suggested body:
+The working subset is Rust Device/Queue/CommandBuffer/ComputeEncoder/Buffer
+objects backed by Vulkan, accepting textual LLVM IR and single-module binary
+AIR. The standalone smoke runs without reims or a VM. A separate optional
+workspace exercises the same fixtures through a pinned reims Vulkan engine.
+Earlier local runs passed on Linux/Lavapipe and Windows/RTX 5060, covering a
+buffer copy and a 10x3 indexed dispatch with a barrier and exact tail regions.
 
-Hello! I have been exploring the canonical Metal provider direction described
-in the reims-vgpu discussion. I prepared a small experimental workspace for
-offline iteration before attempting any production rail integration:
+There is also a draft backend-neutral trace/resource model and capability
+validation. `ComputeProvider` is currently an interface declaration with no
+backend implementation. Asynchronous readback, native Metal execution and
+production integration are still open work. The existing two-executor
+comparison is Vulkan versus Vulkan, not native Metal/Vulkan parity.
 
-> `<repository link>`
-
-This is not a `Metal.framework` ABI implementation, and it is not intended to
-replace the current reims Vulkan rail yet. The current prototype covers a
-deliberately narrow compute-buffer subset:
-
-- a backend-neutral compute trace and provider contract;
-- standalone Vulkan and reims Vulkan adapters;
-- raw LLVM bitcode and offset-zero wrapped AIR input;
-- exact-thread dispatch and bounded buffer footprint validation;
-- resource identity, lease, completion, writeback and structured refusal types;
-- offline smoke tests on Linux/Lavapipe and Windows/RTX.
-
-The proposed shape is:
+I would like to use this as a small collaboration experiment toward:
 
 ```text
-canonical Metal semantic trace
-        |                   |
- native Metal provider   Vulkan-backed provider
-        |                   |
-      macOS              Windows
+shared host Metal operations
+  -> native Metal provider on macOS
+  -> Vulkan-backed provider on Windows
 ```
 
-The goal is to run the same small Metal semantic traces against a native Metal
-reference and the Windows Vulkan provider, without requiring a VM for every
-translation-layer iteration. The existing direct Vulkan rail would remain the
-control path until provider parity and canonical-rail integration are proven.
+The first milestone I propose is one shared buffer-compute case, with native
+Metal output/completion as the reference and Windows Vulkan as the target.
+I can contribute the Windows/RTX and WHPX test environment; help with the
+native Metal reference and the intended API boundary would be especially useful.
 
-I would appreciate feedback on four points:
+Before expanding the interface, could we align on:
 
-1. Does this match the intended canonical Metal rail and Metal-on-Metal
-   reference direction?
-2. Should the backend-neutral provider contract remain in a standalone
-   workspace, or should it eventually move into reims-vgpu?
-3. Which native Metal compute seam should be wrapped first for a useful parity
-   oracle?
-4. Would upstream be interested in collaborating on the first compute-buffer
-   parity case before any production integration PR?
+1. Whether this trace/provider approach fits the intended Metal API emulator,
+   or whether matching existing Metal call sites more closely is preferable?
+2. Whether the contract should remain independent or eventually live in reims?
+3. Which native compute call site and one small parity case would make the
+   most useful first collaboration milestone?
 
-The current implementation is intentionally incomplete: it does not claim MSL
-compilation, general MTLB function resolution, textures, render, blit,
-presentation, ICBs, guest memory landing or full Metal conformance. I am
-looking for architectural feedback and a suitable first collaboration scope,
-rather than asking for this prototype to be merged as-is.
-
-Related context: `<link to the existing Windows/WHPX issue if useful>`.
-
-## Before publishing
-
-- Replace `<repository link>` after the standalone repository is created.
-- Remove the local reims worktree dependency from the public default build.
-- Keep the reims adapter as an optional integration or a separately pinned
-  compatibility package.
-- Add repository metadata, CI and a reproducible Windows build description.
-- Recheck the final tree for credentials, VM artifacts and generated shader
-  files.
+This does not implement Metal.framework binary compatibility, MSL compilation,
+textures/render/presentation or guest-memory lifecycle. It has not replaced a
+production backend or resolved the VM display bugs. I am seeking feedback on
+the boundary and first experiment, with focused integration PRs following once
+we have evidence.

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+exclude = ["vendor/reims-vgpu"]
+
+[package]
+name = "metal-api-reims-vulkan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+license = "LGPL-3.0-or-later"
+description = "Experimental offline adapter to the pinned reims Vulkan compute engine"
+repository = "https://github.com/Hi-Jiajun/metal-api-emulator"
+
+[lib]
+name = "metal_api_reims_vulkan"
+
+[[bin]]
+name = "reims-smoke"
+path = "src/bin/reims-smoke.rs"
+
+[dependencies]
+metal-api-core = { path = "../../crates/metal-api-core" }
+metal-api-vulkan = { path = "../../crates/metal-api-vulkan" }
+metal-smoke = { path = "../../examples/metal-smoke" }
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c" }
+reims-vgpu = { path = "vendor/reims-vgpu/crates/reims-vgpu", default-features = false, features = ["backend-vulkan"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

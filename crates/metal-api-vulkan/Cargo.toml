@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Experimental AIR-to-Vulkan compute executor"
 
 [lib]
 name = "metal_api_vulkan"

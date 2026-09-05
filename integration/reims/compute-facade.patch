@@ -1,0 +1,854 @@
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/compute_validation.rs b/crates/reims-vgpu/src/backend/vulkan/engine/compute_validation.rs
+index ad083ac..49b1653 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/compute_validation.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/compute_validation.rs
+@@ -1,8 +1,10 @@
+ //! Typed validation failures for a Vulkan compute request.
+ //!
+-//! Validation runs before context creation or GPU work. The old rail collapsed
+-//! seventeen request invariants into `DrawError::Invalid(String)`, including
+-//! four descriptor-role checks with identical prose.
++//! Structural validation runs before context creation. Device-limit validation
++//! follows device selection but still precedes Vulkan object creation or GPU
++//! work. The old rail collapsed seventeen request invariants into
++//! `DrawError::Invalid(String)`, including four descriptor-role checks with
++//! identical prose.
+ 
+ use crate::observe::Decline;
+ 
+@@ -25,6 +27,37 @@ pub enum ComputeValidationDecline {
+         local_size: [u32; 3],
+         group_count: [u32; 3],
+     },
++    DispatchLocalSizeLimit {
++        region: usize,
++        dimension: usize,
++        requested: u32,
++        maximum: u32,
++    },
++    DispatchInvocationLimit {
++        region: usize,
++        requested: u64,
++        maximum: u32,
++    },
++    DispatchGroupCountLimit {
++        region: usize,
++        dimension: usize,
++        requested: u32,
++        maximum: u32,
++    },
++    DispatchPushConstantLimit {
++        offset: u32,
++        size: u32,
++        maximum: u32,
++    },
++    StorageBufferRangeLimit {
++        binding: u32,
++        requested: u64,
++        maximum: u64,
++    },
++    StorageBufferDescriptorLimit {
++        requested: u64,
++        maximum: u32,
++    },
+     DuplicateStorageBufferBinding {
+         binding: u32,
+     },
+@@ -86,6 +119,20 @@ impl Decline for ComputeValidationDecline {
+             Self::ZeroGrid { .. } => "vk_compute_validate_zero_grid",
+             Self::NoDispatchRegions => "vk_compute_validate_no_dispatch_regions",
+             Self::ZeroDispatchRegion { .. } => "vk_compute_validate_zero_dispatch_region",
++            Self::DispatchLocalSizeLimit { .. } => "vk_compute_validate_dispatch_local_size_limit",
++            Self::DispatchInvocationLimit { .. } => "vk_compute_validate_dispatch_invocation_limit",
++            Self::DispatchGroupCountLimit { .. } => {
++                "vk_compute_validate_dispatch_group_count_limit"
++            }
++            Self::DispatchPushConstantLimit { .. } => {
++                "vk_compute_validate_dispatch_push_constant_limit"
++            }
++            Self::StorageBufferRangeLimit { .. } => {
++                "vk_compute_validate_storage_buffer_range_limit"
++            }
++            Self::StorageBufferDescriptorLimit { .. } => {
++                "vk_compute_validate_storage_buffer_descriptor_limit"
++            }
+             Self::DuplicateStorageBufferBinding { .. } => {
+                 "vk_compute_validate_duplicate_storage_buffer_binding"
+             }
+@@ -118,6 +165,54 @@ impl Decline for ComputeValidationDecline {
+                 ("grid_y", grid[1].to_string()),
+                 ("grid_z", grid[2].to_string()),
+             ],
++            Self::DispatchLocalSizeLimit {
++                region,
++                dimension,
++                requested,
++                maximum,
++            }
++            | Self::DispatchGroupCountLimit {
++                region,
++                dimension,
++                requested,
++                maximum,
++            } => vec![
++                ("region", region.to_string()),
++                ("dimension", dimension.to_string()),
++                ("requested", requested.to_string()),
++                ("maximum", maximum.to_string()),
++            ],
++            Self::DispatchInvocationLimit {
++                region,
++                requested,
++                maximum,
++            } => vec![
++                ("region", region.to_string()),
++                ("requested", requested.to_string()),
++                ("maximum", maximum.to_string()),
++            ],
++            Self::DispatchPushConstantLimit {
++                offset,
++                size,
++                maximum,
++            } => vec![
++                ("offset", offset.to_string()),
++                ("size", size.to_string()),
++                ("maximum", maximum.to_string()),
++            ],
++            Self::StorageBufferRangeLimit {
++                binding,
++                requested,
++                maximum,
++            } => vec![
++                ("binding", binding.to_string()),
++                ("requested", requested.to_string()),
++                ("maximum", maximum.to_string()),
++            ],
++            Self::StorageBufferDescriptorLimit { requested, maximum } => vec![
++                ("requested", requested.to_string()),
++                ("maximum", maximum.to_string()),
++            ],
+             Self::DuplicateStorageBufferBinding { binding }
+             | Self::EmptyStorageBuffer { binding }
+             | Self::DuplicateSampledImageBinding { binding }
+@@ -217,6 +312,37 @@ mod tests {
+                 local_size: [8, 1, 1],
+                 group_count: [1, 0, 1],
+             },
++            ComputeValidationDecline::DispatchLocalSizeLimit {
++                region: 0,
++                dimension: 1,
++                requested: 65,
++                maximum: 64,
++            },
++            ComputeValidationDecline::DispatchInvocationLimit {
++                region: 0,
++                requested: 256,
++                maximum: 128,
++            },
++            ComputeValidationDecline::DispatchGroupCountLimit {
++                region: 0,
++                dimension: 0,
++                requested: 65_536,
++                maximum: 65_535,
++            },
++            ComputeValidationDecline::DispatchPushConstantLimit {
++                offset: 96,
++                size: 48,
++                maximum: 128,
++            },
++            ComputeValidationDecline::StorageBufferRangeLimit {
++                binding: 0,
++                requested: 129,
++                maximum: 128,
++            },
++            ComputeValidationDecline::StorageBufferDescriptorLimit {
++                requested: 5,
++                maximum: 4,
++            },
+             ComputeValidationDecline::DuplicateStorageBufferBinding { binding: 0 },
+             ComputeValidationDecline::EmptyStorageBuffer { binding: 0 },
+             ComputeValidationDecline::DuplicateSampledImageBinding { binding: 32 },
+@@ -274,13 +400,9 @@ mod tests {
+         slugs.sort_unstable();
+         let before = slugs.len();
+         slugs.dedup();
+-        // Down from 18: the four 1D/array-layer checks went out with the
+-        // non-2D image shape. A compute texture binding is one flat plane
+-        // window or one linear GVA level, so there is no slice or depth axis
+-        // for a request to get wrong.
+-        // Up from 16: an exact-thread launch is decomposed into regions, and
+-        // both ways that decomposition can carry no work are their own reason.
+-        assert_eq!(before, 18, "the compute validator's reason census moved");
++        // Up from the previous 18: six selected-device limits are now checked
++        // before any Vulkan object or command is created.
++        assert_eq!(before, 24, "the compute validator's reason census moved");
+         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
+     }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+index d2236c0..188622c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/context.rs
+@@ -739,6 +739,13 @@ pub(crate) struct DeviceContext {
+     /// and this is the bound that window is checked against. See
+     /// [`super::guest_scatter::build_run_table`].
+     pub max_storage_buffer_range: u64,
++    /// Per-dimension ceiling for `vkCmdDispatch` workgroup counts.
++    pub max_compute_workgroup_count: [u32; 3],
++    /// Largest push-constant byte range the device accepts.
++    pub max_push_constants_size: u32,
++    /// Effective compute-stage/set/resource ceiling for storage-buffer
++    /// descriptors. Every engine compute request uses descriptor set zero.
++    pub max_compute_storage_buffers: u32,
+     /// Which vertex attribute formats this device accepts in a vertex buffer,
+     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,
+     /// so a pipeline resolves each attribute through this rather than assuming
+@@ -1469,6 +1476,13 @@ impl DeviceContext {
+             vertex_divisor,
+             storage_buffer_offset_align: storage_buffer_offset_alignment(&props.limits),
+             max_storage_buffer_range: u64::from(props.limits.max_storage_buffer_range),
++            max_compute_workgroup_count: props.limits.max_compute_work_group_count,
++            max_push_constants_size: props.limits.max_push_constants_size,
++            max_compute_storage_buffers: props
++                .limits
++                .max_per_stage_descriptor_storage_buffers
++                .min(props.limits.max_descriptor_set_storage_buffers)
++                .min(props.limits.max_per_stage_resources),
+             vertex_formats,
+             max_sampler_anisotropy: features.max_sampler_anisotropy,
+             sampler_anisotropy: features.sampler_anisotropy,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec_compute.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec_compute.rs
+index 4261402..e4f71cd 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec_compute.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec_compute.rs
+@@ -9,14 +9,14 @@ use std::sync::atomic::Ordering;
+ use super::caches::{canonicalize_layout_bindings, BindingSig, ComputePipelineKey, ObjectCaches};
+ use super::compute_execution::ComputeExecutionDecline;
+ use super::compute_validation::ComputeValidationDecline;
+-use super::context::ContextOwner;
++use super::context::{ContextOwner, DeviceContext};
+ use super::counters::EngineCounters;
+ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
+ use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot};
+ use super::types::{
+     ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeOutput, ComputeRequest,
+     ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+-    ComputeStorageResidency, DrawError, TargetIdentity,
++    ComputeStorageResidency, DrawError, TargetIdentity, COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE,
+ };
+ use super::vk_call::{VkCall, VkOp};
+ 
+@@ -291,6 +291,142 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
+     Ok(())
+ }
+ 
++#[derive(Clone, Copy, Debug)]
++struct ComputeDeviceLimits {
++    local_size: [u32; 3],
++    local_invocations: u32,
++    group_count: [u32; 3],
++    push_constants_size: u32,
++    storage_buffer_range: u64,
++    storage_buffer_descriptors: u32,
++}
++
++impl From<&DeviceContext> for ComputeDeviceLimits {
++    fn from(context: &DeviceContext) -> Self {
++        Self {
++            local_size: context.features.max_compute_workgroup_size,
++            local_invocations: context.features.max_compute_workgroup_invocations,
++            group_count: context.max_compute_workgroup_count,
++            push_constants_size: context.max_push_constants_size,
++            storage_buffer_range: context.max_storage_buffer_range,
++            storage_buffer_descriptors: context.max_compute_storage_buffers,
++        }
++    }
++}
++
++fn validate_group_count(
++    region: usize,
++    group_count: [u32; 3],
++    limits: ComputeDeviceLimits,
++) -> Result<(), DrawError> {
++    for (dimension, requested) in group_count.into_iter().enumerate() {
++        let maximum = limits.group_count[dimension];
++        if requested > maximum {
++            return Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::DispatchGroupCountLimit {
++                    region,
++                    dimension,
++                    requested,
++                    maximum,
++                },
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn validate_compute_device_limits(
++    req: &ComputeRequest,
++    limits: ComputeDeviceLimits,
++) -> Result<(), DrawError> {
++    match &req.dispatch {
++        ComputeDispatch::Workgroups(group_count) => {
++            validate_group_count(0, *group_count, limits)?;
++        }
++        ComputeDispatch::Regions {
++            push_offset,
++            regions,
++            ..
++        } => {
++            let push_end = push_offset.checked_add(COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE);
++            if push_offset % 4 != 0
++                || push_end.is_none()
++                || push_end.is_some_and(|end| end > limits.push_constants_size)
++            {
++                return Err(DrawError::ComputeValidation(
++                    ComputeValidationDecline::DispatchPushConstantLimit {
++                        offset: *push_offset,
++                        size: COMPUTE_DISPATCH_PUSH_CONSTANT_SIZE,
++                        maximum: limits.push_constants_size,
++                    },
++                ));
++            }
++            for (region_index, region) in regions.iter().enumerate() {
++                for (dimension, requested) in region.local_size.into_iter().enumerate() {
++                    let maximum = limits.local_size[dimension];
++                    if requested > maximum {
++                        return Err(DrawError::ComputeValidation(
++                            ComputeValidationDecline::DispatchLocalSizeLimit {
++                                region: region_index,
++                                dimension,
++                                requested,
++                                maximum,
++                            },
++                        ));
++                    }
++                }
++                let invocations = region
++                    .local_size
++                    .into_iter()
++                    .try_fold(1_u64, |total, dimension| {
++                        total.checked_mul(u64::from(dimension))
++                    })
++                    .unwrap_or(u64::MAX);
++                if invocations > u64::from(limits.local_invocations) {
++                    return Err(DrawError::ComputeValidation(
++                        ComputeValidationDecline::DispatchInvocationLimit {
++                            region: region_index,
++                            requested: invocations,
++                            maximum: limits.local_invocations,
++                        },
++                    ));
++                }
++                validate_group_count(region_index, region.group_count, limits)?;
++            }
++        }
++    }
++
++    let descriptor_count = u64::try_from(req.storage_buffers.len()).unwrap_or(u64::MAX);
++    if descriptor_count > u64::from(limits.storage_buffer_descriptors) {
++        return Err(DrawError::ComputeValidation(
++            ComputeValidationDecline::StorageBufferDescriptorLimit {
++                requested: descriptor_count,
++                maximum: limits.storage_buffer_descriptors,
++            },
++        ));
++    }
++    for buffer in &req.storage_buffers {
++        let requested = u64::try_from(buffer.bytes.len()).unwrap_or(u64::MAX);
++        if requested > limits.storage_buffer_range {
++            return Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::StorageBufferRangeLimit {
++                    binding: buffer.binding,
++                    requested,
++                    maximum: limits.storage_buffer_range,
++                },
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn compute_completion_wait_required(
++    force_completion_wait: bool,
++    all_writeback_deferred: bool,
++) -> bool {
++    force_completion_wait || !all_writeback_deferred
++}
++
+ /// A copy-on-sample bind must name a resident whose image is byte-for-byte the
+ /// image the view will sample: same vk format, same width, same height. The
+ /// runtime only ever binds the key it looked the mirror up under, so an
+@@ -365,6 +501,7 @@ pub(crate) unsafe fn execute_compute_inner(
+     pools: &mut ResourcePools,
+     counters: &EngineCounters,
+     req: &ComputeRequest,
++    force_completion_wait: bool,
+ ) -> Result<ComputeOutput, DrawError> {
+     validate_compute(req)?;
+     let force_loss = owner.force_device_lost;
+@@ -377,6 +514,7 @@ pub(crate) unsafe fn execute_compute_inner(
+             super::reason::DrawReason::NoCombinedGraphicsComputeQueue,
+         ));
+     }
++    validate_compute_device_limits(req, ComputeDeviceLimits::from(ctx))?;
+     pools.ensure_init(ctx, counters)?;
+ 
+     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
+@@ -1418,10 +1556,12 @@ pub(crate) unsafe fn execute_compute_inner(
+         }
+     }
+ 
+-    // A dispatch whose every output stays on the GPU (deferred storage-image
+-    // writebacks, no writable SSBO readbacks, no direct guest-window DMA) has
+-    // nothing to hand the CPU — skip the post-submit fence wait and return
+-    // while the GPU still runs. Ordering stays intact everywhere: every user
++    // A product dispatch whose every output stays on the GPU (deferred
++    // storage-image writebacks, no writable SSBO readbacks, no direct
++    // guest-window DMA) has nothing to hand the CPU, so it may skip the
++    // post-submit fence wait and return while the GPU still runs. The explicit
++    // synchronous facade overrides that choice even with no readback. Product
++    // ordering stays intact everywhere: every user
+     // of the shared fence/CB waits it before reuse, the deferred flush
+     // (read_resident_storage) waits it before copying, and the owed
+     // descriptor-set/pool cleanup is stashed until a later wait proves the CB
+@@ -1443,7 +1583,7 @@ pub(crate) unsafe fn execute_compute_inner(
+     let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), Vec::new());
+     pools.finish_entry_async(&ctx.device, sealed);
+ 
+-    if all_writeback_deferred {
++    if !compute_completion_wait_required(force_completion_wait, all_writeback_deferred) {
+         counters
+             .compute_post_wait_skips
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+@@ -1539,12 +1679,131 @@ pub(super) unsafe fn copy_mapped_output(ptr: *const u8, len: usize) -> Vec<u8> {
+ mod tests {
+     use super::*;
+     use crate::backend::vulkan::engine::{
+-        ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+-        ComputeStorageImageResource, SamplerResource, StorageImageFormat,
++        ComputeBufferResource, ComputeDispatchRegion, ComputeResidentSampleBind,
++        ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
++        SamplerResource, StorageImageFormat,
+     };
+     use crate::model::ComputeStorageResidencyKey;
+     use crate::observe::Decline;
+ 
++    #[test]
++    fn explicit_completion_waits_even_when_no_readback_is_owed() {
++        assert!(compute_completion_wait_required(true, true));
++        assert!(!compute_completion_wait_required(false, true));
++        assert!(compute_completion_wait_required(false, false));
++    }
++
++    fn test_compute_limits() -> ComputeDeviceLimits {
++        ComputeDeviceLimits {
++            local_size: [8, 4, 2],
++            local_invocations: 32,
++            group_count: [16, 8, 4],
++            push_constants_size: 128,
++            storage_buffer_range: 128,
++            storage_buffer_descriptors: 2,
++        }
++    }
++
++    fn test_region_request(local_size: [u32; 3], group_count: [u32; 3]) -> ComputeRequest {
++        ComputeRequest {
++            dispatch: ComputeDispatch::Regions {
++                push_offset: 0,
++                threadgroups_per_grid: group_count,
++                regions: vec![ComputeDispatchRegion {
++                    local_size,
++                    group_count,
++                    push_constants: [0; 12],
++                }],
++            },
++            storage_buffers: vec![ComputeBufferResource {
++                binding: 0,
++                bytes: vec![0; 128],
++                writable: true,
++            }],
++            ..ComputeRequest::default()
++        }
++    }
++
++    #[test]
++    fn device_limits_admit_the_boundary_and_refuse_invalid_dispatches() {
++        let limits = test_compute_limits();
++        assert!(validate_compute_device_limits(
++            &test_region_request([8, 2, 2], [16, 8, 4]),
++            limits
++        )
++        .is_ok());
++
++        let too_wide = test_region_request([9, 1, 1], [1, 1, 1]);
++        assert!(matches!(
++            validate_compute_device_limits(&too_wide, limits),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::DispatchLocalSizeLimit { dimension: 0, .. }
++            ))
++        ));
++
++        let too_many_invocations = test_region_request([8, 4, 2], [1, 1, 1]);
++        let tight_invocation_limit = ComputeDeviceLimits {
++            local_invocations: 31,
++            ..limits
++        };
++        assert!(matches!(
++            validate_compute_device_limits(&too_many_invocations, tight_invocation_limit),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::DispatchInvocationLimit { requested: 64, .. }
++            ))
++        ));
++
++        let too_many_groups = test_region_request([1, 1, 1], [17, 1, 1]);
++        assert!(matches!(
++            validate_compute_device_limits(&too_many_groups, limits),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::DispatchGroupCountLimit { dimension: 0, .. }
++            ))
++        ));
++    }
++
++    #[test]
++    fn device_limits_refuse_push_and_storage_buffer_overreach() {
++        let limits = test_compute_limits();
++        let mut bad_push = test_region_request([1, 1, 1], [1, 1, 1]);
++        let ComputeDispatch::Regions { push_offset, .. } = &mut bad_push.dispatch else {
++            unreachable!()
++        };
++        *push_offset = 2;
++        assert!(matches!(
++            validate_compute_device_limits(&bad_push, limits),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::DispatchPushConstantLimit { offset: 2, .. }
++            ))
++        ));
++
++        let mut long_buffer = test_region_request([1, 1, 1], [1, 1, 1]);
++        long_buffer.storage_buffers[0].bytes.push(0);
++        assert!(matches!(
++            validate_compute_device_limits(&long_buffer, limits),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::StorageBufferRangeLimit { requested: 129, .. }
++            ))
++        ));
++
++        let mut too_many_buffers = test_region_request([1, 1, 1], [1, 1, 1]);
++        for binding in 1..=2 {
++            too_many_buffers
++                .storage_buffers
++                .push(ComputeBufferResource {
++                    binding,
++                    bytes: vec![0],
++                    writable: false,
++                });
++        }
++        assert!(matches!(
++            validate_compute_device_limits(&too_many_buffers, limits),
++            Err(DrawError::ComputeValidation(
++                ComputeValidationDecline::StorageBufferDescriptorLimit { requested: 3, .. }
++            ))
++        ));
++    }
++
+     /// A dispatch whose layout omits a binding its module samples is refused by
+     /// number, and one that only omits an unreferenced binding is not.
+     ///
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 89cdfef..566086a 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -70,18 +70,18 @@ pub(crate) use host_ram::GuestWriteDecline;
+ pub use types::viewport_slot_count;
+ pub use types::{
+     BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
+-    ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload, ComputeDispatchRegion,
+-    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
+-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
++    ComputeBufferOutput, ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload,
++    ComputeDispatchRegion, ComputeImageDestination, ComputeImageResult, ComputeOutput,
++    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+     ComputeStorageImageResource, ComputeStorageResidency, DepthState, DrawError, DrawOutput,
+-    DrawRequest, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
+-    GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
+-    PrimitiveTopology, SampledByteOrigin, SampledContentIdentity, SampledImageResource,
+-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+-    SeedOrder, StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+-    TargetIdentity, TargetKeyDivergence, VertexAttributeFormat, VertexAttributeResource,
+-    VertexStepFunction, ViewportResource, VisibilityResultMode, WindowPresentSource,
+-    COLOR_INPUT_BINDING,
++    DrawRequest, ExactThreadDispatchError, GuestRun, GuestRunSource, GuestSampledBacking,
++    GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
++    PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
++    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
++    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
++    StorageBufferResource, StorageImageFormat, TargetIdentity, TargetKeyDivergence,
++    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
++    VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
+ };
+ pub(crate) use vk_call::{VkCall, VkOp};
+ #[cfg(feature = "host-window")]
+@@ -2031,12 +2031,13 @@ pub fn execute_compute_request(
+             facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+         ));
+     };
+-    device_caches.with(|caches| execute_compute_request_with(caches, req))
++    device_caches.with(|caches| execute_compute_request_with(caches, req, false))
+ }
+ 
+ fn execute_compute_request_with(
+     caches: &mut ObjectCaches,
+     req: &ComputeRequest,
++    force_completion_wait: bool,
+ ) -> Result<ComputeOutput, ComputeError> {
+     let mut guard = lock_engine();
+     let EngineState {
+@@ -2045,11 +2046,18 @@ fn execute_compute_request_with(
+         ref counters,
+         ..
+     } = &mut *guard;
+-    let result =
+-        unsafe { exec_compute::execute_compute_inner(owner, caches, pools, counters, req) };
++    let result = unsafe {
++        exec_compute::execute_compute_inner(
++            owner,
++            caches,
++            pools,
++            counters,
++            req,
++            force_completion_wait,
++        )
++    };
+     match result {
+         Ok(out) => {
+-            // Same as the draw arm: a dispatch that ran proves the device.
+             guard.owner.note_work_completed();
+             Ok(out)
+         }
+@@ -2061,6 +2069,24 @@ fn execute_compute_request_with(
+     }
+ }
+ 
++/// Execute one compute dispatch and wait until its submitted GPU work retires.
++///
++/// The product guest path uses [`execute_compute_request`], which may leave a
++/// readback-free request ordered by the engine's submission ring. Source-level
++/// API facades require `commit` to be synchronous, including for read-only
++/// shaders, so they enter through this explicit boundary instead.
++pub fn execute_compute_request_sync(
++    state: &crate::model::DeviceState,
++    req: &ComputeRequest,
++) -> Result<ComputeOutput, ComputeError> {
++    let Some(device_caches) = device_caches(state) else {
++        return Err(DrawError::Facade(
++            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
++        ));
++    };
++    device_caches.with(|caches| execute_compute_request_with(caches, req, true))
++}
++
+ /// Measure-only: does the target registry hold **content_ready** for this identity?
+ ///
+ /// Used by mapper-ref-texture sample dig (`sample_src=… resident_ready=`) to detect the
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index ac3e713..dffcc2d 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -29,7 +29,8 @@ pub enum DrawError {
+     DrawValidation(super::draw_validation::DrawValidationDecline),
+     /// A validated draw request failed while materializing execution state.
+     DrawExecution(super::draw_execution::DrawExecutionDecline),
+-    /// Compute request rejected before context creation or GPU work.
++    /// Compute request rejected before GPU work. Structural checks run before
++    /// context creation; device-limit checks run immediately after selection.
+     ComputeValidation(super::compute_validation::ComputeValidationDecline),
+     /// A validated compute request lost or mismatched resident execution state.
+     ComputeExecution(super::compute_execution::ComputeExecutionDecline),
+@@ -1411,6 +1412,43 @@ impl Default for ComputeDispatch {
+ }
+ 
+ impl ComputeDispatch {
++    /// Build the complete Vulkan region sequence for one Metal
++    /// `dispatchThreads` launch.
++    ///
++    /// The translated kernel owns both the push-constant offset and the
++    /// region decomposition contract. Keeping this constructor beside
++    /// [`ComputeDispatch::Regions`] gives off-guest API adapters the same plan
++    /// as the product runtime instead of asking each caller to duplicate the
++    /// exact-thread arithmetic.
++    pub fn exact_threads(
++        kernel_dispatch: metal2vulkan::reflect::KernelDispatch,
++        nominal_local_size: [u32; 3],
++        threads_per_grid: [u32; 3],
++    ) -> Result<Self, ExactThreadDispatchError> {
++        kernel_dispatch
++            .validate()
++            .map_err(ExactThreadDispatchError::ContractInvalid)?;
++        let range = kernel_dispatch
++            .push_constant_range()
++            .ok_or(ExactThreadDispatchError::PushRangeUnavailable)?;
++        let plan = kernel_dispatch
++            .plan(nominal_local_size, Some(threads_per_grid))
++            .map_err(ExactThreadDispatchError::PlanRefused)?;
++        Ok(Self::Regions {
++            push_offset: range.offset,
++            threadgroups_per_grid: plan.threadgroups_per_grid,
++            regions: plan
++                .regions
++                .iter()
++                .map(|region| ComputeDispatchRegion {
++                    local_size: region.local_size,
++                    group_count: region.group_count,
++                    push_constants: plan.push_constants(*region),
++                })
++                .collect(),
++        })
++    }
++
+     /// The whole launch's workgroup counts, whichever form issues them.
+     pub fn threadgroups_per_grid(&self) -> [u32; 3] {
+         match self {
+@@ -1433,6 +1471,34 @@ impl ComputeDispatch {
+     }
+ }
+ 
++/// Why a reflected Metal exact-thread contract could not become a complete
++/// engine dispatch.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ExactThreadDispatchError {
++    /// The reflected dispatch contract is malformed.
++    ContractInvalid(String),
++    /// The translated module does not expose the 48-byte logical-grid payload.
++    PushRangeUnavailable,
++    /// The translator rejected the requested grid or nominal local size.
++    PlanRefused(String),
++}
++
++impl std::fmt::Display for ExactThreadDispatchError {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::ContractInvalid(detail) => {
++                write!(formatter, "invalid exact-thread contract: {detail}")
++            }
++            Self::PushRangeUnavailable => {
++                formatter.write_str("translated kernel has no exact-thread push-constant range")
++            }
++            Self::PlanRefused(detail) => write!(formatter, "exact-thread plan refused: {detail}"),
++        }
++    }
++}
++
++impl std::error::Error for ExactThreadDispatchError {}
++
+ /// Byte size of one region's dispatch payload.
+ ///
+ /// Derived from the payload itself rather than restated, so the range a layout
+@@ -2428,6 +2494,63 @@ pub struct SampledContentIdentity {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn exact_thread_constructor_owns_all_boundary_regions_and_payloads() {
++        let dispatch = ComputeDispatch::exact_threads(
++            metal2vulkan::reflect::KernelDispatch::safe_default(),
++            [8, 2, 1],
++            [10, 3, 1],
++        )
++        .expect("the reflected exact-thread contract is complete");
++        let ComputeDispatch::Regions {
++            push_offset,
++            threadgroups_per_grid,
++            regions,
++        } = dispatch
++        else {
++            panic!("an exact-thread contract must produce regions");
++        };
++        assert_eq!(push_offset, 0);
++        assert_eq!(threadgroups_per_grid, [2, 2, 1]);
++        assert_eq!(regions.len(), 4);
++        assert_eq!(
++            regions
++                .iter()
++                .map(|region| (region.local_size, region.group_count))
++                .collect::<Vec<_>>(),
++            vec![
++                ([8, 2, 1], [1, 1, 1]),
++                ([2, 2, 1], [1, 1, 1]),
++                ([8, 1, 1], [1, 1, 1]),
++                ([2, 1, 1], [1, 1, 1]),
++            ]
++        );
++        assert_eq!(
++            regions[3].push_constants,
++            [10, 3, 1, 8, 2, 0, 1, 1, 0, 2, 2, 1]
++        );
++    }
++
++    #[test]
++    fn exact_thread_constructor_refuses_a_contract_without_a_payload() {
++        assert_eq!(
++            ComputeDispatch::exact_threads(
++                metal2vulkan::reflect::KernelDispatch::Workgroups,
++                [8, 2, 1],
++                [10, 3, 1],
++            ),
++            Err(ExactThreadDispatchError::PushRangeUnavailable)
++        );
++        assert!(matches!(
++            ComputeDispatch::exact_threads(
++                metal2vulkan::reflect::KernelDispatch::ThreadsDynamic { offset: 2 },
++                [8, 2, 1],
++                [10, 3, 1],
++            ),
++            Err(ExactThreadDispatchError::ContractInvalid(_))
++        ));
++    }
++
+     /// A draw that samples one of its own attachments must reach the snapshot
+     /// arm, and "its own" is every attachment it binds rather than slot 0.
+     ///
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/vulkan.rs b/crates/reims-vgpu/src/runtime/compute_exec/vulkan.rs
+index 56843be..1062d3f 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/vulkan.rs
+@@ -1531,25 +1531,18 @@ pub(crate) fn kernel_dispatch_launch(
+     // payload at the translator's default offset while `ThreadsDynamic` names
+     // its own, and an offset whose range would not fit is refused rather than
+     // truncated — a short range is a shader reading bytes no one wrote.
+-    let range = kernel_dispatch
+-        .push_constant_range()
+-        .ok_or(KernelDispatchDecline::PushRangeUnavailable)?;
+-    let plan = kernel_dispatch
+-        .plan(nominal_local_size, Some(threads_per_grid))
+-        .map_err(KernelDispatchDecline::PlanRefused)?;
+-    Ok(vk_engine::ComputeDispatch::Regions {
+-        push_offset: range.offset,
+-        threadgroups_per_grid: plan.threadgroups_per_grid,
+-        regions: plan
+-            .regions
+-            .iter()
+-            .map(|region| vk_engine::ComputeDispatchRegion {
+-                local_size: region.local_size,
+-                group_count: region.group_count,
+-                push_constants: plan.push_constants(*region),
+-            })
+-            .collect(),
+-    })
++    vk_engine::ComputeDispatch::exact_threads(kernel_dispatch, nominal_local_size, threads_per_grid)
++        .map_err(|error| match error {
++            vk_engine::ExactThreadDispatchError::ContractInvalid(detail) => {
++                KernelDispatchDecline::PlanRefused(detail)
++            }
++            vk_engine::ExactThreadDispatchError::PushRangeUnavailable => {
++                KernelDispatchDecline::PushRangeUnavailable
++            }
++            vk_engine::ExactThreadDispatchError::PlanRefused(detail) => {
++                KernelDispatchDecline::PlanRefused(detail)
++            }
++        })
+ }
+ 
+ pub(super) fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
