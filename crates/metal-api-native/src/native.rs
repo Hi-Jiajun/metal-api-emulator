@@ -34,7 +34,7 @@ struct State {
 }
 
 /// Synchronous native provider with at most eight serial passes over one buffer
-/// pool, allowing binding permutations for the exact conformance fixtures.
+/// pool, allowing pipeline changes and binding permutations for exact fixtures.
 ///
 /// A submission has a 20-second observation deadline. Unknown retirement or a
 /// GPU error permanently disables new work in this context and retains its
@@ -250,39 +250,53 @@ impl ComputeProvider for NativeMetalProvider {
         let trace = admitted.trace();
         self.check_epoch(trace.device_epoch)?;
         self.capabilities.admit(trace, admitted.resources())?;
-        let pass = &trace.passes[0];
         let mut state = self.lock()?;
         state.ensure_usable()?;
-        let registered = state
-            .pipelines
-            .get(&pass.pipeline)
-            .cloned()
-            .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
-        if trace.function != registered.metadata.function {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Resource,
-                "pipeline_function_mismatch",
-            ));
-        }
-        if trace.pipeline_contract != registered.metadata.contract {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Resource,
-                "pipeline_contract_mismatch",
-            ));
-        }
-        if pass.buffers.iter().any(|view| view.metal_binding > 30) {
-            return Err(refusal(
-                ProviderPhase::Encode,
-                ProviderErrorClass::Capability,
-                "metal_buffer_binding_limit",
-            ));
-        }
-        // Admission establishes one pipeline and stable logical buffer pool.
-        // Dispatch dimensions can differ, so check every pipeline-local
-        // limit before allocating buffers or creating a command buffer.
+        // Resolve and retain every pass's pipeline under the same registry
+        // lock, checking all metadata and local limits before GPU allocation.
+        let mut pipelines = Vec::with_capacity(trace.passes.len());
         for (pass_index, pass) in trace.passes.iter().enumerate() {
+            let metadata = trace.pipeline(pass.pipeline).map_err(|error| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Args,
+                    "pipeline_table_invalid",
+                )
+                .with_detail(error.to_string())
+            })?;
+            let registered = state
+                .pipelines
+                .get(&pass.pipeline)
+                .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
+            if metadata.function != registered.metadata.function {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "pipeline_function_mismatch",
+                ));
+            }
+            if metadata.contract != registered.metadata.contract {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "pipeline_contract_mismatch",
+                ));
+            }
+            if metadata != &registered.metadata {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "pipeline_identity_mismatch",
+                ));
+            }
+            if pass.buffers.iter().any(|view| view.metal_binding > 30) {
+                return Err(refusal(
+                    ProviderPhase::Encode,
+                    ProviderErrorClass::Capability,
+                    "metal_buffer_binding_limit",
+                )
+                .with_field("pass_index", FieldValue::Unsigned(pass_index as u64)));
+            }
             let local = pass.dispatch.threads_per_threadgroup;
             let invocations = local.into_iter().try_fold(1_u64, u64::checked_mul);
             if invocations
@@ -295,13 +309,13 @@ impl ComputeProvider for NativeMetalProvider {
                 )
                 .with_field("pass_index", FieldValue::Unsigned(pass_index as u64)));
             }
+            pipelines.push(registered.pipeline.clone());
         }
         let token = CompletionToken {
             device_epoch: self.epoch,
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
-        let result =
-            objc::rc::autoreleasepool(|| execute(&mut state, trace, registered.pipeline, token));
+        let result = objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token));
         let observation = match &result {
             Ok(submission) => Some(Ok(submission.completion)),
             Err(error) if error.completion.token().is_some() => Some(Err(error.clone())),
@@ -342,7 +356,7 @@ struct SubmissionResources {
     // Retain the whole context as well as the explicit command dependencies.
     _device: Device,
     _queue: CommandQueue,
-    pipeline: ComputePipelineState,
+    pipelines: Vec<ComputePipelineState>,
     command: CommandBuffer,
     buffers: Vec<Buffer>,
 }
@@ -367,7 +381,7 @@ impl Drop for PendingSubmission {
 fn execute(
     state: &mut State,
     trace: &ComputeTrace,
-    pipeline: ComputePipelineState,
+    pipelines: Vec<ComputePipelineState>,
     token: CompletionToken,
 ) -> Result<ProviderSubmission, ProviderError> {
     let pool = trace.serial_resources().map_err(|error| {
@@ -425,7 +439,7 @@ fn execute(
         resources: Some(SubmissionResources {
             _device: state.device.clone(),
             _queue: state.queue.clone(),
-            pipeline,
+            pipelines,
             command,
             buffers,
         }),
@@ -436,7 +450,7 @@ fn execute(
     // resources on MTLCommandQueue carry writes across encoder boundaries:
     // https://developer.apple.com/documentation/metal/resource-synchronization
     // Each pass sees earlier writes; the initial bytes are uploaded only once.
-    for pass in &trace.passes {
+    for (pass_index, pass) in trace.passes.iter().enumerate() {
         let encoder = unsafe {
             let pointer: *mut metal::MTLComputeCommandEncoder =
                 msg_send![resources.command.as_ref(), computeCommandEncoder];
@@ -445,7 +459,7 @@ fn execute(
             }
             ComputeCommandEncoderRef::from_ptr(pointer)
         };
-        encoder.set_compute_pipeline_state(&resources.pipeline);
+        encoder.set_compute_pipeline_state(&resources.pipelines[pass_index]);
         for view in &pass.buffers {
             // serial_resources validated that each pass permutes this pool.
             let buffer = &resources.buffers[pool_positions[&view.view_id]];

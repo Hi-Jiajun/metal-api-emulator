@@ -80,6 +80,7 @@ struct Case {
     buffers: Vec<Buffer>,
     expected_writebacks: Vec<Writeback>,
     dispatches: Option<Vec<CaseDispatch>>,
+    programs: Option<Vec<CaseProgram>>,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -88,9 +89,18 @@ struct CaseDispatch {
     grid: [u64; 3],
     local: [u64; 3],
     bindings: Option<Vec<u64>>,
+    program: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CaseProgram {
+    entry: String,
+    air: Source,
+    metal: Source,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Source {
     path: String,
@@ -187,44 +197,51 @@ fn main() -> Result<()> {
     let suite: Suite = serde_json::from_slice(&raw)?;
     validate_suite(&suite)?;
     let directory = suite_path.parent().unwrap_or(Path::new("."));
-    let mut sources = Vec::new();
+    let mut sources = BTreeMap::new();
     for case in &suite.cases {
-        let air = verified_source(directory, &case.air)?;
-        let metal = verified_source(directory, &case.metal)?;
-        sources.push(match backend {
-            Backend::Vulkan => ShaderSource::SanitizedLl(String::from_utf8(air)?),
-            Backend::NativeMetalProvider => ShaderSource::MetalSource(String::from_utf8(metal)?),
-        });
+        for program in case_programs(case) {
+            let air = verified_source(directory, &program.air)?;
+            let metal = verified_source(directory, &program.metal)?;
+            sources.insert(
+                program.entry,
+                match backend {
+                    Backend::Vulkan => ShaderSource::SanitizedLl(String::from_utf8(air)?),
+                    Backend::NativeMetalProvider => {
+                        ShaderSource::MetalSource(String::from_utf8(metal)?)
+                    }
+                },
+            );
+        }
     }
     let identity = hex(&Sha256::digest(&raw));
     let (provider, device_name) = create_provider(backend)?;
     let mut results = Vec::new();
     let mut pipelines = BTreeMap::new();
-    for (index, (case, source)) in suite.cases.iter().zip(sources).enumerate() {
-        if !pipelines.contains_key(&case.entry) {
-            let pipeline = provider
-                .compile(PipelineCompileRequest {
-                    entry_name: case.entry.clone(),
-                    logical_digest: SemanticDigest::new(
-                        "suite-sha256-entry-v1",
-                        format!("{identity}:{}", case.entry).into_bytes(),
-                    )?,
-                    source,
-                })
-                .map_err(|error| format!("compile {}: {error:?}", case.entry))?;
-            if backend == Backend::Vulkan && case.entry == "transform_3d" {
-                verify_transform_contract(&pipeline)?;
-            }
-            eprintln!(
-                "{} artifact registered: entry={}",
-                backend.name(),
-                case.entry
-            );
-            pipelines.insert(case.entry.clone(), pipeline);
+    for (entry, source) in sources {
+        let pipeline = provider
+            .compile(PipelineCompileRequest {
+                entry_name: entry.clone(),
+                logical_digest: SemanticDigest::new(
+                    "suite-sha256-entry-v1",
+                    format!("{identity}:{entry}").into_bytes(),
+                )?,
+                source,
+            })
+            .map_err(|error| format!("compile {entry}: {error:?}"))?;
+        if backend == Backend::Vulkan && (entry == "transform_3d" || entry == "mix_3d") {
+            verify_transform_contract(&pipeline)?;
         }
+        eprintln!("{} artifact registered: entry={entry}", backend.name());
+        pipelines.insert(entry, pipeline);
+    }
+    for (index, case) in suite.cases.iter().enumerate() {
+        let programs = case_programs(case)
+            .iter()
+            .map(|program| pipelines[&program.entry].clone())
+            .collect::<Vec<_>>();
         results.push(run_case(
             provider.as_ref(),
-            &pipelines[&case.entry],
+            &programs,
             case,
             index as u64 + 1,
             suite.guard_byte,
@@ -284,6 +301,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "transform_pingpong_eight",
             "copy_pingpong",
         ],
+        (1, "compute-buffer-v5") => &[
+            "pipeline_chain_two",
+            "pipeline_chain_three",
+            "pipeline_chain_eight",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -297,34 +319,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     let mut ids = BTreeSet::new();
     for case in &suite.cases {
         validate_case_dispatches(case)?;
-        let (air_path, air_hash, metal_path, metal_hash) = match case.entry.as_str() {
-            "copy_word" => (
-                "../examples/metal-smoke/shaders/kernel_copy_word.ll",
-                "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99",
-                "shaders/copy_word.metal",
-                "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc",
-            ),
-            "kernel_dispatch_threads_boundary_barrier" => (
-                "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
-                "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945",
-                "shaders/indexed_boundary.metal",
-                "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06",
-            ),
-            "transform_3d" => (
-                "shaders/transform_3d.ll",
-                "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2",
-                "shaders/transform_3d.metal",
-                "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b",
-            ),
-            _ => return Err("unknown shader entry".into()),
-        };
-        if case.air.path != air_path
-            || case.air.sha256 != air_hash
-            || case.metal.path != metal_path
-            || case.metal.sha256 != metal_hash
-        {
-            return Err("unreviewed shader identity".into());
-        }
+        validate_case_programs(case)?;
         if !ids.insert(&case.id) {
             return Err("duplicate case identity".into());
         }
@@ -386,6 +381,74 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     Ok(())
 }
 
+fn case_programs(case: &Case) -> Vec<CaseProgram> {
+    case.programs.clone().unwrap_or_else(|| {
+        vec![CaseProgram {
+            entry: case.entry.clone(),
+            air: case.air.clone(),
+            metal: case.metal.clone(),
+        }]
+    })
+}
+fn validate_program(program: &CaseProgram) -> Result<()> {
+    let (air_path, air_hash, metal_path, metal_hash) = match program.entry.as_str() {
+        "copy_word" => (
+            "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+            "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99",
+            "shaders/copy_word.metal",
+            "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc",
+        ),
+        "kernel_dispatch_threads_boundary_barrier" => (
+            "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
+            "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945",
+            "shaders/indexed_boundary.metal",
+            "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06",
+        ),
+        "transform_3d" => (
+            "shaders/transform_3d.ll",
+            "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2",
+            "shaders/transform_3d.metal",
+            "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b",
+        ),
+        "mix_3d" => (
+            "shaders/mix_3d.ll",
+            "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f",
+            "shaders/mix_3d.metal",
+            "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5",
+        ),
+        _ => return Err("unknown shader entry".into()),
+    };
+    if program.air.path != air_path
+        || program.air.sha256 != air_hash
+        || program.metal.path != metal_path
+        || program.metal.sha256 != metal_hash
+    {
+        return Err("unreviewed shader identity".into());
+    }
+    Ok(())
+}
+fn validate_case_programs(case: &Case) -> Result<()> {
+    let programs = case_programs(case);
+    if case.id.starts_with("pipeline_chain_") {
+        if case.programs.is_none()
+            || programs.len() != 2
+            || programs[0].entry != "transform_3d"
+            || programs[1].entry != "mix_3d"
+            || programs[0].entry != case.entry
+            || programs[0].air != case.air
+            || programs[0].metal != case.metal
+        {
+            return Err("unreviewed program table".into());
+        }
+    } else if case.programs.is_some() {
+        return Err("legacy fixture cannot carry program table".into());
+    }
+    for program in programs {
+        validate_program(&program)?;
+    }
+    Ok(())
+}
+
 type CaseShape = (
     &'static str,
     [u64; 3],
@@ -428,7 +491,10 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         | "transform_eight_times"
         | "transform_pingpong_two"
         | "transform_pingpong_three"
-        | "transform_pingpong_eight" => transform([4, 2, 2]),
+        | "transform_pingpong_eight"
+        | "pipeline_chain_two"
+        | "pipeline_chain_three"
+        | "pipeline_chain_eight" => transform([4, 2, 2]),
         "transform_small_grid" => transform([8, 4, 4]),
         _ => return Err("unknown case identity".into()),
     })
@@ -436,9 +502,9 @@ fn case_shape(id: &str) -> Result<CaseShape> {
 
 fn validate_case_dispatches(case: &Case) -> Result<()> {
     let count = match case.id.as_str() {
-        "transform_twice" | "transform_pingpong_two" | "copy_pingpong" => 2,
-        "transform_three_times" | "transform_pingpong_three" => 3,
-        "transform_eight_times" | "transform_pingpong_eight" => 8,
+        "transform_twice" | "transform_pingpong_two" | "copy_pingpong" | "pipeline_chain_two" => 2,
+        "transform_three_times" | "transform_pingpong_three" | "pipeline_chain_three" => 3,
+        "transform_eight_times" | "transform_pingpong_eight" | "pipeline_chain_eight" => 8,
         _ => {
             if case.dispatches.is_some() {
                 return Err("single-pass fixture cannot carry a sequence".into());
@@ -454,8 +520,12 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         return Err("wrong sequence dispatch count".into());
     }
     let locals = [[4, 2, 2], [8, 4, 4], [1, 1, 1]];
-    let pingpong = case.id.contains("pingpong");
+    let mixed = case.id.starts_with("pipeline_chain_");
+    let pingpong = case.id.contains("pingpong") || mixed;
     for (i, dispatch) in dispatches.iter().enumerate() {
+        if dispatch.program != mixed.then_some(i % 2) {
+            return Err("unreviewed program selection".into());
+        }
         let (grid, local) = if case.id == "copy_pingpong" {
             ([1, 1, 1], [1, 1, 1])
         } else {
@@ -556,11 +626,12 @@ fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
 
 fn run_case(
     provider: &dyn PipelineProvider,
-    pipeline: &CompiledComputePipeline,
+    programs: &[CompiledComputePipeline],
     case: &Case,
     operation: u64,
     guard: u8,
 ) -> Result<CaseResult> {
+    let pipeline = &programs[0];
     let mut resources = ResourceTableSnapshot::new();
     let mut views = Vec::new();
     let mut allocations = Vec::new();
@@ -605,8 +676,7 @@ fn run_case(
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
         operation_id: OperationId::new(operation),
-        function: pipeline.function.clone(),
-        pipeline_contract: pipeline.contract.clone(),
+        pipelines: programs.to_vec(),
         encoder_dispatch_type: DispatchType::Serial,
         passes: case
             .dispatches
@@ -616,10 +686,12 @@ fn run_case(
                     grid: case.grid,
                     local: case.local,
                     bindings: None,
+                    program: None,
                 }]
             })
             .into_iter()
             .map(|dispatch| {
+                let selected = &programs[dispatch.program.unwrap_or(0)];
                 let buffers = views
                     .iter()
                     .enumerate()
@@ -639,7 +711,7 @@ fn run_case(
                     })
                     .collect();
                 ComputePass {
-                    pipeline: pipeline.pipeline_id,
+                    pipeline: selected.pipeline_id,
                     buffers,
                     dispatch: Dispatch {
                         kind: DispatchKind::ThreadsExact,
@@ -669,6 +741,44 @@ fn run_case(
         if !matches!(rejected, Err(ref error) if error.slug == "buffer_footprint_exceeds_view") {
             return Err(format!("3D fixture must refuse 119-byte view: {rejected:?}").into());
         }
+    }
+    if programs.len() > 1 {
+        let mut forged = trace.clone();
+        forged.pipelines[1].contract.buffer_bindings[0].footprint =
+            FootprintProof::Static { max_bytes: 1 };
+        let input = provider
+            .capabilities()
+            .validate_trace(forged, resources.clone())
+            .map_err(|error| format!("malformed late-pipeline refusal fixture: {error:?}"))?;
+        if !matches!(provider.submit(input), Err(error) if error.slug == "pipeline_contract_mismatch"
+            && error.completion == CompletionDisposition::NotSubmitted)
+        {
+            return Err(
+                "provider failed to reject second-pipeline forged metadata before submission"
+                    .into(),
+            );
+        }
+        let mut unknown = trace.clone();
+        let original_id = unknown.pipelines[1].pipeline_id;
+        let missing = metal_api_core::provider::PipelineId::new(u64::MAX);
+        unknown.pipelines[1].pipeline_id = missing;
+        for pass in &mut unknown.passes {
+            if pass.pipeline == original_id {
+                pass.pipeline = missing;
+            }
+        }
+        let input = provider
+            .capabilities()
+            .validate_trace(unknown, resources.clone())
+            .map_err(|error| format!("malformed unknown-pipeline refusal fixture: {error:?}"))?;
+        if !matches!(provider.submit(input), Err(error) if error.slug == "unknown_pipeline"
+            && error.completion == CompletionDisposition::NotSubmitted)
+        {
+            return Err(
+                "provider failed to reject unknown second pipeline before submission".into(),
+            );
+        }
+        eprintln!("Checked second-pipeline refusal guards: {}", case.id);
     }
     let admitted = provider
         .capabilities()
@@ -855,6 +965,7 @@ mod tests {
             grid: [5, 3, 2],
             local: [4, 2, 2],
             bindings: None,
+            program: None,
         });
         assert!(validate_suite(&s).is_err());
         let mut s = load();
@@ -869,6 +980,7 @@ mod tests {
             grid: [1, 1, 1],
             local: [1, 1, 1],
             bindings: None,
+            program: None,
         }]);
         assert!(validate_suite(&s).is_err());
     }
@@ -892,6 +1004,29 @@ mod tests {
         assert!(validate_suite(&s).is_err());
         let mut s = load();
         s.cases[0].dispatches.as_mut().unwrap()[1].bindings = None;
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn mixed_suite_rejects_missing_unreviewed_or_unselected_programs() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v5.json"))
+                .unwrap()
+        };
+        validate_suite(&load()).unwrap();
+        let mut s = load();
+        s.cases[0].programs = None;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap()[1].metal.sha256 = "0".repeat(64);
+        assert!(validate_suite(&s).is_err());
+        for program in [None, Some(0), Some(2)] {
+            let mut s = load();
+            s.cases[0].dispatches.as_mut().unwrap()[1].program = program;
+            assert!(validate_suite(&s).is_err());
+        }
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap().reverse();
         assert!(validate_suite(&s).is_err());
     }
 }

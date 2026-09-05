@@ -26,19 +26,19 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   device limits and CPU-visible readback. Multiple bindings of the same Buffer
   are detected and refused.
 - Experimental provider: `VulkanComputeProvider` implements `ComputeProvider`
-  for up to eight synchronous serial exact-thread passes sharing a pipeline
+  for up to eight synchronous serial exact-thread passes using an explicit pipeline table
   and stable owned view pool, followed by one host readback. It registers pipelines, revalidates each trace against its actual
   device and artifact, and returns checked allocation-relative writebacks.
 - Completion: this provider's `submit` waits for GPU completion and readback;
   `wait` observes the recorded terminal result. A submit timeout is terminal
   unknown completion; resources remain retained and the executor is unusable.
 - Shared provider API: compilation, pipeline metadata and release now use
-  `PipelineProvider`. The new Rust native Metal backend accepts the three exact
+  `PipelineProvider`. The new Rust native Metal backend accepts four exact
   reviewed MSL fixtures. Its single-pass v1/v2 execution passed
   [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33979796237);
   the new serial multi-pass increment still needs its own native run.
 - Open design work: asynchronous submission/readback, general native shader
-  admission, multiple pipelines/new resources within a command buffer, aliases and
+  admission, new resources within a command buffer, aliases and
   completion-driven live leases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
@@ -57,8 +57,10 @@ oracle remains separate from the new native Rust provider. The
 path that passed v1/v2 in CI. The [serial-pass extension](conformance/SERIAL-PASSES.md)
 adds one-upload/multiple-dispatch sequences and passed
 [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33980765113).
-The new [buffer-rebinding extension](conformance/BUFFER-REBINDING.md) permits
-existing views to change roles between passes; its native v4 run is pending. Existing evidence does not
+The [buffer-rebinding extension](conformance/BUFFER-REBINDING.md) also passed
+[three-way v4 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33981697514).
+The new [mixed-pipeline extension](conformance/MIXED-PIPELINES.md) supports
+switching compute shaders inside a single command buffer; native v5 is pending. Existing evidence does not
 establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;

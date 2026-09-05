@@ -128,7 +128,28 @@ def _suite_plan(suite):
         _require(isinstance(dispatches, list) and 1 <= len(dispatches) <= 8,
                  f"{where}: invalid dispatch count")
         original_views = [buffer["view"] for buffer in buffers]
+        programs = case.get("programs")
+        if programs is not None:
+            _list(programs, f"{where}.programs")
+            _require(1 <= len(programs) <= 8, f"{where}: invalid program count")
+            entries = []
+            for program in programs:
+                _object(program, ("entry", "air", "metal"), f"{where}.program")
+                entries.append(_string(program["entry"], f"{where}.program.entry"))
+                for kind in ("air", "metal"):
+                    source = program[kind]
+                    _object(source, ("path", "sha256"), f"{where}.program.{kind}")
+                    _string(source["path"], f"{where}.source.path")
+                    _require(isinstance(source["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]), f"{where}: invalid source digest")
+            _require(len(entries) == len(set(entries)), f"{where}: duplicate program entry")
+        used_programs = set()
         for dispatch in dispatches:
+            selection = dispatch.get("program") if isinstance(dispatch, dict) else None
+            if programs is not None:
+                _integer(selection, f"{where}.dispatch.program", 0, len(programs) - 1)
+                used_programs.add(selection)
+            else:
+                _require(selection is None, f"{where}: program selection without table")
             _require(isinstance(dispatch, dict), f"{where}: dispatch must be an object")
             mapping = dispatch.get("bindings")
             if mapping is None:
@@ -143,6 +164,9 @@ def _suite_plan(suite):
                          f"{where}: rebound view does not fit the binding extent")
                 if slot["access"] != "read":
                     writable_views.add(view)
+
+        if programs is not None:
+            _require(used_programs == set(range(len(programs))), f"{where}: unused program entries")
 
         writes, written_views = [], set()
         for value in _list(case.get("expected_writebacks"), f"{where}.expected_writebacks"):

@@ -140,7 +140,7 @@ fn run_indexed_and_refusals(
     // that it belongs to the compiled pipeline. The provider must check that.
     let mut forged = trace.clone();
     let FootprintProof::Affine { accesses } =
-        &mut forged.pipeline_contract.buffer_bindings[0].footprint
+        &mut forged.pipelines[0].contract.buffer_bindings[0].footprint
     else {
         return Err("indexed provider fixture must carry an affine footprint proof".into());
     };
@@ -149,7 +149,7 @@ fn run_indexed_and_refusals(
         access.access_size = 1;
         access.terms.clear();
     }
-    if forged.pipeline_contract == trace.pipeline_contract {
+    if forged.pipelines[0].contract == trace.pipelines[0].contract {
         return Err("forged fixture failed to change the pipeline contract".into());
     }
     let admitted = provider
@@ -235,8 +235,7 @@ fn make_trace(
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: pipeline.device_epoch,
         operation_id: OperationId::new(operation),
-        function: pipeline.function.clone(),
-        pipeline_contract: pipeline.contract.clone(),
+        pipelines: vec![pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
         passes: vec![ComputePass {
             pipeline: pipeline.pipeline_id,

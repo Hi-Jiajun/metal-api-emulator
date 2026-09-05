@@ -191,3 +191,12 @@ contract, expected results and pending native verification.
 initial upload. The final result includes views written only by later passes.
 See [BUFFER-REBINDING.md](BUFFER-REBINDING.md) for its exact admission rules and
 validation limits. New v4 native comparison is pending at this local checkpoint.
+
+## Pipeline-table extension
+
+[suite-v5.json](suite-v5.json) alternates two different compute shaders in a
+single serial submission, keeping the initialized view pool. The Rust trace
+contract is now schema 2 with per-pipeline metadata; report JSON remains
+schema 1. See [MIXED-PIPELINES.md](MIXED-PIPELINES.md) for boundaries and local
+results. New native v5 GPU verification is pending independently of earlier
+published three-way suites.

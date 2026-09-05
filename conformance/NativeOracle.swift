@@ -21,7 +21,7 @@ private func require(_ condition: Bool, _ message: String) throws {
     if !condition { throw OracleError(message) }
 }
 
-private struct SourceDefinition: Decodable {
+private struct SourceDefinition: Decodable, Equatable {
     let path: String
     let sha256: String
 }
@@ -48,6 +48,13 @@ private struct DispatchDefinition: Decodable, Equatable {
     let grid: [UInt64]
     let local: [UInt64]
     let bindings: [UInt64]?
+    let program: Int?
+}
+
+private struct ProgramDefinition: Decodable, Equatable {
+    let entry: String
+    let air: SourceDefinition
+    let metal: SourceDefinition
 }
 
 private struct CaseDefinition: Decodable {
@@ -56,6 +63,7 @@ private struct CaseDefinition: Decodable {
     let grid: [UInt64]
     let local: [UInt64]
     let dispatches: [DispatchDefinition]?
+    let programs: [ProgramDefinition]?
     let air: SourceDefinition
     let metal: SourceDefinition
     let buffers: [BufferDefinition]
@@ -77,7 +85,7 @@ private struct ValidatedBuffer {
 private struct ValidatedCase {
     let definition: CaseDefinition
     let dispatches: [DispatchDefinition]
-    let metalSource: String
+    let programs: [(definition: ProgramDefinition, source: String)]
     let buffers: [ValidatedBuffer]
 }
 
@@ -282,12 +290,12 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" {
         let expectedCount: Int
         switch definition.id {
-        case "transform_twice", "transform_pingpong_two", "copy_pingpong": expectedCount = 2
-        case "transform_three_times", "transform_pingpong_three": expectedCount = 3
-        case "transform_eight_times", "transform_pingpong_eight": expectedCount = 8
+        case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two": expectedCount = 2
+        case "transform_three_times", "transform_pingpong_three", "pipeline_chain_three": expectedCount = 3
+        case "transform_eight_times", "transform_pingpong_eight", "pipeline_chain_eight": expectedCount = 8
         default: throw OracleError("Unsupported serial case: \(definition.id)")
         }
         guard let sequence = definition.dispatches else {
@@ -298,7 +306,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let localSizes: [[UInt64]] = [[4, 2, 2], [8, 4, 4], [1, 1, 1]]
         let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
             var mapping: [UInt64]? = nil
-            if suite == "compute-buffer-v4" {
+            if suite == "compute-buffer-v4" || suite == "compute-buffer-v5" {
                 var views = definition.buffers.map { $0.view }
                 let last = definition.id == "copy_pingpong" ? 1 : 2
                 try require(views.count > last, "Missing pingpong resources")
@@ -307,7 +315,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
             }
             let grid: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : [5, 3, 2]
             let local: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : localSizes[index % localSizes.count]
-            return DispatchDefinition(grid: grid, local: local, bindings: mapping)
+            return DispatchDefinition(grid: grid, local: local, bindings: mapping, program: suite == "compute-buffer-v5" ? index % 2 : nil)
         }
         try require(sequence == expected, "\(definition.id): unsupported serial dispatch sequence")
         try require(sequence[0].grid == definition.grid && sequence[0].local == definition.local,
@@ -316,7 +324,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     } else {
         try require(definition.dispatches == nil,
                     "\(definition.id): serial dispatches require compute-buffer-v3")
-        dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil)]
+        dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     }
     switch definition.id {
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong":
@@ -344,7 +352,8 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         try require(buffer.binding == 0 && buffer.access == "write" && buffer.length == 120,
                     "indexed_boundary: expected a 120-byte write buffer at 0")
     case "transform_tail", "transform_small_grid", "transform_twice", "transform_three_times", "transform_eight_times",
-         "transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight":
+         "transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight",
+         "pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight":
         let expectedLocal: [UInt64] = definition.id == "transform_small_grid" ? [8, 4, 4] : [4, 2, 2]
         try require(definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == expectedLocal,
@@ -362,7 +371,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
 
 // Called only after the fixed dispatch shape and resource permutation checks.
 private func writableViews(_ definition: CaseDefinition) -> Set<UInt64> {
-    let sequence = definition.dispatches ?? [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil)]
+    let sequence = definition.dispatches ?? [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     var result = Set<UInt64>()
     for dispatch in sequence {
         for (index, slot) in definition.buffers.enumerated() where slot.access != "read" {
@@ -441,8 +450,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["transform_twice", "transform_three_times", "transform_eight_times"]
     case "compute-buffer-v4":
         expectedIDs = ["transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight", "copy_pingpong"]
+    case "compute-buffer-v5":
+        expectedIDs = ["pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v4 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v5 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -451,39 +462,64 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     for definition in suite.cases {
         let dispatches = try validateShape(definition, suite: suite.suite)
         let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
+        let primary = ProgramDefinition(entry: definition.entry, air: definition.air, metal: definition.metal)
+        let programs: [ProgramDefinition]
+        if suite.suite == "compute-buffer-v5" {
+            guard let supplied = definition.programs else { throw OracleError("Program table required") }
+            try require(supplied.count == 2 && supplied[0] == primary
+                        && supplied[0].entry == "transform_3d" && supplied[1].entry == "mix_3d",
+                        "Unreviewed program table")
+            programs = supplied
+        } else {
+            try require(definition.programs == nil, "Legacy case cannot carry program table")
+            programs = [primary]
+        }
+        let loaded = try programs.map { program in
+            (definition: program, source: try loadProgram(program, root: root))
+        }
+        cases.append(ValidatedCase(definition: definition, dispatches: dispatches,
+                                   programs: loaded, buffers: buffers))
+    }
+    return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
+}
+
+@available(macOS 11.0, *)
+private func loadProgram(_ program: ProgramDefinition, root: URL) throws -> String {
         let metalBytes: Data
-        switch definition.entry {
+        switch program.entry {
         case "copy_word":
-            _ = try validateSource(definition.air, root: root,
+            _ = try validateSource(program.air, root: root,
                 path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",
                 digest: "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99")
-            metalBytes = try validateSource(definition.metal, root: root,
+            metalBytes = try validateSource(program.metal, root: root,
                 path: "shaders/copy_word.metal",
                 digest: "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc")
         case "kernel_dispatch_threads_boundary_barrier":
-            _ = try validateSource(definition.air, root: root,
+            _ = try validateSource(program.air, root: root,
                 path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
                 digest: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
-            metalBytes = try validateSource(definition.metal, root: root,
+            metalBytes = try validateSource(program.metal, root: root,
                 path: "shaders/indexed_boundary.metal",
                 digest: "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06")
         case "transform_3d":
-            _ = try validateSource(definition.air, root: root,
+            _ = try validateSource(program.air, root: root,
                 path: "shaders/transform_3d.ll",
                 digest: "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2")
-            metalBytes = try validateSource(definition.metal, root: root,
+            metalBytes = try validateSource(program.metal, root: root,
                 path: "shaders/transform_3d.metal",
                 digest: "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b")
+        case "mix_3d":
+            _ = try validateSource(program.air, root: root, path: "shaders/mix_3d.ll",
+                digest: "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f")
+            metalBytes = try validateSource(program.metal, root: root, path: "shaders/mix_3d.metal",
+                digest: "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5")
         default:
-            throw OracleError("Unsupported entry: \(definition.entry)")
+            throw OracleError("Unsupported entry: \(program.entry)")
         }
         guard let metalSource = String(data: metalBytes, encoding: .utf8) else {
-            throw OracleError("\(definition.id): MSL source is not UTF-8")
+            throw OracleError("\(program.entry): MSL source is not UTF-8")
         }
-        cases.append(ValidatedCase(definition: definition, dispatches: dispatches,
-                                   metalSource: metalSource, buffers: buffers))
-    }
-    return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
+    return metalSource
 }
 
 private func metalSize(_ dimensions: [UInt64]) -> MTLSize {
@@ -492,7 +528,7 @@ private func metalSize(_ dimensions: [UInt64]) -> MTLSize {
 
 @available(macOS 11.0, *)
 private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLCommandQueue,
-                     pipeline: MTLComputePipelineState) throws -> CaseResult {
+                     pipelines: [MTLComputePipelineState]) throws -> CaseResult {
     let definition = fixture.definition
     try require(!fixture.dispatches.isEmpty && fixture.dispatches.count <= maximumPassCount,
                 "\(definition.id): runtime supports one to eight serial passes")
@@ -502,7 +538,7 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         let local = metalSize(dispatch.local)
         try require(local.width <= limits.width && local.height <= limits.height && local.depth <= limits.depth,
                     "\(definition.id) pass \(index): local dimensions exceed device limits")
-        try require(local.width * local.height * local.depth <= pipeline.maxTotalThreadsPerThreadgroup,
+        try require(local.width * local.height * local.depth <= pipelines[dispatch.program ?? 0].maxTotalThreadsPerThreadgroup,
                     "\(definition.id) pass \(index): local thread count exceeds pipeline limit")
     }
 
@@ -538,7 +574,7 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw OracleError("\(definition.id): cannot create a compute encoder")
         }
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(pipelines[dispatch.program ?? 0])
         for (index, slot) in fixture.buffers.enumerated() {
             let view = dispatch.bindings?[index] ?? slot.definition.view
             guard let poolIndex = fixture.buffers.firstIndex(where: { $0.definition.view == view }) else {
@@ -619,20 +655,23 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     // across cases while runCase creates fresh commands and buffers each time.
     var pipelines = [String: MTLComputePipelineState]()
     for fixture in suite.cases {
-        let entry = fixture.definition.entry
-        let pipeline: MTLComputePipelineState
-        if let cached = pipelines[entry] {
-            pipeline = cached
-        } else {
-            let library = try device.makeLibrary(source: fixture.metalSource, options: nil)
-            guard let function = library.makeFunction(name: entry) else {
-                throw OracleError("\(fixture.definition.id): Metal function was not found")
+        var selected = [MTLComputePipelineState]()
+        for program in fixture.programs {
+            let entry = program.definition.entry
+            if let cached = pipelines[entry] {
+                selected.append(cached)
+            } else {
+                let library = try device.makeLibrary(source: program.source, options: nil)
+                guard let function = library.makeFunction(name: entry) else {
+                    throw OracleError("\(fixture.definition.id): Metal function was not found")
+                }
+                let pipeline = try device.makeComputePipelineState(function: function)
+                pipelines[entry] = pipeline
+                selected.append(pipeline)
+                diagnostic("native pipeline compiled: entry=\(entry)")
             }
-            pipeline = try device.makeComputePipelineState(function: function)
-            pipelines[entry] = pipeline
-            diagnostic("native pipeline compiled: entry=\(entry)")
         }
-        results.append(try runCase(fixture, device: device, queue: queue, pipeline: pipeline))
+        results.append(try runCase(fixture, device: device, queue: queue, pipelines: selected))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",

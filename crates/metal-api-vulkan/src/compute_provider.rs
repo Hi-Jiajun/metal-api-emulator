@@ -1,7 +1,7 @@
 //! Synchronous, owned-byte implementation of the first compute provider slice.
 
 use crate::{
-    execute_rebound_submission_with_status, BoundDispatch, TranslatedComputePipeline,
+    execute_pipeline_sequence_with_status, BoundDispatch, TranslatedComputePipeline,
     VulkanExecutor, VulkanPipelineArtifact,
 };
 pub use metal_api_core::provider::CompiledComputePipeline;
@@ -28,7 +28,7 @@ struct RegisteredPipeline {
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
-/// sharing one pipeline and an initialized view pool, with owned bytes and
+/// selecting registered pipelines over an initialized view pool, with owned bytes and
 /// host readback. Each pass may permute that pool across the pipeline's bindings. `submit` waits for GPU completion and readback;
 /// `wait` only observes the recorded terminal result. Tokens and metadata are
 /// process-local, and no-copy leases and asynchronous submission are refused.
@@ -269,15 +269,28 @@ impl ComputeProvider for VulkanComputeProvider {
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
         self.capabilities.admit(trace, admitted.resources())?;
-        let pass = &trace.passes[0];
-        let registered = self
-            .pipelines
-            .lock()
-            .map_err(|_| registry_poisoned())?
-            .get(&pass.pipeline)
-            .cloned()
-            .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
-        validate_pipeline_identity(trace, &registered.metadata)?;
+        let artifacts = {
+            let registry = self.pipelines.lock().map_err(|_| registry_poisoned())?;
+            trace
+                .passes
+                .iter()
+                .map(|pass| {
+                    let requested = trace.pipeline(pass.pipeline).map_err(|error| {
+                        refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Resource,
+                            "pipeline_identity_mismatch",
+                        )
+                        .with_detail(error.to_string())
+                    })?;
+                    let registered = registry
+                        .get(&pass.pipeline)
+                        .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
+                    validate_pipeline_identity(requested, &registered.metadata)?;
+                    Ok(registered.artifact.clone())
+                })
+                .collect::<Result<Vec<_>, ProviderError>>()?
+        };
         let pool = trace.serial_resources().map_err(|error| {
             refusal(
                 ProviderPhase::Resolve,
@@ -338,9 +351,9 @@ impl ComputeProvider for VulkanComputeProvider {
                 .lock()
                 .map_err(|_| registry_poisoned())?;
             self.ensure_usable()?;
-            execute_rebound_submission_with_status(
+            execute_pipeline_sequence_with_status(
                 &self.executor.context,
-                registered.artifact.clone(),
+                &artifacts,
                 buffers,
                 &dispatches,
             )
@@ -417,25 +430,25 @@ fn check_epoch(expected: DeviceEpoch, actual: DeviceEpoch) -> Result<(), Provide
 }
 
 fn validate_pipeline_identity(
-    trace: &ComputeTrace,
+    requested: &CompiledComputePipeline,
     metadata: &CompiledComputePipeline,
 ) -> Result<(), ProviderError> {
-    check_epoch(metadata.device_epoch, trace.device_epoch)?;
-    if trace.passes.first().map(|p| p.pipeline) != Some(metadata.pipeline_id) {
+    check_epoch(metadata.device_epoch, requested.device_epoch)?;
+    if requested.pipeline_id != metadata.pipeline_id {
         return Err(refusal(
             ProviderPhase::Resolve,
             ProviderErrorClass::Resource,
             "pipeline_identity_mismatch",
         ));
     }
-    if trace.function != metadata.function {
+    if requested.function != metadata.function {
         return Err(refusal(
             ProviderPhase::Resolve,
             ProviderErrorClass::Resource,
             "pipeline_function_mismatch",
         ));
     }
-    if trace.pipeline_contract != metadata.contract {
+    if requested.contract != metadata.contract {
         return Err(refusal(
             ProviderPhase::Resolve,
             ProviderErrorClass::Resource,

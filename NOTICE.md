@@ -38,3 +38,7 @@ is owned synthetic source paired with the existing copy LLVM fixture.
 `conformance/shaders/transform_3d.ll` and `transform_3d.metal` are owned synthetic
 source counterparts for bounded 3D read/write and sparse-binding tests. They
 contain no extracted AIR or other Apple binary artifacts.
+
+`conformance/shaders/mix_3d.ll` and `mix_3d.metal` are owned synthetic source
+counterparts derived from this project's transform_3d fixture. Their distinct
+integer operation sequence tests pipeline changes within one command buffer.

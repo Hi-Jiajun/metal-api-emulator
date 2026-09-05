@@ -110,3 +110,8 @@ The subsequent [rebinding increment](../conformance/BUFFER-REBINDING.md) allows
 per-pass permutations of the same initialized views. New views, altered source
 bytes, ranges and mixed pipelines remain refused. Native v4 verification is
 pending independently from earlier serial-pass results.
+
+The [mixed-pipeline extension](../conformance/MIXED-PIPELINES.md) changes the
+Rust trace envelope to schema 2 with an explicit pipeline table; every pass
+resolves its own contract and registry entry. Existing-view pool rules remain.
+This new v5 increment still awaits native cloud validation.

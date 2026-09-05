@@ -463,7 +463,27 @@ pub(crate) fn execute_rebound_submission_with_status(
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let result = execute_submission_stages(context, artifact, &buffers, dispatches);
+    let artifacts = vec![artifact; dispatches.len()];
+    execute_pipeline_sequence_with_status(context, &artifacts, buffers, dispatches)
+}
+
+/// Execute one to eight ordered pipeline dispatches over one uploaded pool.
+/// Each pass owns its shader, descriptor layout, specialization, and binding
+/// map, while the sequence shares one command buffer, fence, and final readback.
+pub(crate) fn execute_pipeline_sequence_with_status(
+    context: &Arc<VulkanContext>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: Vec<BufferBinding>,
+    dispatches: &[BoundDispatch],
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    for artifact in artifacts {
+        if !Arc::ptr_eq(context, &artifact.context) {
+            return Err(dispatch_args_error(failure(
+                "pipeline artifact belongs to another Vulkan device",
+            )));
+        }
+    }
+    let result = execute_submission_stages(context, artifacts, &buffers, dispatches);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -475,28 +495,23 @@ pub(crate) fn execute_rebound_submission_with_status(
 
 fn execute_submission_stages(
     context: &Arc<VulkanContext>,
-    artifact: Arc<VulkanPipelineArtifact>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
     buffers: &[BufferBinding],
     dispatches: &[BoundDispatch],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let planned = plan_rebound_submission(
-        &artifact.translated,
-        buffers,
-        &context.properties.limits,
-        dispatches,
-    )?;
+    let translated = artifacts
+        .iter()
+        .map(|artifact| &artifact.translated)
+        .collect::<Vec<_>>();
+    let planned =
+        plan_pipeline_sequence(&translated, buffers, &context.properties.limits, dispatches)?;
     let plans = &planned.plans;
     if plans.iter().all(|plan| plan.regions.is_empty()) {
         return Ok(Vec::new());
     }
-    let reflection = artifact.translated.reflection();
-    let reflected_contract = reflection
-        .kernel_dispatch
-        .expect("validated dispatch contract");
-
     let mut resources = ExecutionResources::new(Arc::clone(context));
     resources
-        .create_pipeline_objects(artifact.translated.spirv(), reflection, plans)
+        .create_pipeline_objects(&translated, plans)
         .map_err(|error| {
             error.into_provider(
                 ProviderPhase::Compile,
@@ -515,11 +530,9 @@ fn execute_submission_stages(
     };
     resources.create_buffers(buffers).map_err(encode_error)?;
     resources
-        .create_descriptors(reflection, dispatches)
+        .create_descriptors(&translated, dispatches)
         .map_err(encode_error)?;
-    resources
-        .record(reflection, reflected_contract, plans)
-        .map_err(encode_error)?;
+    resources.record(&translated, plans).map_err(encode_error)?;
     match resources.submit_and_wait() {
         Ok(()) => {}
         Err(error) => {
@@ -601,10 +614,21 @@ struct ReboundSubmissionPlan {
     writable_pool_keys: BTreeSet<u32>,
 }
 
-/// Pure preflight: no request-specific Vulkan objects exist until this returns.
-/// Each pass must bijectively bind the entire pool to the reflected Metal slots.
+#[cfg(test)]
 fn plan_rebound_submission(
     translated: &TranslatedComputePipeline,
+    buffers: &[BufferBinding],
+    limits: &vk::PhysicalDeviceLimits,
+    dispatches: &[BoundDispatch],
+) -> Result<ReboundSubmissionPlan, ProviderError> {
+    let translated = vec![translated; dispatches.len()];
+    plan_pipeline_sequence(&translated, buffers, limits, dispatches)
+}
+
+/// Pure preflight: no request-specific Vulkan objects exist until this returns.
+/// Each pass must bijectively bind the entire pool to its reflected Metal slots.
+fn plan_pipeline_sequence(
+    translated: &[&TranslatedComputePipeline],
     buffers: &[BufferBinding],
     limits: &vk::PhysicalDeviceLimits,
     dispatches: &[BoundDispatch],
@@ -618,14 +642,10 @@ fn plan_rebound_submission(
         )
     };
     validate_dispatch_count(dispatches.len())?;
-    let reflection = translated.reflection();
-    let reflected_contract = reflection
-        .kernel_dispatch
-        .ok_or_else(|| resolve_capability(failure("translated kernel has no dispatch contract")))?;
-    if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
-        return Err(resolve_capability(failure(format!(
-            "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
-        ))));
+    if translated.len() != dispatches.len() {
+        return Err(dispatch_args_error(failure(
+            "pipeline artifact count must match dispatch count",
+        )));
     }
     let mut pool = BTreeMap::new();
     for buffer in buffers {
@@ -636,14 +656,24 @@ fn plan_rebound_submission(
             ))));
         }
     }
-    if pool.len() != reflection.bindings.len() {
-        return Err(dispatch_args_error(failure(
-            "buffer pool must contain exactly one resource per reflected binding",
-        )));
-    }
     let mut plans = Vec::with_capacity(dispatches.len());
     let mut writable_pool_keys = BTreeSet::new();
-    for dispatch in dispatches {
+    let mut descriptor_count = 0_u32;
+    for (translated, dispatch) in translated.iter().zip(dispatches) {
+        let reflection = translated.reflection();
+        let reflected_contract = reflection.kernel_dispatch.ok_or_else(|| {
+            resolve_capability(failure("translated kernel has no dispatch contract"))
+        })?;
+        if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
+            return Err(resolve_capability(failure(format!(
+                "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
+            ))));
+        }
+        if pool.len() != reflection.bindings.len() {
+            return Err(dispatch_args_error(failure(
+                "buffer pool must contain exactly one resource per reflected binding",
+            )));
+        }
         let mut used_pool_keys = BTreeSet::new();
         let mut bindings = Vec::with_capacity(dispatch.bindings.len());
         for &(metal_index, pool_key) in &dispatch.bindings {
@@ -691,14 +721,14 @@ fn plan_rebound_submission(
                 dispatch_args_error(failure(format!("plan exact dispatch: {error}")))
             })?;
         validate_dispatch_plan(limits, reflected_contract, &plan).map_err(resolve_capability)?;
+        validate_descriptor_limits(limits, reflection).map_err(resolve_capability)?;
+        // This sum sizes the pool; descriptor device limits apply to each pass.
+        descriptor_count = u32::try_from(reflection.bindings.len())
+            .ok()
+            .and_then(|count| descriptor_count.checked_add(count))
+            .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
         plans.push(plan);
     }
-    validate_descriptor_limits(limits, reflection).map_err(resolve_capability)?;
-    // This is a pool allocation count, not a per-stage or per-set device limit.
-    u32::try_from(reflection.bindings.len())
-        .ok()
-        .and_then(|count| count.checked_mul(u32::try_from(dispatches.len()).ok()?))
-        .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
     for buffer in buffers {
         validate_storage_buffer_size(limits, buffer).map_err(resolve_capability)?;
     }
@@ -1086,12 +1116,19 @@ struct GpuBuffer {
     len: usize,
 }
 
-struct ExecutionResources {
+/// A pass owns every object derived from its shader's reflection. Keeping this
+/// ownership separate prevents using one shader's layout for a later shader.
+struct PipelineObjects {
     context: Arc<VulkanContext>,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     shader: vk::ShaderModule,
     pipelines: BTreeMap<[u32; 3], vk::Pipeline>,
+}
+
+struct ExecutionResources {
+    context: Arc<VulkanContext>,
+    pipeline_objects: Vec<PipelineObjects>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
     command_pool: vk::CommandPool,
@@ -1222,7 +1259,7 @@ impl SubmissionFailure {
     }
 }
 
-impl ExecutionResources {
+impl PipelineObjects {
     fn new(context: Arc<VulkanContext>) -> Self {
         Self {
             context,
@@ -1230,18 +1267,10 @@ impl ExecutionResources {
             pipeline_layout: vk::PipelineLayout::null(),
             shader: vk::ShaderModule::null(),
             pipelines: BTreeMap::new(),
-            descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_sets: Vec::new(),
-            command_pool: vk::CommandPool::null(),
-            command: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
-            submitted: false,
-            completed: false,
-            buffers: Vec::new(),
         }
     }
 
-    fn create_pipeline_objects(
+    fn create(
         &mut self,
         spv: &[u8],
         reflection: &ShaderReflection,
@@ -1360,6 +1389,63 @@ impl ExecutionResources {
             }
         }
     }
+}
+
+impl Drop for PipelineObjects {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in self.pipelines.values().copied() {
+                self.context.device.destroy_pipeline(pipeline, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.context
+                    .device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.set_layout != vk::DescriptorSetLayout::null() {
+                self.context
+                    .device
+                    .destroy_descriptor_set_layout(self.set_layout, None);
+            }
+            if self.shader != vk::ShaderModule::null() {
+                self.context.device.destroy_shader_module(self.shader, None);
+            }
+        }
+    }
+}
+
+impl ExecutionResources {
+    fn new(context: Arc<VulkanContext>) -> Self {
+        Self {
+            context,
+            pipeline_objects: Vec::new(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
+            command_pool: vk::CommandPool::null(),
+            command: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            submitted: false,
+            completed: false,
+            buffers: Vec::new(),
+        }
+    }
+
+    fn create_pipeline_objects(
+        &mut self,
+        translated: &[&TranslatedComputePipeline],
+        plans: &[KernelDispatchPlan],
+    ) -> Result<(), ExecutionFailure> {
+        for (translated, plan) in translated.iter().zip(plans) {
+            let mut objects = PipelineObjects::new(Arc::clone(&self.context));
+            objects.create(
+                translated.spirv(),
+                translated.reflection(),
+                std::slice::from_ref(plan),
+            )?;
+            self.pipeline_objects.push(objects);
+        }
+        Ok(())
+    }
 
     fn create_buffers(&mut self, bindings: &[BufferBinding]) -> Result<(), ExecutionFailure> {
         for supplied in bindings {
@@ -1453,15 +1539,16 @@ impl ExecutionResources {
 
     fn create_descriptors(
         &mut self,
-        reflection: &ShaderReflection,
+        translated: &[&TranslatedComputePipeline],
         dispatches: &[BoundDispatch],
     ) -> Result<(), ExecutionFailure> {
-        let count = u32::try_from(reflection.bindings.len())
-            .map_err(|_| failure("descriptor count overflows u32"))?;
         let pass_count = u32::try_from(dispatches.len())
             .map_err(|_| failure("descriptor set count overflows u32"))?;
-        let descriptor_count = count
-            .checked_mul(pass_count)
+        let descriptor_count = translated
+            .iter()
+            .try_fold(0_u32, |total, pipeline| {
+                total.checked_add(u32::try_from(pipeline.reflection().bindings.len()).ok()?)
+            })
             .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
         let sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1474,7 +1561,11 @@ impl ExecutionResources {
             unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }.map_err(
                 |error| ExecutionFailure::vulkan(error, format!("create descriptor pool: {error}")),
             )?;
-        let layouts = vec![self.set_layout; dispatches.len()];
+        let layouts = self
+            .pipeline_objects
+            .iter()
+            .map(|objects| objects.set_layout)
+            .collect::<Vec<_>>();
         let allocation = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
@@ -1485,7 +1576,10 @@ impl ExecutionResources {
 
         // Each recorded pass owns a distinct immutable set. Updating a single
         // shared set here would make every dispatch observe the last mapping.
-        for (dispatch, &set) in dispatches.iter().zip(&self.descriptor_sets) {
+        for ((dispatch, &set), translated) in
+            dispatches.iter().zip(&self.descriptor_sets).zip(translated)
+        {
+            let reflection = translated.reflection();
             let infos = reflection
                 .bindings
                 .iter()
@@ -1525,8 +1619,7 @@ impl ExecutionResources {
 
     fn record(
         &mut self,
-        reflection: &ShaderReflection,
-        contract: KernelDispatch,
+        translated: &[&TranslatedComputePipeline],
         plans: &[KernelDispatchPlan],
     ) -> Result<(), ExecutionFailure> {
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -1553,15 +1646,19 @@ impl ExecutionResources {
                 .map_err(|error| {
                     ExecutionFailure::vulkan(error, format!("begin command buffer: {error}"))
                 })?;
-            let offset = contract
-                .push_constant_range()
-                .expect("validated exact range")
-                .offset;
             for (pass_index, plan) in plans.iter().enumerate() {
+                let objects = &self.pipeline_objects[pass_index];
+                let reflection = translated[pass_index].reflection();
+                let offset = reflection
+                    .kernel_dispatch
+                    .expect("validated kernel dispatch")
+                    .push_constant_range()
+                    .expect("validated exact range")
+                    .offset;
                 self.context.device.cmd_bind_descriptor_sets(
                     self.command,
                     vk::PipelineBindPoint::COMPUTE,
-                    self.pipeline_layout,
+                    objects.pipeline_layout,
                     reflection.descriptor_layout.set,
                     &[self.descriptor_sets[pass_index]],
                     &[],
@@ -1588,7 +1685,7 @@ impl ExecutionResources {
                     );
                 }
                 for region in &plan.regions {
-                    let pipeline = self.pipelines[&region.local_size];
+                    let pipeline = objects.pipelines[&region.local_size];
                     self.context.device.cmd_bind_pipeline(
                         self.command,
                         vk::PipelineBindPoint::COMPUTE,
@@ -1601,7 +1698,7 @@ impl ExecutionResources {
                         .collect::<Vec<_>>();
                     self.context.device.cmd_push_constants(
                         self.command,
-                        self.pipeline_layout,
+                        objects.pipeline_layout,
                         vk::ShaderStageFlags::COMPUTE,
                         offset,
                         &bytes,
@@ -1738,6 +1835,11 @@ impl Drop for ExecutionResources {
             // handles below are intentionally left live, and this strong
             // context reference keeps the loader/device live until process exit.
             let _ = Arc::into_raw(Arc::clone(&self.context));
+            // Rust still drops fields after this Drop returns. Explicitly retain
+            // child RAII owners as well as the raw execution handles.
+            for objects in self.pipeline_objects.drain(..) {
+                std::mem::forget(objects);
+            }
             return;
         }
         unsafe {
@@ -1754,22 +1856,7 @@ impl Drop for ExecutionResources {
                     .device
                     .destroy_descriptor_pool(self.descriptor_pool, None);
             }
-            for pipeline in self.pipelines.values().copied() {
-                self.context.device.destroy_pipeline(pipeline, None);
-            }
-            if self.pipeline_layout != vk::PipelineLayout::null() {
-                self.context
-                    .device
-                    .destroy_pipeline_layout(self.pipeline_layout, None);
-            }
-            if self.set_layout != vk::DescriptorSetLayout::null() {
-                self.context
-                    .device
-                    .destroy_descriptor_set_layout(self.set_layout, None);
-            }
-            if self.shader != vk::ShaderModule::null() {
-                self.context.device.destroy_shader_module(self.shader, None);
-            }
+            self.pipeline_objects.clear();
             for buffer in &self.buffers {
                 self.context.device.destroy_buffer(buffer.buffer, None);
                 self.context.device.free_memory(buffer.memory, None);
@@ -1875,6 +1962,129 @@ mod tests {
                 bindings: vec![(1, 0), (0, 1)],
             },
         ]
+    }
+
+    fn alternate_pipeline_fixture() -> TranslatedComputePipeline {
+        let meta = KernMeta {
+            roles: vec![(0, KernRole::Buffer(3)), (1, KernRole::Buffer(7))],
+            max_work_group_size: Some(16),
+            ..KernMeta::default()
+        };
+        let mut reflection = ShaderReflection::from_kernel(&meta, Some("alternate"), [1; 3]);
+        reflection.kernel_dispatch = Some(KernelDispatch::ThreadsDynamic { offset: 16 });
+        let (first, _, _) = rebound_fixture();
+        for (index, binding) in reflection.bindings.iter_mut().enumerate() {
+            binding.footprint = first.reflection.bindings[index].footprint.clone();
+            // Deliberately reverse access roles while retaining the same pool
+            // mapping, so readback must consult each pipeline's reflection.
+            binding.access = Some(if index == 0 {
+                ResourceAccess::WriteOnly
+            } else {
+                ResourceAccess::ReadOnly
+            });
+        }
+        validate_pipeline_reflection("alternate", &reflection).unwrap();
+        TranslatedComputePipeline {
+            spv: Vec::new(),
+            reflection,
+        }
+    }
+
+    fn mixed_pipeline_dispatches() -> Vec<BoundDispatch> {
+        vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 0), (1, 1)],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![(3, 0), (7, 1)],
+            },
+        ]
+    }
+
+    #[test]
+    fn mixed_preflight_uses_each_shader_binding_layout_and_write_access() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        assert_ne!(
+            first.reflection.bindings[0].descriptor,
+            second.reflection.bindings[0].descriptor
+        );
+        let dispatches = mixed_pipeline_dispatches();
+        let planned =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap();
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([0, 1]));
+        assert_eq!(planned.plans.len(), 2);
+        for (plan, dispatch) in planned.plans.iter().zip(dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    #[test]
+    fn mixed_preflight_rejects_missing_or_extra_pipeline_artifacts() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        let dispatches = mixed_pipeline_dispatches();
+        for translated in [vec![], vec![&first], vec![&first, &second, &first]] {
+            let error =
+                plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches).unwrap_err();
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert!(error.detail.unwrap().contains("artifact count"));
+        }
+    }
+
+    #[test]
+    fn mixed_preflight_checks_later_shader_footprint_before_any_execution() {
+        let (first, buffers, limits) = rebound_fixture();
+        let mut second = alternate_pipeline_fixture();
+        second.reflection.bindings[0]
+            .footprint
+            .as_mut()
+            .unwrap()
+            .strided_accesses[0]
+            .base_offset = 240;
+        let dispatches = mixed_pipeline_dispatches();
+        plan_pipeline_sequence(&[&first], &buffers, &limits, &dispatches[..1]).unwrap();
+        let error =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("buffer 3"));
+    }
+
+    #[test]
+    fn mixed_preflight_checks_later_shader_push_range_and_air_threadgroup_limit() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        let dispatches = mixed_pipeline_dispatches();
+        let small_push_limits = vk::PhysicalDeviceLimits {
+            max_push_constants_size: 48,
+            ..limits
+        };
+        plan_pipeline_sequence(&[&first], &buffers, &small_push_limits, &dispatches[..1]).unwrap();
+        let error = plan_pipeline_sequence(
+            &[&first, &second],
+            &buffers,
+            &small_push_limits,
+            &dispatches,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("push constants end at 64"));
+
+        let mut dispatches = dispatches;
+        dispatches[1].local = [8, 4, 1];
+        let error =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("AIR permits at most 16"));
     }
 
     #[test]

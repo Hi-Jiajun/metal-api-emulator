@@ -1,6 +1,6 @@
 //! Bounded native Metal compute provider for independent offline comparison.
 //!
-//! The provider accepts only the three exact MSL fixtures shipped with the
+//! The provider accepts only the four exact MSL fixtures shipped with the
 //! conformance suite. Their manually audited contracts are not reflection of
 //! arbitrary MSL. Execution is synchronous, uses fresh shared buffers, and is
 //! restricted to unified-memory devices supporting Apple GPU family 4.
@@ -47,6 +47,8 @@ const COPY: &str = include_str!("../../../conformance/shaders/copy_word.metal");
 const INDEXED: &str = include_str!("../../../conformance/shaders/indexed_boundary.metal");
 #[cfg(any(target_os = "macos", test))]
 const TRANSFORM: &str = include_str!("../../../conformance/shaders/transform_3d.metal");
+#[cfg(any(target_os = "macos", test))]
+const MIX: &str = include_str!("../../../conformance/shaders/mix_3d.metal");
 
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
@@ -99,7 +101,7 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
             [10, 3, 1],
             vec![binding(0, BufferAccess::Write, affine(&[4, 40]))],
         ),
-        ("transform_3d", TRANSFORM) => (
+        ("transform_3d", TRANSFORM) | ("mix_3d", MIX) => (
             [5, 3, 2],
             vec![
                 binding(0, BufferAccess::ReadWrite, affine(&[4, 20, 60])),
@@ -112,7 +114,7 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
                 ProviderPhase::Compile,
                 ProviderErrorClass::Capability,
                 "native_shader_not_allowlisted",
-            ))
+            ));
         }
     };
     Ok(PipelineContract {
@@ -146,6 +148,7 @@ mod tests {
             ("copy_word", COPY),
             ("kernel_dispatch_threads_boundary_barrier", INDEXED),
             ("transform_3d", TRANSFORM),
+            ("mix_3d", MIX),
         ] {
             let contract = bounded_contract(&request(entry, source)).unwrap();
             contract.validate().unwrap();
@@ -162,6 +165,8 @@ mod tests {
         }
         let changed = COPY.replace("output[0]", "output[100]");
         assert!(bounded_contract(&request("copy_word", &changed)).is_err());
+        assert!(bounded_contract(&request("transform_3d", MIX)).is_err());
+        assert!(bounded_contract(&request("mix_3d", TRANSFORM)).is_err());
     }
 
     #[test]
@@ -182,6 +187,16 @@ mod tests {
             (
                 "transform_3d",
                 TRANSFORM,
+                [5, 3, 2],
+                vec![
+                    (0, BufferAccess::ReadWrite, 120),
+                    (2, BufferAccess::Read, 4),
+                    (5, BufferAccess::Write, 120),
+                ],
+            ),
+            (
+                "mix_3d",
+                MIX,
                 [5, 3, 2],
                 vec![
                     (0, BufferAccess::ReadWrite, 120),

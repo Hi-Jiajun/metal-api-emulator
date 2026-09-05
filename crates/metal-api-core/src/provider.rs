@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Current version of the pure-value provider trace schema.
-pub const PROVIDER_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_SCHEMA_VERSION: u16 = 2;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -580,8 +580,9 @@ pub struct ComputeTrace {
     pub schema_version: u16,
     pub device_epoch: DeviceEpoch,
     pub operation_id: OperationId,
-    pub function: FunctionIdentity,
-    pub pipeline_contract: PipelineContract,
+    /// Explicit metadata for every pipeline referenced by a pass. Each entry
+    /// belongs to this trace's device epoch and must be used at least once.
+    pub pipelines: Vec<CompiledComputePipeline>,
     pub encoder_dispatch_type: DispatchType,
     pub passes: Vec<ComputePass>,
     pub completion_policy: CompletionPolicy,
@@ -924,8 +925,12 @@ pub fn trace_from_trusted_snapshot(
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch,
         operation_id,
-        function: pipeline.function,
-        pipeline_contract: pipeline.pipeline_contract,
+        pipelines: vec![CompiledComputePipeline {
+            device_epoch,
+            pipeline_id: pipeline.pipeline_id,
+            function: pipeline.function,
+            contract: pipeline.pipeline_contract,
+        }],
         encoder_dispatch_type: DispatchType::Serial,
         passes: vec![ComputePass {
             pipeline: pipeline.pipeline_id,
@@ -943,12 +948,19 @@ pub fn trace_from_trusted_snapshot(
 }
 
 impl ComputeTrace {
+    /// Look up metadata without recursively validating the trace. Providers
+    /// must still check this caller-supplied metadata against their registry.
+    pub fn pipeline(&self, id: PipelineId) -> Result<&CompiledComputePipeline, ContractError> {
+        self.pipelines
+            .iter()
+            .find(|pipeline| pipeline.pipeline_id == id)
+            .ok_or(ContractError::UnknownPipeline(id))
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
             return Err(ContractError::UnsupportedSchemaVersion(self.schema_version));
         }
-        self.function.validate()?;
-        self.pipeline_contract.validate()?;
         if self.passes.is_empty() {
             return Err(ContractError::EmptyTrace);
         }
@@ -958,19 +970,49 @@ impl ComputeTrace {
         if self.operation_id.is_zero() {
             return Err(ContractError::InvalidIdentity("operation id"));
         }
-        let first_pipeline = self.passes[0].pipeline;
-        for pass in &self.passes {
-            if pass.pipeline != first_pipeline {
-                return Err(ContractError::MixedPipelines);
+        if self.pipelines.is_empty() {
+            return Err(ContractError::EmptyPipelineTable);
+        }
+        let mut used = BTreeMap::new();
+        for pipeline in &self.pipelines {
+            if pipeline.pipeline_id.is_zero() {
+                return Err(ContractError::InvalidIdentity("pipeline id"));
             }
-            pass.validate(&self.pipeline_contract)?;
+            if pipeline.device_epoch != self.device_epoch {
+                return Err(ContractError::PipelineEpochMismatch {
+                    pipeline: pipeline.pipeline_id,
+                    expected: self.device_epoch,
+                    actual: pipeline.device_epoch,
+                });
+            }
+            if used.insert(pipeline.pipeline_id, false).is_some() {
+                return Err(ContractError::DuplicatePipeline(pipeline.pipeline_id));
+            }
+            pipeline.function.validate()?;
+            pipeline.contract.validate()?;
+        }
+        for pass in &self.passes {
+            if pass.pipeline.is_zero() {
+                return Err(ContractError::InvalidIdentity("pipeline id"));
+            }
+            let pipeline = self.pipeline(pass.pipeline)?;
+            pass.validate(&pipeline.contract)?;
+            *used
+                .get_mut(&pass.pipeline)
+                .expect("pipeline lookup checked the metadata table") = true;
+        }
+        for (pipeline, was_used) in used {
+            if !was_used {
+                return Err(ContractError::UnusedPipeline(pipeline));
+            }
         }
         Ok(())
     }
 
     /// Validate the serial resource-reuse subset supported by command-buffer
-    /// providers. Every pass uses the same pipeline and complete logical view
-    /// pool, but may permute those views among the pipeline's buffer bindings.
+    /// providers. Every pass uses the same complete logical view pool, but may
+    /// select another registered pipeline and permute those views among its
+    /// buffer bindings.
     /// Access follows each binding's reflection; view identity, allocation,
     /// range and source contents stay fixed. The repeated source bytes describe
     /// one initial upload. Writes from earlier passes remain visible to later
@@ -1383,15 +1425,6 @@ impl ProviderCapabilities {
             }
             _ => {}
         }
-        match trace.pipeline_contract.dispatch_kind {
-            DispatchKind::ThreadsExact if !self.supports_threads_exact => {
-                return Err(capability_error("dispatch_kind_unsupported"));
-            }
-            DispatchKind::Threadgroups if !self.supports_threadgroups => {
-                return Err(capability_error("dispatch_kind_unsupported"));
-            }
-            _ => {}
-        }
         match trace.completion_policy {
             CompletionPolicy::HostReadback if !self.host_readback => {
                 return Err(capability_error("host_readback_unsupported"));
@@ -1404,6 +1437,19 @@ impl ProviderCapabilities {
 
         let mut allocations = BTreeMap::new();
         for pass in &trace.passes {
+            let contract = &trace
+                .pipeline(pass.pipeline)
+                .map_err(contract_error_refusal)?
+                .contract;
+            match contract.dispatch_kind {
+                DispatchKind::ThreadsExact if !self.supports_threads_exact => {
+                    return Err(capability_error("dispatch_kind_unsupported"));
+                }
+                DispatchKind::Threadgroups if !self.supports_threadgroups => {
+                    return Err(capability_error("dispatch_kind_unsupported"));
+                }
+                _ => {}
+            }
             let local = pass.dispatch.threads_per_threadgroup;
             for (axis, requested) in local.into_iter().enumerate() {
                 if requested > self.max_local_size[axis] {
@@ -1425,10 +1471,9 @@ impl ProviderCapabilities {
                     .with_field("maximum", FieldValue::Unsigned(self.max_invocations)));
             }
 
-            let push_end = trace
-                .pipeline_contract
+            let push_end = contract
                 .push_constant_offset
-                .checked_add(trace.pipeline_contract.push_constant_bytes)
+                .checked_add(contract.push_constant_bytes)
                 .ok_or_else(|| capability_error("push_constant_range_overflow"))?;
             if push_end > self.max_push_constant_bytes {
                 return Err(capability_error("push_constant_range_limit")
@@ -1474,8 +1519,7 @@ impl ProviderCapabilities {
                         .with_field("requested", FieldValue::Unsigned(buffer.length))
                         .with_field("maximum", FieldValue::Unsigned(self.max_buffer_range)));
                 }
-                let reflected = trace
-                    .pipeline_contract
+                let reflected = contract
                     .buffer_bindings
                     .iter()
                     .find(|binding| binding.metal_binding == buffer.metal_binding)
@@ -1830,7 +1874,15 @@ pub enum ContractError {
     DuplicateView(ViewId),
     EmptyTrace,
     UnsupportedSchemaVersion(u16),
-    MixedPipelines,
+    EmptyPipelineTable,
+    UnknownPipeline(PipelineId),
+    DuplicatePipeline(PipelineId),
+    UnusedPipeline(PipelineId),
+    PipelineEpochMismatch {
+        pipeline: PipelineId,
+        expected: DeviceEpoch,
+        actual: DeviceEpoch,
+    },
     UnsupportedDispatchType(DispatchType),
     SnapshotDispatchUnsupported(DispatchKind),
     SnapshotAliasUnsupported(AllocationId),
@@ -1853,7 +1905,10 @@ impl fmt::Display for ContractError {
             }
             Self::ArithmeticOverflow(field) => write!(formatter, "{field} overflows u64"),
             Self::MisalignedPushConstantOffset(offset) => {
-                write!(formatter, "push constant offset {offset} is not 4-byte aligned")
+                write!(
+                    formatter,
+                    "push constant offset {offset} is not 4-byte aligned"
+                )
             }
             Self::UnsupportedAttributeStride => {
                 formatter.write_str("attribute stride is outside the B0 buffer-compute subset")
@@ -1937,9 +1992,9 @@ impl fmt::Display for ContractError {
                 formatter,
                 "completion epoch mismatch: expected {expected:?}, received {actual:?}"
             ),
-            Self::ConcurrentPassesUnsupported => formatter.write_str(
-                "multiple compute passes require serial dispatch"
-            ),
+            Self::ConcurrentPassesUnsupported => {
+                formatter.write_str("multiple compute passes require serial dispatch")
+            }
             Self::SerialBufferRebinding { pass_index } => write!(
                 formatter,
                 "serial pass {pass_index} must reuse the initial logical view pool and source bytes"
@@ -1955,24 +2010,32 @@ impl fmt::Display for ContractError {
                 formatter,
                 "writeback for allocation {allocation:?}, view {view:?} has no matching bound view"
             ),
-            Self::ReadOnlyWriteback(view) => write!(
-                formatter,
-                "writeback view {view:?} is not writable"
-            ),
-            Self::WritebackRangeOutOfBounds { view, offset, end, view_offset, view_end } => write!(
+            Self::ReadOnlyWriteback(view) => {
+                write!(formatter, "writeback view {view:?} is not writable")
+            }
+            Self::WritebackRangeOutOfBounds {
+                view,
+                offset,
+                end,
+                view_offset,
+                view_end,
+            } => write!(
                 formatter,
                 "writeback view {view:?} range {offset}..{end} is outside view range {view_offset}..{view_end}"
             ),
-            Self::IncompleteWriteback(view) => write!(
-                formatter,
-                "writeback must cover all of view {view:?}"
-            ),
+            Self::IncompleteWriteback(view) => {
+                write!(formatter, "writeback must cover all of view {view:?}")
+            }
             Self::MissingWriteback { allocation, view } => write!(
                 formatter,
                 "completed host readback is missing allocation {allocation:?}, view {view:?}"
             ),
             Self::ViewIdentityMismatch(view) => {
-                write!(formatter, "view {:?} changes resource declaration across passes", view)
+                write!(
+                    formatter,
+                    "view {:?} changes resource declaration across passes",
+                    view
+                )
             }
             Self::LeaseMismatch { view, lease } => {
                 write!(
@@ -2011,11 +2074,27 @@ impl fmt::Display for ContractError {
             Self::DuplicateView(view) => write!(formatter, "duplicate view {:?}", view),
             Self::EmptyTrace => formatter.write_str("compute trace must contain a pass"),
             Self::UnsupportedSchemaVersion(version) => {
-                write!(formatter, "unsupported provider trace schema version {version}")
+                write!(
+                    formatter,
+                    "unsupported provider trace schema version {version}"
+                )
             }
-            Self::MixedPipelines => {
-                formatter.write_str("v0 compute trace cannot mix pipeline identities")
+            Self::EmptyPipelineTable => {
+                formatter.write_str("compute trace must contain pipeline metadata")
             }
+            Self::UnknownPipeline(pipeline) => write!(formatter, "unknown pipeline {pipeline:?}"),
+            Self::DuplicatePipeline(pipeline) => {
+                write!(formatter, "duplicate pipeline {pipeline:?}")
+            }
+            Self::UnusedPipeline(pipeline) => write!(formatter, "unused pipeline {pipeline:?}"),
+            Self::PipelineEpochMismatch {
+                pipeline,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "pipeline {pipeline:?} epoch mismatch: expected {expected:?}, received {actual:?}"
+            ),
             Self::UnsupportedDispatchType(dispatch_type) => {
                 write!(
                     formatter,
@@ -2032,10 +2111,16 @@ impl fmt::Display for ContractError {
                 allocation
             ),
             Self::MissingSnapshotIdentity(binding) => {
-                write!(formatter, "snapshot binding {binding} has no explicit resource identity")
+                write!(
+                    formatter,
+                    "snapshot binding {binding} has no explicit resource identity"
+                )
             }
             Self::UnknownSnapshotIdentity(binding) => {
-                write!(formatter, "snapshot identity {binding} has no matching buffer")
+                write!(
+                    formatter,
+                    "snapshot identity {binding} has no matching buffer"
+                )
             }
             Self::DispatchKindMismatch { expected, actual } => write!(
                 formatter,
@@ -2175,7 +2260,7 @@ mod tests {
                     entry_name: request.entry_name,
                     source: request.source.kind(),
                 },
-                contract: trace(Vec::new()).pipeline_contract,
+                contract: trace(Vec::new()).pipelines[0].contract.clone(),
             };
             *self.registered.lock().unwrap() = Some(metadata.clone());
             Ok(metadata)
@@ -2269,27 +2354,31 @@ mod tests {
             schema_version: PROVIDER_SCHEMA_VERSION,
             device_epoch: DeviceEpoch::new(1),
             operation_id: OperationId::new(2),
-            function: FunctionIdentity {
-                logical_digest: digest(),
-                entry_name: "copy_word".to_string(),
-                source: FunctionSource::BinaryAir,
-            },
-            pipeline_contract: PipelineContract {
-                dispatch_kind: DispatchKind::ThreadsExact,
-                required_local_size: None,
-                fixed_grid: None,
-                push_constant_offset: 0,
-                push_constant_bytes: 0,
-                buffer_bindings: vec![BufferBindingContract {
-                    metal_binding: 0,
-                    access: BufferAccess::Write,
-                    footprint: FootprintProof::Affine {
-                        accesses: Vec::new(),
-                    },
-                }],
-                shader_capabilities: Vec::new(),
-                translator_revision: None,
-            },
+            pipelines: vec![CompiledComputePipeline {
+                device_epoch: DeviceEpoch::new(1),
+                pipeline_id: PipelineId::new(4),
+                function: FunctionIdentity {
+                    logical_digest: digest(),
+                    entry_name: "copy_word".to_string(),
+                    source: FunctionSource::BinaryAir,
+                },
+                contract: PipelineContract {
+                    dispatch_kind: DispatchKind::ThreadsExact,
+                    required_local_size: None,
+                    fixed_grid: None,
+                    push_constant_offset: 0,
+                    push_constant_bytes: 0,
+                    buffer_bindings: vec![BufferBindingContract {
+                        metal_binding: 0,
+                        access: BufferAccess::Write,
+                        footprint: FootprintProof::Affine {
+                            accesses: Vec::new(),
+                        },
+                    }],
+                    shader_capabilities: Vec::new(),
+                    translator_revision: None,
+                },
+            }],
             encoder_dispatch_type: DispatchType::Serial,
             passes,
             completion_policy: CompletionPolicy::HostReadback,
@@ -2334,11 +2423,11 @@ mod tests {
                 ],
             ),
         ]);
-        let mut read_binding = value.pipeline_contract.buffer_bindings[0].clone();
+        let mut read_binding = value.pipelines[0].contract.buffer_bindings[0].clone();
         read_binding.access = BufferAccess::Read;
-        let mut write_binding = value.pipeline_contract.buffer_bindings[0].clone();
+        let mut write_binding = value.pipelines[0].contract.buffer_bindings[0].clone();
         write_binding.metal_binding = 1;
-        value.pipeline_contract.buffer_bindings = vec![read_binding, write_binding];
+        value.pipelines[0].contract.buffer_bindings = vec![read_binding, write_binding];
         value
     }
 
@@ -2452,7 +2541,7 @@ mod tests {
         changed_pipeline.passes[1].pipeline = PipelineId::new(5);
         assert_eq!(
             changed_pipeline.validate_serial_buffer_reuse(),
-            Err(ContractError::MixedPipelines)
+            Err(ContractError::UnknownPipeline(PipelineId::new(5)))
         );
     }
 
@@ -2524,8 +2613,8 @@ mod tests {
             ),
         ] {
             let mut value = ping_pong_trace();
-            value.pipeline_contract.buffer_bindings[0].access = first;
-            value.pipeline_contract.buffer_bindings[1].access = second;
+            value.pipelines[0].contract.buffer_bindings[0].access = first;
+            value.pipelines[0].contract.buffer_bindings[1].access = second;
             for pass in &mut value.passes {
                 pass.buffers[0].access = first;
                 pass.buffers[1].access = second;
@@ -2583,18 +2672,190 @@ mod tests {
     }
 
     #[test]
-    fn trace_rejects_mixed_pipelines_and_duplicate_bindings() {
+    fn trace_rejects_unknown_pipelines_and_duplicate_bindings() {
         let mixed = trace(vec![
             pass(4, vec![buffer(1, 0)]),
             pass(5, vec![buffer(2, 0)]),
         ]);
-        assert_eq!(mixed.validate(), Err(ContractError::MixedPipelines));
+        assert_eq!(
+            mixed.validate(),
+            Err(ContractError::UnknownPipeline(PipelineId::new(5)))
+        );
 
         let duplicate = trace(vec![pass(4, vec![buffer(1, 0), buffer(2, 0)])]);
         assert_eq!(
             duplicate.validate(),
             Err(ContractError::DuplicateBinding(0))
         );
+    }
+
+    #[test]
+    fn pipeline_table_requires_unique_used_metadata_from_the_trace_epoch() {
+        let value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        assert_eq!(
+            value.pipeline(PipelineId::new(4)).unwrap(),
+            &value.pipelines[0]
+        );
+
+        let mut empty = value.clone();
+        empty.pipelines.clear();
+        assert_eq!(empty.validate(), Err(ContractError::EmptyPipelineTable));
+
+        let mut zero = value.clone();
+        zero.pipelines[0].pipeline_id = PipelineId::new(0);
+        assert_eq!(
+            zero.validate(),
+            Err(ContractError::InvalidIdentity("pipeline id"))
+        );
+
+        let mut foreign = value.clone();
+        foreign.pipelines[0].device_epoch = DeviceEpoch::new(2);
+        assert_eq!(
+            foreign.validate(),
+            Err(ContractError::PipelineEpochMismatch {
+                pipeline: PipelineId::new(4),
+                expected: value.device_epoch,
+                actual: DeviceEpoch::new(2),
+            })
+        );
+
+        let mut duplicate = value.clone();
+        duplicate.pipelines.push(duplicate.pipelines[0].clone());
+        assert_eq!(
+            duplicate.validate(),
+            Err(ContractError::DuplicatePipeline(PipelineId::new(4)))
+        );
+
+        let mut unused = value;
+        let mut second = unused.pipelines[0].clone();
+        second.pipeline_id = PipelineId::new(5);
+        unused.pipelines.push(second);
+        assert_eq!(
+            unused.validate(),
+            Err(ContractError::UnusedPipeline(PipelineId::new(5)))
+        );
+        unused.pipelines[1].function.entry_name.clear();
+        assert_eq!(
+            unused.validate(),
+            Err(ContractError::EmptyField("function entry name"))
+        );
+        unused.pipelines[1].function.entry_name = "other".into();
+        unused.pipelines[1].contract.push_constant_offset = 1;
+        assert_eq!(
+            unused.validate(),
+            Err(ContractError::MisalignedPushConstantOffset(1))
+        );
+    }
+
+    fn mixed_trace() -> ComputeTrace {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)]); 2]);
+        let mut second = value.pipelines[0].clone();
+        second.pipeline_id = PipelineId::new(5);
+        second.function.entry_name = "second_kernel".into();
+        value.pipelines.push(second);
+        value.passes[1].pipeline = PipelineId::new(5);
+        value
+    }
+
+    #[test]
+    fn mixed_pipelines_validate_each_pass_grid_local_size_and_binding_contract() {
+        let mut value = mixed_trace();
+        value.pipelines[0].contract.fixed_grid = Some([10, 3, 1]);
+        value.pipelines[0].contract.required_local_size = Some([8, 2, 1]);
+        value.pipelines[1].contract.fixed_grid = Some([3, 2, 1]);
+        value.pipelines[1].contract.required_local_size = Some([2, 1, 1]);
+        value.pipelines[1].contract.buffer_bindings[0].metal_binding = 7;
+        value.pipelines[1].contract.buffer_bindings[0].access = BufferAccess::Read;
+        value.passes[1].dispatch.grid = [3, 2, 1];
+        value.passes[1].dispatch.threads_per_threadgroup = [2, 1, 1];
+        value.passes[1].buffers[0].metal_binding = 7;
+        value.passes[1].buffers[0].access = BufferAccess::Read;
+        value.validate_serial_buffer_reuse().unwrap();
+        assert_eq!(
+            value.serial_resources().unwrap()[0].access,
+            BufferAccess::ReadWrite
+        );
+
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        provider.admit(&value, &resources()).unwrap();
+
+        let mut wrong_grid = value.clone();
+        wrong_grid.passes[1].dispatch.grid = value.passes[0].dispatch.grid;
+        assert!(matches!(
+            wrong_grid.validate(),
+            Err(ContractError::GridMismatch {
+                expected: [3, 2, 1],
+                ..
+            })
+        ));
+        let mut wrong_local = value.clone();
+        wrong_local.passes[1].dispatch.threads_per_threadgroup =
+            value.passes[0].dispatch.threads_per_threadgroup;
+        assert!(matches!(
+            wrong_local.validate(),
+            Err(ContractError::LocalSizeMismatch {
+                expected: [2, 1, 1],
+                ..
+            })
+        ));
+        let mut wrong_access = value.clone();
+        wrong_access.passes[1].buffers[0].access = BufferAccess::Write;
+        assert!(matches!(
+            wrong_access.validate(),
+            Err(ContractError::AccessMismatch {
+                binding: 7,
+                expected: BufferAccess::Read,
+                ..
+            })
+        ));
+        value.encoder_dispatch_type = DispatchType::Concurrent;
+        assert_eq!(
+            value.validate_serial_buffer_reuse(),
+            Err(ContractError::ConcurrentPassesUnsupported)
+        );
+    }
+
+    #[test]
+    fn capabilities_check_later_pipeline_dispatch_push_range_and_footprint() {
+        let value = mixed_trace();
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        provider.admit(&value, &resources()).unwrap();
+
+        let mut dispatch = value.clone();
+        dispatch.pipelines[1].contract.dispatch_kind = DispatchKind::Threadgroups;
+        dispatch.passes[1].dispatch.kind = DispatchKind::Threadgroups;
+        assert_eq!(
+            provider.admit(&dispatch, &resources()).unwrap_err().slug,
+            "dispatch_kind_unsupported"
+        );
+
+        let mut push = value.clone();
+        push.pipelines[1].contract.push_constant_offset = 128;
+        push.pipelines[1].contract.push_constant_bytes = 4;
+        assert_eq!(
+            provider.admit(&push, &resources()).unwrap_err().slug,
+            "push_constant_range_limit"
+        );
+
+        for footprint in [
+            FootprintProof::Static { max_bytes: 8 },
+            FootprintProof::Affine {
+                accesses: vec![AffineAccess {
+                    base_offset: 4,
+                    access_size: 4,
+                    terms: Vec::new(),
+                }],
+            },
+        ] {
+            let mut too_wide = value.clone();
+            too_wide.pipelines[1].contract.buffer_bindings[0].footprint = footprint;
+            assert_eq!(
+                provider.admit(&too_wide, &resources()).unwrap_err().slug,
+                "buffer_footprint_exceeds_view"
+            );
+        }
     }
 
     #[test]
@@ -2671,7 +2932,7 @@ mod tests {
             attribute_stride: None,
             source: BufferSource::BorrowedNoCopy(LeaseId::new(11)),
         };
-        value.pipeline_contract.buffer_bindings[0].access = BufferAccess::Read;
+        value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
         assert!(value.validate_with_resources(&leased_resources()).is_ok());
 
         let mut out_of_lease = value.clone();
@@ -2719,7 +2980,7 @@ mod tests {
             })
         ));
 
-        value.pipeline_contract.buffer_bindings[0].access = BufferAccess::Read;
+        value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
         value.passes[0].buffers[0].access = BufferAccess::Read;
         value.passes[1].buffers[0].access = BufferAccess::Read;
         assert!(value.validate_with_resources(&resources()).is_ok());
@@ -2808,7 +3069,7 @@ mod tests {
     #[test]
     fn snapshot_adapter_preserves_explicit_resource_identity() {
         let submission = snapshot_submission();
-        let contract = trace(Vec::new()).pipeline_contract;
+        let contract = trace(Vec::new()).pipelines[0].contract.clone();
         let value = trace_from_trusted_snapshot(
             &submission,
             DeviceEpoch::new(3),
@@ -2822,6 +3083,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value.passes.len(), 1);
+        assert_eq!(value.pipelines.len(), 1);
+        assert_eq!(value.pipelines[0].device_epoch, value.device_epoch);
+        assert_eq!(value.pipelines[0].pipeline_id, PipelineId::new(5));
+        assert_eq!(value.pipelines[0].function, snapshot_function());
         assert_eq!(value.passes[0].pipeline, PipelineId::new(5));
         assert_eq!(
             value.passes[0].buffers[0].allocation_id,
@@ -2834,7 +3099,7 @@ mod tests {
     #[test]
     fn snapshot_adapter_refuses_identity_and_dispatch_shape_gaps() {
         let submission = snapshot_submission();
-        let contract = trace(Vec::new()).pipeline_contract;
+        let contract = trace(Vec::new()).pipelines[0].contract.clone();
         let missing = trace_from_trusted_snapshot(
             &submission,
             DeviceEpoch::new(3),
@@ -2893,7 +3158,7 @@ mod tests {
             index: 1,
             bytes: vec![5, 6, 7, 8],
         });
-        let mut pipeline = snapshot_pipeline(trace(Vec::new()).pipeline_contract);
+        let mut pipeline = snapshot_pipeline(trace(Vec::new()).pipelines[0].contract.clone());
         pipeline
             .pipeline_contract
             .buffer_bindings
@@ -2975,7 +3240,7 @@ mod tests {
             }
 
             let mut invalid = value.clone();
-            invalid.pipeline_contract.buffer_bindings[0].footprint = FootprintProof::Affine {
+            invalid.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::Affine {
                 accesses: vec![AffineAccess {
                     base_offset: 0,
                     access_size: 4,
@@ -3041,8 +3306,8 @@ mod tests {
                 },
             ],
         )]);
-        alias
-            .pipeline_contract
+        alias.pipelines[0]
+            .contract
             .buffer_bindings
             .push(BufferBindingContract {
                 metal_binding: 1,
@@ -3058,7 +3323,7 @@ mod tests {
     #[test]
     fn capabilities_refuse_a_future_dispatch_kind_without_guessing() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.pipeline_contract.dispatch_kind = DispatchKind::Threadgroups;
+        value.pipelines[0].contract.dispatch_kind = DispatchKind::Threadgroups;
         value.passes[0].dispatch.kind = DispatchKind::Threadgroups;
         let error = capabilities().admit(&value, &resources()).unwrap_err();
         assert_eq!(error.slug, "dispatch_kind_unsupported");
@@ -3067,7 +3332,7 @@ mod tests {
     #[test]
     fn capabilities_refuse_an_unbounded_writable_footprint() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.pipeline_contract.buffer_bindings[0].footprint = FootprintProof::Unbounded;
+        value.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::Unbounded;
         let error = capabilities().admit(&value, &resources()).unwrap_err();
         assert_eq!(error.slug, "buffer_footprint_unbounded");
     }
@@ -3081,7 +3346,7 @@ mod tests {
         assert_eq!(error.slug, "pass_count_limit");
 
         let mut fixed = value.clone();
-        fixed.pipeline_contract.fixed_grid = Some([10, 3, 1]);
+        fixed.pipelines[0].contract.fixed_grid = Some([10, 3, 1]);
         assert!(capabilities().admit(&fixed, &resources()).is_ok());
         fixed.passes[0].dispatch.grid = [9, 3, 1];
         let error = capabilities().admit(&fixed, &resources()).unwrap_err();
@@ -3105,7 +3370,7 @@ mod tests {
             })
             .unwrap();
         value.passes[0].buffers[0].allocation_id = AllocationId::new(10);
-        value.pipeline_contract.buffer_bindings[0].footprint = FootprintProof::Affine {
+        value.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::Affine {
             accesses: vec![AffineAccess {
                 base_offset: 0,
                 access_size: 4,
@@ -3415,7 +3680,7 @@ mod tests {
         for access in [BufferAccess::Read, BufferAccess::Unused] {
             let mut read_only = trace.clone();
             read_only.passes[0].buffers[0].access = access;
-            read_only.pipeline_contract.buffer_bindings[0].access = access;
+            read_only.pipelines[0].contract.buffer_bindings[0].access = access;
             assert_eq!(
                 submission.validate_for_trace(&read_only),
                 Err(ContractError::ReadOnlyWriteback(ViewId::new(7)))
@@ -3463,13 +3728,14 @@ mod tests {
         let mut second = buffer(6, 1);
         second.offset = 4;
         let mut trace = trace(vec![pass(4, vec![first, second])]);
-        trace
-            .pipeline_contract
+        let second_binding = BufferBindingContract {
+            metal_binding: 1,
+            ..trace.pipelines[0].contract.buffer_bindings[0].clone()
+        };
+        trace.pipelines[0]
+            .contract
             .buffer_bindings
-            .push(BufferBindingContract {
-                metal_binding: 1,
-                ..trace.pipeline_contract.buffer_bindings[0].clone()
-            });
+            .push(second_binding);
         let submission = completed_submission(&trace);
         assert_eq!(submission.writebacks[0].view_id, ViewId::new(6));
         submission.validate_for_trace(&trace).unwrap();
