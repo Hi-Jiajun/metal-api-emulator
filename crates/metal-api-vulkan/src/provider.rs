@@ -133,6 +133,7 @@ mod tests {
     use super::*;
     use metal2vulkan::reflect::{
         BufferByteRange, BufferIndexSource, BufferStrideTerm, BufferStridedAccess,
+        DescriptorLocation, ResourceBinding, ShaderStage,
     };
 
     #[test]
@@ -179,5 +180,98 @@ mod tests {
         );
         assert!(map_access(None, 3).is_err());
         assert!(map_access(Some(ResourceAccess::Sampled), 3).is_err());
+    }
+
+    #[test]
+    fn pipeline_mapping_preserves_reflected_dispatch_and_buffer_contract() {
+        let reflection = ShaderReflection {
+            reflection_version: 1,
+            descriptor_layout: Default::default(),
+            stage: ShaderStage::Kernel,
+            entry_point: Some("copy_word".to_string()),
+            bindings: vec![ResourceBinding {
+                kind: ResourceKind::Buffer,
+                metal_index: 0,
+                descriptor: Some(DescriptorLocation {
+                    set: 0,
+                    binding: 0,
+                    count: 1,
+                }),
+                param_index: Some(0),
+                stage_input_location: None,
+                address_space: Some(1),
+                declared_size: Some(4),
+                extent: Some(metal2vulkan::reflect::BufferExtent::Object { bytes: 4 }),
+                footprint: Some(BufferFootprint {
+                    static_ranges: Vec::new(),
+                    strided_accesses: vec![BufferStridedAccess {
+                        base_offset: 0,
+                        access_size: 4,
+                        terms: vec![BufferStrideTerm {
+                            source: BufferIndexSource::GlobalInvocationIdX,
+                            stride: 4,
+                        }],
+                    }],
+                    has_unbounded_access: false,
+                }),
+                type_layout: None,
+                type_name: None,
+                texture_shape: None,
+                embedded_source: None,
+                access: Some(ResourceAccess::WriteOnly),
+                static_sampler: None,
+            }],
+            argument_buffer_fields: Vec::new(),
+            vertex_attributes: Vec::new(),
+            varyings: Vec::new(),
+            render_targets: Vec::new(),
+            depth_members: Vec::new(),
+            depth_qualifier: None,
+            stencil_members: Vec::new(),
+            local_size: Some([8, 2, 1]),
+            max_work_group_size: Some(16),
+            kernel_dispatch: Some(KernelDispatch::ThreadsDynamic { offset: 0 }),
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: Vec::new(),
+            implicit_imageblock_attachments: Vec::new(),
+            fragment_imageblock: None,
+            datalayout: None,
+            runtime_sampler_specializations: Vec::new(),
+            runtime_storage_image_specializations: Vec::new(),
+            function_constants: Vec::new(),
+        };
+        let contract = pipeline_contract(&reflection, None).unwrap();
+        assert_eq!(contract.dispatch_kind, DispatchKind::ThreadsExact);
+        assert_eq!(contract.required_local_size, [8, 2, 1]);
+        assert_eq!(contract.push_constant_bytes, 48);
+        assert_eq!(contract.buffer_bindings[0].access, BufferAccess::Write);
+        assert_eq!(
+            contract.buffer_bindings[0].footprint,
+            FootprintProof::Affine
+        );
+    }
+
+    #[test]
+    fn capabilities_mapping_uses_the_tightest_descriptor_limit() {
+        let limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_size: [8, 4, 2],
+            max_compute_work_group_invocations: 32,
+            max_compute_work_group_count: [16, 8, 4],
+            max_per_stage_descriptor_storage_buffers: 12,
+            max_descriptor_set_storage_buffers: 10,
+            max_per_stage_resources: 14,
+            max_storage_buffer_range: 4096,
+            ..Default::default()
+        };
+        let capabilities = capabilities_from_limits(&limits);
+        assert_eq!(capabilities.max_local_size, [8, 4, 2]);
+        assert_eq!(capabilities.max_invocations, 32);
+        assert_eq!(capabilities.max_group_count, [16, 8, 4]);
+        assert_eq!(capabilities.max_storage_buffer_descriptors, 10);
+        assert_eq!(capabilities.max_buffer_range, 4096);
+        assert_eq!(capabilities.storage_modes, vec![StorageMode::OwnedBytes]);
+        assert!(!capabilities.supports_threadgroups);
+        assert!(!capabilities.submit_only);
     }
 }
