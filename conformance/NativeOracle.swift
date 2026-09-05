@@ -47,6 +47,7 @@ private struct Writeback: Codable {
 private struct DispatchDefinition: Decodable, Equatable {
     let grid: [UInt64]
     let local: [UInt64]
+    let bindings: [UInt64]?
 }
 
 private struct CaseDefinition: Decodable {
@@ -281,12 +282,12 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" {
         let expectedCount: Int
         switch definition.id {
-        case "transform_twice": expectedCount = 2
-        case "transform_three_times": expectedCount = 3
-        case "transform_eight_times": expectedCount = 8
+        case "transform_twice", "transform_pingpong_two", "copy_pingpong": expectedCount = 2
+        case "transform_three_times", "transform_pingpong_three": expectedCount = 3
+        case "transform_eight_times", "transform_pingpong_eight": expectedCount = 8
         default: throw OracleError("Unsupported serial case: \(definition.id)")
         }
         guard let sequence = definition.dispatches else {
@@ -295,8 +296,18 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         try require(sequence.count == expectedCount && sequence.count <= maximumPassCount,
                     "\(definition.id): unsupported serial pass count")
         let localSizes: [[UInt64]] = [[4, 2, 2], [8, 4, 4], [1, 1, 1]]
-        let expected = (0..<expectedCount).map {
-            DispatchDefinition(grid: [5, 3, 2], local: localSizes[$0 % localSizes.count])
+        let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
+            var mapping: [UInt64]? = nil
+            if suite == "compute-buffer-v4" {
+                var views = definition.buffers.map { $0.view }
+                let last = definition.id == "copy_pingpong" ? 1 : 2
+                try require(views.count > last, "Missing pingpong resources")
+                if index % 2 == 1 { views.swapAt(0, last) }
+                mapping = views
+            }
+            let grid: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : [5, 3, 2]
+            let local: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : localSizes[index % localSizes.count]
+            return DispatchDefinition(grid: grid, local: local, bindings: mapping)
         }
         try require(sequence == expected, "\(definition.id): unsupported serial dispatch sequence")
         try require(sequence[0].grid == definition.grid && sequence[0].local == definition.local,
@@ -305,10 +316,10 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     } else {
         try require(definition.dispatches == nil,
                     "\(definition.id): serial dispatches require compute-buffer-v3")
-        dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local)]
+        dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil)]
     }
     switch definition.id {
-    case "copy_word", "copy_seed_a", "copy_seed_b":
+    case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong":
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "copy_word: unsupported entry or dispatch shape")
@@ -332,7 +343,8 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let buffer = definition.buffers[0]
         try require(buffer.binding == 0 && buffer.access == "write" && buffer.length == 120,
                     "indexed_boundary: expected a 120-byte write buffer at 0")
-    case "transform_tail", "transform_small_grid", "transform_twice", "transform_three_times", "transform_eight_times":
+    case "transform_tail", "transform_small_grid", "transform_twice", "transform_three_times", "transform_eight_times",
+         "transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight":
         let expectedLocal: [UInt64] = definition.id == "transform_small_grid" ? [8, 4, 4] : [4, 2, 2]
         try require(definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == expectedLocal,
@@ -348,11 +360,25 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     return dispatches
 }
 
+// Called only after the fixed dispatch shape and resource permutation checks.
+private func writableViews(_ definition: CaseDefinition) -> Set<UInt64> {
+    let sequence = definition.dispatches ?? [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil)]
+    var result = Set<UInt64>()
+    for dispatch in sequence {
+        for (index, slot) in definition.buffers.enumerated() where slot.access != "read" {
+            result.insert(dispatch.bindings?[index] ?? slot.view)
+        }
+    }
+    return result
+}
+
 private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) throws -> [ValidatedBuffer] {
     var bindings = Set<UInt64>()
     var allocations = Set<UInt64>()
     var views = Set<UInt64>()
     var buffers = [ValidatedBuffer]()
+    try require(definition.buffers.map { $0.binding } == definition.buffers.map { $0.binding }.sorted(),
+                "Bindings must be in canonical order")
     for buffer in definition.buffers {
         let context = "\(definition.id) binding \(buffer.binding)"
         try require(bindings.insert(buffer.binding).inserted, "\(context): duplicate binding")
@@ -379,7 +405,8 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
         buffers.append(ValidatedBuffer(definition: buffer, backing: backing))
     }
 
-    let writable = definition.buffers.filter { $0.access != "read" }
+    let written = writableViews(definition)
+    let writable = definition.buffers.filter { written.contains($0.view) }
     try require(definition.expected_writebacks.count == writable.count,
                 "\(definition.id): expected writeback count mismatch")
     var expectedViews = Set<UInt64>()
@@ -412,8 +439,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
                        "indexed_small_grid", "indexed_unit", "transform_tail", "transform_small_grid"]
     case "compute-buffer-v3":
         expectedIDs = ["transform_twice", "transform_three_times", "transform_eight_times"]
+    case "compute-buffer-v4":
+        expectedIDs = ["transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight", "copy_pingpong"]
     default:
-        throw OracleError("Only compute-buffer-v1, compute-buffer-v2, and compute-buffer-v3 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v4 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -510,8 +539,13 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
             throw OracleError("\(definition.id): cannot create a compute encoder")
         }
         encoder.setComputePipelineState(pipeline)
-        for (buffer, resource) in zip(fixture.buffers, resources) {
-            encoder.setBuffer(resource, offset: Int(buffer.definition.offset), index: Int(buffer.definition.binding))
+        for (index, slot) in fixture.buffers.enumerated() {
+            let view = dispatch.bindings?[index] ?? slot.definition.view
+            guard let poolIndex = fixture.buffers.firstIndex(where: { $0.definition.view == view }) else {
+                throw OracleError("Unknown bound resource")
+            }
+            let resource = fixture.buffers[poolIndex]
+            encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.definition.binding))
         }
         encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
         encoder.endEncoding()
@@ -530,6 +564,7 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
 
     var allocations = [AllocationResult]()
     var writebacks = [Writeback]()
+    let writtenViews = writableViews(definition)
     for (buffer, resource) in zip(fixture.buffers, resources) {
         let specification = buffer.definition
         // Only completed shared resources are CPU-visible. Copy the complete
@@ -537,7 +572,7 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         let observed = Data(bytes: resource.contents(), count: buffer.backing.count)
         let start = Int(specification.offset)
         let end = start + Int(specification.length)
-        if specification.access == "read" {
+        if !writtenViews.contains(specification.view) {
             try require(observed == buffer.backing, "\(definition.id): read-only allocation \(specification.allocation) changed")
         } else {
             try require(observed.prefix(start) == buffer.backing.prefix(start)

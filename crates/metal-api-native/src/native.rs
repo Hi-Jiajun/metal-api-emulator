@@ -34,7 +34,7 @@ struct State {
 }
 
 /// Synchronous native provider with at most eight serial passes over one buffer
-/// set, for the exact conformance fixtures.
+/// pool, allowing binding permutations for the exact conformance fixtures.
 ///
 /// A submission has a 20-second observation deadline. Unknown retirement or a
 /// GPU error permanently disables new work in this context and retains its
@@ -279,8 +279,8 @@ impl ComputeProvider for NativeMetalProvider {
                 "metal_buffer_binding_limit",
             ));
         }
-        // Admission establishes identical pipeline/buffer tables for serial
-        // reuse. Dispatch dimensions can differ, so check every pipeline-local
+        // Admission establishes one pipeline and stable logical buffer pool.
+        // Dispatch dimensions can differ, so check every pipeline-local
         // limit before allocating buffers or creating a command buffer.
         for (pass_index, pass) in trace.passes.iter().enumerate() {
             let local = pass.dispatch.threads_per_threadgroup;
@@ -370,9 +370,21 @@ fn execute(
     pipeline: ComputePipelineState,
     token: CompletionToken,
 ) -> Result<ProviderSubmission, ProviderError> {
-    let pass = &trace.passes[0];
-    let mut buffers = Vec::with_capacity(pass.buffers.len());
-    for view in &pass.buffers {
+    let pool = trace.serial_resources().map_err(|error| {
+        refusal(
+            ProviderPhase::Encode,
+            ProviderErrorClass::Args,
+            "serial_buffer_pool_invalid",
+        )
+        .with_detail(error.to_string())
+    })?;
+    let pool_positions: BTreeMap<_, _> = pool
+        .iter()
+        .enumerate()
+        .map(|(index, view)| (view.view_id, index))
+        .collect();
+    let mut buffers = Vec::with_capacity(pool.len());
+    for view in &pool {
         let BufferSource::OwnedBytes(bytes) = &view.source else {
             return Err(refusal(
                 ProviderPhase::Encode,
@@ -434,7 +446,9 @@ fn execute(
             ComputeCommandEncoderRef::from_ptr(pointer)
         };
         encoder.set_compute_pipeline_state(&resources.pipeline);
-        for (view, buffer) in pass.buffers.iter().zip(&resources.buffers) {
+        for view in &pass.buffers {
+            // serial_resources validated that each pass permutes this pool.
+            let buffer = &resources.buffers[pool_positions[&view.view_id]];
             encoder.set_buffer(u64::from(view.metal_binding), Some(buffer), 0);
         }
         let [gx, gy, gz] = pass.dispatch.grid;
@@ -478,7 +492,7 @@ fn execute(
     // completed command permits the guard to release its backing resources.
     pending.submitted = false;
     let mut writebacks = Vec::new();
-    for (view, buffer) in pass.buffers.iter().zip(&resources.buffers) {
+    for (view, buffer) in pool.iter().zip(&resources.buffers) {
         if view.access.is_writable() {
             let bytes = unsafe {
                 // Admission bounded length to 1 MiB, contents was checked

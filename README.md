@@ -27,7 +27,7 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   are detected and refused.
 - Experimental provider: `VulkanComputeProvider` implements `ComputeProvider`
   for up to eight synchronous serial exact-thread passes sharing a pipeline
-  and owned buffer table, followed by one host readback. It registers pipelines, revalidates each trace against its actual
+  and stable owned view pool, followed by one host readback. It registers pipelines, revalidates each trace against its actual
   device and artifact, and returns checked allocation-relative writebacks.
 - Completion: this provider's `submit` waits for GPU completion and readback;
   `wait` observes the recorded terminal result. A submit timeout is terminal
@@ -38,7 +38,7 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33979796237);
   the new serial multi-pass increment still needs its own native run.
 - Open design work: asynchronous submission/readback, general native shader
-  admission, multiple pipelines/rebinding in a command buffer, aliases and
+  admission, multiple pipelines/new resources within a command buffer, aliases and
   completion-driven live leases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
@@ -55,8 +55,10 @@ boundaries and sparse read/write bindings. Its Swift/Vulkan native run also
 oracle remains separate from the new native Rust provider. The
 [shared-provider increment](docs/SHARED-PROVIDERS.md) adds a third comparison
 path that passed v1/v2 in CI. The [serial-pass extension](conformance/SERIAL-PASSES.md)
-adds one-upload/multiple-dispatch compute sequences; its native runtime
-validation is pending. Existing evidence does not
+adds one-upload/multiple-dispatch sequences and passed
+[three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33980765113).
+The new [buffer-rebinding extension](conformance/BUFFER-REBINDING.md) permits
+existing views to change roles between passes; its native v4 run is pending. Existing evidence does not
 establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;

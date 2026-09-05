@@ -105,3 +105,8 @@ serial dispatches on the same pipeline/buffer table, uploaded once and read
 back once. Only per-pass grid/local dimensions vary. See
 [the serial-pass contract](../conformance/SERIAL-PASSES.md). General rebinding,
 mixed pipelines and asynchronous command buffers remain unimplemented.
+
+The subsequent [rebinding increment](../conformance/BUFFER-REBINDING.md) allows
+per-pass permutations of the same initialized views. New views, altered source
+bytes, ranges and mixed pipelines remain refused. Native v4 verification is
+pending independently from earlier serial-pass results.

@@ -184,3 +184,10 @@ Rust native implementation is not considered validated by earlier Swift runs.
 2, 3 and 8 dispatches, one upload and one final completion. The earlier suites
 remain unchanged. See [SERIAL-PASSES.md](SERIAL-PASSES.md) for the resource reuse
 contract, expected results and pending native verification.
+
+## Existing-view rebinding
+
+[suite-v4.json](suite-v4.json) exercises serial buffer-role swaps with one
+initial upload. The final result includes views written only by later passes.
+See [BUFFER-REBINDING.md](BUFFER-REBINDING.md) for its exact admission rules and
+validation limits. New v4 native comparison is pending at this local checkpoint.

@@ -87,6 +87,7 @@ struct Case {
 struct CaseDispatch {
     grid: [u64; 3],
     local: [u64; 3],
+    bindings: Option<Vec<u64>>,
 }
 
 #[derive(Deserialize)]
@@ -277,6 +278,12 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "transform_three_times",
             "transform_eight_times",
         ],
+        (1, "compute-buffer-v4") => &[
+            "transform_pingpong_two",
+            "transform_pingpong_three",
+            "transform_pingpong_eight",
+            "copy_pingpong",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -357,7 +364,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 return Err("initial data length differs from declared view length".into());
             }
         }
-        let mut writable: Vec<_> = case.buffers.iter().filter(|b| b.access != "read").collect();
+        let mut writable: Vec<_> = case
+            .buffers
+            .iter()
+            .filter(|b| ever_writable(case).contains(&b.view))
+            .collect();
         writable.sort_by_key(|buffer| (buffer.allocation, buffer.view));
         if case.expected_writebacks.len() != writable.len() {
             return Err("expected result does not cover writable views".into());
@@ -406,7 +417,7 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         )
     };
     Ok(match id {
-        "copy_word" | "copy_seed_a" | "copy_seed_b" => copy,
+        "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         "indexed_boundary" | "indexed_tail" => indexed([8, 2, 1]),
         "indexed_full" => indexed([5, 3, 1]),
         "indexed_small_grid" => indexed([16, 4, 1]),
@@ -414,7 +425,10 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         "transform_tail"
         | "transform_twice"
         | "transform_three_times"
-        | "transform_eight_times" => transform([4, 2, 2]),
+        | "transform_eight_times"
+        | "transform_pingpong_two"
+        | "transform_pingpong_three"
+        | "transform_pingpong_eight" => transform([4, 2, 2]),
         "transform_small_grid" => transform([8, 4, 4]),
         _ => return Err("unknown case identity".into()),
     })
@@ -422,9 +436,9 @@ fn case_shape(id: &str) -> Result<CaseShape> {
 
 fn validate_case_dispatches(case: &Case) -> Result<()> {
     let count = match case.id.as_str() {
-        "transform_twice" => 2,
-        "transform_three_times" => 3,
-        "transform_eight_times" => 8,
+        "transform_twice" | "transform_pingpong_two" | "copy_pingpong" => 2,
+        "transform_three_times" | "transform_pingpong_three" => 3,
+        "transform_eight_times" | "transform_pingpong_eight" => 8,
         _ => {
             if case.dispatches.is_some() {
                 return Err("single-pass fixture cannot carry a sequence".into());
@@ -440,15 +454,62 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         return Err("wrong sequence dispatch count".into());
     }
     let locals = [[4, 2, 2], [8, 4, 4], [1, 1, 1]];
+    let pingpong = case.id.contains("pingpong");
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.grid != [5, 3, 2] || dispatch.local != locals[i % locals.len()] {
+        let (grid, local) = if case.id == "copy_pingpong" {
+            ([1, 1, 1], [1, 1, 1])
+        } else {
+            ([5, 3, 2], locals[i % locals.len()])
+        };
+        if dispatch.grid != grid || dispatch.local != local {
             return Err("unreviewed sequence dispatch shape".into());
+        }
+        if pingpong {
+            let mut expected: Vec<_> = case.buffers.iter().map(|buffer| buffer.view).collect();
+            let last = if case.id == "copy_pingpong" { 1 } else { 2 };
+            if expected.len() <= last {
+                return Err("missing pingpong resource".into());
+            }
+            if i % 2 == 1 {
+                expected.swap(0, last);
+            }
+            if dispatch.bindings.as_ref() != Some(&expected) {
+                return Err("unreviewed pingpong binding map".into());
+            }
+        } else if dispatch.bindings.is_some() {
+            return Err("non-rebinding fixture cannot carry binding maps".into());
         }
     }
     if case.grid != dispatches[0].grid || case.local != dispatches[0].local {
         return Err("sequence first dispatch does not match case".into());
     }
     Ok(())
+}
+
+fn ever_writable(case: &Case) -> BTreeSet<u64> {
+    if let Some(dispatches) = &case.dispatches {
+        dispatches
+            .iter()
+            .flat_map(|dispatch| {
+                case.buffers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.access != "read")
+                    .map(|(index, slot)| {
+                        dispatch
+                            .bindings
+                            .as_ref()
+                            .map_or(slot.view, |map| map[index])
+                    })
+            })
+            .collect()
+    } else {
+        case.buffers
+            .iter()
+            .filter(|b| b.access != "read")
+            .map(|b| b.view)
+            .collect()
+    }
 }
 
 fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
@@ -554,26 +615,53 @@ fn run_case(
                 vec![CaseDispatch {
                     grid: case.grid,
                     local: case.local,
+                    bindings: None,
                 }]
             })
             .into_iter()
-            .map(|dispatch| ComputePass {
-                pipeline: pipeline.pipeline_id,
-                buffers: views.clone(),
-                dispatch: Dispatch {
-                    kind: DispatchKind::ThreadsExact,
-                    grid: dispatch.grid,
-                    threads_per_threadgroup: dispatch.local,
-                },
+            .map(|dispatch| {
+                let buffers = views
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slot)| {
+                        let view_id = dispatch
+                            .bindings
+                            .as_ref()
+                            .map_or(slot.view_id.get(), |map| map[index]);
+                        let mut resource = views
+                            .iter()
+                            .find(|view| view.view_id.get() == view_id)
+                            .expect("validated binding map")
+                            .clone();
+                        resource.metal_binding = slot.metal_binding;
+                        resource.access = slot.access;
+                        resource
+                    })
+                    .collect();
+                ComputePass {
+                    pipeline: pipeline.pipeline_id,
+                    buffers,
+                    dispatch: Dispatch {
+                        kind: DispatchKind::ThreadsExact,
+                        grid: dispatch.grid,
+                        threads_per_threadgroup: dispatch.local,
+                    },
+                }
             })
             .collect(),
         completion_policy: CompletionPolicy::HostReadback,
     };
     if case.entry == "transform_3d" {
         let mut short = trace.clone();
+        let shortened = short.passes[0].buffers[0].view_id;
         for pass in &mut short.passes {
-            pass.buffers[0].length = 119;
-            if let BufferSource::OwnedBytes(bytes) = &mut pass.buffers[0].source {
+            let view = pass
+                .buffers
+                .iter_mut()
+                .find(|view| view.view_id == shortened)
+                .unwrap();
+            view.length = 119;
+            if let BufferSource::OwnedBytes(bytes) = &mut view.source {
                 bytes.truncate(119);
             }
         }
@@ -766,6 +854,7 @@ mod tests {
         s.cases[2].dispatches.as_mut().unwrap().push(CaseDispatch {
             grid: [5, 3, 2],
             local: [4, 2, 2],
+            bindings: None,
         });
         assert!(validate_suite(&s).is_err());
         let mut s = load();
@@ -779,7 +868,30 @@ mod tests {
         s.cases[0].dispatches = Some(vec![CaseDispatch {
             grid: [1, 1, 1],
             local: [1, 1, 1],
+            bindings: None,
         }]);
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn pingpong_case_requires_exact_view_permutations_and_final_writebacks() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v4.json"))
+                .unwrap()
+        };
+        let s = load();
+        validate_suite(&s).unwrap();
+        assert_eq!(ever_writable(&s.cases[3]), BTreeSet::from([200, 201]));
+        for map in [vec![410, 420, 410], vec![420, 410, 400], vec![410, 420]] {
+            let mut s = load();
+            s.cases[0].dispatches.as_mut().unwrap()[1].bindings = Some(map);
+            assert!(validate_suite(&s).is_err());
+        }
+        let mut s = load();
+        s.cases[3].expected_writebacks.pop();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].dispatches.as_mut().unwrap()[1].bindings = None;
         assert!(validate_suite(&s).is_err());
     }
 }

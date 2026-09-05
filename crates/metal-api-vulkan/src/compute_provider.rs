@@ -1,8 +1,8 @@
 //! Synchronous, owned-byte implementation of the first compute provider slice.
 
 use crate::{
-    execute_serial_submission_with_status, TranslatedComputePipeline, VulkanExecutor,
-    VulkanPipelineArtifact,
+    execute_rebound_submission_with_status, BoundDispatch, TranslatedComputePipeline,
+    VulkanExecutor, VulkanPipelineArtifact,
 };
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
@@ -12,9 +12,7 @@ use metal_api_core::provider::{
     ProviderErrorClass, ProviderPhase, ProviderSubmission, Retryability, SemanticDigest,
     ShaderSource, SubmissionId, ValidatedComputeTrace,
 };
-use metal_api_core::{
-    AirSource, BufferBinding, BufferUpdate, ComputeSubmission, Device, Function, Size,
-};
+use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +28,8 @@ struct RegisteredPipeline {
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
-/// sharing one pipeline and binding table, with owned bytes and host readback. `submit` waits for GPU completion and readback;
+/// sharing one pipeline and an initialized view pool, with owned bytes and
+/// host readback. Each pass may permute that pool across the pipeline's bindings. `submit` waits for GPU completion and readback;
 /// `wait` only observes the recorded terminal result. Tokens and metadata are
 /// process-local, and no-copy leases and asynchronous submission are refused.
 /// Callers can explicitly release registered pipelines and completion records.
@@ -279,19 +278,39 @@ impl ComputeProvider for VulkanComputeProvider {
             .cloned()
             .ok_or_else(|| unknown_pipeline(pass.pipeline))?;
         validate_pipeline_identity(trace, &registered.metadata)?;
+        let pool = trace.serial_resources().map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "resource_contract_invalid",
+            )
+            .with_detail(error.to_string())
+        })?;
         let mut dispatches = Vec::with_capacity(trace.passes.len());
         for pass in &trace.passes {
             let grid = narrow_dimensions(pass.dispatch.grid)?.dimensions();
             let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?.dimensions();
-            dispatches.push((grid, local));
+            let bindings = pass
+                .buffers
+                .iter()
+                .map(|view| {
+                    let resource = pool
+                        .iter()
+                        .find(|resource| resource.view_id == view.view_id)
+                        .expect("validated resource pool");
+                    (view.metal_binding, resource.metal_binding)
+                })
+                .collect();
+            dispatches.push(BoundDispatch {
+                grid,
+                local,
+                bindings,
+            });
         }
-        let grid = narrow_dimensions(pass.dispatch.grid)?;
-        let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?;
-        let buffers = pass
-            .buffers
+        let buffers = pool
             .iter()
-            .map(|view| {
-                let BufferSource::OwnedBytes(bytes) = &view.source else {
+            .map(|resource| {
+                let BufferSource::OwnedBytes(bytes) = &resource.source else {
                     return Err(refusal(
                         ProviderPhase::Resolve,
                         ProviderErrorClass::Capability,
@@ -299,17 +318,11 @@ impl ComputeProvider for VulkanComputeProvider {
                     ));
                 };
                 Ok(BufferBinding {
-                    index: view.metal_binding,
+                    index: resource.metal_binding,
                     bytes: bytes.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let submission = ComputeSubmission {
-            pipeline: registered.artifact.clone(),
-            buffers,
-            threads_per_grid: grid,
-            threads_per_threadgroup: local,
-        };
         let token = CompletionToken {
             submission_id: SubmissionId::new(next_identity(
                 &self.next_submission,
@@ -325,10 +338,10 @@ impl ComputeProvider for VulkanComputeProvider {
                 .lock()
                 .map_err(|_| registry_poisoned())?;
             self.ensure_usable()?;
-            execute_serial_submission_with_status(
+            execute_rebound_submission_with_status(
                 &self.executor.context,
                 registered.artifact.clone(),
-                submission,
+                buffers,
                 &dispatches,
             )
         };

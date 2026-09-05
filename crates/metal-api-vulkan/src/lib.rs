@@ -425,17 +425,45 @@ pub(crate) fn execute_submission_with_status(
     execute_serial_submission_with_status(context, artifact, submission, &[dispatch])
 }
 
+/// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
+/// Pool keys identify backing buffers; they are not Vulkan descriptor indices.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundDispatch {
+    pub grid: [u32; 3],
+    pub local: [u32; 3],
+    pub bindings: Vec<(u32, u32)>,
+}
+
 /// Execute one to eight ordered dispatches with one pipeline and buffer set.
 /// Tuples contain (grid, local size); the first must match the submission sizes.
-/// The caller owns serialization. All passes are validated before creating
-/// request resources, and share one upload, command buffer, fence, and readback.
 pub(crate) fn execute_serial_submission_with_status(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
     dispatches: &[([u32; 3], [u32; 3])],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let result = execute_submission_stages(context, artifact, submission, dispatches);
+    validate_serial_dispatches(
+        (
+            submission.threads_per_grid.dimensions(),
+            submission.threads_per_threadgroup.dimensions(),
+        ),
+        dispatches,
+    )?;
+    let bound = identity_dispatches(&submission.buffers, dispatches);
+    execute_rebound_submission_with_status(context, artifact, submission.buffers, &bound)
+}
+
+/// Execute one pipeline against a permutation of the uploaded buffers per pass.
+/// The caller owns serialization. All passes are validated before creating
+/// request resources, and share one upload, command buffer, fence, and readback.
+/// Updates identify pool keys and include each buffer writable in any pass once.
+pub(crate) fn execute_rebound_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    buffers: Vec<BufferBinding>,
+    dispatches: &[BoundDispatch],
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let result = execute_submission_stages(context, artifact, &buffers, dispatches);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -448,19 +476,16 @@ pub(crate) fn execute_serial_submission_with_status(
 fn execute_submission_stages(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
-    submission: ComputeSubmission,
-    dispatches: &[([u32; 3], [u32; 3])],
+    buffers: &[BufferBinding],
+    dispatches: &[BoundDispatch],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let plans = plan_serial_submission(
+    let planned = plan_rebound_submission(
         &artifact.translated,
-        &submission.buffers,
+        buffers,
         &context.properties.limits,
-        (
-            submission.threads_per_grid.dimensions(),
-            submission.threads_per_threadgroup.dimensions(),
-        ),
         dispatches,
     )?;
+    let plans = &planned.plans;
     if plans.iter().all(|plan| plan.regions.is_empty()) {
         return Ok(Vec::new());
     }
@@ -471,7 +496,7 @@ fn execute_submission_stages(
 
     let mut resources = ExecutionResources::new(Arc::clone(context));
     resources
-        .create_pipeline_objects(artifact.translated.spirv(), reflection, &plans)
+        .create_pipeline_objects(artifact.translated.spirv(), reflection, plans)
         .map_err(|error| {
             error.into_provider(
                 ProviderPhase::Compile,
@@ -488,14 +513,12 @@ fn execute_submission_stages(
             CompletionDisposition::NotSubmitted,
         )
     };
+    resources.create_buffers(buffers).map_err(encode_error)?;
     resources
-        .create_buffers(reflection, &submission.buffers)
+        .create_descriptors(reflection, dispatches)
         .map_err(encode_error)?;
     resources
-        .create_descriptors(reflection)
-        .map_err(encode_error)?;
-    resources
-        .record(reflection, reflected_contract, &plans)
+        .record(reflection, reflected_contract, plans)
         .map_err(encode_error)?;
     match resources.submit_and_wait() {
         Ok(()) => {}
@@ -507,11 +530,59 @@ fn execute_submission_stages(
         }
     }
     resources
-        .read_updates(reflection)
+        .read_updates(&planned.writable_pool_keys)
         .map_err(ExecutionFailure::into_readback_provider)
 }
 
-/// Pure preflight: no request-specific Vulkan objects exist until this returns.
+fn dispatch_args_error(error: ExecutorError) -> ProviderError {
+    ExecutionFailure::from(error).into_provider(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Args,
+        "vulkan-dispatch-args",
+        CompletionDisposition::NotSubmitted,
+    )
+}
+
+fn validate_serial_dispatches(
+    first_dispatch: ([u32; 3], [u32; 3]),
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Result<(), ProviderError> {
+    validate_dispatch_count(dispatches.len())?;
+    if dispatches[0] != first_dispatch {
+        return Err(dispatch_args_error(failure(
+            "first serial dispatch sizes differ from the submission sizes",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dispatch_count(count: usize) -> Result<(), ProviderError> {
+    if !(1..=MAX_SERIAL_DISPATCHES).contains(&count) {
+        return Err(dispatch_args_error(failure(format!(
+            "serial submission requires 1..={MAX_SERIAL_DISPATCHES} dispatches, got {count}",
+        ))));
+    }
+    Ok(())
+}
+
+fn identity_dispatches(
+    buffers: &[BufferBinding],
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Vec<BoundDispatch> {
+    dispatches
+        .iter()
+        .map(|&(grid, local)| BoundDispatch {
+            grid,
+            local,
+            bindings: buffers
+                .iter()
+                .map(|buffer| (buffer.index, buffer.index))
+                .collect(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn plan_serial_submission(
     translated: &TranslatedComputePipeline,
     buffers: &[BufferBinding],
@@ -519,14 +590,25 @@ fn plan_serial_submission(
     first_dispatch: ([u32; 3], [u32; 3]),
     dispatches: &[([u32; 3], [u32; 3])],
 ) -> Result<Vec<KernelDispatchPlan>, ProviderError> {
-    let resolve_args = |error| {
-        ExecutionFailure::from(error).into_provider(
-            ProviderPhase::Resolve,
-            ProviderErrorClass::Args,
-            "vulkan-dispatch-args",
-            CompletionDisposition::NotSubmitted,
-        )
-    };
+    validate_serial_dispatches(first_dispatch, dispatches)?;
+    let bound = identity_dispatches(buffers, dispatches);
+    Ok(plan_rebound_submission(translated, buffers, limits, &bound)?.plans)
+}
+
+#[derive(Debug)]
+struct ReboundSubmissionPlan {
+    plans: Vec<KernelDispatchPlan>,
+    writable_pool_keys: BTreeSet<u32>,
+}
+
+/// Pure preflight: no request-specific Vulkan objects exist until this returns.
+/// Each pass must bijectively bind the entire pool to the reflected Metal slots.
+fn plan_rebound_submission(
+    translated: &TranslatedComputePipeline,
+    buffers: &[BufferBinding],
+    limits: &vk::PhysicalDeviceLimits,
+    dispatches: &[BoundDispatch],
+) -> Result<ReboundSubmissionPlan, ProviderError> {
     let resolve_capability = |error| {
         ExecutionFailure::from(error).into_provider(
             ProviderPhase::Resolve,
@@ -535,17 +617,7 @@ fn plan_serial_submission(
             CompletionDisposition::NotSubmitted,
         )
     };
-    if !(1..=MAX_SERIAL_DISPATCHES).contains(&dispatches.len()) {
-        return Err(resolve_args(failure(format!(
-            "serial submission requires 1..={MAX_SERIAL_DISPATCHES} dispatches, got {}",
-            dispatches.len()
-        ))));
-    }
-    if dispatches[0] != first_dispatch {
-        return Err(resolve_args(failure(
-            "first serial dispatch sizes differ from the submission sizes",
-        )));
-    }
+    validate_dispatch_count(dispatches.len())?;
     let reflection = translated.reflection();
     let reflected_contract = reflection
         .kernel_dispatch
@@ -555,26 +627,85 @@ fn plan_serial_submission(
             "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
         ))));
     }
+    let mut pool = BTreeMap::new();
+    for buffer in buffers {
+        if pool.insert(buffer.index, buffer).is_some() {
+            return Err(dispatch_args_error(failure(format!(
+                "buffer pool key {} occurs more than once",
+                buffer.index
+            ))));
+        }
+    }
+    if pool.len() != reflection.bindings.len() {
+        return Err(dispatch_args_error(failure(
+            "buffer pool must contain exactly one resource per reflected binding",
+        )));
+    }
     let mut plans = Vec::with_capacity(dispatches.len());
-    for &(grid, local) in dispatches {
-        validate_local_size(limits, local).map_err(resolve_capability)?;
+    let mut writable_pool_keys = BTreeSet::new();
+    for dispatch in dispatches {
+        let mut used_pool_keys = BTreeSet::new();
+        let mut bindings = Vec::with_capacity(dispatch.bindings.len());
+        for &(metal_index, pool_key) in &dispatch.bindings {
+            let buffer = pool.get(&pool_key).ok_or_else(|| {
+                dispatch_args_error(failure(format!("unknown buffer pool key {pool_key}")))
+            })?;
+            if !used_pool_keys.insert(pool_key) {
+                return Err(dispatch_args_error(failure(format!(
+                    "buffer pool key {pool_key} is bound more than once in one pass",
+                ))));
+            }
+            bindings.push(BufferBinding {
+                index: metal_index,
+                bytes: buffer.bytes.clone(),
+            });
+        }
+        if used_pool_keys.len() != pool.len() {
+            return Err(dispatch_args_error(failure(
+                "each pass must bind the entire buffer pool exactly once",
+            )));
+        }
+        validate_local_size(limits, dispatch.local).map_err(resolve_capability)?;
         translated
-            .validate_buffers(buffers, grid)
-            .map_err(resolve_args)?;
+            .validate_buffers(&bindings, dispatch.grid)
+            .map_err(dispatch_args_error)?;
+        for &(metal_index, pool_key) in &dispatch.bindings {
+            let reflected = reflection
+                .bindings
+                .iter()
+                .find(|binding| binding.metal_index == metal_index)
+                .expect("validated reflected binding");
+            if !matches!(
+                reflected.access,
+                Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
+            ) {
+                writable_pool_keys.insert(pool_key);
+            }
+        }
         translated
-            .validate_threadgroup(local)
+            .validate_threadgroup(dispatch.local)
             .map_err(resolve_capability)?;
         let plan = reflected_contract
-            .plan(local, Some(grid))
-            .map_err(|error| resolve_args(failure(format!("plan exact dispatch: {error}"))))?;
+            .plan(dispatch.local, Some(dispatch.grid))
+            .map_err(|error| {
+                dispatch_args_error(failure(format!("plan exact dispatch: {error}")))
+            })?;
         validate_dispatch_plan(limits, reflected_contract, &plan).map_err(resolve_capability)?;
         plans.push(plan);
     }
     validate_descriptor_limits(limits, reflection).map_err(resolve_capability)?;
+    // This is a pool allocation count, not a per-stage or per-set device limit.
+    u32::try_from(reflection.bindings.len())
+        .ok()
+        .and_then(|count| count.checked_mul(u32::try_from(dispatches.len()).ok()?))
+        .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
     for buffer in buffers {
         validate_storage_buffer_size(limits, buffer).map_err(resolve_capability)?;
     }
-    Ok(plans)
+    Ok(ReboundSubmissionPlan {
+        plans,
+        writable_pool_keys,
+    })
 }
 
 fn validate_local_size(
@@ -962,7 +1093,7 @@ struct ExecutionResources {
     shader: vk::ShaderModule,
     pipelines: BTreeMap<[u32; 3], vk::Pipeline>,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -1100,7 +1231,7 @@ impl ExecutionResources {
             shader: vk::ShaderModule::null(),
             pipelines: BTreeMap::new(),
             descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_set: vk::DescriptorSet::null(),
+            descriptor_sets: Vec::new(),
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1230,16 +1361,8 @@ impl ExecutionResources {
         }
     }
 
-    fn create_buffers(
-        &mut self,
-        reflection: &ShaderReflection,
-        bindings: &[BufferBinding],
-    ) -> Result<(), ExecutionFailure> {
-        for reflected in &reflection.bindings {
-            let supplied = bindings
-                .iter()
-                .find(|binding| binding.index == reflected.metal_index)
-                .expect("validated buffer binding");
+    fn create_buffers(&mut self, bindings: &[BufferBinding]) -> Result<(), ExecutionFailure> {
+        for supplied in bindings {
             self.create_buffer(supplied)?;
         }
         self.buffers.sort_by_key(|buffer| buffer.index);
@@ -1331,57 +1454,72 @@ impl ExecutionResources {
     fn create_descriptors(
         &mut self,
         reflection: &ShaderReflection,
+        dispatches: &[BoundDispatch],
     ) -> Result<(), ExecutionFailure> {
-        let count = u32::try_from(self.buffers.len())
+        let count = u32::try_from(reflection.bindings.len())
             .map_err(|_| failure("descriptor count overflows u32"))?;
+        let pass_count = u32::try_from(dispatches.len())
+            .map_err(|_| failure("descriptor set count overflows u32"))?;
+        let descriptor_count = count
+            .checked_mul(pass_count)
+            .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
         let sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: count,
+            descriptor_count,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
+            .max_sets(pass_count)
             .pool_sizes(&sizes);
         self.descriptor_pool =
             unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }.map_err(
                 |error| ExecutionFailure::vulkan(error, format!("create descriptor pool: {error}")),
             )?;
-        let layouts = [self.set_layout];
+        let layouts = vec![self.set_layout; dispatches.len()];
         let allocation = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);
-        self.descriptor_set = unsafe { self.context.device.allocate_descriptor_sets(&allocation) }
+        self.descriptor_sets = unsafe { self.context.device.allocate_descriptor_sets(&allocation) }
             .map_err(|error| {
-                ExecutionFailure::vulkan(error, format!("allocate descriptor set: {error}"))
-            })?[0];
+                ExecutionFailure::vulkan(error, format!("allocate descriptor sets: {error}"))
+            })?;
 
-        let infos = reflection
-            .bindings
-            .iter()
-            .map(|binding| {
-                let gpu = self
-                    .buffers
-                    .iter()
-                    .find(|buffer| buffer.index == binding.metal_index)
-                    .expect("validated GPU buffer");
-                vk::DescriptorBufferInfo::default()
-                    .buffer(gpu.buffer)
-                    .offset(0)
-                    .range(gpu.len as u64)
-            })
-            .collect::<Vec<_>>();
-        let writes = reflection
-            .bindings
-            .iter()
-            .zip(&infos)
-            .map(|(binding, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_set)
-                    .dst_binding(binding.descriptor.expect("validated descriptor").binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect::<Vec<_>>();
-        unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
+        // Each recorded pass owns a distinct immutable set. Updating a single
+        // shared set here would make every dispatch observe the last mapping.
+        for (dispatch, &set) in dispatches.iter().zip(&self.descriptor_sets) {
+            let infos = reflection
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let &(_, pool_key) = dispatch
+                        .bindings
+                        .iter()
+                        .find(|&&(metal_index, _)| metal_index == binding.metal_index)
+                        .expect("validated pass binding");
+                    let gpu = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| buffer.index == pool_key)
+                        .expect("validated GPU buffer pool key");
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(gpu.buffer)
+                        .offset(0)
+                        .range(gpu.len as u64)
+                })
+                .collect::<Vec<_>>();
+            let writes = reflection
+                .bindings
+                .iter()
+                .zip(&infos)
+                .map(|(binding, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding.descriptor.expect("validated descriptor").binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect::<Vec<_>>();
+            unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
+        }
         Ok(())
     }
 
@@ -1415,19 +1553,19 @@ impl ExecutionResources {
                 .map_err(|error| {
                     ExecutionFailure::vulkan(error, format!("begin command buffer: {error}"))
                 })?;
-            self.context.device.cmd_bind_descriptor_sets(
-                self.command,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
-                reflection.descriptor_layout.set,
-                &[self.descriptor_set],
-                &[],
-            );
             let offset = contract
                 .push_constant_range()
                 .expect("validated exact range")
                 .offset;
             for (pass_index, plan) in plans.iter().enumerate() {
+                self.context.device.cmd_bind_descriptor_sets(
+                    self.command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    reflection.descriptor_layout.set,
+                    &[self.descriptor_sets[pass_index]],
+                    &[],
+                );
                 if pass_index != 0 {
                     // Order all earlier compute accesses and make their writes
                     // visible to the next pass's reads and writes (RAW/WAW).
@@ -1553,20 +1691,14 @@ impl ExecutionResources {
 
     fn read_updates(
         &self,
-        reflection: &ShaderReflection,
+        writable_pool_keys: &BTreeSet<u32>,
     ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
         let mut updates = Vec::new();
-        for reflected in &reflection.bindings {
-            if matches!(
-                reflected.access,
-                Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
-            ) {
-                continue;
-            }
+        for &pool_key in writable_pool_keys {
             let gpu = self
                 .buffers
                 .iter()
-                .find(|buffer| buffer.index == reflected.metal_index)
+                .find(|buffer| buffer.index == pool_key)
                 .expect("validated GPU buffer");
             let mapped = unsafe {
                 self.context.device.map_memory(
@@ -1709,6 +1841,166 @@ mod tests {
             }],
             limits,
         )
+    }
+
+    fn rebound_fixture() -> (
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+    ) {
+        let (mut translated, mut buffers, limits) = serial_fixture();
+        translated.reflection.bindings[0].access = Some(ResourceAccess::ReadOnly);
+        let mut output = translated.reflection.bindings[0].clone();
+        output.metal_index = 1;
+        output.descriptor.as_mut().unwrap().binding = 1;
+        output.access = Some(ResourceAccess::WriteOnly);
+        translated.reflection.bindings.push(output);
+        buffers.push(BufferBinding {
+            index: 1,
+            bytes: vec![0; 240],
+        });
+        (translated, buffers, limits)
+    }
+
+    fn ping_pong_dispatches() -> Vec<BoundDispatch> {
+        vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 0), (1, 1)],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![(1, 0), (0, 1)],
+            },
+        ]
+    }
+
+    #[test]
+    fn rebound_preflight_accepts_ping_pong_and_collects_all_written_pool_keys() {
+        let (translated, buffers, limits) = rebound_fixture();
+        let dispatches = ping_pong_dispatches();
+        let first =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
+        assert_eq!(first.writable_pool_keys, BTreeSet::from([1]));
+        let both = plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap();
+        // Pool 0 is read-only initially and writable later; both resources need
+        // one final update even though their binding roles change between passes.
+        assert_eq!(both.writable_pool_keys, BTreeSet::from([0, 1]));
+        assert_eq!(both.plans.len(), 2);
+        for (plan, dispatch) in both.plans.iter().zip(&dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    #[test]
+    fn rebound_preflight_separates_pool_keys_from_metal_binding_indices() {
+        let (translated, mut buffers, limits) = rebound_fixture();
+        buffers[0].index = 11;
+        buffers[1].index = 19;
+        let dispatches = [
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 11), (1, 19)],
+            },
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 19), (1, 11)],
+            },
+        ];
+        let planned = plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap();
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([11, 19]));
+    }
+
+    #[test]
+    fn rebound_preflight_rejects_ambiguous_or_incomplete_resource_maps() {
+        let (translated, buffers, limits) = rebound_fixture();
+        for bindings in [
+            vec![(0, 0), (1, 0)], // Duplicate pool use.
+            vec![(0, 0), (1, 2)], // Unknown pool key.
+            vec![(0, 0)],         // Missing pool resource and Metal slot.
+            vec![(0, 0), (0, 1)], // Duplicate Metal slot.
+            vec![(0, 0), (2, 1)], // Unknown Metal slot.
+        ] {
+            let mut dispatches = ping_pong_dispatches();
+            dispatches[1].bindings = bindings;
+            let error =
+                plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+        let duplicate_pool = vec![buffers[0].clone(), buffers[0].clone()];
+        let error = plan_rebound_submission(
+            &translated,
+            &duplicate_pool,
+            &limits,
+            &ping_pong_dispatches(),
+        )
+        .unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("pool key 0 occurs more than once"));
+        let error =
+            plan_rebound_submission(&translated, &buffers[..1], &limits, &ping_pong_dispatches())
+                .unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("exactly one resource per reflected binding"));
+    }
+
+    #[test]
+    fn rebound_preflight_checks_the_later_slot_footprint_against_its_mapped_buffer() {
+        let (mut translated, mut buffers, limits) = rebound_fixture();
+        buffers[0].bytes.truncate(4);
+        buffers[1].bytes.truncate(8);
+        translated.reflection.bindings[1]
+            .footprint
+            .as_mut()
+            .unwrap()
+            .strided_accesses[0]
+            .access_size = 8;
+        let dispatches = [
+            BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: vec![(0, 0), (1, 1)],
+            },
+            BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: vec![(0, 1), (1, 0)],
+            },
+        ];
+        plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
+        let error =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert!(error.detail.as_deref().unwrap().contains("buffer 1"));
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 8"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        let (translated, buffers, limits) = rebound_fixture();
+        let mut dispatches = ping_pong_dispatches();
+        dispatches[1].grid = [11, 3, 2];
+        let error =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 244"));
     }
 
     #[test]

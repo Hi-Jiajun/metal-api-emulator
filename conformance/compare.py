@@ -121,6 +121,29 @@ def _suite_plan(suite):
             views[view] = (allocation, offset, length, access)
             bindings.add(binding)
 
+        writable_views = set()
+        dispatches = case.get("dispatches")
+        if dispatches is None:
+            dispatches = [{}]
+        _require(isinstance(dispatches, list) and 1 <= len(dispatches) <= 8,
+                 f"{where}: invalid dispatch count")
+        original_views = [buffer["view"] for buffer in buffers]
+        for dispatch in dispatches:
+            _require(isinstance(dispatch, dict), f"{where}: dispatch must be an object")
+            mapping = dispatch.get("bindings")
+            if mapping is None:
+                mapping = original_views
+            _list(mapping, f"{where}.dispatch.bindings")
+            for view in mapping:
+                _integer(view, f"{where}.dispatch.view")
+            _require(len(mapping) == len(buffers) and set(mapping) == set(original_views),
+                     f"{where}: binding map must permute every resource exactly once")
+            for slot, view in zip(buffers, mapping):
+                _require(views[view][2] == slot["length"],
+                         f"{where}: rebound view does not fit the binding extent")
+                if slot["access"] != "read":
+                    writable_views.add(view)
+
         writes, written_views = [], set()
         for value in _list(case.get("expected_writebacks"), f"{where}.expected_writebacks"):
             identity, data = _writeback(value, f"{where} expected writeback")
@@ -128,13 +151,12 @@ def _suite_plan(suite):
             _require(view in views, f"{where}: writeback references unknown view {view}")
             _require(view not in written_views, f"{where}: duplicate expected writeback view {view}")
             expected_allocation, expected_offset, length, access = views[view]
-            _require(access in ("write", "read_write"), f"{where}: writeback targets read-only view {view}")
+            _require(view in writable_views, f"{where}: writeback targets read-only view {view}")
             _require((allocation, offset, len(data)) == (expected_allocation, expected_offset, length),
                      f"{where}: writeback does not cover exact writable view {view}")
             allocations[allocation][offset:offset + length] = data
             written_views.add(view)
             writes.append((identity, data))
-        writable_views = {view for view, (_, _, _, access) in views.items() if access != "read"}
         _require(written_views == writable_views, f"{where}: expected writebacks do not cover writable views")
         plan[case_id] = (writes, allocations)
     return plan
