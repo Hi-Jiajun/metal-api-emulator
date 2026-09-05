@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1/v2/v3 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v6 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -51,10 +51,17 @@ private struct DispatchDefinition: Decodable, Equatable {
     let program: Int?
 }
 
+private struct BufferSlotDefinition: Decodable, Equatable {
+    let binding: UInt64
+    let access: String
+    let length: UInt64
+}
+
 private struct ProgramDefinition: Decodable, Equatable {
     let entry: String
     let air: SourceDefinition
     let metal: SourceDefinition
+    let buffer_slots: [BufferSlotDefinition]?
 }
 
 private struct CaseDefinition: Decodable {
@@ -290,12 +297,12 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" {
         let expectedCount: Int
         switch definition.id {
-        case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two": expectedCount = 2
-        case "transform_three_times", "transform_pingpong_three", "pipeline_chain_three": expectedCount = 3
-        case "transform_eight_times", "transform_pingpong_eight", "pipeline_chain_eight": expectedCount = 8
+        case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two", "layout_chain_two": expectedCount = 2
+        case "transform_three_times", "transform_pingpong_three", "pipeline_chain_three", "layout_chain_three": expectedCount = 3
+        case "transform_eight_times", "transform_pingpong_eight", "pipeline_chain_eight", "layout_chain_eight": expectedCount = 8
         default: throw OracleError("Unsupported serial case: \(definition.id)")
         }
         guard let sequence = definition.dispatches else {
@@ -306,7 +313,11 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let localSizes: [[UInt64]] = [[4, 2, 2], [8, 4, 4], [1, 1, 1]]
         let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
             var mapping: [UInt64]? = nil
-            if suite == "compute-buffer-v4" || suite == "compute-buffer-v5" {
+            if suite == "compute-buffer-v6" {
+                let views = definition.buffers.map { $0.view }
+                try require(views.count == 3, "Missing layout-chain resources")
+                mapping = index % 2 == 0 ? views : [views[1], views[2], views[0]]
+            } else if suite == "compute-buffer-v4" || suite == "compute-buffer-v5" {
                 var views = definition.buffers.map { $0.view }
                 let last = definition.id == "copy_pingpong" ? 1 : 2
                 try require(views.count > last, "Missing pingpong resources")
@@ -315,7 +326,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
             }
             let grid: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : [5, 3, 2]
             let local: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : localSizes[index % localSizes.count]
-            return DispatchDefinition(grid: grid, local: local, bindings: mapping, program: suite == "compute-buffer-v5" ? index % 2 : nil)
+            return DispatchDefinition(grid: grid, local: local, bindings: mapping, program: (suite == "compute-buffer-v5" || suite == "compute-buffer-v6") ? index % 2 : nil)
         }
         try require(sequence == expected, "\(definition.id): unsupported serial dispatch sequence")
         try require(sequence[0].grid == definition.grid && sequence[0].local == definition.local,
@@ -353,7 +364,8 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
                     "indexed_boundary: expected a 120-byte write buffer at 0")
     case "transform_tail", "transform_small_grid", "transform_twice", "transform_three_times", "transform_eight_times",
          "transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight",
-         "pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight":
+         "pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight",
+         "layout_chain_two", "layout_chain_three", "layout_chain_eight":
         let expectedLocal: [UInt64] = definition.id == "transform_small_grid" ? [8, 4, 4] : [4, 2, 2]
         try require(definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == expectedLocal,
@@ -369,13 +381,22 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     return dispatches
 }
 
-// Called only after the fixed dispatch shape and resource permutation checks.
+// Legacy fixtures use their original interface; v6 chooses an independently
+// reviewed interface for each selected program. Resource pool order is not a
+// shader interface when programs use different slots and access modes.
+private func bufferSlots(_ definition: CaseDefinition, program: Int) -> [BufferSlotDefinition] {
+    definition.programs?[program].buffer_slots ?? definition.buffers.map {
+        BufferSlotDefinition(binding: $0.binding, access: $0.access, length: $0.length)
+    }
+}
+
+// Called only after program-table, dispatch-shape, and resource-mapping checks.
 private func writableViews(_ definition: CaseDefinition) -> Set<UInt64> {
     let sequence = definition.dispatches ?? [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     var result = Set<UInt64>()
     for dispatch in sequence {
-        for (index, slot) in definition.buffers.enumerated() where slot.access != "read" {
-            result.insert(dispatch.bindings?[index] ?? slot.view)
+        for (index, slot) in bufferSlots(definition, program: dispatch.program ?? 0).enumerated() where slot.access != "read" {
+            result.insert(dispatch.bindings?[index] ?? definition.buffers[index].view)
         }
     }
     return result
@@ -452,28 +473,32 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["transform_pingpong_two", "transform_pingpong_three", "transform_pingpong_eight", "copy_pingpong"]
     case "compute-buffer-v5":
         expectedIDs = ["pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight"]
+    case "compute-buffer-v6":
+        expectedIDs = ["layout_chain_two", "layout_chain_three", "layout_chain_eight"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v5 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v6 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
     let root = url.deletingLastPathComponent()
     var cases = [ValidatedCase]()
     for definition in suite.cases {
+        // Review every program identity and interface before decoding any
+        // buffer payload or reading shader files from the supplied manifest.
+        let programs = try validatePrograms(definition, suite: suite.suite)
         let dispatches = try validateShape(definition, suite: suite.suite)
-        let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
-        let primary = ProgramDefinition(entry: definition.entry, air: definition.air, metal: definition.metal)
-        let programs: [ProgramDefinition]
-        if suite.suite == "compute-buffer-v5" {
-            guard let supplied = definition.programs else { throw OracleError("Program table required") }
-            try require(supplied.count == 2 && supplied[0] == primary
-                        && supplied[0].entry == "transform_3d" && supplied[1].entry == "mix_3d",
-                        "Unreviewed program table")
-            programs = supplied
-        } else {
-            try require(definition.programs == nil, "Legacy case cannot carry program table")
-            programs = [primary]
+        for dispatch in dispatches {
+            let slots = bufferSlots(definition, program: dispatch.program ?? 0)
+            let views = dispatch.bindings ?? definition.buffers.map { $0.view }
+            try require(views.count == slots.count, "Program binding count mismatch")
+            for (slot, view) in zip(slots, views) {
+                guard let resource = definition.buffers.first(where: { $0.view == view }) else {
+                    throw OracleError("Unknown bound resource")
+                }
+                try require(resource.length == slot.length, "Program binding length mismatch")
+            }
         }
+        let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
         let loaded = try programs.map { program in
             (definition: program, source: try loadProgram(program, root: root))
         }
@@ -483,42 +508,78 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
 }
 
+private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throws -> ProgramDefinition {
+    let air: SourceDefinition
+    let metal: SourceDefinition
+    let slots: [BufferSlotDefinition]
+    switch entry {
+    case "copy_word":
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+            sha256: "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99")
+        metal = SourceDefinition(path: "shaders/copy_word.metal",
+            sha256: "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc")
+        slots = [BufferSlotDefinition(binding: 0, access: "read", length: 4),
+                 BufferSlotDefinition(binding: 1, access: "write", length: 4)]
+    case "kernel_dispatch_threads_boundary_barrier":
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
+            sha256: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
+        metal = SourceDefinition(path: "shaders/indexed_boundary.metal",
+            sha256: "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06")
+        slots = [BufferSlotDefinition(binding: 0, access: "write", length: 120)]
+    case "transform_3d", "mix_3d":
+        if entry == "transform_3d" {
+            air = SourceDefinition(path: "shaders/transform_3d.ll",
+                sha256: "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2")
+            metal = SourceDefinition(path: "shaders/transform_3d.metal",
+                sha256: "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b")
+        } else {
+            air = SourceDefinition(path: "shaders/mix_3d.ll",
+                sha256: "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f")
+            metal = SourceDefinition(path: "shaders/mix_3d.metal",
+                sha256: "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5")
+        }
+        slots = [BufferSlotDefinition(binding: 0, access: "read_write", length: 120),
+                 BufferSlotDefinition(binding: 2, access: "read", length: 4),
+                 BufferSlotDefinition(binding: 5, access: "write", length: 120)]
+    case "remap_3d":
+        air = SourceDefinition(path: "shaders/remap_3d.ll",
+            sha256: "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec")
+        metal = SourceDefinition(path: "shaders/remap_3d.metal",
+            sha256: "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76")
+        slots = [BufferSlotDefinition(binding: 1, access: "read", length: 4),
+                 BufferSlotDefinition(binding: 3, access: "read", length: 120),
+                 BufferSlotDefinition(binding: 7, access: "write", length: 120)]
+    default:
+        throw OracleError("Unsupported entry: \(entry)")
+    }
+    return ProgramDefinition(entry: entry, air: air, metal: metal, buffer_slots: explicitSlots ? slots : nil)
+}
+
+private func validatePrograms(_ definition: CaseDefinition, suite: String) throws -> [ProgramDefinition] {
+    let primary = ProgramDefinition(entry: definition.entry, air: definition.air,
+                                    metal: definition.metal, buffer_slots: nil)
+    if suite == "compute-buffer-v5" || suite == "compute-buffer-v6" {
+        guard let supplied = definition.programs else { throw OracleError("Program table required") }
+        let layouts = suite == "compute-buffer-v6"
+        let expected = try [reviewedProgram("transform_3d", explicitSlots: layouts),
+                            reviewedProgram(layouts ? "remap_3d" : "mix_3d", explicitSlots: layouts)]
+        try require(primary == (try reviewedProgram("transform_3d")) && supplied == expected,
+                    "Unreviewed program table or buffer layout")
+        return supplied
+    }
+    try require(definition.programs == nil, "Legacy case cannot carry program table")
+    try require(primary == (try reviewedProgram(definition.entry)), "Unreviewed primary program")
+    return [primary]
+}
+
 @available(macOS 11.0, *)
 private func loadProgram(_ program: ProgramDefinition, root: URL) throws -> String {
-        let metalBytes: Data
-        switch program.entry {
-        case "copy_word":
-            _ = try validateSource(program.air, root: root,
-                path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",
-                digest: "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99")
-            metalBytes = try validateSource(program.metal, root: root,
-                path: "shaders/copy_word.metal",
-                digest: "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc")
-        case "kernel_dispatch_threads_boundary_barrier":
-            _ = try validateSource(program.air, root: root,
-                path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
-                digest: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
-            metalBytes = try validateSource(program.metal, root: root,
-                path: "shaders/indexed_boundary.metal",
-                digest: "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06")
-        case "transform_3d":
-            _ = try validateSource(program.air, root: root,
-                path: "shaders/transform_3d.ll",
-                digest: "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2")
-            metalBytes = try validateSource(program.metal, root: root,
-                path: "shaders/transform_3d.metal",
-                digest: "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b")
-        case "mix_3d":
-            _ = try validateSource(program.air, root: root, path: "shaders/mix_3d.ll",
-                digest: "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f")
-            metalBytes = try validateSource(program.metal, root: root, path: "shaders/mix_3d.metal",
-                digest: "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5")
-        default:
-            throw OracleError("Unsupported entry: \(program.entry)")
-        }
-        guard let metalSource = String(data: metalBytes, encoding: .utf8) else {
-            throw OracleError("\(program.entry): MSL source is not UTF-8")
-        }
+    let reviewed = try reviewedProgram(program.entry)
+    _ = try validateSource(program.air, root: root, path: reviewed.air.path, digest: reviewed.air.sha256)
+    let metalBytes = try validateSource(program.metal, root: root, path: reviewed.metal.path, digest: reviewed.metal.sha256)
+    guard let metalSource = String(data: metalBytes, encoding: .utf8) else {
+        throw OracleError("\(program.entry): MSL source is not UTF-8")
+    }
     return metalSource
 }
 
@@ -575,13 +636,13 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
             throw OracleError("\(definition.id): cannot create a compute encoder")
         }
         encoder.setComputePipelineState(pipelines[dispatch.program ?? 0])
-        for (index, slot) in fixture.buffers.enumerated() {
-            let view = dispatch.bindings?[index] ?? slot.definition.view
+        for (index, slot) in bufferSlots(definition, program: dispatch.program ?? 0).enumerated() {
+            let view = dispatch.bindings?[index] ?? fixture.buffers[index].definition.view
             guard let poolIndex = fixture.buffers.firstIndex(where: { $0.definition.view == view }) else {
                 throw OracleError("Unknown bound resource")
             }
             let resource = fixture.buffers[poolIndex]
-            encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.definition.binding))
+            encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.binding))
         }
         encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
         encoder.endEncoding()

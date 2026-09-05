@@ -200,3 +200,10 @@ contract is now schema 2 with per-pipeline metadata; report JSON remains
 schema 1. See [MIXED-PIPELINES.md](MIXED-PIPELINES.md) for boundaries and local
 results. New native v5 GPU verification is pending independently of earlier
 published three-way suites.
+
+## Per-program layouts
+
+[suite-v6.json](suite-v6.json) switches between different binding numbers,
+access modes and slot orders over the fixed resource pool. See
+[PIPELINE-LAYOUTS.md](PIPELINE-LAYOUTS.md) for the exact layouts and local
+results. This new native v6 coverage is pending its own cloud run.

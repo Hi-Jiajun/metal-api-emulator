@@ -98,6 +98,15 @@ struct CaseProgram {
     entry: String,
     air: Source,
     metal: Source,
+    buffer_slots: Option<Vec<BufferSlot>>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BufferSlot {
+    binding: u32,
+    access: String,
+    length: u64,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -231,6 +240,26 @@ fn main() -> Result<()> {
         if backend == Backend::Vulkan && (entry == "transform_3d" || entry == "mix_3d") {
             verify_transform_contract(&pipeline)?;
         }
+        if backend == Backend::Vulkan && entry == "remap_3d" {
+            let bindings = &pipeline.contract.buffer_bindings;
+            if bindings
+                .iter()
+                .map(|b| (b.metal_binding, b.access))
+                .collect::<Vec<_>>()
+                != [
+                    (1, BufferAccess::Read),
+                    (3, BufferAccess::Read),
+                    (7, BufferAccess::Write),
+                ]
+            {
+                return Err("remap sparse layout/access reflection mismatch".into());
+            }
+            verify_xyz_access(&bindings[1].footprint)?;
+            verify_xyz_access(&bindings[2].footprint)?;
+            if bindings[0].footprint != (FootprintProof::Static { max_bytes: 4 }) {
+                return Err("remap scalar bias reach mismatch".into());
+            }
+        }
         eprintln!("{} artifact registered: entry={entry}", backend.name());
         pipelines.insert(entry, pipeline);
     }
@@ -239,6 +268,35 @@ fn main() -> Result<()> {
             .iter()
             .map(|program| pipelines[&program.entry].clone())
             .collect::<Vec<_>>();
+        for (source, compiled) in case_programs(case).iter().zip(&programs) {
+            if let Some(slots) = &source.buffer_slots {
+                let expected = slots
+                    .iter()
+                    .map(|slot| {
+                        (
+                            slot.binding,
+                            match slot.access.as_str() {
+                                "read" => BufferAccess::Read,
+                                "write" => BufferAccess::Write,
+                                _ => BufferAccess::ReadWrite,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if compiled
+                    .contract
+                    .buffer_bindings
+                    .iter()
+                    .map(|b| (b.metal_binding, b.access))
+                    .collect::<Vec<_>>()
+                    != expected
+                {
+                    return Err(
+                        "compiled reflection differs from per-program fixture layout".into(),
+                    );
+                }
+            }
+        }
         results.push(run_case(
             provider.as_ref(),
             &programs,
@@ -306,6 +364,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "pipeline_chain_three",
             "pipeline_chain_eight",
         ],
+        (1, "compute-buffer-v6") => &[
+            "layout_chain_two",
+            "layout_chain_three",
+            "layout_chain_eight",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -318,8 +381,8 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     }
     let mut ids = BTreeSet::new();
     for case in &suite.cases {
-        validate_case_dispatches(case)?;
         validate_case_programs(case)?;
+        validate_case_dispatches(case)?;
         if !ids.insert(&case.id) {
             return Err("duplicate case identity".into());
         }
@@ -387,6 +450,7 @@ fn case_programs(case: &Case) -> Vec<CaseProgram> {
             entry: case.entry.clone(),
             air: case.air.clone(),
             metal: case.metal.clone(),
+            buffer_slots: None,
         }]
     })
 }
@@ -416,6 +480,12 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/mix_3d.metal",
             "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5",
         ),
+        "remap_3d" => (
+            "shaders/remap_3d.ll",
+            "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec",
+            "shaders/remap_3d.metal",
+            "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76",
+        ),
         _ => return Err("unknown shader entry".into()),
     };
     if program.air.path != air_path
@@ -429,11 +499,12 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
 }
 fn validate_case_programs(case: &Case) -> Result<()> {
     let programs = case_programs(case);
-    if case.id.starts_with("pipeline_chain_") {
+    let layout_change = case.id.starts_with("layout_chain_");
+    if case.id.starts_with("pipeline_chain_") || layout_change {
         if case.programs.is_none()
             || programs.len() != 2
             || programs[0].entry != "transform_3d"
-            || programs[1].entry != "mix_3d"
+            || programs[1].entry != if layout_change { "remap_3d" } else { "mix_3d" }
             || programs[0].entry != case.entry
             || programs[0].air != case.air
             || programs[0].metal != case.metal
@@ -443,8 +514,28 @@ fn validate_case_programs(case: &Case) -> Result<()> {
     } else if case.programs.is_some() {
         return Err("legacy fixture cannot carry program table".into());
     }
-    for program in programs {
-        validate_program(&program)?;
+    for (index, program) in programs.iter().enumerate() {
+        validate_program(program)?;
+        if layout_change {
+            let expected = if index == 0 {
+                vec![(0, "read_write", 120), (2, "read", 4), (5, "write", 120)]
+            } else {
+                vec![(1, "read", 4), (3, "read", 120), (7, "write", 120)]
+            };
+            let expected = expected
+                .into_iter()
+                .map(|(binding, access, length)| BufferSlot {
+                    binding,
+                    access: access.into(),
+                    length,
+                })
+                .collect::<Vec<_>>();
+            if program.buffer_slots.as_ref() != Some(&expected) {
+                return Err("unreviewed per-program layout".into());
+            }
+        } else if program.buffer_slots.is_some() {
+            return Err("legacy program cannot declare a layout".into());
+        }
     }
     Ok(())
 }
@@ -494,7 +585,10 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         | "transform_pingpong_eight"
         | "pipeline_chain_two"
         | "pipeline_chain_three"
-        | "pipeline_chain_eight" => transform([4, 2, 2]),
+        | "pipeline_chain_eight"
+        | "layout_chain_two"
+        | "layout_chain_three"
+        | "layout_chain_eight" => transform([4, 2, 2]),
         "transform_small_grid" => transform([8, 4, 4]),
         _ => return Err("unknown case identity".into()),
     })
@@ -502,9 +596,19 @@ fn case_shape(id: &str) -> Result<CaseShape> {
 
 fn validate_case_dispatches(case: &Case) -> Result<()> {
     let count = match case.id.as_str() {
-        "transform_twice" | "transform_pingpong_two" | "copy_pingpong" | "pipeline_chain_two" => 2,
-        "transform_three_times" | "transform_pingpong_three" | "pipeline_chain_three" => 3,
-        "transform_eight_times" | "transform_pingpong_eight" | "pipeline_chain_eight" => 8,
+        "transform_twice"
+        | "transform_pingpong_two"
+        | "copy_pingpong"
+        | "pipeline_chain_two"
+        | "layout_chain_two" => 2,
+        "transform_three_times"
+        | "transform_pingpong_three"
+        | "pipeline_chain_three"
+        | "layout_chain_three" => 3,
+        "transform_eight_times"
+        | "transform_pingpong_eight"
+        | "pipeline_chain_eight"
+        | "layout_chain_eight" => 8,
         _ => {
             if case.dispatches.is_some() {
                 return Err("single-pass fixture cannot carry a sequence".into());
@@ -520,7 +624,8 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         return Err("wrong sequence dispatch count".into());
     }
     let locals = [[4, 2, 2], [8, 4, 4], [1, 1, 1]];
-    let mixed = case.id.starts_with("pipeline_chain_");
+    let layout_change = case.id.starts_with("layout_chain_");
+    let mixed = case.id.starts_with("pipeline_chain_") || layout_change;
     let pingpong = case.id.contains("pingpong") || mixed;
     for (i, dispatch) in dispatches.iter().enumerate() {
         if dispatch.program != mixed.then_some(i % 2) {
@@ -541,10 +646,24 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
                 return Err("missing pingpong resource".into());
             }
             if i % 2 == 1 {
-                expected.swap(0, last);
+                if layout_change {
+                    expected.rotate_left(1);
+                } else {
+                    expected.swap(0, last);
+                }
             }
             if dispatch.bindings.as_ref() != Some(&expected) {
                 return Err("unreviewed pingpong binding map".into());
+            }
+            for (slot, view_id) in selected_slots(case, dispatch).iter().zip(&expected) {
+                let view = case
+                    .buffers
+                    .iter()
+                    .find(|view| view.view == *view_id)
+                    .ok_or("unknown mapped resource")?;
+                if view.length != slot.length {
+                    return Err("mapped resource extent differs from selected layout".into());
+                }
             }
         } else if dispatch.bindings.is_some() {
             return Err("non-rebinding fixture cannot carry binding maps".into());
@@ -556,20 +675,36 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
     Ok(())
 }
 
+fn selected_slots(case: &Case, dispatch: &CaseDispatch) -> Vec<BufferSlot> {
+    if let Some(programs) = &case.programs {
+        if let Some(slots) = &programs[dispatch.program.unwrap_or(0)].buffer_slots {
+            return slots.clone();
+        }
+    }
+    case.buffers
+        .iter()
+        .map(|b| BufferSlot {
+            binding: b.binding,
+            access: b.access.clone(),
+            length: b.length,
+        })
+        .collect()
+}
+
 fn ever_writable(case: &Case) -> BTreeSet<u64> {
     if let Some(dispatches) = &case.dispatches {
         dispatches
             .iter()
             .flat_map(|dispatch| {
-                case.buffers
-                    .iter()
+                selected_slots(case, dispatch)
+                    .into_iter()
                     .enumerate()
                     .filter(|(_, slot)| slot.access != "read")
-                    .map(|(index, slot)| {
+                    .map(|(i, _)| {
                         dispatch
                             .bindings
                             .as_ref()
-                            .map_or(slot.view, |map| map[index])
+                            .map_or(case.buffers[i].view, |map| map[i])
                     })
             })
             .collect()
@@ -596,30 +731,34 @@ fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
     {
         return Err("3D fixture sparse/access reflection mismatch".into());
     }
-    for binding in [&bindings[0], &bindings[2]] {
-        let FootprintProof::Affine { accesses } = &binding.footprint else {
-            return Err("3D fixture must carry an affine footprint".into());
-        };
-        if accesses.is_empty() {
-            return Err("3D fixture has no proven accesses".into());
-        }
-        for access in accesses {
-            let mut strides = [0u64; 3];
-            for term in &access.terms {
-                let slot = strides
-                    .get_mut(usize::from(term.axis))
-                    .ok_or("3D fixture unknown axis")?;
-                *slot = slot
-                    .checked_add(term.stride)
-                    .ok_or("3D fixture stride overflow")?;
-            }
-            if access.base_offset != 0 || access.access_size != 4 || strides != [4, 20, 60] {
-                return Err("3D fixture footprint must prove 120-byte XYZ reach".into());
-            }
-        }
-    }
+    verify_xyz_access(&bindings[0].footprint)?;
+    verify_xyz_access(&bindings[2].footprint)?;
     if bindings[1].footprint != (FootprintProof::Static { max_bytes: 4 }) {
         return Err("3D fixture scalar bias reach mismatch".into());
+    }
+    Ok(())
+}
+
+fn verify_xyz_access(footprint: &FootprintProof) -> Result<()> {
+    let FootprintProof::Affine { accesses } = footprint else {
+        return Err("3D fixture must carry an affine footprint".into());
+    };
+    if accesses.is_empty() {
+        return Err("3D fixture has no proven accesses".into());
+    }
+    for access in accesses {
+        let mut strides = [0u64; 3];
+        for term in &access.terms {
+            let slot = strides
+                .get_mut(usize::from(term.axis))
+                .ok_or("3D fixture unknown axis")?;
+            *slot = slot
+                .checked_add(term.stride)
+                .ok_or("3D fixture stride overflow")?;
+        }
+        if access.base_offset != 0 || access.access_size != 4 || strides != [4, 20, 60] {
+            return Err("3D fixture footprint must prove 120-byte XYZ reach".into());
+        }
     }
     Ok(())
 }
@@ -692,14 +831,16 @@ fn run_case(
             .into_iter()
             .map(|dispatch| {
                 let selected = &programs[dispatch.program.unwrap_or(0)];
-                let buffers = views
+                let buffers = selected
+                    .contract
+                    .buffer_bindings
                     .iter()
                     .enumerate()
                     .map(|(index, slot)| {
                         let view_id = dispatch
                             .bindings
                             .as_ref()
-                            .map_or(slot.view_id.get(), |map| map[index]);
+                            .map_or(views[index].view_id.get(), |map| map[index]);
                         let mut resource = views
                             .iter()
                             .find(|view| view.view_id.get() == view_id)
@@ -1027,6 +1168,52 @@ mod tests {
         }
         let mut s = load();
         s.cases[0].programs.as_mut().unwrap().reverse();
+        assert!(validate_suite(&s).is_err());
+    }
+
+    #[test]
+    fn differing_layout_requires_selected_slot_numbers_access_and_lengths() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v6.json"))
+                .unwrap()
+        };
+        let s = load();
+        validate_suite(&s).unwrap();
+        let dispatch = &s.cases[0].dispatches.as_ref().unwrap()[1];
+        let slots = selected_slots(&s.cases[0], dispatch);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| (slot.binding, slot.access.as_str(), slot.length))
+                .collect::<Vec<_>>(),
+            [(1, "read", 4), (3, "read", 120), (7, "write", 120)]
+        );
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap()[1].buffer_slots = None;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap()[1]
+            .buffer_slots
+            .as_mut()
+            .unwrap()[0]
+            .binding = 0;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap()[1]
+            .buffer_slots
+            .as_mut()
+            .unwrap()[1]
+            .access = "read_write".into();
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].programs.as_mut().unwrap()[1]
+            .buffer_slots
+            .as_mut()
+            .unwrap()[0]
+            .length = 120;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].dispatches.as_mut().unwrap()[1].bindings = Some(vec![400, 420, 410]);
         assert!(validate_suite(&s).is_err());
     }
 }

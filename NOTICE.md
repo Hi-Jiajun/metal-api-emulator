@@ -42,3 +42,6 @@ contain no extracted AIR or other Apple binary artifacts.
 `conformance/shaders/mix_3d.ll` and `mix_3d.metal` are owned synthetic source
 counterparts derived from this project's transform_3d fixture. Their distinct
 integer operation sequence tests pipeline changes within one command buffer.
+
+`conformance/shaders/remap_3d.ll` and `remap_3d.metal` are owned synthetic source
+counterparts for per-pipeline binding-order and access-role tests.

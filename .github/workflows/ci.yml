@@ -47,6 +47,8 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v4.json --check /tmp/vulkan-captures/vulkan-capture-v4.json
           cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v5.json --output /tmp/vulkan-captures/vulkan-capture-v5.json
           python3 conformance/compare.py --suite conformance/suite-v5.json --check /tmp/vulkan-captures/vulkan-capture-v5.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v6.json --output /tmp/vulkan-captures/vulkan-capture-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/vulkan-captures/vulkan-capture-v6.json
 
       - name: Preserve Vulkan report
         uses: actions/upload-artifact@v4
@@ -82,10 +84,11 @@ jobs:
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v3.json --output-dir /tmp/native-evidence/v3 --source-revision "$GITHUB_SHA"
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v4.json --output-dir /tmp/native-evidence/v4 --source-revision "$GITHUB_SHA"
           python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v5.json --output-dir /tmp/native-evidence/v5 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v6.json --output-dir /tmp/native-evidence/v6 --source-revision "$GITHUB_SHA"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
-          statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2', 'v3', 'v4', 'v5')]
+          statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6')]
           combined = 'captured' if all(s['capture_status'] == 'captured' for s in statuses) else 'unavailable'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('capture_status=' + combined + '\n')
@@ -106,6 +109,8 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v4.json --check /tmp/native-evidence/rust-provider-v4.json
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v5.json --output /tmp/native-evidence/rust-provider-v5.json
           python3 conformance/compare.py --suite conformance/suite-v5.json --check /tmp/native-evidence/rust-provider-v5.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v6.json --output /tmp/native-evidence/rust-provider-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/native-evidence/rust-provider-v6.json
       - name: Preserve native probe, status and any completed capture
         if: always()
         uses: actions/upload-artifact@v4
@@ -135,3 +140,4 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v3.json --native /tmp/native-evidence/v3/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v3.json --metal-provider /tmp/native-evidence/rust-provider-v3.json
           python3 conformance/compare.py --suite conformance/suite-v4.json --native /tmp/native-evidence/v4/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v4.json --metal-provider /tmp/native-evidence/rust-provider-v4.json
           python3 conformance/compare.py --suite conformance/suite-v5.json --native /tmp/native-evidence/v5/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v5.json --metal-provider /tmp/native-evidence/rust-provider-v5.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --native /tmp/native-evidence/v6/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v6.json --metal-provider /tmp/native-evidence/rust-provider-v6.json

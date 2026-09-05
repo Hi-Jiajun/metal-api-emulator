@@ -1,6 +1,6 @@
 //! Bounded native Metal compute provider for independent offline comparison.
 //!
-//! The provider accepts only the four exact MSL fixtures shipped with the
+//! The provider accepts only the five exact MSL fixtures shipped with the
 //! conformance suite. Their manually audited contracts are not reflection of
 //! arbitrary MSL. Execution is synchronous, uses fresh shared buffers, and is
 //! restricted to unified-memory devices supporting Apple GPU family 4.
@@ -49,6 +49,8 @@ const INDEXED: &str = include_str!("../../../conformance/shaders/indexed_boundar
 const TRANSFORM: &str = include_str!("../../../conformance/shaders/transform_3d.metal");
 #[cfg(any(target_os = "macos", test))]
 const MIX: &str = include_str!("../../../conformance/shaders/mix_3d.metal");
+#[cfg(any(target_os = "macos", test))]
+const REMAP: &str = include_str!("../../../conformance/shaders/remap_3d.metal");
 
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
@@ -109,6 +111,14 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
                 binding(5, BufferAccess::Write, affine(&[4, 20, 60])),
             ],
         ),
+        ("remap_3d", REMAP) => (
+            [5, 3, 2],
+            vec![
+                binding(1, BufferAccess::Read, static_word()),
+                binding(3, BufferAccess::Read, affine(&[4, 20, 60])),
+                binding(7, BufferAccess::Write, affine(&[4, 20, 60])),
+            ],
+        ),
         _ => {
             return Err(refusal(
                 ProviderPhase::Compile,
@@ -149,6 +159,7 @@ mod tests {
             ("kernel_dispatch_threads_boundary_barrier", INDEXED),
             ("transform_3d", TRANSFORM),
             ("mix_3d", MIX),
+            ("remap_3d", REMAP),
         ] {
             let contract = bounded_contract(&request(entry, source)).unwrap();
             contract.validate().unwrap();
@@ -167,6 +178,8 @@ mod tests {
         assert!(bounded_contract(&request("copy_word", &changed)).is_err());
         assert!(bounded_contract(&request("transform_3d", MIX)).is_err());
         assert!(bounded_contract(&request("mix_3d", TRANSFORM)).is_err());
+        assert!(bounded_contract(&request("remap_3d", TRANSFORM)).is_err());
+        assert!(bounded_contract(&request("transform_3d", REMAP)).is_err());
     }
 
     #[test]
@@ -204,6 +217,16 @@ mod tests {
                     (5, BufferAccess::Write, 120),
                 ],
             ),
+            (
+                "remap_3d",
+                REMAP,
+                [5, 3, 2],
+                vec![
+                    (1, BufferAccess::Read, 4),
+                    (3, BufferAccess::Read, 120),
+                    (7, BufferAccess::Write, 120),
+                ],
+            ),
         ] {
             let contract = bounded_contract(&request(entry, source)).unwrap();
             assert_eq!(contract.fixed_grid, Some(grid));
@@ -232,6 +255,52 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn remapped_fixture_has_its_own_access_and_affine_proofs() {
+        let contract = bounded_contract(&request("remap_3d", REMAP)).unwrap();
+        assert_eq!(contract.buffer_bindings[0].metal_binding, 1);
+        assert_eq!(contract.buffer_bindings[0].access, BufferAccess::Read);
+        assert_eq!(
+            contract.buffer_bindings[0].footprint,
+            FootprintProof::Static { max_bytes: 4 }
+        );
+        let indexed_proof = FootprintProof::Affine {
+            accesses: vec![AffineAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![
+                    AffineTerm { axis: 0, stride: 4 },
+                    AffineTerm {
+                        axis: 1,
+                        stride: 20,
+                    },
+                    AffineTerm {
+                        axis: 2,
+                        stride: 60,
+                    },
+                ],
+            }],
+        };
+        assert_eq!(contract.buffer_bindings[1].metal_binding, 3);
+        assert_eq!(contract.buffer_bindings[1].access, BufferAccess::Read);
+        assert_eq!(contract.buffer_bindings[1].footprint, indexed_proof);
+        assert_eq!(contract.buffer_bindings[2].metal_binding, 7);
+        assert_eq!(contract.buffer_bindings[2].access, BufferAccess::Write);
+        assert_eq!(contract.buffer_bindings[2].footprint, indexed_proof);
+        for changed in [
+            REMAP.replace("buffer(3)", "buffer(0)"),
+            REMAP.replace("input[index]", "input[index + 1]"),
+            REMAP.replace("device const uint *input", "device uint *input"),
+        ] {
+            assert_eq!(
+                bounded_contract(&request("remap_3d", &changed))
+                    .unwrap_err()
+                    .slug,
+                "native_shader_not_allowlisted"
+            );
         }
     }
 

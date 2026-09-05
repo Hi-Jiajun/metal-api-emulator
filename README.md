@@ -33,7 +33,7 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `wait` observes the recorded terminal result. A submit timeout is terminal
   unknown completion; resources remain retained and the executor is unusable.
 - Shared provider API: compilation, pipeline metadata and release now use
-  `PipelineProvider`. The new Rust native Metal backend accepts four exact
+  `PipelineProvider`. The new Rust native Metal backend accepts five exact
   reviewed MSL fixtures. Its single-pass v1/v2 execution passed
   [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33979796237);
   the new serial multi-pass increment still needs its own native run.
@@ -60,7 +60,10 @@ adds one-upload/multiple-dispatch sequences and passed
 The [buffer-rebinding extension](conformance/BUFFER-REBINDING.md) also passed
 [three-way v4 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33981697514).
 The new [mixed-pipeline extension](conformance/MIXED-PIPELINES.md) supports
-switching compute shaders inside a single command buffer; native v5 is pending. Existing evidence does not
+switching compute shaders inside a single command buffer and passed
+[three-way v5 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33982552902).
+The new [pipeline-layout suite](conformance/PIPELINE-LAYOUTS.md) changes binding
+numbers and access roles between programs; native v6 validation is pending. Existing evidence does not
 establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;

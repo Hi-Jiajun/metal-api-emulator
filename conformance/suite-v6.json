@@ -1,0 +1,625 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v6",
+  "guard_byte": 90,
+  "cases": [
+    {
+      "id": "layout_chain_two",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "495aa5a57e5aa5a56f5aa5a51c5aa5a50d5aa5a5325aa5a5235aa5a5d05aa5a5c15aa5a5f65aa5a5e75aa5a5945aa5a5855aa5a5aa5aa5a55b5ba5a5485ba5a5795ba5a56e5ba5a51f5ba5a50c5ba5a53d5ba5a5225ba5a5d35ba5a5c05ba5a5f15ba5a5e65ba5a5975ba5a5845ba5a5b55ba5a55a58a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "87ddb9bb30dcb9bb89dcb9bb42d3b9bbdbd3b9bb24d2b9bbbdd2b9bb76deb9bbcfdeb9bb78d9b9bbd1d9b9bb8adfb9bb63dcb9bb6cdfb9bb05dab9bbbedab9bbd725b9bb8025b9bb59d8b9bbd2d8b9bb6bdbb9bbb4dbb9bb4d27b9bbc627b9bb1f26b9bbc826b9bbe124b9bb1a25b9bbb327b9bb3ccfb9bb"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "remap_3d",
+          "air": {
+            "path": "shaders/remap_3d.ll",
+            "sha256": "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec"
+          },
+          "metal": {
+            "path": "shaders/remap_3d.metal",
+            "sha256": "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76"
+          },
+          "buffer_slots": [
+            {
+              "binding": 1,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 3,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 7,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "layout_chain_three",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "f0871c1e09861c1ef6861c1e3f891c1ea4891c1e1d881c1eba881c1ec3841c1ea8841c1ec1831c1eae831c1ef7851c1edc861c1ed5851c1e72801c1ebb801c1ea07f1c1ef97f1c1e26821c1eaf821c1ed4811c1e8d811c1e2a7d1c1eb37d1c1e187c1c1eb17c1c1e5e7f1c1e677f1c1e8c7d1c1e05951c1e"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "aaddb9bb53dcb9bbacdcb9bb65d3b9bbfed3b9bb47d2b9bbe0d2b9bb99deb9bbf2deb9bb9bd9b9bbf4d9b9bbaddfb9bb86dcb9bb8fdfb9bb28dab9bbe1dab9bbfa25b9bba325b9bb7cd8b9bbf5d8b9bb8edbb9bbd7dbb9bb7027b9bbe927b9bb4226b9bbeb26b9bb0425b9bb3d25b9bbd627b9bb5fcfb9bb"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "remap_3d",
+          "air": {
+            "path": "shaders/remap_3d.ll",
+            "sha256": "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec"
+          },
+          "metal": {
+            "path": "shaders/remap_3d.metal",
+            "sha256": "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76"
+          },
+          "buffer_slots": [
+            {
+              "binding": 1,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 3,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 7,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "layout_chain_eight",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "fa050a9623a80d96a8d10d9611410a964e580a96170d0a96bc2b0a9605640d9632660d961b380d9660340d96c9a40d9686cf0d964f920d9674920c96bda00c966a710c96937e0c9618e90c9601030d967ed90c9687cb0c96ac0d0c9635130c9662bd0f968bd80f9690600c96b9620c96b6070c967f82a496"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "5c8c7a26bd3c63261e1e5c263f627b26e0cf742661fe7a26e2977b26e3196126246e6126452d602666cb60260724632668095c26e9a56326eaa46426ebc06426acbf6b268dd36b266efa66268fb06726305765267135652672fa68263323682674885226554e5226b6016a2697166a26b893682639344322"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            420,
+            400,
+            410
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "remap_3d",
+          "air": {
+            "path": "shaders/remap_3d.ll",
+            "sha256": "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec"
+          },
+          "metal": {
+            "path": "shaders/remap_3d.metal",
+            "sha256": "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76"
+          },
+          "buffer_slots": [
+            {
+              "binding": 1,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 3,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 7,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

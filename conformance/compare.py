@@ -14,6 +14,7 @@ import sys
 
 
 MAX_ALLOCATION_BYTES = 1_048_576
+U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 ALLOCATION_OBSERVATIONS = {
     "native-metal": "gpu-buffer-readback",
@@ -129,19 +130,44 @@ def _suite_plan(suite):
                  f"{where}: invalid dispatch count")
         original_views = [buffer["view"] for buffer in buffers]
         programs = case.get("programs")
+        default_slots = [{key: buffer[key] for key in ("binding", "access", "length")}
+                         for buffer in buffers]
+        program_slots = []
         if programs is not None:
             _list(programs, f"{where}.programs")
             _require(1 <= len(programs) <= 8, f"{where}: invalid program count")
             entries = []
             for program in programs:
-                _object(program, ("entry", "air", "metal"), f"{where}.program")
+                keys = ("entry", "air", "metal")
+                if isinstance(program, dict) and "buffer_slots" in program:
+                    keys += ("buffer_slots",)
+                _object(program, keys, f"{where}.program")
                 entries.append(_string(program["entry"], f"{where}.program.entry"))
                 for kind in ("air", "metal"):
                     source = program[kind]
                     _object(source, ("path", "sha256"), f"{where}.program.{kind}")
                     _string(source["path"], f"{where}.source.path")
                     _require(isinstance(source["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]), f"{where}: invalid source digest")
+                slots = program.get("buffer_slots", default_slots)
+                if "buffer_slots" in program:
+                    _list(slots, f"{where}.program.buffer_slots")
+                    _require(len(slots) == len(buffers),
+                             f"{where}: buffer_slots must cover every resource exactly once")
+                    previous_binding = -1
+                    for slot in slots:
+                        slot_where = f"{where}.program.buffer_slot"
+                        _object(slot, ("binding", "access", "length"), slot_where)
+                        binding = _integer(slot["binding"], f"{slot_where}.binding", 0, U32_MAX)
+                        _require(binding > previous_binding,
+                                 f"{where}: buffer_slots bindings must be unique and sorted")
+                        previous_binding = binding
+                        _require(slot["access"] in ("read", "write", "read_write"),
+                                 f"{slot_where}: unknown buffer access")
+                        _integer(slot["length"], f"{slot_where}.length", 1, MAX_ALLOCATION_BYTES)
+                program_slots.append(slots)
             _require(len(entries) == len(set(entries)), f"{where}: duplicate program entry")
+            _require(program_slots[0] == default_slots,
+                     f"{where}: first program buffer_slots must match initial buffer metadata")
         used_programs = set()
         for dispatch in dispatches:
             selection = dispatch.get("program") if isinstance(dispatch, dict) else None
@@ -159,7 +185,8 @@ def _suite_plan(suite):
                 _integer(view, f"{where}.dispatch.view")
             _require(len(mapping) == len(buffers) and set(mapping) == set(original_views),
                      f"{where}: binding map must permute every resource exactly once")
-            for slot, view in zip(buffers, mapping):
+            slots = program_slots[selection] if programs is not None else default_slots
+            for slot, view in zip(slots, mapping):
                 _require(views[view][2] == slot["length"],
                          f"{where}: rebound view does not fit the binding extent")
                 if slot["access"] != "read":
