@@ -101,21 +101,55 @@ private struct SuiteResult: Encodable {
     let results: [CaseResult]
 }
 
+private struct DeviceProbe: Encodable {
+    let schema_version: UInt64 = 1
+    let kind = "metal-device-probe"
+    let platform: String
+    let device: String?
+    let eligible: Bool
+    let reason: String
+    let supports_apple4: Bool
+    let has_unified_memory: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case schema_version, kind, platform, device, eligible, reason
+        case supports_apple4, has_unified_memory
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schema_version, forKey: .schema_version)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(platform, forKey: .platform)
+        // An absent device is explicitly null, not an omitted schema field.
+        try container.encode(device, forKey: .device)
+        try container.encode(eligible, forKey: .eligible)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(supports_apple4, forKey: .supports_apple4)
+        try container.encode(has_unified_memory, forKey: .has_unified_memory)
+    }
+}
+
 private struct Options {
-    let suite: URL
+    let suite: URL?
     let output: URL?
     let validateOnly: Bool
+    let probe: Bool
 }
 
 private let usage = """
 Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --suite PATH --validate-suite
+       native-metal-oracle --probe
        native-metal-oracle --help
 
 Capture the two supported cases using native Metal on Apple silicon macOS 11+.
 Without --output, the successful JSON report goes to stdout. Existing output
 files are never overwritten. Diagnostics go to stderr. --validate-suite checks
 the fixture and both shader source hashes without creating a Metal device.
+--probe needs no suite and reports default-device eligibility as JSON to stdout.
+It cannot be combined with other options. Probe success means the query succeeded;
+it does not mean a device is eligible or that any Metal compute work executed.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -123,6 +157,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var suite: URL?
     var output: URL?
     var validateOnly = false
+    var probe = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -144,17 +179,26 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!validateOnly, "Duplicate --validate-suite option")
             validateOnly = true
             index += 1
+        case "--probe":
+            try require(!probe, "Duplicate --probe option")
+            probe = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
-    guard let suiteURL = suite else { throw OracleError("--suite is required\n\(usage)") }
+    if probe {
+        try require(suite == nil && output == nil && !validateOnly,
+                    "--probe cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: true)
+    }
+    try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
     if let outputURL = output {
         try require(!FileManager.default.fileExists(atPath: outputURL.path),
                     "Output already exists: \(outputURL.path)")
     }
-    return Options(suite: suiteURL, output: output, validateOnly: validateOnly)
+    return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -422,25 +466,52 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
 }
 
 @available(macOS 11.0, *)
+private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
+    let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+    guard let device = device else {
+        return DeviceProbe(platform: platform, device: nil, eligible: false,
+            reason: "no_default_device", supports_apple4: false, has_unified_memory: false)
+    }
+    // Apple4 establishes the nonuniform-threadgroup capability. Restricting
+    // this initial harness to Apple GPUs also makes shared-memory use explicit.
+    let supportsApple4 = device.supportsFamily(.apple4)
+    let hasUnifiedMemory = device.hasUnifiedMemory
+    let hasName = !device.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let eligible = hasName && supportsApple4 && hasUnifiedMemory
+    return DeviceProbe(platform: platform, device: device.name, eligible: eligible,
+        reason: eligible ? "eligible" : "unsupported_features",
+        supports_apple4: supportsApple4, has_unified_memory: hasUnifiedMemory)
+}
+
+@available(macOS 11.0, *)
 private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     guard let device = MTLCreateSystemDefaultDevice() else {
         throw OracleError("No default Metal device is available; capture requires an Apple silicon Mac")
     }
-    // Apple4 establishes the nonuniform-threadgroup capability. Restricting
-    // this initial harness to Apple GPUs also makes shared-memory use explicit.
-    try require(device.supportsFamily(.apple4) && device.hasUnifiedMemory,
-                "This oracle requires an Apple silicon GPU with nonuniform threadgroups and unified memory")
-    try require(!device.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                "Metal device name is empty")
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
     guard let queue = device.makeCommandQueue() else { throw OracleError("Cannot create a Metal command queue") }
     var results = [CaseResult]()
     for fixture in suite.cases {
         results.append(try runCase(fixture, device: device, queue: queue))
     }
-    let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",
-        device: device.name, platform: platform, results: results)
+        device: device.name, platform: eligibility.platform, results: results)
+}
+
+private func writeJSON<T: Encodable>(_ result: T, output: URL? = nil) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    var report = try encoder.encode(result)
+    report.append(0x0a)
+    if let output = output {
+        // Exclusive creation protects against files created during capture.
+        try report.write(to: output, options: .withoutOverwriting)
+    } else {
+        FileHandle.standardOutput.write(report)
+    }
 }
 
 private func diagnostic(_ message: String) {
@@ -455,21 +526,18 @@ do {
     }
     let options = try parseOptions(arguments)
     guard #available(macOS 11.0, *) else { throw OracleError("macOS 11 or later is required") }
-    let suite = try loadSuite(options.suite)
+    if options.probe {
+        // Query capabilities only: no suite, queue, shader, or GPU submission.
+        try writeJSON(assessDevice(MTLCreateSystemDefaultDevice()))
+        exit(EXIT_SUCCESS)
+    }
+    guard let suiteURL = options.suite else { throw OracleError("--suite is required") }
+    let suite = try loadSuite(suiteURL)
     if options.validateOnly {
         diagnostic("Validated \(suite.name): \(suite.cases.count) cases, suite SHA-256 \(suite.sha256); no GPU work submitted")
     } else {
         let result = try capture(suite)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        var report = try encoder.encode(result)
-        report.append(0x0a)
-        if let output = options.output {
-            // Exclusive creation protects against files created during capture.
-            try report.write(to: output, options: .withoutOverwriting)
-        } else {
-            FileHandle.standardOutput.write(report)
-        }
+        try writeJSON(result, output: options.output)
     }
 } catch {
     diagnostic("native-metal-oracle: \(error)")

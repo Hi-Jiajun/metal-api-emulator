@@ -41,8 +41,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
 shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift
-runner still needs macOS compilation and an actual Apple GPU capture; this is
-not yet a native `ComputeProvider` or a passing Metal/Vulkan parity result.
+runner's initial macOS compile/input checks passed. The new CI probe can
+capture and compare real results when an eligible GPU is available; otherwise
+it explicitly records unavailable. An actual Apple GPU capture is still
+outstanding. This is not yet a native `ComputeProvider` or a passing
+Metal/Vulkan parity result.
 
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this

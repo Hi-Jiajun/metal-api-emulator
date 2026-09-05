@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm spirv-tools libvulkan1 mesa-vulkan-drivers
       - run: cargo fmt --all -- --check
-      - run: python3 -m unittest discover -s conformance -p test_compare.py -v
+      - run: python3 -m unittest discover -s conformance -p 'test_*.py' -v
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
       - name: Rustdoc
@@ -39,13 +39,59 @@ jobs:
           cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite.json --output /tmp/vulkan-capture.json
           python3 conformance/compare.py --suite conformance/suite.json --check /tmp/vulkan-capture.json
 
+      - name: Preserve Vulkan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-capture
+          path: /tmp/vulkan-capture.json
+          if-no-files-found: error
+
   native-oracle-build:
-    # Compile and validate the fixture inputs; no GPU result is inferred here.
     runs-on: macos-15
+    timeout-minutes: 10
+    outputs:
+      capture_status: ${{ steps.capture.outputs.capture_status }}
     steps:
       - uses: actions/checkout@v4
       - name: Compile native Metal capture tool
         run: |
           xcrun swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
-      - name: Validate shared suite without creating a Metal device
-        run: /tmp/native-oracle --suite conformance/suite.json --validate-suite
+      - name: Probe Metal and capture when eligible
+        id: capture
+        run: |
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite.json --output-dir /tmp/native-evidence --source-revision "$GITHUB_SHA"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          status = json.loads(Path('/tmp/native-evidence/status.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('capture_status=' + status['capture_status'] + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Native Metal capture: **' + status['capture_status'] + '**.\n\n')
+              summary.write(status['reason'] + '\n')
+          PY
+      - name: Preserve native probe, status and any completed capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-evidence
+          path: /tmp/native-evidence/
+          if-no-files-found: warn
+
+  compare-captures:
+    needs: [standalone, native-oracle-build]
+    if: needs.native-oracle-build.outputs.capture_status == 'captured'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-capture
+          path: /tmp/vulkan-evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-evidence
+          path: /tmp/native-evidence
+      - name: Compare observed native and Vulkan results
+        run: |
+          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json

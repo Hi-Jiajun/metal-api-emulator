@@ -3,8 +3,10 @@
 This directory prepares the first native Metal/Vulkan comparison for two small
 buffer-compute cases. The native runner is a standalone Swift program using
 Metal; it is not a Rust `ComputeProvider` implementation. Its source is prepared
-for Apple silicon macOS 11+, but has not yet been compiled or run on a Mac in
-this workspace. A successful Metal capture is still required.
+for Apple silicon macOS 11+. The initial capture version at `a57c985` compiled
+and validated the shared suite in macOS CI. The current probe extension has
+only local static review until its next macOS CI run. A successful Metal GPU
+capture is still required.
 
 ## Shared input
 
@@ -55,6 +57,12 @@ xcrun swiftc -swift-version 5 -warnings-as-errors \
   -framework Foundation -framework Metal -framework CoreGraphics -framework CryptoKit \
   conformance/NativeOracle.swift -o conformance/native-oracle
 conformance/native-oracle --suite conformance/suite.json --validate-suite
+```
+
+Query device eligibility without submitting GPU commands:
+
+```sh
+conformance/native-oracle --probe
 ```
 
 Then run the actual reference capture:
@@ -122,7 +130,34 @@ and its reports match the fixture's expected bytes. Python comparator tests
 cover positive and negative report checks. Local Rust tests, formatting,
 Clippy and Windows cross-build checks cover the Vulkan runner.
 
-The prepared GitHub workflow compiles Swift and runs `--validate-suite` on a
-macOS runner; it does not attempt GPU execution or manufacture a native
-capture. That job has not yet been run for this local increment. No Swift
-compiler, macOS SDK or Apple GPU was available for local native validation.
+The initial macOS compile-only run at `a57c985` passed. The updated workflow
+retains that compile/input validation and probes Metal device eligibility.
+On an eligible device it captures real native output, validates it and passes
+it to a separate cross-backend comparison job. It uses the existing standard
+`macos-15` runner; no paid runner is configured.
+
+If the runner has no eligible GPU, its `status.json` says `unavailable`, no
+native result is generated and the comparison job is skipped. A green workflow
+with that status does **not** establish native Metal parity. If an eligible
+device fails compilation, execution, timeout or result checks, the job fails;
+those errors are not downgraded to unavailable. Probe output, command logs and
+status are preserved in `native-evidence`, and the Linux report is preserved
+in `vulkan-capture` workflow artifacts.
+
+For a collaborator's machine, the same orchestration can require a GPU:
+
+```sh
+python3 conformance/run_native.py --oracle conformance/native-oracle \
+  --suite conformance/suite.json --output-dir conformance/captures/native-run \
+  --require-metal
+```
+
+The output directory must be new. `status.json` distinguishes `captured`,
+`unavailable` and `failed`, and the wrapper enforces process timeouts in addition
+to the capture tool's GPU fence timeout. `captured` means a validated native
+report exists; cross-backend comparison is a separate check. The status may
+also carry `--source-revision` for local capture provenance.
+
+The current probe/workflow extension has not yet run remotely at this local
+checkpoint. No Swift compiler, macOS SDK or Apple GPU is available locally.
+Python orchestration tests use simulated commands and synthetic reports only.
