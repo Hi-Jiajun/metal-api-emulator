@@ -236,6 +236,20 @@ impl Dispatch {
 pub struct BufferBindingContract {
     pub metal_binding: u32,
     pub access: BufferAccess,
+    pub footprint: FootprintProof,
+}
+
+/// Normalized provider-admission proof for one buffer's reachable bytes.
+///
+/// `Affine` means the provider must evaluate a bounded index expression against
+/// the dispatch. It is intentionally not a parity identity: native and Vulkan
+/// providers may serialize the proof differently while producing the same
+/// observable writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FootprintProof {
+    Static { max_bytes: u64 },
+    Affine,
+    Unbounded,
 }
 
 /// Provider-admission metadata for one translated pipeline.
@@ -553,6 +567,16 @@ impl ProviderCapabilities {
                         .with_field("requested", FieldValue::Unsigned(buffer.length))
                         .with_field("maximum", FieldValue::Unsigned(self.max_buffer_range)));
                 }
+                let reflected = trace
+                    .pipeline_contract
+                    .buffer_bindings
+                    .iter()
+                    .find(|binding| binding.metal_binding == buffer.metal_binding)
+                    .expect("trace validation checked reflected bindings");
+                if reflected.footprint == FootprintProof::Unbounded {
+                    return Err(capability_error("buffer_footprint_unbounded")
+                        .with_field("binding", FieldValue::Unsigned(buffer.metal_binding as u64)));
+                }
                 let storage_mode = match &buffer.source {
                     BufferSource::OwnedBytes(_) => StorageMode::OwnedBytes,
                     BufferSource::StagedLease(_) => StorageMode::StagedLease,
@@ -813,6 +837,7 @@ mod tests {
                 buffer_bindings: vec![BufferBindingContract {
                     metal_binding: 0,
                     access: BufferAccess::Write,
+                    footprint: FootprintProof::Affine,
                 }],
                 shader_capabilities: Vec::new(),
                 translator_revision: None,
@@ -942,6 +967,7 @@ mod tests {
             .push(BufferBindingContract {
                 metal_binding: 1,
                 access: BufferAccess::Write,
+                footprint: FootprintProof::Affine,
             });
         let error = capabilities().admit(&alias).unwrap_err();
         assert_eq!(error.slug, "buffer_alias_unsupported");
@@ -954,6 +980,14 @@ mod tests {
         value.passes[0].dispatch.kind = DispatchKind::Threadgroups;
         let error = capabilities().admit(&value).unwrap_err();
         assert_eq!(error.slug, "dispatch_kind_unsupported");
+    }
+
+    #[test]
+    fn capabilities_refuse_an_unbounded_writable_footprint() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.pipeline_contract.buffer_bindings[0].footprint = FootprintProof::Unbounded;
+        let error = capabilities().admit(&value).unwrap_err();
+        assert_eq!(error.slug, "buffer_footprint_unbounded");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use metal2vulkan::reflect::{
     BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, ResourceAccess, ResourceKind,
     ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
+use metal_api_core::provider::{PipelineContract, ProviderCapabilities, SemanticDigest};
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
     Function, PipelineArtifact,
@@ -22,6 +23,8 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod provider;
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +47,15 @@ impl VulkanExecutor {
 
     pub fn device_name(&self) -> &str {
         &self.context.device_name
+    }
+
+    /// Report the selected Vulkan device as neutral provider capabilities.
+    ///
+    /// The snapshot executor intentionally exposes only owned host bytes and
+    /// synchronous readback today; it does not claim no-copy leases or a
+    /// submit-only completion API.
+    pub fn provider_capabilities(&self) -> ProviderCapabilities {
+        provider::capabilities_from_limits(&self.context.properties.limits)
     }
 }
 
@@ -133,6 +145,15 @@ impl TranslatedComputePipeline {
             }
         }
         Ok(())
+    }
+
+    /// Map this translated kernel to the neutral provider contract. Vulkan
+    /// descriptor locations and exact-thread regions stay implementation-only.
+    pub fn provider_contract(
+        &self,
+        translator_revision: Option<SemanticDigest>,
+    ) -> Result<PipelineContract, ExecutorError> {
+        provider::pipeline_contract(&self.reflection, translator_revision)
     }
 }
 
