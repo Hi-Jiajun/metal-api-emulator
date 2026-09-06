@@ -13,7 +13,7 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::provider::{
     CompletionDisposition, PipelineContract, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderPhase, SemanticDigest,
+    ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -453,7 +453,7 @@ pub(crate) fn execute_serial_submission_with_status(
     execute_rebound_submission_with_status(context, artifact, submission.buffers, &bound)
 }
 
-/// Execute one pipeline against a permutation of the uploaded buffers per pass.
+/// Execute one pipeline against a selected subset of uploaded buffers per pass.
 /// The caller owns serialization. All passes are validated before creating
 /// request resources, and share one upload, command buffer, fence, and readback.
 /// Updates identify pool keys and include each buffer writable in any pass once.
@@ -626,7 +626,8 @@ fn plan_rebound_submission(
 }
 
 /// Pure preflight: no request-specific Vulkan objects exist until this returns.
-/// Each pass must bijectively bind the entire pool to its reflected Metal slots.
+/// Each pass uniquely maps its reflected Metal slots into the shared pool.
+/// Every uploaded resource must be used by at least one pass in the sequence.
 fn plan_pipeline_sequence(
     translated: &[&TranslatedComputePipeline],
     buffers: &[BufferBinding],
@@ -647,6 +648,11 @@ fn plan_pipeline_sequence(
             "pipeline artifact count must match dispatch count",
         )));
     }
+    if buffers.len() > MAX_SERIAL_RESOURCES {
+        return Err(resolve_capability(failure(format!(
+            "buffer pool exceeds serial resource limit {MAX_SERIAL_RESOURCES}",
+        ))));
+    }
     let mut pool = BTreeMap::new();
     for buffer in buffers {
         if pool.insert(buffer.index, buffer).is_some() {
@@ -657,6 +663,7 @@ fn plan_pipeline_sequence(
         }
     }
     let mut plans = Vec::with_capacity(dispatches.len());
+    let mut used_pool_keys = BTreeSet::new();
     let mut writable_pool_keys = BTreeSet::new();
     let mut descriptor_count = 0_u32;
     for (translated, dispatch) in translated.iter().zip(dispatches) {
@@ -669,18 +676,13 @@ fn plan_pipeline_sequence(
                 "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
             ))));
         }
-        if pool.len() != reflection.bindings.len() {
-            return Err(dispatch_args_error(failure(
-                "buffer pool must contain exactly one resource per reflected binding",
-            )));
-        }
-        let mut used_pool_keys = BTreeSet::new();
+        let mut pass_pool_keys = BTreeSet::new();
         let mut bindings = Vec::with_capacity(dispatch.bindings.len());
         for &(metal_index, pool_key) in &dispatch.bindings {
             let buffer = pool.get(&pool_key).ok_or_else(|| {
                 dispatch_args_error(failure(format!("unknown buffer pool key {pool_key}")))
             })?;
-            if !used_pool_keys.insert(pool_key) {
+            if !pass_pool_keys.insert(pool_key) {
                 return Err(dispatch_args_error(failure(format!(
                     "buffer pool key {pool_key} is bound more than once in one pass",
                 ))));
@@ -690,15 +692,11 @@ fn plan_pipeline_sequence(
                 bytes: buffer.bytes.clone(),
             });
         }
-        if used_pool_keys.len() != pool.len() {
-            return Err(dispatch_args_error(failure(
-                "each pass must bind the entire buffer pool exactly once",
-            )));
-        }
         validate_local_size(limits, dispatch.local).map_err(resolve_capability)?;
         translated
             .validate_buffers(&bindings, dispatch.grid)
             .map_err(dispatch_args_error)?;
+        used_pool_keys.extend(pass_pool_keys);
         for &(metal_index, pool_key) in &dispatch.bindings {
             let reflected = reflection
                 .bindings
@@ -728,6 +726,11 @@ fn plan_pipeline_sequence(
             .and_then(|count| descriptor_count.checked_add(count))
             .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
         plans.push(plan);
+    }
+    if used_pool_keys.len() != pool.len() {
+        return Err(dispatch_args_error(failure(
+            "every uploaded buffer pool resource must be bound in at least one pass",
+        )));
     }
     for buffer in buffers {
         validate_storage_buffer_size(limits, buffer).map_err(resolve_capability)?;
@@ -2023,6 +2026,173 @@ mod tests {
         }
     }
 
+    fn subset_pipeline_fixture() -> (
+        TranslatedComputePipeline,
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+        Vec<BoundDispatch>,
+    ) {
+        let (mut first, mut buffers, limits) = rebound_fixture();
+        let mut scalar = first.reflection.bindings[0].clone();
+        scalar.metal_index = 9;
+        scalar.descriptor.as_mut().unwrap().binding = 9;
+        scalar.footprint.as_mut().unwrap().strided_accesses[0]
+            .terms
+            .clear();
+        first.reflection.bindings.push(scalar);
+        validate_pipeline_reflection("serial", &first.reflection).unwrap();
+        buffers[0].index = 11;
+        buffers[1].index = 19;
+        buffers.push(BufferBinding {
+            index: 23,
+            bytes: vec![0; 4],
+        });
+        buffers.push(BufferBinding {
+            index: 29,
+            bytes: vec![0; 240],
+        });
+        let dispatches = vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 11), (1, 19), (9, 23)],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![(3, 19), (7, 29)],
+            },
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![(0, 19), (1, 29), (9, 23)],
+            },
+        ];
+        (
+            first,
+            alternate_pipeline_fixture(),
+            buffers,
+            limits,
+            dispatches,
+        )
+    }
+
+    #[test]
+    fn subset_preflight_allows_three_two_three_slots_and_later_pool_resources() {
+        let (first, second, buffers, limits, dispatches) = subset_pipeline_fixture();
+        let planned =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap();
+        // Resource 29 appears only in later passes and takes slot 1 from 19.
+        // The scalar pool resource stays read-only and is absent in pass two.
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([19, 29]));
+        assert_eq!(planned.plans.len(), 3);
+        for (plan, dispatch) in planned.plans.iter().zip(dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    #[test]
+    fn subset_preflight_rejects_unused_pool_and_invalid_per_pass_maps() {
+        let (first, second, mut buffers, limits, dispatches) = subset_pipeline_fixture();
+        buffers.push(BufferBinding {
+            index: 31,
+            bytes: vec![0; 240],
+        });
+        let error =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("at least one pass"));
+        buffers.pop();
+
+        for (bindings, detail) in [
+            (vec![(3, 19), (7, 31)], "unknown buffer pool key 31"),
+            (vec![(3, 19), (7, 19)], "bound more than once in one pass"),
+            (vec![(3, 19)], "do not match reflection"),
+            (vec![(3, 19), (3, 29)], "buffer 3 is bound more than once"),
+            (vec![(3, 19), (7, 29), (9, 11)], "buffer 9 is not reflected"),
+        ] {
+            let mut invalid_dispatches = dispatches.clone();
+            invalid_dispatches[1].bindings = bindings;
+            let error = plan_pipeline_sequence(
+                &[&first, &second, &first],
+                &buffers,
+                &limits,
+                &invalid_dispatches,
+            )
+            .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert!(error.detail.unwrap().contains(detail));
+        }
+    }
+
+    #[test]
+    fn subset_preflight_checks_scalar_rebound_to_later_array_footprint() {
+        let (first, second, buffers, limits, mut dispatches) = subset_pipeline_fixture();
+        // The first pipeline reads pool 23 as a scalar, but the next pipeline
+        // reads its input as an array. The later pass must reject that mapping.
+        plan_pipeline_sequence(&[&first], &buffers[..3], &limits, &dispatches[..1]).unwrap();
+        dispatches[1].bindings[1] = (7, 23);
+        let error =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error
+            .detail
+            .unwrap()
+            .contains("buffer 7 length 4 is shorter than reflected reach 68"));
+    }
+
+    #[test]
+    fn subset_preflight_bounds_total_resources_separately_from_per_pass_descriptors() {
+        let (mut translated, _, limits) = serial_fixture();
+        let template = translated.reflection.bindings[0].clone();
+        translated.reflection.bindings = (0..8)
+            .map(|index| {
+                let mut binding = template.clone();
+                binding.metal_index = index;
+                binding.descriptor.as_mut().unwrap().binding = index;
+                binding
+            })
+            .collect();
+        let mut buffers = (0..MAX_SERIAL_RESOURCES)
+            .map(|index| BufferBinding {
+                index: index as u32,
+                bytes: vec![0; 4],
+            })
+            .collect::<Vec<_>>();
+        let dispatches = (0..8)
+            .map(|pass| BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: (0..8).map(|index| (index, pass * 8 + index)).collect(),
+            })
+            .collect::<Vec<_>>();
+        let translated = vec![&translated; 8];
+        assert_eq!(
+            plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches)
+                .unwrap()
+                .plans
+                .len(),
+            8
+        );
+        buffers.push(BufferBinding {
+            index: MAX_SERIAL_RESOURCES as u32,
+            bytes: vec![0; 4],
+        });
+        let error =
+            plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("serial resource limit 64"));
+    }
+
     #[test]
     fn mixed_preflight_rejects_missing_or_extra_pipeline_artifacts() {
         let (first, buffers, limits) = rebound_fixture();
@@ -2163,7 +2333,7 @@ mod tests {
             .detail
             .as_deref()
             .unwrap()
-            .contains("exactly one resource per reflected binding"));
+            .contains("unknown buffer pool key 1"));
     }
 
     #[test]

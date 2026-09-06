@@ -27,18 +27,19 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   are detected and refused.
 - Experimental provider: `VulkanComputeProvider` implements `ComputeProvider`
   for up to eight synchronous serial exact-thread passes using an explicit pipeline table
-  and stable owned view pool, followed by one host readback. It registers pipelines, revalidates each trace against its actual
+  and up to 64 stable owned views, followed by one host readback.
+  Each pass binds its own resource subset; all resources upload before execution. It registers pipelines, revalidates each trace against its actual
   device and artifact, and returns checked allocation-relative writebacks.
 - Completion: this provider's `submit` waits for GPU completion and readback;
   `wait` observes the recorded terminal result. A submit timeout is terminal
   unknown completion; resources remain retained and the executor is unusable.
 - Shared provider API: compilation, pipeline metadata and release now use
-  `PipelineProvider`. The new Rust native Metal backend accepts five exact
-  reviewed MSL fixtures. Its single-pass v1/v2 execution passed
-  [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33979796237);
-  the new serial multi-pass increment still needs its own native run.
+  `PipelineProvider`. The Rust native Metal backend accepts six exact
+  reviewed MSL fixtures. Its v1-v6 execution passed
+  [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385);
+  the v7 resource-subset increment still needs its own native run.
 - Open design work: asynchronous submission/readback, general native shader
-  admission, new resources within a command buffer, aliases and
+  admission, CPU uploads during command-buffer execution, aliases and
   completion-driven live leases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
@@ -63,8 +64,12 @@ The new [mixed-pipeline extension](conformance/MIXED-PIPELINES.md) supports
 switching compute shaders inside a single command buffer and passed
 [three-way v5 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33982552902).
 The new [pipeline-layout suite](conformance/PIPELINE-LAYOUTS.md) changes binding
-numbers and access roles between programs; native v6 validation is pending. Existing evidence does not
-establish general Metal conformance.
+numbers and access roles between programs and passed
+[three-way v6 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385).
+The [resource-subset extension](conformance/RESOURCE-SUBSETS.md) allows a pass to
+bind only the resources it needs, including views first used by later passes.
+Its v7 native GPU validation is pending. Existing evidence does not establish
+general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this

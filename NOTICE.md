@@ -45,3 +45,6 @@ integer operation sequence tests pipeline changes within one command buffer.
 
 `conformance/shaders/remap_3d.ll` and `remap_3d.metal` are owned synthetic source
 counterparts for per-pipeline binding-order and access-role tests.
+
+`conformance/shaders/copy_3d.ll` and `copy_3d.metal` are owned synthetic source
+counterparts for a two-buffer producer/consumer stage over resource subsets.

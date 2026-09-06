@@ -15,6 +15,10 @@ use std::time::Duration;
 /// Current version of the pure-value provider trace schema.
 pub const PROVIDER_SCHEMA_VERSION: u16 = 2;
 
+/// Maximum distinct logical views collected before one command-buffer submit.
+/// This shared bounded-resource policy applies to single-pass traces too.
+pub const MAX_SERIAL_RESOURCES: usize = 64;
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1010,65 +1014,68 @@ impl ComputeTrace {
     }
 
     /// Validate the serial resource-reuse subset supported by command-buffer
-    /// providers. Every pass uses the same complete logical view pool, but may
-    /// select another registered pipeline and permute those views among its
-    /// buffer bindings.
+    /// providers. Each pass binds a subset of the complete logical view pool,
+    /// and may select another registered pipeline or permute its bound views.
     /// Access follows each binding's reflection; view identity, allocation,
     /// range and source contents stay fixed. The repeated source bytes describe
-    /// one initial upload. Writes from earlier passes remain visible to later
-    /// passes, and readback happens after the final pass. This does not admit
-    /// new resources or general aliasing. A single pass retains the ordinary
-    /// structural contract.
+    /// one initial upload. Views first bound by later passes are still collected
+    /// and validated before submission, then uploaded with the whole pool;
+    /// they do not introduce CPU uploads during execution. Writes from earlier
+    /// passes remain visible to later passes, and readback happens after the
+    /// final pass. General aliasing remains subject to resource admission.
     pub fn validate_serial_buffer_reuse(&self) -> Result<(), ContractError> {
         self.validate()?;
-        if self.passes.len() > 1 {
-            if self.encoder_dispatch_type != DispatchType::Serial {
-                return Err(ContractError::ConcurrentPassesUnsupported);
-            }
-            let initial_buffers: BTreeMap<_, _> = self.passes[0]
-                .buffers
-                .iter()
-                .map(|view| (view.view_id, view))
-                .collect();
-            for (pass_index, pass) in self.passes.iter().enumerate().skip(1) {
-                if pass.buffers.len() != initial_buffers.len()
-                    || pass.buffers.iter().any(|view| {
-                        initial_buffers.get(&view.view_id).is_none_or(|initial| {
-                            view.allocation_id != initial.allocation_id
-                                || view.offset != initial.offset
-                                || view.length != initial.length
-                                || view.source != initial.source
-                        })
-                    })
-                {
-                    return Err(ContractError::SerialBufferRebinding { pass_index });
+        if self.passes.len() > 1 && self.encoder_dispatch_type != DispatchType::Serial {
+            return Err(ContractError::ConcurrentPassesUnsupported);
+        }
+        let mut initial_buffers = BTreeMap::<ViewId, &BufferView>::new();
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            for view in &pass.buffers {
+                if let Some(initial) = initial_buffers.get(&view.view_id) {
+                    if view.allocation_id != initial.allocation_id
+                        || view.offset != initial.offset
+                        || view.length != initial.length
+                        || view.source != initial.source
+                    {
+                        return Err(ContractError::SerialBufferRebinding { pass_index });
+                    }
+                } else {
+                    initial_buffers.insert(view.view_id, view);
+                    if initial_buffers.len() > MAX_SERIAL_RESOURCES {
+                        return Err(ContractError::SerialResourceLimit {
+                            requested: initial_buffers.len(),
+                            maximum: MAX_SERIAL_RESOURCES,
+                        });
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// The stable upload/readback pool for serial execution, in first-pass
+    /// The stable upload/readback pool for serial execution, in first-use
     /// order. Each view's access is the union of its uses across all passes,
     /// so a view written only by a later pass still requires final readback.
-    /// `metal_binding` retains the first-pass label; providers must use each
-    /// pass's bindings when encoding dispatches.
+    /// `metal_binding` retains the first-use label, which may duplicate another
+    /// resource's label and must never be used as a pool key. Providers identify
+    /// resources by view identity and use each pass's bindings when encoding.
     pub fn serial_resources(&self) -> Result<Vec<BufferView>, ContractError> {
         self.validate_serial_buffer_reuse()?;
-        let mut resources = self.passes[0].buffers.clone();
-        let positions: BTreeMap<_, _> = resources
-            .iter()
-            .enumerate()
-            .map(|(index, view)| (view.view_id, index))
-            .collect();
-        for pass in self.passes.iter().skip(1) {
+        let mut resources = Vec::<BufferView>::new();
+        let mut positions = BTreeMap::<ViewId, usize>::new();
+        for pass in &self.passes {
             for view in &pass.buffers {
-                let resource = &mut resources[positions[&view.view_id]];
-                resource.access = match (resource.access, view.access) {
-                    (BufferAccess::Unused, access) | (access, BufferAccess::Unused) => access,
-                    (left, right) if left == right => left,
-                    _ => BufferAccess::ReadWrite,
-                };
+                if let Some(&position) = positions.get(&view.view_id) {
+                    let resource = &mut resources[position];
+                    resource.access = match (resource.access, view.access) {
+                        (BufferAccess::Unused, access) | (access, BufferAccess::Unused) => access,
+                        (left, right) if left == right => left,
+                        _ => BufferAccess::ReadWrite,
+                    };
+                } else {
+                    positions.insert(view.view_id, resources.len());
+                    resources.push(view.clone());
+                }
             }
         }
         Ok(resources)
@@ -1194,8 +1201,8 @@ impl BufferWriteback {
 /// use [`ProviderError`]. Writebacks are CPU-visible and may only accompany
 /// `CompletedVisible` with [`CompletionPolicy::HostReadback`]. They are ordered
 /// by `(allocation_id, view_id)`. A single pass or serial passes sharing the
-/// same logical view pool require one complete final writeback for each view
-/// written by any pass when host readback completes. Intermediate per-pass
+/// precollected logical view pool require one complete final writeback for each
+/// view written by any pass when host readback completes. Intermediate per-pass
 /// outputs are not returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSubmission {
@@ -1829,6 +1836,10 @@ pub enum ContractError {
     SerialBufferRebinding {
         pass_index: usize,
     },
+    SerialResourceLimit {
+        requested: usize,
+        maximum: usize,
+    },
     WritebackPolicyMismatch(CompletionPolicy),
     NonCanonicalWritebackOrder,
     UnknownWriteback {
@@ -1997,7 +2008,11 @@ impl fmt::Display for ContractError {
             }
             Self::SerialBufferRebinding { pass_index } => write!(
                 formatter,
-                "serial pass {pass_index} must reuse the initial logical view pool and source bytes"
+                "serial pass {pass_index} changes a previously declared view's allocation, range or source bytes"
+            ),
+            Self::SerialResourceLimit { requested, maximum } => write!(
+                formatter,
+                "serial resource pool contains {requested} distinct views, exceeding {maximum}"
             ),
             Self::WritebackPolicyMismatch(policy) => write!(
                 formatter,
@@ -2506,10 +2521,6 @@ mod tests {
             changed_bytes,
             changed_length,
             BufferView {
-                view_id: ViewId::new(2),
-                ..initial.clone()
-            },
-            BufferView {
                 allocation_id: AllocationId::new(10),
                 ..initial.clone()
             },
@@ -2626,14 +2637,8 @@ mod tests {
     }
 
     #[test]
-    fn serial_permutations_refuse_replacement_views_and_source_reuploads() {
+    fn serial_permutations_refuse_source_reuploads_and_missing_pipeline_bindings() {
         let value = ping_pong_trace();
-        let mut replacement = value.clone();
-        replacement.passes[1].buffers[0].view_id = ViewId::new(3);
-        assert_eq!(
-            replacement.serial_resources(),
-            Err(ContractError::SerialBufferRebinding { pass_index: 1 })
-        );
         let mut reupload = value.clone();
         reupload.passes[1].buffers[0].source = BufferSource::OwnedBytes(vec![7; 4]);
         assert_eq!(
@@ -2651,6 +2656,222 @@ mod tests {
         assert_eq!(
             duplicate.serial_resources(),
             Err(ContractError::DuplicateView(ViewId::new(1)))
+        );
+    }
+
+    fn subset_trace() -> ComputeTrace {
+        let mut value = ping_pong_trace();
+        value.passes[1].buffers[1] = BufferView {
+            allocation_id: AllocationId::new(11),
+            source: BufferSource::OwnedBytes(vec![9; 4]),
+            ..buffer(3, 1)
+        };
+        value
+    }
+
+    fn subset_resources() -> ResourceTableSnapshot {
+        let mut pool = resources();
+        for allocation_id in [10, 11] {
+            pool.insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(allocation_id),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 4,
+            })
+            .unwrap();
+        }
+        pool
+    }
+
+    #[test]
+    fn serial_subsets_precollect_later_views_with_initial_bytes_in_first_use_order() {
+        let value = subset_trace();
+        let pool = value.serial_resources().unwrap();
+        assert_eq!(
+            pool.iter()
+                .map(|view| view.view_id.get())
+                .collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+        assert_eq!(pool[0], value.passes[0].buffers[0]);
+        assert_eq!(pool[1].access, BufferAccess::ReadWrite);
+        assert_eq!(pool[2], value.passes[1].buffers[1]);
+        assert_eq!(pool[2].source, BufferSource::OwnedBytes(vec![9; 4]));
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        let admitted = provider
+            .validate_trace(value.clone(), subset_resources())
+            .unwrap();
+        assert_eq!(admitted.trace(), &value);
+    }
+
+    #[test]
+    fn serial_subsets_can_omit_views_when_later_pipeline_requires_fewer_bindings() {
+        let mut value = ping_pong_trace();
+        let mut read_only = value.pipelines[0].clone();
+        read_only.pipeline_id = PipelineId::new(5);
+        read_only.contract.buffer_bindings.truncate(1);
+        value.pipelines.push(read_only);
+        value.passes[1].pipeline = PipelineId::new(5);
+        value.passes[1].buffers.truncate(1);
+        let pool = value.serial_resources().unwrap();
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].access, BufferAccess::Read);
+        assert_eq!(pool[1].access, BufferAccess::ReadWrite);
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        provider.admit(&value, &subset_resources()).unwrap();
+
+        // Omitting A is legal for this pipeline; omitting its required B is not.
+        value.passes[1].buffers.clear();
+        assert_eq!(
+            value.serial_resources(),
+            Err(ContractError::MissingBinding(0))
+        );
+    }
+
+    #[test]
+    fn serial_subsets_refuse_changed_views_after_an_unbound_pass() {
+        let mut value = subset_trace();
+        value.passes.push(value.passes[0].clone());
+        value.validate_serial_buffer_reuse().unwrap();
+        let initial = value.passes[2].buffers[0].clone();
+        for changed in [
+            BufferView {
+                source: BufferSource::OwnedBytes(vec![8; 4]),
+                ..initial.clone()
+            },
+            BufferView {
+                offset: 4,
+                ..initial.clone()
+            },
+            BufferView {
+                length: 3,
+                source: BufferSource::OwnedBytes(vec![7; 3]),
+                ..initial.clone()
+            },
+            BufferView {
+                allocation_id: AllocationId::new(12),
+                ..initial
+            },
+        ] {
+            let mut invalid = value.clone();
+            invalid.passes[2].buffers[0] = changed;
+            assert_eq!(
+                invalid.serial_resources(),
+                Err(ContractError::SerialBufferRebinding { pass_index: 2 })
+            );
+        }
+        // A view first introduced in pass 2 is also frozen before submission.
+        value.passes.push(value.passes[1].clone());
+        value.passes[3].buffers[1].source = BufferSource::OwnedBytes(vec![10; 4]);
+        assert_eq!(
+            value.serial_resources(),
+            Err(ContractError::SerialBufferRebinding { pass_index: 3 })
+        );
+    }
+
+    #[test]
+    fn serial_subsets_allow_duplicate_first_use_binding_labels_but_not_aliases() {
+        let mut value = subset_trace();
+        let pool = value.serial_resources().unwrap();
+        assert_eq!(pool[1].metal_binding, pool[2].metal_binding);
+        assert_ne!(pool[1].view_id, pool[2].view_id);
+        subset_resources().validate_trace(&value).unwrap();
+
+        // C may not overlap A's backing even though A is unbound in pass 2.
+        value.passes[1].buffers[1].allocation_id = AllocationId::new(10);
+        assert_eq!(
+            subset_resources().validate_trace(&value),
+            Err(ContractError::OverlappingWritableViews {
+                first: ViewId::new(2),
+                second: ViewId::new(3),
+                first_pass: 0,
+                second_pass: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn serial_resource_union_has_a_shared_64_view_limit_including_single_pass() {
+        for pass_count in [1, 2] {
+            for count in [MAX_SERIAL_RESOURCES, MAX_SERIAL_RESOURCES + 1] {
+                let mut value = trace(Vec::new());
+                let template = value.pipelines.pop().unwrap();
+                let mut pool = ResourceTableSnapshot::new();
+                let mut next_view = 1_u64;
+                for pass_index in 0..pass_count {
+                    let mut pipeline = template.clone();
+                    pipeline.pipeline_id = PipelineId::new(4 + pass_index as u64);
+                    let binding = pipeline.contract.buffer_bindings[0].clone();
+                    pipeline.contract.buffer_bindings.clear();
+                    let pass_views = if pass_index + 1 == pass_count {
+                        count - (next_view as usize - 1)
+                    } else {
+                        MAX_SERIAL_RESOURCES / 2
+                    };
+                    let mut buffers = Vec::new();
+                    for metal_binding in 0..pass_views as u32 {
+                        let view = BufferView {
+                            allocation_id: AllocationId::new(next_view),
+                            ..buffer(next_view, metal_binding)
+                        };
+                        pool.insert_allocation(AllocationRecord {
+                            allocation_id: view.allocation_id,
+                            owner_epoch: value.device_epoch,
+                            size: 4,
+                        })
+                        .unwrap();
+                        pipeline
+                            .contract
+                            .buffer_bindings
+                            .push(BufferBindingContract {
+                                metal_binding,
+                                ..binding.clone()
+                            });
+                        buffers.push(view);
+                        next_view += 1;
+                    }
+                    value.passes.push(pass(pipeline.pipeline_id.get(), buffers));
+                    value.pipelines.push(pipeline);
+                }
+                let mut provider = capabilities();
+                provider.max_passes = 8;
+                provider.max_storage_buffer_descriptors = 128;
+                if count == MAX_SERIAL_RESOURCES {
+                    assert_eq!(value.serial_resources().unwrap().len(), count);
+                    provider.admit(&value, &pool).unwrap();
+                } else {
+                    let expected = ContractError::SerialResourceLimit {
+                        requested: count,
+                        maximum: MAX_SERIAL_RESOURCES,
+                    };
+                    assert_eq!(value.serial_resources(), Err(expected.clone()));
+                    let error = provider.admit(&value, &pool).unwrap_err();
+                    assert_eq!(error.class, ProviderErrorClass::Args);
+                    assert_eq!(error.detail, Some(expected.to_string()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serial_subsets_require_later_allocation_records_before_submission() {
+        let value = subset_trace();
+        let mut incomplete_pool = resources();
+        incomplete_pool
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(10),
+                owner_epoch: value.device_epoch,
+                size: 4,
+            })
+            .unwrap();
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        let error = provider.admit(&value, &incomplete_pool).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Resource);
+        assert_eq!(
+            error.detail,
+            Some(ContractError::UnknownAllocation(AllocationId::new(11)).to_string())
         );
     }
 
@@ -3598,7 +3819,10 @@ mod tests {
         multi_pass.passes[1].buffers[0].view_id = ViewId::new(8);
         assert_eq!(
             final_result.validate_for_trace(&multi_pass),
-            Err(ContractError::SerialBufferRebinding { pass_index: 1 })
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(8),
+            })
         );
     }
 
@@ -3646,6 +3870,35 @@ mod tests {
             allocation_id: AllocationId::new(10),
             offset: 0,
             bytes: vec![7; 4],
+        });
+        result.validate_for_trace(&value).unwrap();
+        result.writebacks.remove(0);
+        assert_eq!(
+            result.validate_for_trace(&value),
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(1),
+            })
+        );
+    }
+
+    #[test]
+    fn serial_submission_requires_final_writeback_for_a_view_first_bound_later() {
+        let value = subset_trace();
+        let mut result = completed_submission(&value);
+        assert_eq!(result.writebacks.len(), 1);
+        assert_eq!(
+            result.validate_for_trace(&value),
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(11),
+                view: ViewId::new(3),
+            })
+        );
+        result.writebacks.push(BufferWriteback {
+            view_id: ViewId::new(3),
+            allocation_id: AllocationId::new(11),
+            offset: 0,
+            bytes: vec![0x5a; 4],
         });
         result.validate_for_trace(&value).unwrap();
         result.writebacks.remove(0);

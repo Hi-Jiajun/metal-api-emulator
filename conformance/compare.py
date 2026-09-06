@@ -14,6 +14,7 @@ import sys
 
 
 MAX_ALLOCATION_BYTES = 1_048_576
+MAX_SERIAL_RESOURCES = 64
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 ALLOCATION_OBSERVATIONS = {
@@ -96,6 +97,8 @@ def _suite_plan(suite):
         allocations, views, initial_ranges, bindings = {}, {}, {}, set()
         buffers = _list(case.get("buffers"), f"{where}.buffers")
         _require(buffers, f"{where}: no buffers")
+        _require(len(buffers) <= MAX_SERIAL_RESOURCES,
+                 f"{where}: buffer pool exceeds {MAX_SERIAL_RESOURCES} resources")
         for buffer in buffers:
             _require(isinstance(buffer, dict), f"{where}: buffer must be an object")
             allocation = _integer(buffer.get("allocation"), f"{where}.allocation")
@@ -151,8 +154,9 @@ def _suite_plan(suite):
                 slots = program.get("buffer_slots", default_slots)
                 if "buffer_slots" in program:
                     _list(slots, f"{where}.program.buffer_slots")
-                    _require(len(slots) == len(buffers),
-                             f"{where}: buffer_slots must cover every resource exactly once")
+                    _require(1 <= len(slots) <= len(buffers),
+                             f"{where}: buffer_slots must cover every resource selected by "
+                             f"the program exactly once (1..{len(buffers)} slots)")
                     previous_binding = -1
                     for slot in slots:
                         slot_where = f"{where}.program.buffer_slot"
@@ -166,9 +170,11 @@ def _suite_plan(suite):
                         _integer(slot["length"], f"{slot_where}.length", 1, MAX_ALLOCATION_BYTES)
                 program_slots.append(slots)
             _require(len(entries) == len(set(entries)), f"{where}: duplicate program entry")
-            _require(program_slots[0] == default_slots,
+            initial_slots = {slot["binding"]: slot for slot in default_slots}
+            _require(all(initial_slots.get(slot["binding"]) == slot for slot in program_slots[0]),
                      f"{where}: first program buffer_slots must match initial buffer metadata")
         used_programs = set()
+        used_views = set()
         for dispatch in dispatches:
             selection = dispatch.get("program") if isinstance(dispatch, dict) else None
             if programs is not None:
@@ -183,9 +189,16 @@ def _suite_plan(suite):
             _list(mapping, f"{where}.dispatch.bindings")
             for view in mapping:
                 _integer(view, f"{where}.dispatch.view")
-            _require(len(mapping) == len(buffers) and set(mapping) == set(original_views),
-                     f"{where}: binding map must permute every resource exactly once")
             slots = program_slots[selection] if programs is not None else default_slots
+            if programs is None:
+                _require(len(mapping) == len(buffers) and set(mapping) == set(original_views),
+                         f"{where}: binding map must permute every resource exactly once")
+            else:
+                _require(len(mapping) == len(slots) and len(set(mapping)) == len(mapping)
+                         and set(mapping).issubset(views),
+                         f"{where}: binding map must cover every resource selected by program "
+                         "slots and permute every resource in that selection exactly once")
+            used_views.update(mapping)
             for slot, view in zip(slots, mapping):
                 _require(views[view][2] == slot["length"],
                          f"{where}: rebound view does not fit the binding extent")
@@ -194,6 +207,8 @@ def _suite_plan(suite):
 
         if programs is not None:
             _require(used_programs == set(range(len(programs))), f"{where}: unused program entries")
+            _require(used_views == set(original_views),
+                     f"{where}: unused buffer pool resources; every view must appear in a dispatch")
 
         writes, written_views = [], set()
         for value in _list(case.get("expected_writebacks"), f"{where}.expected_writebacks"):

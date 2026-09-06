@@ -206,4 +206,12 @@ published three-way suites.
 [suite-v6.json](suite-v6.json) switches between different binding numbers,
 access modes and slot orders over the fixed resource pool. See
 [PIPELINE-LAYOUTS.md](PIPELINE-LAYOUTS.md) for the exact layouts and local
-results. This new native v6 coverage is pending its own cloud run.
+results. Native v6 passed [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385).
+
+## Resource subsets
+
+[suite-v7.json](suite-v7.json) varies the resources and their count between
+passes. Later passes first use additional buffers; the whole trace resource
+union is still uploaded before any execution. See
+[RESOURCE-SUBSETS.md](RESOURCE-SUBSETS.md) for the 2/4/8-pass cases, bounds and
+validation status. Native v7 GPU execution requires a new cloud run.

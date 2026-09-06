@@ -461,7 +461,7 @@ fn execute(
         };
         encoder.set_compute_pipeline_state(&resources.pipelines[pass_index]);
         for view in &pass.buffers {
-            // serial_resources validated that each pass permutes this pool.
+            // serial_resources validated that each pass binds a subset of this pool.
             let buffer = &resources.buffers[pool_positions[&view.view_id]];
             encoder.set_buffer(u64::from(view.metal_binding), Some(buffer), 0);
         }

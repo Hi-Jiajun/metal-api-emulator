@@ -75,8 +75,17 @@ python3 conformance/compare.py --suite conformance/suite-v6.json \
   typecheck/Clippy passed. Swift and native v6 GPU execution remain pending a
   new cloud run; prior v1-v5 successes cannot prove this new layout coverage.
 
-Both programs still bind three buffers of the same initialized pool. Unused or
+In this v6 suite, both programs bind three buffers of the same initialized pool. Unused or
 new pool resources, varying resource counts, aliasing, async behavior, general
 shader support and production reims/guest/render/display paths are not tested
 here. Swift captures full GPU buffers; Rust providers expose host writeback
 landing, as in the earlier suites.
+
+## Subsequent verification
+
+Commit `66c1106` passed [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385):
+Swift Metal, Rust NativeMetalProvider and Vulkan captures agree for v1-v6.
+The native device was Apple Paravirtual on the hosted macOS runner; this is an
+independent Metal execution path, not bare-metal coverage.
+The subsequent [v7 extension](RESOURCE-SUBSETS.md) changes per-pass resource
+counts and supports later first use.

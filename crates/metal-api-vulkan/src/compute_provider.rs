@@ -6,8 +6,8 @@ use crate::{
 };
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    allocate_device_epoch, BufferSource, BufferWriteback, CompletionDisposition, CompletionToken,
-    ComputeProvider, ComputeTrace, DeviceEpoch, FieldValue, FunctionIdentity, FunctionSource,
+    allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
+    CompletionToken, ComputeProvider, DeviceEpoch, FieldValue, FunctionIdentity, FunctionSource,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
     ProviderErrorClass, ProviderPhase, ProviderSubmission, Retryability, SemanticDigest,
     ShaderSource, SubmissionId, ValidatedComputeTrace,
@@ -29,7 +29,8 @@ struct RegisteredPipeline {
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
 /// selecting registered pipelines over an initialized view pool, with owned bytes and
-/// host readback. Each pass may permute that pool across the pipeline's bindings. `submit` waits for GPU completion and readback;
+/// host readback. Each pass maps a subset of that pool to its pipeline's bindings.
+/// `submit` waits for GPU completion and readback;
 /// `wait` only observes the recorded terminal result. Tokens and metadata are
 /// process-local, and no-copy leases and asynchronous submission are refused.
 /// Callers can explicitly release registered pipelines and completion records.
@@ -307,11 +308,11 @@ impl ComputeProvider for VulkanComputeProvider {
                 .buffers
                 .iter()
                 .map(|view| {
-                    let resource = pool
+                    let position = pool
                         .iter()
-                        .find(|resource| resource.view_id == view.view_id)
+                        .position(|resource| resource.view_id == view.view_id)
                         .expect("validated resource pool");
-                    (view.metal_binding, resource.metal_binding)
+                    (view.metal_binding, position as u32)
                 })
                 .collect();
             dispatches.push(BoundDispatch {
@@ -322,7 +323,8 @@ impl ComputeProvider for VulkanComputeProvider {
         }
         let buffers = pool
             .iter()
-            .map(|resource| {
+            .enumerate()
+            .map(|(position, resource)| {
                 let BufferSource::OwnedBytes(bytes) = &resource.source else {
                     return Err(refusal(
                         ProviderPhase::Resolve,
@@ -331,7 +333,9 @@ impl ComputeProvider for VulkanComputeProvider {
                     ));
                 };
                 Ok(BufferBinding {
-                    index: resource.metal_binding,
+                    // The validated pool has at most 64 resources. First-use
+                    // Metal binding labels may repeat across different passes.
+                    index: position as u32,
                     bytes: bytes.clone(),
                 })
             })
@@ -360,7 +364,7 @@ impl ComputeProvider for VulkanComputeProvider {
         };
         let result = result
             .and_then(|updates| {
-                let writebacks = map_writebacks(trace, updates, token)?;
+                let writebacks = map_writebacks(&pool, updates, token)?;
                 let output = ProviderSubmission {
                     completion: CompletionDisposition::CompletedVisible { token },
                     writebacks,
@@ -483,16 +487,15 @@ fn narrow_dimensions(wide: [u64; 3]) -> Result<Size, ProviderError> {
 }
 
 fn map_writebacks(
-    trace: &ComputeTrace,
+    pool: &[BufferView],
     updates: Vec<BufferUpdate>,
     token: CompletionToken,
 ) -> Result<Vec<BufferWriteback>, ProviderError> {
     let mut writebacks = Vec::with_capacity(updates.len());
     for update in updates {
-        let view = trace.passes[0]
-            .buffers
-            .iter()
-            .find(|v| v.metal_binding == update.index)
+        let view = usize::try_from(update.index)
+            .ok()
+            .and_then(|position| pool.get(position))
             .ok_or_else(|| output_error(token, "writeback_unknown_binding"))?;
         let offset = view
             .offset
@@ -563,6 +566,63 @@ fn unknown_completion(token: CompletionToken) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal_api_core::provider::{AllocationId, BufferAccess, ViewId};
+
+    #[test]
+    fn writebacks_use_pool_identity_when_later_resources_repeat_binding_labels() {
+        let token = CompletionToken {
+            device_epoch: DeviceEpoch::new(1),
+            submission_id: SubmissionId::new(2),
+        };
+        let pool: Vec<_> = [(330, 430, 20), (340, 440, 48)]
+            .into_iter()
+            .map(|(allocation, view, offset)| BufferView {
+                view_id: ViewId::new(view),
+                metal_binding: 9,
+                allocation_id: AllocationId::new(allocation),
+                offset,
+                length: 4,
+                access: BufferAccess::Write,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0; 4]),
+            })
+            .collect();
+        let updates = vec![
+            BufferUpdate {
+                index: 1,
+                offset: 0,
+                bytes: vec![2; 4],
+            },
+            BufferUpdate {
+                index: 0,
+                offset: 0,
+                bytes: vec![1; 4],
+            },
+        ];
+        let writes = map_writebacks(&pool, updates, token).unwrap();
+        assert_eq!(writes[0].view_id, ViewId::new(430));
+        assert_eq!(writes[0].allocation_id, AllocationId::new(330));
+        assert_eq!(writes[0].offset, 20);
+        assert_eq!(writes[0].bytes, vec![1; 4]);
+        assert_eq!(writes[1].view_id, ViewId::new(440));
+        assert_eq!(writes[1].allocation_id, AllocationId::new(340));
+        assert_eq!(writes[1].offset, 48);
+        assert_eq!(writes[1].bytes, vec![2; 4]);
+        assert_eq!(
+            map_writebacks(
+                &pool,
+                vec![BufferUpdate {
+                    index: 9,
+                    offset: 0,
+                    bytes: vec![3; 4]
+                }],
+                token
+            )
+            .unwrap_err()
+            .slug,
+            "writeback_unknown_binding"
+        );
+    }
 
     #[test]
     fn identity_exhaustion_never_wraps_or_reuses_a_value() {

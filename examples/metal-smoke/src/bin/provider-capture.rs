@@ -3,9 +3,9 @@
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
-    Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId, PipelineCompileRequest,
-    PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId,
+    PipelineCompileRequest, PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource,
+    ViewId, PROVIDER_SCHEMA_VERSION,
 };
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
@@ -260,6 +260,9 @@ fn main() -> Result<()> {
                 return Err("remap scalar bias reach mismatch".into());
             }
         }
+        if backend == Backend::Vulkan && entry == "copy_3d" {
+            verify_copy_contract(&pipeline)?;
+        }
         eprintln!("{} artifact registered: entry={entry}", backend.name());
         pipelines.insert(entry, pipeline);
     }
@@ -368,6 +371,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "layout_chain_two",
             "layout_chain_three",
             "layout_chain_eight",
+        ],
+        (1, "compute-buffer-v7") => &[
+            "subset_chain_two",
+            "subset_chain_four",
+            "subset_chain_eight",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -486,6 +494,12 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/remap_3d.metal",
             "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76",
         ),
+        "copy_3d" => (
+            "shaders/copy_3d.ll",
+            "9f379575b8f9ed45e62df27c24761d0030e257f45c6241c649b5caae73cbe9cb",
+            "shaders/copy_3d.metal",
+            "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f",
+        ),
         _ => return Err("unknown shader entry".into()),
     };
     if program.air.path != air_path
@@ -500,7 +514,26 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
 fn validate_case_programs(case: &Case) -> Result<()> {
     let programs = case_programs(case);
     let layout_change = case.id.starts_with("layout_chain_");
-    if case.id.starts_with("pipeline_chain_") || layout_change {
+    let subsets = case.id.starts_with("subset_chain_");
+    if subsets {
+        let expected: &[&str] = if case.id == "subset_chain_two" {
+            &["transform_3d", "copy_3d"]
+        } else {
+            &["transform_3d", "copy_3d", "remap_3d"]
+        };
+        if case.programs.is_none()
+            || programs
+                .iter()
+                .map(|program| program.entry.as_str())
+                .collect::<Vec<_>>()
+                != expected
+            || programs[0].entry != case.entry
+            || programs[0].air != case.air
+            || programs[0].metal != case.metal
+        {
+            return Err("unreviewed subset program table".into());
+        }
+    } else if case.id.starts_with("pipeline_chain_") || layout_change {
         if case.programs.is_none()
             || programs.len() != 2
             || programs[0].entry != "transform_3d"
@@ -516,9 +549,11 @@ fn validate_case_programs(case: &Case) -> Result<()> {
     }
     for (index, program) in programs.iter().enumerate() {
         validate_program(program)?;
-        if layout_change {
+        if layout_change || subsets {
             let expected = if index == 0 {
                 vec![(0, "read_write", 120), (2, "read", 4), (5, "write", 120)]
+            } else if subsets && index == 1 {
+                vec![(4, "read", 120), (9, "write", 120)]
             } else {
                 vec![(1, "read", 4), (3, "read", 120), (7, "write", 120)]
             };
@@ -590,6 +625,29 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         | "layout_chain_three"
         | "layout_chain_eight" => transform([4, 2, 2]),
         "transform_small_grid" => transform([8, 4, 4]),
+        "subset_chain_two" => (
+            "transform_3d",
+            [5, 3, 2],
+            [4, 2, 2],
+            &[
+                (0, "read_write", 120),
+                (2, "read", 4),
+                (5, "write", 120),
+                (8, "write", 120),
+            ],
+        ),
+        "subset_chain_four" | "subset_chain_eight" => (
+            "transform_3d",
+            [5, 3, 2],
+            [4, 2, 2],
+            &[
+                (0, "read_write", 120),
+                (2, "read", 4),
+                (5, "write", 120),
+                (8, "write", 120),
+                (9, "write", 120),
+            ],
+        ),
         _ => return Err("unknown case identity".into()),
     })
 }
@@ -600,7 +658,9 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         | "transform_pingpong_two"
         | "copy_pingpong"
         | "pipeline_chain_two"
-        | "layout_chain_two" => 2,
+        | "layout_chain_two"
+        | "subset_chain_two" => 2,
+        "subset_chain_four" => 4,
         "transform_three_times"
         | "transform_pingpong_three"
         | "pipeline_chain_three"
@@ -608,7 +668,8 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         "transform_eight_times"
         | "transform_pingpong_eight"
         | "pipeline_chain_eight"
-        | "layout_chain_eight" => 8,
+        | "layout_chain_eight"
+        | "subset_chain_eight" => 8,
         _ => {
             if case.dispatches.is_some() {
                 return Err("single-pass fixture cannot carry a sequence".into());
@@ -625,10 +686,16 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
     }
     let locals = [[4, 2, 2], [8, 4, 4], [1, 1, 1]];
     let layout_change = case.id.starts_with("layout_chain_");
+    let subsets = case.id.starts_with("subset_chain_");
     let mixed = case.id.starts_with("pipeline_chain_") || layout_change;
     let pingpong = case.id.contains("pingpong") || mixed;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.program != mixed.then_some(i % 2) {
+        let program = if subsets {
+            Some([0, 1, 2, 1][i % 4])
+        } else {
+            mixed.then_some(i % 2)
+        };
+        if dispatch.program != program {
             return Err("unreviewed program selection".into());
         }
         let (grid, local) = if case.id == "copy_pingpong" {
@@ -639,19 +706,38 @@ fn validate_case_dispatches(case: &Case) -> Result<()> {
         if dispatch.grid != grid || dispatch.local != local {
             return Err("unreviewed sequence dispatch shape".into());
         }
-        if pingpong {
-            let mut expected: Vec<_> = case.buffers.iter().map(|buffer| buffer.view).collect();
-            let last = if case.id == "copy_pingpong" { 1 } else { 2 };
-            if expected.len() <= last {
-                return Err("missing pingpong resource".into());
-            }
-            if i % 2 == 1 {
-                if layout_change {
-                    expected.rotate_left(1);
-                } else {
-                    expected.swap(0, last);
+        if pingpong || subsets {
+            let expected = if subsets {
+                let indices: &[usize] = match i % 4 {
+                    0 => &[0, 1, 2],
+                    1 => &[2, 3],
+                    2 => &[1, 3, 0],
+                    _ => &[0, 4],
+                };
+                indices
+                    .iter()
+                    .map(|&index| {
+                        case.buffers
+                            .get(index)
+                            .map(|b| b.view)
+                            .ok_or("missing subset resource")
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                let mut expected: Vec<_> = case.buffers.iter().map(|buffer| buffer.view).collect();
+                let last = if case.id == "copy_pingpong" { 1 } else { 2 };
+                if expected.len() <= last {
+                    return Err("missing pingpong resource".into());
                 }
-            }
+                if i % 2 == 1 {
+                    if layout_change {
+                        expected.rotate_left(1);
+                    } else {
+                        expected.swap(0, last);
+                    }
+                }
+                expected
+            };
             if dispatch.bindings.as_ref() != Some(&expected) {
                 return Err("unreviewed pingpong binding map".into());
             }
@@ -739,6 +825,22 @@ fn verify_transform_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
     Ok(())
 }
 
+fn verify_copy_contract(pipeline: &CompiledComputePipeline) -> Result<()> {
+    let bindings = &pipeline.contract.buffer_bindings;
+    if bindings
+        .iter()
+        .map(|binding| (binding.metal_binding, binding.access))
+        .collect::<Vec<_>>()
+        != [(4, BufferAccess::Read), (9, BufferAccess::Write)]
+    {
+        return Err("copy sparse layout/access reflection mismatch".into());
+    }
+    for binding in bindings {
+        verify_xyz_access(&binding.footprint)?;
+    }
+    Ok(())
+}
+
 fn verify_xyz_access(footprint: &FootprintProof) -> Result<()> {
     let FootprintProof::Affine { accesses } = footprint else {
         return Err("3D fixture must carry an affine footprint".into());
@@ -763,6 +865,85 @@ fn verify_xyz_access(footprint: &FootprintProof) -> Result<()> {
     Ok(())
 }
 
+fn case_trace(
+    device_epoch: DeviceEpoch,
+    programs: &[CompiledComputePipeline],
+    case: &Case,
+    operation: u64,
+    views: &[BufferView],
+) -> Result<ComputeTrace> {
+    Ok(ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch,
+        operation_id: OperationId::new(operation),
+        pipelines: programs.to_vec(),
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: case
+            .dispatches
+            .clone()
+            .unwrap_or_else(|| {
+                vec![CaseDispatch {
+                    grid: case.grid,
+                    local: case.local,
+                    bindings: None,
+                    program: None,
+                }]
+            })
+            .into_iter()
+            .map(|dispatch| -> Result<ComputePass> {
+                let selected = &programs[dispatch.program.unwrap_or(0)];
+                let expected = selected_slots(case, &dispatch);
+                if selected.contract.buffer_bindings.len() != expected.len()
+                    || selected.contract.buffer_bindings.iter().zip(&expected).any(
+                        |(actual, expected)| {
+                            actual.metal_binding != expected.binding
+                                || expected.access
+                                    != match actual.access {
+                                        BufferAccess::Read => "read",
+                                        BufferAccess::Write => "write",
+                                        BufferAccess::ReadWrite => "read_write",
+                                        BufferAccess::Unused => "unused",
+                                    }
+                        },
+                    )
+                {
+                    return Err("source/fixture selected layout mismatch".into());
+                }
+                let buffers = selected
+                    .contract
+                    .buffer_bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slot)| {
+                        let view_id = dispatch
+                            .bindings
+                            .as_ref()
+                            .map_or(views[index].view_id.get(), |map| map[index]);
+                        let mut resource = views
+                            .iter()
+                            .find(|view| view.view_id.get() == view_id)
+                            .expect("validated binding map")
+                            .clone();
+                        resource.metal_binding = slot.metal_binding;
+                        resource.access = slot.access;
+                        resource
+                    })
+                    .collect();
+                Ok(ComputePass {
+                    pipeline: selected.pipeline_id,
+                    buffers,
+                    dispatch: Dispatch {
+                        kind: DispatchKind::ThreadsExact,
+                        grid: dispatch.grid,
+                        threads_per_threadgroup: dispatch.local,
+                    },
+                })
+            })
+            .collect::<Result<_>>()?,
+        completion_policy: CompletionPolicy::HostReadback,
+    })
+}
+
 fn run_case(
     provider: &dyn PipelineProvider,
     programs: &[CompiledComputePipeline],
@@ -770,7 +951,6 @@ fn run_case(
     operation: u64,
     guard: u8,
 ) -> Result<CaseResult> {
-    let pipeline = &programs[0];
     let mut resources = ResourceTableSnapshot::new();
     let mut views = Vec::new();
     let mut allocations = Vec::new();
@@ -781,15 +961,6 @@ fn run_case(
             "read_write" => BufferAccess::ReadWrite,
             _ => return Err("unsupported access".into()),
         };
-        let reflected = pipeline
-            .contract
-            .buffer_bindings
-            .iter()
-            .find(|b| b.metal_binding == buffer.binding)
-            .ok_or("source reflection omitted fixture buffer")?;
-        if reflected.access != access {
-            return Err("source/fixture access mismatch".into());
-        }
         let initial = unhex(&buffer.initial_hex)?;
         let mut backing = vec![guard; usize::try_from(buffer.allocation_size)?];
         let start = usize::try_from(buffer.offset)?;
@@ -811,71 +982,20 @@ fn run_case(
             source: BufferSource::OwnedBytes(initial),
         });
     }
-    let trace = ComputeTrace {
-        schema_version: PROVIDER_SCHEMA_VERSION,
-        device_epoch: provider.device_epoch(),
-        operation_id: OperationId::new(operation),
-        pipelines: programs.to_vec(),
-        encoder_dispatch_type: DispatchType::Serial,
-        passes: case
-            .dispatches
-            .clone()
-            .unwrap_or_else(|| {
-                vec![CaseDispatch {
-                    grid: case.grid,
-                    local: case.local,
-                    bindings: None,
-                    program: None,
-                }]
-            })
-            .into_iter()
-            .map(|dispatch| {
-                let selected = &programs[dispatch.program.unwrap_or(0)];
-                let buffers = selected
-                    .contract
-                    .buffer_bindings
-                    .iter()
-                    .enumerate()
-                    .map(|(index, slot)| {
-                        let view_id = dispatch
-                            .bindings
-                            .as_ref()
-                            .map_or(views[index].view_id.get(), |map| map[index]);
-                        let mut resource = views
-                            .iter()
-                            .find(|view| view.view_id.get() == view_id)
-                            .expect("validated binding map")
-                            .clone();
-                        resource.metal_binding = slot.metal_binding;
-                        resource.access = slot.access;
-                        resource
-                    })
-                    .collect();
-                ComputePass {
-                    pipeline: selected.pipeline_id,
-                    buffers,
-                    dispatch: Dispatch {
-                        kind: DispatchKind::ThreadsExact,
-                        grid: dispatch.grid,
-                        threads_per_threadgroup: dispatch.local,
-                    },
-                }
-            })
-            .collect(),
-        completion_policy: CompletionPolicy::HostReadback,
-    };
+    let trace = case_trace(provider.device_epoch(), programs, case, operation, &views)?;
     if case.entry == "transform_3d" {
         let mut short = trace.clone();
         let shortened = short.passes[0].buffers[0].view_id;
         for pass in &mut short.passes {
-            let view = pass
+            if let Some(view) = pass
                 .buffers
                 .iter_mut()
                 .find(|view| view.view_id == shortened)
-                .unwrap();
-            view.length = 119;
-            if let BufferSource::OwnedBytes(bytes) = &mut view.source {
-                bytes.truncate(119);
+            {
+                view.length = 119;
+                if let BufferSource::OwnedBytes(bytes) = &mut view.source {
+                    bytes.truncate(119);
+                }
             }
         }
         let rejected = provider.capabilities().admit(&short, &resources);
@@ -1215,5 +1335,237 @@ mod tests {
         let mut s = load();
         s.cases[0].dispatches.as_mut().unwrap()[1].bindings = Some(vec![400, 420, 410]);
         assert!(validate_suite(&s).is_err());
+    }
+
+    fn subset_suite() -> Suite {
+        serde_json::from_str(include_str!("../../../../conformance/suite-v7.json")).unwrap()
+    }
+
+    #[test]
+    fn subset_suite_requires_reviewed_pool_sizes_and_dispatch_sequences() {
+        let suite = subset_suite();
+        validate_suite(&suite).unwrap();
+        assert_eq!(
+            suite
+                .cases
+                .iter()
+                .map(|case| case.buffers.len())
+                .collect::<Vec<_>>(),
+            [4, 5, 5]
+        );
+        for (case_index, dispatch_index, mappings) in [
+            (0, 1, vec![400, 410]),
+            (1, 3, vec![410, 430]),
+            (2, 4, vec![400, 420, 410]),
+            (0, 1, vec![400, 430, 410]),
+        ] {
+            let mut invalid = subset_suite();
+            invalid.cases[case_index].dispatches.as_mut().unwrap()[dispatch_index].bindings =
+                Some(mappings);
+            assert!(validate_suite(&invalid).is_err());
+        }
+        for program in [None, Some(0), Some(2), Some(usize::MAX)] {
+            let mut invalid = subset_suite();
+            invalid.cases[0].dispatches.as_mut().unwrap()[1].program = program;
+            assert!(validate_suite(&invalid).is_err());
+        }
+        let mut invalid = subset_suite();
+        invalid.cases[0].buffers.pop();
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[1].dispatches.as_mut().unwrap().pop();
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[2].dispatches.as_mut().unwrap()[7].local = [1, 1, 1];
+        assert!(validate_suite(&invalid).is_err());
+    }
+
+    #[test]
+    fn subset_programs_require_exact_sources_and_selected_slot_layouts() {
+        let suite = subset_suite();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance");
+        for case in &suite.cases {
+            for program in case_programs(case) {
+                verified_source(&directory, &program.air).unwrap();
+                verified_source(&directory, &program.metal).unwrap();
+            }
+        }
+        let mut invalid = subset_suite();
+        invalid.cases[0].programs.as_mut().unwrap()[1].metal.sha256 = "0".repeat(64);
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[0].programs.as_mut().unwrap()[1]
+            .buffer_slots
+            .as_mut()
+            .unwrap()[0]
+            .binding = 8;
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[0].programs.as_mut().unwrap()[1]
+            .buffer_slots
+            .as_mut()
+            .unwrap()[0]
+            .access = "read_write".into();
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[1].programs.as_mut().unwrap().pop();
+        assert!(validate_suite(&invalid).is_err());
+        let mut invalid = subset_suite();
+        invalid.cases[0].buffers[3].length = 4;
+        assert!(validate_suite(&invalid).is_err());
+    }
+
+    #[test]
+    fn subset_expected_results_cover_late_and_temporarily_unbound_writes() {
+        let suite = subset_suite();
+        assert_eq!(
+            ever_writable(&suite.cases[0]),
+            BTreeSet::from([400, 410, 430])
+        );
+        assert_eq!(
+            ever_writable(&suite.cases[1]),
+            BTreeSet::from([400, 410, 430, 440])
+        );
+        for view in [400, 410, 430, 440] {
+            let mut invalid = subset_suite();
+            invalid.cases[1]
+                .expected_writebacks
+                .retain(|write| write.view != view);
+            assert!(validate_suite(&invalid).is_err());
+        }
+    }
+
+    fn fixture_pipelines(case: &Case) -> Vec<CompiledComputePipeline> {
+        use metal_api_core::provider::{
+            BufferBindingContract, FunctionIdentity, FunctionSource, PipelineContract, PipelineId,
+        };
+        case_programs(case)
+            .into_iter()
+            .enumerate()
+            .map(|(index, program)| CompiledComputePipeline {
+                device_epoch: DeviceEpoch::new(1),
+                pipeline_id: PipelineId::new(index as u64 + 1),
+                function: FunctionIdentity {
+                    logical_digest: SemanticDigest::new("test", vec![1]).unwrap(),
+                    entry_name: program.entry,
+                    source: FunctionSource::MetalSource,
+                },
+                contract: PipelineContract {
+                    dispatch_kind: DispatchKind::ThreadsExact,
+                    required_local_size: None,
+                    fixed_grid: Some(case.grid),
+                    push_constant_offset: 0,
+                    push_constant_bytes: 0,
+                    buffer_bindings: program
+                        .buffer_slots
+                        .unwrap()
+                        .into_iter()
+                        .map(|slot| BufferBindingContract {
+                            metal_binding: slot.binding,
+                            access: match slot.access.as_str() {
+                                "read" => BufferAccess::Read,
+                                "write" => BufferAccess::Write,
+                                "read_write" => BufferAccess::ReadWrite,
+                                _ => unreachable!(),
+                            },
+                            footprint: FootprintProof::Static {
+                                max_bytes: slot.length,
+                            },
+                        })
+                        .collect(),
+                    shader_capabilities: Vec::new(),
+                    translator_revision: None,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subset_trace_retains_all_initial_resources_and_binds_only_selected_views() {
+        let suite = subset_suite();
+        validate_suite(&suite).unwrap();
+        for case in &suite.cases {
+            let mut programs = fixture_pipelines(case);
+            let views = case
+                .buffers
+                .iter()
+                .map(|buffer| BufferView {
+                    view_id: ViewId::new(buffer.view),
+                    allocation_id: AllocationId::new(buffer.allocation),
+                    metal_binding: buffer.binding,
+                    offset: buffer.offset,
+                    length: buffer.length,
+                    access: BufferAccess::Unused,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(unhex(&buffer.initial_hex).unwrap()),
+                })
+                .collect::<Vec<_>>();
+            let trace = case_trace(DeviceEpoch::new(1), &programs, case, 1, &views).unwrap();
+            let resources = trace.serial_resources().unwrap();
+            assert_eq!(resources.len(), case.buffers.len());
+            assert_eq!(trace.passes[0].buffers.len(), 3);
+            assert_eq!(trace.passes[1].buffers.len(), 2);
+            assert_eq!(
+                trace.passes[1]
+                    .buffers
+                    .iter()
+                    .map(|view| (view.metal_binding, view.view_id.get()))
+                    .collect::<Vec<_>>(),
+                [(4, 400), (9, 430)]
+            );
+            assert!(!trace.passes[1]
+                .buffers
+                .iter()
+                .any(|view| view.view_id.get() == 410));
+            for (initial, collected) in views.iter().zip(&resources) {
+                assert_eq!(initial.view_id, collected.view_id);
+                assert_eq!(initial.source, collected.source);
+                assert_eq!(initial.offset, collected.offset);
+            }
+            assert_eq!(
+                resources
+                    .iter()
+                    .filter(|view| view.access.is_writable())
+                    .map(|view| view.view_id.get())
+                    .collect::<BTreeSet<_>>(),
+                ever_writable(case)
+            );
+            programs[1].contract.buffer_bindings[0].access = BufferAccess::ReadWrite;
+            assert!(case_trace(DeviceEpoch::new(1), &programs, case, 1, &views).is_err());
+        }
+    }
+
+    #[test]
+    fn copy_contract_checks_both_sparse_accesses_and_xyz_reach() {
+        use metal_api_core::provider::{AffineAccess, AffineTerm};
+        let mut pipeline = fixture_pipelines(&subset_suite().cases[0]).remove(1);
+        for binding in &mut pipeline.contract.buffer_bindings {
+            binding.footprint = FootprintProof::Affine {
+                accesses: vec![AffineAccess {
+                    base_offset: 0,
+                    access_size: 4,
+                    terms: vec![
+                        AffineTerm { axis: 0, stride: 4 },
+                        AffineTerm {
+                            axis: 1,
+                            stride: 20,
+                        },
+                        AffineTerm {
+                            axis: 2,
+                            stride: 60,
+                        },
+                    ],
+                }],
+            };
+        }
+        verify_copy_contract(&pipeline).unwrap();
+        for index in 0..2 {
+            let mut invalid = pipeline.clone();
+            invalid.contract.buffer_bindings[index].footprint =
+                FootprintProof::Static { max_bytes: 120 };
+            assert!(verify_copy_contract(&invalid).is_err());
+        }
+        pipeline.contract.buffer_bindings[0].metal_binding = 0;
+        assert!(verify_copy_contract(&pipeline).is_err());
     }
 }

@@ -100,18 +100,20 @@ this experimental repository. Existing capture/smoke callers were updated.
 
 ## Follow-up: bounded serial passes
 
-The current providers extend this single-pass checkpoint to at most eight
-serial dispatches on the same pipeline/buffer table, uploaded once and read
-back once. Only per-pass grid/local dimensions vary. See
-[the serial-pass contract](../conformance/SERIAL-PASSES.md). General rebinding,
-mixed pipelines and asynchronous command buffers remain unimplemented.
+The [serial-pass contract](../conformance/SERIAL-PASSES.md) introduced up to
+eight serial dispatches, uploaded once and read back once. Subsequent
+[rebinding](../conformance/BUFFER-REBINDING.md),
+[mixed-pipeline](../conformance/MIXED-PIPELINES.md) and
+[per-program layout](../conformance/PIPELINE-LAYOUTS.md) extensions added view
+permutations and per-pass pipeline selection. The Rust trace envelope uses
+schema 2 with an explicit pipeline table; every pass resolves its own contract
+and registry entry. V1-v6 passed
+[three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385).
 
-The subsequent [rebinding increment](../conformance/BUFFER-REBINDING.md) allows
-per-pass permutations of the same initialized views. New views, altered source
-bytes, ranges and mixed pipelines remain refused. Native v4 verification is
-pending independently from earlier serial-pass results.
-
-The [mixed-pipeline extension](../conformance/MIXED-PIPELINES.md) changes the
-Rust trace envelope to schema 2 with an explicit pipeline table; every pass
-resolves its own contract and registry entry. Existing-view pool rules remain.
-This new v5 increment still awaits native cloud validation.
+The [resource-subset extension](../conformance/RESOURCE-SUBSETS.md) admits up to
+64 unique views across the trace. Each pass binds the views needed by its
+selected pipeline. Later first use is supported; repeated view identities
+retain their original allocation, range and initial bytes. The complete union
+is validated and uploaded before encoding. Readback covers every view written
+by any pass. Asynchronous work, mid-execution CPU uploads and general aliasing
+remain outside this provider subset. Native v7 validation is pending.

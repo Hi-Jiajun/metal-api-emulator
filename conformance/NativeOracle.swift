@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v6 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v7 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -297,12 +297,13 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" || suite == "compute-buffer-v7" {
         let expectedCount: Int
         switch definition.id {
-        case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two", "layout_chain_two": expectedCount = 2
+        case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two", "layout_chain_two", "subset_chain_two": expectedCount = 2
         case "transform_three_times", "transform_pingpong_three", "pipeline_chain_three", "layout_chain_three": expectedCount = 3
-        case "transform_eight_times", "transform_pingpong_eight", "pipeline_chain_eight", "layout_chain_eight": expectedCount = 8
+        case "subset_chain_four": expectedCount = 4
+        case "transform_eight_times", "transform_pingpong_eight", "pipeline_chain_eight", "layout_chain_eight", "subset_chain_eight": expectedCount = 8
         default: throw OracleError("Unsupported serial case: \(definition.id)")
         }
         guard let sequence = definition.dispatches else {
@@ -313,7 +314,17 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let localSizes: [[UInt64]] = [[4, 2, 2], [8, 4, 4], [1, 1, 1]]
         let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
             var mapping: [UInt64]? = nil
-            if suite == "compute-buffer-v6" {
+            var program: Int? = (suite == "compute-buffer-v5" || suite == "compute-buffer-v6") ? index % 2 : nil
+            if suite == "compute-buffer-v7" {
+                let views = definition.buffers.map { $0.view }
+                try require(views.count == (expectedCount == 2 ? 4 : 5), "Missing subset-chain resources")
+                switch index % 4 {
+                case 0: mapping = [views[0], views[1], views[2]]; program = 0
+                case 1: mapping = [views[2], views[3]]; program = 1
+                case 2: mapping = [views[1], views[3], views[0]]; program = 2
+                default: mapping = [views[0], views[4]]; program = 1
+                }
+            } else if suite == "compute-buffer-v6" {
                 let views = definition.buffers.map { $0.view }
                 try require(views.count == 3, "Missing layout-chain resources")
                 mapping = index % 2 == 0 ? views : [views[1], views[2], views[0]]
@@ -326,7 +337,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
             }
             let grid: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : [5, 3, 2]
             let local: [UInt64] = definition.id == "copy_pingpong" ? [1, 1, 1] : localSizes[index % localSizes.count]
-            return DispatchDefinition(grid: grid, local: local, bindings: mapping, program: (suite == "compute-buffer-v5" || suite == "compute-buffer-v6") ? index % 2 : nil)
+            return DispatchDefinition(grid: grid, local: local, bindings: mapping, program: program)
         }
         try require(sequence == expected, "\(definition.id): unsupported serial dispatch sequence")
         try require(sequence[0].grid == definition.grid && sequence[0].local == definition.local,
@@ -375,15 +386,29 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
                     && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 5 && $0.access == "write" && $0.length == 120 },
                     "\(definition.id): expected 120-byte read/write at 0, 4-byte read at 2, and 120-byte write at 5")
+    case "subset_chain_two", "subset_chain_four", "subset_chain_eight":
+        try require(suite == "compute-buffer-v7" && definition.entry == "transform_3d"
+                    && definition.grid == [5, 3, 2] && definition.local == [4, 2, 2],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        let expectedLabels: [UInt64] = definition.id == "subset_chain_two" ? [0, 2, 5, 8] : [0, 2, 5, 8, 9]
+        try require(definition.buffers.map { $0.binding } == expectedLabels,
+                    "\(definition.id): unsupported resource pool labels")
+        for (index, resource) in definition.buffers.enumerated() {
+            let access = index == 0 ? "read_write" : index == 1 ? "read" : "write"
+            let length: UInt64 = index == 1 ? 4 : 120
+            try require(resource.access == access && resource.length == length,
+                        "\(definition.id): unsupported resource pool shape")
+        }
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
     return dispatches
 }
 
-// Legacy fixtures use their original interface; v6 chooses an independently
+// Legacy fixtures use their original interface; v6/v7 choose an independently
 // reviewed interface for each selected program. Resource pool order is not a
-// shader interface when programs use different slots and access modes.
+// shader interface when programs use different slots and access modes, or
+// bind only a subset of the declared resources.
 private func bufferSlots(_ definition: CaseDefinition, program: Int) -> [BufferSlotDefinition] {
     definition.programs?[program].buffer_slots ?? definition.buffers.map {
         BufferSlotDefinition(binding: $0.binding, access: $0.access, length: $0.length)
@@ -475,8 +500,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["pipeline_chain_two", "pipeline_chain_three", "pipeline_chain_eight"]
     case "compute-buffer-v6":
         expectedIDs = ["layout_chain_two", "layout_chain_three", "layout_chain_eight"]
+    case "compute-buffer-v7":
+        expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v6 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v7 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -487,17 +514,22 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         // buffer payload or reading shader files from the supplied manifest.
         let programs = try validatePrograms(definition, suite: suite.suite)
         let dispatches = try validateShape(definition, suite: suite.suite)
+        var usedViews = Set<UInt64>()
         for dispatch in dispatches {
+            try require(programs.indices.contains(dispatch.program ?? 0), "Unknown selected program")
             let slots = bufferSlots(definition, program: dispatch.program ?? 0)
             let views = dispatch.bindings ?? definition.buffers.map { $0.view }
             try require(views.count == slots.count, "Program binding count mismatch")
+            try require(Set(views).count == views.count, "Duplicate resource within one pass")
             for (slot, view) in zip(slots, views) {
                 guard let resource = definition.buffers.first(where: { $0.view == view }) else {
                     throw OracleError("Unknown bound resource")
                 }
                 try require(resource.length == slot.length, "Program binding length mismatch")
+                usedViews.insert(view)
             }
         }
+        try require(usedViews == Set(definition.buffers.map { $0.view }), "Unused declared resource")
         let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
         let loaded = try programs.map { program in
             (definition: program, source: try loadProgram(program, root: root))
@@ -549,6 +581,13 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
         slots = [BufferSlotDefinition(binding: 1, access: "read", length: 4),
                  BufferSlotDefinition(binding: 3, access: "read", length: 120),
                  BufferSlotDefinition(binding: 7, access: "write", length: 120)]
+    case "copy_3d":
+        air = SourceDefinition(path: "shaders/copy_3d.ll",
+            sha256: "9f379575b8f9ed45e62df27c24761d0030e257f45c6241c649b5caae73cbe9cb")
+        metal = SourceDefinition(path: "shaders/copy_3d.metal",
+            sha256: "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f")
+        slots = [BufferSlotDefinition(binding: 4, access: "read", length: 120),
+                 BufferSlotDefinition(binding: 9, access: "write", length: 120)]
     default:
         throw OracleError("Unsupported entry: \(entry)")
     }
@@ -558,6 +597,17 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
 private func validatePrograms(_ definition: CaseDefinition, suite: String) throws -> [ProgramDefinition] {
     let primary = ProgramDefinition(entry: definition.entry, air: definition.air,
                                     metal: definition.metal, buffer_slots: nil)
+    if suite == "compute-buffer-v7" {
+        guard let supplied = definition.programs else { throw OracleError("Program table required") }
+        var expected = try [reviewedProgram("transform_3d", explicitSlots: true),
+                            reviewedProgram("copy_3d", explicitSlots: true)]
+        if definition.id != "subset_chain_two" {
+            expected.append(try reviewedProgram("remap_3d", explicitSlots: true))
+        }
+        try require(primary == (try reviewedProgram("transform_3d")) && supplied == expected,
+                    "Unreviewed subset program table or buffer layout")
+        return supplied
+    }
     if suite == "compute-buffer-v5" || suite == "compute-buffer-v6" {
         guard let supplied = definition.programs else { throw OracleError("Program table required") }
         let layouts = suite == "compute-buffer-v6"
