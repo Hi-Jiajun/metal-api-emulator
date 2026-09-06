@@ -52,6 +52,19 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/vulkan-captures/vulkan-capture-v6.json
           python3 conformance/compare.py --suite conformance/suite-v7.json --check /tmp/vulkan-captures/vulkan-capture-v7.json
 
+      - name: Capture Vulkan through shared object API
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          for version in 1 2 3 4 5 6 7; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
+          done
+
       - name: Preserve Vulkan report
         uses: actions/upload-artifact@v4
         with:
@@ -116,6 +129,15 @@ jobs:
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v7.json --output /tmp/native-evidence/rust-provider-v7.json
           python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/native-evidence/rust-provider-v6.json
           python3 conformance/compare.py --suite conformance/suite-v7.json --check /tmp/native-evidence/rust-provider-v7.json
+      - name: Capture Rust Metal through shared object API
+        if: steps.capture.outputs.capture_status == 'captured'
+        run: |
+          for version in 1 2 3 4 5 6 7; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            target/debug/provider-capture --api objects --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/native-evidence/metal-objects-v${version}.json"
+          done
       - name: Preserve native probe, status and any completed capture
         if: always()
         uses: actions/upload-artifact@v4
@@ -140,10 +162,10 @@ jobs:
           path: /tmp/native-evidence
       - name: Compare observed native and Vulkan results
         run: |
-          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json --metal-provider /tmp/native-evidence/rust-provider-v1.json
-          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json --metal-provider /tmp/native-evidence/rust-provider-v2.json
-          python3 conformance/compare.py --suite conformance/suite-v3.json --native /tmp/native-evidence/v3/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v3.json --metal-provider /tmp/native-evidence/rust-provider-v3.json
-          python3 conformance/compare.py --suite conformance/suite-v4.json --native /tmp/native-evidence/v4/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v4.json --metal-provider /tmp/native-evidence/rust-provider-v4.json
-          python3 conformance/compare.py --suite conformance/suite-v5.json --native /tmp/native-evidence/v5/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v5.json --metal-provider /tmp/native-evidence/rust-provider-v5.json
-          python3 conformance/compare.py --suite conformance/suite-v6.json --native /tmp/native-evidence/v6/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v6.json --metal-provider /tmp/native-evidence/rust-provider-v6.json
-          python3 conformance/compare.py --suite conformance/suite-v7.json --native /tmp/native-evidence/v7/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v7.json --metal-provider /tmp/native-evidence/rust-provider-v7.json
+          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json --metal-provider /tmp/native-evidence/rust-provider-v1.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v1.json --metal-objects /tmp/native-evidence/metal-objects-v1.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json --metal-provider /tmp/native-evidence/rust-provider-v2.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v2.json --metal-objects /tmp/native-evidence/metal-objects-v2.json
+          python3 conformance/compare.py --suite conformance/suite-v3.json --native /tmp/native-evidence/v3/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v3.json --metal-provider /tmp/native-evidence/rust-provider-v3.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v3.json --metal-objects /tmp/native-evidence/metal-objects-v3.json
+          python3 conformance/compare.py --suite conformance/suite-v4.json --native /tmp/native-evidence/v4/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v4.json --metal-provider /tmp/native-evidence/rust-provider-v4.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v4.json --metal-objects /tmp/native-evidence/metal-objects-v4.json
+          python3 conformance/compare.py --suite conformance/suite-v5.json --native /tmp/native-evidence/v5/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v5.json --metal-provider /tmp/native-evidence/rust-provider-v5.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v5.json --metal-objects /tmp/native-evidence/metal-objects-v5.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --native /tmp/native-evidence/v6/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v6.json --metal-provider /tmp/native-evidence/rust-provider-v6.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v6.json --metal-objects /tmp/native-evidence/metal-objects-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v7.json --native /tmp/native-evidence/v7/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v7.json --metal-provider /tmp/native-evidence/rust-provider-v7.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v7.json --metal-objects /tmp/native-evidence/metal-objects-v7.json

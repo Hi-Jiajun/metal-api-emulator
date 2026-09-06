@@ -214,4 +214,15 @@ results. Native v6 passed [three-way CI](https://github.com/Hi-Jiajun/metal-api-
 passes. Later passes first use additional buffers; the whole trace resource
 union is still uploaded before any execution. See
 [RESOURCE-SUBSETS.md](RESOURCE-SUBSETS.md) for the 2/4/8-pass cases, bounds and
-validation status. Native v7 GPU execution requires a new cloud run.
+validation status. Native v7 passed
+[three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+
+## Provider object entry point
+
+`provider-capture --api objects` runs the same v1-v7 fixtures through the new
+shared object API. Its reports identify `vulkan-objects` or
+`native-metal-provider-objects`; both report actual host-buffer landing.
+The direct trace captures remain separate, and the Swift oracle is unchanged.
+Compare all five paths with the additional `--vulkan-objects` and
+`--metal-objects` arguments. See [PROVIDER-OBJECTS.md](../docs/PROVIDER-OBJECTS.md)
+for object lifetimes, result validation and the current verification boundary.

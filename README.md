@@ -28,16 +28,20 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 - Experimental provider: `VulkanComputeProvider` implements `ComputeProvider`
   for up to eight synchronous serial exact-thread passes using an explicit pipeline table
   and up to 64 stable owned views, followed by one host readback.
-  Each pass binds its own resource subset; all resources upload before execution. It registers pipelines, revalidates each trace against its actual
-  device and artifact, and returns checked allocation-relative writebacks.
+  Each pass binds its own resource subset; all resources upload before execution.
+  It registers pipelines, revalidates each trace against its actual device and
+  artifact, and returns checked allocation-relative writebacks.
 - Completion: this provider's `submit` waits for GPU completion and readback;
   `wait` observes the recorded terminal result. A submit timeout is terminal
   unknown completion; resources remain retained and the executor is unusable.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
-  reviewed MSL fixtures. Its v1-v6 execution passed
-  [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385);
-  the v7 resource-subset increment still needs its own native run.
+  reviewed MSL fixtures. Its v1-v7 execution passed
+  [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+- Shared object API: experimental `metal_api_core::provider_api` records
+  pipeline/buffer objects into one complete trace and submits it once. Host
+  buffer writes land only after complete output validation. See
+  [PROVIDER-OBJECTS.md](docs/PROVIDER-OBJECTS.md) for lifecycle and validation.
 - Open design work: asynchronous submission/readback, general native shader
   admission, CPU uploads during command-buffer execution, aliases and
   completion-driven live leases.
@@ -68,8 +72,11 @@ numbers and access roles between programs and passed
 [three-way v6 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/33983234385).
 The [resource-subset extension](conformance/RESOURCE-SUBSETS.md) allows a pass to
 bind only the resources it needs, including views first used by later passes.
-Its v7 native GPU validation is pending. Existing evidence does not establish
-general Metal conformance.
+It passed [three-way v7 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+The new [provider object API](docs/PROVIDER-OBJECTS.md) runs these existing suites
+through Device/Buffer/CommandBuffer/Encoder objects; its own native cloud
+validation is pending. Existing evidence does not establish general Metal
+conformance.
 
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this

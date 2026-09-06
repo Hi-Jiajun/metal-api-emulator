@@ -56,9 +56,11 @@ V1-v6 suite files remain byte-for-byte unchanged. The Rust trace schema stays
   typecheck/Clippy passed. The existing `block` dependency emits a future Rust
   compatibility notice on the macOS target.
 
-Native v7 Swift compilation and Swift/Rust Metal GPU execution require a new
-cloud run; the earlier v6 native result cannot establish v7 behavior. CI now
-includes v7 in both native capture paths, Vulkan capture and the comparison job.
+Subsequent [CI run 34010989175](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175)
+passed at commit `5c10dcd`: Swift and Rust native v1-v7 captures all ran, and
+all 26 cases per backend agree with Vulkan. Downloaded reports were checked
+against the exact source and suite hashes; v7 also matches local RTX 5060.
+The native device was Apple Paravirtual, not a bare-metal Apple GPU.
 
 Swift captures complete GPU allocation bytes. Rust providers expose final view
 writebacks landed in host-initialized allocations, so their guard checks do not

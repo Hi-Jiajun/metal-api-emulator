@@ -21,6 +21,8 @@ ALLOCATION_OBSERVATIONS = {
     "native-metal": "gpu-buffer-readback",
     "vulkan": "host-writeback-landing",
     "native-metal-provider": "host-writeback-landing",
+    "vulkan-objects": "host-writeback-landing",
+    "native-metal-provider-objects": "host-writeback-landing",
 }
 
 
@@ -312,10 +314,16 @@ def main(argv=None):
     parser.add_argument("--vulkan", type=Path, help="capture produced by Vulkan")
     parser.add_argument("--metal-provider", type=Path,
                         help="optional third capture produced by the Rust native Metal provider")
+    parser.add_argument("--vulkan-objects", type=Path,
+                        help="optional Vulkan capture through the provider object API")
+    parser.add_argument("--metal-objects", type=Path,
+                        help="optional native Metal provider capture through the object API")
     args = parser.parse_args(argv)
     if args.check is not None:
-        if args.native is not None or args.vulkan is not None or args.metal_provider is not None:
-            parser.error("--check cannot be combined with --native, --vulkan, or --metal-provider")
+        if any(path is not None for path in (args.native, args.vulkan, args.metal_provider,
+                                            args.vulkan_objects, args.metal_objects)):
+            parser.error("--check cannot be combined with --native, --vulkan, --metal-provider, "
+                         "--vulkan-objects, or --metal-objects")
     elif args.native is None or args.vulkan is None:
         parser.error("provide --check, or both --native and --vulkan")
     try:
@@ -331,9 +339,19 @@ def main(argv=None):
             _, vulkan = _read_json(args.vulkan)
             validate_capture(suite, digest, native, required_backend="native-metal")
             validate_capture(suite, digest, vulkan, required_backend="vulkan")
-            if args.metal_provider is not None:
-                _, metal_provider = _read_json(args.metal_provider)
-                validate_capture(suite, digest, metal_provider, required_backend="native-metal-provider")
+            backends = ["native-metal", "vulkan"]
+            for path, backend in ((args.metal_provider, "native-metal-provider"),
+                                  (args.vulkan_objects, "vulkan-objects"),
+                                  (args.metal_objects, "native-metal-provider-objects")):
+                if path is not None:
+                    _, report = _read_json(path)
+                    validate_capture(suite, digest, report, required_backend=backend)
+                    backends.append(backend)
+            if args.vulkan_objects is not None or args.metal_objects is not None:
+                print(f"PASS parity: {' / '.join(backends)}; "
+                      f"{suite['suite']}; {len(suite['cases'])} cases; host-visible bytes agreement; "
+                      "Swift native GPU buffer readback / trace and object API provider host writeback landing")
+            elif args.metal_provider is not None:
                 print(f"PASS parity: native-metal / vulkan / native-metal-provider; "
                       f"{suite['suite']}; {len(suite['cases'])} cases; host-visible bytes agreement; "
                       "Swift native GPU buffer readback / Vulkan and Rust Metal provider host writeback landing")

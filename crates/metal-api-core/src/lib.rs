@@ -13,6 +13,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub mod provider;
+pub mod provider_api;
 
 /// Opaque backend-owned compiled pipeline state.
 pub type PipelineArtifact = Arc<dyn Any + Send + Sync>;

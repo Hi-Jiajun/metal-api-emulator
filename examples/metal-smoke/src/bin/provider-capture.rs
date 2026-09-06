@@ -7,6 +7,7 @@ use metal_api_core::provider::{
     PipelineCompileRequest, PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource,
     ViewId, PROVIDER_SCHEMA_VERSION,
 };
+use metal_api_core::{provider_api as objects, Size};
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
 use metal_api_vulkan::VulkanComputeProvider;
@@ -17,6 +18,7 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -28,6 +30,12 @@ enum Backend {
     NativeMetalProvider,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryApi {
+    Trace,
+    Objects,
+}
+
 impl Backend {
     fn name(self) -> &'static str {
         match self {
@@ -35,15 +43,23 @@ impl Backend {
             Self::NativeMetalProvider => "native-metal-provider",
         }
     }
+
+    fn report_name(self, api: EntryApi) -> &'static str {
+        match (self, api) {
+            (Self::Vulkan, EntryApi::Objects) => "vulkan-objects",
+            (Self::NativeMetalProvider, EntryApi::Objects) => "native-metal-provider-objects",
+            (_, EntryApi::Trace) => self.name(),
+        }
+    }
 }
 
-fn create_provider(backend: Backend) -> Result<(Box<dyn PipelineProvider>, String)> {
+fn create_provider(backend: Backend) -> Result<(Arc<dyn PipelineProvider>, String)> {
     match backend {
         Backend::Vulkan => {
             let provider = VulkanComputeProvider::new()
                 .map_err(|error| format!("create Vulkan provider: {error:?}"))?;
             let name = provider.device_name().to_owned();
-            Ok((Box::new(provider), name))
+            Ok((Arc::new(provider), name))
         }
         Backend::NativeMetalProvider => {
             #[cfg(target_os = "macos")]
@@ -51,7 +67,7 @@ fn create_provider(backend: Backend) -> Result<(Box<dyn PipelineProvider>, Strin
                 let provider = NativeMetalProvider::new()
                     .map_err(|error| format!("create native Metal provider: {error:?}"))?;
                 let name = provider.device_name().to_owned();
-                Ok((Box::new(provider), name))
+                Ok((Arc::new(provider), name))
             }
             #[cfg(not(target_os = "macos"))]
             Err("native-metal-provider requires macOS".into())
@@ -169,11 +185,12 @@ fn main() -> Result<()> {
     let mut suite_path = None;
     let mut output_path = None;
     let mut backend = None;
+    let mut api = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
                 "usage: provider-capture --suite conformance/suite.json [--output capture.json] \
-                 [--backend vulkan|native-metal-provider]"
+                 [--backend vulkan|native-metal-provider] [--api trace|objects]"
             );
             return Ok(());
         }
@@ -183,6 +200,16 @@ fn main() -> Result<()> {
                     Some("vulkan") => Backend::Vulkan,
                     Some("native-metal-provider") => Backend::NativeMetalProvider,
                     _ => return Err("--backend requires vulkan or native-metal-provider".into()),
+                },
+            );
+            continue;
+        }
+        if flag == "--api" && api.is_none() {
+            api = Some(
+                match args.next().as_deref().and_then(|value| value.to_str()) {
+                    Some("trace") => EntryApi::Trace,
+                    Some("objects") => EntryApi::Objects,
+                    _ => return Err("--api requires trace or objects".into()),
                 },
             );
             continue;
@@ -197,6 +224,7 @@ fn main() -> Result<()> {
         *destination = Some(PathBuf::from(args.next().ok_or("missing argument value")?));
     }
     let backend = backend.unwrap_or(Backend::Vulkan);
+    let api = api.unwrap_or(EntryApi::Trace);
     let suite_path = suite_path.ok_or("--suite is required")?;
     if output_path.as_ref().is_some_and(|path| path.exists()) {
         return Err("refusing to overwrite an existing capture".into());
@@ -224,19 +252,30 @@ fn main() -> Result<()> {
     }
     let identity = hex(&Sha256::digest(&raw));
     let (provider, device_name) = create_provider(backend)?;
+    let object_device =
+        (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
     let mut results = Vec::new();
     let mut pipelines = BTreeMap::new();
+    let mut object_pipelines = BTreeMap::new();
     for (entry, source) in sources {
-        let pipeline = provider
-            .compile(PipelineCompileRequest {
-                entry_name: entry.clone(),
-                logical_digest: SemanticDigest::new(
-                    "suite-sha256-entry-v1",
-                    format!("{identity}:{entry}").into_bytes(),
-                )?,
-                source,
-            })
-            .map_err(|error| format!("compile {entry}: {error:?}"))?;
+        let request = PipelineCompileRequest {
+            entry_name: entry.clone(),
+            logical_digest: SemanticDigest::new(
+                "suite-sha256-entry-v1",
+                format!("{identity}:{entry}").into_bytes(),
+            )?,
+            source,
+        };
+        let pipeline = if let Some(device) = &object_device {
+            let pipeline = device.compile_pipeline(request)?;
+            let metadata = pipeline.metadata().clone();
+            object_pipelines.insert(entry.clone(), pipeline);
+            metadata
+        } else {
+            provider
+                .compile(request)
+                .map_err(|error| format!("compile {entry}: {error:?}"))?
+        };
         if backend == Backend::Vulkan && (entry == "transform_3d" || entry == "mix_3d") {
             verify_transform_contract(&pipeline)?;
         }
@@ -300,24 +339,34 @@ fn main() -> Result<()> {
                 }
             }
         }
-        results.push(run_case(
-            provider.as_ref(),
-            &programs,
-            case,
-            index as u64 + 1,
-            suite.guard_byte,
-        )?);
+        results.push(if let Some(device) = &object_device {
+            let programs = case_programs(case)
+                .iter()
+                .map(|program| object_pipelines[&program.entry].clone())
+                .collect::<Vec<_>>();
+            run_object_case(device, &programs, case, suite.guard_byte)?
+        } else {
+            run_case(
+                provider.as_ref(),
+                &programs,
+                case,
+                index as u64 + 1,
+                suite.guard_byte,
+            )?
+        });
     }
-    for pipeline in pipelines.values() {
-        provider
-            .release_pipeline(pipeline)
-            .map_err(|error| format!("release pipeline: {error:?}"))?;
+    if api == EntryApi::Trace {
+        for pipeline in pipelines.values() {
+            provider
+                .release_pipeline(pipeline)
+                .map_err(|error| format!("release pipeline: {error:?}"))?;
+        }
     }
     let capture = Capture {
         schema_version: 1,
         suite: suite.suite,
         suite_sha256: identity,
-        backend: backend.name(),
+        backend: backend.report_name(api),
         allocation_observation: "host-writeback-landing",
         device: device_name,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -941,6 +990,113 @@ fn case_trace(
             })
             .collect::<Result<_>>()?,
         completion_policy: CompletionPolicy::HostReadback,
+    })
+}
+
+fn run_object_case(
+    device: &objects::Device,
+    programs: &[objects::Pipeline],
+    case: &Case,
+    guard: u8,
+) -> Result<CaseResult> {
+    // Fixture IDs are report labels only. The object API creates and validates
+    // its own allocation/view identities before they are mapped back here.
+    let mut resources = BTreeMap::new();
+    let mut report_ids = BTreeMap::new();
+    for definition in &case.buffers {
+        let mut initial = vec![guard; usize::try_from(definition.allocation_size)?];
+        let offset = usize::try_from(definition.offset)?;
+        let bytes = unhex(&definition.initial_hex)?;
+        initial[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        let buffer = device.new_buffer_with_bytes(initial)?;
+        let view = buffer.view(offset, usize::try_from(definition.length)?)?;
+        report_ids.insert(
+            (view.allocation_id(), view.view_id()),
+            (definition.allocation, definition.view),
+        );
+        resources.insert(definition.view, (buffer, view));
+    }
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    let dispatches = case.dispatches.clone().unwrap_or_else(|| {
+        vec![CaseDispatch {
+            grid: case.grid,
+            local: case.local,
+            bindings: None,
+            program: None,
+        }]
+    });
+    // Several dispatches on one encoder exercise snapshot-at-dispatch behavior,
+    // including changed pipelines, binding tables and later first use.
+    let mut encoder = command.compute_command_encoder()?;
+    for dispatch in &dispatches {
+        encoder.clear_buffers()?;
+        encoder.set_compute_pipeline_state(&programs[dispatch.program.unwrap_or(0)])?;
+        let slots = selected_slots(case, dispatch);
+        let views = dispatch
+            .bindings
+            .clone()
+            .unwrap_or_else(|| case.buffers.iter().map(|buffer| buffer.view).collect());
+        for (slot, view) in slots.iter().zip(views) {
+            let (_, view) = resources.get(&view).ok_or("unknown object fixture view")?;
+            encoder.set_buffer(slot.binding, view)?;
+        }
+        let narrow = |dimensions: [u64; 3]| -> Result<Size> {
+            Ok(Size::new(
+                u32::try_from(dimensions[0])?,
+                u32::try_from(dimensions[1])?,
+                u32::try_from(dimensions[2])?,
+            )?)
+        };
+        encoder.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
+    }
+    encoder.end_encoding()?;
+    command.commit()?;
+    command.wait_until_completed()?;
+    if command.status()? != metal_api_core::CommandBufferStatus::Completed {
+        return Err("object command did not reach Completed".into());
+    }
+    let output = command.submission()?;
+    if !matches!(
+        output.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ) {
+        return Err("object capture requires completed visible results".into());
+    }
+    let mut writebacks = Vec::new();
+    for write in output.writebacks {
+        let &(allocation, view) = report_ids
+            .get(&(write.allocation_id, write.view_id))
+            .ok_or("unknown object writeback identity")?;
+        writebacks.push(Writeback {
+            allocation,
+            view,
+            offset: write.offset,
+            bytes_hex: hex(&write.bytes),
+        });
+    }
+    writebacks.sort_by_key(|write| (write.allocation, write.view));
+    let mut allocations = Vec::new();
+    for definition in &case.buffers {
+        let (buffer, _) = &resources[&definition.view];
+        // Observe the object's actual host landing, rather than replaying the
+        // returned writebacks into a second synthetic allocation.
+        allocations.push(Allocation {
+            allocation: definition.allocation,
+            bytes_hex: hex(&buffer.read()?),
+        });
+    }
+    allocations.sort_by_key(|allocation| allocation.allocation);
+    eprintln!(
+        "objects command completed: {} passes={}",
+        case.id,
+        dispatches.len()
+    );
+    Ok(CaseResult {
+        id: case.id.clone(),
+        completion: "CompletedVisible",
+        writebacks,
+        allocations,
     })
 }
 

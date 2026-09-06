@@ -116,4 +116,8 @@ selected pipeline. Later first use is supported; repeated view identities
 retain their original allocation, range and initial bytes. The complete union
 is validated and uploaded before encoding. Readback covers every view written
 by any pass. Asynchronous work, mid-execution CPU uploads and general aliasing
-remain outside this provider subset. Native v7 validation is pending.
+remain outside this provider subset. V1-v7 passed
+[three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+
+The subsequent [provider object API](PROVIDER-OBJECTS.md) connects application
+objects to this trace boundary. Its native validation requires a new cloud run.
