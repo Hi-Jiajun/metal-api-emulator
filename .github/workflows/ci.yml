@@ -222,3 +222,21 @@ jobs:
           test "${#icds[@]}" -eq 1
           export VK_ICD_FILENAMES="${icds[0]}"
           cargo run --manifest-path integration/reims/Cargo.toml --locked --bin reims-smoke
+
+  windows-cross-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy
+          rustup override set 1.96.0
+      - name: Install MinGW-w64 and the Windows target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build the Windows rail
+        run: cargo build --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins
+      - name: Clippy the Windows rail
+        run: cargo clippy --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins --no-deps -- -D warnings

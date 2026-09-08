@@ -127,6 +127,14 @@ dma-buf is a deliberate non-goal for the Windows rail (Linux-only kernel
 object); host-pointer import and the copy rails are the fallbacks. Guest memory
 and the production guest/display path remain future work.
 
+The Unix-domain-socket IPC, command-channel and shared-memory descriptor cases
+are `#[cfg(unix)]`. The Windows build skips them and runs the cross-platform
+Vulkan suite, including the single-process staged and borrowed no-copy imports;
+the borrowed import was validated on an RTX 5060 with
+`VK_EXT_external_memory_host` (`copy_out=in_place`). A Windows shared-memory
+handle transport is not implemented, so the owner/provider command channel
+remains Unix-only for borrowed leases.
+
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native
 captures; any Rust native execution or comparison failure fails the job. The

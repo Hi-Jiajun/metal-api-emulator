@@ -171,6 +171,13 @@ recognizes the conventional `C:\msys64\mingw64\bin` installation. To run the
 optional engine comparison after building it, pass `-ReimsRunner` with the path
 to `reims-smoke.exe`. Both executables run in separate processes.
 
+`provider-smoke.exe` also runs on Windows. The Unix-domain-socket IPC,
+command-channel and shared-memory descriptor cases are skipped there because
+Windows has no `SCM_RIGHTS` equivalent; the staged and borrowed no-copy lease
+cases run on the device. The RTX 5060 run exercised
+`VK_EXT_external_memory_host` host-pointer import with the owner mapping
+observing the GPU write in place.
+
 The suite checks:
 
 ```text
@@ -209,6 +216,9 @@ attributed in [NOTICE.md](NOTICE.md). Generated AIR stays temporary.
 Earlier local checkpoints ran these four checks on Linux/Lavapipe and
 Windows/RTX 5060 with both Vulkan executors. Those runs validate the narrow
 snapshot executor path. They do not demonstrate native Metal parity.
+The 2026-09-08 Windows RTX 5060 run additionally exercised the cross-platform
+provider smoke, including borrowed no-copy host-pointer import, and the v1-v8
+capture rails.
 Publication-preparation checks are recorded in [docs/VALIDATION.md](docs/VALIDATION.md).
 The subsequent provider implementation is described in
 [docs/PROVIDER-B1.md](docs/PROVIDER-B1.md).

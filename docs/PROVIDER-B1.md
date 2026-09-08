@@ -224,6 +224,19 @@ parity.
   Binary SHA-256 values are recorded in
   `evidence/windows-rtx5060-v8-7e67a0e-2026-09-08/manifest.md`. This is a
   Vulkan-provider validation on Windows, not native Metal parity.
+- 2026-09-08 Windows rail restored and host-pointer import validated: the
+  Windows GNU build had been broken since the command-channel descriptor work
+  (`descriptor_error` was Unix-gated). `e891102` makes it unconditional and
+  gates the Unix-domain-socket smoke cases with `#[cfg(unix)]`.
+  `provider-smoke.exe` on the RTX 5060 now runs the cross-platform suite,
+  including `provider_staged_lease` and
+  `provider_borrowed_lease lease=98 alignment=4096 copy_in=live
+  copy_out=in_place`, the first real-device check of
+  `VK_EXT_external_memory_host` host-pointer import; all 24 v1-v8
+  direct/object/async-object captures still match. Binary SHA-256 values are
+  recorded in `evidence/windows-rtx5060-e891102-2026-09-08/manifest.md`. The
+  Unix command-channel/descriptor cases are skipped on Windows because there
+  is no `SCM_RIGHTS` equivalent.
 - 2026-09-08 native device-removal increment: 159 Rust tests passed (core 100,
   native 9, Vulkan 36, capture 14) and 115 Python tests passed. Native Metal
   classifies `MTLCommandBufferError::DeviceRemoved` (code 11) as `DeviceLost`
