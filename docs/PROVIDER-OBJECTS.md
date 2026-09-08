@@ -83,7 +83,7 @@ lands unvalidated bytes.
 ## Capture and comparison
 
 No shader or suite is added. `provider-capture --api objects` reruns the same
-26 cases from v1-v7, including multiple dispatches on one encoder, pipeline
+29 cases from v1-v8, including multiple dispatches on one encoder, pipeline
 changes, changed slot counts and buffers first used later. The capture maps
 opaque object allocation/view IDs to fixture labels only after the object API
 has validated the actual provider result. Allocation reports read the actual
@@ -147,11 +147,15 @@ stand in for object captures.
   handler; a configurable observation deadline (20 seconds by default) reports
   unknown completion and abandons the provider. The default synchronous mode,
   direct trace rail and all five comparison paths are unchanged. CI runs
-  `provider-capture --api objects --async` for v1-v7 on Lavapipe and, when a
+  `provider-capture --api objects --async` for v1-v8 on Lavapipe and, when a
   native device is eligible, on macOS.
 - All 26 v1-v7 object cases passed on Linux/Lavapipe and Windows/RTX 5060.
   Results agree per allocation/view with fresh Linux direct-trace captures and
   the archived Swift/Rust Metal reports from run 34010989175.
+- The v8 binary-AIR cases passed through the direct, object and async-object
+  rails on Linux/Lavapipe and, for native MSL, on the Apple Paravirtual device
+  in [CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
+  Windows/RTX 5060 has not run the new encoding.
 - All existing suite and shader files remain byte-for-byte unchanged.
   Formatting, Clippy, rustdoc, Windows GNU build and macOS ARM64 Rust
   typecheck/Clippy passed. The pre-existing `block` dependency still emits its

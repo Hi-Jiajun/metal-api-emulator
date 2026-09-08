@@ -47,8 +47,8 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
   reviewed MSL fixtures and shares the optional deferred completion mode.
-  Its v1-v7 execution passed
-  [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+  Its v1-v8 execution passed
+  [five-path CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
 - Shared object API: experimental `metal_api_core::provider_api` records
   pipeline/buffer objects into one complete trace and submits it once. Host
   buffer writes land only after complete output validation. See
@@ -58,6 +58,12 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   provider, Vulkan object API and Rust Metal object API. The archived evidence
   contains 26 cases per path; this verifies the bounded object API on the
   reviewed fixtures, not general Metal conformance.
+- Binary AIR encoding: commit `d8e42bf3fe3668c8e516af9fe5544db9316d97ca`
+  passed the full v1-v8 five-path comparison in
+  [CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
+  V8 reuses the v7 cases with raw and Apple-wrapped bitcode; native rails keep
+  using MSL. The archived evidence contains 29 cases per path and does not
+  establish general Metal conformance.
 - Open design work: explicit cancellation, completion-driven lease release,
   general native shader admission, CPU uploads during command-buffer execution
   and aliases.
@@ -89,6 +95,9 @@ numbers and access roles between programs and passed
 The [resource-subset extension](conformance/RESOURCE-SUBSETS.md) allows a pass to
 bind only the resources it needs, including views first used by later passes.
 It passed [three-way v7 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+The [binary-AIR encoding suite](conformance/suite-v8.json) reuses the v7 cases
+with raw and Apple-wrapped LLVM bitcode and passed
+[five-path v8 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
 The new [provider object API](docs/PROVIDER-OBJECTS.md) runs these existing suites
 through Device/Buffer/CommandBuffer/Encoder objects; its native cloud execution
 and five-path comparison passed in run

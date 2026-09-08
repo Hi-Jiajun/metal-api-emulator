@@ -217,9 +217,19 @@ union is still uploaded before any execution. See
 validation status. Native v7 passed
 [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 
+## Binary AIR encodings
+
+[suite-v8.json](suite-v8.json) reuses the v7 2/4/8-pass cases and adds an
+`air_encoding` field: `raw` submits bare LLVM bitcode and `wrapped` submits the
+Apple wrapper with an exact offset/size payload. Text IR remains the default
+for v1-v7. The Vulkan rails assemble the reviewed `.ll` fixture with `llvm-as`
+and submit the selected encoding; the Swift and Rust native rails keep using
+the reviewed MSL fixture. Native v8 passed
+[five-path CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
+
 ## Provider object entry point
 
-`provider-capture --api objects` runs the same v1-v7 fixtures through the new
+`provider-capture --api objects` runs the same v1-v8 fixtures through the new
 shared object API. Its reports identify `vulkan-objects` or
 `native-metal-provider-objects`; both report actual host-buffer landing.
 The direct trace captures remain separate, and the Swift oracle is unchanged.

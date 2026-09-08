@@ -47,7 +47,7 @@ uses the same wait/readback semantics.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
-`provider-capture --api objects --async`; CI runs v1-v7 this way on Lavapipe.
+`provider-capture --api objects --async`; CI runs v1-v8 this way on Lavapipe.
 Async mode still serializes submission with the same queue lock, so it overlaps
 host work and completion observation rather than concurrent GPU execution.
 There is no end-to-end deadline on compilation, locks, initialization or
@@ -99,6 +99,12 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 binary-AIR encoding increment: 151 Rust tests passed (core 96,
+  native 7, Vulkan 34, capture 14) and 115 Python tests passed. `suite-v8.json`
+  reuses the v7 cases with raw and Apple-wrapped bitcode; Lavapipe and the
+  Apple Paravirtual device passed the five-path v1-v8 comparison in
+  [CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
+  Formatting, Clippy with `-D warnings` and rustdoc passed.
 - 2026-09-08 observation-deadline increment: 147 Rust tests passed (core 92,
   native 7, Vulkan 34, capture 14) and 113 Python tests passed. The shared
   `ObservationDeadline` clamps caller timeouts to the remaining observation

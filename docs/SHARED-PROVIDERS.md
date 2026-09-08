@@ -121,6 +121,9 @@ completion to a device fence observed by `wait`, while native Metal uses an
 concurrent GPU execution, mid-execution CPU uploads and general aliasing remain
 outside this provider subset. V1-v7 passed
 [three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
+The v8 binary-AIR encoding suite reuses those cases and passed the five-path
+v1-v8 comparison in
+[CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
 
 The subsequent [provider object API](PROVIDER-OBJECTS.md) connects application
 objects to this trace boundary. Its native execution and five-path v1-v7

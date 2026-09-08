@@ -12,7 +12,7 @@ import compare
 from test_compare import synthetic_report
 
 
-SUITES = ("suite.json", *(f"suite-v{version}.json" for version in range(2, 8)))
+SUITES = ("suite.json", *(f"suite-v{version}.json" for version in range(2, 9)))
 OBJECT_BACKENDS = ("vulkan-objects", "native-metal-provider-objects")
 CAPTURE_FLAGS = {
     "native-metal": "--native",
@@ -29,7 +29,7 @@ class ObjectCaptureTests(unittest.TestCase):
         self.suite = json.loads(raw)
         self.digest = hashlib.sha256(raw).hexdigest()
 
-    def test_both_object_paths_accept_all_seven_suite_versions(self):
+    def test_both_object_paths_accept_all_eight_suite_versions(self):
         for name in SUITES:
             raw = Path(__file__).with_name(name).read_bytes()
             suite, digest = json.loads(raw), hashlib.sha256(raw).hexdigest()
