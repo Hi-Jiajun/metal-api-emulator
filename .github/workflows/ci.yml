@@ -191,3 +191,28 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v5.json --native /tmp/native-evidence/v5/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v5.json --metal-provider /tmp/native-evidence/rust-provider-v5.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v5.json --metal-objects /tmp/native-evidence/metal-objects-v5.json
           python3 conformance/compare.py --suite conformance/suite-v6.json --native /tmp/native-evidence/v6/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v6.json --metal-provider /tmp/native-evidence/rust-provider-v6.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v6.json --metal-objects /tmp/native-evidence/metal-objects-v6.json
           python3 conformance/compare.py --suite conformance/suite-v7.json --native /tmp/native-evidence/v7/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v7.json --metal-provider /tmp/native-evidence/rust-provider-v7.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v7.json --metal-objects /tmp/native-evidence/metal-objects-v7.json
+
+  reims-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup override set 1.96.0
+      - name: Install offline GPU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm spirv-tools libvulkan1 mesa-vulkan-drivers
+      - name: Prepare pinned reims sources
+        run: python3 integration/reims/prepare.py
+      - name: Test optional reims adapter
+        run: cargo test --manifest-path integration/reims/Cargo.toml --locked
+      - name: Run reims smoke on Lavapipe
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          cargo run --manifest-path integration/reims/Cargo.toml --locked --bin reims-smoke
