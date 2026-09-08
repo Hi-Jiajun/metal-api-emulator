@@ -86,12 +86,16 @@ and only then submits, so the final destination proves commit-order execution
 on the real device. This checks host-side reservation ordering, not concurrent
 GPU execution. A second case commits two command buffers with disjoint buffers
 and asserts that the second commit returns while the first command is still
-pending, so independent submissions stay in flight at once. The executor
-creates up to four queues in the selected family (clamped to the family's
-queue count) and the async provider distributes independent submissions
-round-robin across them, so a multi-queue device can overlap device execution
-while the host-side execution lock still serializes the enqueue call.
-Lavapipe reports `queues=1 distributed=false`; the Windows RTX 5060 reports
+pending, so independent submissions stay in flight at once. A third case
+records two dispatches in one command buffer with a data dependency and checks
+that the inter-pass compute barrier makes the first pass's write visible to the
+second. The executor creates up to four queues in the selected family (clamped
+to the family's queue count) and the async provider picks the least-loaded
+queue, breaking ties with a round-robin cursor. Each queue has its own host
+enqueue lock, so independent queues can submit concurrently while submissions
+to one queue stay serialized; a probe-backed case holds two queue locks at once
+on the Windows RTX 5060. Lavapipe reports `queues=1 distributed=false` and
+skips the concurrency case; the Windows RTX 5060 reports
 `queues=4 distributed=true`.
 There is no end-to-end deadline on compilation, locks, initialization or
 submit. The synchronous fence wait keeps a fixed 20-second bound; a configured

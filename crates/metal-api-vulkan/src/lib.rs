@@ -27,7 +27,7 @@ use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 mod compute_provider;
 mod provider;
@@ -37,6 +37,8 @@ pub use compute_provider::{CompiledComputePipeline, VulkanComputeProvider};
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+type EnqueueProbe = Arc<dyn Fn(usize) + Send + Sync>;
 
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
@@ -95,6 +97,24 @@ impl VulkanExecutor {
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
         self.context.queue_submission_counts()
+    }
+
+    /// Install a probe called with the selected queue index while that queue's
+    /// host enqueue lock is held. Smoke tests use it to prove that independent
+    /// queues enqueue concurrently; production callers leave it unset.
+    #[doc(hidden)]
+    pub fn set_enqueue_probe_for_test(&self, probe: EnqueueProbe) {
+        if let Ok(mut slot) = self.context.enqueue_probe.lock() {
+            *slot = Some(probe);
+        }
+    }
+
+    /// Remove a probe installed by [`Self::set_enqueue_probe_for_test`].
+    #[doc(hidden)]
+    pub fn clear_enqueue_probe_for_test(&self) {
+        if let Ok(mut slot) = self.context.enqueue_probe.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -233,12 +253,32 @@ impl ComputeExecutor for VulkanExecutor {
         }
         let _execution = self
             .context
-            .execution_lock
-            .lock()
-            .map_err(|_| failure("Vulkan execution lock is poisoned"))?;
+            .lock_queue(0)
+            .map_err(|_| failure("Vulkan queue lock is poisoned"))?;
         self.context.ensure_usable()?;
         execute_submission(&self.context, artifact, submission)
     }
+}
+
+/// Pick the least-loaded queue, breaking ties from `round_robin_start`.
+///
+/// The cursor is advanced by the caller; keeping the policy pure lets it be
+/// unit tested without a Vulkan device.
+fn select_queue(in_flight: &[usize], round_robin_start: usize) -> usize {
+    if in_flight.is_empty() {
+        return 0;
+    }
+    let start = round_robin_start % in_flight.len();
+    let mut best = start;
+    let mut best_load = in_flight[start];
+    for step in 1..in_flight.len() {
+        let index = (start + step) % in_flight.len();
+        if in_flight[index] < best_load {
+            best = index;
+            best_load = in_flight[index];
+        }
+    }
+    best
 }
 
 pub(crate) struct VulkanContext {
@@ -250,10 +290,12 @@ pub(crate) struct VulkanContext {
     queues: Vec<vk::Queue>,
     next_queue: AtomicUsize,
     queue_submissions: Vec<AtomicUsize>,
+    queue_in_flight: Vec<AtomicUsize>,
     properties: vk::PhysicalDeviceProperties,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
-    execution_lock: Mutex<()>,
+    queue_locks: Vec<Mutex<()>>,
+    enqueue_probe: Mutex<Option<EnqueueProbe>>,
     poisoned: AtomicBool,
     abandoned: AtomicBool,
     device_lost: AtomicBool,
@@ -371,10 +413,12 @@ impl VulkanContext {
             queues,
             next_queue: AtomicUsize::new(0),
             queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
+            queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
             device_name,
-            execution_lock: Mutex::new(()),
+            queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
+            enqueue_probe: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             device_lost: AtomicBool::new(false),
@@ -393,17 +437,48 @@ impl VulkanContext {
         }
     }
 
-    /// Round-robin index of the next independent submission.
+    /// Least-loaded device queue for the next independent submission.
     ///
-    /// A single-queue family always returns zero, preserving the previous
-    /// behaviour on devices such as Lavapipe.
+    /// Ties are broken by a round-robin cursor so idle devices still spread
+    /// submissions evenly. A single-queue family always returns zero,
+    /// preserving the previous behaviour on devices such as Lavapipe.
     pub(crate) fn pick_queue(&self) -> usize {
-        self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len()
+        let len = self.queues.len();
+        let start = self.next_queue.fetch_add(1, Ordering::Relaxed) % len;
+        let mut loads = [0_usize; MAX_DEVICE_QUEUES];
+        for (slot, counter) in loads.iter_mut().zip(&self.queue_in_flight) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
+        select_queue(&loads[..len], start)
+    }
+
+    /// Lock the host-side enqueue section of one device queue.
+    ///
+    /// Vulkan requires host access to a `VkQueue` to be externally
+    /// synchronized. Per-queue locks let independent queues enqueue
+    /// concurrently while submissions to the same queue stay serialized.
+    pub(crate) fn lock_queue(&self, index: usize) -> Result<MutexGuard<'_, ()>, &'static str> {
+        self.queue_locks
+            .get(index)
+            .ok_or("Vulkan queue index out of range")?
+            .lock()
+            .map_err(|_| "Vulkan queue lock is poisoned")
     }
 
     pub(crate) fn record_queue_submission(&self, index: usize) {
         if let Some(counter) = self.queue_submissions.get(index) {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.queue_in_flight.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_queue_retirement(&self, index: usize) {
+        if let Some(counter) = self.queue_in_flight.get(index) {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
         }
     }
 
@@ -725,7 +800,7 @@ fn execute_submission_stages(
 /// A recorded and queue-submitted sequence whose completion fence is pending.
 ///
 /// `submit` performs planning, resource creation, recording and `queue_submit`;
-/// the caller must hold the executor's execution lock. `wait` observes the
+/// the caller must hold the selected queue's host lock. `wait` observes the
 /// device fence and may run on any thread without that lock, so an asynchronous
 /// provider no longer needs a worker per submission. Dropping a still-pending
 /// value poisons the context and retains every in-flight handle until process
@@ -2237,6 +2312,15 @@ impl ExecutionResources {
 
     fn submit(&mut self, queue_index: usize) -> Result<(), SubmissionFailure> {
         self.queue_index = queue_index;
+        if let Some(probe) = self
+            .context
+            .enqueue_probe
+            .lock()
+            .ok()
+            .and_then(|probe| probe.clone())
+        {
+            probe(queue_index);
+        }
         self.fence = unsafe {
             self.context
                 .device
@@ -2274,7 +2358,10 @@ impl ExecutionResources {
         };
         match wait {
             Ok(()) => {
-                self.completed = true;
+                if !self.completed {
+                    self.completed = true;
+                    self.context.record_queue_retirement(self.queue_index);
+                }
                 Ok(true)
             }
             Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
@@ -2362,6 +2449,9 @@ impl Drop for ExecutionResources {
                 std::mem::forget(objects);
             }
             return;
+        }
+        if self.submitted && !self.completed {
+            self.context.record_queue_retirement(self.queue_index);
         }
         if let Some((registry, lease_ids)) = self.borrowed.take() {
             registry.retire_all(&lease_ids);
@@ -3350,5 +3440,16 @@ mod tests {
             Some(ResourceAccess::WriteOnly),
             Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
         ));
+    }
+
+    #[test]
+    fn queue_selection_prefers_idle_queues_and_keeps_round_robin_ties() {
+        assert_eq!(select_queue(&[0, 0, 0, 0], 0), 0);
+        assert_eq!(select_queue(&[0, 0, 0, 0], 2), 2);
+        assert_eq!(select_queue(&[3, 1, 2, 0], 0), 3);
+        assert_eq!(select_queue(&[1, 1, 0, 1], 2), 2);
+        assert_eq!(select_queue(&[2, 2, 2, 1], 3), 3);
+        assert_eq!(select_queue(&[7], 5), 0);
+        assert_eq!(select_queue(&[], 0), 0);
     }
 }

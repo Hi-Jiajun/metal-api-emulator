@@ -127,6 +127,8 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_borrowed_lease(Arc::clone(&executor))?;
     run_object_queue_ordering()?;
     run_object_parallel_commands()?;
+    run_object_serial_dependency()?;
+    run_object_concurrent_enqueue()?;
     run_device_lifecycle()?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
@@ -2054,6 +2056,221 @@ fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 queues={queues} distributed={distributed} writeback=exact"
+    );
+    Ok(())
+}
+
+/// Two dispatches in one command buffer with a data dependency: the first
+/// copies the input word into `middle`, the second copies `middle` into the
+/// destination. The second pass can only observe the first pass's write if the
+/// encoder's inter-pass compute barrier is correct. This is the single-queue
+/// dependency path, so Lavapipe can exercise it in CI.
+fn run_object_serial_dependency() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?,
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_serial_dependency".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile serial-dependency fixture: {error:?}"))?;
+    let expected = 0x5a5a_1234_u32.to_le_bytes().to_vec();
+    let input = device.new_buffer_with_bytes(expected.clone())?;
+    let middle = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let destination = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let input_view = input.view(0, 4)?;
+    let middle_view = middle.view(0, 4)?;
+    let destination_view = destination.view(0, 4)?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_view)?;
+        encoder.set_buffer(1, &middle_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.clear_buffers()?;
+        encoder.set_buffer(0, &middle_view)?;
+        encoder.set_buffer(1, &destination_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    command.commit()?;
+    command.wait_until_completed()?;
+    if middle.read()? != expected || destination.read()? != expected {
+        return Err(format!(
+            "serial dependency writebacks differ: middle={:02x?} destination={:02x?}",
+            middle.read()?,
+            destination.read()?
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_serial_dependency passes=2 barrier=compute_shader writeback=exact"
+    );
+    Ok(())
+}
+
+/// Two independent submissions must be able to hold different device-queue
+/// enqueue locks at the same time. The probe blocks inside the host enqueue
+/// section until both submissions have entered it, so a single global lock
+/// would time out instead of observing two distinct queue indices.
+/// Single-queue devices skip the case: Vulkan requires those submissions to
+/// serialize on the one queue handle.
+fn run_object_concurrent_enqueue() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let queues = executor.queue_count();
+    if queues < 2 {
+        println!("SKIP provider_object_concurrent_enqueue reason=single_queue queues={queues}");
+        return Ok(());
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let probe_release = Arc::clone(&release);
+    executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+        let _ = entered_tx.send(queue);
+        let (lock, condvar) = &*probe_release;
+        let mut released = lock.lock().expect("enqueue probe mutex");
+        while !*released {
+            released = condvar.wait(released).expect("enqueue probe condvar");
+        }
+    }));
+    let result = run_object_concurrent_enqueue_inner(&executor, queues, &entered_rx, &release);
+    executor.clear_enqueue_probe_for_test();
+    result
+}
+
+fn run_object_concurrent_enqueue_inner(
+    executor: &Arc<VulkanExecutor>,
+    queues: usize,
+    entered_rx: &std::sync::mpsc::Receiver<usize>,
+    release: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+) -> Result<(), Box<dyn Error>> {
+    let release_probe = || {
+        let (lock, condvar) = &**release;
+        *lock.lock().expect("enqueue probe mutex") = true;
+        condvar.notify_all();
+    };
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_concurrent_enqueue".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile concurrent-enqueue fixture: {error:?}"))?;
+    let word_a = 0x3333_3333_u32.to_le_bytes().to_vec();
+    let word_b = 0x4444_4444_u32.to_le_bytes().to_vec();
+    let input_a = device.new_buffer_with_bytes(word_a.clone())?;
+    let input_b = device.new_buffer_with_bytes(word_b.clone())?;
+    let output_a = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let output_b = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_a.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_a.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_b.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_b.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let first_thread = std::thread::spawn(move || -> Result<_, String> {
+        first
+            .commit()
+            .map_err(|error| format!("first concurrent commit: {error:?}"))?;
+        Ok(first)
+    });
+    let first_queue = match entered_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(queue) => queue,
+        Err(error) => {
+            release_probe();
+            let _ = first_thread.join();
+            return Err(format!("first enqueue did not enter the probe: {error}").into());
+        }
+    };
+    let second_thread = std::thread::spawn(move || -> Result<_, String> {
+        second
+            .commit()
+            .map_err(|error| format!("second concurrent commit: {error:?}"))?;
+        Ok(second)
+    });
+    let second_queue = match entered_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(queue) => queue,
+        Err(_) => {
+            release_probe();
+            let _ = first_thread.join();
+            let _ = second_thread.join();
+            return Err("second enqueue did not enter while the first queue lock was held".into());
+        }
+    };
+    release_probe();
+    let first = first_thread
+        .join()
+        .map_err(|_| "first concurrent commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    let second = second_thread
+        .join()
+        .map_err(|_| "second concurrent commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    first.wait_until_completed()?;
+    second.wait_until_completed()?;
+    if output_a.read()? != word_a || output_b.read()? != word_b {
+        return Err(format!(
+            "concurrent enqueue writebacks differ: a={:02x?} b={:02x?}",
+            output_a.read()?,
+            output_b.read()?
+        )
+        .into());
+    }
+    if first_queue == second_queue {
+        return Err(format!(
+            "concurrent submissions shared queue {first_queue}; expected distinct enqueue locks"
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_concurrent_enqueue queues={queues} queue_a={first_queue} queue_b={second_queue} host_enqueue=concurrent writeback=exact"
     );
     Ok(())
 }

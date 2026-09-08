@@ -221,10 +221,15 @@ reservation, so the destination can only observe the first command's write
 when the queue preserves order. A second object-API case commits two command
 buffers with disjoint buffers: the second commit must return while the first
 command is still pending, so independent submissions stay in flight at once.
-The executor creates up to four device queues in the selected family and the
-async provider distributes independent submissions round-robin across them;
-Lavapipe reports `queues=1 distributed=false`, while the Windows RTX 5060
-reports `queues=4 distributed=true`.
+A third case records two dispatches in one command buffer with a data
+dependency, so the inter-pass compute barrier must make the first pass's write
+visible to the second. The executor creates up to four device queues in the
+selected family and the async provider picks the least-loaded queue, breaking
+ties with a round-robin cursor. Each queue has its own host enqueue lock, so
+independent queues can submit concurrently while submissions to one queue stay
+serialized; a probe-backed case holds two queue locks at once on the Windows
+RTX 5060. Lavapipe reports `queues=1 distributed=false` and skips the
+concurrency case, while the Windows RTX 5060 reports `queues=4 distributed=true`.
 A final case injects a simulated device loss
 into a dedicated executor: `health` must report `DeviceLost`, new compilation
 must be refused with `device_lost`/`RetryAfterRecreate`, and a freshly created

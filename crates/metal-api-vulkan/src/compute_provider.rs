@@ -876,8 +876,7 @@ impl VulkanComputeProvider {
             let _execution = self
                 .executor
                 .context
-                .execution_lock
-                .lock()
+                .lock_queue(queue_index)
                 .map_err(|_| registry_poisoned())?;
             ensure_executor_usable(&self.executor)?;
             PendingExecution::submit(
@@ -1032,9 +1031,9 @@ fn map_writebacks(
     Ok(writebacks)
 }
 
-/// Serialize device work with the standalone executor, then run the prepared
-/// sequence. The worker path calls this directly; the synchronous path calls
-/// it on the submitting thread.
+/// Serialize queue-0 device work with the standalone executor, then run the
+/// prepared sequence. The worker path calls this directly; the synchronous
+/// path calls it on the submitting thread.
 fn execute_on_context(
     executor: &Arc<VulkanExecutor>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
@@ -1044,8 +1043,7 @@ fn execute_on_context(
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let _execution = executor
         .context
-        .execution_lock
-        .lock()
+        .lock_queue(0)
         .map_err(|_| registry_poisoned())?;
     ensure_executor_usable(executor)?;
     execute_pool_sequence_with_status(
