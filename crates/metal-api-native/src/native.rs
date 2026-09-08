@@ -12,6 +12,7 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
     MTLResourceOptions, MTLSize,
 };
+use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{
     AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome, CompletionRecord, ObservationDeadline,
 };
@@ -82,6 +83,7 @@ pub struct NativeMetalProvider {
     async_execution: bool,
     observation_deadline: Duration,
     async_abandoned: Arc<AtomicBool>,
+    completion_outbox: Option<Arc<CompletionOutbox>>,
 }
 
 impl NativeMetalProvider {
@@ -154,6 +156,7 @@ impl NativeMetalProvider {
                 async_execution: false,
                 observation_deadline: GPU_DEADLINE,
                 async_abandoned: Arc::new(AtomicBool::new(false)),
+                completion_outbox: None,
             })
         })
     }
@@ -172,6 +175,31 @@ impl NativeMetalProvider {
 
     pub fn async_execution(&self) -> bool {
         self.async_execution
+    }
+
+    /// Publish admission, terminal transitions and device health through
+    /// `outbox`. The outbox must be scoped to this provider's device epoch.
+    /// Without an outbox the provider keeps its in-process behavior.
+    pub fn with_completion_outbox(
+        mut self,
+        outbox: Arc<CompletionOutbox>,
+    ) -> Result<Self, ProviderError> {
+        if outbox.device_epoch() != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "completion_outbox_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field("actual", FieldValue::Unsigned(outbox.device_epoch().get())));
+        }
+        self.completion_outbox = Some(outbox);
+        Ok(self)
+    }
+
+    /// Completion outbox attached to this provider, if any.
+    pub fn completion_outbox(&self) -> Option<&Arc<CompletionOutbox>> {
+        self.completion_outbox.as_ref()
     }
 
     /// Bound how long a deferred submission may remain non-terminal before
@@ -267,6 +295,43 @@ impl NativeMetalProvider {
             .get(&token.submission_id)
             .cloned()
             .ok_or_else(|| unknown_completion(token))
+    }
+
+    fn terminal_record(
+        &self,
+        token: CompletionToken,
+        writebacks: Vec<BufferWriteback>,
+    ) -> Arc<CompletionRecord> {
+        match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                let record = CompletionRecord::running_with_observer(token, outbox.observer());
+                record.complete(writebacks);
+                record
+            }
+            None => CompletionRecord::completed(writebacks),
+        }
+    }
+
+    fn failed_record(&self, token: CompletionToken, error: ProviderError) -> Arc<CompletionRecord> {
+        match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                let record = CompletionRecord::running_with_observer(token, outbox.observer());
+                record.fail(error);
+                record
+            }
+            None => CompletionRecord::failed(error),
+        }
+    }
+
+    fn sync_completion_health(&self) {
+        if let Some(outbox) = &self.completion_outbox {
+            let health = self.health();
+            if outbox.health() != health {
+                let _ = outbox.publish_device(health);
+            }
+        }
     }
 
     fn fail_deadline(&self, slot: &CompletionSlot, token: CompletionToken) -> ProviderError {
@@ -474,13 +539,15 @@ impl ComputeProvider for NativeMetalProvider {
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
         if self.async_execution {
-            return self.submit_async(&mut state, trace, pipelines, token);
+            let result = self.submit_async(&mut state, trace, pipelines, token);
+            self.sync_completion_health();
+            return result;
         }
         let result = objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token));
         let observation = match &result {
-            Ok(submission) => Some(CompletionRecord::completed(submission.writebacks.clone())),
+            Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {
-                Some(CompletionRecord::failed(error.clone()))
+                Some(self.failed_record(token, error.clone()))
             }
             Err(_) => None,
         };
@@ -494,6 +561,7 @@ impl ComputeProvider for NativeMetalProvider {
                 },
             );
         }
+        self.sync_completion_health();
         result
     }
 
@@ -505,15 +573,22 @@ impl ComputeProvider for NativeMetalProvider {
         self.check_token(token)?;
         let slot = self.slot(token)?;
         if !slot.record.is_running() {
-            return slot.record.wait(token, timeout);
+            let result = slot.record.wait(token, timeout);
+            self.sync_completion_health();
+            return result;
         }
         if slot.deadline.expired() {
-            return Err(self.fail_deadline(&slot, token));
+            let result = Err(self.fail_deadline(&slot, token));
+            self.sync_completion_health();
+            return result;
         }
         let observed = slot.record.wait(token, slot.deadline.clamp(timeout))?;
         if matches!(observed, CompletionDisposition::TimedOut { .. }) && slot.deadline.expired() {
-            return Err(self.fail_deadline(&slot, token));
+            let result = Err(self.fail_deadline(&slot, token));
+            self.sync_completion_health();
+            return result;
         }
+        self.sync_completion_health();
         Ok(observed)
     }
 
@@ -521,7 +596,9 @@ impl ComputeProvider for NativeMetalProvider {
         self.check_token(token)?;
         let slot = self.slot(token)?;
         slot.record.cancel();
-        slot.record.wait(token, Duration::ZERO)
+        let result = slot.record.wait(token, Duration::ZERO);
+        self.sync_completion_health();
+        result
     }
 
     fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
@@ -758,7 +835,13 @@ impl NativeMetalProvider {
             buffers,
         } = pending.resources.take().expect("encoded resources");
         pending.submitted = true;
-        let record = CompletionRecord::running();
+        let record = match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                CompletionRecord::running_with_observer(token, outbox.observer())
+            }
+            None => CompletionRecord::running(),
+        };
         self.completions()?.insert(
             token.submission_id,
             CompletionSlot {
@@ -769,6 +852,7 @@ impl NativeMetalProvider {
         );
         let abandoned = Arc::clone(&self.async_abandoned);
         let device_lost = Arc::clone(&state.device_lost);
+        let outbox = self.completion_outbox.clone();
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -819,6 +903,18 @@ impl NativeMetalProvider {
                         token: Some(token),
                     }),
                 ),
+            }
+            if let Some(outbox) = &outbox {
+                let health = if device_lost.load(Ordering::SeqCst) {
+                    ProviderHealth::DeviceLost
+                } else if abandoned.load(Ordering::SeqCst) {
+                    ProviderHealth::Exhausted
+                } else {
+                    ProviderHealth::Usable
+                };
+                if outbox.health() != health {
+                    let _ = outbox.publish_device(health);
+                }
             }
         });
         let block = handler.copy();

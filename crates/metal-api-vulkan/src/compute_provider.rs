@@ -4,6 +4,7 @@ use crate::{
     execute_pipeline_sequence_with_status, BoundDispatch, ContextHealth, PendingExecution,
     TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
 };
+use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
@@ -59,6 +60,7 @@ pub struct VulkanComputeProvider {
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
     observation_deadline: Duration,
     async_execution: bool,
+    completion_outbox: Option<Arc<CompletionOutbox>>,
 }
 
 impl VulkanComputeProvider {
@@ -90,6 +92,7 @@ impl VulkanComputeProvider {
             retire_tx: Mutex::new(None),
             observation_deadline: GPU_DEADLINE,
             async_execution: false,
+            completion_outbox: None,
         })
     }
 
@@ -102,6 +105,31 @@ impl VulkanComputeProvider {
 
     pub fn async_execution(&self) -> bool {
         self.async_execution
+    }
+
+    /// Publish admission, terminal transitions and device health through
+    /// `outbox`. The outbox must be scoped to this provider's device epoch.
+    /// Without an outbox the provider keeps its in-process behavior.
+    pub fn with_completion_outbox(
+        mut self,
+        outbox: Arc<CompletionOutbox>,
+    ) -> Result<Self, ProviderError> {
+        if outbox.device_epoch() != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "completion_outbox_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field("actual", FieldValue::Unsigned(outbox.device_epoch().get())));
+        }
+        self.completion_outbox = Some(outbox);
+        Ok(self)
+    }
+
+    /// Completion outbox attached to this provider, if any.
+    pub fn completion_outbox(&self) -> Option<&Arc<CompletionOutbox>> {
+        self.completion_outbox.as_ref()
     }
 
     /// Bound how long a deferred submission may remain non-terminal before
@@ -230,6 +258,7 @@ impl VulkanComputeProvider {
         let sender = slot.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<PendingExecution>();
             let context = Arc::clone(&self.executor.context);
+            let outbox = self.completion_outbox.clone();
             let _ = std::thread::Builder::new()
                 .name("vulkan-provider-retire".into())
                 .spawn(move || {
@@ -255,11 +284,137 @@ impl VulkanComputeProvider {
                                 }
                             }
                         }
+                        if let Some(outbox) = &outbox {
+                            sync_context_health(&context, outbox);
+                        }
                     }
                 });
             tx
         });
         let _ = sender.send(pending);
+    }
+
+    fn wait_inner(
+        &self,
+        token: CompletionToken,
+        timeout: Duration,
+    ) -> Result<CompletionDisposition, ProviderError> {
+        self.validate_token(token)?;
+        let (record, pending, pool, deadline) = {
+            let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
+            let slot = completions
+                .get_mut(&token.submission_id)
+                .ok_or_else(|| unknown_completion(token))?;
+            if !slot.record.is_running() {
+                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
+            } else if let Some(pending) = slot.pending.take() {
+                (
+                    Arc::clone(&slot.record),
+                    Some(pending),
+                    slot.pool.clone(),
+                    slot.deadline,
+                )
+            } else {
+                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
+            }
+        };
+        let Some(mut pending) = pending else {
+            return record.wait(token, timeout);
+        };
+        if deadline.expired() {
+            self.retire(pending);
+            return Err(self.fail_deadline(&record, token));
+        }
+        match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
+            Ok(true) => match pending
+                .read_updates()
+                .and_then(|updates| map_writebacks(&pool, updates, token))
+            {
+                Ok(writebacks) => {
+                    drop(pending);
+                    record.complete(writebacks);
+                    Ok(CompletionDisposition::CompletedVisible { token })
+                }
+                Err(error) => {
+                    drop(pending);
+                    record.fail(error.clone());
+                    Err(error)
+                }
+            },
+            Ok(false) => {
+                if deadline.expired() {
+                    self.retire(pending);
+                    return Err(self.fail_deadline(&record, token));
+                }
+                let mut pending = Some(pending);
+                let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
+                if let Some(slot) = completions.get_mut(&token.submission_id) {
+                    if slot.record.is_running() && slot.pending.is_none() {
+                        slot.pending = pending.take();
+                    }
+                }
+                drop(completions);
+                if let Some(pending) = pending {
+                    self.retire(pending);
+                }
+                Ok(CompletionDisposition::TimedOut { token })
+            }
+            Err(error) => {
+                drop(pending);
+                record.fail(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn cancel_inner(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
+        self.validate_token(token)?;
+        let (record, pending) = {
+            let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
+            let slot = completions
+                .get_mut(&token.submission_id)
+                .ok_or_else(|| unknown_completion(token))?;
+            (Arc::clone(&slot.record), slot.pending.take())
+        };
+        if let Some(pending) = pending {
+            self.retire(pending);
+        }
+        record.cancel();
+        record.wait(token, Duration::ZERO)
+    }
+
+    fn terminal_record(
+        &self,
+        token: CompletionToken,
+        writebacks: Vec<BufferWriteback>,
+    ) -> Arc<CompletionRecord> {
+        match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                let record = CompletionRecord::running_with_observer(token, outbox.observer());
+                record.complete(writebacks);
+                record
+            }
+            None => CompletionRecord::completed(writebacks),
+        }
+    }
+
+    fn failed_record(&self, token: CompletionToken, error: ProviderError) -> Arc<CompletionRecord> {
+        match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                let record = CompletionRecord::running_with_observer(token, outbox.observer());
+                record.fail(error);
+                record
+            }
+            None => CompletionRecord::failed(error),
+        }
+    }
+
+    fn sync_completion_health(&self) {
+        if let Some(outbox) = &self.completion_outbox {
+            sync_context_health(&self.executor.context, outbox);
+        }
     }
 
     fn fail_deadline(&self, record: &CompletionRecord, token: CompletionToken) -> ProviderError {
@@ -449,7 +604,9 @@ impl ComputeProvider for VulkanComputeProvider {
             device_epoch: self.epoch,
         };
         if self.async_execution {
-            return self.submit_async(pool, artifacts, buffers, dispatches, token);
+            let result = self.submit_async(pool, artifacts, buffers, dispatches, token);
+            self.sync_completion_health();
+            return result;
         }
         let result = execute_on_context(&self.executor, &artifacts, buffers, &dispatches)
             .and_then(|updates| {
@@ -465,9 +622,9 @@ impl ComputeProvider for VulkanComputeProvider {
             })
             .map_err(|error| attach_token(error, token));
         let observation = match &result {
-            Ok(output) => Some(CompletionRecord::completed(output.writebacks.clone())),
+            Ok(output) => Some(self.terminal_record(token, output.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {
-                Some(CompletionRecord::failed(error.clone()))
+                Some(self.failed_record(token, error.clone()))
             }
             Err(_) => None,
         };
@@ -485,6 +642,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     },
                 );
         }
+        self.sync_completion_health();
         result
     }
 
@@ -493,88 +651,15 @@ impl ComputeProvider for VulkanComputeProvider {
         token: CompletionToken,
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
-        self.validate_token(token)?;
-        let (record, pending, pool, deadline) = {
-            let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
-            let slot = completions
-                .get_mut(&token.submission_id)
-                .ok_or_else(|| unknown_completion(token))?;
-            if !slot.record.is_running() {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
-            } else if let Some(pending) = slot.pending.take() {
-                (
-                    Arc::clone(&slot.record),
-                    Some(pending),
-                    slot.pool.clone(),
-                    slot.deadline,
-                )
-            } else {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
-            }
-        };
-        let Some(mut pending) = pending else {
-            return record.wait(token, timeout);
-        };
-        if deadline.expired() {
-            self.retire(pending);
-            return Err(self.fail_deadline(&record, token));
-        }
-        match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
-            Ok(true) => match pending
-                .read_updates()
-                .and_then(|updates| map_writebacks(&pool, updates, token))
-            {
-                Ok(writebacks) => {
-                    drop(pending);
-                    record.complete(writebacks);
-                    Ok(CompletionDisposition::CompletedVisible { token })
-                }
-                Err(error) => {
-                    drop(pending);
-                    record.fail(error.clone());
-                    Err(error)
-                }
-            },
-            Ok(false) => {
-                if deadline.expired() {
-                    self.retire(pending);
-                    return Err(self.fail_deadline(&record, token));
-                }
-                let mut pending = Some(pending);
-                let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
-                if let Some(slot) = completions.get_mut(&token.submission_id) {
-                    if slot.record.is_running() && slot.pending.is_none() {
-                        slot.pending = pending.take();
-                    }
-                }
-                drop(completions);
-                if let Some(pending) = pending {
-                    self.retire(pending);
-                }
-                Ok(CompletionDisposition::TimedOut { token })
-            }
-            Err(error) => {
-                drop(pending);
-                record.fail(error.clone());
-                Err(error)
-            }
-        }
+        let result = self.wait_inner(token, timeout);
+        self.sync_completion_health();
+        result
     }
 
     fn cancel(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
-        self.validate_token(token)?;
-        let (record, pending) = {
-            let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
-            let slot = completions
-                .get_mut(&token.submission_id)
-                .ok_or_else(|| unknown_completion(token))?;
-            (Arc::clone(&slot.record), slot.pending.take())
-        };
-        if let Some(pending) = pending {
-            self.retire(pending);
-        }
-        record.cancel();
-        record.wait(token, Duration::ZERO)
+        let result = self.cancel_inner(token);
+        self.sync_completion_health();
+        result
     }
 
     fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
@@ -609,7 +694,13 @@ impl VulkanComputeProvider {
             ensure_executor_usable(&self.executor)?;
             PendingExecution::submit(&self.executor.context, &artifacts, &buffers, &dispatches)?
         };
-        let record = CompletionRecord::running();
+        let record = match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                CompletionRecord::running_with_observer(token, outbox.observer())
+            }
+            None => CompletionRecord::running(),
+        };
         self.completions
             .lock()
             .map_err(|_| registry_poisoned())?
@@ -766,6 +857,17 @@ fn execute_on_context(
 
 fn ensure_executor_usable(executor: &VulkanExecutor) -> Result<(), ProviderError> {
     ensure_context_usable(&executor.context)
+}
+
+fn sync_context_health(context: &VulkanContext, outbox: &CompletionOutbox) {
+    let health = match context.health() {
+        ContextHealth::Usable => ProviderHealth::Usable,
+        ContextHealth::Exhausted => ProviderHealth::Exhausted,
+        ContextHealth::DeviceLost => ProviderHealth::DeviceLost,
+    };
+    if outbox.health() != health {
+        let _ = outbox.publish_device(health);
+    }
 }
 
 fn ensure_context_usable(context: &VulkanContext) -> Result<(), ProviderError> {

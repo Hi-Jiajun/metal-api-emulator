@@ -4,6 +4,9 @@ use super::{
     assemble_owned_air, execute_copy_word, execute_indexed_boundary_dispatch,
     indexed_boundary_golden, wrap_air_bitcode,
 };
+use metal_api_core::completion::wire::{
+    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
+};
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferSource, BufferView, CompletionDisposition,
     CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
@@ -14,8 +17,22 @@ use metal_api_core::provider::{
 use metal_api_core::{Device, Library};
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Default)]
+struct RecordingSink {
+    messages: Mutex<Vec<CompletionMessage>>,
+}
+
+impl CompletionSink for RecordingSink {
+    fn deliver(&self, message: CompletionMessage) {
+        self.messages
+            .lock()
+            .expect("recording completion sink")
+            .push(message);
+    }
+}
 
 /// Exercise provider admission, GPU execution, writeback identity, and completion.
 /// Both paths share one Vulkan executor but compile and submit independently.
@@ -172,9 +189,17 @@ fn run_timeout_reclamation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn 
 /// same provider must still accept new work once the retired submission's
 /// fence signals.
 fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let sink = Arc::new(RecordingSink::default());
     let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
         .map_err(provider_error)?
         .with_async_execution(true);
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        sink.clone(),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
     let function = device
         .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
@@ -202,28 +227,33 @@ fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
         .validate_trace(trace.clone(), resources_for_trace(&trace)?)
         .map_err(provider_error)?;
     let submitted = provider.submit(admitted).map_err(provider_error)?;
-    let token = submitted
+    let cancelled_token = submitted
         .completion
         .token()
         .ok_or("cancelled submission has no token")?;
-    match provider.cancel(token).map_err(provider_error)? {
-        CompletionDisposition::Cancelled { token: cancelled } if cancelled == token => {}
+    match provider.cancel(cancelled_token).map_err(provider_error)? {
+        CompletionDisposition::Cancelled { token: cancelled } if cancelled == cancelled_token => {}
         other => return Err(format!("cancel did not release the slot: {other:?}").into()),
     }
     match provider
-        .wait(token, Duration::ZERO)
+        .wait(cancelled_token, Duration::ZERO)
         .map_err(provider_error)?
     {
-        CompletionDisposition::Cancelled { token: waited } if waited == token => {}
+        CompletionDisposition::Cancelled { token: waited } if waited == cancelled_token => {}
         other => return Err(format!("cancelled wait changed disposition: {other:?}").into()),
     }
-    match provider.readback(token) {
+    match provider.readback(cancelled_token) {
         Err(error)
             if error.slug == "completion_cancelled"
-                && error.completion == (CompletionDisposition::Cancelled { token }) => {}
+                && error.completion
+                    == (CompletionDisposition::Cancelled {
+                        token: cancelled_token,
+                    }) => {}
         other => return Err(format!("cancelled readback was not refused: {other:?}").into()),
     }
-    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_completion(cancelled_token)
+        .map_err(provider_error)?;
 
     // The cancelled submission was retired, not dropped in place: the provider
     // must still execute and read back new work.
@@ -232,17 +262,23 @@ fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
         .validate_trace(trace.clone(), resources_for_trace(&trace)?)
         .map_err(provider_error)?;
     let submitted = provider.submit(admitted).map_err(provider_error)?;
-    let token = submitted
+    let post_cancel_token = submitted
         .completion
         .token()
         .ok_or("post-cancel submission has no token")?;
     let observed = provider
-        .wait(token, Duration::from_secs(10))
+        .wait(post_cancel_token, Duration::from_secs(10))
         .map_err(provider_error)?;
-    if observed != (CompletionDisposition::CompletedVisible { token }) {
+    if observed
+        != (CompletionDisposition::CompletedVisible {
+            token: post_cancel_token,
+        })
+    {
         return Err(format!("post-cancel submission did not complete: {observed:?}").into());
     }
-    let readback = provider.readback(token).map_err(provider_error)?;
+    let readback = provider
+        .readback(post_cancel_token)
+        .map_err(provider_error)?;
     readback.validate_for_trace(&trace)?;
     let [writeback] = readback.writebacks.as_slice() else {
         return Err("post-cancel readback must contain exactly one writeback".into());
@@ -250,11 +286,37 @@ fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
     if writeback.bytes != 0x6745_2301_u32.to_le_bytes() {
         return Err("post-cancel readback bytes changed".into());
     }
-    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_completion(post_cancel_token)
+        .map_err(provider_error)?;
     provider
         .release_pipeline(&pipeline)
         .map_err(provider_error)?;
-    println!("PASS provider_cancellation slot_released=true context_usable=true readback=refused");
+
+    let observed = sink
+        .messages
+        .lock()
+        .expect("recording completion sink")
+        .iter()
+        .filter_map(|message| match message {
+            CompletionMessage::Token(update) => {
+                Some((update.token, update.sequence.get(), update.update.clone()))
+            }
+            CompletionMessage::Device(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        (cancelled_token, 1, CompletionUpdate::Submitted),
+        (cancelled_token, 2, CompletionUpdate::Cancelled),
+        (post_cancel_token, 1, CompletionUpdate::Submitted),
+        (post_cancel_token, 2, CompletionUpdate::CompletedVisible),
+    ];
+    if observed != expected {
+        return Err(format!("completion outbox stream changed: {observed:?}").into());
+    }
+    println!(
+        "PASS provider_cancellation slot_released=true context_usable=true readback=refused completion_outbox=Submitted,Cancelled,Submitted,CompletedVisible"
+    );
     Ok(())
 }
 

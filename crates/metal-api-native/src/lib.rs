@@ -186,7 +186,29 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use metal_api_core::completion::wire::{
+        CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
+    };
     use metal_api_core::provider::{DeviceEpoch, SemanticDigest, SubmissionId};
+    #[cfg(target_os = "macos")]
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct RecordingSink {
+        messages: Mutex<Vec<CompletionMessage>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CompletionSink for RecordingSink {
+        fn deliver(&self, message: CompletionMessage) {
+            self.messages
+                .lock()
+                .expect("recording completion sink")
+                .push(message);
+        }
+    }
 
     #[test]
     fn device_removed_is_distinct_from_other_command_buffer_errors() {
@@ -521,6 +543,10 @@ mod tests {
         let provider = provider
             .with_async_execution(true)
             .with_observation_deadline(Duration::ZERO);
+        let sink = Arc::new(RecordingSink::default());
+        let outbox =
+            Arc::new(CompletionOutbox::new(provider.device_epoch(), sink.clone()).unwrap());
+        let provider = provider.with_completion_outbox(outbox).unwrap();
         let pipeline = provider
             .compile(request("copy_word", COPY))
             .expect("reviewed copy_word fixture compiles");
@@ -608,5 +634,30 @@ mod tests {
         provider.release_completion(first_token).unwrap();
         provider.release_completion(second_token).unwrap();
         provider.release_pipeline(&pipeline).unwrap();
+
+        let observed = sink
+            .messages
+            .lock()
+            .expect("recording completion sink")
+            .iter()
+            .filter_map(|message| match message {
+                CompletionMessage::Token(update) => {
+                    Some((update.token, update.sequence.get(), update.update.clone()))
+                }
+                CompletionMessage::Device(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(observed.len() >= 3, "outbox stream: {observed:?}");
+        assert_eq!(observed[0], (first_token, 1, CompletionUpdate::Submitted));
+        assert_eq!(
+            observed[1],
+            (first_token, 2, CompletionUpdate::SubmittedUnknown)
+        );
+        assert_eq!(observed[2], (second_token, 1, CompletionUpdate::Submitted));
+        // The completion handler may still publish the second token's terminal
+        // transition after the test releases the slot.
+        assert!(observed[3..].iter().all(|(token, sequence, update)| {
+            *token == second_token && *sequence == 2 && update.is_terminal()
+        }));
     }
 }
