@@ -10,8 +10,13 @@
 //! TCP stream, a pipe pair or an in-memory buffer. The `unix` module (enabled
 //! on Unix targets) adds a `UnixStream` pair helper and a listener wrapper for
 //! the cross-process test and for a future owner/provider split.
+//!
+//! [`receiver::CompletionReceiver`] is the owner-side half: it applies received
+//! messages to a `metal_api_core::completion::wire::CompletionMirror` and can
+//! retire leases through the mirror's converged observation.
 
 pub mod codec;
+pub mod receiver;
 pub mod transport;
 
 #[cfg(unix)]
