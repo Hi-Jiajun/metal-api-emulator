@@ -27,7 +27,12 @@ uses the same wait/readback semantics.
    stale epochs, unknown pipelines, forged reflection, unsupported storage and
    narrowing overflow before creating request-specific Vulkan objects. A
    non-`None` `BufferView::attribute_stride` is refused during admission with
-   the structured `buffer_attribute_stride_unsupported` capability slug.
+   the structured `buffer_attribute_stride_unsupported` capability slug; an
+   unsupported trace schema version is `trace_schema_unsupported` (capability),
+   and pipeline/allocation/lease epoch mismatches share the
+   `resource_contract_invalid` resource class. The refusal table matches every
+   `ContractError` variant exhaustively, so a new variant cannot silently fall
+   back to the generic `trace_contract_invalid` args slug.
 5. In the default synchronous mode, a successful `submit` returns
    `CompletedVisible` and canonical writebacks sorted by
    `(allocation_id, view_id)`. Offsets are allocation-relative; only writable

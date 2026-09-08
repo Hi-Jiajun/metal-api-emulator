@@ -2495,32 +2495,100 @@ fn capability_error(slug: &'static str) -> ProviderError {
 }
 
 fn contract_error_refusal(error: ContractError) -> ProviderError {
+    use ContractError as E;
+
+    // Exhaustive on purpose: adding a `ContractError` variant must force a
+    // deliberate class/slug decision instead of silently becoming `Args`.
     let (class, slug) = match &error {
-        ContractError::UnknownAllocation(_)
-        | ContractError::DuplicateAllocation(_)
-        | ContractError::AllocationEpochMismatch { .. }
-        | ContractError::AllocationRangeOutOfBounds { .. }
-        | ContractError::DuplicateLease(_)
-        | ContractError::UnknownLease(_)
-        | ContractError::LeaseEpochMismatch { .. }
-        | ContractError::LeaseRangeOutOfBounds { .. }
-        | ContractError::LeaseMismatch { .. }
-        | ContractError::OverlappingWritableViews { .. }
-        | ContractError::ViewIdentityMismatch(_)
-        | ContractError::SnapshotAliasUnsupported(_) => {
+        // Resource lifecycle: identity, epoch, range and alias violations.
+        E::UnknownAllocation(_)
+        | E::DuplicateAllocation(_)
+        | E::AllocationEpochMismatch { .. }
+        | E::AllocationRangeOutOfBounds { .. }
+        | E::DuplicateLease(_)
+        | E::UnknownLease(_)
+        | E::LeaseEpochMismatch { .. }
+        | E::LeaseRangeOutOfBounds { .. }
+        | E::LeaseMismatch { .. }
+        | E::OverlappingWritableViews { .. }
+        | E::ViewIdentityMismatch(_)
+        | E::PipelineEpochMismatch { .. }
+        | E::SnapshotAliasUnsupported(_) => {
             (ProviderErrorClass::Resource, "resource_contract_invalid")
         }
-        ContractError::SourceLengthMismatch { .. } => {
+        E::CompletionEpochMismatch { .. } => {
+            (ProviderErrorClass::Resource, "completion_epoch_mismatch")
+        }
+        // Caller-supplied source and pointer shapes.
+        E::SourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "buffer_source_length_mismatch")
         }
-        ContractError::LeaseSourceLengthMismatch { .. } => {
+        E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
-        ContractError::UnsupportedAttributeStride => (
+        E::NullHostPointer(_) => (ProviderErrorClass::Args, "borrowed_host_pointer_null"),
+        // Well-formed input asking for a feature outside the B0 subset.
+        E::UnsupportedAttributeStride => (
             ProviderErrorClass::Capability,
             "buffer_attribute_stride_unsupported",
         ),
-        _ => (ProviderErrorClass::Args, "trace_contract_invalid"),
+        E::UnsupportedSchemaVersion(_) => {
+            (ProviderErrorClass::Capability, "trace_schema_unsupported")
+        }
+        E::UnsupportedDispatchType(_) => {
+            (ProviderErrorClass::Capability, "dispatch_type_unsupported")
+        }
+        E::SnapshotDispatchUnsupported(_) => (
+            ProviderErrorClass::Capability,
+            "snapshot_dispatch_unsupported",
+        ),
+        // Completion/writeback protocol returned by the caller.
+        E::DuplicateWriteback { .. }
+        | E::InvalidSubmissionCompletion(_)
+        | E::InvalidReadbackCompletion(_)
+        | E::WritebackBeforeCompletion
+        | E::WritebackPolicyMismatch(_)
+        | E::NonCanonicalWritebackOrder
+        | E::UnknownWriteback { .. }
+        | E::ReadOnlyWriteback(_)
+        | E::WritebackRangeOutOfBounds { .. }
+        | E::IncompleteWriteback(_)
+        | E::MissingWriteback { .. } => (ProviderErrorClass::Args, "writeback_contract_invalid"),
+        // Provider-side completion publication invariants: a provider bug, not
+        // caller input. The outbox returns `ContractError` directly, so they
+        // share this converter for a stable class.
+        E::CompletionPublishAfterTerminal(_)
+        | E::CompletionPublishAfterDeviceLost(_)
+        | E::CompletionHealthRegression { .. } => {
+            (ProviderErrorClass::Internal, "completion_protocol_invalid")
+        }
+        // Structural trace errors: the caller can fix the trace.
+        E::EmptyField(_)
+        | E::InvalidIdentity(_)
+        | E::ZeroLength(_)
+        | E::ZeroDimension { .. }
+        | E::ArithmeticOverflow(_)
+        | E::MisalignedPushConstantOffset(_)
+        | E::ConcurrentPassesUnsupported
+        | E::SerialBufferRebinding { .. }
+        | E::SerialResourceLimit { .. }
+        | E::DuplicateBinding(_)
+        | E::NonCanonicalBindingOrder(_)
+        | E::MissingBinding(_)
+        | E::UnknownBinding(_)
+        | E::AccessMismatch { .. }
+        | E::LocalSizeMismatch { .. }
+        | E::GridMismatch { .. }
+        | E::FixedGridRequiresExactDispatch
+        | E::DuplicateView(_)
+        | E::EmptyTrace
+        | E::EmptyPipelineTable
+        | E::UnknownPipeline(_)
+        | E::DuplicatePipeline(_)
+        | E::UnusedPipeline(_)
+        | E::MissingSnapshotIdentity(_)
+        | E::UnknownSnapshotIdentity(_)
+        | E::DispatchKindMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
         .expect("static provider refusal slug")
@@ -4465,6 +4533,70 @@ mod tests {
             error.detail,
             Some(ContractError::UnsupportedAttributeStride.to_string())
         );
+    }
+
+    #[test]
+    fn schema_version_is_a_structured_capability_refusal() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.schema_version = PROVIDER_SCHEMA_VERSION + 1;
+        let error = capabilities().admit(&value, &resources()).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.slug, "trace_schema_unsupported");
+        assert_eq!(
+            error.detail,
+            Some(ContractError::UnsupportedSchemaVersion(PROVIDER_SCHEMA_VERSION + 1).to_string())
+        );
+    }
+
+    #[test]
+    fn contract_error_refusal_classes_and_slugs_are_stable() {
+        let cases = [
+            (
+                ContractError::PipelineEpochMismatch {
+                    pipeline: PipelineId::new(4),
+                    expected: DeviceEpoch::new(1),
+                    actual: DeviceEpoch::new(2),
+                },
+                ProviderErrorClass::Resource,
+                "resource_contract_invalid",
+            ),
+            (
+                ContractError::CompletionEpochMismatch {
+                    expected: DeviceEpoch::new(1),
+                    actual: DeviceEpoch::new(2),
+                },
+                ProviderErrorClass::Resource,
+                "completion_epoch_mismatch",
+            ),
+            (
+                ContractError::NullHostPointer(LeaseId::new(1)),
+                ProviderErrorClass::Args,
+                "borrowed_host_pointer_null",
+            ),
+            (
+                ContractError::MissingBinding(0),
+                ProviderErrorClass::Args,
+                "trace_contract_invalid",
+            ),
+            (
+                ContractError::WritebackBeforeCompletion,
+                ProviderErrorClass::Args,
+                "writeback_contract_invalid",
+            ),
+            (
+                ContractError::CompletionPublishAfterTerminal(CompletionToken {
+                    submission_id: SubmissionId::new(1),
+                    device_epoch: DeviceEpoch::new(1),
+                }),
+                ProviderErrorClass::Internal,
+                "completion_protocol_invalid",
+            ),
+        ];
+        for (error, class, slug) in cases {
+            let refusal = contract_error_refusal(error);
+            assert_eq!(refusal.class, class, "unexpected class for {slug}");
+            assert_eq!(refusal.slug, slug);
+        }
     }
 
     #[test]
