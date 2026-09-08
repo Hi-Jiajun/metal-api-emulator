@@ -38,8 +38,12 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   waits on the completion fence in `wait`, while native Metal registers an
   `MTLCommandBuffer` completion handler that retains the command resources
   until readback. A configurable observation deadline (20 seconds by default,
-  `with_observation_deadline`) reports unknown completion and makes the
-  provider unusable for new work.
+  `with_observation_deadline`) publishes `SubmittedUnknown`; the timed-out
+  submission goes to the Vulkan retirement thread or the native completion
+  handler, so the provider keeps accepting new work unless the fence never
+  signals or Metal reports a command-buffer error. `ComputeProvider::cancel`
+  and `CommandBuffer::cancel` release a pending observation without claiming
+  device retirement.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
   reviewed MSL fixtures and shares the optional deferred completion mode.

@@ -14,8 +14,10 @@ the command pending until `wait_until_completed` observes completion, retrieves
 `readback` and lands validated writebacks. Both backends support the deferred
 path: Vulkan records and submits under its shared queue lock and observes a
 device fence in `wait`, while native Metal registers an `MTLCommandBuffer`
-completion handler. This increment does not add general shader support, guest
-memory, rendering or production reims routing.
+completion handler. A pending command can be cancelled: the provider releases
+its observation slot and the device reclaims the submission when it retires.
+This increment does not add general shader support, guest memory, rendering or
+production reims routing.
 
 ## Recording and execution
 
@@ -72,6 +74,11 @@ implements `readback`; otherwise the command fails at wait with a structured
 capability error and no host bytes change. Dropping a pending command releases
 its reservations and completion record without claiming that unknown GPU work
 retired; the backend's retention policy still governs GPU storage.
+`CommandBuffer::cancel` does the same explicitly: it calls
+`ComputeProvider::cancel`, drops the host reservations and marks the command
+`Failed` with `CompletionUnavailable(Cancelled)`. A cancel that races a
+completed result, or a provider that does not implement cancellation, never
+lands unvalidated bytes.
 
 ## Capture and comparison
 

@@ -36,11 +36,14 @@ uses the same wait/readback semantics.
    caller-supplied timeout and then performs readback; `readback` returns the
    same canonical writebacks after completion. A configurable observation
    deadline (20 seconds by default, `with_observation_deadline`) reports
-   `vulkan-completion-unknown` with `SubmittedUnknown` and makes the executor
-   unusable. `release_completion` hands a still-pending submission to a shared
-   retirement thread that waits for the fence and releases its handles.
-   `release_pipeline` removes a registry entry. In-progress submissions keep
-   their own artifact reference. These calls do not release abandoned GPU work.
+   `vulkan-completion-unknown` with `SubmittedUnknown`; the timed-out
+   submission goes to the same retirement thread, so the executor keeps
+   accepting new work unless the fence never signals. `cancel` releases the
+   observation slot and hands the pending submission to retirement, reporting
+   `Cancelled`; `release_completion` does the same for a still-pending
+   submission. `release_pipeline` removes a registry entry. In-progress
+   submissions keep their own artifact reference. These calls do not release
+   abandoned GPU work.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
@@ -49,8 +52,9 @@ Async mode still serializes submission with the same queue lock, so it overlaps
 host work and completion observation rather than concurrent GPU execution.
 There is no end-to-end deadline on compilation, locks, initialization or
 submit. The synchronous fence wait keeps a fixed 20-second bound; a configured
-observation deadline or caller deadline makes the executor unusable and
-reports unknown completion with retained resources. Live guest leases,
+observation deadline reports unknown completion and retires the submission
+when its fence signals. Resources are still retained to process exit when a
+fence never signals or a device-loss error is observed. Live guest leases,
 multi-pass ordering, general MTLB resolution and native Metal remain
 unimplemented.
 
