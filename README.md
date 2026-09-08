@@ -69,8 +69,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   the per-stream sequences, makes terminal replay idempotent and refuses
   contradictory transitions. `LoopbackTransport` is an in-memory test and
   diagnostic transport. The mirror composes with `LeaseLedger` through
-  `observe_into`; the actual IPC transport and provider wiring remain future
-  work.
+  `observe_into`; `metal-api-ipc` carries the stream over `MCW1` frames and
+  providers publish through the epoch-checked outbox. Guest memory, display and
+  VM behavior remain future work.
 - Cloud validation: commit `489b489c11b43afbf821295d9d5fe8d9303e1e79` passed
   the full v1-v7 five-path comparison: Swift native, Vulkan direct, Rust Metal
   provider, Vulkan object API and Rust Metal object API. The archived evidence

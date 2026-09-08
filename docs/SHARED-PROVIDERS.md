@@ -22,12 +22,15 @@ identity; it is not proof that two independently compiled modules are equal.
   general native reflection/footprint admission is implemented.
 
 The native backend uses one serialized Metal device/queue owner, fresh shared
-buffers, a retained pipeline and a synchronous completion boundary. It returns
-allocation-relative writable view data validated against the same core trace
-contract. Failed or timed-out submitted work invalidates the native context;
-unknown GPU resources remain retained rather than being freed prematurely.
-It does not add no-copy guest mappings, general buffer aliasing, multi-pass
-commands, asynchronous cancellation or production reims routing.
+buffers, a retained pipeline and a synchronous completion boundary by default,
+with an optional `MTLCommandBuffer` completion handler for deferred completion.
+It returns allocation-relative writable view data validated against the same
+core trace contract. A timeout observation retires the submission while the
+context stays usable until the abandonment budget is exhausted; unknown GPU
+resources remain retained rather than being freed prematurely.
+It supports no-copy host reservations, serial multi-pass commands and
+asynchronous cancellation; guest mappings, general buffer aliasing and
+production reims routing remain outside this subset.
 
 ## One capture runner
 
@@ -81,8 +84,9 @@ the owner mapping in place. A retained in-flight submission keeps the import
 held, and release is refused with `lease_in_use` until a destroying execution
 drop retires it. The native provider also imports `StagedLease` windows: it
 advertises `StorageMode::StagedLease`, resolves the admitted window through the
-same registry and uploads the copied bytes. It does not yet import guest memory
-or `newBufferWithBytesNoCopy`.
+same registry and uploads the copied bytes. It also maps aligned borrowed
+reservations with `newBufferWithBytesNoCopy:` and imports them as
+`BorrowedNoCopy`; guest memory import remains future work.
 
 ## Cross-process completion notifications
 
@@ -117,8 +121,11 @@ from the mirror alone. `metal-api-ipc::command` adds the opposite direction: a
 versioned `MCC1` request/response channel where the owner compiles, submits,
 waits, reads back, cancels and releases on a provider in another process, and
 imports staged leases plus descriptor-backed no-copy leases over the same
-connection, and chunk frames carry requests larger than one frame. dma-buf and
-guest memory plus the production guest/display path remain future work.
+connection, and chunk frames carry requests larger than one frame. A rejected
+duplicate import still consumes its descriptor so the connection stays framed.
+dma-buf is a deliberate non-goal for the Windows rail (Linux-only kernel
+object); host-pointer import and the copy rails are the fallbacks. Guest memory
+and the production guest/display path remain future work.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

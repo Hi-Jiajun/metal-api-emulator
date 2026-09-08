@@ -2516,6 +2516,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         ContractError::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
+        ContractError::UnsupportedAttributeStride => (
+            ProviderErrorClass::Capability,
+            "buffer_attribute_stride_unsupported",
+        ),
         _ => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
@@ -4448,6 +4452,19 @@ mod tests {
             });
         let error = capabilities().admit(&alias, &resources()).unwrap_err();
         assert_eq!(error.slug, "buffer_alias_unsupported");
+    }
+
+    #[test]
+    fn attribute_stride_is_a_structured_capability_refusal() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.passes[0].buffers[0].attribute_stride = Some(16);
+        let error = capabilities().admit(&value, &resources()).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.slug, "buffer_attribute_stride_unsupported");
+        assert_eq!(
+            error.detail,
+            Some(ContractError::UnsupportedAttributeStride.to_string())
+        );
     }
 
     #[test]

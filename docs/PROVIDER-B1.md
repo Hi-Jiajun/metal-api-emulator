@@ -25,7 +25,9 @@ uses the same wait/readback semantics.
 4. `submit` rechecks the receiving device's capabilities and registered artifact,
    including the exact function identity and reflected contract. It refuses
    stale epochs, unknown pipelines, forged reflection, unsupported storage and
-   narrowing overflow before creating request-specific Vulkan objects.
+   narrowing overflow before creating request-specific Vulkan objects. A
+   non-`None` `BufferView::attribute_stride` is refused during admission with
+   the structured `buffer_attribute_stride_unsupported` capability slug.
 5. In the default synchronous mode, a successful `submit` returns
    `CompletedVisible` and canonical writebacks sorted by
    `(allocation_id, view_id)`. Offsets are allocation-relative; only writable
@@ -70,13 +72,14 @@ submit. The synchronous fence wait keeps a fixed 20-second bound; a configured
 observation deadline reports unknown completion and retires the submission
 when its fence signals. Resources whose fence never signals are retained to
 process exit, but the abandonment budget bounds how many such submissions a
-provider will tolerate before it fails closed. Live guest leases, multi-pass
-ordering, general MTLB resolution and native Metal remain unimplemented. The
-core `LeaseLedger` defines completion-driven lease release, and
-`metal_api_core::completion::wire` defines the transport-independent
-notification stream and its sender-side publisher that will carry those tokens
-between processes; provider-side guest-memory import, the owner-to-provider
-command transport and native no-copy import remain unimplemented.
+provider will tolerate before it fails closed. Live guest leases and general
+MTLB resolution remain unimplemented. The core `LeaseLedger` defines
+completion-driven lease release, and `metal_api_core::completion::wire` defines
+the transport-independent notification stream and its sender-side publisher
+that carry those tokens between processes; `metal-api-ipc` carries the stream
+and the owner-to-provider `MCC1` command channel, and the native provider maps
+borrowed reservations with `newBufferWithBytesNoCopy:`. Provider-side
+guest-memory import remains unimplemented.
 
 ## Execution failures and visibility
 

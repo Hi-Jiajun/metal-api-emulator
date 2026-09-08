@@ -1273,6 +1273,17 @@ mod tests {
             assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
         }
 
+        // The wire format carries the field even though provider admission
+        // refuses a non-None attribute stride.
+        let mut strided = trace.clone();
+        strided.passes[0].buffers[0].attribute_stride = Some(16);
+        let request = CommandRequest::Submit {
+            trace: strided,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+
         let writeback = BufferWriteback {
             view_id: ViewId::new(31),
             allocation_id: AllocationId::new(41),
