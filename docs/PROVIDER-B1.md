@@ -158,6 +158,20 @@ parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 remote-provider channel-failure contract: a `RemoteProvider` whose
+  command channel closes reports `ProviderHealth::Exhausted` from `health()`
+  instead of blocking or claiming `DeviceLost`, and its operations fail with
+  the structured `provider_unavailable` resource error and
+  `Retryability::RetryAfterRecreate`; the owner must recreate the provider
+  before new work is admitted. Framing and contract errors remain
+  `command_transport_failed` with unknown retryability because they describe a
+  protocol defect rather than a missing provider. A local unnamed mapping is
+  now rejected with the args-class `shared_mapping_unnamed` instead of an I/O
+  error. The new IPC test
+  `remote_provider_reports_exhausted_after_the_command_channel_closes` uses a
+  one-shot server that answers `Capabilities` and `Health` then closes,
+  observes EOF on the next exchange and pins the `Usable` to `Exhausted`
+  transition plus the structured operation refusal.
 - 2026-09-08 owner-to-provider command channel: `metal-api-ipc::command` adds a
   versioned `MCC1` request/response channel with `RemoteProvider`,
   `serve_provider` and `serve_provider_unix`. The owner remotely compiles,

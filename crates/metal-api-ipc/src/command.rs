@@ -545,13 +545,15 @@ impl<R: Read, W: Write> RemoteProvider<R, W> {
         memory: &crate::shared::SharedMemory,
     ) -> Result<(), ProviderError> {
         let name = memory.mapping_name().ok_or_else(|| {
-            transport_error(
+            let mut error = ProviderError::new(
                 ProviderPhase::Resolve,
-                CommandError::Codec(CodecError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "shared mapping has no exported name",
-                ))),
+                ProviderErrorClass::Args,
+                "shared_mapping_unnamed",
             )
+            .expect("non-empty shared mapping slug");
+            error.retryability = Retryability::Never;
+            error.detail = Some("shared mapping has no exported name".into());
+            error
         })?;
         let len = memory.len();
         match self.exchange_with(
@@ -765,13 +767,30 @@ impl RemoteProvider<std::os::unix::net::UnixStream, std::os::unix::net::UnixStre
 }
 
 fn transport_error(phase: ProviderPhase, error: CommandError) -> ProviderError {
-    let mut provider_error = ProviderError::new(
-        phase,
-        ProviderErrorClass::Internal,
-        "command_transport_failed",
-    )
-    .expect("non-empty command transport slug");
-    provider_error.retryability = Retryability::Unknown;
+    // A closed channel is a provider-availability failure: the remote handle
+    // cannot serve new work and the owner must reconnect. Framing or contract
+    // errors stay internal because they describe a protocol defect rather than
+    // a missing provider.
+    let channel_closed = matches!(
+        &error,
+        CommandError::Codec(CodecError::Eof | CodecError::Io(_))
+    );
+    let (class, slug, retryability) = if channel_closed {
+        (
+            ProviderErrorClass::Resource,
+            "provider_unavailable",
+            Retryability::RetryAfterRecreate,
+        )
+    } else {
+        (
+            ProviderErrorClass::Internal,
+            "command_transport_failed",
+            Retryability::Unknown,
+        )
+    };
+    let mut provider_error =
+        ProviderError::new(phase, class, slug).expect("non-empty command transport slug");
+    provider_error.retryability = retryability;
     provider_error.detail = Some(error.to_string());
     provider_error
 }
@@ -1761,6 +1780,42 @@ mod tests {
         server_thread.join().unwrap().unwrap();
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         assert_eq!(imports.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_provider_reports_exhausted_after_the_command_channel_closes() {
+        let (client, mut server) = super::unix::pair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let response = match server.recv_request().unwrap() {
+                    CommandRequest::Capabilities => CommandResponse::Capabilities {
+                        epoch: DeviceEpoch::new(7),
+                        capabilities: fake_capabilities(),
+                    },
+                    CommandRequest::Health => CommandResponse::Health {
+                        health: ProviderHealth::Usable,
+                    },
+                    other => panic!("unexpected request {other:?}"),
+                };
+                server.send_response(&response).unwrap();
+                server.flush().unwrap();
+            }
+        });
+
+        let remote = RemoteProvider::connect(client).unwrap();
+        assert_eq!(remote.health(), ProviderHealth::Usable);
+        // The one-shot server closes the channel after the health reply, so the
+        // next exchange observes EOF.
+        server_thread.join().unwrap();
+        // A closed command channel degrades to Exhausted rather than blocking
+        // or claiming the device was lost: the owner must recreate the
+        // provider before new work can be admitted.
+        assert_eq!(remote.health(), ProviderHealth::Exhausted);
+        let error = remote.compile(compile_request()).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Resource);
+        assert_eq!(error.slug, "provider_unavailable");
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
     }
 
     #[cfg(unix)]
