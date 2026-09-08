@@ -119,15 +119,27 @@ It covers textual/raw/wrapped copies, the indexed 10x3 boundary/barrier case,
 nonzero view offsets, forged pipeline metadata, isolation between two providers
 on one executor, unknown completion tokens, use after registry release,
 zero-deadline reclamation, explicit cancellation with a recorded outbox stream,
-single-process completion over a Unix socket and a two-process owner/provider
-completion hop. The runner spawns itself with `--completion-child`: the child
-owns the Vulkan device and publishes admission and `CompletedVisible` through
-the real outbox and writer thread, while the parent owns only the listener,
-mirror and lease ledger. This is Vulkan-provider versus Vulkan-executor
-regression coverage, not native Metal parity.
+single-process completion over a Unix socket, a staged lease import where the
+owner supplies the reservation window and the provider executes and retires it,
+and a two-process owner/provider completion hop. The runner spawns itself with
+`--completion-child`: the child owns the Vulkan device and publishes admission
+and `CompletedVisible` through the real outbox and writer thread, while the
+parent owns only the listener, mirror and lease ledger. This is
+Vulkan-provider versus Vulkan-executor regression coverage, not native Metal
+parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 Vulkan staged lease import: `metal_api_core::provider` gains
+  `StagedLease`, `LeaseRegistry` and the `LeaseImporter` trait. The Vulkan
+  provider advertises `StorageMode::StagedLease`, copies the owner's reservation
+  window into provider-owned storage at submit time, slices each view from the
+  reservation, and refuses unimported, snapshot-mismatched or out-of-range
+  leases; `BorrowedNoCopy` remains typed-refused. Three new core tests cover
+  exact-length validation, import/release/duplicate resolution and foreign
+  epoch refusal. 224 Rust tests and 115 Python tests passed; Lavapipe reports
+  `provider_staged_lease lease=97 writeback=exact retired=true
+  refusal=lease_not_imported`.
 - 2026-09-08 two-process completion owner/provider smoke: `provider-smoke`
   gained a `--completion-child` mode. The parent binds a Unix listener, spawns
   the child, learns the child's device epoch and submission identity from its

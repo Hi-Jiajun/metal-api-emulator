@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Current version of the pure-value provider trace schema.
@@ -1029,6 +1030,221 @@ pub const fn disposition_retires_resources(disposition: CompletionDisposition) -
     )
 }
 
+/// Owner-issued lease backing staged into a provider.
+///
+/// `bytes` covers exactly the reservation window (`reservation.offset ..
+/// reservation.offset + reservation.length`). A provider that advertises
+/// [`StorageMode::StagedLease`] copies the bytes into provider-owned storage
+/// before execution; the owner's [`LeaseLedger`] remains the authority for
+/// when the owner backing may be dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedLease {
+    pub reservation: LeaseReservation,
+    pub bytes: Vec<u8>,
+}
+
+impl StagedLease {
+    /// Build a staged lease and validate the reservation/length pairing.
+    pub fn new(reservation: LeaseReservation, bytes: Vec<u8>) -> Result<Self, ContractError> {
+        let staged = Self { reservation, bytes };
+        staged.validate()?;
+        Ok(staged)
+    }
+
+    /// Validate identities, the reservation range and the byte length.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let lease_id = self.reservation.lease.lease_id;
+        if lease_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("staged lease id"));
+        }
+        if self.reservation.lease.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("staged lease allocation id"));
+        }
+        if self.reservation.lease.owner_epoch.is_zero() {
+            return Err(ContractError::InvalidIdentity("staged lease owner epoch"));
+        }
+        self.reservation.end()?;
+        let actual = u64::try_from(self.bytes.len())
+            .map_err(|_| ContractError::ArithmeticOverflow("staged lease length"))?;
+        if actual != self.reservation.length {
+            return Err(ContractError::LeaseSourceLengthMismatch {
+                lease: lease_id,
+                expected: self.reservation.length,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Lease identity the bytes are staged for.
+    pub const fn lease_id(&self) -> LeaseId {
+        self.reservation.lease.lease_id
+    }
+}
+
+/// Provider-side store of staged lease backing.
+///
+/// The registry owns copied bytes, not owner memory. Import refuses a duplicate
+/// identity, and [`LeaseRegistry::view_bytes`] refuses a lease whose reservation
+/// does not match the admitted resource snapshot.
+#[derive(Debug, Default)]
+pub struct LeaseRegistry {
+    leases: Mutex<BTreeMap<LeaseId, StagedLease>>,
+}
+
+impl LeaseRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of imported leases.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether no lease is imported.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Stage the bytes for one lease. A duplicate identity is refused until
+    /// [`LeaseRegistry::release`] drops the previous import.
+    pub fn import(&self, staged: StagedLease) -> Result<(), ProviderError> {
+        staged.validate().map_err(contract_error_refusal)?;
+        let lease_id = staged.lease_id();
+        let mut leases = self.lock();
+        if leases.contains_key(&lease_id) {
+            return Err(lease_error(
+                "lease_already_imported",
+                lease_id,
+                ProviderErrorClass::Args,
+            ));
+        }
+        leases.insert(lease_id, staged);
+        Ok(())
+    }
+
+    /// Drop one imported lease.
+    pub fn release(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        let mut leases = self.lock();
+        if leases.remove(&lease_id).is_none() {
+            return Err(lease_error(
+                "lease_not_imported",
+                lease_id,
+                ProviderErrorClass::Args,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve the view bytes for a staged lease.
+    ///
+    /// The admitted snapshot is authoritative: the staged reservation must
+    /// match it exactly, and the view must fall inside it.
+    pub fn view_bytes(
+        &self,
+        lease_id: LeaseId,
+        view: &BufferView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let leases = self.lock();
+        let staged = leases
+            .get(&lease_id)
+            .ok_or_else(|| lease_error("lease_not_imported", lease_id, ProviderErrorClass::Args))?;
+        let reservation = resources.lease(lease_id).ok_or_else(|| {
+            lease_error("lease_not_admitted", lease_id, ProviderErrorClass::Resource)
+        })?;
+        if staged.reservation != reservation {
+            return Err(lease_error(
+                "lease_snapshot_mismatch",
+                lease_id,
+                ProviderErrorClass::Resource,
+            ));
+        }
+        if reservation.lease.owner_epoch != device_epoch {
+            return Err(lease_error(
+                "lease_epoch_mismatch",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+            .with_field("expected", FieldValue::Unsigned(device_epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(reservation.lease.owner_epoch.get()),
+            ));
+        }
+        let lease_end = reservation.end().map_err(contract_error_refusal)?;
+        let view_end = view.offset.checked_add(view.length).ok_or_else(|| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("staged lease view range"))
+        })?;
+        let start = view.offset.checked_sub(reservation.offset).ok_or_else(|| {
+            lease_error(
+                "lease_range_out_of_bounds",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+        })?;
+        if view_end > lease_end {
+            return Err(lease_error(
+                "lease_range_out_of_bounds",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+            .with_field("view_end", FieldValue::Unsigned(view_end))
+            .with_field("lease_end", FieldValue::Unsigned(lease_end)));
+        }
+        let start = usize::try_from(start).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("staged lease offset"))
+        })?;
+        let length = usize::try_from(view.length).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow(
+                "staged lease view length",
+            ))
+        })?;
+        let end = start.checked_add(length).ok_or_else(|| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("staged lease slice"))
+        })?;
+        staged
+            .bytes
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                lease_error(
+                    "lease_range_out_of_bounds",
+                    lease_id,
+                    ProviderErrorClass::Resource,
+                )
+            })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<LeaseId, StagedLease>> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn lease_error(slug: &'static str, lease_id: LeaseId, class: ProviderErrorClass) -> ProviderError {
+    ProviderError::new(ProviderPhase::Resolve, class, slug)
+        .expect("non-empty lease error slug")
+        .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+}
+
+/// Provider-side import of owner-issued lease backing.
+///
+/// A provider advertising [`StorageMode::StagedLease`] implements this trait.
+/// Importing copies the bytes into provider-owned storage; the owner's
+/// [`LeaseLedger`] remains the authority for when the owner backing may be
+/// dropped.
+pub trait LeaseImporter {
+    /// Stage the bytes for `staged.reservation`.
+    fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError>;
+
+    /// Drop the staged bytes for `lease_id`.
+    fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError>;
+}
+
 /// Explicit identities needed when the legacy snapshot API is converted into
 /// a provider trace. The snapshot API only carries a Metal binding index; it
 /// must not be treated as an allocation identity by inference.
@@ -1958,6 +2174,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         ContractError::SourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "buffer_source_length_mismatch")
         }
+        ContractError::LeaseSourceLengthMismatch { .. } => {
+            (ProviderErrorClass::Args, "lease_source_length_mismatch")
+        }
         _ => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
@@ -2100,6 +2319,11 @@ pub enum ContractError {
     UnsupportedAttributeStride,
     SourceLengthMismatch {
         view: ViewId,
+        expected: u64,
+        actual: u64,
+    },
+    LeaseSourceLengthMismatch {
+        lease: LeaseId,
         expected: u64,
         actual: u64,
     },
@@ -2250,6 +2474,14 @@ impl fmt::Display for ContractError {
                 formatter,
                 "view {:?} source length {actual} does not match declared length {expected}",
                 view
+            ),
+            Self::LeaseSourceLengthMismatch {
+                lease,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "lease {lease:?} staged length {actual} does not match reservation length {expected}"
             ),
             Self::DuplicateAllocation(allocation) => {
                 write!(formatter, "duplicate allocation {:?}", allocation)
@@ -4167,6 +4399,165 @@ mod tests {
             ledger.register(lease_reservation(5, 2, 0, 0)),
             Err(ContractError::ZeroLength("lease reservation"))
         );
+    }
+
+    #[test]
+    fn staged_lease_requires_exact_reservation_bytes() {
+        let reservation = lease_reservation(1, 2, 0, 4);
+        assert!(StagedLease::new(reservation, vec![7; 4]).is_ok());
+        assert_eq!(
+            StagedLease::new(reservation, vec![7; 3]),
+            Err(ContractError::LeaseSourceLengthMismatch {
+                lease: LeaseId::new(1),
+                expected: 4,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            StagedLease::new(lease_reservation(0, 2, 0, 4), vec![0; 4]),
+            Err(ContractError::InvalidIdentity("staged lease id"))
+        );
+        assert_eq!(
+            StagedLease::new(lease_reservation(1, 2, 0, 0), Vec::new()),
+            Err(ContractError::ZeroLength("lease reservation"))
+        );
+    }
+
+    #[test]
+    fn lease_registry_imports_releases_and_resolves_view_bytes() {
+        let registry = LeaseRegistry::new();
+        assert!(registry.is_empty());
+        let reservation = lease_reservation(1, 2, 8, 16);
+        let bytes: Vec<u8> = (0..16).collect();
+        registry
+            .import(StagedLease::new(reservation, bytes.clone()).unwrap())
+            .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry
+                .import(StagedLease::new(reservation, bytes.clone()).unwrap())
+                .unwrap_err()
+                .slug,
+            "lease_already_imported"
+        );
+
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(2),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 64,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+
+        let mut view = buffer(1, 0);
+        view.allocation_id = AllocationId::new(2);
+        view.offset = 12;
+        view.length = 4;
+        view.source = BufferSource::StagedLease(LeaseId::new(1));
+        assert_eq!(
+            registry
+                .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap(),
+            vec![4, 5, 6, 7]
+        );
+
+        let mut outside = view.clone();
+        outside.offset = 24;
+        outside.length = 4;
+        assert_eq!(
+            registry
+                .view_bytes(LeaseId::new(1), &outside, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_range_out_of_bounds"
+        );
+
+        let mut mismatched = ResourceTableSnapshot::new();
+        mismatched
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(2),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 64,
+            })
+            .unwrap();
+        mismatched
+            .insert_lease(lease_reservation(1, 2, 4, 16))
+            .unwrap();
+        assert_eq!(
+            registry
+                .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &mismatched)
+                .unwrap_err()
+                .slug,
+            "lease_snapshot_mismatch"
+        );
+
+        let mut unadmitted = ResourceTableSnapshot::new();
+        unadmitted
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(2),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 64,
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &unadmitted)
+                .unwrap_err()
+                .slug,
+            "lease_not_admitted"
+        );
+
+        assert_eq!(
+            registry.release(LeaseId::new(9)).unwrap_err().slug,
+            "lease_not_imported"
+        );
+        registry.release(LeaseId::new(1)).unwrap();
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry
+                .view_bytes(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_not_imported"
+        );
+    }
+
+    #[test]
+    fn lease_registry_refuses_a_foreign_owner_epoch() {
+        let registry = LeaseRegistry::new();
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id: LeaseId::new(3),
+                allocation_id: AllocationId::new(4),
+                owner_epoch: DeviceEpoch::new(2),
+            },
+            offset: 0,
+            length: 4,
+        };
+        registry
+            .import(StagedLease::new(reservation, vec![0; 4]).unwrap())
+            .unwrap();
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(4),
+                owner_epoch: DeviceEpoch::new(2),
+                size: 8,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+        let mut view = buffer(1, 0);
+        view.allocation_id = AllocationId::new(4);
+        view.length = 4;
+        view.source = BufferSource::StagedLease(LeaseId::new(3));
+        let error = registry
+            .view_bytes(LeaseId::new(3), &view, DeviceEpoch::new(1), &resources)
+            .unwrap_err();
+        assert_eq!(error.slug, "lease_epoch_mismatch");
+        assert_eq!(error.fields.get("expected"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(error.fields.get("actual"), Some(&FieldValue::Unsigned(2)));
     }
 
     #[test]

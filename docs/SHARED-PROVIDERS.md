@@ -69,9 +69,13 @@ that establishes retirement out of band can call `retire`, and `device_lost`
 releases every registered lease as a teardown guarantee. Binding is
 idempotent, and one token may cover several leases.
 
-This is a core lifetime contract. Both providers still accept only
-`OwnedBytes` sources; importing owner-issued guest or no-copy leases remains
-future work.
+This is a core lifetime contract. The Vulkan provider also imports owner-issued
+`StagedLease` backing: `LeaseImporter::import_staged_lease` copies the
+reservation window into provider-owned storage, `StorageMode::StagedLease` is
+advertised in its capabilities, and a view is resolved from the imported bytes
+at submit time. The native provider still accepts only `OwnedBytes`; true
+no-copy import (external memory or `newBufferWithBytesNoCopy`) remains future
+work.
 
 ## Cross-process completion notifications
 

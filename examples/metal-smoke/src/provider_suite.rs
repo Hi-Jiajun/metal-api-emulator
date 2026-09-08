@@ -8,11 +8,12 @@ use metal_api_core::completion::wire::{
     CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate, MirrorOutcome,
 };
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView, CompletionDisposition,
-    CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch,
-    Dispatch, DispatchKind, DispatchType, FootprintProof, LeaseId, LeaseLedger, LeaseObservation,
-    LeaseReservation, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, SubmissionId, ViewId,
+    AllocationId, AllocationRecord, BufferAccess, BufferLease, BufferSource, BufferView,
+    CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass, ComputeProvider,
+    ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, LeaseId,
+    LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, OperationId,
+    PipelineCompileRequest, PipelineProvider, ProviderError, ProviderSubmission,
+    ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease, SubmissionId, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
@@ -73,6 +74,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_cancellation(Arc::clone(&executor))?;
     run_completion_ipc(Arc::clone(&executor))?;
     run_completion_ipc_process()?;
+    run_staged_lease(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -603,6 +605,137 @@ fn parse_handshake(line: &str) -> Result<(DeviceEpoch, CompletionToken), Box<dyn
             submission_id,
         },
     ))
+}
+
+/// Import owner-issued bytes for one lease, execute a view backed by that
+/// lease, retire it through the owner ledger and refuse it after release.
+fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"staged_lease".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let lease_id = LeaseId::new(97);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(197),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 8,
+    };
+    let mut input = 0x6745_2301_u32.to_le_bytes().to_vec();
+    input.extend_from_slice(&[0_u8; 4]);
+    provider
+        .import_staged_lease(StagedLease::new(reservation, input)?)
+        .map_err(provider_error)?;
+
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(97),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers: vec![
+                BufferView {
+                    view_id: ViewId::new(297),
+                    metal_binding: 0,
+                    allocation_id: AllocationId::new(197),
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::StagedLease(lease_id),
+                },
+                BufferView {
+                    view_id: ViewId::new(298),
+                    metal_binding: 1,
+                    allocation_id: AllocationId::new(198),
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                },
+            ],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        }],
+        completion_policy: CompletionPolicy::HostReadback,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(197),
+        owner_epoch: provider.device_epoch(),
+        size: 16,
+    })?;
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(198),
+        owner_epoch: provider.device_epoch(),
+        size: 32,
+    })?;
+    resources.insert_lease(reservation)?;
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!(
+            "staged lease submission did not complete: {:?}",
+            result.completion
+        )
+        .into());
+    };
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if ledger.observe(token, result.completion)? != LeaseObservation::Retired {
+        return Err("staged lease completion did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("staged lease was not release-ready".into());
+    }
+
+    provider
+        .release_staged_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let error = provider
+        .submit(admitted)
+        .expect_err("released staged lease must be refused");
+    if error.slug != "lease_not_imported" {
+        return Err(format!("released staged lease refused with {}", error.slug).into());
+    }
+
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    println!(
+        "PASS provider_staged_lease lease=97 writeback=exact retired=true refusal=lease_not_imported"
+    );
+    Ok(())
 }
 
 fn run_indexed_and_refusals(

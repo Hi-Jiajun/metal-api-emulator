@@ -10,10 +10,10 @@ pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
     CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch, FieldValue,
-    FunctionIdentity, FunctionSource, PipelineCompileRequest, PipelineId, PipelineProvider,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, Retryability, SemanticDigest, ShaderSource, SubmissionId,
-    ValidatedComputeTrace,
+    FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
+    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, Retryability,
+    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, ValidatedComputeTrace,
 };
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
@@ -40,8 +40,9 @@ struct CompletionSlot {
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
-/// selecting registered pipelines over an initialized view pool, with owned bytes and
-/// host readback. Each pass maps a subset of that pool to its pipeline's bindings.
+/// selecting registered pipelines over an initialized view pool, with owned
+/// bytes, staged lease imports and host readback. Each pass maps a subset of
+/// that pool to its pipeline's bindings.
 /// By default `submit` waits for GPU completion and readback, and `wait` only
 /// observes the recorded terminal result. `with_async_execution(true)` records
 /// and submits on the calling thread, returns `Submitted`, and defers the
@@ -61,6 +62,7 @@ pub struct VulkanComputeProvider {
     observation_deadline: Duration,
     async_execution: bool,
     completion_outbox: Option<Arc<CompletionOutbox>>,
+    staging: LeaseRegistry,
 }
 
 impl VulkanComputeProvider {
@@ -81,6 +83,12 @@ impl VulkanComputeProvider {
         let epoch = allocate_device_epoch()?;
         let mut capabilities = executor.provider_capabilities();
         capabilities.max_passes = 8;
+        if !capabilities
+            .storage_modes
+            .contains(&StorageMode::StagedLease)
+        {
+            capabilities.storage_modes.push(StorageMode::StagedLease);
+        }
         Ok(Self {
             executor,
             epoch,
@@ -93,6 +101,7 @@ impl VulkanComputeProvider {
             observation_deadline: GPU_DEADLINE,
             async_execution: false,
             completion_outbox: None,
+            staging: LeaseRegistry::new(),
         })
     }
 
@@ -445,6 +454,35 @@ impl VulkanComputeProvider {
     }
 }
 
+impl VulkanComputeProvider {
+    /// Staged lease registry owned by this provider.
+    pub fn lease_registry(&self) -> &LeaseRegistry {
+        &self.staging
+    }
+}
+
+impl LeaseImporter for VulkanComputeProvider {
+    fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError> {
+        if staged.reservation.lease.owner_epoch != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "lease_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(staged.reservation.lease.owner_epoch.get()),
+            ));
+        }
+        self.staging.import(staged)
+    }
+
+    fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        self.staging.release(lease_id)
+    }
+}
+
 impl PipelineProvider for VulkanComputeProvider {
     fn device_epoch(&self) -> DeviceEpoch {
         self.epoch
@@ -581,18 +619,27 @@ impl ComputeProvider for VulkanComputeProvider {
             .iter()
             .enumerate()
             .map(|(position, resource)| {
-                let BufferSource::OwnedBytes(bytes) = &resource.source else {
-                    return Err(refusal(
-                        ProviderPhase::Resolve,
-                        ProviderErrorClass::Capability,
-                        "storage_mode_unsupported",
-                    ));
+                let bytes = match &resource.source {
+                    BufferSource::OwnedBytes(bytes) => bytes.clone(),
+                    BufferSource::StagedLease(lease_id) => self.staging.view_bytes(
+                        *lease_id,
+                        resource,
+                        self.epoch,
+                        admitted.resources(),
+                    )?,
+                    BufferSource::BorrowedNoCopy(_) => {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "storage_mode_unsupported",
+                        ));
+                    }
                 };
                 Ok(BufferBinding {
                     // The validated pool has at most 64 resources. First-use
                     // Metal binding labels may repeat across different passes.
                     index: position as u32,
-                    bytes: bytes.clone(),
+                    bytes,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
