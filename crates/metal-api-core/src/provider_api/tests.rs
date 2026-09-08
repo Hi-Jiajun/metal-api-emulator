@@ -24,6 +24,9 @@ const ASYNC_UNKNOWN: usize = 13;
 const ASYNC_BAD_READBACK: usize = 14;
 const ASYNC_MISSING_READBACK: usize = 15;
 const ASYNC_DEVICE_LOST: usize = 16;
+const CANCEL_GOOD: usize = 17;
+const CANCEL_RACE_COMPLETED: usize = 18;
+const CANCEL_REFUSED: usize = 19;
 
 const fn is_async_mode(mode: usize) -> bool {
     matches!(
@@ -36,6 +39,9 @@ const fn is_async_mode(mode: usize) -> bool {
             | ASYNC_BAD_READBACK
             | ASYNC_MISSING_READBACK
             | ASYNC_DEVICE_LOST
+            | CANCEL_GOOD
+            | CANCEL_RACE_COMPLETED
+            | CANCEL_REFUSED
     )
 }
 
@@ -49,6 +55,7 @@ struct FakeProvider {
     released_completions: Mutex<Vec<CompletionToken>>,
     release_order: Mutex<Vec<&'static str>>,
     readbacks: Mutex<BTreeMap<SubmissionId, CompletionReadback>>,
+    cancelled: Mutex<Vec<CompletionToken>>,
     wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -65,6 +72,7 @@ impl FakeProvider {
             released_completions: Mutex::new(Vec::new()),
             release_order: Mutex::new(Vec::new()),
             readbacks: Mutex::new(BTreeMap::new()),
+            cancelled: Mutex::new(Vec::new()),
             wait_calls: AtomicUsize::new(0),
             gate: None,
         }
@@ -240,6 +248,21 @@ impl ComputeProvider for FakeProvider {
                 .unwrap()
                 .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) })
             })
+    }
+
+    fn cancel(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
+        self.cancelled.lock().unwrap().push(token);
+        match self.mode.load(Ordering::SeqCst) {
+            CANCEL_RACE_COMPLETED => Ok(CompletionDisposition::CompletedVisible { token }),
+            CANCEL_REFUSED => Err(ProviderError::new(
+                ProviderPhase::Wait,
+                ProviderErrorClass::Capability,
+                "completion_cancel_unsupported",
+            )
+            .unwrap()
+            .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) })),
+            _ => Ok(CompletionDisposition::Cancelled { token }),
+        }
     }
 }
 
@@ -893,4 +916,58 @@ fn concurrent_commands_with_opposite_binding_order_keep_both_updates() {
     });
     assert_eq!(a.read().unwrap(), vec![1, 1, 3, 3, 3, 3, 1, 1]);
     assert_eq!(b.read().unwrap(), vec![2, 2, 4, 4, 4, 4, 2, 2]);
+}
+
+#[test]
+fn cancelling_a_pending_command_releases_reservations_and_provider_slot() {
+    let (provider, device) = setup();
+    provider.mode.store(CANCEL_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:1");
+    let (a, av) = buffer(&device, 1);
+    let command = command(&device, &pipeline, &[(0, &av)]);
+    command.commit().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Committed);
+    command.cancel().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+    assert_eq!(provider.cancelled.lock().unwrap().len(), 1);
+    // The host reservation is released without waiting for device retirement.
+    assert_eq!(a.read().unwrap(), vec![1; 8]);
+    let error = command.wait_until_completed().unwrap_err();
+    assert!(matches!(
+        error,
+        Error::CompletionUnavailable(CompletionDisposition::Cancelled { .. })
+    ));
+    drop(command);
+    assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cancel_race_loss_and_refusal_never_land_results() {
+    for mode in [CANCEL_RACE_COMPLETED, CANCEL_REFUSED] {
+        let (provider, device) = setup();
+        provider.mode.store(mode, Ordering::SeqCst);
+        let pipeline = pipeline(&device, "wide:1");
+        let (a, av) = buffer(&device, 1);
+        let command = command(&device, &pipeline, &[(0, &av)]);
+        command.commit().unwrap();
+        assert!(command.cancel().is_err(), "mode={mode}");
+        assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+        assert_eq!(a.read().unwrap(), vec![1; 8], "mode={mode}");
+        drop(command);
+        assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn cancelling_a_recording_command_is_refused() {
+    let (provider, device) = setup();
+    provider.mode.store(CANCEL_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:1");
+    let (_, av) = buffer(&device, 1);
+    let command = command(&device, &pipeline, &[(0, &av)]);
+    assert!(matches!(
+        command.cancel(),
+        Err(Error::Api(ApiError::CommandBufferNotCommitted))
+    ));
+    assert!(provider.cancelled.lock().unwrap().is_empty());
 }

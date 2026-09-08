@@ -1111,12 +1111,13 @@ impl CompletionToken {
 /// Explicit completion observation. A timeout is non-terminal and may be
 /// followed by another wait on the same token. Terminal observations describe
 /// result availability, not permission to release GPU backing; in particular,
-/// `SubmittedUnknown` does not establish GPU retirement.
+/// `SubmittedUnknown` and `Cancelled` do not establish GPU retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionDisposition {
     NotSubmitted,
     Submitted { token: CompletionToken },
     CompletedVisible { token: CompletionToken },
+    Cancelled { token: CompletionToken },
     TimedOut { token: CompletionToken },
     Failed { token: Option<CompletionToken> },
     DeviceLost { token: Option<CompletionToken> },
@@ -1129,6 +1130,7 @@ impl CompletionDisposition {
             Self::NotSubmitted => Ok(()),
             Self::Submitted { token }
             | Self::CompletedVisible { token }
+            | Self::Cancelled { token }
             | Self::TimedOut { token } => token.validate(),
             Self::Failed { token }
             | Self::DeviceLost { token }
@@ -1143,6 +1145,7 @@ impl CompletionDisposition {
             Self::NotSubmitted => None,
             Self::Submitted { token }
             | Self::CompletedVisible { token }
+            | Self::Cancelled { token }
             | Self::TimedOut { token } => Some(token),
             Self::Failed { token }
             | Self::DeviceLost { token }
@@ -1154,6 +1157,7 @@ impl CompletionDisposition {
         matches!(
             self,
             Self::CompletedVisible { .. }
+                | Self::Cancelled { .. }
                 | Self::Failed { .. }
                 | Self::DeviceLost { .. }
                 | Self::SubmittedUnknown { .. }
@@ -1378,6 +1382,30 @@ pub trait ComputeProvider: Send + Sync {
         token: CompletionToken,
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError>;
+
+    /// Request cancellation of a deferred submission and release the
+    /// provider's observation slot. Cancellation never un-submits device work:
+    /// resources are reclaimed when the device retires the submission, or by
+    /// the backend's completion handler.
+    ///
+    /// Returns the terminal disposition observed at the time of the request.
+    /// `Cancelled` means the slot was still running and is now released from
+    /// observation; a terminal disposition means cancellation lost the race
+    /// and the original outcome is reported unchanged. After a successful
+    /// cancellation, `wait` keeps reporting `Cancelled` until
+    /// [`PipelineProvider::release_completion`] forgets the slot, and
+    /// `readback` refuses because no result was observed.
+    ///
+    /// Providers without deferred work may leave the default refusal.
+    fn cancel(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
+        Err(ProviderError::new(
+            ProviderPhase::Wait,
+            ProviderErrorClass::Capability,
+            "completion_cancel_unsupported",
+        )
+        .expect("non-empty provider error slug")
+        .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) }))
+    }
 
     /// Return host-visible writebacks for a token already observed as
     /// `CompletedVisible`. The returned completion must repeat that token.
@@ -3739,7 +3767,15 @@ mod tests {
             device_epoch: DeviceEpoch::new(1),
         };
         assert!(!CompletionDisposition::TimedOut { token }.is_terminal());
+        assert!(CompletionDisposition::Cancelled { token }.is_terminal());
         assert!(CompletionDisposition::SubmittedUnknown { token: Some(token) }.is_terminal());
+        assert_eq!(
+            CompletionDisposition::Cancelled { token }.token(),
+            Some(token)
+        );
+        assert!(CompletionDisposition::Cancelled { token }
+            .validate()
+            .is_ok());
         assert_eq!(
             CompletionDisposition::TimedOut { token }.token(),
             Some(token)

@@ -9,8 +9,10 @@
 //! from commit through that boundary, so concurrent CPU access and commands
 //! using those buffers wait for completion instead of racing the GPU. Dropping
 //! a pending command releases its reservations and completion record without
-//! claiming that unknown GPU work retired. This module does not extend the
-//! older [`crate::ComputeExecutor`] object API.
+//! claiming that unknown GPU work retired. Cancelling a pending command
+//! releases the provider observation slot and the host reservations without
+//! claiming device retirement. This module does not extend the older
+//! [`crate::ComputeExecutor`] object API.
 
 use crate::provider::{
     self as contract, AllocationId, AllocationRecord, BufferSource, BufferWriteback,
@@ -482,8 +484,10 @@ impl Drop for CommandShared {
 
 /// Single-use command buffer. A synchronous provider completes at commit; a
 /// provider returning `Submitted` completes on the first `wait_until_completed`
-/// after its readback passes exact-trace validation. No buffer bytes change if
-/// admission, execution, completion observation or readback validation fails.
+/// after its readback passes exact-trace validation. [`CommandBuffer::cancel`]
+/// abandons a pending observation without landing results. No buffer bytes
+/// change if admission, execution, completion observation or readback
+/// validation fails.
 pub struct CommandBuffer {
     shared: Arc<CommandShared>,
 }
@@ -556,6 +560,69 @@ impl CommandBuffer {
                 Err(error)
             }
         };
+        self.shared.completion.notify_all();
+        result
+    }
+
+    /// Cancel a committed command whose deferred completion has not landed.
+    ///
+    /// The provider releases its observation slot and the host reservations
+    /// covering the committed buffers are dropped, so CPU access resumes
+    /// without waiting for device retirement. The command becomes `Failed`
+    /// with [`Error::CompletionUnavailable`] carrying `Cancelled`. Device work
+    /// that was already submitted may still run; the provider reclaims its
+    /// backing when the device retires it. A command whose result already
+    /// landed, or whose provider refuses cancellation, cannot be cancelled and
+    /// reports the corresponding error.
+    pub fn cancel(&self) -> Result<(), Error> {
+        let pending = {
+            let mut inner = lock(&self.shared.inner, "provider command")?;
+            loop {
+                match inner.status {
+                    CommandBufferStatus::Recording => {
+                        return Err(ApiError::CommandBufferNotCommitted.into())
+                    }
+                    CommandBufferStatus::Completed | CommandBufferStatus::Failed => {
+                        return Err(inner
+                            .failure
+                            .clone()
+                            .unwrap_or(ApiError::CommandBufferNotCompleted.into()))
+                    }
+                    CommandBufferStatus::Committed => {
+                        if let Some(pending) = inner.pending.take() {
+                            break pending;
+                        }
+                        inner = self
+                            .shared
+                            .completion
+                            .wait(inner)
+                            .map_err(|_| ApiError::StatePoisoned("provider command"))?;
+                    }
+                }
+            }
+        };
+        let observed = provider_call(|| self.shared.owner.provider.cancel(pending.token));
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        let result = match observed {
+            Ok(CompletionDisposition::Cancelled { token }) if token == pending.token => {
+                inner.status = CommandBufferStatus::Failed;
+                inner.failure = Some(Error::CompletionUnavailable(
+                    CompletionDisposition::Cancelled { token },
+                ));
+                Ok(())
+            }
+            Ok(other) => {
+                inner.status = CommandBufferStatus::Failed;
+                inner.failure = Some(Error::CompletionUnavailable(other));
+                Err(Error::CompletionUnavailable(other))
+            }
+            Err(error) => {
+                inner.status = CommandBufferStatus::Failed;
+                inner.failure = Some(error.clone());
+                Err(error)
+            }
+        };
+        drop(pending);
         self.shared.completion.notify_all();
         result
     }
@@ -737,6 +804,7 @@ impl CommandBuffer {
                 }
                 CompletionDisposition::Failed { .. }
                 | CompletionDisposition::DeviceLost { .. }
+                | CompletionDisposition::Cancelled { .. }
                 | CompletionDisposition::SubmittedUnknown { .. } => {
                     return Err(Error::CompletionUnavailable(observed))
                 }

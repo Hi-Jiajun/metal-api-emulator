@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 enum CompletionState {
     Running,
     Completed(Vec<BufferWriteback>),
+    Cancelled,
     Failed(ProviderError),
 }
 
@@ -134,6 +135,26 @@ impl CompletionRecord {
         self.ready.notify_all();
     }
 
+    /// Record host-requested cancellation. Ignored if a terminal state already
+    /// won. Cancellation abandons the observation of device work; it is not
+    /// evidence that the GPU retired the submission.
+    pub fn cancel(&self) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                if matches!(*state, CompletionState::Running) {
+                    *state = CompletionState::Cancelled;
+                }
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                if matches!(*state, CompletionState::Running) {
+                    *state = CompletionState::Cancelled;
+                }
+            }
+        }
+        self.ready.notify_all();
+    }
+
     /// Whether the record has not yet observed a terminal state.
     pub fn is_running(&self) -> bool {
         match self.state.lock() {
@@ -173,6 +194,9 @@ impl CompletionRecord {
                 CompletionState::Completed(_) => {
                     return Ok(CompletionDisposition::CompletedVisible { token })
                 }
+                CompletionState::Cancelled => {
+                    return Ok(CompletionDisposition::Cancelled { token })
+                }
                 CompletionState::Failed(error) => return Err(error.clone()),
             }
         }
@@ -187,6 +211,13 @@ impl CompletionRecord {
                 completion: CompletionDisposition::CompletedVisible { token },
                 writebacks: writebacks.clone(),
             }),
+            CompletionState::Cancelled => Err(ProviderError::new(
+                ProviderPhase::Readback,
+                ProviderErrorClass::Execute,
+                "completion_cancelled",
+            )
+            .expect("non-empty completion record error slug")
+            .with_completion(CompletionDisposition::Cancelled { token })),
             CompletionState::Failed(error) => Err(error.clone()),
             CompletionState::Running => Err(ProviderError::new(
                 ProviderPhase::Readback,
@@ -300,6 +331,27 @@ mod tests {
         record.complete(vec![completion_writeback()]);
         assert_eq!(record.wait(token, Duration::ZERO).unwrap_err(), failure);
         assert_eq!(record.readback(token).unwrap_err(), failure);
+    }
+
+    #[test]
+    fn cancellation_is_a_terminal_observation() {
+        let token = completion_token();
+        let record = CompletionRecord::running();
+        record.cancel();
+        assert!(!record.is_running());
+        assert_eq!(
+            record.wait(token, Duration::ZERO).unwrap(),
+            CompletionDisposition::Cancelled { token }
+        );
+        let error = record.readback(token).unwrap_err();
+        assert_eq!(error.slug, "completion_cancelled");
+        assert_eq!(error.completion, CompletionDisposition::Cancelled { token });
+        // A late device completion cannot resurrect cancelled work.
+        record.complete(vec![completion_writeback()]);
+        assert_eq!(
+            record.wait(token, Duration::ZERO).unwrap(),
+            CompletionDisposition::Cancelled { token }
+        );
     }
 
     #[test]

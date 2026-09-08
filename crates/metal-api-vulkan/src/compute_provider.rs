@@ -534,6 +534,22 @@ impl ComputeProvider for VulkanComputeProvider {
         }
     }
 
+    fn cancel(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
+        self.validate_token(token)?;
+        let (record, pending) = {
+            let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
+            let slot = completions
+                .get_mut(&token.submission_id)
+                .ok_or_else(|| unknown_completion(token))?;
+            (Arc::clone(&slot.record), slot.pending.take())
+        };
+        if let Some(pending) = pending {
+            self.retire(pending);
+        }
+        record.cancel();
+        record.wait(token, Duration::ZERO)
+    }
+
     fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
         self.validate_token(token)?;
         let record = {

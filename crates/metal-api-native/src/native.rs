@@ -436,6 +436,13 @@ impl ComputeProvider for NativeMetalProvider {
         Ok(observed)
     }
 
+    fn cancel(&self, token: CompletionToken) -> Result<CompletionDisposition, ProviderError> {
+        self.check_token(token)?;
+        let slot = self.slot(token)?;
+        slot.record.cancel();
+        slot.record.wait(token, Duration::ZERO)
+    }
+
     fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
         self.check_token(token)?;
         self.slot(token)?.record.readback(token)

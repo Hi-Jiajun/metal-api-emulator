@@ -47,6 +47,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     }
     run_indexed_and_refusals(&provider, &peer, &device)?;
     run_timeout_reclamation(Arc::clone(&executor))?;
+    run_cancellation(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -163,6 +164,97 @@ fn run_timeout_reclamation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn 
     check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
     release_case(&recovery, &pipeline, &result)?;
     println!("PASS provider_timeout_reclamation deadline=0 context_usable=true writeback=exact");
+    Ok(())
+}
+
+/// Explicit cancellation releases the observation slot without claiming device
+/// retirement: `wait` keeps reporting `Cancelled`, `readback` refuses, and the
+/// same provider must still accept new work once the retired submission's
+/// fence signals.
+fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"cancellation".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let trace = make_trace(&pipeline, 92, dispatch, bindings())?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("cancelled submission has no token")?;
+    match provider.cancel(token).map_err(provider_error)? {
+        CompletionDisposition::Cancelled { token: cancelled } if cancelled == token => {}
+        other => return Err(format!("cancel did not release the slot: {other:?}").into()),
+    }
+    match provider
+        .wait(token, Duration::ZERO)
+        .map_err(provider_error)?
+    {
+        CompletionDisposition::Cancelled { token: waited } if waited == token => {}
+        other => return Err(format!("cancelled wait changed disposition: {other:?}").into()),
+    }
+    match provider.readback(token) {
+        Err(error)
+            if error.slug == "completion_cancelled"
+                && error.completion == (CompletionDisposition::Cancelled { token }) => {}
+        other => return Err(format!("cancelled readback was not refused: {other:?}").into()),
+    }
+    provider.release_completion(token).map_err(provider_error)?;
+
+    // The cancelled submission was retired, not dropped in place: the provider
+    // must still execute and read back new work.
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("post-cancel submission has no token")?;
+    let observed = provider
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("post-cancel submission did not complete: {observed:?}").into());
+    }
+    let readback = provider.readback(token).map_err(provider_error)?;
+    readback.validate_for_trace(&trace)?;
+    let [writeback] = readback.writebacks.as_slice() else {
+        return Err("post-cancel readback must contain exactly one writeback".into());
+    };
+    if writeback.bytes != 0x6745_2301_u32.to_le_bytes() {
+        return Err("post-cancel readback bytes changed".into());
+    }
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    println!("PASS provider_cancellation slot_released=true context_usable=true readback=refused");
     Ok(())
 }
 
