@@ -1,4 +1,4 @@
-//! Synchronous, owned-byte implementation of the first compute provider slice.
+//! Owned-byte implementation of the first compute provider slice.
 
 use crate::{
     execute_pipeline_sequence_with_status, BoundDispatch, TranslatedComputePipeline,
@@ -7,16 +7,17 @@ use crate::{
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
-    CompletionToken, ComputeProvider, DeviceEpoch, FieldValue, FunctionIdentity, FunctionSource,
-    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderPhase, ProviderSubmission, Retryability, SemanticDigest,
-    ShaderSource, SubmissionId, ValidatedComputeTrace,
+    CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch, FieldValue,
+    FunctionIdentity, FunctionSource, PipelineCompileRequest, PipelineId, PipelineProvider,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase, ProviderSubmission,
+    Retryability, SemanticDigest, ShaderSource, SubmissionId, ValidatedComputeTrace,
 };
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
 
@@ -25,15 +26,125 @@ struct RegisteredPipeline {
     artifact: Arc<VulkanPipelineArtifact>,
 }
 
+enum CompletionState {
+    Running,
+    Completed(Vec<BufferWriteback>),
+    Failed(ProviderError),
+}
+
+/// Shared slot between a submit path and later `wait`/`readback` calls.
+///
+/// A synchronous provider fills the slot before returning `CompletedVisible`.
+/// An asynchronous provider inserts `Running`, lets a worker fill it, and
+/// returns `Submitted` immediately. Removing the slot from the provider map
+/// does not cancel a worker; the worker's `Arc` keeps the record and its GPU
+/// resources alive until execution finishes.
+struct CompletionRecord {
+    state: Mutex<CompletionState>,
+    ready: Condvar,
+}
+
+impl CompletionRecord {
+    fn running() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CompletionState::Running),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn completed(writebacks: Vec<BufferWriteback>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CompletionState::Completed(writebacks)),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn failed(error: ProviderError) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CompletionState::Failed(error)),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn complete(&self, writebacks: Vec<BufferWriteback>) {
+        match self.state.lock() {
+            Ok(mut state) => *state = CompletionState::Completed(writebacks),
+            Err(poisoned) => *poisoned.into_inner() = CompletionState::Completed(writebacks),
+        }
+        self.ready.notify_all();
+    }
+
+    fn fail(&self, error: ProviderError) {
+        match self.state.lock() {
+            Ok(mut state) => *state = CompletionState::Failed(error),
+            Err(poisoned) => *poisoned.into_inner() = CompletionState::Failed(error),
+        }
+        self.ready.notify_all();
+    }
+
+    fn wait(
+        &self,
+        token: CompletionToken,
+        timeout: Duration,
+    ) -> Result<CompletionDisposition, ProviderError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self.state.lock().map_err(|_| registry_poisoned())?;
+        loop {
+            match &*state {
+                CompletionState::Running => {
+                    let Some(deadline) = deadline else {
+                        return Ok(CompletionDisposition::TimedOut { token });
+                    };
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(CompletionDisposition::TimedOut { token });
+                    }
+                    let (next, result) = self
+                        .ready
+                        .wait_timeout(state, deadline - now)
+                        .map_err(|_| registry_poisoned())?;
+                    state = next;
+                    if result.timed_out() && matches!(&*state, CompletionState::Running) {
+                        return Ok(CompletionDisposition::TimedOut { token });
+                    }
+                }
+                CompletionState::Completed(_) => {
+                    return Ok(CompletionDisposition::CompletedVisible { token })
+                }
+                CompletionState::Failed(error) => return Err(error.clone()),
+            }
+        }
+    }
+
+    fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
+        let state = self.state.lock().map_err(|_| registry_poisoned())?;
+        match &*state {
+            CompletionState::Completed(writebacks) => Ok(CompletionReadback {
+                completion: CompletionDisposition::CompletedVisible { token },
+                writebacks: writebacks.clone(),
+            }),
+            CompletionState::Failed(error) => Err(error.clone()),
+            CompletionState::Running => Err(refusal(
+                ProviderPhase::Readback,
+                ProviderErrorClass::Resource,
+                "completion_not_ready",
+            )
+            .with_completion(CompletionDisposition::Submitted { token })),
+        }
+    }
+}
+
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
 /// selecting registered pipelines over an initialized view pool, with owned bytes and
 /// host readback. Each pass maps a subset of that pool to its pipeline's bindings.
-/// `submit` waits for GPU completion and readback;
-/// `wait` only observes the recorded terminal result. Tokens and metadata are
-/// process-local, and no-copy leases and asynchronous submission are refused.
-/// Callers can explicitly release registered pipelines and completion records.
+/// By default `submit` waits for GPU completion and readback, and `wait` only
+/// observes the recorded terminal result. `with_async_execution(true)` moves
+/// the device work to a worker: `submit` returns `Submitted`, `wait` observes
+/// completion and `readback` returns the final writebacks. Tokens and metadata
+/// are process-local, and no-copy leases are refused. Callers can explicitly
+/// release registered pipelines and completion records.
 pub struct VulkanComputeProvider {
     executor: Arc<VulkanExecutor>,
     epoch: DeviceEpoch,
@@ -41,7 +152,8 @@ pub struct VulkanComputeProvider {
     next_pipeline: AtomicU64,
     next_submission: AtomicU64,
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
-    completions: Mutex<BTreeMap<SubmissionId, Result<CompletionDisposition, ProviderError>>>,
+    completions: Mutex<BTreeMap<SubmissionId, Arc<CompletionRecord>>>,
+    async_execution: bool,
 }
 
 impl VulkanComputeProvider {
@@ -70,7 +182,19 @@ impl VulkanComputeProvider {
             next_submission: AtomicU64::new(1),
             pipelines: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
+            async_execution: false,
         })
+    }
+
+    /// Select deferred submission. The default synchronous mode is retained
+    /// for the direct trace rail and existing captures.
+    pub fn with_async_execution(mut self, async_execution: bool) -> Self {
+        self.async_execution = async_execution;
+        self
+    }
+
+    pub fn async_execution(&self) -> bool {
+        self.async_execution
     }
 
     pub fn device_epoch(&self) -> DeviceEpoch {
@@ -150,8 +274,10 @@ impl VulkanComputeProvider {
         PipelineProvider::release_pipeline(self, pipeline)
     }
 
-    /// Forget a terminal observation. This releases no GPU resources; unknown
-    /// completion resources stay with the executor's abandonment policy.
+    /// Forget a completion observation. Removing a running async record does
+    /// not cancel its worker; the worker retains its GPU resources until
+    /// execution finishes. Unknown completion resources stay with the
+    /// executor's abandonment policy.
     pub fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
         self.validate_token(token)?;
         let _observation = self
@@ -347,22 +473,10 @@ impl ComputeProvider for VulkanComputeProvider {
             )?),
             device_epoch: self.epoch,
         };
-        let result = {
-            let _execution = self
-                .executor
-                .context
-                .execution_lock
-                .lock()
-                .map_err(|_| registry_poisoned())?;
-            self.ensure_usable()?;
-            execute_pipeline_sequence_with_status(
-                &self.executor.context,
-                &artifacts,
-                buffers,
-                &dispatches,
-            )
-        };
-        let result = result
+        if self.async_execution {
+            return self.submit_async(pool, artifacts, buffers, dispatches, token);
+        }
+        let result = execute_on_context(&self.executor, &artifacts, buffers, &dispatches)
             .and_then(|updates| {
                 let writebacks = map_writebacks(&pool, updates, token)?;
                 let output = ProviderSubmission {
@@ -376,20 +490,16 @@ impl ComputeProvider for VulkanComputeProvider {
             })
             .map_err(|error| attach_token(error, token));
         let observation = match &result {
-            Ok(output) => Some(Ok(output.completion)),
-            Err(error) if error.completion.token().is_some() => Some(Err(error.clone())),
+            Ok(output) => Some(CompletionRecord::completed(output.writebacks.clone())),
+            Err(error) if error.completion.token().is_some() => {
+                Some(CompletionRecord::failed(error.clone()))
+            }
             Err(_) => None,
         };
         if let Some(observation) = observation {
             self.completions
                 .lock()
-                .map_err(|_| {
-                    let completion = match &observation {
-                        Ok(disposition) => *disposition,
-                        Err(error) => error.completion,
-                    };
-                    registry_poisoned().with_completion(completion)
-                })?
+                .map_err(|_| registry_poisoned())?
                 .insert(token.submission_id, observation);
         }
         result
@@ -398,17 +508,83 @@ impl ComputeProvider for VulkanComputeProvider {
     fn wait(
         &self,
         token: CompletionToken,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
-        // Every token made observable by this synchronous provider is terminal.
-        // A timed-out underlying submit is SubmittedUnknown, not a waitable job.
         self.validate_token(token)?;
-        self.completions
+        let record = self
+            .completions
             .lock()
             .map_err(|_| registry_poisoned())?
             .get(&token.submission_id)
             .cloned()
-            .ok_or_else(|| unknown_completion(token))?
+            .ok_or_else(|| unknown_completion(token))?;
+        record.wait(token, timeout)
+    }
+
+    fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
+        self.validate_token(token)?;
+        let record = self
+            .completions
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .get(&token.submission_id)
+            .cloned()
+            .ok_or_else(|| unknown_completion(token))?;
+        record.readback(token)
+    }
+}
+
+impl VulkanComputeProvider {
+    fn submit_async(
+        &self,
+        pool: Vec<BufferView>,
+        artifacts: Vec<Arc<VulkanPipelineArtifact>>,
+        buffers: Vec<BufferBinding>,
+        dispatches: Vec<BoundDispatch>,
+        token: CompletionToken,
+    ) -> Result<ProviderSubmission, ProviderError> {
+        let record = CompletionRecord::running();
+        let executor = Arc::clone(&self.executor);
+        let worker_record = Arc::clone(&record);
+        let spawn = std::thread::Builder::new()
+            .name("vulkan-provider-async".into())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    execute_on_context(&executor, &artifacts, buffers, &dispatches)
+                }));
+                let outcome = match outcome {
+                    Ok(Ok(updates)) => map_writebacks(&pool, updates, token),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Internal,
+                        "vulkan_async_worker_panicked",
+                    )
+                    .with_completion(CompletionDisposition::SubmittedUnknown {
+                        token: Some(token),
+                    })),
+                };
+                match outcome {
+                    Ok(writebacks) => worker_record.complete(writebacks),
+                    Err(error) => worker_record.fail(error),
+                }
+            });
+        if let Err(error) = spawn {
+            return Err(refusal(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Resource,
+                "vulkan_async_worker_spawn_failed",
+            )
+            .with_detail(error.to_string()));
+        }
+        self.completions
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .insert(token.submission_id, record);
+        Ok(ProviderSubmission {
+            completion: CompletionDisposition::Submitted { token },
+            writebacks: Vec::new(),
+        })
     }
 }
 
@@ -510,6 +686,33 @@ fn map_writebacks(
     }
     writebacks.sort_by_key(|w| (w.allocation_id, w.view_id));
     Ok(writebacks)
+}
+
+/// Serialize device work with the standalone executor, then run the prepared
+/// sequence. The worker path calls this directly; the synchronous path calls
+/// it on the submitting thread.
+fn execute_on_context(
+    executor: &Arc<VulkanExecutor>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: Vec<BufferBinding>,
+    dispatches: &[BoundDispatch],
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let _execution = executor
+        .context
+        .execution_lock
+        .lock()
+        .map_err(|_| registry_poisoned())?;
+    executor.context.ensure_usable().map_err(|error| {
+        let mut result = refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Resource,
+            "provider_unavailable",
+        )
+        .with_detail(error.to_string());
+        result.retryability = Retryability::RetryAfterRecreate;
+        result
+    })?;
+    execute_pipeline_sequence_with_status(&executor.context, artifacts, buffers, dispatches)
 }
 
 fn attach_token(mut error: ProviderError, token: CompletionToken) -> ProviderError {
@@ -666,5 +869,75 @@ mod tests {
             attach_token(after, token).completion,
             CompletionDisposition::SubmittedUnknown { token: Some(token) }
         );
+    }
+
+    fn completion_token() -> CompletionToken {
+        CompletionToken {
+            device_epoch: DeviceEpoch::new(1),
+            submission_id: SubmissionId::new(2),
+        }
+    }
+
+    fn completion_writeback() -> BufferWriteback {
+        BufferWriteback {
+            view_id: ViewId::new(3),
+            allocation_id: AllocationId::new(4),
+            offset: 0,
+            bytes: vec![5; 4],
+        }
+    }
+
+    #[test]
+    fn completion_record_reports_running_timeout_then_completed_readback() {
+        let token = completion_token();
+        let record = CompletionRecord::running();
+        assert_eq!(
+            record.wait(token, Duration::ZERO).unwrap(),
+            CompletionDisposition::TimedOut { token }
+        );
+        assert!(
+            matches!(record.readback(token), Err(error) if error.slug == "completion_not_ready")
+        );
+        record.complete(vec![completion_writeback()]);
+        assert_eq!(
+            record.wait(token, Duration::ZERO).unwrap(),
+            CompletionDisposition::CompletedVisible { token }
+        );
+        let readback = record.readback(token).unwrap();
+        assert_eq!(
+            readback.completion,
+            CompletionDisposition::CompletedVisible { token }
+        );
+        assert_eq!(readback.writebacks, vec![completion_writeback()]);
+    }
+
+    #[test]
+    fn completion_record_waiter_wakes_on_worker_completion() {
+        let token = completion_token();
+        let record = CompletionRecord::running();
+        let worker = Arc::clone(&record);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            worker.complete(vec![completion_writeback()]);
+        });
+        assert_eq!(
+            record.wait(token, Duration::from_secs(5)).unwrap(),
+            CompletionDisposition::CompletedVisible { token }
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn completion_record_propagates_worker_failure() {
+        let token = completion_token();
+        let record = CompletionRecord::running();
+        let failure = refusal(
+            ProviderPhase::Wait,
+            ProviderErrorClass::Execute,
+            "synthetic_worker_failure",
+        );
+        record.fail(failure.clone());
+        assert_eq!(record.wait(token, Duration::ZERO).unwrap_err(), failure);
+        assert_eq!(record.readback(token).unwrap_err(), failure);
     }
 }

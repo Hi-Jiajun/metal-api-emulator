@@ -1,9 +1,11 @@
-# B1: synchronous Vulkan provider
+# B1: Vulkan provider
 
 `VulkanComputeProvider` implements the core `ComputeProvider` trait for a
 single serial exact-thread pass, owned byte views and complete host readback.
 The existing `ComputeExecutor` remains available as an independent application
 entry point. Both paths share Vulkan execution machinery and the queue lock.
+The provider defaults to synchronous execution and can be switched to deferred
+completion with `with_async_execution(true)`.
 
 ## Invocation and ownership
 
@@ -22,20 +24,26 @@ entry point. Both paths share Vulkan execution machinery and the queue lock.
    including the exact function identity and reflected contract. It refuses
    stale epochs, unknown pipelines, forged reflection, unsupported storage and
    narrowing overflow before creating request-specific Vulkan objects.
-5. A successful `submit` returns `CompletedVisible` and canonical writebacks
-   sorted by `(allocation_id, view_id)`. Offsets are allocation-relative; only
-   writable views are returned, each exactly once at its complete declared size.
-6. `wait` observes the recorded terminal disposition. `release_completion` drops
-   that observation; `release_pipeline` removes a registry entry. In-progress
-   submissions keep their own artifact reference. Records otherwise remain until
-   the provider is dropped. These calls do not release abandoned GPU work.
+5. In the default synchronous mode, a successful `submit` returns
+   `CompletedVisible` and canonical writebacks sorted by
+   `(allocation_id, view_id)`. Offsets are allocation-relative; only writable
+   views are returned, each exactly once at its complete declared size.
+6. In async mode, `submit` returns `Submitted` after preparing the owned-byte
+   request and starting one worker under the shared queue lock. `wait` observes
+   completion with its caller-supplied timeout; `readback` returns the same
+   canonical writebacks after completion. `release_completion` drops the
+   observation without cancelling a running worker; the worker retains its GPU
+   resources until execution finishes. `release_pipeline` removes a registry
+   entry. In-progress submissions keep their own artifact reference. These calls
+   do not release abandoned GPU work.
 
-This provider supports synchronous commit only: `submit` returns
-`CompletedVisible` and `wait(timeout)` does not launch a second wait because
-the returned token is already terminal. The object API can accept a provider
-that returns `Submitted` and implements `readback`; this implementation does
-not.
-There is no end-to-end deadline on compilation, locks, initialization or submit.
+The synchronous mode keeps the direct trace rail and existing captures
+unchanged. The async mode is used by the object-API capture path with
+`provider-capture --api objects --async`; CI runs v1-v7 this way on Lavapipe.
+The worker still serializes device execution with the same queue lock, so async
+mode overlaps host work and record observation rather than concurrent GPU
+execution. There is no end-to-end deadline on compilation, locks, initialization
+or submit.
 The existing 20-second fence timeout makes the executor unusable and reports
 unknown completion with retained resources. Live guest leases, multi-pass
 ordering, general MTLB resolution and native Metal remain unimplemented.
@@ -81,6 +89,12 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 async increment: 144 Rust tests passed (core 86, native 7,
+  Vulkan 37, capture 14) and 113 Python tests passed. Linux/Lavapipe ran
+  `provider-capture --api objects --async` for v1-v7 (26 cases) with the same
+  host-visible writebacks and allocations as the suite; the default synchronous
+  direct/object captures were unchanged. Formatting, Clippy with `-D warnings`
+  and rustdoc passed.
 - 58 unit tests passed: 41 core and 17 Vulkan. New cases include result identity,
   writable-view coverage, premature writeback, range/order validation, bounded
   ID generation, narrowing and execution-failure classification.

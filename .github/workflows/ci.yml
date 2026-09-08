@@ -65,6 +65,19 @@ jobs:
             python3 conformance/compare.py --suite "$suite" --check "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
           done
 
+      - name: Capture Vulkan through async object API
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          for version in 1 2 3 4 5 6 7; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --async --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-async-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/vulkan-captures/vulkan-objects-async-v${version}.json"
+          done
+
       - name: Preserve Vulkan report
         uses: actions/upload-artifact@v4
         with:

@@ -53,15 +53,22 @@ impl Backend {
     }
 }
 
-fn create_provider(backend: Backend) -> Result<(Arc<dyn PipelineProvider>, String)> {
+fn create_provider(
+    backend: Backend,
+    async_execution: bool,
+) -> Result<(Arc<dyn PipelineProvider>, String)> {
     match backend {
         Backend::Vulkan => {
             let provider = VulkanComputeProvider::new()
-                .map_err(|error| format!("create Vulkan provider: {error:?}"))?;
+                .map_err(|error| format!("create Vulkan provider: {error:?}"))?
+                .with_async_execution(async_execution);
             let name = provider.device_name().to_owned();
             Ok((Arc::new(provider), name))
         }
         Backend::NativeMetalProvider => {
+            if async_execution {
+                return Err("--async requires the Vulkan backend".into());
+            }
             #[cfg(target_os = "macos")]
             {
                 let provider = NativeMetalProvider::new()
@@ -186,13 +193,18 @@ fn main() -> Result<()> {
     let mut output_path = None;
     let mut backend = None;
     let mut api = None;
+    let mut async_execution = false;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
                 "usage: provider-capture --suite conformance/suite.json [--output capture.json] \
-                 [--backend vulkan|native-metal-provider] [--api trace|objects]"
+                 [--backend vulkan|native-metal-provider] [--api trace|objects] [--async]"
             );
             return Ok(());
+        }
+        if flag == "--async" {
+            async_execution = true;
+            continue;
         }
         if flag == "--backend" && backend.is_none() {
             backend = Some(
@@ -225,6 +237,9 @@ fn main() -> Result<()> {
     }
     let backend = backend.unwrap_or(Backend::Vulkan);
     let api = api.unwrap_or(EntryApi::Trace);
+    if async_execution && api != EntryApi::Objects {
+        return Err("--async requires --api objects".into());
+    }
     let suite_path = suite_path.ok_or("--suite is required")?;
     if output_path.as_ref().is_some_and(|path| path.exists()) {
         return Err("refusing to overwrite an existing capture".into());
@@ -251,7 +266,7 @@ fn main() -> Result<()> {
         }
     }
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name) = create_provider(backend)?;
+    let (provider, device_name) = create_provider(backend, async_execution)?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
     let mut results = Vec::new();
@@ -344,7 +359,7 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|program| object_pipelines[&program.entry].clone())
                 .collect::<Vec<_>>();
-            run_object_case(device, &programs, case, suite.guard_byte)?
+            run_object_case(device, &programs, case, suite.guard_byte, async_execution)?
         } else {
             run_case(
                 provider.as_ref(),
@@ -998,6 +1013,7 @@ fn run_object_case(
     programs: &[objects::Pipeline],
     case: &Case,
     guard: u8,
+    async_execution: bool,
 ) -> Result<CaseResult> {
     // Fixture IDs are report labels only. The object API creates and validates
     // its own allocation/view identities before they are mapped back here.
@@ -1052,6 +1068,17 @@ fn run_object_case(
     }
     encoder.end_encoding()?;
     command.commit()?;
+    if async_execution {
+        if command.status()? != metal_api_core::CommandBufferStatus::Committed {
+            return Err("async object commit did not leave the command pending".into());
+        }
+        if !matches!(
+            command.submission()?.completion,
+            CompletionDisposition::Submitted { .. }
+        ) {
+            return Err("async object commit did not return a submitted token".into());
+        }
+    }
     command.wait_until_completed()?;
     if command.status()? != metal_api_core::CommandBufferStatus::Completed {
         return Err("object command did not reach Completed".into());

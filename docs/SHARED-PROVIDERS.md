@@ -115,8 +115,10 @@ The [resource-subset extension](../conformance/RESOURCE-SUBSETS.md) admits up to
 selected pipeline. Later first use is supported; repeated view identities
 retain their original allocation, range and initial bytes. The complete union
 is validated and uploaded before encoding. Readback covers every view written
-by any pass. Asynchronous work, mid-execution CPU uploads and general aliasing
-remain outside this provider subset. V1-v7 passed
+by any pass. The Vulkan provider's optional async mode defers completion to a
+worker but still serializes device execution; concurrent GPU execution,
+mid-execution CPU uploads and general aliasing remain outside this provider
+subset. V1-v7 passed
 [three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 
 The subsequent [provider object API](PROVIDER-OBJECTS.md) connects application
