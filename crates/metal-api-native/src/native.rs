@@ -218,16 +218,16 @@ impl NativeMetalProvider {
 
     /// Report whether this provider can still admit new work.
     pub fn health(&self) -> ProviderHealth {
-        let (state_abandoned, device_lost) = match self.state.lock() {
-            Ok(state) => (state.abandoned, state.device_lost.load(Ordering::SeqCst)),
-            Err(poisoned) => {
-                let state = poisoned.into_inner();
-                (state.abandoned, state.device_lost.load(Ordering::SeqCst))
-            }
-        };
-        if device_lost {
+        match self.state.lock() {
+            Ok(state) => self.health_from_state(&state),
+            Err(poisoned) => self.health_from_state(&poisoned.into_inner()),
+        }
+    }
+
+    fn health_from_state(&self, state: &State) -> ProviderHealth {
+        if state.device_lost.load(Ordering::SeqCst) {
             ProviderHealth::DeviceLost
-        } else if state_abandoned || self.async_abandoned.load(Ordering::SeqCst) {
+        } else if state.abandoned || self.async_abandoned.load(Ordering::SeqCst) {
             ProviderHealth::Exhausted
         } else {
             ProviderHealth::Usable
@@ -326,8 +326,11 @@ impl NativeMetalProvider {
     }
 
     fn sync_completion_health(&self) {
+        self.publish_health(self.health());
+    }
+
+    fn publish_health(&self, health: ProviderHealth) {
         if let Some(outbox) = &self.completion_outbox {
-            let health = self.health();
             if outbox.health() != health {
                 let _ = outbox.publish_device(health);
             }
@@ -540,7 +543,7 @@ impl ComputeProvider for NativeMetalProvider {
         };
         if self.async_execution {
             let result = self.submit_async(&mut state, trace, pipelines, token);
-            self.sync_completion_health();
+            self.publish_health(self.health_from_state(&state));
             return result;
         }
         let result = objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token));
@@ -561,7 +564,7 @@ impl ComputeProvider for NativeMetalProvider {
                 },
             );
         }
-        self.sync_completion_health();
+        self.publish_health(self.health_from_state(&state));
         result
     }
 
