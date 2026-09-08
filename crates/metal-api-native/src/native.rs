@@ -2,17 +2,21 @@
 //! memory are passed to Metal; submission copies admitted view contents.
 
 use crate::{bounded_contract, refusal, unknown_completion};
+use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef,
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
     MTLResourceOptions, MTLSize,
 };
+use metal_api_core::completion::CompletionRecord;
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::sync::{Mutex, MutexGuard};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const GPU_DEADLINE: Duration = Duration::from_secs(20);
@@ -27,24 +31,36 @@ struct State {
     device: Device,
     queue: CommandQueue,
     pipelines: BTreeMap<PipelineId, RegisteredPipeline>,
-    completions: BTreeMap<SubmissionId, Result<CompletionDisposition, ProviderError>>,
     next_pipeline: u64,
     next_submission: u64,
     abandoned: bool,
 }
 
-/// Synchronous native provider with at most eight serial passes over one buffer
-/// pool, allowing pipeline changes and binding permutations for exact fixtures.
+#[derive(Clone)]
+struct CompletionSlot {
+    record: Arc<CompletionRecord>,
+    started: Instant,
+}
+
+/// Native provider with at most eight serial passes over one buffer pool,
+/// allowing pipeline changes and binding permutations for exact fixtures.
 ///
 /// A submission has a 20-second observation deadline. Unknown retirement or a
 /// GPU error permanently disables new work in this context and retains its
 /// submitted backing until process exit. `wait` reads the recorded terminal
-/// observation; releasing that record does not retire GPU resources.
+/// observation; releasing that record does not retire GPU resources. By
+/// default `submit` waits for GPU completion and readback. Calling
+/// [`NativeMetalProvider::with_async_execution`] with `true` instead returns
+/// `Submitted` immediately and fills the completion record from an
+/// `MTLCommandBuffer` completion handler.
 pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
     capabilities: ProviderCapabilities,
     state: Mutex<State>,
+    completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
+    async_execution: bool,
+    async_abandoned: Arc<AtomicBool>,
 }
 
 impl NativeMetalProvider {
@@ -106,17 +122,31 @@ impl NativeMetalProvider {
                     device,
                     queue,
                     pipelines: BTreeMap::new(),
-                    completions: BTreeMap::new(),
                     next_pipeline: 1,
                     next_submission: 1,
                     abandoned: false,
                 }),
+                completions: Mutex::new(BTreeMap::new()),
+                async_execution: false,
+                async_abandoned: Arc::new(AtomicBool::new(false)),
             })
         })
     }
 
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// Select deferred submission. The default synchronous mode is retained
+    /// for existing direct captures and for providers that need immediate
+    /// readback.
+    pub fn with_async_execution(mut self, async_execution: bool) -> Self {
+        self.async_execution = async_execution;
+        self
+    }
+
+    pub fn async_execution(&self) -> bool {
+        self.async_execution
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, ProviderError> {
@@ -127,6 +157,46 @@ impl NativeMetalProvider {
                 "provider_registry_poisoned",
             )
         })
+    }
+
+    fn ensure_usable(&self, state: &State) -> Result<(), ProviderError> {
+        if state.abandoned || self.async_abandoned.load(Ordering::SeqCst) {
+            let mut error = resource_error("provider_unavailable");
+            error.retryability = Retryability::RetryAfterRecreate;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn completions(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<SubmissionId, CompletionSlot>>, ProviderError> {
+        self.completions.lock().map_err(|_| {
+            refusal(
+                ProviderPhase::Wait,
+                ProviderErrorClass::Internal,
+                "provider_registry_poisoned",
+            )
+        })
+    }
+
+    fn slot(&self, token: CompletionToken) -> Result<CompletionSlot, ProviderError> {
+        self.completions()?
+            .get(&token.submission_id)
+            .cloned()
+            .ok_or_else(|| unknown_completion(token))
+    }
+
+    fn fail_deadline(&self, slot: &CompletionSlot, token: CompletionToken) -> ProviderError {
+        let error = refusal(
+            ProviderPhase::Wait,
+            ProviderErrorClass::Execute,
+            "metal_completion_unknown",
+        )
+        .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) });
+        slot.record.fail(error.clone());
+        self.async_abandoned.store(true, Ordering::SeqCst);
+        error
     }
 
     fn check_epoch(&self, epoch: DeviceEpoch) -> Result<(), ProviderError> {
@@ -166,7 +236,7 @@ impl PipelineProvider for NativeMetalProvider {
     ) -> Result<CompiledComputePipeline, ProviderError> {
         let contract = bounded_contract(&request)?;
         let mut state = self.lock()?;
-        state.ensure_usable()?;
+        self.ensure_usable(&state)?;
         objc::rc::autoreleasepool(|| {
             let ShaderSource::MetalSource(source) = &request.source else {
                 unreachable!("checked bounded source")
@@ -233,8 +303,7 @@ impl PipelineProvider for NativeMetalProvider {
     fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
         self.check_token(token)?;
         let _record = self
-            .lock()?
-            .completions
+            .completions()?
             .remove(&token.submission_id)
             .ok_or_else(|| unknown_completion(token))?;
         Ok(())
@@ -251,7 +320,7 @@ impl ComputeProvider for NativeMetalProvider {
         self.check_epoch(trace.device_epoch)?;
         self.capabilities.admit(trace, admitted.resources())?;
         let mut state = self.lock()?;
-        state.ensure_usable()?;
+        self.ensure_usable(&state)?;
         // Resolve and retain every pass's pipeline under the same registry
         // lock, checking all metadata and local limits before GPU allocation.
         let mut pipelines = Vec::with_capacity(trace.passes.len());
@@ -315,14 +384,25 @@ impl ComputeProvider for NativeMetalProvider {
             device_epoch: self.epoch,
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
+        if self.async_execution {
+            return self.submit_async(&mut state, trace, pipelines, token);
+        }
         let result = objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token));
         let observation = match &result {
-            Ok(submission) => Some(Ok(submission.completion)),
-            Err(error) if error.completion.token().is_some() => Some(Err(error.clone())),
+            Ok(submission) => Some(CompletionRecord::completed(submission.writebacks.clone())),
+            Err(error) if error.completion.token().is_some() => {
+                Some(CompletionRecord::failed(error.clone()))
+            }
             Err(_) => None,
         };
-        if let Some(observation) = observation {
-            state.completions.insert(token.submission_id, observation);
+        if let Some(record) = observation {
+            self.completions()?.insert(
+                token.submission_id,
+                CompletionSlot {
+                    record,
+                    started: Instant::now(),
+                },
+            );
         }
         result
     }
@@ -330,25 +410,28 @@ impl ComputeProvider for NativeMetalProvider {
     fn wait(
         &self,
         token: CompletionToken,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.check_token(token)?;
-        self.lock()?
-            .completions
-            .get(&token.submission_id)
-            .cloned()
-            .ok_or_else(|| unknown_completion(token))?
-    }
-}
-
-impl State {
-    fn ensure_usable(&self) -> Result<(), ProviderError> {
-        if self.abandoned {
-            let mut error = resource_error("provider_unavailable");
-            error.retryability = Retryability::RetryAfterRecreate;
-            return Err(error);
+        let slot = self.slot(token)?;
+        if !slot.record.is_running() {
+            return slot.record.wait(token, timeout);
         }
-        Ok(())
+        let Some(remaining) = GPU_DEADLINE.checked_sub(slot.started.elapsed()) else {
+            return Err(self.fail_deadline(&slot, token));
+        };
+        let observed = slot.record.wait(token, timeout.min(remaining))?;
+        if matches!(observed, CompletionDisposition::TimedOut { .. })
+            && slot.started.elapsed() >= GPU_DEADLINE
+        {
+            return Err(self.fail_deadline(&slot, token));
+        }
+        Ok(observed)
+    }
+
+    fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
+        self.check_token(token)?;
+        self.slot(token)?.record.readback(token)
     }
 }
 
@@ -378,12 +461,16 @@ impl Drop for PendingSubmission {
     }
 }
 
-fn execute(
+struct EncodedSubmission {
+    pending: PendingSubmission,
+    pool: Vec<BufferView>,
+}
+
+fn encode(
     state: &mut State,
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
-    token: CompletionToken,
-) -> Result<ProviderSubmission, ProviderError> {
+) -> Result<EncodedSubmission, ProviderError> {
     let pool = trace.serial_resources().map_err(|error| {
         refusal(
             ProviderPhase::Encode,
@@ -435,7 +522,7 @@ fn execute(
         // commandBuffer is autoreleased, so retain it for the pending guard.
         CommandBufferRef::from_ptr(pointer).to_owned()
     };
-    let mut pending = PendingSubmission {
+    let pending = PendingSubmission {
         resources: Some(SubmissionResources {
             _device: state.device.clone(),
             _queue: state.queue.clone(),
@@ -470,7 +557,18 @@ fn execute(
         encoder.dispatch_threads(MTLSize::new(gx, gy, gz), MTLSize::new(lx, ly, lz));
         encoder.end_encoding();
     }
+    Ok(EncodedSubmission { pending, pool })
+}
+
+fn execute(
+    state: &mut State,
+    trace: &ComputeTrace,
+    pipelines: Vec<ComputePipelineState>,
+    token: CompletionToken,
+) -> Result<ProviderSubmission, ProviderError> {
+    let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines)?;
     pending.submitted = true;
+    let resources = pending.resources.as_ref().expect("encoded resources");
     resources.command.commit();
     let started = Instant::now();
     loop {
@@ -505,8 +603,26 @@ fn execute(
     // Shared memory on the admitted device is now CPU visible. Only a known
     // completed command permits the guard to release its backing resources.
     pending.submitted = false;
+    let writebacks = collect_writebacks(&pool, &resources.buffers);
+    let submission = ProviderSubmission {
+        completion: CompletionDisposition::CompletedVisible { token },
+        writebacks,
+    };
+    submission.validate_for_trace(trace).map_err(|error| {
+        refusal(
+            ProviderPhase::Readback,
+            ProviderErrorClass::Internal,
+            "writeback_contract_invalid",
+        )
+        .with_detail(error.to_string())
+        .with_completion(CompletionDisposition::Failed { token: Some(token) })
+    })?;
+    Ok(submission)
+}
+
+fn collect_writebacks(pool: &[BufferView], buffers: &[Buffer]) -> Vec<BufferWriteback> {
     let mut writebacks = Vec::new();
-    for (view, buffer) in pool.iter().zip(&resources.buffers) {
+    for (view, buffer) in pool.iter().zip(buffers) {
         if view.access.is_writable() {
             let bytes = unsafe {
                 // Admission bounded length to 1 MiB, contents was checked
@@ -523,20 +639,90 @@ fn execute(
         }
     }
     writebacks.sort_by_key(|writeback| (writeback.allocation_id, writeback.view_id));
-    let submission = ProviderSubmission {
-        completion: CompletionDisposition::CompletedVisible { token },
-        writebacks,
-    };
-    submission.validate_for_trace(trace).map_err(|error| {
-        refusal(
-            ProviderPhase::Readback,
-            ProviderErrorClass::Internal,
-            "writeback_contract_invalid",
-        )
-        .with_detail(error.to_string())
-        .with_completion(CompletionDisposition::Failed { token: Some(token) })
-    })?;
-    Ok(submission)
+    writebacks
+}
+
+impl NativeMetalProvider {
+    fn submit_async(
+        &self,
+        state: &mut State,
+        trace: &ComputeTrace,
+        pipelines: Vec<ComputePipelineState>,
+        token: CompletionToken,
+    ) -> Result<ProviderSubmission, ProviderError> {
+        let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines)?;
+        let SubmissionResources {
+            _device,
+            _queue,
+            pipelines: retained_pipelines,
+            command,
+            buffers,
+        } = pending.resources.take().expect("encoded resources");
+        pending.submitted = true;
+        let record = CompletionRecord::running();
+        self.completions()?.insert(
+            token.submission_id,
+            CompletionSlot {
+                record: Arc::clone(&record),
+                started: Instant::now(),
+            },
+        );
+        let abandoned = Arc::clone(&self.async_abandoned);
+        let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
+            // Retain the device, queue and compiled pipelines for the whole
+            // device execution; the block itself is retained by the command
+            // buffer until it is invoked.
+            let _retain = (&_device, &_queue, &retained_pipelines);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                objc::rc::autoreleasepool(|| match command.status() {
+                    MTLCommandBufferStatus::Completed => Ok(collect_writebacks(&pool, &buffers)),
+                    MTLCommandBufferStatus::Error => {
+                        abandoned.store(true, Ordering::SeqCst);
+                        let detail = unsafe {
+                            let error: *mut Object = msg_send![command, error];
+                            error_description(error)
+                        };
+                        Err(refusal(
+                            ProviderPhase::Wait,
+                            ProviderErrorClass::Execute,
+                            "metal_command_failed",
+                        )
+                        .with_detail(detail)
+                        .with_completion(CompletionDisposition::Failed { token: Some(token) }))
+                    }
+                    _ => Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Internal,
+                        "metal_completion_handler_without_terminal_status",
+                    )
+                    .with_completion(CompletionDisposition::SubmittedUnknown {
+                        token: Some(token),
+                    })),
+                })
+            }));
+            match outcome {
+                Ok(Ok(writebacks)) => record.complete(writebacks),
+                Ok(Err(error)) => record.fail(error),
+                Err(_) => record.fail(
+                    refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Internal,
+                        "metal_completion_handler_panicked",
+                    )
+                    .with_completion(CompletionDisposition::SubmittedUnknown {
+                        token: Some(token),
+                    }),
+                ),
+            }
+        });
+        let block = handler.copy();
+        command.add_completed_handler(&block);
+        command.commit();
+        Ok(ProviderSubmission {
+            completion: CompletionDisposition::Submitted { token },
+            writebacks: Vec::new(),
+        })
+    }
 }
 
 fn next_id(counter: &mut u64) -> Result<u64, ProviderError> {

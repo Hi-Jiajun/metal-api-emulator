@@ -197,6 +197,7 @@ version = "0.1.0"
 name = "metal-api-native"
 version = "0.1.0"
 dependencies = [
+ "block",
  "foreign-types",
  "metal",
  "metal-api-core",

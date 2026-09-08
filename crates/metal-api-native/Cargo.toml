@@ -12,6 +12,7 @@ description = "Bounded native Metal compute provider for offline comparison"
 metal-api-core = { path = "../metal-api-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
 metal = "=0.33.0"
 objc = "0.2.7"
 foreign-types = "0.5"

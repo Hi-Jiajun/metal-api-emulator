@@ -31,14 +31,17 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   Each pass binds its own resource subset; all resources upload before execution.
   It registers pipelines, revalidates each trace against its actual device and
   artifact, and returns checked allocation-relative writebacks.
-- Completion: the provider defaults to synchronous `submit`/`wait`. With
-  `with_async_execution(true)`, `submit` returns `Submitted`, one worker runs
-  the owned-byte request under the shared queue lock, and `wait`/`readback`
-  observe and retrieve the final writebacks. A submit timeout is terminal
-  unknown completion; resources remain retained and the executor is unusable.
+- Completion: both providers default to synchronous `submit`/`wait`. With
+  `with_async_execution(true)`, `submit` returns `Submitted` and
+  `wait`/`readback` retrieve the final writebacks: Vulkan runs the owned-byte
+  request on one worker under the shared queue lock, while native Metal
+  registers an `MTLCommandBuffer` completion handler that retains the command
+  resources until readback. A 20-second observation deadline reports unknown
+  completion and makes the provider unusable for new work.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
-  reviewed MSL fixtures. Its v1-v7 execution passed
+  reviewed MSL fixtures and shares the optional deferred completion mode.
+  Its v1-v7 execution passed
   [three-way CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 - Shared object API: experimental `metal_api_core::provider_api` records
   pipeline/buffer objects into one complete trace and submits it once. Host
@@ -49,11 +52,10 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   provider, Vulkan object API and Rust Metal object API. The archived evidence
   contains 26 cases per path; this verifies the bounded object API on the
   reviewed fixtures, not general Metal conformance.
-- Open design work: native Metal async completion, cancellation/deadline and
-  completion-driven lease release (the Vulkan provider has an async mode and
-  the object API accepts `Submitted`; the native provider still completes
-  inside `submit`), general native shader admission, CPU uploads during
-  command-buffer execution and aliases.
+- Open design work: cancellation and an explicit deadline contract,
+  completion-driven lease release, device-side Vulkan fence/event completion
+  without a per-submission worker, general native shader admission, CPU
+  uploads during command-buffer execution and aliases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
   textures, rendering, presentation, heaps, ICBs or production

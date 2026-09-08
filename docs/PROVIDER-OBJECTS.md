@@ -11,9 +11,11 @@ The objects are experimental Rust APIs, not Metal.framework ABI objects.
 Submission is split at Metal's commit/wait boundary. A provider that finishes
 inside `submit` completes at commit; a provider that returns `Submitted` leaves
 the command pending until `wait_until_completed` observes completion, retrieves
-`readback` and lands validated writebacks. This increment does not add a
-background worker, general shader support, guest memory, rendering or
-production reims routing.
+`readback` and lands validated writebacks. Both backends support the deferred
+path: Vulkan uses a worker under its shared queue lock, and native Metal
+registers an `MTLCommandBuffer` completion handler. This increment does not
+add general shader support, guest memory, rendering or production reims
+routing.
 
 ## Recording and execution
 
@@ -99,6 +101,10 @@ cargo run --locked -p metal-smoke --bin provider-capture -- \
 cargo run --locked -p metal-smoke --bin provider-capture -- \
   --api objects --backend native-metal-provider \
   --suite conformance/suite-v7.json --output metal-objects.json
+# Deferred native Metal completion (same report backend and host-visible results):
+cargo run --locked -p metal-smoke --bin provider-capture -- \
+  --api objects --async --backend native-metal-provider \
+  --suite conformance/suite-v7.json --output metal-objects-async.json
 python3 conformance/compare.py --suite conformance/suite-v7.json \
   --native swift-metal.json --vulkan vulkan-trace.json \
   --metal-provider metal-trace.json --vulkan-objects vulkan-objects.json \
@@ -112,24 +118,29 @@ stand in for object captures.
 
 ## Verification checkpoint
 
-- 144 Rust tests passed: core 86, native 7, Vulkan 37, capture 14. The eight
+- 145 Rust tests passed: core 90, native 7, Vulkan 34, capture 14. The eight
   new core tests cover asynchronous `Submitted` finalization, readback
   validation, non-terminal wait retries, terminal failure/unknown completion,
   unsupported readback, reservation blocking and overlapping async commands.
-  Three new Vulkan tests cover the shared completion record's timeout,
-  waiter-wakeup, readback and failure paths.
+  Four shared `metal_api_core::completion` tests cover the completion record's
+  timeout, waiter-wakeup, readback, failure propagation and first-terminal-wins
+  paths used by both providers.
   Earlier tests cover single submission, recording snapshots, commit-time
   bytes, foreign ownership, limits, aliases, atomic failure, panic/waiter
   recovery, concurrent commands and pipeline/completion retirement.
 - 113 Python tests passed. Object captures have distinct required identities
   and must satisfy the same full writeback and allocation checks as trace
   captures. Synthetic reports are comparator tests only.
-- `VulkanComputeProvider::with_async_execution(true)` now returns `Submitted`,
+- `VulkanComputeProvider::with_async_execution(true)` returns `Submitted`,
   runs the prepared owned-byte request on one worker under the shared queue
-  lock, and serves `wait`/`readback` from a shared completion record. The
-  default synchronous mode, direct trace rail and all five comparison paths are
-  unchanged. CI runs `provider-capture --api objects --async` for v1-v7 on
-  Lavapipe; the native provider still completes inside `submit`.
+  lock, and serves `wait`/`readback` from the shared completion record.
+  `NativeMetalProvider::with_async_execution(true)` returns `Submitted` after
+  commit and fills the same record type from an `MTLCommandBuffer` completion
+  handler; a 20-second observation deadline reports unknown completion and
+  abandons the provider. The default synchronous mode, direct trace rail and
+  all five comparison paths are unchanged. CI runs
+  `provider-capture --api objects --async` for v1-v7 on Lavapipe and, when a
+  native device is eligible, on macOS.
 - All 26 v1-v7 object cases passed on Linux/Lavapipe and Windows/RTX 5060.
   Results agree per allocation/view with fresh Linux direct-trace captures and
   the archived Swift/Rust Metal reports from run 34010989175.

@@ -5,7 +5,9 @@ single serial exact-thread pass, owned byte views and complete host readback.
 The existing `ComputeExecutor` remains available as an independent application
 entry point. Both paths share Vulkan execution machinery and the queue lock.
 The provider defaults to synchronous execution and can be switched to deferred
-completion with `with_async_execution(true)`.
+completion with `with_async_execution(true)`. The completion slot is the shared
+`metal_api_core::completion::CompletionRecord`, so the native Metal provider
+uses the same wait/readback semantics.
 
 ## Invocation and ownership
 
@@ -89,8 +91,10 @@ Metal parity.
 
 ## Verification of this local increment
 
-- 2026-09-08 async increment: 144 Rust tests passed (core 86, native 7,
-  Vulkan 37, capture 14) and 113 Python tests passed. Linux/Lavapipe ran
+- 2026-09-08 native async increment: 145 Rust tests passed (core 90, native 7,
+  Vulkan 34, capture 14) and 113 Python tests passed. The shared completion
+  record moved to `metal_api_core::completion` with four tests; the native
+  provider's deferred mode is covered by the macOS object capture. Linux/Lavapipe ran
   `provider-capture --api objects --async` for v1-v7 (26 cases) with the same
   host-visible writebacks and allocations as the suite; the default synchronous
   direct/object captures were unchanged. Formatting, Clippy with `-D warnings`

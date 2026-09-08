@@ -66,13 +66,11 @@ fn create_provider(
             Ok((Arc::new(provider), name))
         }
         Backend::NativeMetalProvider => {
-            if async_execution {
-                return Err("--async requires the Vulkan backend".into());
-            }
             #[cfg(target_os = "macos")]
             {
                 let provider = NativeMetalProvider::new()
-                    .map_err(|error| format!("create native Metal provider: {error:?}"))?;
+                    .map_err(|error| format!("create native Metal provider: {error:?}"))?
+                    .with_async_execution(async_execution);
                 let name = provider.device_name().to_owned();
                 Ok((Arc::new(provider), name))
             }
