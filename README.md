@@ -70,7 +70,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   [CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
   V8 reuses the v7 cases with raw and Apple-wrapped bitcode; native rails keep
   using MSL. The archived evidence contains 29 cases per path and does not
-  establish general Metal conformance.
+  establish general Metal conformance. The Windows Vulkan provider ran the
+  same v1-v8 direct, object and async-object rails on an NVIDIA GeForce
+  RTX 5060 with matching host-visible writebacks.
 - Open design work: device-loss reclamation beyond the bounded abandonment
   budget, cross-process completion, completion-driven lease release, general
   native shader admission, CPU uploads during command-buffer execution and

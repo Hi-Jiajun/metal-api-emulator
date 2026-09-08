@@ -169,7 +169,10 @@ stand in for object captures.
 - The v8 binary-AIR cases passed through the direct, object and async-object
   rails on Linux/Lavapipe and, for native MSL, on the Apple Paravirtual device
   in [CI run 34223294821](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
-  Windows/RTX 5060 has not run the new encoding.
+  Windows/RTX 5060 ran the same v1-v8 direct, object and async-object rails on
+  2026-09-08 with matching host-visible writebacks; the evidence is archived
+  under `evidence/windows-rtx5060-v8-7e67a0e-2026-09-08/` in the local
+  workspace.
 - All existing suite and shader files remain byte-for-byte unchanged.
   Formatting, Clippy, rustdoc, Windows GNU build and macOS ARM64 Rust
   typecheck/Clippy passed. The pre-existing `block` dependency still emits its

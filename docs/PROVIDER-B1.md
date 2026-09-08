@@ -118,6 +118,13 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 Windows RTX 5060 v8 validation: Windows GNU debug binaries built
+  from `7e67a0e` ran `provider-smoke` and the v1-v8 direct, object and
+  async-object captures on an NVIDIA GeForce RTX 5060. All 12 smoke checks and
+  all 29 cases per rail passed, including the v8 raw/wrapped AIR encoding.
+  Binary SHA-256 values are recorded in
+  `evidence/windows-rtx5060-v8-7e67a0e-2026-09-08/manifest.md`. This is a
+  Vulkan-provider validation on Windows, not native Metal parity.
 - 2026-09-08 native device-removal increment: 159 Rust tests passed (core 100,
   native 9, Vulkan 36, capture 14) and 115 Python tests passed. Native Metal
   classifies `MTLCommandBufferError::DeviceRemoved` (code 11) as `DeviceLost`
