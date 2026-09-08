@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v7 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v8 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -297,7 +297,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" || suite == "compute-buffer-v7" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" || suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
         let expectedCount: Int
         switch definition.id {
         case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two", "layout_chain_two", "subset_chain_two": expectedCount = 2
@@ -315,7 +315,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
             var mapping: [UInt64]? = nil
             var program: Int? = (suite == "compute-buffer-v5" || suite == "compute-buffer-v6") ? index % 2 : nil
-            if suite == "compute-buffer-v7" {
+            if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
                 let views = definition.buffers.map { $0.view }
                 try require(views.count == (expectedCount == 2 ? 4 : 5), "Missing subset-chain resources")
                 switch index % 4 {
@@ -387,7 +387,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
                     && definition.buffers.contains { $0.binding == 5 && $0.access == "write" && $0.length == 120 },
                     "\(definition.id): expected 120-byte read/write at 0, 4-byte read at 2, and 120-byte write at 5")
     case "subset_chain_two", "subset_chain_four", "subset_chain_eight":
-        try require(suite == "compute-buffer-v7" && definition.entry == "transform_3d"
+        try require((suite == "compute-buffer-v7" || suite == "compute-buffer-v8") && definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == [4, 2, 2],
                     "\(definition.id): unsupported entry or dispatch shape")
         let expectedLabels: [UInt64] = definition.id == "subset_chain_two" ? [0, 2, 5, 8] : [0, 2, 5, 8, 9]
@@ -502,8 +502,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["layout_chain_two", "layout_chain_three", "layout_chain_eight"]
     case "compute-buffer-v7":
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
+    case "compute-buffer-v8":
+        expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v7 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v8 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -597,7 +599,7 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
 private func validatePrograms(_ definition: CaseDefinition, suite: String) throws -> [ProgramDefinition] {
     let primary = ProgramDefinition(entry: definition.entry, air: definition.air,
                                     metal: definition.metal, buffer_slots: nil)
-    if suite == "compute-buffer-v7" {
+    if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
         guard let supplied = definition.programs else { throw OracleError("Program table required") }
         var expected = try [reviewedProgram("transform_3d", explicitSlots: true),
                             reviewedProgram("copy_3d", explicitSlots: true)]
