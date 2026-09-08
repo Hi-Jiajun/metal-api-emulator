@@ -67,7 +67,7 @@ fn execute_copy_word(device: &Device, library: Library) -> Result<u32, Box<dyn E
     Ok(word)
 }
 
-fn assemble_owned_air(source: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn assemble_owned_air(source: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let tool = std::env::var_os("METAL_API_LLVM_AS").unwrap_or_else(|| "llvm-as".into());
     let output_path = std::env::temp_dir().join(format!(
         "metal-api-smoke-{}-copy-word.air",
@@ -97,14 +97,35 @@ fn assemble_owned_air(source: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         )
         .into());
     }
-    let air = std::fs::read(&output_path)?;
+    let air = normalize_bitcode(&std::fs::read(&output_path)?)?;
     if !air.starts_with(&[0x42, 0x43, 0xc0, 0xde]) {
         return Err("llvm-as did not produce raw LLVM bitcode".into());
     }
     Ok(air)
 }
 
-fn wrap_air_bitcode(bitcode: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+/// `llvm-as` emits the Apple bitcode wrapper for modules carrying a target
+/// triple. The provider accepts raw bitcode or a wrapper whose offset+size
+/// covers the file exactly, so normalize the tool output to raw bytes first.
+fn normalize_bitcode(air: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    const WRAPPER_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
+    const WRAPPER_HEADER_LEN: usize = 0x14;
+    if !air.starts_with(&WRAPPER_MAGIC) {
+        return Ok(air.to_vec());
+    }
+    if air.len() < WRAPPER_HEADER_LEN {
+        return Err("llvm-as bitcode wrapper is truncated".into());
+    }
+    let offset = u32::from_le_bytes(air[8..12].try_into()?) as usize;
+    let size = u32::from_le_bytes(air[12..16].try_into()?) as usize;
+    let payload = air
+        .get(offset..)
+        .and_then(|rest| rest.get(..size))
+        .ok_or("llvm-as bitcode wrapper payload is truncated")?;
+    Ok(payload.to_vec())
+}
+
+pub fn wrap_air_bitcode(bitcode: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let size = u32::try_from(bitcode.len()).map_err(|_| "binary AIR is larger than u32")?;
     let mut wrapper = vec![0_u8; 0x14];
     wrapper[0..4].copy_from_slice(&[0xde, 0xc0, 0x17, 0x0b]);

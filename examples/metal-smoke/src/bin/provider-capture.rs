@@ -11,6 +11,7 @@ use metal_api_core::{provider_api as objects, Size};
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
 use metal_api_vulkan::VulkanComputeProvider;
+use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,12 +97,23 @@ struct Case {
     entry: String,
     grid: [u64; 3],
     local: [u64; 3],
+    #[serde(default)]
+    air_encoding: AirEncoding,
     air: Source,
     metal: Source,
     buffers: Vec<Buffer>,
     expected_writebacks: Vec<Writeback>,
     dispatches: Option<Vec<CaseDispatch>>,
     programs: Option<Vec<CaseProgram>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+enum AirEncoding {
+    #[default]
+    Text,
+    Raw,
+    Wrapped,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq)]
@@ -252,15 +264,22 @@ fn main() -> Result<()> {
         for program in case_programs(case) {
             let air = verified_source(directory, &program.air)?;
             let metal = verified_source(directory, &program.metal)?;
-            sources.insert(
-                program.entry,
-                match backend {
-                    Backend::Vulkan => ShaderSource::SanitizedLl(String::from_utf8(air)?),
-                    Backend::NativeMetalProvider => {
-                        ShaderSource::MetalSource(String::from_utf8(metal)?)
+            let source = match backend {
+                Backend::Vulkan => {
+                    let air = String::from_utf8(air)?;
+                    match case.air_encoding {
+                        AirEncoding::Text => ShaderSource::SanitizedLl(air),
+                        AirEncoding::Raw => ShaderSource::BinaryAir(assemble_owned_air(&air)?),
+                        AirEncoding::Wrapped => {
+                            ShaderSource::BinaryAir(wrap_air_bitcode(&assemble_owned_air(&air)?)?)
+                        }
                     }
-                },
-            );
+                }
+                Backend::NativeMetalProvider => {
+                    ShaderSource::MetalSource(String::from_utf8(metal)?)
+                }
+            };
+            sources.insert((program.entry, case.air_encoding), source);
         }
     }
     let identity = hex(&Sha256::digest(&raw));
@@ -270,7 +289,7 @@ fn main() -> Result<()> {
     let mut results = Vec::new();
     let mut pipelines = BTreeMap::new();
     let mut object_pipelines = BTreeMap::new();
-    for (entry, source) in sources {
+    for ((entry, encoding), source) in sources {
         let request = PipelineCompileRequest {
             entry_name: entry.clone(),
             logical_digest: SemanticDigest::new(
@@ -282,7 +301,7 @@ fn main() -> Result<()> {
         let pipeline = if let Some(device) = &object_device {
             let pipeline = device.compile_pipeline(request)?;
             let metadata = pipeline.metadata().clone();
-            object_pipelines.insert(entry.clone(), pipeline);
+            object_pipelines.insert((entry.clone(), encoding), pipeline);
             metadata
         } else {
             provider
@@ -316,12 +335,12 @@ fn main() -> Result<()> {
             verify_copy_contract(&pipeline)?;
         }
         eprintln!("{} artifact registered: entry={entry}", backend.name());
-        pipelines.insert(entry, pipeline);
+        pipelines.insert((entry, encoding), pipeline);
     }
     for (index, case) in suite.cases.iter().enumerate() {
         let programs = case_programs(case)
             .iter()
-            .map(|program| pipelines[&program.entry].clone())
+            .map(|program| pipelines[&(program.entry.clone(), case.air_encoding)].clone())
             .collect::<Vec<_>>();
         for (source, compiled) in case_programs(case).iter().zip(&programs) {
             if let Some(slots) = &source.buffer_slots {
@@ -355,7 +374,9 @@ fn main() -> Result<()> {
         results.push(if let Some(device) = &object_device {
             let programs = case_programs(case)
                 .iter()
-                .map(|program| object_pipelines[&program.entry].clone())
+                .map(|program| {
+                    object_pipelines[&(program.entry.clone(), case.air_encoding)].clone()
+                })
                 .collect::<Vec<_>>();
             run_object_case(device, &programs, case, suite.guard_byte, async_execution)?
         } else {
@@ -439,6 +460,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "subset_chain_four",
             "subset_chain_eight",
         ],
+        (1, "compute-buffer-v8") => &[
+            "subset_chain_two",
+            "subset_chain_four",
+            "subset_chain_eight",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -448,6 +474,21 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             .any(|case| !case_ids.contains(&case.id.as_str()))
     {
         return Err("incorrect case set for suite".into());
+    }
+    let encodings = suite
+        .cases
+        .iter()
+        .map(|case| case.air_encoding)
+        .collect::<BTreeSet<_>>();
+    if suite.suite == "compute-buffer-v8" {
+        if !encodings.contains(&AirEncoding::Raw) || !encodings.contains(&AirEncoding::Wrapped) {
+            return Err("v8 suite must cover raw and wrapped binary AIR".into());
+        }
+    } else if encodings
+        .iter()
+        .any(|encoding| *encoding != AirEncoding::Text)
+    {
+        return Err("binary AIR encodings are only qualified by the v8 suite".into());
     }
     let mut ids = BTreeSet::new();
     for case in &suite.cases {

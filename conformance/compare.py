@@ -96,6 +96,9 @@ def _suite_plan(suite):
         case_id = _string(case.get("id"), "suite case.id")
         where = f"suite case {case_id}"
         _require(case_id not in plan, f"{where}: duplicate case")
+        air_encoding = case.get("air_encoding", "text")
+        _require(air_encoding in ("text", "raw", "wrapped"),
+                 f"{where}: unknown air_encoding")
         allocations, views, initial_ranges, bindings = {}, {}, {}, set()
         buffers = _list(case.get("buffers"), f"{where}.buffers")
         _require(buffers, f"{where}: no buffers")
