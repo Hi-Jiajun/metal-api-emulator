@@ -916,11 +916,6 @@ fn import_borrowed_descriptor(
     reservation: LeaseReservation,
 ) -> CommandResponse {
     let lease_id = reservation.lease.lease_id;
-    if mappings.contains_key(&lease_id) {
-        return CommandResponse::Error {
-            error: descriptor_error("lease_already_imported", ProviderErrorClass::Args),
-        };
-    }
     let descriptor = match transport.recv_descriptor() {
         Ok(descriptor) => descriptor,
         Err(error) => {
@@ -933,6 +928,15 @@ fn import_borrowed_descriptor(
             }
         }
     };
+    // Every import request carries a descriptor, including one that will be
+    // rejected. Consume it first so a duplicate lease id cannot leave the
+    // descriptor payload in the stream and desynchronize the next frame.
+    if mappings.contains_key(&lease_id) {
+        drop(descriptor);
+        return CommandResponse::Error {
+            error: descriptor_error("lease_already_imported", ProviderErrorClass::Args),
+        };
+    }
     let mapping = match crate::shared::SharedMemory::from_owned_fd(descriptor) {
         Ok(mapping) => mapping,
         Err(error) => {
@@ -1589,6 +1593,85 @@ mod tests {
         assert_eq!(borrowed.len(), 0);
         let refused = remote.release_borrowed_lease(lease_id).unwrap_err();
         assert_eq!(refused.slug, "lease_not_imported");
+        drop(remote);
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_duplicate_borrowed_import_keeps_the_channel_in_sync() {
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let provider = FakeProvider {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+            submissions: Arc::new(AtomicU64::new(0)),
+            imports: Arc::new(AtomicU64::new(0)),
+            borrowed: Arc::clone(&borrowed),
+        };
+        let (client, mut server) = super::unix::pair().unwrap();
+        let server_thread = std::thread::spawn(move || serve_provider_unix(&provider, &mut server));
+
+        let remote = RemoteProvider::connect(client).unwrap();
+        let lease_id = LeaseId::new(91);
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: AllocationId::new(42),
+                owner_epoch: DeviceEpoch::new(7),
+            },
+            offset: 0,
+            length: 4096,
+        };
+
+        let mut first = crate::shared::SharedMemory::create(4096).unwrap();
+        first.as_mut_slice().fill(0x11);
+        remote.import_borrowed_lease(reservation, &first).unwrap();
+
+        let mut duplicate = crate::shared::SharedMemory::create(4096).unwrap();
+        duplicate.as_mut_slice().fill(0x22);
+        let error = remote
+            .import_borrowed_lease(reservation, &duplicate)
+            .unwrap_err();
+        assert_eq!(error.slug, "lease_already_imported");
+
+        // The rejected import still carried a descriptor. The server must
+        // consume it, otherwise its one-byte payload desynchronizes the next
+        // frame on this connection.
+        remote.release_borrowed_lease(lease_id).unwrap();
+        assert_eq!(borrowed.len(), 0);
+
+        let mut third = crate::shared::SharedMemory::create(4096).unwrap();
+        third.as_mut_slice().fill(0x33);
+        remote.import_borrowed_lease(reservation, &third).unwrap();
+
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(42),
+                owner_epoch: DeviceEpoch::new(7),
+                size: 4096,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+        let view = BufferView {
+            view_id: ViewId::new(79),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(42),
+            offset: 0,
+            length: 4,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::BorrowedNoCopy(lease_id),
+        };
+        let resolved = borrowed
+            .view_pointer(lease_id, &view, DeviceEpoch::new(7), &resources)
+            .unwrap();
+        // SAFETY: the server keeps the mapping alive until release and the
+        // owner mapping refers to the same physical pages.
+        let observed = unsafe { std::slice::from_raw_parts(resolved.pointer as *const u8, 4) };
+        assert_eq!(observed, &[0x33; 4]);
+
+        remote.release_borrowed_lease(lease_id).unwrap();
         drop(remote);
         server_thread.join().unwrap().unwrap();
     }
