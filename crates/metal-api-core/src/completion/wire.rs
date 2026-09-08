@@ -43,8 +43,10 @@ use crate::provider::{
 };
 use std::collections::BTreeMap;
 
+mod outbox;
 mod publisher;
 
+pub use outbox::{CompletionOutbox, CompletionSink};
 pub use publisher::CompletionPublisher;
 
 /// Monotonic revision of one completion stream.

@@ -12,7 +12,7 @@ use crate::provider::{
     BufferWriteback, CompletionDisposition, CompletionReadback, CompletionToken, ProviderError,
     ProviderErrorClass, ProviderPhase, Retryability,
 };
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod wire;
@@ -64,6 +64,38 @@ impl ObservationDeadline {
     }
 }
 
+/// Terminal transition observed by a [`CompletionRecord`].
+///
+/// The value mirrors the disposition `wait` would report, except that a
+/// timeout and `Submitted` are not terminal and therefore never observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletionTerminal {
+    /// Host-visible writebacks are ready.
+    CompletedVisible,
+    /// The host cancelled observation before a result landed.
+    Cancelled,
+    /// The provider observed a refusal.
+    Failed(ProviderError),
+    /// The provider can no longer observe the submission.
+    SubmittedUnknown,
+}
+
+/// Observer of the first terminal transition of a [`CompletionRecord`].
+///
+/// The record calls this exactly once, after the state change, without holding
+/// the record lock. An implementation must not block the provider for long and
+/// must not call back into the same record. A provider uses it to publish the
+/// same terminal transition it stores in-process; see
+/// [`wire::CompletionOutbox`].
+pub trait CompletionObserver: Send + Sync {
+    fn observe_terminal(&self, token: CompletionToken, terminal: CompletionTerminal);
+}
+
+struct TerminalObserver {
+    token: CompletionToken,
+    observer: Arc<dyn CompletionObserver>,
+}
+
 /// Shared slot between a submit path and later `wait`/`readback` calls.
 ///
 /// A synchronous provider fills the slot before returning `CompletedVisible`.
@@ -77,87 +109,132 @@ impl ObservationDeadline {
 pub struct CompletionRecord {
     state: Mutex<CompletionState>,
     ready: Condvar,
+    terminal_observer: Option<TerminalObserver>,
 }
 
 impl CompletionRecord {
     /// Create a record whose device work has not reached a terminal state.
-    pub fn running() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
+    pub fn running() -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(CompletionState::Running),
             ready: Condvar::new(),
+            terminal_observer: None,
+        })
+    }
+
+    /// Create a running record that publishes its first terminal transition
+    /// through `observer`.
+    pub fn running_with_observer(
+        token: CompletionToken,
+        observer: Arc<dyn CompletionObserver>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CompletionState::Running),
+            ready: Condvar::new(),
+            terminal_observer: Some(TerminalObserver { token, observer }),
         })
     }
 
     /// Create a record that is already completed with host-visible writebacks.
-    pub fn completed(writebacks: Vec<BufferWriteback>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
+    pub fn completed(writebacks: Vec<BufferWriteback>) -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(CompletionState::Completed(writebacks)),
             ready: Condvar::new(),
+            terminal_observer: None,
         })
     }
 
     /// Create a record that is already failed.
-    pub fn failed(error: ProviderError) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
+    pub fn failed(error: ProviderError) -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(CompletionState::Failed(error)),
             ready: Condvar::new(),
+            terminal_observer: None,
         })
     }
 
     /// Record successful completion. Ignored if a terminal state already won.
     pub fn complete(&self, writebacks: Vec<BufferWriteback>) {
+        let mut changed = false;
         match self.state.lock() {
             Ok(mut state) => {
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Completed(writebacks);
+                    changed = true;
                 }
             }
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Completed(writebacks);
+                    changed = true;
                 }
             }
         }
         self.ready.notify_all();
+        if changed {
+            self.notify_terminal(CompletionTerminal::CompletedVisible);
+        }
     }
 
     /// Record a provider failure. Ignored if a terminal state already won.
     pub fn fail(&self, error: ProviderError) {
+        let terminal = match &error.completion {
+            CompletionDisposition::SubmittedUnknown { .. } => CompletionTerminal::SubmittedUnknown,
+            _ => CompletionTerminal::Failed(error.clone()),
+        };
+        let mut changed = false;
         match self.state.lock() {
             Ok(mut state) => {
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Failed(error);
+                    changed = true;
                 }
             }
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Failed(error);
+                    changed = true;
                 }
             }
         }
         self.ready.notify_all();
+        if changed {
+            self.notify_terminal(terminal);
+        }
     }
 
     /// Record host-requested cancellation. Ignored if a terminal state already
     /// won. Cancellation abandons the observation of device work; it is not
     /// evidence that the GPU retired the submission.
     pub fn cancel(&self) {
+        let mut changed = false;
         match self.state.lock() {
             Ok(mut state) => {
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Cancelled;
+                    changed = true;
                 }
             }
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 if matches!(*state, CompletionState::Running) {
                     *state = CompletionState::Cancelled;
+                    changed = true;
                 }
             }
         }
         self.ready.notify_all();
+        if changed {
+            self.notify_terminal(CompletionTerminal::Cancelled);
+        }
+    }
+
+    fn notify_terminal(&self, terminal: CompletionTerminal) {
+        if let Some(entry) = &self.terminal_observer {
+            entry.observer.observe_terminal(entry.token, terminal);
+        }
     }
 
     /// Whether the record has not yet observed a terminal state.
@@ -469,5 +546,95 @@ mod tests {
         let budget = AbandonmentBudget::new(0, 0);
         let mut ledger = AbandonmentLedger::default();
         assert_eq!(ledger.record(budget, 0), AbandonmentOutcome::Exhausted);
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        terminals: Mutex<Vec<(CompletionToken, CompletionTerminal)>>,
+    }
+
+    impl CompletionObserver for RecordingObserver {
+        fn observe_terminal(&self, token: CompletionToken, terminal: CompletionTerminal) {
+            self.terminals
+                .lock()
+                .expect("recording observer")
+                .push((token, terminal));
+        }
+    }
+
+    fn observed(observer: &Arc<RecordingObserver>) -> Vec<(CompletionToken, CompletionTerminal)> {
+        observer
+            .terminals
+            .lock()
+            .expect("recording observer")
+            .clone()
+    }
+
+    #[test]
+    fn observer_sees_the_first_terminal_transition_once() {
+        let observer = Arc::new(RecordingObserver::default());
+        let token = completion_token();
+        let record = CompletionRecord::running_with_observer(token, observer.clone());
+        assert!(record.is_running());
+        record.complete(vec![completion_writeback()]);
+        record.fail(record_poisoned());
+        record.cancel();
+        assert_eq!(
+            observed(&observer),
+            vec![(token, CompletionTerminal::CompletedVisible)]
+        );
+    }
+
+    #[test]
+    fn observer_distinguishes_submitted_unknown_from_failure() {
+        let observer = Arc::new(RecordingObserver::default());
+        let token = completion_token();
+        let record = CompletionRecord::running_with_observer(token, observer.clone());
+        let mut error = record_poisoned();
+        error.completion = CompletionDisposition::SubmittedUnknown { token: Some(token) };
+        record.fail(error);
+        assert_eq!(
+            observed(&observer),
+            vec![(token, CompletionTerminal::SubmittedUnknown)]
+        );
+    }
+
+    #[test]
+    fn observer_reports_cancellation_without_a_later_completion() {
+        let observer = Arc::new(RecordingObserver::default());
+        let token = completion_token();
+        let record = CompletionRecord::running_with_observer(token, observer.clone());
+        record.cancel();
+        record.complete(Vec::new());
+        assert_eq!(
+            observed(&observer),
+            vec![(token, CompletionTerminal::Cancelled)]
+        );
+    }
+
+    #[test]
+    fn observer_is_not_notified_for_a_timeout() {
+        let observer = Arc::new(RecordingObserver::default());
+        let token = completion_token();
+        let record = CompletionRecord::running_with_observer(token, observer.clone());
+        assert_eq!(
+            record.wait(token, Duration::ZERO).unwrap(),
+            CompletionDisposition::TimedOut { token }
+        );
+        assert!(observed(&observer).is_empty());
+    }
+
+    #[test]
+    fn failure_observer_carries_the_structured_error() {
+        let observer = Arc::new(RecordingObserver::default());
+        let token = completion_token();
+        let record = CompletionRecord::running_with_observer(token, observer.clone());
+        let mut error = record_poisoned();
+        error.completion = CompletionDisposition::Failed { token: Some(token) };
+        record.fail(error.clone());
+        assert_eq!(
+            observed(&observer),
+            vec![(token, CompletionTerminal::Failed(error))]
+        );
     }
 }
