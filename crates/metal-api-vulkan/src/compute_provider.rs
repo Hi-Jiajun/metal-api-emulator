@@ -1,17 +1,18 @@
 //! Owned-byte implementation of the first compute provider slice.
 
 use crate::{
-    execute_pipeline_sequence_with_status, BoundDispatch, PendingExecution,
-    TranslatedComputePipeline, VulkanExecutor, VulkanPipelineArtifact,
+    execute_pipeline_sequence_with_status, BoundDispatch, ContextHealth, PendingExecution,
+    TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
 };
-use metal_api_core::completion::{CompletionRecord, ObservationDeadline};
+use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
     CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch, FieldValue,
     FunctionIdentity, FunctionSource, PipelineCompileRequest, PipelineId, PipelineProvider,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase, ProviderSubmission,
-    Retryability, SemanticDigest, ShaderSource, SubmissionId, ValidatedComputeTrace,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, Retryability, SemanticDigest, ShaderSource, SubmissionId,
+    ValidatedComputeTrace,
 };
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
@@ -118,6 +119,20 @@ impl VulkanComputeProvider {
         self.executor.device_name()
     }
 
+    /// Report whether this provider can still admit new work.
+    pub fn health(&self) -> ProviderHealth {
+        match self.executor.context.health() {
+            ContextHealth::Usable => ProviderHealth::Usable,
+            ContextHealth::DeviceLost => ProviderHealth::DeviceLost,
+            ContextHealth::Exhausted => ProviderHealth::Exhausted,
+        }
+    }
+
+    /// Report `(abandoned submissions, abandoned bytes)` for this context.
+    pub fn abandonment_stats(&self) -> (u64, u64) {
+        self.executor.context.abandonment_stats()
+    }
+
     /// Translate and register a function. The logical digest is a caller-issued
     /// fixture/parity identity; it is not used to reuse an artifact or to prove
     /// equality of differently encoded modules. Each compile gets its own ID.
@@ -214,11 +229,32 @@ impl VulkanComputeProvider {
         };
         let sender = slot.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<PendingExecution>();
+            let context = Arc::clone(&self.executor.context);
             let _ = std::thread::Builder::new()
                 .name("vulkan-provider-retire".into())
                 .spawn(move || {
                     while let Ok(mut pending) = rx.recv() {
-                        let _ = pending.wait(crate::FENCE_TIMEOUT_NS);
+                        match pending.wait(crate::FENCE_TIMEOUT_NS) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if context.record_abandonment(pending.owned_bytes())
+                                    == AbandonmentOutcome::Admitted
+                                {
+                                    pending.retain_after_budgeted_abandon();
+                                }
+                            }
+                            Err(error) if error.class == ProviderErrorClass::DeviceLost => {
+                                pending.mark_device_lost();
+                                context.mark_device_lost();
+                            }
+                            Err(_) => {
+                                if context.record_abandonment(pending.owned_bytes())
+                                    == AbandonmentOutcome::Admitted
+                                {
+                                    pending.retain_after_budgeted_abandon();
+                                }
+                            }
+                        }
                     }
                 });
             tx
@@ -250,16 +286,7 @@ impl VulkanComputeProvider {
     }
 
     fn ensure_usable(&self) -> Result<(), ProviderError> {
-        self.executor.context.ensure_usable().map_err(|error| {
-            let mut result = refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Resource,
-                "provider_unavailable",
-            )
-            .with_detail(error.to_string());
-            result.retryability = Retryability::RetryAfterRecreate;
-            result
-        })
+        ensure_context_usable(&self.executor.context)
     }
 }
 
@@ -738,16 +765,36 @@ fn execute_on_context(
 }
 
 fn ensure_executor_usable(executor: &VulkanExecutor) -> Result<(), ProviderError> {
-    executor.context.ensure_usable().map_err(|error| {
-        let mut result = refusal(
-            ProviderPhase::Resolve,
-            ProviderErrorClass::Resource,
-            "provider_unavailable",
-        )
-        .with_detail(error.to_string());
-        result.retryability = Retryability::RetryAfterRecreate;
-        result
-    })
+    ensure_context_usable(&executor.context)
+}
+
+fn ensure_context_usable(context: &VulkanContext) -> Result<(), ProviderError> {
+    match context.health() {
+        ContextHealth::Usable => Ok(()),
+        ContextHealth::DeviceLost => Err(device_lost_error()),
+        ContextHealth::Exhausted => Err(provider_unavailable_error()),
+    }
+}
+
+fn device_lost_error() -> ProviderError {
+    let mut error = refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::DeviceLost,
+        "device_lost",
+    );
+    error.retryability = Retryability::RetryAfterRecreate;
+    error.completion = CompletionDisposition::DeviceLost { token: None };
+    error
+}
+
+fn provider_unavailable_error() -> ProviderError {
+    let mut error = refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Resource,
+        "provider_unavailable",
+    );
+    error.retryability = Retryability::RetryAfterRecreate;
+    error
 }
 
 fn duration_to_nanos(duration: Duration) -> u64 {
@@ -809,6 +856,26 @@ fn unknown_completion(token: CompletionToken) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{AllocationId, BufferAccess, ViewId};
+
+    #[test]
+    fn unavailable_provider_errors_require_recreation() {
+        let lost = device_lost_error();
+        assert_eq!(lost.phase, ProviderPhase::Resolve);
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(lost.slug, "device_lost");
+        assert_eq!(lost.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+
+        let exhausted = provider_unavailable_error();
+        assert_eq!(exhausted.phase, ProviderPhase::Resolve);
+        assert_eq!(exhausted.class, ProviderErrorClass::Resource);
+        assert_eq!(exhausted.slug, "provider_unavailable");
+        assert_eq!(exhausted.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(exhausted.completion, CompletionDisposition::NotSubmitted);
+    }
 
     #[test]
     fn writebacks_use_pool_identity_when_later_resources_repeat_binding_labels() {

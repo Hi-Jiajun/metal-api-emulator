@@ -425,7 +425,8 @@ mod tests {
         use metal_api_core::provider::{
             AllocationId, AllocationRecord, BufferSource, BufferView, CompletionPolicy,
             ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType, OperationId,
-            PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+            PipelineProvider, ProviderHealth, ResourceTableSnapshot, ViewId,
+            PROVIDER_SCHEMA_VERSION,
         };
         use std::time::Duration;
 
@@ -501,6 +502,10 @@ mod tests {
         let first_token = first.completion.token().unwrap();
         let error = provider.wait(first_token, Duration::ZERO).unwrap_err();
         assert_eq!(error.slug, "metal_completion_unknown");
+        assert_eq!(provider.health(), ProviderHealth::Usable);
+        let (abandoned, bytes) = provider.abandonment_stats();
+        assert_eq!(abandoned, 1);
+        assert!(bytes > 0);
         // The completion handler retains and releases the timed-out submission;
         // an observation deadline must not permanently disable the context.
         let second = provider

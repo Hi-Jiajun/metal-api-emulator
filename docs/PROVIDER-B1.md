@@ -38,12 +38,23 @@ uses the same wait/readback semantics.
    deadline (20 seconds by default, `with_observation_deadline`) reports
    `vulkan-completion-unknown` with `SubmittedUnknown`; the timed-out
    submission goes to the same retirement thread, so the executor keeps
-   accepting new work unless the fence never signals. `cancel` releases the
+   accepting new work while its abandonment budget remains intact. `cancel` releases the
    observation slot and hands the pending submission to retirement, reporting
    `Cancelled`; `release_completion` does the same for a still-pending
    submission. `release_pipeline` removes a registry entry. In-progress
    submissions keep their own artifact reference. These calls do not release
    abandoned GPU work.
+7. Bounded abandonment: a fence that never signals (or a completion handler
+   that never fires) is recorded against a provider-scoped
+   `AbandonmentBudget`. Vulkan defaults to one abandoned submission and 64 MiB;
+   native Metal defaults to eight submissions and 64 MiB. The builder
+   `with_abandonment_budget` raises or lowers the bound. When the bound is
+   reached, `health()` reports `Exhausted` and new compile/submit calls are
+   refused with `provider_unavailable` and `Retryability::RetryAfterRecreate`.
+   A confirmed `VK_ERROR_DEVICE_LOST` takes the `DeviceLost` path instead:
+   `health()` reports `DeviceLost`, the lost device's handles are destroyed
+   rather than leaked, and new work is refused until the caller recreates the
+   provider.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
@@ -53,10 +64,10 @@ host work and completion observation rather than concurrent GPU execution.
 There is no end-to-end deadline on compilation, locks, initialization or
 submit. The synchronous fence wait keeps a fixed 20-second bound; a configured
 observation deadline reports unknown completion and retires the submission
-when its fence signals. Resources are still retained to process exit when a
-fence never signals or a device-loss error is observed. Live guest leases,
-multi-pass ordering, general MTLB resolution and native Metal remain
-unimplemented.
+when its fence signals. Resources whose fence never signals are retained to
+process exit, but the abandonment budget bounds how many such submissions a
+provider will tolerate before it fails closed. Live guest leases, multi-pass
+ordering, general MTLB resolution and native Metal remain unimplemented.
 
 ## Execution failures and visibility
 

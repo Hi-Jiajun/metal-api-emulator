@@ -119,7 +119,11 @@ by any pass. Both providers offer an optional async mode: Vulkan defers
 completion to a device fence observed by `wait`, while native Metal uses an
 `MTLCommandBuffer` completion handler. Both still serialize submission;
 concurrent GPU execution, mid-execution CPU uploads and general aliasing remain
-outside this provider subset. V1-v7 passed
+outside this provider subset. A provider-scoped `AbandonmentBudget` bounds how
+many submissions may lose their completion observation before the provider
+fails closed with `provider_unavailable`/`RetryAfterRecreate`; a confirmed
+device loss instead reports `DeviceLost` and destroys the lost device's
+handles. V1-v7 passed
 [three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 The v8 binary-AIR encoding suite reuses those cases and passed the five-path
 v1-v8 comparison in

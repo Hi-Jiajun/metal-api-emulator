@@ -11,6 +11,7 @@ use metal2vulkan::reflect::{
     BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, KernelDispatchPlan,
     ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
+use metal_api_core::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
 use metal_api_core::provider::{
     CompletionDisposition, PipelineContract, ProviderCapabilities, ProviderError,
     ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
@@ -206,6 +207,17 @@ pub(crate) struct VulkanContext {
     execution_lock: Mutex<()>,
     poisoned: AtomicBool,
     abandoned: AtomicBool,
+    device_lost: AtomicBool,
+    abandonment_budget: AbandonmentBudget,
+    abandonment: Mutex<AbandonmentLedger>,
+}
+
+/// Provider-facing view of one Vulkan context's remaining usability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextHealth {
+    Usable,
+    Exhausted,
+    DeviceLost,
 }
 
 impl VulkanContext {
@@ -265,6 +277,9 @@ impl VulkanContext {
             execution_lock: Mutex::new(()),
             poisoned: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
+            device_lost: AtomicBool::new(false),
+            abandonment_budget: AbandonmentBudget::new(1, 64 * 1024 * 1024),
+            abandonment: Mutex::new(AbandonmentLedger::default()),
         })
     }
 
@@ -278,7 +293,46 @@ impl VulkanContext {
         }
     }
 
+    pub(crate) fn health(&self) -> ContextHealth {
+        if self.device_lost.load(Ordering::Acquire) {
+            ContextHealth::DeviceLost
+        } else if self.abandoned.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
+            ContextHealth::Exhausted
+        } else {
+            ContextHealth::Usable
+        }
+    }
+
+    pub(crate) fn record_abandonment(&self, bytes: u64) -> AbandonmentOutcome {
+        let outcome = match self.abandonment.lock() {
+            Ok(mut ledger) => ledger.record(self.abandonment_budget, bytes),
+            Err(poisoned) => poisoned.into_inner().record(self.abandonment_budget, bytes),
+        };
+        if outcome == AbandonmentOutcome::Exhausted {
+            self.poisoned.store(true, Ordering::Release);
+            self.abandoned.store(true, Ordering::Release);
+        }
+        outcome
+    }
+
+    pub(crate) fn abandonment_stats(&self) -> (u64, u64) {
+        match self.abandonment.lock() {
+            Ok(ledger) => (ledger.submissions(), ledger.bytes()),
+            Err(poisoned) => {
+                let ledger = poisoned.into_inner();
+                (ledger.submissions(), ledger.bytes())
+            }
+        }
+    }
+
+    pub(crate) fn mark_device_lost(&self) {
+        self.device_lost.store(true, Ordering::Release);
+        self.poisoned.store(true, Ordering::Release);
+        self.abandoned.store(true, Ordering::Release);
+    }
+
     fn abandon(self: &Arc<Self>, resources: ExecutionResources) {
+        let _ = self.record_abandonment(resources.owned_bytes());
         self.poisoned.store(true, Ordering::Release);
         self.abandoned.store(true, Ordering::Release);
         // The queue may still access every handle in `resources`. Keep both it
@@ -310,7 +364,7 @@ impl VulkanContext {
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.abandoned.load(Ordering::Acquire) && !self.device_lost.load(Ordering::Acquire) {
             // Timeout paths leak an extra Arc, so this arm is defensive rather
             // than expected. Never unload the Vulkan loader under pending work.
             return;
@@ -574,8 +628,14 @@ impl PendingExecution {
             .map_err(encode_error)?;
         resources.record(&translated, plans).map_err(encode_error)?;
         if let Err(error) = resources.submit() {
+            let device_lost = error.is_device_lost();
             if error.is_pending() {
-                context.abandon(resources);
+                if device_lost {
+                    resources.mark_device_lost();
+                    context.mark_device_lost();
+                } else {
+                    context.abandon(resources);
+                }
             }
             return Err(error.into_provider());
         }
@@ -601,6 +661,18 @@ impl PendingExecution {
         self.resources
             .read_updates(&self.writable_pool_keys)
             .map_err(ExecutionFailure::into_readback_provider)
+    }
+
+    pub(crate) fn owned_bytes(&self) -> u64 {
+        self.resources.owned_bytes()
+    }
+
+    pub(crate) fn mark_device_lost(&mut self) {
+        self.resources.mark_device_lost();
+    }
+
+    pub(crate) fn retain_after_budgeted_abandon(&mut self) {
+        self.resources.retain_after_budgeted_abandon();
     }
 }
 
@@ -1196,7 +1268,24 @@ struct ExecutionResources {
     fence: vk::Fence,
     submitted: bool,
     completed: bool,
+    device_lost: bool,
+    leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+}
+
+/// How `ExecutionResources::drop` must treat still-submitted handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceDropPolicy {
+    Destroy,
+    Retain,
+}
+
+fn resource_drop_policy(submitted: bool, completed: bool, device_lost: bool) -> ResourceDropPolicy {
+    if submitted && !completed && !device_lost {
+        ResourceDropPolicy::Retain
+    } else {
+        ResourceDropPolicy::Destroy
+    }
 }
 
 struct ExecutionFailure {
@@ -1293,6 +1382,13 @@ impl SubmissionFailure {
 
     fn is_pending(&self) -> bool {
         matches!(self, Self::Pending { .. })
+    }
+
+    fn is_device_lost(&self) -> bool {
+        let error = match self {
+            Self::Safe { error, .. } | Self::Pending { error, .. } => error,
+        };
+        error.result == Some(vk::Result::ERROR_DEVICE_LOST)
     }
 
     fn into_provider(self) -> ProviderError {
@@ -1486,8 +1582,24 @@ impl ExecutionResources {
             fence: vk::Fence::null(),
             submitted: false,
             completed: false,
+            device_lost: false,
+            leak_is_budgeted: false,
             buffers: Vec::new(),
         }
+    }
+
+    fn owned_bytes(&self) -> u64 {
+        self.buffers.iter().fold(0_u64, |total, buffer| {
+            total.saturating_add(u64::try_from(buffer.len).unwrap_or(u64::MAX))
+        })
+    }
+
+    fn mark_device_lost(&mut self) {
+        self.device_lost = true;
+    }
+
+    fn retain_after_budgeted_abandon(&mut self) {
+        self.leak_is_budgeted = true;
     }
 
     fn create_pipeline_objects(
@@ -1890,9 +2002,13 @@ impl ExecutionResources {
 
 impl Drop for ExecutionResources {
     fn drop(&mut self) {
-        if self.submitted && !self.completed {
-            self.context.poisoned.store(true, Ordering::Release);
-            self.context.abandoned.store(true, Ordering::Release);
+        if resource_drop_policy(self.submitted, self.completed, self.device_lost)
+            == ResourceDropPolicy::Retain
+        {
+            if !self.leak_is_budgeted {
+                self.context.poisoned.store(true, Ordering::Release);
+                self.context.abandoned.store(true, Ordering::Release);
+            }
             // A panic between queue submission and the explicit wait outcome
             // cannot unwind into destruction of in-flight handles. Raw Vulkan
             // handles below are intentionally left live, and this strong
@@ -2647,6 +2763,20 @@ mod tests {
 
     #[test]
     fn device_loss_is_classified_from_vulkan_result() {
+        assert!(
+            SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                vk::Result::ERROR_DEVICE_LOST,
+                "queue device lost",
+            ))
+            .is_device_lost()
+        );
+        assert!(
+            !SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                vk::Result::ERROR_UNKNOWN,
+                "queue outcome unknown",
+            ))
+            .is_device_lost()
+        );
         let error = SubmissionFailure::Pending {
             phase: ProviderPhase::Wait,
             error: ExecutionFailure::vulkan(
@@ -2674,6 +2804,26 @@ mod tests {
         assert_eq!(
             misleading_detail.completion,
             CompletionDisposition::SubmittedUnknown { token: None }
+        );
+    }
+
+    #[test]
+    fn only_unobserved_live_work_retains_vulkan_handles() {
+        assert_eq!(
+            resource_drop_policy(true, false, false),
+            ResourceDropPolicy::Retain
+        );
+        assert_eq!(
+            resource_drop_policy(true, false, true),
+            ResourceDropPolicy::Destroy
+        );
+        assert_eq!(
+            resource_drop_policy(true, true, false),
+            ResourceDropPolicy::Destroy
+        );
+        assert_eq!(
+            resource_drop_policy(false, false, false),
+            ResourceDropPolicy::Destroy
         );
     }
 

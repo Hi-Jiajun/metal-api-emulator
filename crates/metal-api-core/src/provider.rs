@@ -1804,6 +1804,24 @@ pub enum Retryability {
     Unknown,
 }
 
+/// Whether a provider can still admit new work.
+///
+/// `DeviceLost` and `Exhausted` are terminal for one provider instance: callers
+/// must recreate the provider before retrying. `Exhausted` means the bounded
+/// abandonment budget was reached, not that the device was observed as lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderHealth {
+    Usable,
+    DeviceLost,
+    Exhausted,
+}
+
+impl ProviderHealth {
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Usable)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FieldValue {
     Unsigned(u64),

@@ -241,6 +241,71 @@ fn record_poisoned() -> ProviderError {
     error
 }
 
+/// Bounded allowance for submissions whose completion can no longer be observed.
+///
+/// The budget is provider-scoped and monotonic. Abandoned resources cannot be
+/// safely returned to the device, so the ledger never refunds bytes; once the
+/// configured limit is reached the provider must refuse new work and be
+/// recreated. `max_submissions` is the abandoned count at which the budget is
+/// exhausted (a value of 1 fails closed on the first abandonment).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbandonmentBudget {
+    max_submissions: u64,
+    max_bytes: u64,
+}
+
+/// Result of recording one abandoned submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbandonmentOutcome {
+    Admitted,
+    Exhausted,
+}
+
+impl AbandonmentBudget {
+    pub const fn new(max_submissions: u64, max_bytes: u64) -> Self {
+        Self {
+            max_submissions,
+            max_bytes,
+        }
+    }
+
+    pub const fn max_submissions(self) -> u64 {
+        self.max_submissions
+    }
+
+    pub const fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+}
+
+/// Monotonic accounting for abandoned submissions in one provider instance.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AbandonmentLedger {
+    submissions: u64,
+    bytes: u64,
+}
+
+impl AbandonmentLedger {
+    /// Record one abandonment and report whether the budget is still intact.
+    pub fn record(&mut self, budget: AbandonmentBudget, bytes: u64) -> AbandonmentOutcome {
+        self.submissions = self.submissions.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.submissions >= budget.max_submissions || self.bytes >= budget.max_bytes {
+            AbandonmentOutcome::Exhausted
+        } else {
+            AbandonmentOutcome::Admitted
+        }
+    }
+
+    pub const fn submissions(self) -> u64 {
+        self.submissions
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +437,32 @@ mod tests {
         assert!(deadline.expired());
         assert_eq!(deadline.remaining(), None);
         assert_eq!(deadline.clamp(Duration::from_secs(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn abandonment_budget_exhausts_at_the_configured_submission_count() {
+        let budget = AbandonmentBudget::new(3, 1_000);
+        let mut ledger = AbandonmentLedger::default();
+        assert_eq!(ledger.record(budget, 10), AbandonmentOutcome::Admitted);
+        assert_eq!(ledger.record(budget, 10), AbandonmentOutcome::Admitted);
+        assert_eq!(ledger.record(budget, 10), AbandonmentOutcome::Exhausted);
+        assert_eq!(ledger.submissions(), 3);
+        assert_eq!(ledger.bytes(), 30);
+    }
+
+    #[test]
+    fn abandonment_budget_exhausts_on_an_oversized_submission() {
+        let budget = AbandonmentBudget::new(8, 64);
+        let mut ledger = AbandonmentLedger::default();
+        assert_eq!(ledger.record(budget, 64), AbandonmentOutcome::Exhausted);
+        assert_eq!(ledger.submissions(), 1);
+        assert_eq!(ledger.bytes(), 64);
+    }
+
+    #[test]
+    fn zero_abandonment_budget_fails_closed_immediately() {
+        let budget = AbandonmentBudget::new(0, 0);
+        let mut ledger = AbandonmentLedger::default();
+        assert_eq!(ledger.record(budget, 0), AbandonmentOutcome::Exhausted);
     }
 }

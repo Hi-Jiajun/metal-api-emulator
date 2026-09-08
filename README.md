@@ -40,10 +40,14 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   until readback. A configurable observation deadline (20 seconds by default,
   `with_observation_deadline`) publishes `SubmittedUnknown`; the timed-out
   submission goes to the Vulkan retirement thread or the native completion
-  handler, so the provider keeps accepting new work unless the fence never
-  signals or Metal reports a command-buffer error. `ComputeProvider::cancel`
-  and `CommandBuffer::cancel` release a pending observation without claiming
-  device retirement.
+  handler, so the provider keeps accepting new work while its abandonment
+  budget remains intact. A provider-scoped `AbandonmentBudget` bounds how many
+  unobservable submissions it tolerates; once exhausted, `health()` reports
+  `Exhausted` and new work is refused with `provider_unavailable` and
+  `RetryAfterRecreate`. A confirmed device loss reports `DeviceLost` and
+  destroys the lost device's handles. `ComputeProvider::cancel` and
+  `CommandBuffer::cancel` release a pending observation without claiming device
+  retirement.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
   reviewed MSL fixtures and shares the optional deferred completion mode.
@@ -64,9 +68,10 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   V8 reuses the v7 cases with raw and Apple-wrapped bitcode; native rails keep
   using MSL. The archived evidence contains 29 cases per path and does not
   establish general Metal conformance.
-- Open design work: explicit cancellation, completion-driven lease release,
-  general native shader admission, CPU uploads during command-buffer execution
-  and aliases.
+- Open design work: device-loss reclamation beyond the bounded abandonment
+  budget, cross-process completion, completion-driven lease release, general
+  native shader admission, CPU uploads during command-buffer execution and
+  aliases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
   textures, rendering, presentation, heaps, ICBs or production

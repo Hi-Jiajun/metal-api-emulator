@@ -9,7 +9,9 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
     MTLResourceOptions, MTLSize,
 };
-use metal_api_core::completion::{CompletionRecord, ObservationDeadline};
+use metal_api_core::completion::{
+    AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome, CompletionRecord, ObservationDeadline,
+};
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use std::collections::BTreeMap;
@@ -40,6 +42,15 @@ struct State {
 struct CompletionSlot {
     record: Arc<CompletionRecord>,
     deadline: ObservationDeadline,
+    owned_bytes: u64,
+}
+
+fn trace_owned_bytes(trace: &ComputeTrace) -> u64 {
+    trace.passes.iter().fold(0_u64, |total, pass| {
+        pass.buffers
+            .iter()
+            .fold(total, |total, view| total.saturating_add(view.length))
+    })
 }
 
 /// Native provider with at most eight serial passes over one buffer pool,
@@ -62,6 +73,8 @@ pub struct NativeMetalProvider {
     capabilities: ProviderCapabilities,
     state: Mutex<State>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
+    abandonment_budget: AbandonmentBudget,
+    abandonment: Mutex<AbandonmentLedger>,
     async_execution: bool,
     observation_deadline: Duration,
     async_abandoned: Arc<AtomicBool>,
@@ -131,6 +144,8 @@ impl NativeMetalProvider {
                     abandoned: false,
                 }),
                 completions: Mutex::new(BTreeMap::new()),
+                abandonment_budget: AbandonmentBudget::new(8, 64 * 1024 * 1024),
+                abandonment: Mutex::new(AbandonmentLedger::default()),
                 async_execution: false,
                 observation_deadline: GPU_DEADLINE,
                 async_abandoned: Arc::new(AtomicBool::new(false)),
@@ -159,6 +174,48 @@ impl NativeMetalProvider {
     pub fn with_observation_deadline(mut self, limit: Duration) -> Self {
         self.observation_deadline = limit;
         self
+    }
+
+    /// Bound how many deferred submissions may become unobservable before the
+    /// provider refuses new work. The default tolerates eight abandonments.
+    pub fn with_abandonment_budget(mut self, budget: AbandonmentBudget) -> Self {
+        self.abandonment_budget = budget;
+        self
+    }
+
+    /// Report whether this provider can still admit new work.
+    pub fn health(&self) -> ProviderHealth {
+        let state_abandoned = match self.state.lock() {
+            Ok(state) => state.abandoned,
+            Err(poisoned) => poisoned.into_inner().abandoned,
+        };
+        if state_abandoned || self.async_abandoned.load(Ordering::SeqCst) {
+            ProviderHealth::Exhausted
+        } else {
+            ProviderHealth::Usable
+        }
+    }
+
+    /// Report `(abandoned submissions, abandoned bytes)` for this provider.
+    pub fn abandonment_stats(&self) -> (u64, u64) {
+        match self.abandonment.lock() {
+            Ok(ledger) => (ledger.submissions(), ledger.bytes()),
+            Err(poisoned) => {
+                let ledger = poisoned.into_inner();
+                (ledger.submissions(), ledger.bytes())
+            }
+        }
+    }
+
+    fn record_abandonment(&self, bytes: u64) -> AbandonmentOutcome {
+        let outcome = match self.abandonment.lock() {
+            Ok(mut ledger) => ledger.record(self.abandonment_budget, bytes),
+            Err(poisoned) => poisoned.into_inner().record(self.abandonment_budget, bytes),
+        };
+        if outcome == AbandonmentOutcome::Exhausted {
+            self.async_abandoned.store(true, Ordering::SeqCst);
+        }
+        outcome
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, ProviderError> {
@@ -207,6 +264,7 @@ impl NativeMetalProvider {
         )
         .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) });
         slot.record.fail(error.clone());
+        self.record_abandonment(slot.owned_bytes);
         error
     }
 
@@ -313,10 +371,13 @@ impl PipelineProvider for NativeMetalProvider {
 
     fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
         self.check_token(token)?;
-        let _record = self
+        let slot = self
             .completions()?
             .remove(&token.submission_id)
             .ok_or_else(|| unknown_completion(token))?;
+        if slot.record.is_running() {
+            self.record_abandonment(slot.owned_bytes);
+        }
         Ok(())
     }
 }
@@ -412,6 +473,7 @@ impl ComputeProvider for NativeMetalProvider {
                 CompletionSlot {
                     record,
                     deadline: ObservationDeadline::new(self.observation_deadline),
+                    owned_bytes: trace_owned_bytes(trace),
                 },
             );
         }
@@ -681,6 +743,7 @@ impl NativeMetalProvider {
             CompletionSlot {
                 record: Arc::clone(&record),
                 deadline: ObservationDeadline::new(self.observation_deadline),
+                owned_bytes: trace_owned_bytes(trace),
             },
         );
         let abandoned = Arc::clone(&self.async_abandoned);
