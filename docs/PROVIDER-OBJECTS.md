@@ -111,7 +111,10 @@ stand in for object captures.
   typecheck/Clippy passed. The pre-existing `block` dependency still emits its
   future Rust compatibility notice for the macOS target.
 
-Native object-API GPU execution and all-five comparison require a new cloud
-run. CI now captures both object paths for every v1-v7 suite. The prior
-direct-trace success at `5c10dcd` establishes the provider baseline, not this
-new object entry point. No new Metal shader support is claimed.
+Native object-API GPU execution and all-five comparison passed in CI run
+`34011824447` for commit `489b489c11b43afbf821295d9d5fe8d9303e1e79`.
+The downloaded evidence was revalidated locally: 7 suites, 35 reports and 26
+cases per path; an independent canonical comparison found every case's
+completion, writebacks and allocation bytes equal across all five paths. Raw
+JSON ordering and backend/device metadata may differ. No new Metal shader
+support is claimed.

@@ -120,4 +120,5 @@ remain outside this provider subset. V1-v7 passed
 [three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 
 The subsequent [provider object API](PROVIDER-OBJECTS.md) connects application
-objects to this trace boundary. Its native validation requires a new cloud run.
+objects to this trace boundary. Its native execution and five-path v1-v7
+validation passed in [CI run 34011824447](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34011824447).

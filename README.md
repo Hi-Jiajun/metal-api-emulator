@@ -42,6 +42,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   pipeline/buffer objects into one complete trace and submits it once. Host
   buffer writes land only after complete output validation. See
   [PROVIDER-OBJECTS.md](docs/PROVIDER-OBJECTS.md) for lifecycle and validation.
+- Cloud validation: commit `489b489c11b43afbf821295d9d5fe8d9303e1e79` passed
+  the full v1-v7 five-path comparison: Swift native, Vulkan direct, Rust Metal
+  provider, Vulkan object API and Rust Metal object API. The archived evidence
+  contains 26 cases per path; this verifies the bounded object API on the
+  reviewed fixtures, not general Metal conformance.
 - Open design work: asynchronous submission/readback, general native shader
   admission, CPU uploads during command-buffer execution, aliases and
   completion-driven live leases.
@@ -74,9 +79,10 @@ The [resource-subset extension](conformance/RESOURCE-SUBSETS.md) allows a pass t
 bind only the resources it needs, including views first used by later passes.
 It passed [three-way v7 CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).
 The new [provider object API](docs/PROVIDER-OBJECTS.md) runs these existing suites
-through Device/Buffer/CommandBuffer/Encoder objects; its own native cloud
-validation is pending. Existing evidence does not establish general Metal
-conformance.
+through Device/Buffer/CommandBuffer/Encoder objects; its native cloud execution
+and five-path comparison passed in run
+[34011824447](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34011824447).
+Existing evidence does not establish general Metal conformance.
 
 The goal is the host provider used by reims and source-level test programs;
 loading arbitrary macOS Objective-C/Swift binaries on Windows is outside this
