@@ -189,9 +189,10 @@ impl VulkanComputeProvider {
 
     /// Forget a completion observation. Removing a running deferred record
     /// does not cancel device work: the provider hands the pending submission
-    /// to a shared reaper that waits for its fence and then releases the
-    /// handles. Unknown completion resources stay with the executor's
-    /// abandonment policy.
+    /// to a shared retirement thread that waits for its fence and then releases
+    /// the handles. The same retirement path reclaims a submission whose
+    /// observation deadline expired, so a timed-out submission does not poison
+    /// the shared context unless its fence never signals.
     pub fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
         self.validate_token(token)?;
         let slot = self
@@ -488,7 +489,7 @@ impl ComputeProvider for VulkanComputeProvider {
             return record.wait(token, timeout);
         };
         if deadline.expired() {
-            drop(pending);
+            self.retire(pending);
             return Err(self.fail_deadline(&record, token));
         }
         match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
@@ -509,7 +510,7 @@ impl ComputeProvider for VulkanComputeProvider {
             },
             Ok(false) => {
                 if deadline.expired() {
-                    drop(pending);
+                    self.retire(pending);
                     return Err(self.fail_deadline(&record, token));
                 }
                 let mut pending = Some(pending);

@@ -25,7 +25,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     let provider =
         VulkanComputeProvider::with_executor(executor.clone()).map_err(provider_error)?;
     let peer = VulkanComputeProvider::with_executor(executor.clone()).map_err(provider_error)?;
-    let device = Device::new(executor);
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
     let source = include_str!("../shaders/kernel_copy_word.ll");
     run_copy(
         &provider,
@@ -46,6 +46,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
         )?;
     }
     run_indexed_and_refusals(&provider, &peer, &device)?;
+    run_timeout_reclamation(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -98,6 +99,70 @@ fn run_copy(
     println!(
         "PASS provider_copy_word encoding={encoding} output={reference:#010x} writeback_offset=16 snapshot_parity=exact"
     );
+    Ok(())
+}
+
+/// A submission whose observation deadline expires must be handed to the
+/// shared retirement thread, not dropped in place: dropping an in-flight
+/// `PendingExecution` poisons the whole Vulkan context. The second provider
+/// below shares the same executor and proves the context is still usable.
+fn run_timeout_reclamation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let expiring = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(provider_error)?
+        .with_async_execution(true)
+        .with_observation_deadline(Duration::ZERO);
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let digest = || SemanticDigest::new("metal-smoke-fixture-v1", b"timeout_reclamation".to_vec());
+    let pipeline = expiring
+        .compile_pipeline(&function, digest()?)
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 90, dispatch, bindings())?;
+    let admitted = expiring
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = expiring.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("timed-out submission has no token")?;
+    match expiring.wait(token, Duration::ZERO) {
+        Err(error)
+            if error.slug == "vulkan-completion-unknown"
+                && error.completion
+                    == (CompletionDisposition::SubmittedUnknown { token: Some(token) }) => {}
+        other => {
+            return Err(
+                format!("zero deadline did not publish unknown completion: {other:?}").into(),
+            )
+        }
+    }
+    expiring.release_completion(token).map_err(provider_error)?;
+
+    let recovery =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let pipeline = recovery
+        .compile_pipeline(&function, digest()?)
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 91, dispatch, bindings())?;
+    let result = submit_and_wait(&recovery, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    release_case(&recovery, &pipeline, &result)?;
+    println!("PASS provider_timeout_reclamation deadline=0 context_usable=true writeback=exact");
     Ok(())
 }
 
