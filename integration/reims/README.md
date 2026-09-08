@@ -20,6 +20,15 @@ It exposes buffer results, validates exact dispatch and device limits, and adds
 an explicit synchronous completion entry. The product's asynchronous entry is
 preserved. These changes have not been accepted upstream.
 
+The adapter builds against the current metal2vulkan revision
+(`43c46ac8a24adf1a6e872b8a52c706ec9614fad0`) while the vendored reims engine
+still pins `9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c`. The exact-thread region
+plan and 48-byte push-constant payload ABI are identical across those revisions,
+so `src/lib.rs` constructs `ComputeDispatch::Regions` from the current
+reflection instead of passing a `KernelDispatch` value across the two crate
+versions. Reims itself must be bumped before the two dependencies can share one
+translator type.
+
 For offline preparation, `--source /path/to/reims-clone` reads the same pinned
 commit from an existing clone. It always creates a new checkout here; it does
 not edit that source clone. Existing destination directories are refused.

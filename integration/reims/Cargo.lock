@@ -303,6 +303,7 @@ version = "0.1.0"
 name = "metal-api-native"
 version = "0.1.0"
 dependencies = [
+ "block",
  "foreign-types",
  "metal",
  "metal-api-core",
@@ -316,7 +317,7 @@ dependencies = [
  "metal-api-core",
  "metal-api-vulkan",
  "metal-smoke",
- "metal2vulkan",
+ "metal2vulkan 0.1.0 (git+https://github.com/steelbrain/metal2vulkan.git?rev=43c46ac8a24adf1a6e872b8a52c706ec9614fad0)",
  "reims-vgpu",
 ]
 
@@ -326,7 +327,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "metal-api-core",
- "metal2vulkan",
+ "metal2vulkan 0.1.0 (git+https://github.com/steelbrain/metal2vulkan.git?rev=43c46ac8a24adf1a6e872b8a52c706ec9614fad0)",
  "spirv",
 ]
 
@@ -346,6 +347,15 @@ dependencies = [
 name = "metal2vulkan"
 version = "0.1.0"
 source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=43c46ac8a24adf1a6e872b8a52c706ec9614fad0#43c46ac8a24adf1a6e872b8a52c706ec9614fad0"
+dependencies = [
+ "spirv",
+ "wait-timeout",
+]
+
+[[package]]
+name = "metal2vulkan"
+version = "0.1.0"
+source = "git+https://github.com/steelbrain/metal2vulkan.git?rev=9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c#9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c"
 dependencies = [
  "spirv",
  "wait-timeout",
@@ -452,7 +462,7 @@ dependencies = [
  "foreign-types",
  "libc",
  "metal",
- "metal2vulkan",
+ "metal2vulkan 0.1.0 (git+https://github.com/steelbrain/metal2vulkan.git?rev=9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c)",
  "objc",
  "once_cell",
  "parking_lot",
