@@ -236,7 +236,8 @@ parity.
   direct/object/async-object captures still match. Binary SHA-256 values are
   recorded in `evidence/windows-rtx5060-e891102-2026-09-08/manifest.md`. The
   Unix command-channel/descriptor cases are skipped on Windows because there
-  is no `SCM_RIGHTS` equivalent.
+  is no `SCM_RIGHTS` equivalent. The optional reims adapter also cross-compiled
+  and ran on the RTX 5060 (`reims-smoke.exe`, `PASS suite executor=reims`).
 - 2026-09-08 native device-removal increment: 159 Rust tests passed (core 100,
   native 9, Vulkan 36, capture 14) and 115 Python tests passed. Native Metal
   classifies `MTLCommandBufferError::DeviceRemoved` (code 11) as `DeviceLost`

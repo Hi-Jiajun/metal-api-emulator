@@ -178,6 +178,10 @@ cases run on the device. The RTX 5060 run exercised
 `VK_EXT_external_memory_host` host-pointer import with the owner mapping
 observing the GPU write in place.
 
+The optional `reims-smoke.exe` also cross-compiles and runs on the same host.
+It reported the reims-vgpu persistent Vulkan engine and passed the copy,
+raw/wrapped AIR and indexed-boundary checks on the RTX 5060.
+
 The suite checks:
 
 ```text
