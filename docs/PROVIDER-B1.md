@@ -143,7 +143,10 @@ parity.
   `ImportStagedLease`/`ReleaseStagedLease` and `health` travel over the channel,
   and `ImportBorrowedLease` carries the reservation in the frame plus the owner
   mapping with `SCM_RIGHTS`; the Unix server maps it, keeps it alive until
-  release and imports it through `NoCopyLeaseImporter`. Lavapipe reports
+  release and imports it through `NoCopyLeaseImporter`. Requests larger than
+  the sender's frame limit are split into chunk frames and reassembled before
+  decoding, bounded by `MAX_CHUNKED_REQUEST` (256 MiB); the command smoke
+  lowers the limit to 1 KiB so every request takes that path. Lavapipe reports
   `provider_command_process ... commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place`.
 - 2026-09-08 Vulkan no-copy lease import: `metal_api_core::provider` gains
   `BorrowedLease`, `BorrowedLeaseRegistry` and the `NoCopyLeaseImporter` trait.

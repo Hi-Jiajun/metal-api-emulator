@@ -538,6 +538,8 @@ pub fn run_provider_command_child(
         .with_completion_outbox(outbox)
         .map_err(provider_error)?;
     let mut transport = command_unix::connect(command_socket)?;
+    // Chunk responses too, so readbacks travel through the chunk path.
+    transport.set_max_frame(1024);
     serve_provider_unix(&provider, &mut transport)?;
     drop(provider);
     writer
@@ -662,8 +664,11 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         .ok_or("provider command child stdout was not piped")?;
     let mut lines = BufReader::new(stdout).lines();
 
-    let command_transport = command_listener.accept()?;
+    let mut command_transport = command_listener.accept()?;
     command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Exercise the chunked request path on the same connection: every request
+    // below is larger than this frame limit.
+    command_transport.set_max_frame(1024);
     let completion_transport = completion_listener.accept()?;
     completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
 
@@ -897,7 +902,7 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         return Err(format!("provider command child exited with {status}").into());
     }
     println!(
-        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place"
+        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place chunked=1024"
     );
     Ok(())
 }

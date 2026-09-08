@@ -15,9 +15,12 @@
 //!
 //! # Scope
 //!
-//! A frame is bounded by [`crate::command_codec::MAX_COMMAND_FRAME`]; a trace
-//! whose encoded owned bytes exceed that bound must use a chunked data channel
-//! (not part of this version). Lease-backed views carry only their lease id.
+//! A frame is bounded by [`crate::command_codec::MAX_COMMAND_FRAME`]. When an
+//! encoded request exceeds the sender's frame limit, the transport splits it
+//! into chunk frames and the receiver reassembles it before decoding, so a
+//! trace larger than one frame travels over the same connection (bounded by
+//! [`crate::command_codec::MAX_CHUNKED_PAYLOAD`]). Lease-backed views carry
+//! only their lease id.
 //! Staged leases travel inside the frame; no-copy leases use
 //! [`CommandRequest::ImportBorrowedLease`], which carries the reservation in
 //! the frame and sends the owner mapping with `SCM_RIGHTS` immediately after
@@ -25,7 +28,7 @@
 //! and [`RemoteProvider::import_borrowed_lease`] on the owner side.
 
 use crate::codec::CodecError;
-use crate::command_codec::CommandCodec;
+use crate::command_codec::{CommandCodec, MAX_CHUNKED_PAYLOAD, MAX_COMMAND_FRAME};
 use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, LeaseId, LeaseImporter, LeaseReservation,
@@ -215,6 +218,16 @@ pub struct CommandTransport<R, W> {
     writer: W,
     sent: u64,
     received: u64,
+    max_frame: usize,
+    next_transfer: u64,
+    pending_chunk: Option<ChunkAssembly>,
+}
+
+#[derive(Debug)]
+struct ChunkAssembly {
+    transfer_id: u64,
+    total: usize,
+    bytes: Vec<u8>,
 }
 
 impl<R: Read, W: Write> CommandTransport<R, W> {
@@ -225,7 +238,25 @@ impl<R: Read, W: Write> CommandTransport<R, W> {
             writer,
             sent: 0,
             received: 0,
+            max_frame: MAX_COMMAND_FRAME,
+            next_transfer: 0,
+            pending_chunk: None,
         }
+    }
+
+    /// Set the largest request payload sent as one frame before the transport
+    /// splits it into chunk frames.
+    ///
+    /// Defaults to [`MAX_COMMAND_FRAME`]. A receiver accepts chunk frames
+    /// regardless of its own value, so tests and constrained transports can
+    /// lower it on the sending side only.
+    pub fn set_max_frame(&mut self, max_frame: usize) {
+        self.max_frame = max_frame.clamp(1, MAX_COMMAND_FRAME);
+    }
+
+    /// Largest request payload sent as one frame.
+    pub const fn max_frame(&self) -> usize {
+        self.max_frame
     }
 
     /// Send one request and read its response.
@@ -247,27 +278,163 @@ impl<R: Read, W: Write> CommandTransport<R, W> {
     where
         F: FnOnce(&mut W) -> Result<(), CommandError>,
     {
-        CommandCodec::write_request(&mut self.writer, request)?;
+        let payload = CommandCodec::encode_request_payload(request)?;
+        self.send_payload(CommandCodec::request_frame_kind(), &payload)?;
         self.writer.flush().map_err(CodecError::Io)?;
         self.sent += 1;
         after_send(&mut self.writer)?;
-        let response = CommandCodec::read_response(&mut self.reader)?;
+        let payload = self.recv_payload(CommandCodec::response_frame_kind())?;
+        let response = CommandCodec::decode_response_payload(&payload)?;
         self.received += 1;
         Ok(response)
     }
 
     /// Read one request. Used by the provider-side server loop.
     pub fn recv_request(&mut self) -> Result<CommandRequest, CommandError> {
-        let request = CommandCodec::read_request(&mut self.reader)?;
+        let payload = self.recv_payload(CommandCodec::request_frame_kind())?;
+        let request = CommandCodec::decode_request_payload(&payload)?;
         self.received += 1;
         Ok(request)
     }
 
     /// Write one response. Used by the provider-side server loop.
     pub fn send_response(&mut self, response: &CommandResponse) -> Result<(), CommandError> {
-        CommandCodec::write_response(&mut self.writer, response)?;
+        let payload = CommandCodec::encode_response_payload(response)?;
+        self.send_payload(CommandCodec::response_frame_kind(), &payload)?;
         self.sent += 1;
         Ok(())
+    }
+
+    fn send_payload(&mut self, frame_kind: u8, payload: &[u8]) -> Result<(), CommandError> {
+        if payload.len() <= self.max_frame {
+            self.write_frame(frame_kind, payload)?;
+            return Ok(());
+        }
+        let total =
+            u64::try_from(payload.len()).map_err(|_| CodecError::ChunkedPayloadTooLarge {
+                total: u64::MAX,
+                maximum: MAX_CHUNKED_PAYLOAD,
+            })?;
+        if payload.len() > MAX_CHUNKED_PAYLOAD {
+            return Err(CodecError::ChunkedPayloadTooLarge {
+                total,
+                maximum: MAX_CHUNKED_PAYLOAD,
+            }
+            .into());
+        }
+        let transfer_id = self.next_transfer;
+        self.next_transfer = self.next_transfer.wrapping_add(1);
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            let end = (offset + self.max_frame).min(payload.len());
+            CommandCodec::write_chunk_frame(
+                &mut self.writer,
+                transfer_id,
+                offset as u64,
+                total,
+                &payload[offset..end],
+            )?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    fn write_frame(&mut self, frame_kind: u8, payload: &[u8]) -> Result<(), CommandError> {
+        if frame_kind == CommandCodec::request_frame_kind() {
+            CommandCodec::write_request_payload(&mut self.writer, payload)?;
+        } else {
+            CommandCodec::write_response_payload(&mut self.writer, payload)?;
+        }
+        Ok(())
+    }
+
+    fn recv_payload(&mut self, frame_kind: u8) -> Result<Vec<u8>, CommandError> {
+        loop {
+            let (kind, payload) = CommandCodec::read_raw_frame(&mut self.reader)?;
+            if kind == frame_kind {
+                if let Some(pending) = self.pending_chunk.take() {
+                    return Err(CodecError::ChunkInterrupted {
+                        received: pending.bytes.len() as u64,
+                        declared: pending.total as u64,
+                    }
+                    .into());
+                }
+                return Ok(payload);
+            }
+            if kind != CommandCodec::chunk_frame_kind() {
+                return Err(CodecError::UnknownFrameKind(kind).into());
+            }
+            let chunk = CommandCodec::decode_chunk_payload(&payload)?;
+            let total =
+                usize::try_from(chunk.total).map_err(|_| CodecError::ChunkedPayloadTooLarge {
+                    total: chunk.total,
+                    maximum: MAX_CHUNKED_PAYLOAD,
+                })?;
+            if total > MAX_CHUNKED_PAYLOAD {
+                return Err(CodecError::ChunkedPayloadTooLarge {
+                    total: chunk.total,
+                    maximum: MAX_CHUNKED_PAYLOAD,
+                }
+                .into());
+            }
+            match &mut self.pending_chunk {
+                None => {
+                    if chunk.offset != 0 || chunk.bytes.is_empty() || total == 0 {
+                        return Err(CodecError::ChunkSequence {
+                            expected: 0,
+                            actual: chunk.offset,
+                        }
+                        .into());
+                    }
+                    self.pending_chunk = Some(ChunkAssembly {
+                        transfer_id: chunk.transfer_id,
+                        total,
+                        bytes: Vec::new(),
+                    });
+                }
+                Some(pending) => {
+                    if pending.transfer_id != chunk.transfer_id {
+                        return Err(CodecError::ChunkSequence {
+                            expected: pending.transfer_id,
+                            actual: chunk.transfer_id,
+                        }
+                        .into());
+                    }
+                    if pending.total as u64 != chunk.total {
+                        return Err(CodecError::ChunkTotalMismatch {
+                            declared: pending.total as u64,
+                            actual: chunk.total,
+                        }
+                        .into());
+                    }
+                    let expected = pending.bytes.len() as u64;
+                    if chunk.offset != expected {
+                        return Err(CodecError::ChunkSequence {
+                            expected,
+                            actual: chunk.offset,
+                        }
+                        .into());
+                    }
+                }
+            }
+            let end = chunk.offset + chunk.bytes.len() as u64;
+            if end > chunk.total {
+                return Err(CodecError::ChunkTotalMismatch {
+                    declared: chunk.total,
+                    actual: end,
+                }
+                .into());
+            }
+            let pending = self
+                .pending_chunk
+                .as_mut()
+                .expect("pending chunk was set above");
+            pending.bytes.extend_from_slice(&chunk.bytes);
+            if end == chunk.total {
+                let pending = self.pending_chunk.take().expect("completed chunk transfer");
+                return Ok(pending.bytes);
+            }
+        }
     }
 
     /// Flush the underlying writer.
@@ -934,6 +1101,8 @@ mod tests {
     #[cfg(unix)]
     use super::serve_provider_unix;
     use super::{serve_provider, CommandRequest, CommandResponse, RemoteProvider};
+    #[cfg(unix)]
+    use crate::codec::CodecError;
     use crate::command_codec::CommandCodec;
     use metal_api_core::provider::{
         AllocationId, AllocationRecord, BufferAccess, BufferBindingContract, BufferLease,
@@ -1422,5 +1591,74 @@ mod tests {
         assert_eq!(refused.slug, "lease_not_imported");
         drop(remote);
         server_thread.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_provider_chunks_requests_above_the_frame_limit() {
+        let submissions = Arc::new(AtomicU64::new(0));
+        let imports = Arc::new(AtomicU64::new(0));
+        let provider = FakeProvider {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+            submissions: Arc::clone(&submissions),
+            imports: Arc::clone(&imports),
+            borrowed: Arc::new(BorrowedLeaseRegistry::new()),
+        };
+        let (mut client, mut server) = super::unix::pair().unwrap();
+        client.set_max_frame(32);
+        server.set_max_frame(32);
+        assert_eq!(client.max_frame(), 32);
+        let server_thread = std::thread::spawn(move || serve_provider(&provider, &mut server));
+
+        // Capabilities already exceeds 32 bytes, so connect and every request
+        // below exercise chunk framing and reassembly.
+        let remote = RemoteProvider::connect(client).unwrap();
+        let compiled = remote.compile(compile_request()).unwrap();
+        let trace = trace(&compiled);
+        let admitted = remote
+            .capabilities()
+            .validate_trace(trace, resources())
+            .unwrap();
+        let submitted = remote.submit(admitted).unwrap();
+        let token = submitted.completion.token().unwrap();
+        assert_eq!(
+            remote.wait(token, Duration::from_secs(1)).unwrap(),
+            CompletionDisposition::CompletedVisible { token }
+        );
+        let readback = remote.readback(token).unwrap();
+        assert_eq!(readback.writebacks.len(), 1);
+        remote.release_completion(token).unwrap();
+        remote.release_pipeline(&compiled).unwrap();
+        drop(remote);
+        server_thread.join().unwrap().unwrap();
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunk_frames_reject_a_request_before_the_transfer_finishes() {
+        let (mut client, mut server) = super::unix::pair().unwrap();
+        let payload = CommandCodec::encode_request_payload(&CommandRequest::Compile {
+            request: compile_request(),
+        })
+        .unwrap();
+        assert!(payload.len() > 4);
+        let half = payload.len() / 2;
+        CommandCodec::write_chunk_frame(
+            &mut client.writer,
+            9,
+            0,
+            payload.len() as u64,
+            &payload[..half],
+        )
+        .unwrap();
+        CommandCodec::write_request(&mut client.writer, &CommandRequest::Health).unwrap();
+
+        let error = server.recv_request().unwrap_err();
+        assert!(matches!(
+            error,
+            super::CommandError::Codec(CodecError::ChunkInterrupted { .. })
+        ));
     }
 }

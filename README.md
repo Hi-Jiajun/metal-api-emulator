@@ -194,8 +194,10 @@ also imports an owner-issued staged lease, executes a view from the copied
 window and retires the lease through the owner ledger, then imports an aligned
 owner mapping without copying
 (`VK_EXT_external_memory_host`) and proves live reads and in-place GPU writes
-before release. This is a provider/legacy Vulkan comparison, not a native Metal
-oracle.
+before release. The command connection lowers its frame limit to 1 KiB in this
+case, so every request travels as chunk frames and the child reassembles it
+before decoding. This is a provider/legacy Vulkan comparison, not a native
+Metal oracle.
 
 The indexed case launches a 10x3 grid with an 8x2 nominal threadgroup, exercises
 a barrier and checks all 30 output words. Its source and reference output are

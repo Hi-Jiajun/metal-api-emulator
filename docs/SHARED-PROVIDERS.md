@@ -117,8 +117,8 @@ from the mirror alone. `metal-api-ipc::command` adds the opposite direction: a
 versioned `MCC1` request/response channel where the owner compiles, submits,
 waits, reads back, cancels and releases on a provider in another process, and
 imports staged leases plus descriptor-backed no-copy leases over the same
-connection. A chunked data channel, dma-buf/guest memory and the production
-guest/display path remain future work.
+connection, and chunk frames carry requests larger than one frame. dma-buf and
+guest memory plus the production guest/display path remain future work.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

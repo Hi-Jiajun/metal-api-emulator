@@ -26,9 +26,13 @@ use std::io::{Read, Write};
 pub const COMMAND_FRAME_MAGIC: [u8; 4] = *b"MCC1";
 /// Maximum encoded payload, excluding the nine-byte frame header.
 pub const MAX_COMMAND_FRAME: usize = 64 * 1024 * 1024;
+/// Maximum total length of a request or response reassembled from chunk
+/// frames.
+pub const MAX_CHUNKED_PAYLOAD: usize = 256 * 1024 * 1024;
 
 const REQUEST_FRAME: u8 = 0x01;
 const RESPONSE_FRAME: u8 = 0x02;
+const CHUNK_FRAME: u8 = 0x03;
 
 const CAPABILITIES_REQUEST: u8 = 0x01;
 const COMPILE_REQUEST: u8 = 0x02;
@@ -57,9 +61,26 @@ const ERROR_RESPONSE: u8 = 0x7f;
 /// Stateless encoder/decoder for command frames.
 pub struct CommandCodec;
 
+/// One decoded chunk frame.
+#[derive(Debug)]
+pub(crate) struct ChunkPayload {
+    pub(crate) transfer_id: u64,
+    pub(crate) offset: u64,
+    pub(crate) total: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
 impl CommandCodec {
     /// Encode one complete request frame.
     pub fn encode_request(request: &CommandRequest) -> Result<Vec<u8>, CodecError> {
+        frame(REQUEST_FRAME, Self::encode_request_payload(request)?)
+    }
+
+    /// Encode one request payload without the frame header.
+    ///
+    /// A transport that cannot fit the payload into [`MAX_COMMAND_FRAME`]
+    /// splits it into chunk frames with `CommandCodec::write_chunk_frame`.
+    pub fn encode_request_payload(request: &CommandRequest) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::new();
         match request {
             CommandRequest::Capabilities => encoder.u8(CAPABILITIES_REQUEST),
@@ -111,16 +132,26 @@ impl CommandCodec {
                 put_token(&mut encoder, token);
             }
         }
-        frame(REQUEST_FRAME, encoder.bytes)
+        Ok(encoder.bytes)
     }
 
     /// Decode one complete request frame.
     pub fn decode_request(frame: &[u8]) -> Result<CommandRequest, CodecError> {
-        decode_request_payload(unframe(frame, REQUEST_FRAME)?)
+        Self::decode_request_payload(unframe(frame, REQUEST_FRAME)?)
+    }
+
+    /// Decode one request payload without the frame header.
+    pub fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> {
+        decode_request_payload(payload)
     }
 
     /// Encode one complete response frame.
     pub fn encode_response(response: &CommandResponse) -> Result<Vec<u8>, CodecError> {
+        frame(RESPONSE_FRAME, Self::encode_response_payload(response)?)
+    }
+
+    /// Encode one response payload without the frame header.
+    pub fn encode_response_payload(response: &CommandResponse) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::new();
         match response {
             CommandResponse::Capabilities {
@@ -158,12 +189,17 @@ impl CommandCodec {
                 put_error(&mut encoder, error);
             }
         }
-        frame(RESPONSE_FRAME, encoder.bytes)
+        Ok(encoder.bytes)
     }
 
     /// Decode one complete response frame.
     pub fn decode_response(frame: &[u8]) -> Result<CommandResponse, CodecError> {
-        decode_response_payload(unframe(frame, RESPONSE_FRAME)?)
+        Self::decode_response_payload(unframe(frame, RESPONSE_FRAME)?)
+    }
+
+    /// Decode one response payload without the frame header.
+    pub fn decode_response_payload(payload: &[u8]) -> Result<CommandResponse, CodecError> {
+        decode_response_payload(payload)
     }
 
     /// Write one request frame.
@@ -182,6 +218,74 @@ impl CommandCodec {
             return Err(CodecError::UnknownCommandTag(kind));
         }
         decode_request_payload(&payload)
+    }
+
+    /// Write one request payload as a single frame.
+    pub(crate) fn write_request_payload<W: Write>(
+        writer: &mut W,
+        payload: &[u8],
+    ) -> Result<(), CodecError> {
+        write_framed(writer, REQUEST_FRAME, payload)
+    }
+
+    /// Write one response payload as a single frame.
+    pub(crate) fn write_response_payload<W: Write>(
+        writer: &mut W,
+        payload: &[u8],
+    ) -> Result<(), CodecError> {
+        write_framed(writer, RESPONSE_FRAME, payload)
+    }
+
+    /// Write one chunk of a request payload.
+    pub(crate) fn write_chunk_frame<W: Write>(
+        writer: &mut W,
+        transfer_id: u64,
+        offset: u64,
+        total: u64,
+        bytes: &[u8],
+    ) -> Result<(), CodecError> {
+        let mut encoder = Encoder::new();
+        encoder.u64(transfer_id);
+        encoder.u64(offset);
+        encoder.u64(total);
+        encoder.blob(bytes);
+        write_framed(writer, CHUNK_FRAME, &encoder.bytes)
+    }
+
+    /// Read one frame without interpreting its kind.
+    pub(crate) fn read_raw_frame<R: Read>(reader: &mut R) -> Result<(u8, Vec<u8>), CodecError> {
+        read_frame(reader)
+    }
+
+    /// Decode one chunk frame payload.
+    pub(crate) fn decode_chunk_payload(payload: &[u8]) -> Result<ChunkPayload, CodecError> {
+        let mut decoder = Decoder::new(payload);
+        let transfer_id = decoder.u64()?;
+        let offset = decoder.u64()?;
+        let total = decoder.u64()?;
+        let bytes = decoder.blob()?;
+        decoder.finish()?;
+        Ok(ChunkPayload {
+            transfer_id,
+            offset,
+            total,
+            bytes,
+        })
+    }
+
+    /// Frame kind of a request frame.
+    pub(crate) const fn request_frame_kind() -> u8 {
+        REQUEST_FRAME
+    }
+
+    /// Frame kind of a response frame.
+    pub(crate) const fn response_frame_kind() -> u8 {
+        RESPONSE_FRAME
+    }
+
+    /// Frame kind of a chunk frame.
+    pub(crate) const fn chunk_frame_kind() -> u8 {
+        CHUNK_FRAME
     }
 
     /// Write one response frame.
@@ -301,6 +405,22 @@ fn frame(kind: u8, payload: Vec<u8>) -> Result<Vec<u8>, CodecError> {
         });
     }
     Ok(reframe(kind, payload))
+}
+
+fn write_framed<W: Write>(writer: &mut W, kind: u8, payload: &[u8]) -> Result<(), CodecError> {
+    if payload.len() > MAX_COMMAND_FRAME {
+        return Err(CodecError::FrameTooLarge {
+            length: payload.len(),
+            maximum: MAX_COMMAND_FRAME,
+        });
+    }
+    let mut header = [0u8; 9];
+    header[..4].copy_from_slice(&COMMAND_FRAME_MAGIC);
+    header[4] = kind;
+    header[5..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    writer.write_all(&header).map_err(CodecError::Io)?;
+    writer.write_all(payload).map_err(CodecError::Io)?;
+    Ok(())
 }
 
 fn unframe(frame: &[u8], expected: u8) -> Result<&[u8], CodecError> {

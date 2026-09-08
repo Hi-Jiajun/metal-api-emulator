@@ -62,6 +62,11 @@ pub enum CodecError {
     UnknownMessageTag(u8),
     UnknownUpdateTag(u8),
     UnknownCommandTag(u8),
+    UnknownFrameKind(u8),
+    ChunkSequence { expected: u64, actual: u64 },
+    ChunkTotalMismatch { declared: u64, actual: u64 },
+    ChunkInterrupted { received: u64, declared: u64 },
+    ChunkedPayloadTooLarge { total: u64, maximum: usize },
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
@@ -101,6 +106,25 @@ impl fmt::Display for CodecError {
             Self::UnknownCommandTag(tag) => {
                 write!(formatter, "unknown command frame tag {tag:#04x}")
             }
+            Self::UnknownFrameKind(kind) => {
+                write!(formatter, "unknown command frame kind {kind:#04x}")
+            }
+            Self::ChunkSequence { expected, actual } => write!(
+                formatter,
+                "command chunk sequence expected offset {expected}, received {actual}"
+            ),
+            Self::ChunkTotalMismatch { declared, actual } => write!(
+                formatter,
+                "command chunk total mismatch: declared {declared}, received {actual}"
+            ),
+            Self::ChunkInterrupted { received, declared } => write!(
+                formatter,
+                "command chunk transfer interrupted after {received} of {declared} bytes"
+            ),
+            Self::ChunkedPayloadTooLarge { total, maximum } => write!(
+                formatter,
+                "chunked command payload length {total} exceeds maximum {maximum}"
+            ),
             Self::UnknownEnumValue { field, value } => {
                 write!(formatter, "unknown {field} value {value}")
             }
