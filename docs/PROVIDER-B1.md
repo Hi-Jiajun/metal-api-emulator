@@ -171,7 +171,11 @@ parity.
   `remote_provider_reports_exhausted_after_the_command_channel_closes` uses a
   one-shot server that answers `Capabilities` and `Health` then closes,
   observes EOF on the next exchange and pins the `Usable` to `Exhausted`
-  transition plus the structured operation refusal.
+  transition plus the structured operation refusal. The owner half
+  `run_remote_provider_disconnect_process` repeats the contract across a real
+  process boundary: it kills the command child after a `Usable` health check
+  and reports
+  `PASS provider_disconnect_process transport=unix health=Exhausted refusal=provider_unavailable retry=RetryAfterRecreate killed=true`.
 - 2026-09-08 owner-to-provider command channel: `metal-api-ipc::command` adds a
   versioned `MCC1` request/response channel with `RemoteProvider`,
   `serve_provider` and `serve_provider_unix`. The owner remotely compiles,

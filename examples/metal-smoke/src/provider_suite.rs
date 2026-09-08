@@ -17,6 +17,8 @@ use metal_api_core::provider::{
     ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
     StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
+#[cfg(unix)]
+use metal_api_core::provider::{ProviderErrorClass, Retryability};
 use metal_api_core::{Device, Library};
 use metal_api_ipc::command::{serve_provider_named, tcp as command_tcp, RemoteProvider};
 #[cfg(unix)]
@@ -114,6 +116,8 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_completion_ipc_process()?;
     #[cfg(unix)]
     run_remote_provider_process()?;
+    #[cfg(unix)]
+    run_remote_provider_disconnect_process()?;
     #[cfg(unix)]
     run_borrowed_shared_process()?;
     run_named_provider_process()?;
@@ -978,6 +982,86 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place chunked=1024"
+    );
+    Ok(())
+}
+
+/// Owner half of the command-channel failure test.
+///
+/// The child owns a real Vulkan device and serves the command channel. The
+/// owner connects, confirms `Usable` health, kills the child process, then
+/// observes `Exhausted` health and a structured `provider_unavailable`
+/// refusal on the next operation.
+#[cfg(unix)]
+fn run_remote_provider_disconnect_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let command_path = std::env::temp_dir().join(format!(
+        "metal-smoke-disconnect-command-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let completion_path = std::env::temp_dir().join(format!(
+        "metal-smoke-disconnect-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let command_listener = command_unix::UnixListenerCommandTransport::bind(&command_path)?;
+    let completion_listener = unix::UnixListenerTransport::bind(&completion_path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--command-child")
+        .arg(&command_path)
+        .arg(&completion_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let _completion_transport = completion_listener.accept()?;
+    _completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    if remote.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "disconnect provider health is not usable: {:?}",
+            remote.health()
+        )
+        .into());
+    }
+    child.kill()?;
+    let status = child.wait()?;
+    if remote.health() != ProviderHealth::Exhausted {
+        return Err(format!(
+            "disconnect provider health is {:?}, expected Exhausted",
+            remote.health()
+        )
+        .into());
+    }
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"remote_provider_disconnect".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let error = remote.compile(compile).map(|_| ()).unwrap_err();
+    if error.class != ProviderErrorClass::Resource
+        || error.slug != "provider_unavailable"
+        || error.retryability != Retryability::RetryAfterRecreate
+    {
+        return Err(format!(
+            "disconnect refusal was not provider_unavailable/RetryAfterRecreate: {error:?}"
+        )
+        .into());
+    }
+    drop(remote);
+    let _ = std::fs::remove_file(&command_path);
+    let _ = std::fs::remove_file(&completion_path);
+    println!(
+        "PASS provider_disconnect_process transport=unix health=Exhausted refusal=provider_unavailable retry=RetryAfterRecreate killed={}",
+        !status.success()
     );
     Ok(())
 }
