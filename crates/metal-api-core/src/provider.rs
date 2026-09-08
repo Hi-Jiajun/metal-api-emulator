@@ -1306,6 +1306,16 @@ struct BorrowedEntry {
 pub struct BorrowedView {
     pub pointer: usize,
     pub len: usize,
+    /// Base of the imported reservation. Providers that map a whole
+    /// reservation instead of the view window bind this pointer and apply
+    /// [`BorrowedView::offset`].
+    pub base_pointer: usize,
+    /// Reservation length in bytes, the range covered by
+    /// [`BorrowedView::base_pointer`].
+    pub base_len: usize,
+    /// Offset of [`BorrowedView::pointer`] from
+    /// [`BorrowedView::base_pointer`].
+    pub offset: usize,
     /// Valid bytes from `pointer` to the end of the imported reservation.
     pub capacity: usize,
 }
@@ -1486,9 +1496,17 @@ impl BorrowedLeaseRegistry {
         let capacity = usize::try_from(lease_end - view.offset).map_err(|_| {
             contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease capacity"))
         })?;
+        let base_len = usize::try_from(reservation.length).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow(
+                "borrowed lease reservation length",
+            ))
+        })?;
         Ok(BorrowedView {
             pointer,
             len,
+            base_pointer: entry.lease.host_pointer,
+            base_len,
+            offset: start,
             capacity,
         })
     }
@@ -1537,6 +1555,9 @@ pub trait NoCopyLeaseImporter {
     ///
     /// `borrowed.host_pointer` must point to `borrowed.reservation.length`
     /// readable and writable bytes aligned to [`Self::no_copy_alignment`].
+    /// Providers that map whole reservations, such as Metal no-copy buffers,
+    /// additionally require `borrowed.reservation.length` to be a multiple of
+    /// [`Self::no_copy_alignment`].
     /// The owner must keep that mapping valid and at the same address until
     /// every retained submission is retired and
     /// [`Self::release_borrowed_lease`] has returned.
@@ -4923,6 +4944,9 @@ mod tests {
             BorrowedView {
                 pointer: 0x4004,
                 len: 4,
+                base_pointer: 0x4000,
+                base_len: 16,
+                offset: 4,
                 capacity: 12,
             }
         );

@@ -313,6 +313,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "foreign-types",
+ "libc",
  "metal",
  "metal-api-core",
  "objc",

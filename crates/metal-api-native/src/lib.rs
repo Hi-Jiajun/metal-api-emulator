@@ -789,4 +789,218 @@ mod tests {
         provider.release_completion(token).unwrap();
         provider.release_pipeline(&pipeline).unwrap();
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn borrowed_lease_imports_without_copying_and_retires() {
+        use metal_api_core::provider::{
+            AllocationId, AllocationRecord, BorrowedLease, BufferLease, BufferSource, BufferView,
+            CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType,
+            LeaseId, LeaseLedger, LeaseObservation, LeaseReservation, NoCopyLeaseImporter,
+            OperationId, PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+        };
+
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native borrowed lease test: no eligible Metal device");
+            return;
+        };
+        let pipeline = provider
+            .compile(request("copy_word", COPY))
+            .expect("reviewed copy_word fixture compiles");
+        let alignment = provider.no_copy_alignment();
+        assert!(
+            alignment > 0,
+            "native provider must advertise page alignment"
+        );
+        let lease_id = LeaseId::new(98);
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: AllocationId::new(197),
+                owner_epoch: provider.device_epoch(),
+            },
+            offset: 0,
+            // Metal maps whole no-copy reservations, so the owner window must
+            // be a page multiple.
+            length: alignment,
+        };
+        let layout =
+            std::alloc::Layout::from_size_align(alignment as usize, alignment as usize).unwrap();
+        // SAFETY: the layout is non-zero and the allocation is freed below.
+        let owner = unsafe { std::alloc::alloc(layout) };
+        assert!(!owner.is_null(), "page-aligned owner allocation failed");
+        // SAFETY: `owner` covers one writable page.
+        unsafe {
+            std::ptr::write_bytes(owner, 0xcd, alignment as usize);
+            std::ptr::copy_nonoverlapping(0xaaaa_aaaa_u32.to_le_bytes().as_ptr(), owner, 4);
+        }
+
+        // SAFETY: the owner allocation outlives the import and is released
+        // after both submissions retire below.
+        let error = unsafe {
+            provider
+                .import_borrowed_lease(BorrowedLease::new(reservation, owner as usize + 1).unwrap())
+        }
+        .expect_err("misaligned owner pointer must be refused");
+        assert_eq!(error.slug, "lease_alignment_unsupported");
+        // SAFETY: `owner` covers one writable page; the short reservation is
+        // refused before the mapping is imported.
+        let error = unsafe {
+            provider.import_borrowed_lease(
+                BorrowedLease::new(
+                    LeaseReservation {
+                        length: 8,
+                        ..reservation
+                    },
+                    owner as usize,
+                )
+                .unwrap(),
+            )
+        }
+        .expect_err("non-page-multiple reservation must be refused");
+        assert_eq!(error.slug, "lease_length_unsupported");
+        // SAFETY: as above.
+        unsafe {
+            provider
+                .import_borrowed_lease(BorrowedLease::new(reservation, owner as usize).unwrap())
+                .unwrap();
+        }
+
+        let resources = || {
+            let mut snapshot = ResourceTableSnapshot::new();
+            snapshot
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(197),
+                    owner_epoch: provider.device_epoch(),
+                    size: alignment,
+                })
+                .unwrap();
+            snapshot
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(198),
+                    owner_epoch: provider.device_epoch(),
+                    size: 32,
+                })
+                .unwrap();
+            snapshot.insert_lease(reservation).unwrap();
+            snapshot
+        };
+        let trace = |lease_access: BufferAccess, owned: Vec<u8>, view: u64| {
+            let owned_access = match lease_access {
+                BufferAccess::Read => BufferAccess::Write,
+                BufferAccess::Write => BufferAccess::Read,
+                other => panic!("borrowed fixture cannot use {other:?}"),
+            };
+            let lease_view = |binding| BufferView {
+                view_id: ViewId::new(view),
+                metal_binding: binding,
+                allocation_id: AllocationId::new(197),
+                offset: 0,
+                length: 4,
+                access: lease_access,
+                attribute_stride: None,
+                source: BufferSource::BorrowedNoCopy(lease_id),
+            };
+            let owned_view = |binding| BufferView {
+                view_id: ViewId::new(view + 1),
+                metal_binding: binding,
+                allocation_id: AllocationId::new(198),
+                offset: 0,
+                length: 4,
+                access: owned_access,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(owned.clone()),
+            };
+            let buffers = match lease_access {
+                BufferAccess::Read => vec![lease_view(0), owned_view(1)],
+                BufferAccess::Write => vec![owned_view(0), lease_view(1)],
+                other => panic!("borrowed fixture cannot use {other:?}"),
+            };
+            ComputeTrace {
+                schema_version: PROVIDER_SCHEMA_VERSION,
+                device_epoch: provider.device_epoch(),
+                operation_id: OperationId::new(view),
+                pipelines: vec![pipeline.clone()],
+                encoder_dispatch_type: DispatchType::Serial,
+                passes: vec![ComputePass {
+                    pipeline: pipeline.pipeline_id,
+                    buffers,
+                    dispatch: Dispatch {
+                        kind: DispatchKind::ThreadsExact,
+                        grid: [1, 1, 1],
+                        threads_per_threadgroup: [1, 1, 1],
+                    },
+                }],
+                completion_policy: CompletionPolicy::HostReadback,
+            }
+        };
+
+        // The owner changes its mapping after import; a provider that had
+        // snapshotted the bytes would observe the old word.
+        // SAFETY: `owner` covers one writable page.
+        unsafe {
+            std::ptr::copy_nonoverlapping(0xbbbb_bbbb_u32.to_le_bytes().as_ptr(), owner, 4);
+        }
+        let read_trace = trace(BufferAccess::Read, vec![0; 4], 398);
+        let read = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(read_trace.clone(), resources())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(read.writebacks.len(), 1);
+        assert_eq!(read.writebacks[0].bytes, 0xbbbb_bbbb_u32.to_le_bytes());
+        let read_token = read.completion.token().unwrap();
+
+        let word = 0x1234_5678_u32;
+        let write_trace = trace(BufferAccess::Write, word.to_le_bytes().to_vec(), 400);
+        let write = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(write_trace.clone(), resources())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(write.writebacks.len(), 1);
+        assert_eq!(write.writebacks[0].bytes, word.to_le_bytes());
+        // SAFETY: `owner` covers one initialized page.
+        let observed = unsafe { std::slice::from_raw_parts(owner, 4) };
+        assert_eq!(observed, word.to_le_bytes(), "GPU write was not in place");
+        let write_token = write.completion.token().unwrap();
+
+        let mut ledger = LeaseLedger::new();
+        ledger.register(reservation).unwrap();
+        for (token, disposition) in [
+            (read_token, read.completion),
+            (write_token, write.completion),
+        ] {
+            ledger.bind(lease_id, token).unwrap();
+            assert_eq!(
+                ledger.observe(token, disposition).unwrap(),
+                LeaseObservation::Retired
+            );
+        }
+        assert!(ledger.release_ready(lease_id));
+        assert_eq!(provider.borrowed_registry().outstanding(lease_id), Some(0));
+        provider.release_borrowed_lease(lease_id).unwrap();
+
+        let error = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(write_trace.clone(), resources())
+                    .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.slug, "lease_not_imported");
+        provider.release_completion(read_token).unwrap();
+        provider.release_completion(write_token).unwrap();
+        provider.release_pipeline(&pipeline).unwrap();
+        // SAFETY: the layout matches the allocation above and no submission
+        // retains the mapping anymore.
+        unsafe { std::alloc::dealloc(owner, layout) };
+    }
 }

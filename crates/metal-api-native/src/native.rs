@@ -86,6 +86,7 @@ pub struct NativeMetalProvider {
     async_abandoned: Arc<AtomicBool>,
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
+    borrowed: Arc<BorrowedLeaseRegistry>,
 }
 
 impl NativeMetalProvider {
@@ -135,7 +136,11 @@ impl NativeMetalProvider {
                 max_buffer_range: device.max_buffer_length().min(1024 * 1024),
                 max_push_constant_bytes: 0,
                 alias_mode: AliasMode::Refused,
-                storage_modes: vec![StorageMode::OwnedBytes, StorageMode::StagedLease],
+                storage_modes: vec![
+                    StorageMode::OwnedBytes,
+                    StorageMode::StagedLease,
+                    StorageMode::BorrowedNoCopy,
+                ],
                 host_readback: true,
                 submit_only: false,
             };
@@ -160,6 +165,7 @@ impl NativeMetalProvider {
                 async_abandoned: Arc::new(AtomicBool::new(false)),
                 completion_outbox: None,
                 staging: LeaseRegistry::new(),
+                borrowed: Arc::new(BorrowedLeaseRegistry::new()),
             })
         })
     }
@@ -544,27 +550,73 @@ impl ComputeProvider for NativeMetalProvider {
             device_epoch: self.epoch,
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
-        let resolve = |view: &BufferView| -> Result<Vec<u8>, ProviderError> {
+        let borrowed_leases = trace
+            .passes
+            .iter()
+            .flat_map(|pass| pass.buffers.iter())
+            .filter_map(|view| match view.source {
+                BufferSource::BorrowedNoCopy(lease_id) => Some(lease_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut retains = BorrowedRetains::new(Arc::clone(&self.borrowed), borrowed_leases);
+        retains.retain()?;
+        let resolve = |view: &BufferView| -> Result<ResolvedBuffer, ProviderError> {
             match &view.source {
-                BufferSource::OwnedBytes(bytes) => Ok(bytes.clone()),
-                BufferSource::StagedLease(lease_id) => {
-                    self.staging
-                        .view_bytes(*lease_id, view, self.epoch, admitted.resources())
+                BufferSource::OwnedBytes(bytes) => Ok(ResolvedBuffer::Owned(bytes.clone())),
+                BufferSource::StagedLease(lease_id) => self
+                    .staging
+                    .view_bytes(*lease_id, view, self.epoch, admitted.resources())
+                    .map(ResolvedBuffer::Owned),
+                BufferSource::BorrowedNoCopy(lease_id) => {
+                    let resolved = self.borrowed.view_pointer(
+                        *lease_id,
+                        view,
+                        self.epoch,
+                        admitted.resources(),
+                    )?;
+                    let alignment = self.no_copy_alignment();
+                    if alignment == 0 {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "storage_mode_unsupported",
+                        ));
+                    }
+                    if !(resolved.base_len as u64).is_multiple_of(alignment) {
+                        return Err(borrowed_length_error(
+                            *lease_id,
+                            resolved.base_len as u64,
+                            alignment,
+                        ));
+                    }
+                    let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
+                    if !resolved.base_pointer.is_multiple_of(alignment) {
+                        return Err(borrowed_alignment_error(
+                            *lease_id,
+                            resolved.base_pointer,
+                            alignment as u64,
+                        ));
+                    }
+                    if !resolved.offset.is_multiple_of(4) {
+                        return Err(borrowed_offset_error(*lease_id, resolved.offset as u64));
+                    }
+                    Ok(ResolvedBuffer::Borrowed {
+                        pointer: resolved.base_pointer as *mut u8,
+                        length: resolved.base_len,
+                        offset: resolved.offset as u64,
+                    })
                 }
-                BufferSource::BorrowedNoCopy(_) => Err(refusal(
-                    ProviderPhase::Encode,
-                    ProviderErrorClass::Capability,
-                    "storage_mode_unsupported",
-                )),
             }
         };
         if self.async_execution {
-            let result = self.submit_async(&mut state, trace, pipelines, token, &resolve);
+            let result = self.submit_async(&mut state, trace, pipelines, token, &resolve, retains);
             self.publish_health(self.health_from_state(&state));
             return result;
         }
-        let result =
-            objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token, &resolve));
+        let result = objc::rc::autoreleasepool(|| {
+            execute(&mut state, trace, pipelines, token, &resolve, retains)
+        });
         let observation = match &result {
             Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {
@@ -634,7 +686,52 @@ struct SubmissionResources {
     _queue: CommandQueue,
     pipelines: Vec<ComputePipelineState>,
     command: CommandBuffer,
-    buffers: Vec<Buffer>,
+    buffers: Vec<BoundBuffer>,
+    // Keep owner mappings imported and retained until Metal retires the work.
+    _borrowed: BorrowedRetains,
+}
+
+/// One pool buffer plus the byte offset of its admitted view.
+///
+/// Owned and staged views are copied into a buffer that starts at the view,
+/// so their offset is zero. Borrowed views map the whole reservation, so the
+/// view is addressed with a binding offset instead.
+struct BoundBuffer {
+    buffer: Buffer,
+    offset: u64,
+}
+
+/// Retains no-copy leases for one submission until its Metal resources own
+/// them. If encoding fails first, Drop returns the retains so the owner is not
+/// blocked by a submission that never reached the queue.
+struct BorrowedRetains {
+    registry: Arc<BorrowedLeaseRegistry>,
+    lease_ids: Vec<LeaseId>,
+    armed: bool,
+}
+
+impl BorrowedRetains {
+    fn new(registry: Arc<BorrowedLeaseRegistry>, lease_ids: Vec<LeaseId>) -> Self {
+        Self {
+            registry,
+            lease_ids,
+            armed: false,
+        }
+    }
+
+    fn retain(&mut self) -> Result<(), ProviderError> {
+        self.registry.retain_all(&self.lease_ids)?;
+        self.armed = true;
+        Ok(())
+    }
+}
+
+impl Drop for BorrowedRetains {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.retire_all(&self.lease_ids);
+        }
+    }
 }
 
 struct PendingSubmission {
@@ -659,15 +756,26 @@ struct EncodedSubmission {
     pool: Vec<BufferView>,
 }
 
-/// Resolves one admitted view to the exact bytes uploaded to Metal. Owned
-/// views return their snapshot; staged views return the imported window slice.
-type BufferResolver<'a> = dyn Fn(&BufferView) -> Result<Vec<u8>, ProviderError> + 'a;
+/// One admitted view resolved for binding. Owned and staged views return their
+/// snapshot bytes; borrowed views return the owner pointer Metal maps directly.
+enum ResolvedBuffer {
+    Owned(Vec<u8>),
+    Borrowed {
+        pointer: *mut u8,
+        length: usize,
+        offset: u64,
+    },
+}
+
+/// Resolves one admitted view to the exact binding used by Metal.
+type BufferResolver<'a> = dyn Fn(&BufferView) -> Result<ResolvedBuffer, ProviderError> + 'a;
 
 fn encode(
     state: &mut State,
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
     resolve: &BufferResolver<'_>,
+    retains: BorrowedRetains,
 ) -> Result<EncodedSubmission, ProviderError> {
     let pool = trace.serial_resources().map_err(|error| {
         refusal(
@@ -684,17 +792,36 @@ fn encode(
         .collect();
     let mut buffers = Vec::with_capacity(pool.len());
     for view in &pool {
-        let bytes = resolve(view)?;
-        // The resolved bytes contain the view itself, not the entire logical
-        // allocation. Binding offset is zero; writebacks retain view.offset.
-        let buffer = unsafe {
-            let pointer: *mut metal::MTLBuffer = msg_send![state.device.as_ref(),
-                newBufferWithBytes:bytes.as_ptr().cast::<std::ffi::c_void>()
-                length:view.length options:MTLResourceOptions::StorageModeShared];
-            if pointer.is_null() {
-                return Err(resource_error("metal_buffer_allocation_failed"));
-            }
-            Buffer::from_ptr(pointer)
+        let (buffer, offset) = match resolve(view)? {
+            ResolvedBuffer::Owned(bytes) => unsafe {
+                // The resolved bytes contain the view itself, not the entire
+                // logical allocation. Binding offset is zero; writebacks
+                // retain view.offset.
+                let pointer: *mut metal::MTLBuffer = msg_send![state.device.as_ref(),
+                    newBufferWithBytes:bytes.as_ptr().cast::<std::ffi::c_void>()
+                    length:view.length options:MTLResourceOptions::StorageModeShared];
+                if pointer.is_null() {
+                    return Err(resource_error("metal_buffer_allocation_failed"));
+                }
+                (Buffer::from_ptr(pointer), 0)
+            },
+            ResolvedBuffer::Borrowed {
+                pointer,
+                length,
+                offset,
+            } => unsafe {
+                // Metal maps the whole owner reservation directly; a nil
+                // deallocator keeps the owner responsible for unmapping it.
+                let buffer: *mut metal::MTLBuffer = msg_send![state.device.as_ref(),
+                    newBufferWithBytesNoCopy:pointer.cast::<std::ffi::c_void>()
+                    length:length
+                    options:MTLResourceOptions::StorageModeShared
+                    deallocator:std::ptr::null::<std::ffi::c_void>()];
+                if buffer.is_null() {
+                    return Err(resource_error("metal_no_copy_buffer_allocation_failed"));
+                }
+                (Buffer::from_ptr(buffer), offset)
+            },
         };
         if buffer.contents().is_null() {
             return Err(resource_error("metal_buffer_mapping_failed"));
@@ -704,7 +831,7 @@ fn encode(
         if buffer.hazard_tracking_mode() != MTLHazardTrackingMode::Tracked {
             return Err(resource_error("metal_buffer_hazard_tracking_unavailable"));
         }
-        buffers.push(buffer);
+        buffers.push(BoundBuffer { buffer, offset });
     }
     let command = unsafe {
         let pointer: *mut metal::MTLCommandBuffer = msg_send![state.queue.as_ref(), commandBuffer];
@@ -721,6 +848,7 @@ fn encode(
             pipelines,
             command,
             buffers,
+            _borrowed: retains,
         }),
         submitted: false,
     };
@@ -741,8 +869,12 @@ fn encode(
         encoder.set_compute_pipeline_state(&resources.pipelines[pass_index]);
         for view in &pass.buffers {
             // serial_resources validated that each pass binds a subset of this pool.
-            let buffer = &resources.buffers[pool_positions[&view.view_id]];
-            encoder.set_buffer(u64::from(view.metal_binding), Some(buffer), 0);
+            let bound = &resources.buffers[pool_positions[&view.view_id]];
+            encoder.set_buffer(
+                u64::from(view.metal_binding),
+                Some(&bound.buffer),
+                bound.offset,
+            );
         }
         let [gx, gy, gz] = pass.dispatch.grid;
         let [lx, ly, lz] = pass.dispatch.threads_per_threadgroup;
@@ -758,8 +890,10 @@ fn execute(
     pipelines: Vec<ComputePipelineState>,
     token: CompletionToken,
     resolve: &BufferResolver<'_>,
+    retains: BorrowedRetains,
 ) -> Result<ProviderSubmission, ProviderError> {
-    let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines, resolve)?;
+    let EncodedSubmission { mut pending, pool } =
+        encode(state, trace, pipelines, resolve, retains)?;
     pending.submitted = true;
     let resources = pending.resources.as_ref().expect("encoded resources");
     resources.command.commit();
@@ -817,15 +951,19 @@ fn execute(
     Ok(submission)
 }
 
-fn collect_writebacks(pool: &[BufferView], buffers: &[Buffer]) -> Vec<BufferWriteback> {
+fn collect_writebacks(pool: &[BufferView], buffers: &[BoundBuffer]) -> Vec<BufferWriteback> {
     let mut writebacks = Vec::new();
-    for (view, buffer) in pool.iter().zip(buffers) {
+    for (view, bound) in pool.iter().zip(buffers) {
         if view.access.is_writable() {
             let bytes = unsafe {
                 // Admission bounded length to 1 MiB, contents was checked
                 // before commit, and this completed buffer remains retained.
-                std::slice::from_raw_parts(buffer.contents().cast::<u8>(), view.length as usize)
-                    .to_vec()
+                let contents = bound
+                    .buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(bound.offset as usize);
+                std::slice::from_raw_parts(contents, view.length as usize).to_vec()
             };
             writebacks.push(BufferWriteback {
                 view_id: view.view_id,
@@ -845,6 +983,11 @@ impl NativeMetalProvider {
         &self.staging
     }
 
+    /// No-copy lease registry owned by this provider.
+    pub fn borrowed_registry(&self) -> &BorrowedLeaseRegistry {
+        &self.borrowed
+    }
+
     fn submit_async(
         &self,
         state: &mut State,
@@ -852,14 +995,17 @@ impl NativeMetalProvider {
         pipelines: Vec<ComputePipelineState>,
         token: CompletionToken,
         resolve: &BufferResolver<'_>,
+        retains: BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
-        let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines, resolve)?;
+        let EncodedSubmission { mut pending, pool } =
+            encode(state, trace, pipelines, resolve, retains)?;
         let SubmissionResources {
             _device,
             _queue,
             pipelines: retained_pipelines,
             command,
             buffers,
+            _borrowed,
         } = pending.resources.take().expect("encoded resources");
         pending.submitted = true;
         let record = match &self.completion_outbox {
@@ -884,7 +1030,7 @@ impl NativeMetalProvider {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
             // buffer until it is invoked.
-            let _retain = (&_device, &_queue, &retained_pipelines);
+            let _retain = (&_device, &_queue, &retained_pipelines, &_borrowed);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 objc::rc::autoreleasepool(|| match command.status() {
                     MTLCommandBufferStatus::Completed => Ok(collect_writebacks(&pool, &buffers)),
@@ -974,6 +1120,99 @@ impl LeaseImporter for NativeMetalProvider {
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
         self.staging.release(lease_id)
     }
+}
+
+impl NoCopyLeaseImporter for NativeMetalProvider {
+    fn no_copy_alignment(&self) -> u64 {
+        page_size()
+    }
+
+    unsafe fn import_borrowed_lease(&self, borrowed: BorrowedLease) -> Result<(), ProviderError> {
+        if borrowed.reservation.lease.owner_epoch != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "lease_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(borrowed.reservation.lease.owner_epoch.get()),
+            ));
+        }
+        let alignment = self.no_copy_alignment();
+        if alignment == 0 {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "storage_mode_unsupported",
+            ));
+        }
+        if !borrowed.reservation.length.is_multiple_of(alignment) {
+            return Err(borrowed_length_error(
+                borrowed.lease_id(),
+                borrowed.reservation.length,
+                alignment,
+            ));
+        }
+        let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
+        if !borrowed.host_pointer.is_multiple_of(alignment) {
+            return Err(borrowed_alignment_error(
+                borrowed.lease_id(),
+                borrowed.host_pointer,
+                alignment as u64,
+            ));
+        }
+        self.borrowed.import(borrowed)
+    }
+
+    fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        self.borrowed.release(lease_id)
+    }
+}
+
+/// Page size Metal requires for `newBufferWithBytesNoCopy:` on macOS.
+fn page_size() -> u64 {
+    // SAFETY: `sysconf` has no preconditions for `_SC_PAGESIZE`.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size <= 0 {
+        0
+    } else {
+        size as u64
+    }
+}
+
+fn borrowed_alignment_error(lease_id: LeaseId, pointer: usize, alignment: u64) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_alignment_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("pointer", FieldValue::Unsigned(pointer as u64))
+    .with_field("alignment", FieldValue::Unsigned(alignment))
+}
+
+fn borrowed_length_error(lease_id: LeaseId, length: u64, alignment: u64) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_length_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("length", FieldValue::Unsigned(length))
+    .with_field("alignment", FieldValue::Unsigned(alignment))
+}
+
+fn borrowed_offset_error(lease_id: LeaseId, offset: u64) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_offset_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("offset", FieldValue::Unsigned(offset))
+    .with_field("alignment", FieldValue::Unsigned(4))
 }
 
 fn next_id(counter: &mut u64) -> Result<u64, ProviderError> {
