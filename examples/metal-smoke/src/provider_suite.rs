@@ -9,8 +9,8 @@ use metal_api_core::completion::wire::{
 };
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView, CompletionDisposition,
-    CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FootprintProof, LeaseId, LeaseLedger, LeaseObservation,
+    CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FootprintProof, LeaseId, LeaseLedger, LeaseObservation,
     LeaseReservation, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
     ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, SubmissionId, ViewId,
     PROVIDER_SCHEMA_VERSION,
@@ -21,6 +21,8 @@ use metal_api_ipc::sender::spawn_writer;
 use metal_api_ipc::unix;
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +72,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_timeout_reclamation(Arc::clone(&executor))?;
     run_cancellation(Arc::clone(&executor))?;
     run_completion_ipc(Arc::clone(&executor))?;
+    run_completion_ipc_process()?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -415,6 +418,191 @@ fn run_completion_ipc(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
         "PASS provider_completion_ipc transport=unix outbox=Submitted,CompletedVisible lease=retired"
     );
     Ok(())
+}
+
+/// Provider half of the two-process completion test.
+///
+/// The child owns the Vulkan device, connects to the owner's listener and
+/// publishes admission and the terminal transition through the real outbox and
+/// writer thread. The handshake line tells the owner which device epoch and
+/// submission identity to mirror before any frame is applied.
+pub fn run_completion_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let transport = unix::connect(socket)?;
+    let (sender, writer) = spawn_writer(transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"completion_ipc_process".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        96,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("completion child submission has no token")?;
+    println!(
+        "handshake epoch={} submission={}",
+        token.device_epoch.get(),
+        token.submission_id.get()
+    );
+    std::io::stdout().flush()?;
+
+    let observed = provider
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("completion child submission did not complete: {observed:?}").into());
+    }
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "completion child writer panicked")??;
+    println!(
+        "PASS completion_child epoch={} submission={} completed=true",
+        token.device_epoch.get(),
+        token.submission_id.get()
+    );
+    Ok(())
+}
+
+/// Owner half of the two-process completion test.
+///
+/// The parent process owns no provider in this case: it listens on a Unix
+/// socket, spawns the provider child and retires a lease from the mirrored
+/// completion stream alone.
+fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "metal-smoke-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let listener = unix::UnixListenerTransport::bind(&path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--completion-child")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("completion child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let handshake = lines
+        .next()
+        .ok_or("completion child exited before its handshake")??;
+    let (device_epoch, token) = parse_handshake(&handshake)?;
+
+    let transport = listener.accept()?;
+    transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut receiver = CompletionReceiver::new(transport, device_epoch)?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("completion process receiver did not apply admission".into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("completion process receiver did not apply completion".into());
+    }
+    if receiver.applied() != 2 || receiver.ignored() != 0 {
+        return Err(format!(
+            "completion process mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+
+    let lease_id = LeaseId::new(96);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(96),
+            owner_epoch: device_epoch,
+        },
+        offset: 0,
+        length: 64,
+    })?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("completion process did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("completion process lease was not release-ready".into());
+    }
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err(format!("completion child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_completion_ipc_process owner=parent provider=child transport=unix outbox=Submitted,CompletedVisible lease=retired"
+    );
+    Ok(())
+}
+
+fn parse_handshake(line: &str) -> Result<(DeviceEpoch, CompletionToken), Box<dyn Error>> {
+    let mut epoch = None;
+    let mut submission = None;
+    for field in line.split_whitespace() {
+        if let Some(value) = field.strip_prefix("epoch=") {
+            epoch = Some(value.parse::<u64>()?);
+        } else if let Some(value) = field.strip_prefix("submission=") {
+            submission = Some(value.parse::<u64>()?);
+        }
+    }
+    let device_epoch = DeviceEpoch::new(epoch.ok_or("completion handshake is missing epoch")?);
+    let submission_id =
+        SubmissionId::new(submission.ok_or("completion handshake is missing submission")?);
+    Ok((
+        device_epoch,
+        CompletionToken {
+            device_epoch,
+            submission_id,
+        },
+    ))
 }
 
 fn run_indexed_and_refusals(

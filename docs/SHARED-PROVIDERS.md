@@ -96,8 +96,14 @@ idempotent terminal replay, and refuses a different terminal, a non-terminal
 after a terminal, or a token update after device loss. `LoopbackTransport` is
 an in-memory test and diagnostic transport that preserves order; a real pipe,
 socket, shared ring or RPC layer chooses its own encoding and error type. The
-wire types have no serialization dependency; the actual IPC transport and
-provider wiring remain future work.
+wire types have no serialization dependency. `metal-api-ipc` carries them over
+any `Read` + `Write` stream with a versioned `MCW1` frame codec:
+`CompletionReceiver` drives the owner mirror and lease ledger,
+`sender::spawn_writer` runs the provider-side writer thread, and
+`provider-smoke` proves a two-process split where the child owns the Vulkan
+device and publishes through a Unix socket while the parent retires a lease
+from the mirror alone. A production owner/provider command channel and
+provider-side lease import remain future work.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

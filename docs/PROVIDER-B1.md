@@ -117,12 +117,26 @@ The provider runner shares one Vulkan device with the old snapshot executor,
 compiles each path independently and compares both against the fixture golden.
 It covers textual/raw/wrapped copies, the indexed 10x3 boundary/barrier case,
 nonzero view offsets, forged pipeline metadata, isolation between two providers
-on one executor, unknown completion tokens and use after registry release.
-This is Vulkan-provider versus Vulkan-executor regression coverage, not native
-Metal parity.
+on one executor, unknown completion tokens, use after registry release,
+zero-deadline reclamation, explicit cancellation with a recorded outbox stream,
+single-process completion over a Unix socket and a two-process owner/provider
+completion hop. The runner spawns itself with `--completion-child`: the child
+owns the Vulkan device and publishes admission and `CompletedVisible` through
+the real outbox and writer thread, while the parent owns only the listener,
+mirror and lease ledger. This is Vulkan-provider versus Vulkan-executor
+regression coverage, not native Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 two-process completion owner/provider smoke: `provider-smoke`
+  gained a `--completion-child` mode. The parent binds a Unix listener, spawns
+  the child, learns the child's device epoch and submission identity from its
+  handshake and retires a lease from the mirrored terminal transition; the
+  child owns the Vulkan device and publishes through `CompletionOutbox` and
+  `metal-api-ipc::sender::spawn_writer`. Lavapipe reports
+  `provider_completion_ipc_process owner=parent provider=child transport=unix
+  outbox=Submitted,CompletedVisible lease=retired`. 221 Rust tests and 115
+  Python tests passed.
 - 2026-09-08 provider-side completion publisher: `CompletionPublisher` is the
   sender-side dual of `CompletionMirror`; it assigns monotonic per-token and
   device-health sequences, returns the identical message for an idempotent

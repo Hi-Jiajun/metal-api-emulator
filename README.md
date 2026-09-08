@@ -182,8 +182,11 @@ PASS indexed_boundary_dispatch words=30 regions=4
 `provider-smoke` runs the same four cases through canonical traces and compares
 against the original snapshot executor on the same Vulkan device. It checks
 nonzero view offsets, immutable pipeline metadata, owner epochs, completion
-tokens and explicit registry release. This is a provider/legacy Vulkan
-comparison, not a native Metal oracle.
+tokens and explicit registry release, plus the asynchronous completion path:
+an outbox stream, a Unix-socket completion hop and a two-process owner/provider
+case where the child owns the Vulkan device and the parent retires a lease from
+the mirrored terminal alone. This is a provider/legacy Vulkan comparison, not a
+native Metal oracle.
 
 The indexed case launches a 10x3 grid with an 8x2 nominal threadgroup, exercises
 a barrier and checks all 30 output words. Its source and reference output are
