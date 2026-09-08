@@ -71,7 +71,9 @@ observation deadline reports unknown completion and retires the submission
 when its fence signals. Resources whose fence never signals are retained to
 process exit, but the abandonment budget bounds how many such submissions a
 provider will tolerate before it fails closed. Live guest leases, multi-pass
-ordering, general MTLB resolution and native Metal remain unimplemented.
+ordering, general MTLB resolution and native Metal remain unimplemented. The
+core `LeaseLedger` now defines completion-driven lease release; provider-side
+guest/no-copy lease import is still unimplemented.
 
 ## Execution failures and visibility
 
@@ -118,6 +120,14 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 completion-driven lease ledger: `LeaseLedger` and
+  `disposition_retires_resources` were added to `metal-api-core::provider`
+  with six unit tests covering multi-token retirement, idempotent binding,
+  shared tokens, device loss, unknown/cancelled/timeout retention and
+  malformed registrations. 165 Rust tests passed (core 106, native 9,
+  Vulkan 36, capture 14) and 115 Python tests passed; Lavapipe v8 direct and
+  async-object captures matched. The ledger is not yet wired into provider
+  buffer import.
 - 2026-09-08 Windows RTX 5060 v8 validation: Windows GNU debug binaries built
   from `7e67a0e` ran `provider-smoke` and the v1-v8 direct, object and
   async-object captures on an NVIDIA GeForce RTX 5060. All 12 smoke checks and

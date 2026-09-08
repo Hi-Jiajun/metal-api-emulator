@@ -74,9 +74,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   same v1-v8 direct, object and async-object rails on an NVIDIA GeForce
   RTX 5060 with matching host-visible writebacks.
 - Open design work: device-loss reclamation beyond the bounded abandonment
-  budget, cross-process completion, completion-driven lease release, general
-  native shader admission, CPU uploads during command-buffer execution and
-  aliases.
+  budget, cross-process completion, provider-side lease import (the core
+  `LeaseLedger` release contract now exists), general native shader admission,
+  CPU uploads during command-buffer execution and aliases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
   textures, rendering, presentation, heaps, ICBs or production

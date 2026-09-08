@@ -57,6 +57,23 @@ are landed into initialized host allocations. The Swift `native-metal` oracle
 continues to report full Metal buffer readback, including actual GPU guard and
 read-only observations. Reports from the two native paths are not interchangeable.
 
+## Completion-driven lease lifetime
+
+`metal_api_core::provider::LeaseLedger` tracks owner-issued buffer leases across
+submissions. The owner registers each `LeaseReservation`, binds the completion
+token of every submission that references the lease, and may release the
+backing only when every bound token has retirement evidence. `NotSubmitted`,
+`CompletedVisible`, `Failed` and `DeviceLost` retire a token; `Submitted`,
+`TimedOut`, `Cancelled` and `SubmittedUnknown` keep the lease held. A provider
+that establishes retirement out of band can call `retire`, and `device_lost`
+releases every registered lease as a teardown guarantee. Binding is
+idempotent, and one token may cover several leases.
+
+This is a core lifetime contract. Both providers still accept only
+`OwnedBytes` sources; importing owner-issued guest or no-copy leases remains
+future work, as does the cross-process completion protocol that would carry
+these tokens between processes.
+
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native
 captures; any Rust native execution or comparison failure fails the job. The

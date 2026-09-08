@@ -6,7 +6,7 @@
 //! [`crate::ComputeExecutor`] snapshot API remains separate and is kept for
 //! compatibility with the first offline harness.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -821,6 +821,212 @@ impl ResourceTableSnapshot {
         }
         Ok(())
     }
+}
+
+/// Completion-driven lifetime tracking for owner-issued buffer leases.
+///
+/// The neutral memory owner registers each lease reservation, binds the
+/// completion token of every submission that references it, and releases the
+/// backing only when every bound token has retirement evidence. Observation
+/// alone is not enough: `Submitted`, `TimedOut`, `Cancelled` and
+/// `SubmittedUnknown` do not prove the GPU stopped using the backing. A
+/// provider that establishes retirement out of band can call
+/// [`LeaseLedger::retire`]. Device loss is a teardown guarantee and releases
+/// every lease.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LeaseLedger {
+    leases: BTreeMap<LeaseId, LeaseState>,
+    bindings: BTreeMap<TokenKey, BTreeSet<LeaseId>>,
+    device_lost: bool,
+}
+
+type TokenKey = (DeviceEpoch, SubmissionId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeaseState {
+    reservation: LeaseReservation,
+    outstanding: usize,
+}
+
+/// Result of observing one completion token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaseObservation {
+    /// The observation does not prove GPU retirement; the lease stays held.
+    Pending,
+    /// The token is retired; a lease with no other outstanding token may now
+    /// be released.
+    Retired,
+}
+
+impl LeaseLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a lease reservation before binding submissions to it.
+    pub fn register(&mut self, reservation: LeaseReservation) -> Result<(), ContractError> {
+        let lease_id = reservation.lease.lease_id;
+        if lease_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("lease id"));
+        }
+        if reservation.lease.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("lease allocation id"));
+        }
+        if reservation.lease.owner_epoch.is_zero() {
+            return Err(ContractError::InvalidIdentity("lease owner epoch"));
+        }
+        reservation.end()?;
+        if self.leases.contains_key(&lease_id) {
+            return Err(ContractError::DuplicateLease(lease_id));
+        }
+        self.leases.insert(
+            lease_id,
+            LeaseState {
+                reservation,
+                outstanding: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind a submission token to a lease the submission references.
+    ///
+    /// Binding the same token twice to one lease is idempotent, so callers may
+    /// walk a trace's views without deduplicating.
+    pub fn bind(&mut self, lease_id: LeaseId, token: CompletionToken) -> Result<(), ContractError> {
+        token.validate()?;
+        let state = self
+            .leases
+            .get_mut(&lease_id)
+            .ok_or(ContractError::UnknownLease(lease_id))?;
+        let entry = self.bindings.entry(token_key(token)).or_default();
+        if entry.insert(lease_id) {
+            state.outstanding =
+                state
+                    .outstanding
+                    .checked_add(1)
+                    .ok_or(ContractError::ArithmeticOverflow(
+                        "lease outstanding bindings",
+                    ))?;
+        }
+        Ok(())
+    }
+
+    /// Record a completion observation for a bound token.
+    ///
+    /// The disposition must not carry a different token. Only retirement
+    /// evidence (see [`disposition_retires_resources`]) releases the token;
+    /// pending, cancelled, timed-out and unknown observations keep every bound
+    /// lease held.
+    pub fn observe(
+        &mut self,
+        token: CompletionToken,
+        disposition: CompletionDisposition,
+    ) -> Result<LeaseObservation, ContractError> {
+        if let Some(observed) = disposition.token() {
+            if observed != token {
+                return Err(ContractError::InvalidSubmissionCompletion(disposition));
+            }
+        }
+        if disposition_retires_resources(disposition) {
+            self.retire(token);
+            Ok(LeaseObservation::Retired)
+        } else {
+            Ok(LeaseObservation::Pending)
+        }
+    }
+
+    /// Record out-of-band retirement for a token.
+    ///
+    /// Idempotent; an unknown token is ignored because observations may arrive
+    /// in any order or after the lease was already released.
+    pub fn retire(&mut self, token: CompletionToken) {
+        let Some(lease_ids) = self.bindings.remove(&token_key(token)) else {
+            return;
+        };
+        for lease_id in lease_ids {
+            if let Some(state) = self.leases.get_mut(&lease_id) {
+                state.outstanding = state.outstanding.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Device teardown releases every lease regardless of outstanding tokens.
+    pub fn device_lost(&mut self) {
+        self.device_lost = true;
+        self.bindings.clear();
+        for state in self.leases.values_mut() {
+            state.outstanding = 0;
+        }
+    }
+
+    pub const fn is_device_lost(&self) -> bool {
+        self.device_lost
+    }
+
+    pub fn contains(&self, lease_id: LeaseId) -> bool {
+        self.leases.contains_key(&lease_id)
+    }
+
+    pub fn lease(&self, lease_id: LeaseId) -> Option<LeaseReservation> {
+        self.leases.get(&lease_id).map(|state| state.reservation)
+    }
+
+    /// Number of bound tokens that have not retired, or `None` if unknown.
+    pub fn outstanding(&self, lease_id: LeaseId) -> Option<usize> {
+        self.leases.get(&lease_id).map(|state| state.outstanding)
+    }
+
+    /// Whether the owner may release the lease's backing.
+    pub fn release_ready(&self, lease_id: LeaseId) -> bool {
+        self.leases
+            .get(&lease_id)
+            .is_some_and(|state| self.device_lost || state.outstanding == 0)
+    }
+
+    /// Remove and return a lease whose backing may be released.
+    pub fn release(&mut self, lease_id: LeaseId) -> Option<LeaseReservation> {
+        if !self.release_ready(lease_id) {
+            return None;
+        }
+        self.leases.remove(&lease_id).map(|state| state.reservation)
+    }
+
+    /// Remove every lease whose backing may be released.
+    pub fn release_all_ready(&mut self) -> Vec<LeaseReservation> {
+        let ready: Vec<LeaseId> = self
+            .leases
+            .iter()
+            .filter(|(_, state)| self.device_lost || state.outstanding == 0)
+            .map(|(lease_id, _)| *lease_id)
+            .collect();
+        ready
+            .into_iter()
+            .filter_map(|lease_id| self.release(lease_id))
+            .collect()
+    }
+}
+
+fn token_key(token: CompletionToken) -> TokenKey {
+    (token.device_epoch, token.submission_id)
+}
+
+/// Whether a completion observation proves the device no longer uses the
+/// submission's resources.
+///
+/// `NotSubmitted` never reached the queue. `CompletedVisible` and `Failed` are
+/// only published after terminal execution or after the fence/handler already
+/// reported completion; providers use `SubmittedUnknown` for unknown queue or
+/// wait state. `DeviceLost` is a teardown guarantee. `Submitted`, `TimedOut`,
+/// `Cancelled` and `SubmittedUnknown` are not retirement evidence.
+pub const fn disposition_retires_resources(disposition: CompletionDisposition) -> bool {
+    matches!(
+        disposition,
+        CompletionDisposition::NotSubmitted
+            | CompletionDisposition::CompletedVisible { .. }
+            | CompletionDisposition::Failed { .. }
+            | CompletionDisposition::DeviceLost { .. }
+    )
 }
 
 /// Explicit identities needed when the legacy snapshot API is converted into
@@ -3776,6 +3982,200 @@ mod tests {
             view.validate_against_lease(lease, DeviceEpoch::new(2)),
             Err(ContractError::LeaseEpochMismatch { .. })
         ));
+    }
+
+    fn lease_reservation(
+        lease: u64,
+        allocation: u64,
+        offset: u64,
+        length: u64,
+    ) -> LeaseReservation {
+        LeaseReservation {
+            lease: BufferLease {
+                lease_id: LeaseId::new(lease),
+                allocation_id: AllocationId::new(allocation),
+                owner_epoch: DeviceEpoch::new(1),
+            },
+            offset,
+            length,
+        }
+    }
+
+    fn lease_token(submission: u64) -> CompletionToken {
+        CompletionToken {
+            submission_id: SubmissionId::new(submission),
+            device_epoch: DeviceEpoch::new(1),
+        }
+    }
+
+    #[test]
+    fn lease_ledger_releases_only_after_every_bound_token_retires() {
+        let mut ledger = LeaseLedger::new();
+        let lease = lease_reservation(1, 2, 0, 64);
+        ledger.register(lease).unwrap();
+        let first = lease_token(10);
+        let second = lease_token(11);
+        ledger.bind(lease.lease.lease_id, first).unwrap();
+        ledger.bind(lease.lease.lease_id, second).unwrap();
+        assert_eq!(ledger.outstanding(lease.lease.lease_id), Some(2));
+        assert_eq!(
+            ledger.observe(
+                first,
+                CompletionDisposition::CompletedVisible { token: first }
+            ),
+            Ok(LeaseObservation::Retired)
+        );
+        assert!(!ledger.release_ready(lease.lease.lease_id));
+        assert_eq!(
+            ledger.observe(
+                second,
+                CompletionDisposition::SubmittedUnknown {
+                    token: Some(second)
+                }
+            ),
+            Ok(LeaseObservation::Pending)
+        );
+        assert!(!ledger.release_ready(lease.lease.lease_id));
+        assert_eq!(
+            ledger.observe(
+                second,
+                CompletionDisposition::DeviceLost {
+                    token: Some(second)
+                }
+            ),
+            Ok(LeaseObservation::Retired)
+        );
+        assert!(ledger.release_ready(lease.lease.lease_id));
+        assert_eq!(ledger.release(lease.lease.lease_id), Some(lease));
+        assert!(!ledger.contains(lease.lease.lease_id));
+    }
+
+    #[test]
+    fn lease_ledger_keeps_unknown_cancelled_and_timed_out_observations_pending() {
+        for disposition in [
+            CompletionDisposition::Submitted {
+                token: lease_token(10),
+            },
+            CompletionDisposition::TimedOut {
+                token: lease_token(10),
+            },
+            CompletionDisposition::Cancelled {
+                token: lease_token(10),
+            },
+            CompletionDisposition::SubmittedUnknown {
+                token: Some(lease_token(10)),
+            },
+        ] {
+            let mut ledger = LeaseLedger::new();
+            let lease = lease_reservation(1, 2, 0, 64);
+            ledger.register(lease).unwrap();
+            ledger.bind(lease.lease.lease_id, lease_token(10)).unwrap();
+            assert_eq!(
+                ledger.observe(lease_token(10), disposition),
+                Ok(LeaseObservation::Pending),
+                "disposition={disposition:?}"
+            );
+            assert!(!ledger.release_ready(lease.lease.lease_id));
+            assert_eq!(ledger.release(lease.lease.lease_id), None);
+            ledger.retire(lease_token(10));
+            assert!(ledger.release_ready(lease.lease.lease_id));
+        }
+    }
+
+    #[test]
+    fn lease_ledger_shares_one_token_across_leases_and_is_idempotent() {
+        let mut ledger = LeaseLedger::new();
+        let first = lease_reservation(1, 2, 0, 64);
+        let second = lease_reservation(3, 4, 8, 16);
+        ledger.register(first).unwrap();
+        ledger.register(second).unwrap();
+        let token = lease_token(10);
+        ledger.bind(first.lease.lease_id, token).unwrap();
+        ledger.bind(first.lease.lease_id, token).unwrap();
+        ledger.bind(second.lease.lease_id, token).unwrap();
+        assert_eq!(ledger.outstanding(first.lease.lease_id), Some(1));
+        assert_eq!(ledger.outstanding(second.lease.lease_id), Some(1));
+        ledger.retire(token);
+        ledger.retire(token);
+        assert_eq!(ledger.outstanding(first.lease.lease_id), Some(0));
+        assert_eq!(ledger.outstanding(second.lease.lease_id), Some(0));
+        assert_eq!(ledger.release_all_ready().len(), 2);
+        assert!(ledger.leases.is_empty());
+    }
+
+    #[test]
+    fn lease_ledger_device_loss_releases_every_lease() {
+        let mut ledger = LeaseLedger::new();
+        let lease = lease_reservation(1, 2, 0, 64);
+        ledger.register(lease).unwrap();
+        ledger.bind(lease.lease.lease_id, lease_token(10)).unwrap();
+        assert!(!ledger.is_device_lost());
+        ledger.device_lost();
+        assert!(ledger.is_device_lost());
+        assert!(!ledger.release_ready(LeaseId::new(99)));
+        assert!(ledger.release_ready(lease.lease.lease_id));
+        assert_eq!(ledger.outstanding(lease.lease.lease_id), Some(0));
+        assert_eq!(ledger.release(lease.lease.lease_id), Some(lease));
+    }
+
+    #[test]
+    fn lease_ledger_refuses_duplicate_unknown_and_mismatched_bindings() {
+        let mut ledger = LeaseLedger::new();
+        let lease = lease_reservation(1, 2, 0, 64);
+        ledger.register(lease).unwrap();
+        assert_eq!(
+            ledger.register(lease),
+            Err(ContractError::DuplicateLease(lease.lease.lease_id))
+        );
+        assert_eq!(
+            ledger.bind(LeaseId::new(9), lease_token(10)),
+            Err(ContractError::UnknownLease(LeaseId::new(9)))
+        );
+        let other = lease_token(11);
+        assert_eq!(
+            ledger.observe(
+                lease_token(10),
+                CompletionDisposition::CompletedVisible { token: other }
+            ),
+            Err(ContractError::InvalidSubmissionCompletion(
+                CompletionDisposition::CompletedVisible { token: other }
+            ))
+        );
+        assert_eq!(
+            ledger.register(lease_reservation(0, 2, 0, 64)),
+            Err(ContractError::InvalidIdentity("lease id"))
+        );
+        assert_eq!(
+            ledger.register(lease_reservation(5, 2, 0, 0)),
+            Err(ContractError::ZeroLength("lease reservation"))
+        );
+    }
+
+    #[test]
+    fn retirement_evidence_matches_the_provider_contract() {
+        let token = lease_token(10);
+        for disposition in [
+            CompletionDisposition::NotSubmitted,
+            CompletionDisposition::CompletedVisible { token },
+            CompletionDisposition::Failed { token: Some(token) },
+            CompletionDisposition::DeviceLost { token: Some(token) },
+        ] {
+            assert!(
+                disposition_retires_resources(disposition),
+                "disposition={disposition:?}"
+            );
+        }
+        for disposition in [
+            CompletionDisposition::Submitted { token },
+            CompletionDisposition::TimedOut { token },
+            CompletionDisposition::Cancelled { token },
+            CompletionDisposition::SubmittedUnknown { token: Some(token) },
+        ] {
+            assert!(
+                !disposition_retires_resources(disposition),
+                "disposition={disposition:?}"
+            );
+        }
     }
 
     #[test]
