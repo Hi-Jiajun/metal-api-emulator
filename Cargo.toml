@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/metal-api-core",
+    "crates/metal-api-ipc",
     "crates/metal-api-vulkan",
     "crates/metal-api-native",
     "examples/metal-smoke",

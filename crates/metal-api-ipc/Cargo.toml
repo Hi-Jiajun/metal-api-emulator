@@ -1,0 +1,15 @@
+[package]
+name = "metal-api-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Length-prefixed transport for the neutral provider completion stream"
+
+[dependencies]
+metal-api-core = { path = "../metal-api-core" }
+
+[dev-dependencies]
+metal-api-core = { path = "../metal-api-core" }
