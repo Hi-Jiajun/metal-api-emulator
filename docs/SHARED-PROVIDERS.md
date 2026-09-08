@@ -90,9 +90,14 @@ means the owner may request the readback over the separate data channel.
 
 `CompletionMirror::observe_into` applies the converged observation to a
 `LeaseLedger`, so the owner can release a lease only after a terminal with
-retirement evidence or device loss. The wire types have no serialization
-dependency; a pipe, socket, shared ring or RPC layer chooses the encoding. The
-provider-side publisher and the actual transport remain future work.
+retirement evidence or device loss. `CompletionPublisher` is the sender-side
+dual: it assigns the per-stream sequences, returns the identical message for an
+idempotent terminal replay, and refuses a different terminal, a non-terminal
+after a terminal, or a token update after device loss. `LoopbackTransport` is
+an in-memory test and diagnostic transport that preserves order; a real pipe,
+socket, shared ring or RPC layer chooses its own encoding and error type. The
+wire types have no serialization dependency; the actual IPC transport and
+provider wiring remain future work.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

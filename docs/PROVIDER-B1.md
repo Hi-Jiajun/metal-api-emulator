@@ -74,9 +74,9 @@ provider will tolerate before it fails closed. Live guest leases, multi-pass
 ordering, general MTLB resolution and native Metal remain unimplemented. The
 core `LeaseLedger` defines completion-driven lease release, and
 `metal_api_core::completion::wire` defines the transport-independent
-notification stream that will carry those tokens between processes;
-provider-side guest/no-copy lease import and the actual transport remain
-unimplemented.
+notification stream and its sender-side publisher that will carry those tokens
+between processes; provider-side guest/no-copy lease import and the actual IPC
+transport remain unimplemented.
 
 ## Execution failures and visibility
 
@@ -123,6 +123,16 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 provider-side completion publisher: `CompletionPublisher` is the
+  sender-side dual of `CompletionMirror`; it assigns monotonic per-token and
+  device-health sequences, returns the identical message for an idempotent
+  terminal replay, and refuses a conflicting terminal or any non-terminal
+  update after device loss. `LoopbackTransport` is an in-memory test and
+  diagnostic transport. Nine new core tests cover per-token sequences,
+  idempotent terminal replay, monotonic health, device-loss refusal,
+  publisher/mirror round trip under reordering, identity validation and a
+  cross-thread `mpsc` boundary. 186 Rust tests passed (core 127, native 9,
+  Vulkan 36, capture 14) and 115 Python tests passed.
 - 2026-09-08 cross-process completion wire contract:
   `metal-api-core::completion::wire` adds `CompletionMessage`,
   `CompletionMirror`, `CompletionSequence` and `CompletionFailure` with 12

@@ -5,9 +5,11 @@
 //! through `Arc`, `Mutex` and `Condvar`. A provider that crosses a process
 //! boundary cannot share that memory; it publishes the same terminal semantics
 //! as messages over an arbitrary transport (pipe, socket, shared ring or RPC).
-//! This module defines only those messages and the receiver-side mirror. It
-//! performs no I/O, owns no GPU resources and deliberately has no serialization
-//! dependency: the transport chooses the encoding.
+//! This module defines those messages, the sender-side [`CompletionPublisher`]
+//! and the receiver-side [`CompletionMirror`]. It performs no I/O, owns no GPU
+//! resources and deliberately has no serialization dependency: the transport
+//! chooses the encoding. [`LoopbackTransport`] is an in-memory test and
+//! diagnostic transport, not a production IPC implementation.
 //!
 //! # Ordering and duplication
 //!
@@ -40,6 +42,10 @@ use crate::provider::{
     ProviderPhase, Retryability, SubmissionId,
 };
 use std::collections::BTreeMap;
+
+mod publisher;
+
+pub use publisher::CompletionPublisher;
 
 /// Monotonic revision of one completion stream.
 ///
@@ -199,6 +205,18 @@ impl CompletionMessage {
                 Ok(())
             }
         }
+    }
+}
+
+impl From<CompletionTokenUpdate> for CompletionMessage {
+    fn from(update: CompletionTokenUpdate) -> Self {
+        Self::Token(update)
+    }
+}
+
+impl From<CompletionDeviceUpdate> for CompletionMessage {
+    fn from(update: CompletionDeviceUpdate) -> Self {
+        Self::Device(update)
     }
 }
 
@@ -485,6 +503,71 @@ impl CompletionMirror {
             None => Ok(LeaseObservation::Pending),
         }
     }
+}
+
+/// In-memory transport for tests and single-process diagnostics.
+///
+/// It preserves send order and never drops, duplicates or reorders messages.
+/// A real cross-process transport may do all three; [`CompletionMirror`] is
+/// designed to tolerate that. This type is deliberately not a trait: a real
+/// transport has its own I/O error type, and the wire messages are plain values
+/// that any encoding can carry.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LoopbackTransport {
+    messages: Vec<CompletionMessage>,
+}
+
+impl LoopbackTransport {
+    pub const fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+        }
+    }
+
+    pub fn send(&mut self, message: impl Into<CompletionMessage>) {
+        self.messages.push(message.into());
+    }
+
+    pub fn messages(&self) -> &[CompletionMessage] {
+        &self.messages
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Deliver every queued message in order and clear the queue.
+    pub fn deliver_all(&mut self, mirror: &mut CompletionMirror) -> Result<usize, ContractError> {
+        deliver(std::mem::take(&mut self.messages), mirror)
+    }
+
+    /// Deliver every queued message in reverse order and clear the queue. This
+    /// is a test double for a transport that reorders notifications.
+    pub fn deliver_reversed(
+        &mut self,
+        mirror: &mut CompletionMirror,
+    ) -> Result<usize, ContractError> {
+        let mut messages = std::mem::take(&mut self.messages);
+        messages.reverse();
+        deliver(messages, mirror)
+    }
+}
+
+fn deliver(
+    messages: impl IntoIterator<Item = CompletionMessage>,
+    mirror: &mut CompletionMirror,
+) -> Result<usize, ContractError> {
+    let mut applied = 0;
+    for message in messages {
+        if mirror.apply(message)? == MirrorOutcome::Applied {
+            applied += 1;
+        }
+    }
+    Ok(applied)
 }
 
 fn status_from_update(update: CompletionUpdate) -> TokenMirrorStatus {

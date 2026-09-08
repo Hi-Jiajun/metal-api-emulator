@@ -2215,6 +2215,12 @@ pub enum ContractError {
         expected: DispatchKind,
         actual: DispatchKind,
     },
+    CompletionPublishAfterTerminal(CompletionToken),
+    CompletionPublishAfterDeviceLost(CompletionToken),
+    CompletionHealthRegression {
+        current: ProviderHealth,
+        requested: ProviderHealth,
+    },
 }
 
 impl fmt::Display for ContractError {
@@ -2456,6 +2462,18 @@ impl fmt::Display for ContractError {
             Self::DispatchKindMismatch { expected, actual } => write!(
                 formatter,
                 "dispatch kind mismatch: expected {expected:?}, received {actual:?}"
+            ),
+            Self::CompletionPublishAfterTerminal(token) => {
+                write!(formatter, "completion token {:?} is already terminal", token)
+            }
+            Self::CompletionPublishAfterDeviceLost(token) => write!(
+                formatter,
+                "completion token {:?} cannot be published after device loss",
+                token
+            ),
+            Self::CompletionHealthRegression { current, requested } => write!(
+                formatter,
+                "completion health regression: current {current:?}, requested {requested:?}"
             ),
         }
     }
