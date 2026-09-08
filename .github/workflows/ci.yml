@@ -240,3 +240,7 @@ jobs:
         run: cargo build --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins
       - name: Clippy the Windows rail
         run: cargo clippy --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins --no-deps -- -D warnings
+      - name: Prepare pinned reims sources
+        run: python3 integration/reims/prepare.py
+      - name: Check the Windows reims adapter
+        run: cargo check --locked --target x86_64-pc-windows-gnu --manifest-path integration/reims/Cargo.toml --bin reims-smoke
