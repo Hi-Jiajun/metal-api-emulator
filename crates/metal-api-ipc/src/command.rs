@@ -25,9 +25,10 @@ use crate::codec::CodecError;
 use crate::command_codec::CommandCodec;
 use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionReadback, CompletionToken,
-    ComputeProvider, ComputeTrace, DeviceEpoch, PipelineCompileRequest, PipelineProvider,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase, ProviderSubmission,
-    ResourceTableSnapshot, Retryability, ValidatedComputeTrace,
+    ComputeProvider, ComputeTrace, DeviceEpoch, LeaseId, LeaseImporter, PipelineCompileRequest,
+    PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, ResourceTableSnapshot, Retryability, StagedLease,
+    ValidatedComputeTrace,
 };
 use std::fmt;
 use std::io::{Read, Write};
@@ -41,8 +42,14 @@ use std::time::Duration;
 pub enum CommandRequest {
     /// Ask for the provider device epoch and capabilities.
     Capabilities,
+    /// Ask for the provider's current health.
+    Health,
     /// Compile one reviewed shader artifact on the provider.
     Compile { request: PipelineCompileRequest },
+    /// Import staged owner bytes for one lease.
+    ImportStagedLease { staged: StagedLease },
+    /// Drop a staged lease import.
+    ReleaseStagedLease { lease_id: LeaseId },
     /// Admit and submit one trace with its resource snapshot.
     Submit {
         trace: ComputeTrace,
@@ -68,7 +75,10 @@ impl CommandRequest {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Capabilities => "capabilities",
+            Self::Health => "health",
             Self::Compile { .. } => "compile",
+            Self::ImportStagedLease { .. } => "import_staged_lease",
+            Self::ReleaseStagedLease { .. } => "release_staged_lease",
             Self::Submit { .. } => "submit",
             Self::Wait { .. } => "wait",
             Self::Readback { .. } => "readback",
@@ -89,9 +99,13 @@ pub enum CommandResponse {
         epoch: DeviceEpoch,
         capabilities: ProviderCapabilities,
     },
+    Health {
+        health: ProviderHealth,
+    },
     Compiled {
         pipeline: CompiledComputePipeline,
     },
+    Imported,
     Submitted {
         submission: ProviderSubmission,
     },
@@ -112,7 +126,9 @@ impl CommandResponse {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Capabilities { .. } => "capabilities",
+            Self::Health { .. } => "health",
             Self::Compiled { .. } => "compiled",
+            Self::Imported => "imported",
             Self::Submitted { .. } => "submitted",
             Self::Observed { .. } => "observed",
             Self::Readback { .. } => "readback",
@@ -283,6 +299,13 @@ impl<R: Read + Send, W: Write + Send> ComputeProvider for RemoteProvider<R, W> {
         self.capabilities.clone()
     }
 
+    fn health(&self) -> ProviderHealth {
+        match self.exchange(CommandRequest::Health, ProviderPhase::Resolve) {
+            Ok(CommandResponse::Health { health }) => health,
+            _ => ProviderHealth::Exhausted,
+        }
+    }
+
     fn submit(&self, trace: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let (trace, resources) = trace.into_parts();
         match self.exchange(
@@ -326,6 +349,38 @@ impl<R: Read + Send, W: Write + Send> ComputeProvider for RemoteProvider<R, W> {
             other => Err(unexpected_response(
                 ProviderPhase::Readback,
                 "readback",
+                &other,
+            )),
+        }
+    }
+}
+
+impl<R: Read + Send, W: Write + Send> LeaseImporter for RemoteProvider<R, W> {
+    fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError> {
+        match self.exchange(
+            CommandRequest::ImportStagedLease { staged },
+            ProviderPhase::Resolve,
+        )? {
+            CommandResponse::Imported => Ok(()),
+            CommandResponse::Error { error } => Err(error),
+            other => Err(unexpected_response(
+                ProviderPhase::Resolve,
+                "imported",
+                &other,
+            )),
+        }
+    }
+
+    fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        match self.exchange(
+            CommandRequest::ReleaseStagedLease { lease_id },
+            ProviderPhase::Resolve,
+        )? {
+            CommandResponse::Released => Ok(()),
+            CommandResponse::Error { error } => Err(error),
+            other => Err(unexpected_response(
+                ProviderPhase::Resolve,
+                "released",
                 &other,
             )),
         }
@@ -409,13 +464,22 @@ fn unexpected_response(
     error
 }
 
+/// Combined provider endpoint the server requires.
+///
+/// A provider that advertises staged leases implements both
+/// [`PipelineProvider`] and [`LeaseImporter`]; this trait lets the server hold
+/// one trait object instead of a generic parameter.
+pub trait ProviderEndpoint: PipelineProvider + LeaseImporter {}
+
+impl<T: PipelineProvider + LeaseImporter> ProviderEndpoint for T {}
+
 /// Provider-side loop. Serves requests until the owner closes the connection.
 ///
 /// Submission requests are admitted with the provider's own capabilities
 /// before [`ComputeProvider::submit`] is called, so remote owners cannot skip
 /// the admission contract.
 pub fn serve_provider<R: Read, W: Write>(
-    provider: &dyn PipelineProvider,
+    provider: &dyn ProviderEndpoint,
     transport: &mut CommandTransport<R, W>,
 ) -> Result<(), CommandError> {
     loop {
@@ -430,16 +494,31 @@ pub fn serve_provider<R: Read, W: Write>(
     }
 }
 
-fn handle_request(provider: &dyn PipelineProvider, request: CommandRequest) -> CommandResponse {
+fn handle_request(provider: &dyn ProviderEndpoint, request: CommandRequest) -> CommandResponse {
     match request {
         CommandRequest::Capabilities => CommandResponse::Capabilities {
             epoch: provider.device_epoch(),
             capabilities: provider.capabilities(),
         },
+        CommandRequest::Health => CommandResponse::Health {
+            health: provider.health(),
+        },
         CommandRequest::Compile { request } => match provider.compile(request) {
             Ok(pipeline) => CommandResponse::Compiled { pipeline },
             Err(error) => CommandResponse::Error { error },
         },
+        CommandRequest::ImportStagedLease { staged } => {
+            match provider.import_staged_lease(staged) {
+                Ok(()) => CommandResponse::Imported,
+                Err(error) => CommandResponse::Error { error },
+            }
+        }
+        CommandRequest::ReleaseStagedLease { lease_id } => {
+            match provider.release_staged_lease(lease_id) {
+                Ok(()) => CommandResponse::Released,
+                Err(error) => CommandResponse::Error { error },
+            }
+        }
         CommandRequest::Submit { trace, resources } => {
             let admitted = match provider.capabilities().validate_trace(trace, resources) {
                 Ok(admitted) => admitted,
@@ -558,14 +637,15 @@ mod tests {
     use super::{serve_provider, CommandRequest, CommandResponse, RemoteProvider};
     use crate::command_codec::CommandCodec;
     use metal_api_core::provider::{
-        AllocationId, AllocationRecord, BufferAccess, BufferBindingContract, BufferSource,
-        BufferView, BufferWriteback, CompiledComputePipeline, CompletionDisposition,
+        AllocationId, AllocationRecord, BufferAccess, BufferBindingContract, BufferLease,
+        BufferSource, BufferView, BufferWriteback, CompiledComputePipeline, CompletionDisposition,
         CompletionReadback, CompletionToken, ComputePass, ComputeProvider, ComputeTrace,
         DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity,
-        OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
-        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase, ProviderSubmission,
-        ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, SubmissionId,
-        ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
+        LeaseId, LeaseImporter, LeaseReservation, OperationId, PipelineCompileRequest,
+        PipelineContract, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
+        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
+        ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
+        SubmissionId, ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -662,8 +742,27 @@ mod tests {
         let trace = trace(&compiled);
         let requests = [
             CommandRequest::Capabilities,
+            CommandRequest::Health,
             CommandRequest::Compile {
                 request: request.clone(),
+            },
+            CommandRequest::ImportStagedLease {
+                staged: StagedLease::new(
+                    LeaseReservation {
+                        lease: BufferLease {
+                            lease_id: LeaseId::new(51),
+                            allocation_id: AllocationId::new(41),
+                            owner_epoch: DeviceEpoch::new(7),
+                        },
+                        offset: 0,
+                        length: 4,
+                    },
+                    vec![1, 2, 3, 4],
+                )
+                .unwrap(),
+            },
+            CommandRequest::ReleaseStagedLease {
+                lease_id: LeaseId::new(51),
             },
             CommandRequest::Submit {
                 trace: trace.clone(),
@@ -727,6 +826,10 @@ mod tests {
             CommandResponse::Compiled {
                 pipeline: compiled.clone(),
             },
+            CommandResponse::Health {
+                health: ProviderHealth::Usable,
+            },
+            CommandResponse::Imported,
             CommandResponse::Submitted {
                 submission: ProviderSubmission {
                     completion: CompletionDisposition::Submitted { token: token() },
@@ -755,6 +858,7 @@ mod tests {
         epoch: DeviceEpoch,
         capabilities: ProviderCapabilities,
         submissions: Arc<AtomicU64>,
+        imports: Arc<AtomicU64>,
     }
 
     impl ComputeProvider for FakeProvider {
@@ -822,6 +926,17 @@ mod tests {
         }
     }
 
+    impl LeaseImporter for FakeProvider {
+        fn import_staged_lease(&self, _staged: StagedLease) -> Result<(), ProviderError> {
+            self.imports.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release_staged_lease(&self, _lease_id: LeaseId) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             max_passes: 1,
@@ -846,18 +961,38 @@ mod tests {
     #[test]
     fn remote_provider_serves_compile_submit_wait_and_readback() {
         let submissions = Arc::new(AtomicU64::new(0));
+        let imports = Arc::new(AtomicU64::new(0));
         let provider = FakeProvider {
             epoch: DeviceEpoch::new(7),
             capabilities: fake_capabilities(),
             submissions: Arc::clone(&submissions),
+            imports: Arc::clone(&imports),
         };
         let (client, mut server) = super::unix::pair().unwrap();
         let server_thread = std::thread::spawn(move || serve_provider(&provider, &mut server));
 
         let remote = RemoteProvider::connect(client).unwrap();
         assert_eq!(remote.device_epoch(), DeviceEpoch::new(7));
+        assert_eq!(remote.health(), ProviderHealth::Usable);
         assert_eq!(remote.capabilities(), fake_capabilities());
         let compiled = remote.compile(compile_request()).unwrap();
+        remote
+            .import_staged_lease(
+                StagedLease::new(
+                    LeaseReservation {
+                        lease: BufferLease {
+                            lease_id: LeaseId::new(51),
+                            allocation_id: AllocationId::new(41),
+                            owner_epoch: DeviceEpoch::new(7),
+                        },
+                        offset: 0,
+                        length: 4,
+                    },
+                    vec![1, 2, 3, 4],
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let trace = trace(&compiled);
         let admitted = remote
             .capabilities()
@@ -873,9 +1008,11 @@ mod tests {
         assert_eq!(readback.writebacks.len(), 1);
         assert_eq!(readback.writebacks[0].bytes, vec![4, 3, 2, 1]);
         remote.release_completion(token).unwrap();
+        remote.release_staged_lease(LeaseId::new(51)).unwrap();
         remote.release_pipeline(&compiled).unwrap();
         drop(remote);
         server_thread.join().unwrap().unwrap();
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(imports.load(Ordering::SeqCst), 1);
     }
 }

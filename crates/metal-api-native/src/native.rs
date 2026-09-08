@@ -481,6 +481,10 @@ impl ComputeProvider for NativeMetalProvider {
         self.capabilities.clone()
     }
 
+    fn health(&self) -> ProviderHealth {
+        NativeMetalProvider::health(self)
+    }
+
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let trace = admitted.trace();
         self.check_epoch(trace.device_epoch)?;

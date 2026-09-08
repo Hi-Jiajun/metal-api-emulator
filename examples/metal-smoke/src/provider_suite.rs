@@ -13,8 +13,8 @@ use metal_api_core::provider::{
     ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
     FootprintProof, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
     NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
-    StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
 use metal_api_ipc::command::{serve_provider, unix as command_unix, RemoteProvider};
@@ -681,7 +681,28 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         ),
     };
     let pipeline = remote.compile(compile).map_err(provider_error)?;
-    let trace = make_trace(
+    if remote.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "remote provider health is not usable: {:?}",
+            remote.health()
+        )
+        .into());
+    }
+    let lease_id = LeaseId::new(96);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(100),
+            owner_epoch: epoch,
+        },
+        offset: 8,
+        length: 4,
+    };
+    let word = 0x6745_2301_u32.to_le_bytes().to_vec();
+    remote
+        .import_staged_lease(StagedLease::new(reservation, word.clone())?)
+        .map_err(provider_error)?;
+    let mut trace = make_trace(
         &pipeline,
         501,
         Dispatch {
@@ -689,14 +710,14 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
             grid: [1, 1, 1],
             threads_per_threadgroup: [1, 1, 1],
         },
-        vec![
-            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
-            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
-        ],
+        vec![(0, 8, word.clone()), (1, 16, vec![0; 4])],
     )?;
+    trace.passes[0].buffers[0].source = BufferSource::StagedLease(lease_id);
+    let mut resources = resources_for_trace(&trace)?;
+    resources.insert_lease(reservation)?;
     let admitted = remote
         .capabilities()
-        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .validate_trace(trace.clone(), resources.clone())
         .map_err(provider_error)?;
     let submitted = remote.submit(admitted).map_err(provider_error)?;
     let token = submitted
@@ -739,8 +760,30 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         writebacks: readback.writebacks,
     };
     result.validate_for_trace(&trace)?;
-    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    check_writeback(&trace, &result, 1, &word)?;
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("remote command completion did not retire the staged lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("remote command staged lease was not release-ready".into());
+    }
     remote.release_completion(token).map_err(provider_error)?;
+    remote
+        .release_staged_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(
+            format!("remote provider did not refuse the released lease: {refused:?}").into(),
+        );
+    }
     remote.release_pipeline(&pipeline).map_err(provider_error)?;
     drop(remote);
 
@@ -754,7 +797,7 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         return Err(format!("provider command child exited with {status}").into());
     }
     println!(
-        "PASS provider_command_process owner=parent provider=child transport=unix commands=compile,submit,wait,readback completion=mirrored writeback=exact"
+        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused"
     );
     Ok(())
 }

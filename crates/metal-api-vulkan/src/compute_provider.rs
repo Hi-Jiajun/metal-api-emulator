@@ -657,6 +657,10 @@ impl ComputeProvider for VulkanComputeProvider {
         self.capabilities.clone()
     }
 
+    fn health(&self) -> ProviderHealth {
+        VulkanComputeProvider::health(self)
+    }
+
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let trace = admitted.trace();
         check_epoch(self.epoch, trace.device_epoch)?;

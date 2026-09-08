@@ -16,8 +16,9 @@ use metal_api_core::provider::{
     CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
     FieldValue, FootprintProof, FunctionIdentity, FunctionSource, LeaseId, LeaseReservation,
     OperationId, PipelineCompileRequest, PipelineContract, PipelineId, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderPhase, ProviderSubmission, ResourceTableSnapshot,
-    Retryability, SemanticDigest, ShaderSource, StorageMode, SubmissionId, ViewId,
+    ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
+    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
+    SubmissionId, ViewId,
 };
 use std::io::{Read, Write};
 
@@ -37,6 +38,9 @@ const READBACK_REQUEST: u8 = 0x05;
 const CANCEL_REQUEST: u8 = 0x06;
 const RELEASE_PIPELINE_REQUEST: u8 = 0x07;
 const RELEASE_COMPLETION_REQUEST: u8 = 0x08;
+const HEALTH_REQUEST: u8 = 0x09;
+const IMPORT_STAGED_LEASE_REQUEST: u8 = 0x0a;
+const RELEASE_STAGED_LEASE_REQUEST: u8 = 0x0b;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -44,6 +48,8 @@ const SUBMITTED_RESPONSE: u8 = 0x03;
 const OBSERVED_RESPONSE: u8 = 0x04;
 const READBACK_RESPONSE: u8 = 0x05;
 const RELEASED_RESPONSE: u8 = 0x06;
+const HEALTH_RESPONSE: u8 = 0x07;
+const IMPORTED_RESPONSE: u8 = 0x08;
 const ERROR_RESPONSE: u8 = 0x7f;
 
 /// Stateless encoder/decoder for command frames.
@@ -55,9 +61,18 @@ impl CommandCodec {
         let mut encoder = Encoder::new();
         match request {
             CommandRequest::Capabilities => encoder.u8(CAPABILITIES_REQUEST),
+            CommandRequest::Health => encoder.u8(HEALTH_REQUEST),
             CommandRequest::Compile { request } => {
                 encoder.u8(COMPILE_REQUEST);
                 put_compile_request(&mut encoder, request);
+            }
+            CommandRequest::ImportStagedLease { staged } => {
+                encoder.u8(IMPORT_STAGED_LEASE_REQUEST);
+                put_staged_lease(&mut encoder, staged);
+            }
+            CommandRequest::ReleaseStagedLease { lease_id } => {
+                encoder.u8(RELEASE_STAGED_LEASE_REQUEST);
+                encoder.u64(lease_id.get());
             }
             CommandRequest::Submit { trace, resources } => {
                 encoder.u8(SUBMIT_REQUEST);
@@ -106,10 +121,15 @@ impl CommandCodec {
                 put_epoch(&mut encoder, *epoch);
                 put_capabilities(&mut encoder, capabilities);
             }
+            CommandResponse::Health { health } => {
+                encoder.u8(HEALTH_RESPONSE);
+                put_health(&mut encoder, *health);
+            }
             CommandResponse::Compiled { pipeline } => {
                 encoder.u8(COMPILED_RESPONSE);
                 put_pipeline(&mut encoder, pipeline);
             }
+            CommandResponse::Imported => encoder.u8(IMPORTED_RESPONSE),
             CommandResponse::Submitted { submission } => {
                 encoder.u8(SUBMITTED_RESPONSE);
                 put_submission(&mut encoder, submission);
@@ -178,8 +198,15 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
     let tag = decoder.u8()?;
     let request = match tag {
         CAPABILITIES_REQUEST => CommandRequest::Capabilities,
+        HEALTH_REQUEST => CommandRequest::Health,
         COMPILE_REQUEST => CommandRequest::Compile {
             request: get_compile_request(&mut decoder)?,
+        },
+        IMPORT_STAGED_LEASE_REQUEST => CommandRequest::ImportStagedLease {
+            staged: get_staged_lease(&mut decoder)?,
+        },
+        RELEASE_STAGED_LEASE_REQUEST => CommandRequest::ReleaseStagedLease {
+            lease_id: LeaseId::new(decoder.u64()?),
         },
         SUBMIT_REQUEST => CommandRequest::Submit {
             trace: get_trace(&mut decoder)?,
@@ -215,9 +242,13 @@ fn decode_response_payload(payload: &[u8]) -> Result<CommandResponse, CodecError
             epoch: get_epoch(&mut decoder)?,
             capabilities: get_capabilities(&mut decoder)?,
         },
+        HEALTH_RESPONSE => CommandResponse::Health {
+            health: get_health(&mut decoder)?,
+        },
         COMPILED_RESPONSE => CommandResponse::Compiled {
             pipeline: get_pipeline(&mut decoder)?,
         },
+        IMPORTED_RESPONSE => CommandResponse::Imported,
         SUBMITTED_RESPONSE => CommandResponse::Submitted {
             submission: get_submission(&mut decoder)?,
         },
@@ -1040,11 +1071,7 @@ fn put_resources(encoder: &mut Encoder, resources: &ResourceTableSnapshot) {
     let leases: Vec<_> = resources.leases().collect();
     encoder.u64(leases.len() as u64);
     for reservation in &leases {
-        encoder.u64(reservation.lease.lease_id.get());
-        encoder.u64(reservation.lease.allocation_id.get());
-        put_epoch(encoder, reservation.lease.owner_epoch);
-        encoder.u64(reservation.offset);
-        encoder.u64(reservation.length);
+        put_reservation(encoder, reservation);
     }
 }
 
@@ -1068,17 +1095,61 @@ fn get_resources(decoder: &mut Decoder<'_>) -> Result<ResourceTableSnapshot, Cod
             remaining: decoder.remaining(),
         })?;
     for _ in 0..lease_count {
-        resources.insert_lease(LeaseReservation {
-            lease: BufferLease {
-                lease_id: LeaseId::new(decoder.u64()?),
-                allocation_id: AllocationId::new(decoder.u64()?),
-                owner_epoch: get_epoch(decoder)?,
-            },
-            offset: decoder.u64()?,
-            length: decoder.u64()?,
-        })?;
+        resources.insert_lease(get_reservation(decoder)?)?;
     }
     Ok(resources)
+}
+
+fn put_reservation(encoder: &mut Encoder, reservation: &LeaseReservation) {
+    encoder.u64(reservation.lease.lease_id.get());
+    encoder.u64(reservation.lease.allocation_id.get());
+    put_epoch(encoder, reservation.lease.owner_epoch);
+    encoder.u64(reservation.offset);
+    encoder.u64(reservation.length);
+}
+
+fn get_reservation(decoder: &mut Decoder<'_>) -> Result<LeaseReservation, CodecError> {
+    Ok(LeaseReservation {
+        lease: BufferLease {
+            lease_id: LeaseId::new(decoder.u64()?),
+            allocation_id: AllocationId::new(decoder.u64()?),
+            owner_epoch: get_epoch(decoder)?,
+        },
+        offset: decoder.u64()?,
+        length: decoder.u64()?,
+    })
+}
+
+fn put_staged_lease(encoder: &mut Encoder, staged: &StagedLease) {
+    put_reservation(encoder, &staged.reservation);
+    encoder.blob(&staged.bytes);
+}
+
+fn get_staged_lease(decoder: &mut Decoder<'_>) -> Result<StagedLease, CodecError> {
+    Ok(StagedLease::new(
+        get_reservation(decoder)?,
+        decoder.blob()?,
+    )?)
+}
+
+fn put_health(encoder: &mut Encoder, health: ProviderHealth) {
+    encoder.u8(match health {
+        ProviderHealth::Usable => 0,
+        ProviderHealth::DeviceLost => 1,
+        ProviderHealth::Exhausted => 2,
+    });
+}
+
+fn get_health(decoder: &mut Decoder<'_>) -> Result<ProviderHealth, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(ProviderHealth::Usable),
+        1 => Ok(ProviderHealth::DeviceLost),
+        2 => Ok(ProviderHealth::Exhausted),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "provider health",
+            value,
+        }),
+    }
 }
 
 fn put_writeback(encoder: &mut Encoder, writeback: &BufferWriteback) {

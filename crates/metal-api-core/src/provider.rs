@@ -2129,6 +2129,13 @@ fn validate_writebacks_for_trace(
 pub trait ComputeProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Current provider health. Providers that can lose a device or exhaust a
+    /// bounded abandonment budget must override this; callers must recreate a
+    /// provider whose health is not [`ProviderHealth::Usable`].
+    fn health(&self) -> ProviderHealth {
+        ProviderHealth::Usable
+    }
+
     fn submit(&self, trace: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError>;
 
     fn wait(
