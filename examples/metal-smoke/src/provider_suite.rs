@@ -121,6 +121,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     println!("SKIP provider_ipc_process cases transport=unix reason=platform");
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
+    run_object_queue_ordering()?;
     run_device_lifecycle()?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
@@ -1779,6 +1780,90 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
         .map_err(provider_error)?;
     println!(
         "PASS provider_borrowed_lease lease=98 alignment={alignment} copy_in=live copy_out=in_place retired=true refusal=lease_not_imported"
+    );
+    Ok(())
+}
+
+/// Two command buffers on one object-API queue with a data dependency: the
+/// first copies the input word into `middle`, the second copies `middle` into
+/// the destination. The second commit blocks on the shared `middle`
+/// reservation until the first command completes, so the destination can only
+/// hold the input word when the queue preserves commit order. This is a
+/// host-reservation ordering check, not concurrent GPU execution.
+fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_queue_ordering".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile queue fixture: {error:?}"))?;
+    let input = device.new_buffer_with_bytes(0x6745_2301_u32.to_le_bytes().to_vec())?;
+    let middle = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let destination = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let input_view = input.view(0, 4)?;
+    let middle_read = middle.view(0, 4)?;
+    let middle_write = middle.view(0, 4)?;
+    let destination_view = destination.view(0, 4)?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_view)?;
+        encoder.set_buffer(1, &middle_write)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &middle_read)?;
+        encoder.set_buffer(1, &destination_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    first.commit()?;
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second commit: {error:?}"))?;
+        Ok::<_, String>(second)
+    });
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "queue-ordering commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    let expected = 0x6745_2301_u32.to_le_bytes();
+    if middle.read()? != expected {
+        return Err("first command did not copy the input word into the middle buffer".into());
+    }
+    if destination.read()? != expected {
+        return Err("second command did not observe the first command's write".into());
+    }
+    println!(
+        "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
     );
     Ok(())
 }

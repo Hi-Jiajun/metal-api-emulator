@@ -215,9 +215,12 @@ owner mapping without copying
 (`VK_EXT_external_memory_host`) and proves live reads and in-place GPU writes
 before release. The command connection lowers its frame limit to 1 KiB in this
 case, so every request travels as chunk frames and the child reassembles it
-before decoding. A final case injects a simulated device loss into a dedicated
-executor: `health` must report `DeviceLost`, new compilation must be refused
-with `device_lost`/`RetryAfterRecreate`, and a freshly created
+before decoding. The object-API queue case commits two command buffers with a
+shared buffer in commit order: the second commit blocks on the first command's
+reservation, so the destination can only observe the first command's write
+when the queue preserves order. A final case injects a simulated device loss
+into a dedicated executor: `health` must report `DeviceLost`, new compilation
+must be refused with `device_lost`/`RetryAfterRecreate`, and a freshly created
 executor/provider pair must resume work with an exact writeback. The object
 API's `Device::health()` must expose the same lost and recovered states. The
 injection exercises the lifecycle state machine; it is not a real GPU device
