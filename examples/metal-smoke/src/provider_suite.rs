@@ -2037,8 +2037,23 @@ fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let queues = executor.queue_count();
+    let counts = executor.queue_submission_counts();
+    let submissions: usize = counts.iter().sum();
+    if submissions != 2 {
+        return Err(
+            format!("parallel queue recorded {submissions} submissions, expected 2").into(),
+        );
+    }
+    let distributed = queues > 1 && counts.iter().filter(|count| **count > 0).count() >= 2;
+    if queues > 1 && !distributed {
+        return Err(format!(
+            "multi-queue device did not distribute independent submissions: queues={queues} counts={counts:?}"
+        )
+        .into());
+    }
     println!(
-        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 writeback=exact"
+        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 queues={queues} distributed={distributed} writeback=exact"
     );
     Ok(())
 }

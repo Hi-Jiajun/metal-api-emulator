@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod compute_provider;
@@ -41,6 +41,13 @@ static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
 }
+
+/// Device queues created per selected queue family.
+///
+/// Four queues are enough to demonstrate independent in-flight work without
+/// over-subscribing drivers whose family reports many queues. A family with a
+/// single queue (Lavapipe) keeps the previous single-queue behaviour.
+const MAX_DEVICE_QUEUES: usize = 4;
 
 /// Native Vulkan implementation of the Phase 1 compute subset.
 pub struct VulkanExecutor {
@@ -77,6 +84,17 @@ impl VulkanExecutor {
     #[doc(hidden)]
     pub fn inject_device_loss_for_test(&self) {
         self.context.mark_device_lost();
+    }
+
+    /// Number of device queues created for the selected queue family.
+    pub fn queue_count(&self) -> usize {
+        self.context.queue_count()
+    }
+
+    /// Successful submissions recorded per device queue.
+    #[doc(hidden)]
+    pub fn queue_submission_counts(&self) -> Vec<usize> {
+        self.context.queue_submission_counts()
     }
 }
 
@@ -229,7 +247,9 @@ pub(crate) struct VulkanContext {
     device: AshDevice,
     external_memory_host: Option<ExternalMemoryHost>,
     queue_family: u32,
-    queue: vk::Queue,
+    queues: Vec<vk::Queue>,
+    next_queue: AtomicUsize,
+    queue_submissions: Vec<AtomicUsize>,
     properties: vk::PhysicalDeviceProperties,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
@@ -279,10 +299,19 @@ impl VulkanContext {
                 return Err(error);
             }
         };
-        let priorities = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let available_queues = queue_families
+            .get(queue_family as usize)
+            .map(|family| family.queue_count as usize)
+            .unwrap_or(1);
+        let queue_count = available_queues.clamp(1, MAX_DEVICE_QUEUES);
+        let priorities = vec![1.0_f32; queue_count];
+        let mut queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
+            .queue_priorities(&priorities);
+        queue_info.queue_count = queue_count as u32;
+        let queue_info = [queue_info];
         let extensions = match unsafe { instance.enumerate_device_extension_properties(physical) } {
             Ok(extensions) => extensions,
             Err(error) => {
@@ -314,7 +343,9 @@ impl VulkanContext {
                 return Err(failure(format!("create Vulkan device: {error}")));
             }
         };
-        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let queues = (0..queue_count)
+            .map(|index| unsafe { device.get_device_queue(queue_family, index as u32) })
+            .collect::<Vec<_>>();
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
@@ -337,7 +368,9 @@ impl VulkanContext {
             device,
             external_memory_host,
             queue_family,
-            queue,
+            queues,
+            next_queue: AtomicUsize::new(0),
+            queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
             device_name,
@@ -358,6 +391,31 @@ impl VulkanContext {
         } else {
             Ok(())
         }
+    }
+
+    /// Round-robin index of the next independent submission.
+    ///
+    /// A single-queue family always returns zero, preserving the previous
+    /// behaviour on devices such as Lavapipe.
+    pub(crate) fn pick_queue(&self) -> usize {
+        self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len()
+    }
+
+    pub(crate) fn record_queue_submission(&self, index: usize) {
+        if let Some(counter) = self.queue_submissions.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
+    pub(crate) fn queue_submission_counts(&self) -> Vec<usize> {
+        self.queue_submissions
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
     }
 
     pub(crate) fn health(&self) -> ContextHealth {
@@ -646,7 +704,8 @@ fn execute_submission_stages(
     dispatches: &[BoundDispatch],
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let mut pending = PendingExecution::submit(context, artifacts, buffers, dispatches, borrowed)?;
+    let mut pending =
+        PendingExecution::submit(context, 0, artifacts, buffers, dispatches, borrowed)?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
         context.poisoned.store(true, Ordering::Release);
         return Err(ExecutionFailure::vulkan(
@@ -679,6 +738,7 @@ pub(crate) struct PendingExecution {
 impl PendingExecution {
     pub(crate) fn submit(
         context: &Arc<VulkanContext>,
+        queue_index: usize,
         artifacts: &[Arc<VulkanPipelineArtifact>],
         buffers: &[PoolBinding],
         dispatches: &[BoundDispatch],
@@ -722,7 +782,7 @@ impl PendingExecution {
             .create_descriptors(&translated, dispatches)
             .map_err(encode_error)?;
         resources.record(&translated, plans).map_err(encode_error)?;
-        if let Err(error) = resources.submit() {
+        if let Err(error) = resources.submit(queue_index) {
             let device_lost = error.is_device_lost();
             if error.is_pending() {
                 if device_lost {
@@ -1411,6 +1471,7 @@ struct ExecutionResources {
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+    queue_index: usize,
     submitted: bool,
     completed: bool,
     device_lost: bool,
@@ -1726,6 +1787,7 @@ impl ExecutionResources {
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            queue_index: 0,
             submitted: false,
             completed: false,
             device_lost: false,
@@ -2173,7 +2235,8 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn submit(&mut self) -> Result<(), SubmissionFailure> {
+    fn submit(&mut self, queue_index: usize) -> Result<(), SubmissionFailure> {
+        self.queue_index = queue_index;
         self.fence = unsafe {
             self.context
                 .device
@@ -2188,7 +2251,7 @@ impl ExecutionResources {
         if let Err(error) = unsafe {
             self.context
                 .device
-                .queue_submit(self.context.queue, &submits, self.fence)
+                .queue_submit(self.context.queues[queue_index], &submits, self.fence)
         } {
             self.context.poisoned.store(true, Ordering::Release);
             let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
@@ -2198,6 +2261,7 @@ impl ExecutionResources {
             self.submitted = failure.is_pending();
             return Err(failure);
         }
+        self.context.record_queue_submission(queue_index);
         self.submitted = true;
         Ok(())
     }

@@ -871,6 +871,7 @@ impl VulkanComputeProvider {
         token: CompletionToken,
         retains: &mut BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
+        let queue_index = self.executor.context.pick_queue();
         let pending = {
             let _execution = self
                 .executor
@@ -881,6 +882,7 @@ impl VulkanComputeProvider {
             ensure_executor_usable(&self.executor)?;
             PendingExecution::submit(
                 &self.executor.context,
+                queue_index,
                 &artifacts,
                 &buffers,
                 &dispatches,
