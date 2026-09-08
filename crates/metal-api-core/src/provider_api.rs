@@ -1,17 +1,24 @@
-//! Experimental synchronous compute objects over the shared provider contract.
+//! Experimental compute objects over the shared provider contract.
 //!
 //! Dispatch records freeze pipeline and view bindings. Buffer contents are read
 //! once at commit, when the complete command is admitted and submitted once.
-//! Buffer locks are held through synchronous execution and checked writeback;
-//! concurrent CPU access and commands using those buffers wait for that boundary.
-//! This module does not extend the older [`crate::ComputeExecutor`] object API.
+//! A provider that completes inside `submit` finishes the command at commit. A
+//! provider that returns `Submitted` leaves the command pending; the first
+//! `wait_until_completed` observes completion, validates `readback` against the
+//! exact submitted trace and then lands writebacks. Buffer reservations are held
+//! from commit through that boundary, so concurrent CPU access and commands
+//! using those buffers wait for completion instead of racing the GPU. Dropping
+//! a pending command releases its reservations and completion record without
+//! claiming that unknown GPU work retired. This module does not extend the
+//! older [`crate::ComputeExecutor`] object API.
 
 use crate::provider::{
-    self as contract, AllocationId, AllocationRecord, BufferSource, CompiledComputePipeline,
-    CompletionDisposition, CompletionPolicy, CompletionToken, ContractError, Dispatch,
-    DispatchKind, DispatchType, OperationId, PipelineCompileRequest, PipelineId, PipelineProvider,
-    ProviderCapabilities, ProviderError, ProviderSubmission, ResourceTableSnapshot, ViewId,
-    MAX_SERIAL_RESOURCES, PROVIDER_SCHEMA_VERSION,
+    self as contract, AllocationId, AllocationRecord, BufferSource, BufferWriteback,
+    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionToken,
+    ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType, OperationId,
+    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
+    ProviderSubmission, ResourceTableSnapshot, ViewId, MAX_SERIAL_RESOURCES,
+    PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,7 +41,7 @@ pub enum Error {
     InvalidPipelineMetadata,
     PassLimit { requested: usize, maximum: usize },
     ProviderPanicked,
-    SynchronousCompletionRequired,
+    CompletionUnavailable(CompletionDisposition),
     CompletionObservationMismatch,
 }
 
@@ -57,9 +64,10 @@ impl fmt::Display for Error {
                 write!(f, "command has {requested} passes; maximum is {maximum}")
             }
             Self::ProviderPanicked => f.write_str("provider panicked"),
-            Self::SynchronousCompletionRequired => {
-                f.write_str("object API requires synchronous completed host readback")
-            }
+            Self::CompletionUnavailable(disposition) => write!(
+                f,
+                "provider completion did not produce host-visible results: {disposition:?}"
+            ),
             Self::CompletionObservationMismatch => {
                 f.write_str("provider wait disagrees with submitted completion")
             }
@@ -177,6 +185,8 @@ impl Device {
                 allocation_id: AllocationId::new(next_id()?),
                 length,
                 bytes: Mutex::new(bytes),
+                reservations: Mutex::new(0),
+                available: Condvar::new(),
             }),
         })
     }
@@ -216,6 +226,8 @@ struct BufferInner {
     allocation_id: AllocationId,
     length: usize,
     bytes: Mutex<Vec<u8>>,
+    reservations: Mutex<usize>,
+    available: Condvar,
 }
 
 /// Fixed-size CPU storage. Reads and writes wait while a command uses it.
@@ -228,11 +240,11 @@ impl Buffer {
         self.inner.allocation_id
     }
     pub fn read(&self) -> Result<Vec<u8>, Error> {
-        Ok(lock(&self.inner.bytes, "provider buffer")?.clone())
+        Ok(self.lock_unreserved()?.clone())
     }
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         let end = checked_range(offset, bytes.len(), self.inner.length)?;
-        lock(&self.inner.bytes, "provider buffer")?[offset..end].copy_from_slice(bytes);
+        self.lock_unreserved()?[offset..end].copy_from_slice(bytes);
         Ok(())
     }
     /// Allocate a distinct logical view. Clone the returned view to reuse its
@@ -249,6 +261,69 @@ impl Buffer {
             length,
         })
     }
+
+    /// Wait until no command reserves this allocation, then hold its bytes.
+    /// A reservation may be acquired between the count check and this lock;
+    /// re-check under the bytes guard and retry so CPU access is linearized
+    /// either completely before the commit-time snapshot or completely after
+    /// the command releases its reservation.
+    fn lock_unreserved(&self) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
+        loop {
+            let mut reservations = lock(&self.inner.reservations, "provider buffer reservation")?;
+            while *reservations != 0 {
+                reservations = self
+                    .inner
+                    .available
+                    .wait(reservations)
+                    .map_err(|_| ApiError::StatePoisoned("provider buffer reservation"))?;
+            }
+            drop(reservations);
+            let bytes = lock(&self.inner.bytes, "provider buffer")?;
+            if *lock(&self.inner.reservations, "provider buffer reservation")? == 0 {
+                return Ok(bytes);
+            }
+            drop(bytes);
+        }
+    }
+
+    fn reserve(&self) -> Result<BufferReservation, Error> {
+        let mut reservations = lock(&self.inner.reservations, "provider buffer reservation")?;
+        while *reservations != 0 {
+            reservations = self
+                .inner
+                .available
+                .wait(reservations)
+                .map_err(|_| ApiError::StatePoisoned("provider buffer reservation"))?;
+        }
+        *reservations = 1;
+        Ok(BufferReservation {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
+/// Exclusive commit-through-completion reservation for one allocation. The
+/// guard is `Send` so finalization may run on the waiting thread, and dropping
+/// it wakes CPU accessors even when a pending command is abandoned.
+struct BufferReservation {
+    inner: Arc<BufferInner>,
+}
+impl BufferReservation {
+    fn allocation_id(&self) -> AllocationId {
+        self.inner.allocation_id
+    }
+    fn lock_bytes(&self) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
+        lock(&self.inner.bytes, "provider buffer")
+    }
+}
+impl Drop for BufferReservation {
+    fn drop(&mut self) {
+        match self.inner.reservations.lock() {
+            Ok(mut reservations) => *reservations = reservations.saturating_sub(1),
+            Err(poisoned) => *poisoned.into_inner() = 0,
+        }
+        self.inner.available.notify_all();
+    }
 }
 
 fn checked_range(offset: usize, length: usize, allocation_length: usize) -> Result<usize, Error> {
@@ -262,6 +337,56 @@ fn checked_range(offset: usize, length: usize, allocation_length: usize) -> Resu
             }
             .into()
         })
+}
+
+/// Reserve every allocation in identity order. All commands use the same order,
+/// so overlapping commands serialize while disjoint commands proceed.
+fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
+    let mut buffers = BTreeMap::<AllocationId, &Buffer>::new();
+    for pass in passes {
+        for view in pass.buffers.values() {
+            buffers.insert(view.allocation_id(), &view.buffer);
+        }
+    }
+    buffers.into_values().map(Buffer::reserve).collect()
+}
+
+/// Validate every writeback range before copying any host byte, then land all
+/// of them under the reservations held by the caller.
+fn apply_writebacks(
+    reservations: &[BufferReservation],
+    writebacks: &[BufferWriteback],
+) -> Result<(), Error> {
+    if writebacks.is_empty() {
+        return Ok(());
+    }
+    let positions = reservations
+        .iter()
+        .enumerate()
+        .map(|(position, reservation)| (reservation.allocation_id(), position))
+        .collect::<BTreeMap<_, _>>();
+    let mut writes = Vec::with_capacity(writebacks.len());
+    for writeback in writebacks {
+        let position = *positions
+            .get(&writeback.allocation_id)
+            .ok_or(ContractError::UnknownAllocation(writeback.allocation_id))?;
+        let offset = usize::try_from(writeback.offset)
+            .map_err(|_| ContractError::ArithmeticOverflow("writeback offset"))?;
+        let end = checked_range(
+            offset,
+            writeback.bytes.len(),
+            reservations[position].inner.length,
+        )?;
+        writes.push((position, offset, end, &writeback.bytes));
+    }
+    let mut guards = Vec::with_capacity(reservations.len());
+    for reservation in reservations {
+        guards.push(reservation.lock_bytes()?);
+    }
+    for (position, offset, end, bytes) in writes {
+        guards[position][offset..end].copy_from_slice(bytes);
+    }
+    Ok(())
 }
 
 /// Immutable range and identity in one buffer allocation.
@@ -298,6 +423,7 @@ impl CommandQueue {
                     failure: None,
                     submission: None,
                     completion: None,
+                    pending: None,
                 }),
                 completion: Condvar::new(),
             }),
@@ -319,6 +445,21 @@ struct CommandInner {
     failure: Option<Error>,
     submission: Option<ProviderSubmission>,
     completion: Option<CompletionToken>,
+    pending: Option<PendingCompletion>,
+}
+
+/// Submitted work whose completion and host readback have not been observed.
+/// The reservations keep CPU access blocked until finalization lands or the
+/// command is dropped.
+struct PendingCompletion {
+    token: CompletionToken,
+    trace: ComputeTrace,
+    reservations: Vec<BufferReservation>,
+}
+
+enum ExecutionOutcome {
+    Completed(ProviderSubmission),
+    Pending(ProviderSubmission, PendingCompletion),
 }
 struct CommandShared {
     owner: Arc<DeviceState>,
@@ -339,8 +480,10 @@ impl Drop for CommandShared {
     }
 }
 
-/// Single-use synchronous command buffer. No buffer bytes change if admission,
-/// execution, completion observation or writeback validation fails.
+/// Single-use command buffer. A synchronous provider completes at commit; a
+/// provider returning `Submitted` completes on the first `wait_until_completed`
+/// after its readback passes exact-trace validation. No buffer bytes change if
+/// admission, execution, completion observation or readback validation fails.
 pub struct CommandBuffer {
     shared: Arc<CommandShared>,
 }
@@ -388,14 +531,23 @@ impl CommandBuffer {
             inner.passes.clone()
         };
         let mut token = None;
-        let result = catch_unwind(AssertUnwindSafe(|| self.execute(&passes, &mut token)))
-            .unwrap_or(Err(Error::ProviderPanicked));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let reservations = reserve_buffers(&passes)?;
+            self.execute(&passes, reservations, &mut token)
+        }))
+        .unwrap_or(Err(Error::ProviderPanicked));
         let mut inner = lock(&self.shared.inner, "provider command")?;
         inner.completion = token;
         let result = match result {
-            Ok(submission) => {
+            Ok(ExecutionOutcome::Completed(submission)) => {
                 inner.submission = Some(submission);
                 inner.status = CommandBufferStatus::Completed;
+                Ok(())
+            }
+            Ok(ExecutionOutcome::Pending(submission, pending)) => {
+                inner.submission = Some(submission);
+                inner.pending = Some(pending);
+                // Status remains Committed until host-visible results land.
                 Ok(())
             }
             Err(error) => {
@@ -411,29 +563,26 @@ impl CommandBuffer {
     fn execute(
         &self,
         passes: &[RecordedPass],
+        reservations: Vec<BufferReservation>,
         token: &mut Option<CompletionToken>,
-    ) -> Result<ProviderSubmission, Error> {
+    ) -> Result<ExecutionOutcome, Error> {
         let owner = &self.shared.owner;
-        let mut buffers = BTreeMap::<AllocationId, &Buffer>::new();
-        for pass in passes {
-            for view in pass.buffers.values() {
-                buffers.insert(view.allocation_id(), &view.buffer);
-            }
-        }
-        // All commands acquire their complete union in allocation order. Keep
-        // guards outside provider_call's unwind boundary so a provider panic
-        // cannot poison otherwise unchanged host storage.
-        let mut guards = Vec::with_capacity(buffers.len());
         let mut positions = BTreeMap::new();
         let mut resources = ResourceTableSnapshot::new();
-        for (id, buffer) in buffers {
-            positions.insert(id, guards.len());
-            guards.push(lock(&buffer.inner.bytes, "provider buffer")?);
+        for (position, reservation) in reservations.iter().enumerate() {
+            positions.insert(reservation.allocation_id(), position);
             resources.insert_allocation(AllocationRecord {
-                allocation_id: id,
+                allocation_id: reservation.allocation_id(),
                 owner_epoch: owner.epoch,
-                size: buffer.inner.length as u64,
+                size: reservation.inner.length as u64,
             })?;
+        }
+        // Reservations exclude CPU access for the whole commit-to-completion
+        // window. These guards are local to this call and are released before a
+        // pending command returns to the caller.
+        let mut guards = Vec::with_capacity(reservations.len());
+        for reservation in &reservations {
+            guards.push(reservation.lock_bytes()?);
         }
         let mut pipelines = BTreeMap::<PipelineId, CompiledComputePipeline>::new();
         let mut trace_passes = Vec::with_capacity(passes.len());
@@ -494,57 +643,117 @@ impl CommandBuffer {
             .filter(|token| token.device_epoch == owner.epoch && token.validate().is_ok());
         let submission = result?;
         submission.validate_for_trace(&trace)?;
-        if !matches!(
-            submission.completion,
-            CompletionDisposition::CompletedVisible { .. }
-        ) {
-            return Err(Error::SynchronousCompletionRequired);
+        match submission.completion {
+            CompletionDisposition::CompletedVisible { token: completed } => {
+                if token.as_ref() != Some(&completed) {
+                    return Err(Error::CompletionObservationMismatch);
+                }
+                let observed = provider_call(|| owner.provider.wait(completed, Duration::ZERO))?;
+                if observed != submission.completion {
+                    return Err(Error::CompletionObservationMismatch);
+                }
+                drop(guards);
+                apply_writebacks(&reservations, &submission.writebacks)?;
+                Ok(ExecutionOutcome::Completed(submission))
+            }
+            CompletionDisposition::Submitted { token: submitted } => {
+                if token.as_ref() != Some(&submitted) {
+                    return Err(Error::CompletionObservationMismatch);
+                }
+                drop(guards);
+                Ok(ExecutionOutcome::Pending(
+                    submission,
+                    PendingCompletion {
+                        token: submitted,
+                        trace,
+                        reservations,
+                    },
+                ))
+            }
+            _ => Err(Error::CompletionUnavailable(submission.completion)),
         }
-        let completed_token = token.ok_or(Error::SynchronousCompletionRequired)?;
-        let observed = provider_call(|| owner.provider.wait(completed_token, Duration::ZERO))?;
-        if observed != submission.completion {
-            return Err(Error::CompletionObservationMismatch);
-        }
-        let mut writes = Vec::with_capacity(submission.writebacks.len());
-        for write in &submission.writebacks {
-            let position = *positions
-                .get(&write.allocation_id)
-                .ok_or(ContractError::UnknownAllocation(write.allocation_id))?;
-            let offset = usize::try_from(write.offset)
-                .map_err(|_| ContractError::ArithmeticOverflow("writeback offset"))?;
-            let end = checked_range(offset, write.bytes.len(), guards[position].len())?;
-            writes.push((position, offset, end, &write.bytes));
-        }
-        // Every recoverable failure precedes the first copy.
-        for (position, offset, end, bytes) in writes {
-            guards[position][offset..end].copy_from_slice(bytes);
-        }
-        Ok(submission)
     }
 
     pub fn wait_until_completed(&self) -> Result<(), Error> {
-        let mut inner = lock(&self.shared.inner, "provider command")?;
-        loop {
-            match inner.status {
-                CommandBufferStatus::Recording => {
-                    return Err(ApiError::CommandBufferNotCommitted.into())
-                }
-                CommandBufferStatus::Completed => return Ok(()),
-                CommandBufferStatus::Failed => {
-                    return Err(inner
-                        .failure
-                        .clone()
-                        .unwrap_or(ApiError::CommandBufferNotCompleted.into()))
-                }
-                CommandBufferStatus::Committed => {
-                    inner = self
-                        .shared
-                        .completion
-                        .wait(inner)
-                        .map_err(|_| ApiError::StatePoisoned("provider command"))?;
+        let pending = {
+            let mut inner = lock(&self.shared.inner, "provider command")?;
+            loop {
+                match inner.status {
+                    CommandBufferStatus::Recording => {
+                        return Err(ApiError::CommandBufferNotCommitted.into())
+                    }
+                    CommandBufferStatus::Completed => return Ok(()),
+                    CommandBufferStatus::Failed => {
+                        return Err(inner
+                            .failure
+                            .clone()
+                            .unwrap_or(ApiError::CommandBufferNotCompleted.into()))
+                    }
+                    CommandBufferStatus::Committed => {
+                        if let Some(pending) = inner.pending.take() {
+                            break pending;
+                        }
+                        inner = self
+                            .shared
+                            .completion
+                            .wait(inner)
+                            .map_err(|_| ApiError::StatePoisoned("provider command"))?;
+                    }
                 }
             }
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| self.finalize(&pending)))
+            .unwrap_or(Err(Error::ProviderPanicked));
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        let result = match result {
+            Ok(submission) => {
+                inner.submission = Some(submission);
+                inner.status = CommandBufferStatus::Completed;
+                Ok(())
+            }
+            Err(error) => {
+                inner.status = CommandBufferStatus::Failed;
+                inner.failure = Some(error.clone());
+                Err(error)
+            }
+        };
+        self.shared.completion.notify_all();
+        result
+    }
+
+    /// Observe a pending token, validate readback against the exact submitted
+    /// trace and land every writeback before releasing reservations.
+    fn finalize(&self, pending: &PendingCompletion) -> Result<ProviderSubmission, Error> {
+        let owner = &self.shared.owner;
+        let mut timeout = Duration::from_millis(10);
+        loop {
+            let observed = provider_call(|| owner.provider.wait(pending.token, timeout))?;
+            match observed {
+                CompletionDisposition::CompletedVisible { token } if token == pending.token => {
+                    break
+                }
+                CompletionDisposition::TimedOut { token } if token == pending.token => {
+                    timeout = timeout.saturating_mul(2).min(Duration::from_millis(100));
+                }
+                CompletionDisposition::Failed { .. }
+                | CompletionDisposition::DeviceLost { .. }
+                | CompletionDisposition::SubmittedUnknown { .. } => {
+                    return Err(Error::CompletionUnavailable(observed))
+                }
+                _ => return Err(Error::CompletionObservationMismatch),
+            }
         }
+        let readback = provider_call(|| owner.provider.readback(pending.token))?;
+        readback.validate_for_trace(&pending.trace)?;
+        match readback.completion {
+            CompletionDisposition::CompletedVisible { token } if token == pending.token => {}
+            _ => return Err(Error::CompletionObservationMismatch),
+        }
+        apply_writebacks(&pending.reservations, &readback.writebacks)?;
+        Ok(ProviderSubmission {
+            completion: readback.completion,
+            writebacks: readback.writebacks,
+        })
     }
 
     pub fn submission(&self) -> Result<ProviderSubmission, Error> {

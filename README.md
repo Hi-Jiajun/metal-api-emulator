@@ -47,7 +47,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   provider, Vulkan object API and Rust Metal object API. The archived evidence
   contains 26 cases per path; this verifies the bounded object API on the
   reviewed fixtures, not general Metal conformance.
-- Open design work: asynchronous submission/readback, general native shader
+- Open design work: a real asynchronous provider implementation (the object
+  API and provider `readback` contract accept `Submitted`; the Vulkan and
+  native providers still complete inside `submit`), general native shader
   admission, CPU uploads during command-buffer execution, aliases and
   completion-driven live leases.
   Resource snapshots do not hold live guest pages.

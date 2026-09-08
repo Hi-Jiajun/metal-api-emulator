@@ -2,8 +2,10 @@
 //!
 //! This crate owns API ordering and object lifetimes. A backend owns shader
 //! translation and execution through [`ComputeExecutor`]. The first milestone
-//! is synchronous on commit, but keeps Metal's explicit commit/wait boundary so
-//! a later asynchronous executor does not need to change application code.
+//! is synchronous on commit. The provider object API keeps Metal's explicit
+//! commit/wait boundary and accepts a provider that returns `Submitted` plus a
+//! validated completion readback, so an asynchronous executor does not need to
+//! change application code.
 
 use std::any::Any;
 use std::collections::BTreeMap;

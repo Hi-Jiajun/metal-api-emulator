@@ -30,8 +30,11 @@ entry point. Both paths share Vulkan execution machinery and the queue lock.
    submissions keep their own artifact reference. Records otherwise remain until
    the provider is dropped. These calls do not release abandoned GPU work.
 
-The API supports synchronous commit only. `wait(timeout)` does not launch a
-second wait for this implementation; the returned token is already terminal.
+This provider supports synchronous commit only: `submit` returns
+`CompletedVisible` and `wait(timeout)` does not launch a second wait because
+the returned token is already terminal. The object API can accept a provider
+that returns `Submitted` and implements `readback`; this implementation does
+not.
 There is no end-to-end deadline on compilation, locks, initialization or submit.
 The existing 20-second fence timeout makes the executor unusable and reports
 unknown completion with retained resources. Live guest leases, multi-pass

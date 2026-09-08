@@ -1,9 +1,9 @@
 use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, BufferAccess, BufferBindingContract, BufferWriteback,
-    ComputeProvider, ComputeTrace, FootprintProof, FunctionIdentity, PipelineContract,
-    ProviderErrorClass, ProviderPhase, SemanticDigest, ShaderSource, StorageMode, SubmissionId,
-    ValidatedComputeTrace,
+    CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof, FunctionIdentity,
+    PipelineContract, ProviderErrorClass, ProviderPhase, SemanticDigest, ShaderSource, StorageMode,
+    SubmissionId, ValidatedComputeTrace,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -17,6 +17,27 @@ const MISSING_WRITE: usize = 6;
 const PANIC_WAIT: usize = 7;
 const BAD_METADATA: usize = 8;
 const PANIC_RELEASE: usize = 9;
+const ASYNC_GOOD: usize = 10;
+const ASYNC_TIMEOUT_THEN_GOOD: usize = 11;
+const ASYNC_FAILED: usize = 12;
+const ASYNC_UNKNOWN: usize = 13;
+const ASYNC_BAD_READBACK: usize = 14;
+const ASYNC_MISSING_READBACK: usize = 15;
+const ASYNC_DEVICE_LOST: usize = 16;
+
+const fn is_async_mode(mode: usize) -> bool {
+    matches!(
+        mode,
+        SUBMITTED
+            | ASYNC_GOOD
+            | ASYNC_TIMEOUT_THEN_GOOD
+            | ASYNC_FAILED
+            | ASYNC_UNKNOWN
+            | ASYNC_BAD_READBACK
+            | ASYNC_MISSING_READBACK
+            | ASYNC_DEVICE_LOST
+    )
+}
 
 struct FakeProvider {
     epoch: contract::DeviceEpoch,
@@ -27,6 +48,8 @@ struct FakeProvider {
     released_pipelines: AtomicUsize,
     released_completions: Mutex<Vec<CompletionToken>>,
     release_order: Mutex<Vec<&'static str>>,
+    readbacks: Mutex<BTreeMap<SubmissionId, CompletionReadback>>,
+    wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
@@ -41,6 +64,8 @@ impl FakeProvider {
             released_pipelines: AtomicUsize::new(0),
             released_completions: Mutex::new(Vec::new()),
             release_order: Mutex::new(Vec::new()),
+            readbacks: Mutex::new(BTreeMap::new()),
+            wait_calls: AtomicUsize::new(0),
             gate: None,
         }
     }
@@ -104,12 +129,6 @@ impl ComputeProvider for FakeProvider {
         if mode == PANIC_SUBMIT {
             panic!("synthetic submit panic");
         }
-        if mode == SUBMITTED {
-            return Ok(ProviderSubmission {
-                completion: CompletionDisposition::Submitted { token },
-                writebacks: vec![],
-            });
-        }
         let resources = trace.serial_resources().unwrap();
         let mut contents = resources
             .iter()
@@ -155,6 +174,26 @@ impl ComputeProvider for FakeProvider {
         if mode == MISSING_WRITE {
             writebacks.pop();
         }
+        if is_async_mode(mode) {
+            let mut readback_writebacks = writebacks.clone();
+            if mode == ASYNC_BAD_READBACK {
+                readback_writebacks.last_mut().unwrap().offset += 1;
+            }
+            if mode == ASYNC_MISSING_READBACK {
+                readback_writebacks.pop();
+            }
+            self.readbacks.lock().unwrap().insert(
+                token.submission_id,
+                CompletionReadback {
+                    completion: CompletionDisposition::CompletedVisible { token },
+                    writebacks: readback_writebacks,
+                },
+            );
+            return Ok(ProviderSubmission {
+                completion: CompletionDisposition::Submitted { token },
+                writebacks: vec![],
+            });
+        }
         Ok(ProviderSubmission {
             completion: CompletionDisposition::CompletedVisible { token },
             writebacks,
@@ -165,11 +204,42 @@ impl ComputeProvider for FakeProvider {
         token: CompletionToken,
         _timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
+        let call = self.wait_calls.fetch_add(1, Ordering::SeqCst) + 1;
         match self.mode.load(Ordering::SeqCst) {
             PANIC_WAIT => panic!("synthetic wait panic"),
             WRONG_WAIT => Ok(CompletionDisposition::TimedOut { token }),
+            ASYNC_FAILED => Ok(CompletionDisposition::Failed { token: Some(token) }),
+            ASYNC_UNKNOWN => Ok(CompletionDisposition::SubmittedUnknown { token: Some(token) }),
+            ASYNC_DEVICE_LOST => Ok(CompletionDisposition::DeviceLost { token: Some(token) }),
+            ASYNC_TIMEOUT_THEN_GOOD if call <= 2 => Ok(CompletionDisposition::TimedOut { token }),
             _ => Ok(CompletionDisposition::CompletedVisible { token }),
         }
+    }
+
+    fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
+        if self.mode.load(Ordering::SeqCst) == SUBMITTED {
+            return Err(ProviderError::new(
+                ProviderPhase::Wait,
+                ProviderErrorClass::Capability,
+                "completion_readback_unsupported",
+            )
+            .unwrap()
+            .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) }));
+        }
+        self.readbacks
+            .lock()
+            .unwrap()
+            .get(&token.submission_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderPhase::Wait,
+                    ProviderErrorClass::Resource,
+                    "unknown_completion",
+                )
+                .unwrap()
+                .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) })
+            })
     }
 }
 
@@ -233,6 +303,7 @@ impl PipelineProvider for FakeProvider {
         Ok(())
     }
     fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
+        self.readbacks.lock().unwrap().remove(&token.submission_id);
         self.released_completions.lock().unwrap().push(token);
         self.release_order.lock().unwrap().push("completion");
         if self.mode.load(Ordering::SeqCst) == PANIC_RELEASE {
@@ -579,7 +650,6 @@ fn pass_and_resource_limits_accept_boundaries_and_refuse_excess() {
 fn provider_failures_and_invalid_results_never_partially_land() {
     for mode in [
         BAD_LAST_WRITE,
-        SUBMITTED,
         FAIL,
         PANIC_SUBMIT,
         WRONG_WAIT,
@@ -597,7 +667,6 @@ fn provider_failures_and_invalid_results_never_partially_land() {
         assert_eq!(command.wait_until_completed(), Err(error.clone()));
         assert_eq!(command.submission(), Err(error.clone()));
         match mode {
-            SUBMITTED => assert_eq!(error, Error::SynchronousCompletionRequired),
             FAIL => assert!(
                 matches!(error, Error::Provider(error) if error.slug == "synthetic_failure")
             ),
@@ -614,6 +683,161 @@ fn provider_failures_and_invalid_results_never_partially_land() {
             usize::from(mode != PANIC_SUBMIT)
         );
     }
+}
+
+#[test]
+fn async_submission_finalizes_on_wait_and_lands_validated_readback() {
+    let (provider, device) = setup();
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:2");
+    let (a, av) = buffer(&device, 1);
+    let (b, bv) = buffer(&device, 2);
+    let command = command(&device, &pipeline, &[(0, &av), (1, &bv)]);
+    command.commit().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Committed);
+    assert!(matches!(
+        command.submission().unwrap().completion,
+        CompletionDisposition::Submitted { .. }
+    ));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = a.clone();
+    let handle = std::thread::spawn(move || sender.send(reader.read()).unwrap());
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(),
+        vec![1, 1, 2, 2, 2, 2, 1, 1]
+    );
+    handle.join().unwrap();
+    assert_eq!(b.read().unwrap(), vec![2, 2, 3, 3, 3, 3, 2, 2]);
+    let submission = command.submission().unwrap();
+    assert!(matches!(
+        submission.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ));
+    assert_eq!(submission.writebacks.len(), 2);
+    drop(command);
+    assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn async_wait_retries_nonterminal_timeouts_until_visible() {
+    let (provider, device) = setup();
+    provider
+        .mode
+        .store(ASYNC_TIMEOUT_THEN_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:1");
+    let (a, av) = buffer(&device, 1);
+    let command = command(&device, &pipeline, &[(0, &av)]);
+    command.commit().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Committed);
+    command.wait_until_completed().unwrap();
+    assert_eq!(provider.wait_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(a.read().unwrap(), vec![1, 1, 2, 2, 2, 2, 1, 1]);
+}
+
+#[test]
+fn async_terminal_failures_and_unknown_completion_never_land() {
+    for mode in [ASYNC_FAILED, ASYNC_UNKNOWN, ASYNC_DEVICE_LOST] {
+        let (provider, device) = setup();
+        provider.mode.store(mode, Ordering::SeqCst);
+        let pipeline = pipeline(&device, "wide:1");
+        let (a, av) = buffer(&device, 1);
+        let command = command(&device, &pipeline, &[(0, &av)]);
+        command.commit().unwrap();
+        let error = command.wait_until_completed().unwrap_err();
+        assert!(
+            matches!(error, Error::CompletionUnavailable(_)),
+            "mode={mode}"
+        );
+        assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+        assert_eq!(a.read().unwrap(), vec![1; 8], "mode={mode}");
+        assert!(matches!(
+            command.submission().unwrap().completion,
+            CompletionDisposition::Submitted { .. }
+        ));
+        drop(command);
+        assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn async_readback_contract_failures_never_partially_land() {
+    for mode in [ASYNC_BAD_READBACK, ASYNC_MISSING_READBACK] {
+        let (provider, device) = setup();
+        provider.mode.store(mode, Ordering::SeqCst);
+        let pipeline = pipeline(&device, "wide:2");
+        let (a, av) = buffer(&device, 1);
+        let (b, bv) = buffer(&device, 2);
+        let command = command(&device, &pipeline, &[(0, &av), (1, &bv)]);
+        command.commit().unwrap();
+        let error = command.wait_until_completed().unwrap_err();
+        assert!(matches!(error, Error::Contract(_)), "mode={mode}");
+        assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+        assert_eq!(a.read().unwrap(), vec![1; 8], "mode={mode}");
+        assert_eq!(b.read().unwrap(), vec![2; 8], "mode={mode}");
+        drop(command);
+        assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn async_provider_without_readback_support_fails_at_wait() {
+    let (provider, device) = setup();
+    provider.mode.store(SUBMITTED, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:1");
+    let (a, av) = buffer(&device, 1);
+    let command = command(&device, &pipeline, &[(0, &av)]);
+    command.commit().unwrap();
+    let error = command.wait_until_completed().unwrap_err();
+    assert!(
+        matches!(&error, Error::Provider(error) if error.slug == "completion_readback_unsupported")
+    );
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+    assert_eq!(a.read().unwrap(), vec![1; 8]);
+    drop(command);
+    assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn dropping_pending_command_releases_reservations_and_completion_record() {
+    let (provider, device) = setup();
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:1");
+    let (a, av) = buffer(&device, 1);
+    let command = command(&device, &pipeline, &[(0, &av)]);
+    command.commit().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Committed);
+    drop(command);
+    assert_eq!(provider.released_completions.lock().unwrap().len(), 1);
+    assert_eq!(a.read().unwrap(), vec![1; 8]);
+    a.write(0, &[9]).unwrap();
+    assert_eq!(a.read().unwrap()[0], 9);
+}
+
+#[test]
+fn concurrent_async_commands_serialize_on_overlapping_reservations() {
+    let (provider, device) = setup();
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "wide:2");
+    let (a, av) = buffer(&device, 1);
+    let (b, bv) = buffer(&device, 2);
+    let first = command(&device, &pipeline, &[(0, &av), (1, &bv)]);
+    let second = command(&device, &pipeline, &[(0, &bv), (1, &av)]);
+    first.commit().unwrap();
+    let second = std::thread::spawn(move || {
+        second.commit().unwrap();
+        second
+    });
+    first.wait_until_completed().unwrap();
+    let second = second.join().unwrap();
+    second.wait_until_completed().unwrap();
+    assert_eq!(a.read().unwrap(), vec![1, 1, 3, 3, 3, 3, 1, 1]);
+    assert_eq!(b.read().unwrap(), vec![2, 2, 4, 4, 4, 4, 2, 2]);
 }
 
 #[test]
