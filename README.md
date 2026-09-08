@@ -33,11 +33,12 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   artifact, and returns checked allocation-relative writebacks.
 - Completion: both providers default to synchronous `submit`/`wait`. With
   `with_async_execution(true)`, `submit` returns `Submitted` and
-  `wait`/`readback` retrieve the final writebacks: Vulkan runs the owned-byte
-  request on one worker under the shared queue lock, while native Metal
-  registers an `MTLCommandBuffer` completion handler that retains the command
-  resources until readback. A 20-second observation deadline reports unknown
-  completion and makes the provider unusable for new work.
+  `wait`/`readback` retrieve the final writebacks: Vulkan records and submits
+  the owned-byte request on the calling thread under the shared queue lock and
+  waits on the completion fence in `wait`, while native Metal registers an
+  `MTLCommandBuffer` completion handler that retains the command resources
+  until readback. A 20-second observation deadline reports unknown completion
+  and makes the provider unusable for new work.
 - Shared provider API: compilation, pipeline metadata and release now use
   `PipelineProvider`. The Rust native Metal backend accepts six exact
   reviewed MSL fixtures and shares the optional deferred completion mode.
@@ -53,8 +54,7 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   contains 26 cases per path; this verifies the bounded object API on the
   reviewed fixtures, not general Metal conformance.
 - Open design work: cancellation and an explicit deadline contract,
-  completion-driven lease release, device-side Vulkan fence/event completion
-  without a per-submission worker, general native shader admission, CPU
+  completion-driven lease release, general native shader admission, CPU
   uploads during command-buffer execution and aliases.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,

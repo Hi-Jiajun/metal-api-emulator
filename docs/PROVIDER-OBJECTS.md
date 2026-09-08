@@ -12,10 +12,10 @@ Submission is split at Metal's commit/wait boundary. A provider that finishes
 inside `submit` completes at commit; a provider that returns `Submitted` leaves
 the command pending until `wait_until_completed` observes completion, retrieves
 `readback` and lands validated writebacks. Both backends support the deferred
-path: Vulkan uses a worker under its shared queue lock, and native Metal
-registers an `MTLCommandBuffer` completion handler. This increment does not
-add general shader support, guest memory, rendering or production reims
-routing.
+path: Vulkan records and submits under its shared queue lock and observes a
+device fence in `wait`, while native Metal registers an `MTLCommandBuffer`
+completion handler. This increment does not add general shader support, guest
+memory, rendering or production reims routing.
 
 ## Recording and execution
 
@@ -132,8 +132,9 @@ stand in for object captures.
   and must satisfy the same full writeback and allocation checks as trace
   captures. Synthetic reports are comparator tests only.
 - `VulkanComputeProvider::with_async_execution(true)` returns `Submitted`,
-  runs the prepared owned-byte request on one worker under the shared queue
-  lock, and serves `wait`/`readback` from the shared completion record.
+  records and submits the prepared owned-byte request under the shared queue
+  lock, and serves the device-fence wait and `readback` from the shared
+  completion record without a per-submission worker.
   `NativeMetalProvider::with_async_execution(true)` returns `Submitted` after
   commit and fills the same record type from an `MTLCommandBuffer` completion
   handler; a 20-second observation deadline reports unknown completion and

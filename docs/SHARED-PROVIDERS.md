@@ -116,8 +116,8 @@ selected pipeline. Later first use is supported; repeated view identities
 retain their original allocation, range and initial bytes. The complete union
 is validated and uploaded before encoding. Readback covers every view written
 by any pass. Both providers offer an optional async mode: Vulkan defers
-completion to a worker under the shared queue lock, while native Metal uses an
-`MTLCommandBuffer` completion handler. Both still serialize device execution;
+completion to a device fence observed by `wait`, while native Metal uses an
+`MTLCommandBuffer` completion handler. Both still serialize submission;
 concurrent GPU execution, mid-execution CPU uploads and general aliasing remain
 outside this provider subset. V1-v7 passed
 [three-way native/Vulkan CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34010989175).

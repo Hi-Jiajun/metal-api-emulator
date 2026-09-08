@@ -30,25 +30,28 @@ uses the same wait/readback semantics.
    `CompletedVisible` and canonical writebacks sorted by
    `(allocation_id, view_id)`. Offsets are allocation-relative; only writable
    views are returned, each exactly once at its complete declared size.
-6. In async mode, `submit` returns `Submitted` after preparing the owned-byte
-   request and starting one worker under the shared queue lock. `wait` observes
-   completion with its caller-supplied timeout; `readback` returns the same
-   canonical writebacks after completion. `release_completion` drops the
-   observation without cancelling a running worker; the worker retains its GPU
-   resources until execution finishes. `release_pipeline` removes a registry
-   entry. In-progress submissions keep their own artifact reference. These calls
-   do not release abandoned GPU work.
+6. In async mode, `submit` records and submits the owned-byte request on the
+   calling thread under the shared queue lock and returns `Submitted` without
+   waiting. `wait` waits on the device completion fence with its
+   caller-supplied timeout and then performs readback; `readback` returns the
+   same canonical writebacks after completion. A 20-second observation
+   deadline reports `vulkan-completion-unknown` with `SubmittedUnknown` and
+   makes the executor unusable. `release_completion` hands a still-pending
+   submission to a shared retirement thread that waits for the fence and
+   releases its handles. `release_pipeline` removes a registry entry.
+   In-progress submissions keep their own artifact reference. These calls do
+   not release abandoned GPU work.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
 `provider-capture --api objects --async`; CI runs v1-v7 this way on Lavapipe.
-The worker still serializes device execution with the same queue lock, so async
-mode overlaps host work and record observation rather than concurrent GPU
-execution. There is no end-to-end deadline on compilation, locks, initialization
-or submit.
-The existing 20-second fence timeout makes the executor unusable and reports
-unknown completion with retained resources. Live guest leases, multi-pass
-ordering, general MTLB resolution and native Metal remain unimplemented.
+Async mode still serializes submission with the same queue lock, so it overlaps
+host work and completion observation rather than concurrent GPU execution.
+There is no end-to-end deadline on compilation, locks, initialization or
+submit. A 20-second fence timeout or caller deadline makes the executor
+unusable and reports unknown completion with retained resources. Live guest
+leases, multi-pass ordering, general MTLB resolution and native Metal remain
+unimplemented.
 
 ## Execution failures and visibility
 
@@ -91,6 +94,13 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 Vulkan device-fence increment: 145 Rust tests passed (core 90,
+  native 7, Vulkan 34, capture 14) and 113 Python tests passed. Async submit
+  records and submits on the calling thread, and `wait` observes the device
+  completion fence without a per-submission worker. Linux/Lavapipe ran v1-v7
+  direct, object and async-object captures (26 cases per rail) with unchanged
+  host-visible writebacks. Formatting, Clippy with `-D warnings` and rustdoc
+  passed.
 - 2026-09-08 native async increment: 145 Rust tests passed (core 90, native 7,
   Vulkan 34, capture 14) and 113 Python tests passed. The shared completion
   record moved to `metal_api_core::completion` with four tests; the native

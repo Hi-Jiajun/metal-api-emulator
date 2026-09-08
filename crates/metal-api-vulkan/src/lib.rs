@@ -499,52 +499,109 @@ fn execute_submission_stages(
     buffers: &[BufferBinding],
     dispatches: &[BoundDispatch],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let translated = artifacts
-        .iter()
-        .map(|artifact| &artifact.translated)
-        .collect::<Vec<_>>();
-    let planned =
-        plan_pipeline_sequence(&translated, buffers, &context.properties.limits, dispatches)?;
-    let plans = &planned.plans;
-    if plans.iter().all(|plan| plan.regions.is_empty()) {
-        return Ok(Vec::new());
+    let mut pending = PendingExecution::submit(context, artifacts, buffers, dispatches)?;
+    if !pending.wait(FENCE_TIMEOUT_NS)? {
+        context.poisoned.store(true, Ordering::Release);
+        return Err(ExecutionFailure::vulkan(
+            vk::Result::TIMEOUT,
+            "compute completion timed out after 20 seconds",
+        )
+        .into_provider(
+            ProviderPhase::Wait,
+            ProviderErrorClass::Execute,
+            "vulkan-wait",
+            CompletionDisposition::SubmittedUnknown { token: None },
+        ));
     }
-    let mut resources = ExecutionResources::new(Arc::clone(context));
-    resources
-        .create_pipeline_objects(&translated, plans)
-        .map_err(|error| {
+    pending.read_updates()
+}
+
+/// A recorded and queue-submitted sequence whose completion fence is pending.
+///
+/// `submit` performs planning, resource creation, recording and `queue_submit`;
+/// the caller must hold the executor's execution lock. `wait` observes the
+/// device fence and may run on any thread without that lock, so an asynchronous
+/// provider no longer needs a worker per submission. Dropping a still-pending
+/// value poisons the context and retains every in-flight handle until process
+/// exit, matching `ExecutionResources`' unknown-retirement policy.
+pub(crate) struct PendingExecution {
+    resources: ExecutionResources,
+    writable_pool_keys: BTreeSet<u32>,
+}
+
+impl PendingExecution {
+    pub(crate) fn submit(
+        context: &Arc<VulkanContext>,
+        artifacts: &[Arc<VulkanPipelineArtifact>],
+        buffers: &[BufferBinding],
+        dispatches: &[BoundDispatch],
+    ) -> Result<Self, ProviderError> {
+        let translated = artifacts
+            .iter()
+            .map(|artifact| &artifact.translated)
+            .collect::<Vec<_>>();
+        let planned =
+            plan_pipeline_sequence(&translated, buffers, &context.properties.limits, dispatches)?;
+        let plans = &planned.plans;
+        if plans.iter().all(|plan| plan.regions.is_empty()) {
+            return Ok(Self {
+                resources: ExecutionResources::new(Arc::clone(context)),
+                writable_pool_keys: BTreeSet::new(),
+            });
+        }
+        let mut resources = ExecutionResources::new(Arc::clone(context));
+        resources
+            .create_pipeline_objects(&translated, plans)
+            .map_err(|error| {
+                error.into_provider(
+                    ProviderPhase::Compile,
+                    ProviderErrorClass::Compile,
+                    "vulkan-pipeline-create",
+                    CompletionDisposition::NotSubmitted,
+                )
+            })?;
+        let encode_error = |error: ExecutionFailure| {
             error.into_provider(
-                ProviderPhase::Compile,
-                ProviderErrorClass::Compile,
-                "vulkan-pipeline-create",
+                ProviderPhase::Encode,
+                ProviderErrorClass::Resource,
+                "vulkan-encode",
                 CompletionDisposition::NotSubmitted,
             )
-        })?;
-    let encode_error = |error: ExecutionFailure| {
-        error.into_provider(
-            ProviderPhase::Encode,
-            ProviderErrorClass::Resource,
-            "vulkan-encode",
-            CompletionDisposition::NotSubmitted,
-        )
-    };
-    resources.create_buffers(buffers).map_err(encode_error)?;
-    resources
-        .create_descriptors(&translated, dispatches)
-        .map_err(encode_error)?;
-    resources.record(&translated, plans).map_err(encode_error)?;
-    match resources.submit_and_wait() {
-        Ok(()) => {}
-        Err(error) => {
+        };
+        resources.create_buffers(buffers).map_err(encode_error)?;
+        resources
+            .create_descriptors(&translated, dispatches)
+            .map_err(encode_error)?;
+        resources.record(&translated, plans).map_err(encode_error)?;
+        if let Err(error) = resources.submit() {
             if error.is_pending() {
                 context.abandon(resources);
             }
             return Err(error.into_provider());
         }
+        Ok(Self {
+            resources,
+            writable_pool_keys: planned.writable_pool_keys,
+        })
     }
-    resources
-        .read_updates(&planned.writable_pool_keys)
-        .map_err(ExecutionFailure::into_readback_provider)
+
+    /// Wait for the completion fence. `Ok(true)` means the queue retired the
+    /// work; `Ok(false)` means the timeout elapsed and the caller may retry.
+    pub(crate) fn wait(&mut self, timeout_ns: u64) -> Result<bool, ProviderError> {
+        if !self.resources.submitted {
+            self.resources.completed = true;
+            return Ok(true);
+        }
+        self.resources
+            .wait(timeout_ns)
+            .map_err(SubmissionFailure::into_provider)
+    }
+
+    pub(crate) fn read_updates(&self) -> Result<Vec<BufferUpdate>, ProviderError> {
+        self.resources
+            .read_updates(&self.writable_pool_keys)
+            .map_err(ExecutionFailure::into_readback_provider)
+    }
 }
 
 fn dispatch_args_error(error: ExecutorError) -> ProviderError {
@@ -1738,7 +1795,7 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn submit_and_wait(&mut self) -> Result<(), SubmissionFailure> {
+    fn submit(&mut self) -> Result<(), SubmissionFailure> {
         self.fence = unsafe {
             self.context
                 .device
@@ -1764,26 +1821,29 @@ impl ExecutionResources {
             return Err(failure);
         }
         self.submitted = true;
+        Ok(())
+    }
+
+    fn wait(&mut self, timeout_ns: u64) -> Result<bool, SubmissionFailure> {
         let wait = unsafe {
             self.context
                 .device
-                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+                .wait_for_fences(&[self.fence], true, timeout_ns)
         };
         match wait {
             Ok(()) => {
                 self.completed = true;
-                Ok(())
+                Ok(true)
             }
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
             Err(error) => {
                 self.context.poisoned.store(true, Ordering::Release);
-                let message = if error == vk::Result::TIMEOUT {
-                    "compute completion timed out after 20 seconds".to_string()
-                } else {
-                    format!("wait for compute completion failed: {error}")
-                };
                 Err(SubmissionFailure::Pending {
                     phase: ProviderPhase::Wait,
-                    error: ExecutionFailure::vulkan(error, message),
+                    error: ExecutionFailure::vulkan(
+                        error,
+                        format!("wait for compute completion failed: {error}"),
+                    ),
                 })
             }
         }
