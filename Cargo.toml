@@ -19,6 +19,7 @@ repository = "https://github.com/Hi-Jiajun/metal-api-emulator"
 
 [workspace.dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
+libc = "0.2"
 metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "43c46ac8a24adf1a6e872b8a52c706ec9614fad0" }
 spirv = "0.4"
 

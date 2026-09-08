@@ -9,6 +9,7 @@ license.workspace = true
 description = "Length-prefixed transport for the neutral provider completion stream"
 
 [dependencies]
+libc = { workspace = true }
 metal-api-core = { path = "../metal-api-core" }
 
 [dev-dependencies]

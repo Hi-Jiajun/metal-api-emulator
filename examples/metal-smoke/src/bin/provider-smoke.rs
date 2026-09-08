@@ -14,6 +14,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             metal_smoke::run_completion_child(&socket)
         }
+        Some(flag) if flag == "--borrowed-shared-child" => {
+            let socket = args
+                .next()
+                .ok_or("usage: provider-smoke --borrowed-shared-child <socket>")?;
+            if args.next().is_some() {
+                return Err("usage: provider-smoke --borrowed-shared-child <socket>".into());
+            }
+            metal_smoke::run_borrowed_shared_child(&socket)
+        }
         Some(other) => Err(format!("usage: provider-smoke (unknown argument {:?})", other).into()),
     }
 }

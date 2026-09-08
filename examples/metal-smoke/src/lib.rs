@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 mod provider_suite;
 
-pub use provider_suite::{run_completion_child, run_provider_suite};
+pub use provider_suite::{run_borrowed_shared_child, run_completion_child, run_provider_suite};
 
 pub fn run_suite(
     label: &'static str,

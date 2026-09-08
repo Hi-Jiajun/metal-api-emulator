@@ -19,13 +19,21 @@ use metal_api_core::provider::{
 use metal_api_core::{Device, Library};
 use metal_api_ipc::receiver::CompletionReceiver;
 use metal_api_ipc::sender::spawn_writer;
-use metal_api_ipc::unix;
+use metal_api_ipc::{shared, unix};
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+const BORROWED_SHARED_LEASE_ID: u64 = 99;
+const BORROWED_SHARED_ALLOCATION_ID: u64 = 298;
+const BORROWED_SHARED_LENGTH: u64 = 64;
+const BORROWED_SHARED_SIZE: usize = 4096;
+const BORROWED_SHARED_OWNER_WORD: u32 = 0xaaaa_aaaa;
+const BORROWED_SHARED_GPU_WORD: u32 = 0x1234_5678;
 
 #[derive(Default)]
 struct RecordingSink {
@@ -74,6 +82,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_cancellation(Arc::clone(&executor))?;
     run_completion_ipc(Arc::clone(&executor))?;
     run_completion_ipc_process()?;
+    run_borrowed_shared_process()?;
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
@@ -582,6 +591,309 @@ fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_completion_ipc_process owner=parent provider=child transport=unix outbox=Submitted,CompletedVisible lease=retired"
+    );
+    Ok(())
+}
+
+/// Provider half of the two-process borrowed no-copy test.
+///
+/// The child receives an owner mapping over `SCM_RIGHTS`, imports the same
+/// physical pages as a borrowed lease and submits one read and one write
+/// through them. The owner proves the write landed in its own mapping without
+/// any writeback copy.
+pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    let stream = UnixStream::connect(socket)?;
+    let descriptor = shared::recv_fd(&stream)?;
+    let mapping = shared::SharedMemory::from_owned_fd(descriptor)?;
+    let transport = unix::from_stream(stream)?;
+
+    let executor = VulkanExecutor::new()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err(
+            "borrowed shared child: provider does not advertise VK_EXT_external_memory_host".into(),
+        );
+    }
+    if !provider
+        .capabilities()
+        .storage_modes
+        .contains(&StorageMode::BorrowedNoCopy)
+    {
+        return Err("borrowed shared child: provider does not advertise BorrowedNoCopy".into());
+    }
+    if !(mapping.as_ptr() as usize).is_multiple_of(alignment as usize) {
+        return Err(format!(
+            "borrowed shared child: mapping {:p} is not aligned to {alignment}",
+            mapping.as_ptr()
+        )
+        .into());
+    }
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    // SAFETY: `mapping` outlives the import and stays mapped until the lease
+    // is released below.
+    unsafe {
+        provider
+            .import_borrowed_lease(BorrowedLease::new(reservation, mapping.as_ptr() as usize)?)
+            .map_err(provider_error)?;
+    }
+
+    let (sender, writer) = spawn_writer(transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"borrowed_shared".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let read_trace = borrowed_lease_trace(
+        &provider,
+        &pipeline,
+        lease_id,
+        BufferAccess::Read,
+        BufferSource::OwnedBytes(vec![0; 4]),
+        497,
+        498,
+    );
+    let read_resources = borrowed_lease_resources(&provider, reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(read_trace.clone(), read_resources)
+        .map_err(provider_error)?;
+    let read_result = provider.submit(admitted).map_err(provider_error)?;
+    read_result.validate_for_trace(&read_trace)?;
+    let read_token = read_result
+        .completion
+        .token()
+        .ok_or("borrowed shared read has no token")?;
+
+    let write_trace = borrowed_lease_trace(
+        &provider,
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        499,
+        500,
+    );
+    let write_resources = borrowed_lease_resources(&provider, reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources)
+        .map_err(provider_error)?;
+    let write_result = provider.submit(admitted).map_err(provider_error)?;
+    write_result.validate_for_trace(&write_trace)?;
+    let write_token = write_result
+        .completion
+        .token()
+        .ok_or("borrowed shared write has no token")?;
+
+    for token in [read_token, write_token] {
+        println!(
+            "handshake epoch={} submission={}",
+            token.device_epoch.get(),
+            token.submission_id.get()
+        );
+    }
+    std::io::stdout().flush()?;
+
+    let observed = provider
+        .wait(read_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token: read_token }) {
+        return Err(format!("borrowed shared read did not complete: {observed:?}").into());
+    }
+    check_writeback(
+        &read_trace,
+        &read_result,
+        1,
+        &BORROWED_SHARED_OWNER_WORD.to_le_bytes(),
+    )?;
+
+    let observed = provider
+        .wait(write_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token: write_token }) {
+        return Err(format!("borrowed shared write did not complete: {observed:?}").into());
+    }
+    check_writeback(
+        &write_trace,
+        &write_result,
+        1,
+        &BORROWED_SHARED_GPU_WORD.to_le_bytes(),
+    )?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "borrowed shared child mapping did not observe the GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    for token in [read_token, write_token] {
+        ledger.bind(lease_id, token)?;
+        if ledger.observe(token, CompletionDisposition::CompletedVisible { token })?
+            != LeaseObservation::Retired
+        {
+            return Err("borrowed shared completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed shared lease was not release-ready".into());
+    }
+    provider
+        .release_completion(read_token)
+        .map_err(provider_error)?;
+    provider
+        .release_completion(write_token)
+        .map_err(provider_error)?;
+    provider
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "borrowed shared child writer panicked")??;
+    println!(
+        "PASS borrowed_shared_child lease={BORROWED_SHARED_LEASE_ID} copy_in=owner_visible copy_out=in_place retired=true"
+    );
+    Ok(())
+}
+
+/// Owner half of the two-process borrowed no-copy test.
+///
+/// The parent keeps no Vulkan provider. It creates the mapping, passes the
+/// descriptor with `SCM_RIGHTS`, mirrors the completion stream and then reads
+/// its own pages to prove the child's GPU write happened in place.
+fn run_borrowed_shared_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "metal-smoke-borrowed-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let listener = unix::UnixListenerTransport::bind(&path)?;
+    let mut mapping = shared::SharedMemory::create(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    mapping.as_mut_slice()[..4].copy_from_slice(&BORROWED_SHARED_OWNER_WORD.to_le_bytes());
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--borrowed-shared-child")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("borrowed shared child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let transport = listener.accept()?;
+    transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    shared::send_fd(transport.writer(), mapping.descriptor())?;
+
+    let mut device_epoch = None;
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let line = lines
+            .next()
+            .ok_or("borrowed shared child exited before its handshake")??;
+        let (epoch, token) = parse_handshake(&line)?;
+        match device_epoch {
+            None => device_epoch = Some(epoch),
+            Some(expected) if expected != epoch => {
+                return Err("borrowed shared child changed its device epoch".into())
+            }
+            Some(_) => {}
+        }
+        tokens.push(token);
+    }
+    let device_epoch = device_epoch.ok_or("borrowed shared child produced no handshake")?;
+
+    let mut receiver = CompletionReceiver::new(transport, device_epoch)?;
+    for _ in 0..4 {
+        if receiver.recv()? != MirrorOutcome::Applied {
+            return Err("borrowed shared receiver did not apply a completion frame".into());
+        }
+    }
+    if receiver.applied() != 4 || receiver.ignored() != 0 {
+        return Err(format!(
+            "borrowed shared mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: device_epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    })?;
+    for token in &tokens {
+        ledger.bind(lease_id, *token)?;
+        if receiver.observe_into(&mut ledger, *token)? != LeaseObservation::Retired {
+            return Err("borrowed shared completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed shared lease was not release-ready".into());
+    }
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err(format!("borrowed shared child exited with {status}").into());
+    }
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "owner mapping did not observe the child GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("owner mapping guards changed".into());
+    }
+    println!(
+        "PASS provider_borrowed_shared_process owner=parent provider=child transport=scm_rights copy_in=owner_visible copy_out=in_place retired=true"
     );
     Ok(())
 }
