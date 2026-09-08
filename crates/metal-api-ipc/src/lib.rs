@@ -25,6 +25,8 @@
 //! pages instead of receiving a copy.
 
 pub mod codec;
+pub mod command;
+pub mod command_codec;
 pub mod receiver;
 pub mod sender;
 pub mod transport;

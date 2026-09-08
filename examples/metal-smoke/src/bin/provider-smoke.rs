@@ -23,6 +23,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             metal_smoke::run_borrowed_shared_child(&socket)
         }
+        Some(flag) if flag == "--command-child" => {
+            let command_socket = args.next().ok_or(
+                "usage: provider-smoke --command-child <command-socket> <completion-socket>",
+            )?;
+            let completion_socket = args.next().ok_or(
+                "usage: provider-smoke --command-child <command-socket> <completion-socket>",
+            )?;
+            if args.next().is_some() {
+                return Err(
+                    "usage: provider-smoke --command-child <command-socket> <completion-socket>"
+                        .into(),
+                );
+            }
+            metal_smoke::run_provider_command_child(&command_socket, &completion_socket)
+        }
         Some(other) => Err(format!("usage: provider-smoke (unknown argument {:?})", other).into()),
     }
 }

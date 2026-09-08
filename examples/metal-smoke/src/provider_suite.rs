@@ -17,6 +17,7 @@ use metal_api_core::provider::{
     StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
+use metal_api_ipc::command::{serve_provider, unix as command_unix, RemoteProvider};
 use metal_api_ipc::receiver::CompletionReceiver;
 use metal_api_ipc::sender::spawn_writer;
 use metal_api_ipc::{shared, unix};
@@ -82,6 +83,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_cancellation(Arc::clone(&executor))?;
     run_completion_ipc(Arc::clone(&executor))?;
     run_completion_ipc_process()?;
+    run_remote_provider_process()?;
     run_borrowed_shared_process()?;
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
@@ -514,6 +516,37 @@ pub fn run_completion_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+/// Provider half of the owner-command test.
+///
+/// The child owns the Vulkan device, serves owner commands on the command
+/// socket and publishes admission and terminal notifications on the
+/// completion socket. It never submits work on its own: every compile,
+/// submit, wait and readback below is initiated by the owner process.
+pub fn run_provider_command_child(
+    command_socket: &std::ffi::OsStr,
+    completion_socket: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let epoch = provider.device_epoch();
+    let completion_transport = unix::connect(completion_socket)?;
+    let (sender, writer) = spawn_writer(completion_transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(epoch, Arc::new(sender))?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut transport = command_unix::connect(command_socket)?;
+    serve_provider(&provider, &mut transport)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "provider command writer panicked")??;
+    println!("PASS command_child epoch={} served=true", epoch.get());
+    Ok(())
+}
+
 /// Owner half of the two-process completion test.
 ///
 /// The parent process owns no provider in this case: it listens on a Unix
@@ -591,6 +624,137 @@ fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_completion_ipc_process owner=parent provider=child transport=unix outbox=Submitted,CompletedVisible lease=retired"
+    );
+    Ok(())
+}
+
+/// Owner half of the owner-command test.
+///
+/// The parent owns no provider. It compiles a reviewed shader on the provider
+/// child through the command channel, builds and submits the trace itself,
+/// mirrors the provider's completion stream on a second connection, and reads
+/// the result back over the command channel. The child never submits on its
+/// own, so this proves the owner can remotely drive a provider.
+fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let command_path = std::env::temp_dir().join(format!(
+        "metal-smoke-command-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let completion_path = std::env::temp_dir().join(format!(
+        "metal-smoke-command-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let command_listener = command_unix::UnixListenerCommandTransport::bind(&command_path)?;
+    let completion_listener = unix::UnixListenerTransport::bind(&completion_path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--command-child")
+        .arg(&command_path)
+        .arg(&completion_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("provider command child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let completion_transport = completion_listener.accept()?;
+    completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    let epoch = remote.device_epoch();
+    let mut receiver = CompletionReceiver::new(completion_transport, epoch)?;
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"remote_provider_command".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let pipeline = remote.compile(compile).map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        501,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("remote command submission has no token")?;
+    if !matches!(
+        submitted.completion,
+        CompletionDisposition::Submitted { .. }
+    ) {
+        return Err(format!(
+            "remote provider did not acknowledge submission: {:?}",
+            submitted.completion
+        )
+        .into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply admission".into());
+    }
+    let observed = remote
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("remote provider did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply completion".into());
+    }
+    if receiver.applied() != 2 || receiver.ignored() != 0 {
+        return Err(format!(
+            "remote command mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+    let readback = remote.readback(token).map_err(provider_error)?;
+    let result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    result.validate_for_trace(&trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    remote.release_completion(token).map_err(provider_error)?;
+    remote.release_pipeline(&pipeline).map_err(provider_error)?;
+    drop(remote);
+
+    let status = child.wait()?;
+    for line in &mut lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&command_path);
+    let _ = std::fs::remove_file(&completion_path);
+    if !status.success() {
+        return Err(format!("provider command child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_command_process owner=parent provider=child transport=unix commands=compile,submit,wait,readback completion=mirrored writeback=exact"
     );
     Ok(())
 }

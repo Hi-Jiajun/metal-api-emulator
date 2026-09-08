@@ -720,6 +720,16 @@ impl ResourceTableSnapshot {
         self.leases.get(&lease_id).copied()
     }
 
+    /// Iterate allocation records in identity order.
+    pub fn allocations(&self) -> impl Iterator<Item = AllocationRecord> + '_ {
+        self.allocations.values().copied()
+    }
+
+    /// Iterate lease reservations in identity order.
+    pub fn leases(&self) -> impl Iterator<Item = LeaseReservation> + '_ {
+        self.leases.values().copied()
+    }
+
     pub fn validate_trace(&self, trace: &ComputeTrace) -> Result<(), ContractError> {
         trace.validate()?;
         let mut views =

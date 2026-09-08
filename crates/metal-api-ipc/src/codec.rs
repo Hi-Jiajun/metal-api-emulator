@@ -61,6 +61,7 @@ pub enum CodecError {
     TrailingPayload { extra: usize },
     UnknownMessageTag(u8),
     UnknownUpdateTag(u8),
+    UnknownCommandTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
@@ -96,6 +97,9 @@ impl fmt::Display for CodecError {
             }
             Self::UnknownUpdateTag(tag) => {
                 write!(formatter, "unknown completion update tag {tag:#04x}")
+            }
+            Self::UnknownCommandTag(tag) => {
+                write!(formatter, "unknown command frame tag {tag:#04x}")
             }
             Self::UnknownEnumValue { field, value } => {
                 write!(formatter, "unknown {field} value {value}")
