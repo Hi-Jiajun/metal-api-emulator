@@ -54,7 +54,8 @@ if ($CaptureMatrix) {
         throw "provider-capture.exe is missing next to the runner: $captureRunner"
     }
     $suiteDir = Join-Path $PSScriptRoot 'conformance'
-    $outputDir = Join-Path $PSScriptRoot 'target\windows-captures'
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $outputDir = Join-Path $PSScriptRoot "target\windows-captures\$stamp"
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     foreach ($version in 1..8) {
         $suite = if ($version -eq 1) { 'suite.json' } else { "suite-v$version.json" }
