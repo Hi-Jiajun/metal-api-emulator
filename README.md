@@ -185,9 +185,14 @@ nonzero view offsets, immutable pipeline metadata, owner epochs, completion
 tokens and explicit registry release, plus the asynchronous completion path:
 an outbox stream, a Unix-socket completion hop and a two-process owner/provider
 case where the child owns the Vulkan device and the parent retires a lease from
-the mirrored terminal alone. It also imports an owner-issued staged lease,
-executes a view from the copied window and retires the lease through the owner
-ledger, then imports an aligned owner mapping without copying
+the mirrored terminal alone. The same two processes also exercise the
+owner-to-provider `MCC1` request/response channel: the parent compiles,
+submits, waits, reads back and releases on the child, imports a staged lease,
+and passes a shared mapping descriptor with `SCM_RIGHTS` so the child imports
+the same pages as a `BorrowedNoCopy` lease and writes through them in place. It
+also imports an owner-issued staged lease, executes a view from the copied
+window and retires the lease through the owner ledger, then imports an aligned
+owner mapping without copying
 (`VK_EXT_external_memory_host`) and proves live reads and in-place GPU writes
 before release. This is a provider/legacy Vulkan comparison, not a native Metal
 oracle.

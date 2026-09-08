@@ -122,15 +122,29 @@ zero-deadline reclamation, explicit cancellation with a recorded outbox stream,
 single-process completion over a Unix socket, a staged lease import where the
 owner supplies the reservation window and the provider executes and retires it,
 a no-copy host-memory import that proves live reads and in-place GPU writes,
-and a two-process owner/provider completion hop. The runner spawns itself with
-`--completion-child`: the child owns the Vulkan device and publishes admission
-and `CompletedVisible` through the real outbox and writer thread, while the
-parent owns only the listener, mirror and lease ledger. This is
+a two-process owner/provider completion hop, and an owner-driven command
+channel where the parent compiles, submits, waits, reads back and releases on
+the child and imports both a staged lease and a descriptor-backed no-copy
+lease. The runner spawns itself with `--completion-child`: the child owns the
+Vulkan device and publishes admission and `CompletedVisible` through the real
+outbox and writer thread, while the parent owns only the listener, mirror and
+lease ledger. `--command-child` serves the same provider over `MCC1`; the
+parent owns no provider and drives every operation remotely. This is
 Vulkan-provider versus Vulkan-executor regression coverage, not native Metal
 parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 owner-to-provider command channel: `metal-api-ipc::command` adds a
+  versioned `MCC1` request/response channel with `RemoteProvider`,
+  `serve_provider` and `serve_provider_unix`. The owner remotely compiles,
+  submits, waits, reads back, cancels and releases; the provider re-admits every
+  submission with its own capabilities before calling `submit`.
+  `ImportStagedLease`/`ReleaseStagedLease` and `health` travel over the channel,
+  and `ImportBorrowedLease` carries the reservation in the frame plus the owner
+  mapping with `SCM_RIGHTS`; the Unix server maps it, keeps it alive until
+  release and imports it through `NoCopyLeaseImporter`. Lavapipe reports
+  `provider_command_process ... commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place`.
 - 2026-09-08 Vulkan no-copy lease import: `metal_api_core::provider` gains
   `BorrowedLease`, `BorrowedLeaseRegistry` and the `NoCopyLeaseImporter` trait.
   The Vulkan provider advertises `StorageMode::BorrowedNoCopy` only when the

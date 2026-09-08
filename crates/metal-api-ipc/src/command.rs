@@ -17,23 +17,31 @@
 //!
 //! A frame is bounded by [`crate::command_codec::MAX_COMMAND_FRAME`]; a trace
 //! whose encoded owned bytes exceed that bound must use a chunked data channel
-//! (not part of this version). Lease-backed views carry only their lease id,
-//! so the owner and provider must import the backing through a separate
-//! descriptor-passing channel before submitting a trace that references it.
+//! (not part of this version). Lease-backed views carry only their lease id.
+//! Staged leases travel inside the frame; no-copy leases use
+//! [`CommandRequest::ImportBorrowedLease`], which carries the reservation in
+//! the frame and sends the owner mapping with `SCM_RIGHTS` immediately after
+//! it. Descriptor requests need [`serve_provider_unix`] on the provider side
+//! and [`RemoteProvider::import_borrowed_lease`] on the owner side.
 
 use crate::codec::CodecError;
 use crate::command_codec::CommandCodec;
 use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionReadback, CompletionToken,
-    ComputeProvider, ComputeTrace, DeviceEpoch, LeaseId, LeaseImporter, PipelineCompileRequest,
-    PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-    ProviderPhase, ProviderSubmission, ResourceTableSnapshot, Retryability, StagedLease,
-    ValidatedComputeTrace,
+    ComputeProvider, ComputeTrace, DeviceEpoch, LeaseId, LeaseImporter, LeaseReservation,
+    PipelineCompileRequest, PipelineProvider, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, ResourceTableSnapshot,
+    Retryability, StagedLease, ValidatedComputeTrace,
 };
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::time::Duration;
+
+#[cfg(unix)]
+use metal_api_core::provider::{BorrowedLease, FieldValue, NoCopyLeaseImporter};
+#[cfg(unix)]
+use std::collections::BTreeMap;
 
 /// One owner request. The response is always a [`CommandResponse`] on the same
 /// connection.
@@ -50,6 +58,15 @@ pub enum CommandRequest {
     ImportStagedLease { staged: StagedLease },
     /// Drop a staged lease import.
     ReleaseStagedLease { lease_id: LeaseId },
+    /// Import a process-shared owner mapping as a no-copy lease.
+    ///
+    /// The frame carries the reservation; the owner sends exactly one
+    /// descriptor over the same Unix socket immediately after the frame and
+    /// the provider maps it before answering. Only [`serve_provider_unix`]
+    /// can serve this request.
+    ImportBorrowedLease { reservation: LeaseReservation },
+    /// Drop a descriptor-backed no-copy lease import.
+    ReleaseBorrowedLease { lease_id: LeaseId },
     /// Admit and submit one trace with its resource snapshot.
     Submit {
         trace: ComputeTrace,
@@ -79,6 +96,8 @@ impl CommandRequest {
             Self::Compile { .. } => "compile",
             Self::ImportStagedLease { .. } => "import_staged_lease",
             Self::ReleaseStagedLease { .. } => "release_staged_lease",
+            Self::ImportBorrowedLease { .. } => "import_borrowed_lease",
+            Self::ReleaseBorrowedLease { .. } => "release_borrowed_lease",
             Self::Submit { .. } => "submit",
             Self::Wait { .. } => "wait",
             Self::Readback { .. } => "readback",
@@ -150,6 +169,9 @@ pub enum CommandError {
         expected: &'static str,
         actual: &'static str,
     },
+    /// A descriptor-carrying request arrived on a transport that cannot carry
+    /// descriptors.
+    DescriptorUnsupported { kind: &'static str },
 }
 
 impl fmt::Display for CommandError {
@@ -161,6 +183,10 @@ impl fmt::Display for CommandError {
                 formatter,
                 "command response mismatch: expected {expected}, received {actual}"
             ),
+            Self::DescriptorUnsupported { kind } => write!(
+                formatter,
+                "command request {kind} needs a Unix descriptor transport"
+            ),
         }
     }
 }
@@ -169,7 +195,9 @@ impl std::error::Error for CommandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Codec(error) => Some(error),
-            Self::Remote(_) | Self::UnexpectedResponse { .. } => None,
+            Self::Remote(_)
+            | Self::UnexpectedResponse { .. }
+            | Self::DescriptorUnsupported { .. } => None,
         }
     }
 }
@@ -202,9 +230,27 @@ impl<R: Read, W: Write> CommandTransport<R, W> {
 
     /// Send one request and read its response.
     pub fn request(&mut self, request: &CommandRequest) -> Result<CommandResponse, CommandError> {
+        self.request_with(request, |_| Ok(()))
+    }
+
+    /// Send one request, run `after_send` on the writer, then read the
+    /// response.
+    ///
+    /// Descriptor-carrying requests use this to write the frame first and the
+    /// `SCM_RIGHTS` control message second, so the provider reads the request
+    /// before the descriptor it belongs to.
+    pub fn request_with<F>(
+        &mut self,
+        request: &CommandRequest,
+        after_send: F,
+    ) -> Result<CommandResponse, CommandError>
+    where
+        F: FnOnce(&mut W) -> Result<(), CommandError>,
+    {
         CommandCodec::write_request(&mut self.writer, request)?;
         self.writer.flush().map_err(CodecError::Io)?;
         self.sent += 1;
+        after_send(&mut self.writer)?;
         let response = CommandCodec::read_response(&mut self.reader)?;
         self.received += 1;
         Ok(response)
@@ -284,12 +330,24 @@ impl<R: Read, W: Write> RemoteProvider<R, W> {
         request: CommandRequest,
         phase: ProviderPhase,
     ) -> Result<CommandResponse, ProviderError> {
+        self.exchange_with(request, phase, |_| Ok(()))
+    }
+
+    fn exchange_with<F>(
+        &self,
+        request: CommandRequest,
+        phase: ProviderPhase,
+        after_send: F,
+    ) -> Result<CommandResponse, ProviderError>
+    where
+        F: FnOnce(&mut W) -> Result<(), CommandError>,
+    {
         let mut transport = self
             .transport
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         transport
-            .request(&request)
+            .request_with(&request, after_send)
             .map_err(|error| transport_error(phase, error))
     }
 }
@@ -436,6 +494,55 @@ impl<R: Read + Send, W: Write + Send> PipelineProvider for RemoteProvider<R, W> 
     }
 }
 
+#[cfg(unix)]
+impl RemoteProvider<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream> {
+    /// Import an owner [`crate::shared::SharedMemory`] mapping as a no-copy
+    /// lease over this command connection.
+    ///
+    /// The reservation must fit inside the mapped range. The descriptor
+    /// travels over the same socket with `SCM_RIGHTS`; the provider maps the
+    /// same physical pages and imports them through
+    /// [`NoCopyLeaseImporter::import_borrowed_lease`]. The owner must keep the
+    /// mapping alive until [`Self::release_borrowed_lease`] returns.
+    pub fn import_borrowed_lease(
+        &self,
+        reservation: LeaseReservation,
+        memory: &crate::shared::SharedMemory,
+    ) -> Result<(), ProviderError> {
+        match self.exchange_with(
+            CommandRequest::ImportBorrowedLease { reservation },
+            ProviderPhase::Resolve,
+            |writer| {
+                Ok(crate::shared::send_fd(writer, memory.descriptor()).map_err(CodecError::Io)?)
+            },
+        )? {
+            CommandResponse::Imported => Ok(()),
+            CommandResponse::Error { error } => Err(error),
+            other => Err(unexpected_response(
+                ProviderPhase::Resolve,
+                "imported",
+                &other,
+            )),
+        }
+    }
+
+    /// Drop a descriptor-backed no-copy lease import.
+    pub fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        match self.exchange(
+            CommandRequest::ReleaseBorrowedLease { lease_id },
+            ProviderPhase::Resolve,
+        )? {
+            CommandResponse::Released => Ok(()),
+            CommandResponse::Error { error } => Err(error),
+            other => Err(unexpected_response(
+                ProviderPhase::Resolve,
+                "released",
+                &other,
+            )),
+        }
+    }
+}
+
 fn transport_error(phase: ProviderPhase, error: CommandError) -> ProviderError {
     let mut provider_error = ProviderError::new(
         phase,
@@ -488,13 +595,23 @@ pub fn serve_provider<R: Read, W: Write>(
             Err(CommandError::Codec(CodecError::Eof)) => return Ok(()),
             Err(error) => return Err(error),
         };
+        if let CommandRequest::ImportBorrowedLease { .. }
+        | CommandRequest::ReleaseBorrowedLease { .. } = request
+        {
+            return Err(CommandError::DescriptorUnsupported {
+                kind: request.kind(),
+            });
+        }
         let response = handle_request(provider, request);
         transport.send_response(&response)?;
         transport.flush()?;
     }
 }
 
-fn handle_request(provider: &dyn ProviderEndpoint, request: CommandRequest) -> CommandResponse {
+fn handle_request<P>(provider: &P, request: CommandRequest) -> CommandResponse
+where
+    P: ProviderEndpoint + ?Sized,
+{
     match request {
         CommandRequest::Capabilities => CommandResponse::Capabilities {
             epoch: provider.device_epoch(),
@@ -519,6 +636,13 @@ fn handle_request(provider: &dyn ProviderEndpoint, request: CommandRequest) -> C
                 Err(error) => CommandResponse::Error { error },
             }
         }
+        CommandRequest::ImportBorrowedLease { .. }
+        | CommandRequest::ReleaseBorrowedLease { .. } => CommandResponse::Error {
+            error: descriptor_error(
+                "descriptor_transport_required",
+                ProviderErrorClass::Internal,
+            ),
+        },
         CommandRequest::Submit { trace, resources } => {
             let admitted = match provider.capabilities().validate_trace(trace, resources) {
                 Ok(admitted) => admitted,
@@ -554,6 +678,165 @@ fn handle_request(provider: &dyn ProviderEndpoint, request: CommandRequest) -> C
     }
 }
 
+/// Provider endpoint that can import descriptor-backed no-copy leases.
+#[cfg(unix)]
+pub trait DescriptorProviderEndpoint: ProviderEndpoint + NoCopyLeaseImporter {}
+
+#[cfg(unix)]
+impl<T: ProviderEndpoint + NoCopyLeaseImporter> DescriptorProviderEndpoint for T {}
+
+/// Provider-side loop for a Unix command connection that can carry
+/// `SCM_RIGHTS` descriptors.
+///
+/// This serves every [`serve_provider`] request plus
+/// [`CommandRequest::ImportBorrowedLease`] and
+/// [`CommandRequest::ReleaseBorrowedLease`]. The server keeps each imported
+/// mapping alive until the provider releases the lease, so the borrowed
+/// pointer stays valid for the whole import.
+#[cfg(unix)]
+pub fn serve_provider_unix(
+    provider: &dyn DescriptorProviderEndpoint,
+    transport: &mut unix::UnixCommandTransport,
+) -> Result<(), CommandError> {
+    let mut mappings = BTreeMap::new();
+    let result = loop {
+        let request = match transport.recv_request() {
+            Ok(request) => request,
+            Err(CommandError::Codec(CodecError::Eof)) => break Ok(()),
+            Err(error) => break Err(error),
+        };
+        let response = match request {
+            CommandRequest::ImportBorrowedLease { reservation } => {
+                import_borrowed_descriptor(provider, transport, &mut mappings, reservation)
+            }
+            CommandRequest::ReleaseBorrowedLease { lease_id } => {
+                release_borrowed_descriptor(provider, &mut mappings, lease_id)
+            }
+            request => handle_request(provider, request),
+        };
+        if let Err(error) = transport
+            .send_response(&response)
+            .and_then(|()| transport.flush())
+        {
+            break Err(error);
+        }
+    };
+    close_borrowed_mappings(provider, &mut mappings);
+    result
+}
+
+#[cfg(unix)]
+fn close_borrowed_mappings(
+    provider: &dyn DescriptorProviderEndpoint,
+    mappings: &mut BTreeMap<LeaseId, crate::shared::SharedMemory>,
+) {
+    for (lease_id, mapping) in std::mem::take(mappings) {
+        match provider.release_borrowed_lease(lease_id) {
+            Ok(()) => drop(mapping),
+            // A submission still retains the mapping, so the provider may
+            // still read it. Leak the pages instead of unmapping under the
+            // provider; the operating system reclaims them at process exit.
+            Err(_) => std::mem::forget(mapping),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn import_borrowed_descriptor(
+    provider: &dyn DescriptorProviderEndpoint,
+    transport: &mut unix::UnixCommandTransport,
+    mappings: &mut BTreeMap<LeaseId, crate::shared::SharedMemory>,
+    reservation: LeaseReservation,
+) -> CommandResponse {
+    let lease_id = reservation.lease.lease_id;
+    if mappings.contains_key(&lease_id) {
+        return CommandResponse::Error {
+            error: descriptor_error("lease_already_imported", ProviderErrorClass::Args),
+        };
+    }
+    let descriptor = match transport.recv_descriptor() {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return CommandResponse::Error {
+                error: descriptor_error(
+                    "borrowed_lease_descriptor_invalid",
+                    ProviderErrorClass::Internal,
+                )
+                .with_detail(error.to_string()),
+            }
+        }
+    };
+    let mapping = match crate::shared::SharedMemory::from_owned_fd(descriptor) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            return CommandResponse::Error {
+                error: descriptor_error(
+                    "borrowed_lease_descriptor_invalid",
+                    ProviderErrorClass::Internal,
+                )
+                .with_detail(error.to_string()),
+            }
+        }
+    };
+    let Ok(expected) = usize::try_from(reservation.length) else {
+        return CommandResponse::Error {
+            error: descriptor_error(
+                "borrowed_lease_length_unsupported",
+                ProviderErrorClass::Args,
+            ),
+        };
+    };
+    if mapping.len() < expected {
+        return CommandResponse::Error {
+            error: descriptor_error("borrowed_lease_length_mismatch", ProviderErrorClass::Args)
+                .with_field("mapped", FieldValue::Unsigned(mapping.len() as u64))
+                .with_field("reservation", FieldValue::Unsigned(reservation.length)),
+        };
+    }
+    let borrowed = match BorrowedLease::new(reservation, mapping.as_ptr() as usize) {
+        Ok(borrowed) => borrowed,
+        Err(error) => {
+            return CommandResponse::Error {
+                error: descriptor_error("borrowed_lease_invalid", ProviderErrorClass::Args)
+                    .with_detail(error.to_string()),
+            }
+        }
+    };
+    // SAFETY: `mapping` is kept in `mappings` until the provider releases the
+    // lease, so the borrowed pointer stays valid and address-stable for the
+    // whole import.
+    if let Err(error) = unsafe { provider.import_borrowed_lease(borrowed) } {
+        return CommandResponse::Error { error };
+    }
+    mappings.insert(lease_id, mapping);
+    CommandResponse::Imported
+}
+
+#[cfg(unix)]
+fn release_borrowed_descriptor(
+    provider: &dyn DescriptorProviderEndpoint,
+    mappings: &mut BTreeMap<LeaseId, crate::shared::SharedMemory>,
+    lease_id: LeaseId,
+) -> CommandResponse {
+    if !mappings.contains_key(&lease_id) {
+        return CommandResponse::Error {
+            error: descriptor_error("lease_not_imported", ProviderErrorClass::Args),
+        };
+    }
+    match provider.release_borrowed_lease(lease_id) {
+        Ok(()) => {
+            mappings.remove(&lease_id);
+            CommandResponse::Released
+        }
+        Err(error) => CommandResponse::Error { error },
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_error(slug: &'static str, class: ProviderErrorClass) -> ProviderError {
+    ProviderError::new(ProviderPhase::Resolve, class, slug).expect("static descriptor refusal slug")
+}
+
 #[cfg(unix)]
 pub mod unix {
     //! Unix-domain socket helpers for [`CommandTransport`].
@@ -584,6 +867,20 @@ pub mod unix {
     }
 
     impl CommandTransport<UnixStream, UnixStream> {
+        /// Send one descriptor over the command socket with `SCM_RIGHTS`.
+        ///
+        /// The one-byte descriptor payload follows the current frame bytes,
+        /// so a server that just read a request frame can receive exactly this
+        /// descriptor before writing its response.
+        pub fn send_descriptor(&self, descriptor: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+            crate::shared::send_fd(&self.writer, descriptor)
+        }
+
+        /// Receive one descriptor sent by [`Self::send_descriptor`].
+        pub fn recv_descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+            crate::shared::recv_fd(&self.reader)
+        }
+
         /// Set the read timeout on the underlying socket.
         pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
             self.reader.set_read_timeout(timeout)
@@ -634,6 +931,8 @@ pub mod unix {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::serve_provider_unix;
     use super::{serve_provider, CommandRequest, CommandResponse, RemoteProvider};
     use crate::command_codec::CommandCodec;
     use metal_api_core::provider::{
@@ -650,6 +949,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    use metal_api_core::provider::{BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter};
 
     fn token() -> CompletionToken {
         CompletionToken {
@@ -764,6 +1066,20 @@ mod tests {
             CommandRequest::ReleaseStagedLease {
                 lease_id: LeaseId::new(51),
             },
+            CommandRequest::ImportBorrowedLease {
+                reservation: LeaseReservation {
+                    lease: BufferLease {
+                        lease_id: LeaseId::new(52),
+                        allocation_id: AllocationId::new(41),
+                        owner_epoch: DeviceEpoch::new(7),
+                    },
+                    offset: 0,
+                    length: 4096,
+                },
+            },
+            CommandRequest::ReleaseBorrowedLease {
+                lease_id: LeaseId::new(52),
+            },
             CommandRequest::Submit {
                 trace: trace.clone(),
                 resources: resources(),
@@ -859,6 +1175,8 @@ mod tests {
         capabilities: ProviderCapabilities,
         submissions: Arc<AtomicU64>,
         imports: Arc<AtomicU64>,
+        #[cfg(unix)]
+        borrowed: Arc<BorrowedLeaseRegistry>,
     }
 
     impl ComputeProvider for FakeProvider {
@@ -937,6 +1255,24 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    impl NoCopyLeaseImporter for FakeProvider {
+        fn no_copy_alignment(&self) -> u64 {
+            4096
+        }
+
+        unsafe fn import_borrowed_lease(
+            &self,
+            borrowed: BorrowedLease,
+        ) -> Result<(), ProviderError> {
+            self.borrowed.import(borrowed)
+        }
+
+        fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+            self.borrowed.release(lease_id)
+        }
+    }
+
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             max_passes: 1,
@@ -967,6 +1303,7 @@ mod tests {
             capabilities: fake_capabilities(),
             submissions: Arc::clone(&submissions),
             imports: Arc::clone(&imports),
+            borrowed: Arc::new(BorrowedLeaseRegistry::new()),
         };
         let (client, mut server) = super::unix::pair().unwrap();
         let server_thread = std::thread::spawn(move || serve_provider(&provider, &mut server));
@@ -1014,5 +1351,76 @@ mod tests {
         server_thread.join().unwrap().unwrap();
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         assert_eq!(imports.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_provider_imports_a_descriptor_backed_lease() {
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let provider = FakeProvider {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+            submissions: Arc::new(AtomicU64::new(0)),
+            imports: Arc::new(AtomicU64::new(0)),
+            borrowed: Arc::clone(&borrowed),
+        };
+        let (client, mut server) = super::unix::pair().unwrap();
+        let server_thread = std::thread::spawn(move || serve_provider_unix(&provider, &mut server));
+
+        let remote = RemoteProvider::connect(client).unwrap();
+        let mut memory = crate::shared::SharedMemory::create(4096).unwrap();
+        memory.as_mut_slice().fill(0x5a);
+        let lease_id = LeaseId::new(77);
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: AllocationId::new(41),
+                owner_epoch: DeviceEpoch::new(7),
+            },
+            offset: 0,
+            length: 4096,
+        };
+        remote.import_borrowed_lease(reservation, &memory).unwrap();
+        assert_eq!(borrowed.len(), 1);
+
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(41),
+                owner_epoch: DeviceEpoch::new(7),
+                size: 4096,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+        let view = BufferView {
+            view_id: ViewId::new(78),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(41),
+            offset: 0,
+            length: 4,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::BorrowedNoCopy(lease_id),
+        };
+        let resolved = borrowed
+            .view_pointer(lease_id, &view, DeviceEpoch::new(7), &resources)
+            .unwrap();
+        assert_eq!(resolved.len, 4);
+        // SAFETY: the server keeps the mapping alive until release and the
+        // owner mapping refers to the same physical pages.
+        let observed = unsafe { std::slice::from_raw_parts(resolved.pointer as *const u8, 4) };
+        assert_eq!(observed, &[0x5a; 4]);
+
+        memory.as_mut_slice()[..4].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        // SAFETY: as above; the import is still live.
+        let observed = unsafe { std::slice::from_raw_parts(resolved.pointer as *const u8, 4) };
+        assert_eq!(observed, &0x1234_5678_u32.to_le_bytes());
+
+        remote.release_borrowed_lease(lease_id).unwrap();
+        assert_eq!(borrowed.len(), 0);
+        let refused = remote.release_borrowed_lease(lease_id).unwrap_err();
+        assert_eq!(refused.slug, "lease_not_imported");
+        drop(remote);
+        server_thread.join().unwrap().unwrap();
     }
 }

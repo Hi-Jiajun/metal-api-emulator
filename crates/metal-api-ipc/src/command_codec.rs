@@ -41,6 +41,8 @@ const RELEASE_COMPLETION_REQUEST: u8 = 0x08;
 const HEALTH_REQUEST: u8 = 0x09;
 const IMPORT_STAGED_LEASE_REQUEST: u8 = 0x0a;
 const RELEASE_STAGED_LEASE_REQUEST: u8 = 0x0b;
+const IMPORT_BORROWED_LEASE_REQUEST: u8 = 0x0c;
+const RELEASE_BORROWED_LEASE_REQUEST: u8 = 0x0d;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -72,6 +74,14 @@ impl CommandCodec {
             }
             CommandRequest::ReleaseStagedLease { lease_id } => {
                 encoder.u8(RELEASE_STAGED_LEASE_REQUEST);
+                encoder.u64(lease_id.get());
+            }
+            CommandRequest::ImportBorrowedLease { reservation } => {
+                encoder.u8(IMPORT_BORROWED_LEASE_REQUEST);
+                put_reservation(&mut encoder, reservation);
+            }
+            CommandRequest::ReleaseBorrowedLease { lease_id } => {
+                encoder.u8(RELEASE_BORROWED_LEASE_REQUEST);
                 encoder.u64(lease_id.get());
             }
             CommandRequest::Submit { trace, resources } => {
@@ -206,6 +216,12 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
             staged: get_staged_lease(&mut decoder)?,
         },
         RELEASE_STAGED_LEASE_REQUEST => CommandRequest::ReleaseStagedLease {
+            lease_id: LeaseId::new(decoder.u64()?),
+        },
+        IMPORT_BORROWED_LEASE_REQUEST => CommandRequest::ImportBorrowedLease {
+            reservation: get_reservation(&mut decoder)?,
+        },
+        RELEASE_BORROWED_LEASE_REQUEST => CommandRequest::ReleaseBorrowedLease {
             lease_id: LeaseId::new(decoder.u64()?),
         },
         SUBMIT_REQUEST => CommandRequest::Submit {

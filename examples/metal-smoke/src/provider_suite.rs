@@ -17,7 +17,7 @@ use metal_api_core::provider::{
     StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
-use metal_api_ipc::command::{serve_provider, unix as command_unix, RemoteProvider};
+use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
 use metal_api_ipc::receiver::CompletionReceiver;
 use metal_api_ipc::sender::spawn_writer;
 use metal_api_ipc::{shared, unix};
@@ -538,7 +538,7 @@ pub fn run_provider_command_child(
         .with_completion_outbox(outbox)
         .map_err(provider_error)?;
     let mut transport = command_unix::connect(command_socket)?;
-    serve_provider(&provider, &mut transport)?;
+    serve_provider_unix(&provider, &mut transport)?;
     drop(provider);
     writer
         .join()
@@ -746,14 +746,6 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
     if receiver.recv()? != MirrorOutcome::Applied {
         return Err("remote command receiver did not apply completion".into());
     }
-    if receiver.applied() != 2 || receiver.ignored() != 0 {
-        return Err(format!(
-            "remote command mirror counted applied={} ignored={}",
-            receiver.applied(),
-            receiver.ignored()
-        )
-        .into());
-    }
     let readback = remote.readback(token).map_err(provider_error)?;
     let result = ProviderSubmission {
         completion: readback.completion,
@@ -784,6 +776,114 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
             format!("remote provider did not refuse the released lease: {refused:?}").into(),
         );
     }
+
+    // Descriptor-backed no-copy lease over the same command connection.
+    let mut mapping = shared::SharedMemory::create(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    let borrowed_lease_id = LeaseId::new(95);
+    let borrowed_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: borrowed_lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    remote
+        .import_borrowed_lease(borrowed_reservation, &mapping)
+        .map_err(provider_error)?;
+    let borrowed_trace = borrowed_lease_trace(
+        epoch,
+        &pipeline,
+        borrowed_lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        601,
+        602,
+    );
+    let borrowed_resources = borrowed_lease_resources(epoch, borrowed_reservation)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(borrowed_trace.clone(), borrowed_resources.clone())
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let borrowed_token = submitted
+        .completion
+        .token()
+        .ok_or("remote borrowed submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply borrowed admission".into());
+    }
+    let observed = remote
+        .wait(borrowed_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed
+        != (CompletionDisposition::CompletedVisible {
+            token: borrowed_token,
+        })
+    {
+        return Err(format!("remote borrowed lease did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply borrowed completion".into());
+    }
+    let readback = remote.readback(borrowed_token).map_err(provider_error)?;
+    let borrowed_result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    borrowed_result.validate_for_trace(&borrowed_trace)?;
+    check_writeback(
+        &borrowed_trace,
+        &borrowed_result,
+        1,
+        &BORROWED_SHARED_GPU_WORD.to_le_bytes(),
+    )?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "remote borrowed mapping did not observe the GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("remote borrowed mapping guards changed".into());
+    }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(borrowed_reservation)?;
+    ledger.bind(borrowed_lease_id, borrowed_token)?;
+    if receiver.observe_into(&mut ledger, borrowed_token)? != LeaseObservation::Retired {
+        return Err("remote command completion did not retire the borrowed lease".into());
+    }
+    if !ledger.release_ready(borrowed_lease_id) {
+        return Err("remote command borrowed lease was not release-ready".into());
+    }
+    remote
+        .release_completion(borrowed_token)
+        .map_err(provider_error)?;
+    remote
+        .release_borrowed_lease(borrowed_lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(borrowed_trace.clone(), borrowed_resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(format!(
+            "remote provider did not refuse the released borrowed lease: {refused:?}"
+        )
+        .into());
+    }
+    if receiver.applied() != 4 || receiver.ignored() != 0 {
+        return Err(format!(
+            "remote command mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
     remote.release_pipeline(&pipeline).map_err(provider_error)?;
     drop(remote);
 
@@ -797,7 +897,7 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         return Err(format!("provider command child exited with {status}").into());
     }
     println!(
-        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused"
+        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place"
     );
     Ok(())
 }
@@ -875,7 +975,7 @@ pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn
         .map_err(provider_error)?;
 
     let read_trace = borrowed_lease_trace(
-        &provider,
+        provider.device_epoch(),
         &pipeline,
         lease_id,
         BufferAccess::Read,
@@ -883,7 +983,7 @@ pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn
         497,
         498,
     );
-    let read_resources = borrowed_lease_resources(&provider, reservation)?;
+    let read_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
     let admitted = provider
         .capabilities()
         .validate_trace(read_trace.clone(), read_resources)
@@ -896,7 +996,7 @@ pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn
         .ok_or("borrowed shared read has no token")?;
 
     let write_trace = borrowed_lease_trace(
-        &provider,
+        provider.device_epoch(),
         &pipeline,
         lease_id,
         BufferAccess::Write,
@@ -904,7 +1004,7 @@ pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn
         499,
         500,
     );
-    let write_resources = borrowed_lease_resources(&provider, reservation)?;
+    let write_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
     let admitted = provider
         .capabilities()
         .validate_trace(write_trace.clone(), write_resources)
@@ -1322,7 +1422,7 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
     // snapshotted the bytes would observe the old word.
     owner.as_mut_slice()[..4].copy_from_slice(&0xbbbb_bbbb_u32.to_le_bytes());
     let read_trace = borrowed_lease_trace(
-        &provider,
+        provider.device_epoch(),
         &pipeline,
         lease_id,
         BufferAccess::Read,
@@ -1330,7 +1430,7 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
         397,
         398,
     );
-    let read_resources = borrowed_lease_resources(&provider, reservation)?;
+    let read_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
     let admitted = provider
         .capabilities()
         .validate_trace(read_trace.clone(), read_resources.clone())
@@ -1349,7 +1449,7 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
 
     let word = 0x1234_5678_u32;
     let write_trace = borrowed_lease_trace(
-        &provider,
+        provider.device_epoch(),
         &pipeline,
         lease_id,
         BufferAccess::Write,
@@ -1357,7 +1457,7 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
         399,
         400,
     );
-    let write_resources = borrowed_lease_resources(&provider, reservation)?;
+    let write_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
     let admitted = provider
         .capabilities()
         .validate_trace(write_trace.clone(), write_resources.clone())
@@ -1430,7 +1530,7 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
 
 #[allow(clippy::too_many_arguments)]
 fn borrowed_lease_trace(
-    provider: &VulkanComputeProvider,
+    epoch: DeviceEpoch,
     pipeline: &CompiledComputePipeline,
     lease_id: LeaseId,
     lease_access: BufferAccess,
@@ -1470,7 +1570,7 @@ fn borrowed_lease_trace(
     };
     ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
-        device_epoch: provider.device_epoch(),
+        device_epoch: epoch,
         operation_id: OperationId::new(lease_view_id),
         pipelines: vec![pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
@@ -1488,18 +1588,18 @@ fn borrowed_lease_trace(
 }
 
 fn borrowed_lease_resources(
-    provider: &VulkanComputeProvider,
+    epoch: DeviceEpoch,
     reservation: LeaseReservation,
 ) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
     let mut resources = ResourceTableSnapshot::new();
     resources.insert_allocation(AllocationRecord {
         allocation_id: AllocationId::new(298),
-        owner_epoch: provider.device_epoch(),
+        owner_epoch: epoch,
         size: 64,
     })?;
     resources.insert_allocation(AllocationRecord {
         allocation_id: AllocationId::new(299),
-        owner_epoch: provider.device_epoch(),
+        owner_epoch: epoch,
         size: 32,
     })?;
     resources.insert_lease(reservation)?;
