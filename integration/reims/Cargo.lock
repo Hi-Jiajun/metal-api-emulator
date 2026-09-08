@@ -300,6 +300,13 @@ name = "metal-api-core"
 version = "0.1.0"
 
 [[package]]
+name = "metal-api-ipc"
+version = "0.1.0"
+dependencies = [
+ "metal-api-core",
+]
+
+[[package]]
 name = "metal-api-native"
 version = "0.1.0"
 dependencies = [
@@ -336,6 +343,7 @@ name = "metal-smoke"
 version = "0.1.0"
 dependencies = [
  "metal-api-core",
+ "metal-api-ipc",
  "metal-api-native",
  "metal-api-vulkan",
  "serde",
