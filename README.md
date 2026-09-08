@@ -218,7 +218,10 @@ case, so every request travels as chunk frames and the child reassembles it
 before decoding. The object-API queue case commits two command buffers with a
 shared buffer in commit order: the second commit blocks on the first command's
 reservation, so the destination can only observe the first command's write
-when the queue preserves order. A final case injects a simulated device loss
+when the queue preserves order. A second object-API case commits two command
+buffers with disjoint buffers: the second commit must return while the first
+command is still pending, so independent submissions stay in flight at once.
+A final case injects a simulated device loss
 into a dedicated executor: `health` must report `DeviceLost`, new compilation
 must be refused with `device_lost`/`RetryAfterRecreate`, and a freshly created
 executor/provider pair must resume work with an exact writeback. The object

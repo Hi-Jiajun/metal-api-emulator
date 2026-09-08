@@ -84,7 +84,10 @@ unchanged. The async mode is used by the object-API capture path with
 buffer dependency: the second commit blocks on the first command's reservation
 and only then submits, so the final destination proves commit-order execution
 on the real device. This checks host-side reservation ordering, not concurrent
-GPU execution.
+GPU execution. A second case commits two command buffers with disjoint buffers
+and asserts that the second commit returns while the first command is still
+pending, so independent submissions stay in flight at once; the case still
+exercises one queue and does not prove overlapping GPU execution.
 Async mode still serializes submission with the same queue lock, so it overlaps
 host work and completion observation rather than concurrent GPU execution.
 There is no end-to-end deadline on compilation, locks, initialization or

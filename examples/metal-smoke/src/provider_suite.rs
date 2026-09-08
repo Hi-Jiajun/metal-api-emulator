@@ -126,6 +126,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
     run_object_queue_ordering()?;
+    run_object_parallel_commands()?;
     run_device_lifecycle()?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
@@ -1948,6 +1949,96 @@ fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
+    );
+    Ok(())
+}
+
+/// Two independent command buffers with disjoint buffer reservations: the
+/// second commit must not wait for the first command to complete, so both
+/// submissions stay in flight at once. The test is a host-reservation
+/// granularity check; it does not claim overlapping GPU execution or
+/// multi-queue scheduling.
+fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_parallel_commands".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile parallel fixture: {error:?}"))?;
+    let word_a = 0x1111_1111_u32.to_le_bytes().to_vec();
+    let word_b = 0x2222_2222_u32.to_le_bytes().to_vec();
+    let input_a = device.new_buffer_with_bytes(word_a.clone())?;
+    let input_b = device.new_buffer_with_bytes(word_b.clone())?;
+    let output_a = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let output_b = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_a.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_a.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_b.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_b.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    first.commit()?;
+    let (committed, wait_for_commit) = std::sync::mpsc::channel();
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second parallel commit: {error:?}"))?;
+        committed
+            .send(())
+            .map_err(|_| "parallel commit signal receiver dropped".to_string())?;
+        Ok::<_, String>(second)
+    });
+    wait_for_commit
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "second disjoint commit blocked on the first reservation")?;
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "parallel commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    if output_a.read()? != word_a || output_b.read()? != word_b {
+        return Err(format!(
+            "parallel writebacks differ: a={:02x?} b={:02x?}",
+            output_a.read()?,
+            output_b.read()?
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 writeback=exact"
     );
     Ok(())
 }
