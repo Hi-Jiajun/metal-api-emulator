@@ -79,8 +79,10 @@ imports an aligned owner host mapping with `VkImportMemoryHostPointerInfoEXT`,
 `BorrowedLeaseRegistry` tracks per-submission retains, and GPU writes land in
 the owner mapping in place. A retained in-flight submission keeps the import
 held, and release is refused with `lease_in_use` until a destroying execution
-drop retires it. The native provider still accepts only `OwnedBytes`;
-guest-memory import and `newBufferWithBytesNoCopy` remain future work.
+drop retires it. The native provider also imports `StagedLease` windows: it
+advertises `StorageMode::StagedLease`, resolves the admitted window through the
+same registry and uploads the copied bytes. It does not yet import guest memory
+or `newBufferWithBytesNoCopy`.
 
 ## Cross-process completion notifications
 

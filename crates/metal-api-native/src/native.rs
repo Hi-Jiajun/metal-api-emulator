@@ -1,5 +1,6 @@
 //! Metal handles stay behind one lock. No guest pointers or caller-owned
-//! memory are passed to Metal; submission copies admitted view contents.
+//! memory are passed to Metal; submission copies admitted view contents or
+//! staged lease windows.
 
 use crate::{
     bounded_contract, classify_command_buffer_error, device_lost_refusal, refusal,
@@ -84,6 +85,7 @@ pub struct NativeMetalProvider {
     observation_deadline: Duration,
     async_abandoned: Arc<AtomicBool>,
     completion_outbox: Option<Arc<CompletionOutbox>>,
+    staging: LeaseRegistry,
 }
 
 impl NativeMetalProvider {
@@ -133,7 +135,7 @@ impl NativeMetalProvider {
                 max_buffer_range: device.max_buffer_length().min(1024 * 1024),
                 max_push_constant_bytes: 0,
                 alias_mode: AliasMode::Refused,
-                storage_modes: vec![StorageMode::OwnedBytes],
+                storage_modes: vec![StorageMode::OwnedBytes, StorageMode::StagedLease],
                 host_readback: true,
                 submit_only: false,
             };
@@ -157,6 +159,7 @@ impl NativeMetalProvider {
                 observation_deadline: GPU_DEADLINE,
                 async_abandoned: Arc::new(AtomicBool::new(false)),
                 completion_outbox: None,
+                staging: LeaseRegistry::new(),
             })
         })
     }
@@ -541,12 +544,27 @@ impl ComputeProvider for NativeMetalProvider {
             device_epoch: self.epoch,
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
+        let resolve = |view: &BufferView| -> Result<Vec<u8>, ProviderError> {
+            match &view.source {
+                BufferSource::OwnedBytes(bytes) => Ok(bytes.clone()),
+                BufferSource::StagedLease(lease_id) => {
+                    self.staging
+                        .view_bytes(*lease_id, view, self.epoch, admitted.resources())
+                }
+                BufferSource::BorrowedNoCopy(_) => Err(refusal(
+                    ProviderPhase::Encode,
+                    ProviderErrorClass::Capability,
+                    "storage_mode_unsupported",
+                )),
+            }
+        };
         if self.async_execution {
-            let result = self.submit_async(&mut state, trace, pipelines, token);
+            let result = self.submit_async(&mut state, trace, pipelines, token, &resolve);
             self.publish_health(self.health_from_state(&state));
             return result;
         }
-        let result = objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token));
+        let result =
+            objc::rc::autoreleasepool(|| execute(&mut state, trace, pipelines, token, &resolve));
         let observation = match &result {
             Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {
@@ -641,10 +659,15 @@ struct EncodedSubmission {
     pool: Vec<BufferView>,
 }
 
+/// Resolves one admitted view to the exact bytes uploaded to Metal. Owned
+/// views return their snapshot; staged views return the imported window slice.
+type BufferResolver<'a> = dyn Fn(&BufferView) -> Result<Vec<u8>, ProviderError> + 'a;
+
 fn encode(
     state: &mut State,
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
+    resolve: &BufferResolver<'_>,
 ) -> Result<EncodedSubmission, ProviderError> {
     let pool = trace.serial_resources().map_err(|error| {
         refusal(
@@ -661,14 +684,8 @@ fn encode(
         .collect();
     let mut buffers = Vec::with_capacity(pool.len());
     for view in &pool {
-        let BufferSource::OwnedBytes(bytes) = &view.source else {
-            return Err(refusal(
-                ProviderPhase::Encode,
-                ProviderErrorClass::Capability,
-                "storage_mode_unsupported",
-            ));
-        };
-        // OwnedBytes contains the view itself, not the entire logical
+        let bytes = resolve(view)?;
+        // The resolved bytes contain the view itself, not the entire logical
         // allocation. Binding offset is zero; writebacks retain view.offset.
         let buffer = unsafe {
             let pointer: *mut metal::MTLBuffer = msg_send![state.device.as_ref(),
@@ -740,8 +757,9 @@ fn execute(
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
     token: CompletionToken,
+    resolve: &BufferResolver<'_>,
 ) -> Result<ProviderSubmission, ProviderError> {
-    let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines)?;
+    let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines, resolve)?;
     pending.submitted = true;
     let resources = pending.resources.as_ref().expect("encoded resources");
     resources.command.commit();
@@ -822,14 +840,20 @@ fn collect_writebacks(pool: &[BufferView], buffers: &[Buffer]) -> Vec<BufferWrit
 }
 
 impl NativeMetalProvider {
+    /// Staged lease registry owned by this provider.
+    pub fn lease_registry(&self) -> &LeaseRegistry {
+        &self.staging
+    }
+
     fn submit_async(
         &self,
         state: &mut State,
         trace: &ComputeTrace,
         pipelines: Vec<ComputePipelineState>,
         token: CompletionToken,
+        resolve: &BufferResolver<'_>,
     ) -> Result<ProviderSubmission, ProviderError> {
-        let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines)?;
+        let EncodedSubmission { mut pending, pool } = encode(state, trace, pipelines, resolve)?;
         let SubmissionResources {
             _device,
             _queue,
@@ -927,6 +951,28 @@ impl NativeMetalProvider {
             completion: CompletionDisposition::Submitted { token },
             writebacks: Vec::new(),
         })
+    }
+}
+
+impl LeaseImporter for NativeMetalProvider {
+    fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError> {
+        if staged.reservation.lease.owner_epoch != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "lease_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(staged.reservation.lease.owner_epoch.get()),
+            ));
+        }
+        self.staging.import(staged)
+    }
+
+    fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        self.staging.release(lease_id)
     }
 }
 

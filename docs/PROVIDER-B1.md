@@ -142,6 +142,11 @@ parity.
   resolution. Lavapipe reports `provider_borrowed_lease lease=98
   alignment=4096 copy_in=live copy_out=in_place retired=true
   refusal=lease_not_imported`.
+- 2026-09-08 native staged lease import: `NativeMetalProvider` implements
+  `LeaseImporter`, advertises `StorageMode::StagedLease` and resolves every
+  admitted view through `LeaseRegistry` before `newBufferWithBytes:`. A new
+  macOS test imports an 8-byte window, executes the copied view, retires the
+  lease through `LeaseLedger` and refuses it after release.
 - 2026-09-08 Vulkan staged lease import: `metal_api_core::provider` gains
   `StagedLease`, `LeaseRegistry` and the `LeaseImporter` trait. The Vulkan
   provider advertises `StorageMode::StagedLease`, copies the owner's reservation

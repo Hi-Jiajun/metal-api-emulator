@@ -660,4 +660,133 @@ mod tests {
             *token == second_token && *sequence == 2 && update.is_terminal()
         }));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_lease_import_copies_and_retires_a_window() {
+        use metal_api_core::provider::{
+            AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView,
+            CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType,
+            LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, OperationId,
+            PipelineProvider, ResourceTableSnapshot, StagedLease, ViewId, PROVIDER_SCHEMA_VERSION,
+        };
+
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native staged lease test: no eligible Metal device");
+            return;
+        };
+        let pipeline = provider
+            .compile(request("copy_word", COPY))
+            .expect("reviewed copy_word fixture compiles");
+        let lease_id = LeaseId::new(97);
+        let reservation = LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: AllocationId::new(197),
+                owner_epoch: provider.device_epoch(),
+            },
+            offset: 0,
+            length: 8,
+        };
+        let mut input = 0x6745_2301_u32.to_le_bytes().to_vec();
+        input.extend_from_slice(&[0_u8; 4]);
+        provider
+            .import_staged_lease(StagedLease::new(reservation, input).unwrap())
+            .unwrap();
+
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: provider.device_epoch(),
+            operation_id: OperationId::new(97),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ViewId::new(297),
+                        metal_binding: 0,
+                        allocation_id: AllocationId::new(197),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::StagedLease(lease_id),
+                    },
+                    BufferView {
+                        view_id: ViewId::new(298),
+                        metal_binding: 1,
+                        allocation_id: AllocationId::new(198),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let resources = || {
+            let mut snapshot = ResourceTableSnapshot::new();
+            snapshot
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(197),
+                    owner_epoch: provider.device_epoch(),
+                    size: 16,
+                })
+                .unwrap();
+            snapshot
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(198),
+                    owner_epoch: provider.device_epoch(),
+                    size: 32,
+                })
+                .unwrap();
+            snapshot.insert_lease(reservation).unwrap();
+            snapshot
+        };
+
+        let submission = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(trace.clone(), resources())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(submission.writebacks.len(), 1);
+        assert_eq!(
+            submission.writebacks[0].bytes,
+            0x6745_2301_u32.to_le_bytes()
+        );
+        let token = submission.completion.token().unwrap();
+        let mut ledger = LeaseLedger::new();
+        ledger.register(reservation).unwrap();
+        ledger.bind(lease_id, token).unwrap();
+        assert_eq!(
+            ledger.observe(token, submission.completion).unwrap(),
+            LeaseObservation::Retired
+        );
+        assert!(ledger.release_ready(lease_id));
+        provider.release_staged_lease(lease_id).unwrap();
+        assert!(provider.lease_registry().is_empty());
+
+        let error = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(trace.clone(), resources())
+                    .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.slug, "lease_not_imported");
+        provider.release_completion(token).unwrap();
+        provider.release_pipeline(&pipeline).unwrap();
+    }
 }
