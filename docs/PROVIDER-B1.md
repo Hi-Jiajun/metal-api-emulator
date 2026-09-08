@@ -238,6 +238,20 @@ parity.
   Unix command-channel/descriptor cases are skipped on Windows because there
   is no `SCM_RIGHTS` equivalent. The optional reims adapter also cross-compiled
   and ran on the RTX 5060 (`reims-smoke.exe`, `PASS suite executor=reims`).
+- 2026-09-08 Windows named-mapping command channel: `metal-api-ipc` can create
+  named mappings (`shm_open` on Unix, `CreateFileMappingW` on Windows) and
+  carry the mapping name and length after an `ImportBorrowedLease` frame, so
+  the owner/provider command channel no longer needs `SCM_RIGHTS` for no-copy
+  leases. `provider-smoke` runs a two-process TCP case where the RTX 5060
+  child opens the owner's named section, imports it through
+  `VK_EXT_external_memory_host` and writes through the owner's pages; a
+  duplicate import is refused after consuming its mapping name and the
+  connection stays framed. CI run `34243286265` passed all five jobs with 241
+  Rust tests (core 145, ipc 26, receiver 5, sender 2, transport 4, native 9,
+  Vulkan 36, capture 14), 115 Python tests, the Lavapipe v1-v8 direct, object
+  and async-object captures and the macOS/reims jobs. The RTX 5060 run is
+  archived in `evidence/windows-named-8439f7e-2026-09-08/` and the CI run in
+  `evidence/windows-named-8439f7e-2026-09-08/run-34243286265/`.
 - 2026-09-08 native device-removal increment: 159 Rust tests passed (core 100,
   native 9, Vulkan 36, capture 14) and 115 Python tests passed. Native Metal
   classifies `MTLCommandBufferError::DeviceRemoved` (code 11) as `DeviceLost`

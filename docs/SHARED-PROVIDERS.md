@@ -120,20 +120,21 @@ device and publishes through a Unix socket while the parent retires a lease
 from the mirror alone. `metal-api-ipc::command` adds the opposite direction: a
 versioned `MCC1` request/response channel where the owner compiles, submits,
 waits, reads back, cancels and releases on a provider in another process, and
-imports staged leases plus descriptor-backed no-copy leases over the same
-connection, and chunk frames carry requests larger than one frame. A rejected
-duplicate import still consumes its descriptor so the connection stays framed.
+imports staged leases plus descriptor- or name-backed no-copy leases over the
+same connection, and chunk frames carry requests larger than one frame. A
+rejected duplicate import still consumes its descriptor or mapping name so the
+connection stays framed.
 dma-buf is a deliberate non-goal for the Windows rail (Linux-only kernel
 object); host-pointer import and the copy rails are the fallbacks. Guest memory
 and the production guest/display path remain future work.
 
-The Unix-domain-socket IPC, command-channel and shared-memory descriptor cases
-are `#[cfg(unix)]`. The Windows build skips them and runs the cross-platform
-Vulkan suite, including the single-process staged and borrowed no-copy imports;
-the borrowed import was validated on an RTX 5060 with
-`VK_EXT_external_memory_host` (`copy_out=in_place`). A Windows shared-memory
-handle transport is not implemented, so the owner/provider command channel
-remains Unix-only for borrowed leases.
+The Unix-domain-socket IPC and descriptor cases are `#[cfg(unix)]`. The
+Windows build skips them and runs the cross-platform Vulkan suite, including
+the single-process staged and borrowed no-copy imports and the two-process
+named-mapping command channel: the owner creates a named section, the provider
+opens it by name and imports the same pages. The borrowed import was validated
+on an RTX 5060 with `VK_EXT_external_memory_host` (`copy_out=in_place`) in both
+cases.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

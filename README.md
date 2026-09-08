@@ -174,12 +174,14 @@ Pass `-ProviderSmoke` to run `provider-smoke.exe` (the cross-platform provider
 suite) and `-CaptureMatrix` to write the v1-v8 direct, object and
 async-object captures under `target\windows-captures`.
 
-`provider-smoke.exe` also runs on Windows. The Unix-domain-socket IPC,
-command-channel and shared-memory descriptor cases are skipped there because
-Windows has no `SCM_RIGHTS` equivalent; the staged and borrowed no-copy lease
-cases run on the device. The RTX 5060 run exercised
-`VK_EXT_external_memory_host` host-pointer import with the owner mapping
-observing the GPU write in place.
+`provider-smoke.exe` also runs on Windows. The Unix-domain-socket IPC and
+descriptor cases are skipped there because Windows has no `SCM_RIGHTS`
+equivalent, but the two-process command channel runs over TCP with a named
+section mapping: the owner creates it with `CreateFileMappingW`, the child
+opens it with `OpenFileMappingW` and imports it as a borrowed no-copy lease.
+The RTX 5060 run exercised `VK_EXT_external_memory_host` host-pointer import
+with the owner mapping observing the GPU write in place for both the
+single-process and the named two-process cases.
 
 The optional `reims-smoke.exe` also cross-compiles and runs on the same host.
 It reported the reims-vgpu persistent Vulkan engine and passed the copy,
@@ -204,8 +206,10 @@ the mirrored terminal alone. The same two processes also exercise the
 owner-to-provider `MCC1` request/response channel: the parent compiles,
 submits, waits, reads back and releases on the child, imports a staged lease,
 and passes a shared mapping descriptor with `SCM_RIGHTS` so the child imports
-the same pages as a `BorrowedNoCopy` lease and writes through them in place. It
-also imports an owner-issued staged lease, executes a view from the copied
+the same pages as a `BorrowedNoCopy` lease and writes through them in place. A
+second two-process case uses TCP and a named section instead of `SCM_RIGHTS`,
+so the same owner/provider command channel runs on Windows. It also imports an
+owner-issued staged lease, executes a view from the copied
 window and retires the lease through the owner ledger, then imports an aligned
 owner mapping without copying
 (`VK_EXT_external_memory_host`) and proves live reads and in-place GPU writes
