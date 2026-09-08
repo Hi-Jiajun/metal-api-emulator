@@ -4,36 +4,53 @@ use super::{
     assemble_owned_air, execute_copy_word, execute_indexed_boundary_dispatch,
     indexed_boundary_golden, wrap_air_bitcode,
 };
+#[cfg(unix)]
+use metal_api_core::completion::wire::MirrorOutcome;
 use metal_api_core::completion::wire::{
-    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate, MirrorOutcome,
+    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
 };
+#[cfg(unix)]
+use metal_api_core::provider::ProviderHealth;
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
     BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
     ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
     FootprintProof, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
     NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
+    StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
+#[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
+#[cfg(unix)]
 use metal_api_ipc::receiver::CompletionReceiver;
+#[cfg(unix)]
 use metal_api_ipc::sender::spawn_writer;
+#[cfg(unix)]
 use metal_api_ipc::{shared, unix};
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
 const BORROWED_SHARED_LEASE_ID: u64 = 99;
+#[cfg(unix)]
 const BORROWED_SHARED_ALLOCATION_ID: u64 = 298;
+#[cfg(unix)]
 const BORROWED_SHARED_LENGTH: u64 = 64;
+#[cfg(unix)]
 const BORROWED_SHARED_SIZE: usize = 4096;
+#[cfg(unix)]
 const BORROWED_SHARED_OWNER_WORD: u32 = 0xaaaa_aaaa;
+#[cfg(unix)]
 const BORROWED_SHARED_GPU_WORD: u32 = 0x1234_5678;
 
 #[derive(Default)]
@@ -48,6 +65,24 @@ impl CompletionSink for RecordingSink {
             .expect("recording completion sink")
             .push(message);
     }
+}
+
+#[cfg(not(unix))]
+pub fn run_completion_child(_socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --completion-child requires Unix domain sockets".into())
+}
+
+#[cfg(not(unix))]
+pub fn run_provider_command_child(
+    _command_socket: &std::ffi::OsStr,
+    _completion_socket: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --command-child requires Unix domain sockets".into())
+}
+
+#[cfg(not(unix))]
+pub fn run_borrowed_shared_child(_socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --borrowed-shared-child requires Unix domain sockets".into())
 }
 
 /// Exercise provider admission, GPU execution, writeback identity, and completion.
@@ -81,10 +116,16 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_indexed_and_refusals(&provider, &peer, &device)?;
     run_timeout_reclamation(Arc::clone(&executor))?;
     run_cancellation(Arc::clone(&executor))?;
+    #[cfg(unix)]
     run_completion_ipc(Arc::clone(&executor))?;
+    #[cfg(unix)]
     run_completion_ipc_process()?;
+    #[cfg(unix)]
     run_remote_provider_process()?;
+    #[cfg(unix)]
     run_borrowed_shared_process()?;
+    #[cfg(not(unix))]
+    println!("SKIP provider_ipc_process cases transport=unix reason=platform");
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
@@ -342,6 +383,7 @@ fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[cfg(unix)]
 fn run_completion_ipc(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
     let (owner_transport, provider_transport) = unix::pair()?;
     let (sender, writer) = spawn_writer(provider_transport)?;
@@ -440,6 +482,7 @@ fn run_completion_ipc(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
 /// publishes admission and the terminal transition through the real outbox and
 /// writer thread. The handshake line tells the owner which device epoch and
 /// submission identity to mirror before any frame is applied.
+#[cfg(unix)]
 pub fn run_completion_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
     let executor = VulkanExecutor::new()?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
@@ -522,6 +565,7 @@ pub fn run_completion_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Erro
 /// socket and publishes admission and terminal notifications on the
 /// completion socket. It never submits work on its own: every compile,
 /// submit, wait and readback below is initiated by the owner process.
+#[cfg(unix)]
 pub fn run_provider_command_child(
     command_socket: &std::ffi::OsStr,
     completion_socket: &std::ffi::OsStr,
@@ -554,6 +598,7 @@ pub fn run_provider_command_child(
 /// The parent process owns no provider in this case: it listens on a Unix
 /// socket, spawns the provider child and retires a lease from the mirrored
 /// completion stream alone.
+#[cfg(unix)]
 fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -637,6 +682,7 @@ fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
 /// mirrors the provider's completion stream on a second connection, and reads
 /// the result back over the command channel. The child never submits on its
 /// own, so this proves the owner can remotely drive a provider.
+#[cfg(unix)]
 fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -913,6 +959,7 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
 /// physical pages as a borrowed lease and submits one read and one write
 /// through them. The owner proves the write landed in its own mapping without
 /// any writeback copy.
+#[cfg(unix)]
 pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
     let stream = UnixStream::connect(socket)?;
     let descriptor = shared::recv_fd(&stream)?;
@@ -1103,6 +1150,7 @@ pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn
 /// The parent keeps no Vulkan provider. It creates the mapping, passes the
 /// descriptor with `SCM_RIGHTS`, mirrors the completion stream and then reads
 /// its own pages to prove the child's GPU write happened in place.
+#[cfg(unix)]
 fn run_borrowed_shared_process() -> Result<(), Box<dyn Error>> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -1210,6 +1258,7 @@ fn run_borrowed_shared_process() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn parse_handshake(line: &str) -> Result<(DeviceEpoch, CompletionToken), Box<dyn Error>> {
     let mut epoch = None;
     let mut submission = None;

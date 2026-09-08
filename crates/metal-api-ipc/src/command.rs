@@ -1003,7 +1003,6 @@ fn release_borrowed_descriptor(
     }
 }
 
-#[cfg(unix)]
 fn descriptor_error(slug: &'static str, class: ProviderErrorClass) -> ProviderError {
     ProviderError::new(ProviderPhase::Resolve, class, slug).expect("static descriptor refusal slug")
 }
