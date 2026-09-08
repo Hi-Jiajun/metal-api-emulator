@@ -5,16 +5,20 @@ use super::{
     indexed_boundary_golden, wrap_air_bitcode,
 };
 use metal_api_core::completion::wire::{
-    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
+    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate, MirrorOutcome,
 };
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BufferSource, BufferView, CompletionDisposition,
+    AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView, CompletionDisposition,
     CompletionPolicy, CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FootprintProof, OperationId, PipelineCompileRequest,
-    PipelineProvider, ProviderError, ProviderSubmission, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    DispatchKind, DispatchType, FootprintProof, LeaseId, LeaseLedger, LeaseObservation,
+    LeaseReservation, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
+    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, SubmissionId, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
+use metal_api_ipc::receiver::CompletionReceiver;
+use metal_api_ipc::sender::spawn_writer;
+use metal_api_ipc::unix;
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -65,6 +69,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_indexed_and_refusals(&provider, &peer, &device)?;
     run_timeout_reclamation(Arc::clone(&executor))?;
     run_cancellation(Arc::clone(&executor))?;
+    run_completion_ipc(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -316,6 +321,98 @@ fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
     }
     println!(
         "PASS provider_cancellation slot_released=true context_usable=true readback=refused completion_outbox=Submitted,Cancelled,Submitted,CompletedVisible"
+    );
+    Ok(())
+}
+
+fn run_completion_ipc(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let (owner_transport, provider_transport) = unix::pair()?;
+    let (sender, writer) = spawn_writer(provider_transport)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut receiver = CompletionReceiver::new(owner_transport, provider.device_epoch())?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"completion_ipc".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        95,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("ipc submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("ipc receiver did not apply admission".into());
+    }
+    let observed = provider
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("ipc submission did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("ipc receiver did not apply completion".into());
+    }
+
+    let lease_id = LeaseId::new(95);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(95),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 64,
+    })?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("ipc completion did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("ipc lease was not release-ready".into());
+    }
+
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    drop(receiver);
+    writer.join().map_err(|_| "ipc writer panicked")??;
+    println!(
+        "PASS provider_completion_ipc transport=unix outbox=Submitted,CompletedVisible lease=retired"
     );
     Ok(())
 }

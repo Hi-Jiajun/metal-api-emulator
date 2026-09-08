@@ -226,6 +226,7 @@ name = "metal-smoke"
 version = "0.1.0"
 dependencies = [
  "metal-api-core",
+ "metal-api-ipc",
  "metal-api-native",
  "metal-api-vulkan",
  "serde",
