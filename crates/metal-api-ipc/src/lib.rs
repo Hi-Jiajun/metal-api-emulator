@@ -14,9 +14,14 @@
 //! [`receiver::CompletionReceiver`] is the owner-side half: it applies received
 //! messages to a `metal_api_core::completion::wire::CompletionMirror` and can
 //! retire leases through the mirror's converged observation.
+//!
+//! [`sender::spawn_writer`] is the provider-side half: it implements the core
+//! `CompletionSink` over a background writer thread, so a provider outbox can
+//! publish without blocking a completion handler.
 
 pub mod codec;
 pub mod receiver;
+pub mod sender;
 pub mod transport;
 
 #[cfg(unix)]
