@@ -196,6 +196,81 @@ pub mod unix {
     }
 }
 
+pub mod tcp {
+    //! TCP helpers for [`CompletionTransport`].
+    //!
+    //! The two-process provider smoke uses this module on Windows, where the
+    //! Unix-domain-socket helpers are unavailable, and on Linux it exercises
+    //! the same portable path.
+
+    use super::CompletionTransport;
+    use std::io;
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    /// Transport over a TCP connection.
+    pub type TcpTransport = CompletionTransport<TcpStream, TcpStream>;
+
+    /// Wrap one connected stream.
+    pub fn from_stream(stream: TcpStream) -> io::Result<TcpTransport> {
+        stream.set_nodelay(true)?;
+        Ok(CompletionTransport::new(stream.try_clone()?, stream))
+    }
+
+    /// Connect to a listening endpoint.
+    pub fn connect(addr: impl ToSocketAddrs) -> io::Result<TcpTransport> {
+        from_stream(TcpStream::connect(addr)?)
+    }
+
+    impl CompletionTransport<TcpStream, TcpStream> {
+        /// Set the read timeout on the underlying socket.
+        pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.reader().set_read_timeout(timeout)
+        }
+
+        /// Set the write timeout on the underlying socket.
+        pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.writer().set_write_timeout(timeout)
+        }
+
+        /// Shut down both directions of the underlying socket.
+        pub fn shutdown_both(&self) -> io::Result<()> {
+            self.reader().shutdown(std::net::Shutdown::Both)
+        }
+    }
+
+    /// Listening socket that accepts transports.
+    #[derive(Debug)]
+    pub struct TcpListenerTransport {
+        listener: TcpListener,
+    }
+
+    impl TcpListenerTransport {
+        /// Bind a listener.
+        pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+            Ok(Self {
+                listener: TcpListener::bind(addr)?,
+            })
+        }
+
+        /// Address the listener is bound to.
+        pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+            self.listener.local_addr()
+        }
+
+        /// Accept one connection.
+        pub fn accept(&self) -> io::Result<TcpTransport> {
+            let (stream, _) = self.listener.accept()?;
+            from_stream(stream)
+        }
+
+        /// Borrow the underlying listener.
+        pub const fn listener(&self) -> &TcpListener {
+            &self.listener
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

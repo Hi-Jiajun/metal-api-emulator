@@ -20,9 +20,10 @@
 //! publish without blocking a completion handler.
 //!
 //! [`shared`] adds process-shared memory for no-copy provider leases: the
-//! owner creates an anonymous mapping and passes its descriptor over a Unix
-//! socket with `SCM_RIGHTS`, so the provider can import the same physical
-//! pages instead of receiving a copy.
+//! owner creates a mapping and passes its descriptor over a Unix socket with
+//! `SCM_RIGHTS`, or exports a named mapping (Unix `shm_open`, Windows
+//! `CreateFileMappingW`) that the provider opens by name, so it can import the
+//! same physical pages instead of receiving a copy.
 
 pub mod codec;
 pub mod command;
@@ -31,7 +32,6 @@ pub mod receiver;
 pub mod sender;
 pub mod transport;
 
-#[cfg(unix)]
 pub mod shared;
 
 #[cfg(unix)]

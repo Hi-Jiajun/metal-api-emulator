@@ -38,6 +38,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             metal_smoke::run_provider_command_child(&command_socket, &completion_socket)
         }
+        Some(flag) if flag == "--named-command-child" => {
+            let command_addr = args.next().ok_or(
+                "usage: provider-smoke --named-command-child <command-addr> <completion-addr>",
+            )?;
+            let completion_addr = args.next().ok_or(
+                "usage: provider-smoke --named-command-child <command-addr> <completion-addr>",
+            )?;
+            if args.next().is_some() {
+                return Err(
+                    "usage: provider-smoke --named-command-child <command-addr> <completion-addr>"
+                        .into(),
+                );
+            }
+            metal_smoke::run_named_command_child(&command_addr, &completion_addr)
+        }
         Some(other) => Err(format!("usage: provider-smoke (unknown argument {:?})", other).into()),
     }
 }

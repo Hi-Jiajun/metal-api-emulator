@@ -4,53 +4,45 @@ use super::{
     assemble_owned_air, execute_copy_word, execute_indexed_boundary_dispatch,
     indexed_boundary_golden, wrap_air_bitcode,
 };
-#[cfg(unix)]
 use metal_api_core::completion::wire::MirrorOutcome;
 use metal_api_core::completion::wire::{
     CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
 };
-#[cfg(unix)]
-use metal_api_core::provider::ProviderHealth;
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
     BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
     ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
     FootprintProof, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
     NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
-    StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
+use metal_api_ipc::command::{serve_provider_named, tcp as command_tcp, RemoteProvider};
 #[cfg(unix)]
-use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
-#[cfg(unix)]
+use metal_api_ipc::command::{serve_provider_unix, unix as command_unix};
 use metal_api_ipc::receiver::CompletionReceiver;
-#[cfg(unix)]
 use metal_api_ipc::sender::spawn_writer;
+use metal_api_ipc::shared;
+use metal_api_ipc::transport::tcp;
 #[cfg(unix)]
-use metal_api_ipc::{shared, unix};
+use metal_api_ipc::unix;
 use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
 use std::error::Error;
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+use std::io::{BufRead, BufReader};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(unix)]
 const BORROWED_SHARED_LEASE_ID: u64 = 99;
-#[cfg(unix)]
 const BORROWED_SHARED_ALLOCATION_ID: u64 = 298;
-#[cfg(unix)]
 const BORROWED_SHARED_LENGTH: u64 = 64;
-#[cfg(unix)]
 const BORROWED_SHARED_SIZE: usize = 4096;
-#[cfg(unix)]
 const BORROWED_SHARED_OWNER_WORD: u32 = 0xaaaa_aaaa;
-#[cfg(unix)]
 const BORROWED_SHARED_GPU_WORD: u32 = 0x1234_5678;
 
 #[derive(Default)]
@@ -124,6 +116,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_remote_provider_process()?;
     #[cfg(unix)]
     run_borrowed_shared_process()?;
+    run_named_provider_process()?;
     #[cfg(not(unix))]
     println!("SKIP provider_ipc_process cases transport=unix reason=platform");
     run_staged_lease(Arc::clone(&executor))?;
@@ -593,6 +586,40 @@ pub fn run_provider_command_child(
     Ok(())
 }
 
+/// Provider half of the two-process named-mapping test.
+///
+/// The child owns the Vulkan device and serves owner commands over TCP. It
+/// opens the named owner mapping and imports it as a no-copy lease, so the GPU
+/// writes through the owner's pages. This is the Windows command-channel path;
+/// the Linux CI runs the same code.
+pub fn run_named_command_child(
+    command_addr: &std::ffi::OsStr,
+    completion_addr: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    let command_addr = command_addr.to_string_lossy();
+    let completion_addr = completion_addr.to_string_lossy();
+    let completion_transport = tcp::connect(completion_addr.as_ref())?;
+    let executor = VulkanExecutor::new()?;
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let epoch = provider.device_epoch();
+    let (sender, writer) = spawn_writer(completion_transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(epoch, Arc::new(sender))?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut transport = command_tcp::connect(command_addr.as_ref())?;
+    transport.set_max_frame(1024);
+    serve_provider_named(&provider, &mut transport)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "named command writer panicked")??;
+    println!("PASS named_command_child epoch={} served=true", epoch.get());
+    Ok(())
+}
+
 /// Owner half of the two-process completion test.
 ///
 /// The parent process owns no provider in this case: it listens on a Unix
@@ -949,6 +976,179 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place chunked=1024"
+    );
+    Ok(())
+}
+
+/// Owner half of the two-process named-mapping test.
+///
+/// This is the portable counterpart of `run_remote_provider_process`: the
+/// command and completion channels are TCP and the no-copy lease travels as a
+/// named mapping instead of an `SCM_RIGHTS` descriptor. It runs on Windows,
+/// where the Unix descriptor path is unavailable, and on Linux so CI exercises
+/// the same code.
+fn run_named_provider_process() -> Result<(), Box<dyn Error>> {
+    let command_listener = command_tcp::TcpListenerCommandTransport::bind("127.0.0.1:0")?;
+    let completion_listener = tcp::TcpListenerTransport::bind("127.0.0.1:0")?;
+    let command_addr = command_listener.local_addr()?.to_string();
+    let completion_addr = completion_listener.local_addr()?.to_string();
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--named-command-child")
+        .arg(&command_addr)
+        .arg(&completion_addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("named command child stdout was not piped")?;
+    let lines = BufReader::new(stdout).lines();
+
+    let mut command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Exercise the chunked request path on the same connection.
+    command_transport.set_max_frame(1024);
+    let completion_transport = completion_listener.accept()?;
+    completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    let epoch = remote.device_epoch();
+    let mut receiver = CompletionReceiver::new(completion_transport, epoch)?;
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"named_provider_command".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let pipeline = remote.compile(compile).map_err(provider_error)?;
+
+    let (mut mapping, _name) = shared::SharedMemory::create_named(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    mapping.as_mut_slice()[..4].copy_from_slice(&BORROWED_SHARED_OWNER_WORD.to_le_bytes());
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    remote
+        .import_named_borrowed_lease(reservation, &mapping)
+        .map_err(provider_error)?;
+    // The duplicate request must consume its mapping name before the refusal,
+    // so the connection stays framed for the submission below.
+    let duplicate = remote
+        .import_named_borrowed_lease(reservation, &mapping)
+        .unwrap_err();
+    if duplicate.slug != "lease_already_imported" {
+        return Err(
+            format!("named borrowed duplicate import was not refused: {duplicate:?}").into(),
+        );
+    }
+    if remote.health() != ProviderHealth::Usable {
+        return Err("named command channel lost framing after a duplicate import".into());
+    }
+
+    let trace = borrowed_lease_trace(
+        epoch,
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        701,
+        702,
+    );
+    let resources = borrowed_lease_resources(epoch, reservation)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("named borrowed submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("named command receiver did not apply borrowed admission".into());
+    }
+    let observed = remote
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("named borrowed lease did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("named command receiver did not apply borrowed completion".into());
+    }
+    let readback = remote.readback(token).map_err(provider_error)?;
+    let result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    result.validate_for_trace(&trace)?;
+    check_writeback(&trace, &result, 1, &BORROWED_SHARED_GPU_WORD.to_le_bytes())?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "named owner mapping did not observe the provider GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("named owner mapping guards changed".into());
+    }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("named command completion did not retire the borrowed lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("named command borrowed lease was not release-ready".into());
+    }
+    remote.release_completion(token).map_err(provider_error)?;
+    remote
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(format!(
+            "named provider did not refuse the released borrowed lease: {refused:?}"
+        )
+        .into());
+    }
+    if receiver.applied() != 2 || receiver.ignored() != 0 {
+        return Err(format!(
+            "named command mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+    remote.release_pipeline(&pipeline).map_err(provider_error)?;
+    drop(remote);
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    if !status.success() {
+        return Err(format!("named command child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_named_command_process owner=parent provider=child transport=tcp mapping=named commands=compile,import_named,submit,wait,readback,release completion=mirrored writeback=exact borrowed=retired,in_place duplicate=refused chunked=1024"
     );
     Ok(())
 }
