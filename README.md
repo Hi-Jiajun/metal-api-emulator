@@ -215,8 +215,12 @@ owner mapping without copying
 (`VK_EXT_external_memory_host`) and proves live reads and in-place GPU writes
 before release. The command connection lowers its frame limit to 1 KiB in this
 case, so every request travels as chunk frames and the child reassembles it
-before decoding. This is a provider/legacy Vulkan comparison, not a native
-Metal oracle.
+before decoding. A final case injects a simulated device loss into a dedicated
+executor: `health` must report `DeviceLost`, new compilation must be refused
+with `device_lost`/`RetryAfterRecreate`, and a freshly created
+executor/provider pair must resume work with an exact writeback. The injection
+exercises the lifecycle state machine; it is not a real GPU device loss. This
+is a provider/legacy Vulkan comparison, not a native Metal oracle.
 
 The indexed case launches a 10x3 grid with an 8x2 nominal threadgroup, exercises
 a barrier and checks all 30 output words. Its source and reference output are

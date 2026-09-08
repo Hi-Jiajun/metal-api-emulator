@@ -67,6 +67,15 @@ uses the same wait/readback semantics.
    `Retryability::RetryAfterRecreate`. A device-loss failure does not consume
    the abandonment budget.
 
+   `provider-smoke` now covers this lifecycle on a dedicated Vulkan executor
+   with a simulated injection: after `VulkanExecutor::inject_device_loss_for_test`,
+   `health()` must report `DeviceLost`, the next `compile_pipeline` must be
+   refused with `device_lost` and `RetryAfterRecreate`, and a newly created
+   executor/provider pair must complete a fresh `copy_word` submission with an
+   exact writeback. The hook exists because CI cannot produce a deterministic
+   `VK_ERROR_DEVICE_LOST`; the case validates the state machine, not a real
+   device loss.
+
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
 `provider-capture --api objects --async`; CI runs v1-v8 this way on Lavapipe.
@@ -307,8 +316,10 @@ parity.
   issue recorded for the earlier publication candidate.
 - Windows provider executable SHA-256:
   `e8b61a45a64e44850fe048af52420dc2d93fa14feea9d571dd51bf0bf03da661`.
-- Device-loss/timeout mappings are unit-tested; no real GPU device loss or
-  timeout was injected. No Vulkan validation layer was available locally.
+- Device-loss/timeout mappings are unit-tested and `provider-smoke` injects a
+  simulated device loss to check the health/refusal/recreate lifecycle; no real
+  GPU device loss or timeout was injected. No Vulkan validation layer was
+  available locally.
 - Initial publication CI at `9d7c007` passed. The workflow now includes
   `provider-smoke`, but this increment has not been pushed or run in remote CI.
 

@@ -121,6 +121,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     println!("SKIP provider_ipc_process cases transport=unix reason=platform");
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
+    run_device_lifecycle()?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -1778,6 +1779,99 @@ fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
         .map_err(provider_error)?;
     println!(
         "PASS provider_borrowed_lease lease=98 alignment={alignment} copy_in=live copy_out=in_place retired=true refusal=lease_not_imported"
+    );
+    Ok(())
+}
+
+/// A confirmed device loss is terminal for the lost context: health reports
+/// `DeviceLost`, new work is refused with `RetryAfterRecreate`, and a fresh
+/// executor/provider pair must resume normal work. CI cannot produce a
+/// deterministic `VK_ERROR_DEVICE_LOST`, so the loss is injected through the
+/// executor's test hook and this case is a lifecycle check, not a real
+/// device-loss reproduction; the handle-destruction path still needs a real
+/// lost device or an in-flight resource at the moment of loss.
+fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"device_lifecycle".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 92, dispatch, bindings())?;
+    let result = submit_and_wait(&provider, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    if provider.health() != ProviderHealth::Usable {
+        return Err(format!("fresh provider is not usable: {:?}", provider.health()).into());
+    }
+    release_case(&provider, &pipeline, &result)?;
+
+    executor.inject_device_loss_for_test();
+    if provider.health() != ProviderHealth::DeviceLost {
+        return Err(format!(
+            "injected loss did not report DeviceLost: {:?}",
+            provider.health()
+        )
+        .into());
+    }
+    let refusal = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"device_lifecycle_refused".to_vec(),
+            )?,
+        )
+        .expect_err("lost provider admitted a new pipeline");
+    if refusal.class != metal_api_core::provider::ProviderErrorClass::DeviceLost
+        || refusal.slug != "device_lost"
+        || refusal.retryability != metal_api_core::provider::Retryability::RetryAfterRecreate
+        || refusal.completion != (CompletionDisposition::DeviceLost { token: None })
+    {
+        return Err(format!("lost provider refused with the wrong error: {refusal:?}").into());
+    }
+    drop(provider);
+
+    let recovered_executor = VulkanExecutor::new()?;
+    let recovered = VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+        .map_err(provider_error)?;
+    let recovered_device =
+        Device::new(Arc::clone(&recovered_executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = recovered_device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = recovered
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"device_lifecycle_recovered".to_vec(),
+            )?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 93, dispatch, bindings())?;
+    let result = submit_and_wait(&recovered, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    release_case(&recovered, &pipeline, &result)?;
+    println!(
+        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost retry=RetryAfterRecreate recreated=true writeback=exact"
     );
     Ok(())
 }

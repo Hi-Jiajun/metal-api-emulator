@@ -66,6 +66,18 @@ impl VulkanExecutor {
     pub fn provider_capabilities(&self) -> ProviderCapabilities {
         provider::capabilities_from_limits(&self.context.properties.limits)
     }
+
+    /// Simulate a confirmed device loss for lifecycle tests.
+    ///
+    /// CI cannot produce a deterministic `VK_ERROR_DEVICE_LOST`, so this hook
+    /// marks the shared context lost: `health` becomes `DeviceLost`, new work
+    /// is refused with `RetryAfterRecreate`, and still-submitted resources are
+    /// destroyed instead of retained. It does not replace a real device-loss
+    /// run and must not be used outside tests.
+    #[doc(hidden)]
+    pub fn inject_device_loss_for_test(&self) {
+        self.context.mark_device_lost();
+    }
 }
 
 pub(crate) struct VulkanPipelineArtifact {
