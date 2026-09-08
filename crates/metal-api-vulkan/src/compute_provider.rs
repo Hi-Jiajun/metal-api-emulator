@@ -4,7 +4,7 @@ use crate::{
     execute_pipeline_sequence_with_status, BoundDispatch, PendingExecution,
     TranslatedComputePipeline, VulkanExecutor, VulkanPipelineArtifact,
 };
-use metal_api_core::completion::CompletionRecord;
+use metal_api_core::completion::{CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
 const GPU_DEADLINE: Duration = Duration::from_secs(20);
@@ -32,7 +32,7 @@ struct CompletionSlot {
     record: Arc<CompletionRecord>,
     pending: Option<PendingExecution>,
     pool: Vec<BufferView>,
-    started: Instant,
+    deadline: ObservationDeadline,
 }
 
 /// One provider identity sharing the standalone executor's Vulkan device owner.
@@ -56,6 +56,7 @@ pub struct VulkanComputeProvider {
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
+    observation_deadline: Duration,
     async_execution: bool,
 }
 
@@ -86,6 +87,7 @@ impl VulkanComputeProvider {
             pipelines: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             retire_tx: Mutex::new(None),
+            observation_deadline: GPU_DEADLINE,
             async_execution: false,
         })
     }
@@ -99,6 +101,13 @@ impl VulkanComputeProvider {
 
     pub fn async_execution(&self) -> bool {
         self.async_execution
+    }
+
+    /// Bound how long a deferred submission may remain non-terminal before
+    /// `wait` publishes unknown completion. The default is 20 seconds.
+    pub fn with_observation_deadline(mut self, limit: Duration) -> Self {
+        self.observation_deadline = limit;
+        self
     }
 
     pub fn device_epoch(&self) -> DeviceEpoch {
@@ -444,7 +453,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         record: observation,
                         pending: None,
                         pool: Vec::new(),
-                        started: Instant::now(),
+                        deadline: ObservationDeadline::new(self.observation_deadline),
                     },
                 );
         }
@@ -457,32 +466,32 @@ impl ComputeProvider for VulkanComputeProvider {
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.validate_token(token)?;
-        let (record, pending, pool, started) = {
+        let (record, pending, pool, deadline) = {
             let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
             let slot = completions
                 .get_mut(&token.submission_id)
                 .ok_or_else(|| unknown_completion(token))?;
             if !slot.record.is_running() {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.started)
+                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
             } else if let Some(pending) = slot.pending.take() {
                 (
                     Arc::clone(&slot.record),
                     Some(pending),
                     slot.pool.clone(),
-                    slot.started,
+                    slot.deadline,
                 )
             } else {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.started)
+                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
             }
         };
         let Some(mut pending) = pending else {
             return record.wait(token, timeout);
         };
-        let Some(remaining) = GPU_DEADLINE.checked_sub(started.elapsed()) else {
+        if deadline.expired() {
             drop(pending);
             return Err(self.fail_deadline(&record, token));
-        };
-        match pending.wait(duration_to_nanos(timeout.min(remaining))) {
+        }
+        match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
             Ok(true) => match pending
                 .read_updates()
                 .and_then(|updates| map_writebacks(&pool, updates, token))
@@ -499,7 +508,7 @@ impl ComputeProvider for VulkanComputeProvider {
                 }
             },
             Ok(false) => {
-                if started.elapsed() >= GPU_DEADLINE {
+                if deadline.expired() {
                     drop(pending);
                     return Err(self.fail_deadline(&record, token));
                 }
@@ -566,7 +575,7 @@ impl VulkanComputeProvider {
                     record,
                     pending: Some(pending),
                     pool,
-                    started: Instant::now(),
+                    deadline: ObservationDeadline::new(self.observation_deadline),
                 },
             );
         Ok(ProviderSubmission {

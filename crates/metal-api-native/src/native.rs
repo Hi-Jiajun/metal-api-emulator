@@ -9,7 +9,7 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
     MTLResourceOptions, MTLSize,
 };
-use metal_api_core::completion::CompletionRecord;
+use metal_api_core::completion::{CompletionRecord, ObservationDeadline};
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use std::collections::BTreeMap;
@@ -39,20 +39,20 @@ struct State {
 #[derive(Clone)]
 struct CompletionSlot {
     record: Arc<CompletionRecord>,
-    started: Instant,
+    deadline: ObservationDeadline,
 }
 
 /// Native provider with at most eight serial passes over one buffer pool,
 /// allowing pipeline changes and binding permutations for exact fixtures.
 ///
-/// A submission has a 20-second observation deadline. Unknown retirement or a
-/// GPU error permanently disables new work in this context and retains its
-/// submitted backing until process exit. `wait` reads the recorded terminal
-/// observation; releasing that record does not retire GPU resources. By
-/// default `submit` waits for GPU completion and readback. Calling
-/// [`NativeMetalProvider::with_async_execution`] with `true` instead returns
-/// `Submitted` immediately and fills the completion record from an
-/// `MTLCommandBuffer` completion handler.
+/// A submission has a configurable observation deadline (20 seconds by
+/// default). Unknown retirement or a GPU error permanently disables new work
+/// in this context and retains its submitted backing until process exit.
+/// `wait` reads the recorded terminal observation; releasing that record does
+/// not retire GPU resources. By default `submit` waits for GPU completion and
+/// readback. Calling [`NativeMetalProvider::with_async_execution`] with `true`
+/// instead returns `Submitted` immediately and fills the completion record from
+/// an `MTLCommandBuffer` completion handler.
 pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
@@ -60,6 +60,7 @@ pub struct NativeMetalProvider {
     state: Mutex<State>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     async_execution: bool,
+    observation_deadline: Duration,
     async_abandoned: Arc<AtomicBool>,
 }
 
@@ -128,6 +129,7 @@ impl NativeMetalProvider {
                 }),
                 completions: Mutex::new(BTreeMap::new()),
                 async_execution: false,
+                observation_deadline: GPU_DEADLINE,
                 async_abandoned: Arc::new(AtomicBool::new(false)),
             })
         })
@@ -147,6 +149,13 @@ impl NativeMetalProvider {
 
     pub fn async_execution(&self) -> bool {
         self.async_execution
+    }
+
+    /// Bound how long a deferred submission may remain non-terminal before
+    /// `wait` publishes unknown completion. The default is 20 seconds.
+    pub fn with_observation_deadline(mut self, limit: Duration) -> Self {
+        self.observation_deadline = limit;
+        self
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, ProviderError> {
@@ -400,7 +409,7 @@ impl ComputeProvider for NativeMetalProvider {
                 token.submission_id,
                 CompletionSlot {
                     record,
-                    started: Instant::now(),
+                    deadline: ObservationDeadline::new(self.observation_deadline),
                 },
             );
         }
@@ -417,13 +426,11 @@ impl ComputeProvider for NativeMetalProvider {
         if !slot.record.is_running() {
             return slot.record.wait(token, timeout);
         }
-        let Some(remaining) = GPU_DEADLINE.checked_sub(slot.started.elapsed()) else {
+        if slot.deadline.expired() {
             return Err(self.fail_deadline(&slot, token));
-        };
-        let observed = slot.record.wait(token, timeout.min(remaining))?;
-        if matches!(observed, CompletionDisposition::TimedOut { .. })
-            && slot.started.elapsed() >= GPU_DEADLINE
-        {
+        }
+        let observed = slot.record.wait(token, slot.deadline.clamp(timeout))?;
+        if matches!(observed, CompletionDisposition::TimedOut { .. }) && slot.deadline.expired() {
             return Err(self.fail_deadline(&slot, token));
         }
         Ok(observed)
@@ -664,7 +671,7 @@ impl NativeMetalProvider {
             token.submission_id,
             CompletionSlot {
                 record: Arc::clone(&record),
-                started: Instant::now(),
+                deadline: ObservationDeadline::new(self.observation_deadline),
             },
         );
         let abandoned = Arc::clone(&self.async_abandoned);

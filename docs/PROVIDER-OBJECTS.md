@@ -118,13 +118,13 @@ stand in for object captures.
 
 ## Verification checkpoint
 
-- 145 Rust tests passed: core 90, native 7, Vulkan 34, capture 14. The eight
+- 147 Rust tests passed: core 92, native 7, Vulkan 34, capture 14. The eight
   new core tests cover asynchronous `Submitted` finalization, readback
   validation, non-terminal wait retries, terminal failure/unknown completion,
   unsupported readback, reservation blocking and overlapping async commands.
-  Four shared `metal_api_core::completion` tests cover the completion record's
+  Six shared `metal_api_core::completion` tests cover the completion record's
   timeout, waiter-wakeup, readback, failure propagation and first-terminal-wins
-  paths used by both providers.
+  paths plus `ObservationDeadline` clamping and expiry.
   Earlier tests cover single submission, recording snapshots, commit-time
   bytes, foreign ownership, limits, aliases, atomic failure, panic/waiter
   recovery, concurrent commands and pipeline/completion retirement.
@@ -137,9 +137,9 @@ stand in for object captures.
   completion record without a per-submission worker.
   `NativeMetalProvider::with_async_execution(true)` returns `Submitted` after
   commit and fills the same record type from an `MTLCommandBuffer` completion
-  handler; a 20-second observation deadline reports unknown completion and
-  abandons the provider. The default synchronous mode, direct trace rail and
-  all five comparison paths are unchanged. CI runs
+  handler; a configurable observation deadline (20 seconds by default) reports
+  unknown completion and abandons the provider. The default synchronous mode,
+  direct trace rail and all five comparison paths are unchanged. CI runs
   `provider-capture --api objects --async` for v1-v7 on Lavapipe and, when a
   native device is eligible, on macOS.
 - All 26 v1-v7 object cases passed on Linux/Lavapipe and Windows/RTX 5060.

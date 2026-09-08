@@ -34,13 +34,13 @@ uses the same wait/readback semantics.
    calling thread under the shared queue lock and returns `Submitted` without
    waiting. `wait` waits on the device completion fence with its
    caller-supplied timeout and then performs readback; `readback` returns the
-   same canonical writebacks after completion. A 20-second observation
-   deadline reports `vulkan-completion-unknown` with `SubmittedUnknown` and
-   makes the executor unusable. `release_completion` hands a still-pending
-   submission to a shared retirement thread that waits for the fence and
-   releases its handles. `release_pipeline` removes a registry entry.
-   In-progress submissions keep their own artifact reference. These calls do
-   not release abandoned GPU work.
+   same canonical writebacks after completion. A configurable observation
+   deadline (20 seconds by default, `with_observation_deadline`) reports
+   `vulkan-completion-unknown` with `SubmittedUnknown` and makes the executor
+   unusable. `release_completion` hands a still-pending submission to a shared
+   retirement thread that waits for the fence and releases its handles.
+   `release_pipeline` removes a registry entry. In-progress submissions keep
+   their own artifact reference. These calls do not release abandoned GPU work.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
@@ -48,9 +48,10 @@ unchanged. The async mode is used by the object-API capture path with
 Async mode still serializes submission with the same queue lock, so it overlaps
 host work and completion observation rather than concurrent GPU execution.
 There is no end-to-end deadline on compilation, locks, initialization or
-submit. A 20-second fence timeout or caller deadline makes the executor
-unusable and reports unknown completion with retained resources. Live guest
-leases, multi-pass ordering, general MTLB resolution and native Metal remain
+submit. The synchronous fence wait keeps a fixed 20-second bound; a configured
+observation deadline or caller deadline makes the executor unusable and
+reports unknown completion with retained resources. Live guest leases,
+multi-pass ordering, general MTLB resolution and native Metal remain
 unimplemented.
 
 ## Execution failures and visibility
@@ -94,6 +95,13 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 observation-deadline increment: 147 Rust tests passed (core 92,
+  native 7, Vulkan 34, capture 14) and 113 Python tests passed. The shared
+  `ObservationDeadline` clamps caller timeouts to the remaining observation
+  window and both providers use it with a configurable limit (20 seconds by
+  default). Linux/Lavapipe v1-v7 async-object captures passed with unchanged
+  host-visible writebacks. Formatting, Clippy with `-D warnings` and rustdoc
+  passed.
 - 2026-09-08 Vulkan device-fence increment: 145 Rust tests passed (core 90,
   native 7, Vulkan 34, capture 14) and 113 Python tests passed. Async submit
   records and submits on the calling thread, and `wait` observes the device

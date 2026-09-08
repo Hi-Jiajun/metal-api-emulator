@@ -18,6 +18,46 @@ enum CompletionState {
     Failed(ProviderError),
 }
 
+/// A monotonic observation bound shared by deferred-completion providers.
+///
+/// A provider starts one deadline when it records a `Submitted` submission.
+/// `wait` clamps the caller's timeout to `remaining`; once `expired` is true,
+/// the provider must publish a terminal unknown completion instead of a
+/// non-terminal `TimedOut`. The deadline measures host observation time, not
+/// device execution time.
+#[derive(Clone, Copy, Debug)]
+pub struct ObservationDeadline {
+    started: Instant,
+    limit: Duration,
+}
+
+impl ObservationDeadline {
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            limit,
+        }
+    }
+
+    pub fn limit(&self) -> Duration {
+        self.limit
+    }
+
+    /// Time left before the provider must report unknown completion.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.limit.checked_sub(self.started.elapsed())
+    }
+
+    pub fn expired(&self) -> bool {
+        self.remaining().is_none()
+    }
+
+    /// Bound a caller timeout by the remaining observation window.
+    pub fn clamp(&self, requested: Duration) -> Duration {
+        requested.min(self.remaining().unwrap_or(Duration::ZERO))
+    }
+}
+
 /// Shared slot between a submit path and later `wait`/`readback` calls.
 ///
 /// A synchronous provider fills the slot before returning `CompletedVisible`.
@@ -260,5 +300,25 @@ mod tests {
         record.complete(vec![completion_writeback()]);
         assert_eq!(record.wait(token, Duration::ZERO).unwrap_err(), failure);
         assert_eq!(record.readback(token).unwrap_err(), failure);
+    }
+
+    #[test]
+    fn observation_deadline_clamps_to_the_smaller_bound() {
+        let deadline = ObservationDeadline::new(Duration::from_secs(30));
+        assert_eq!(
+            deadline.clamp(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert!(deadline.clamp(Duration::from_secs(60)) <= Duration::from_secs(30));
+        assert!(!deadline.expired());
+        assert_eq!(deadline.limit(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn expired_observation_deadline_never_grants_a_retry_window() {
+        let deadline = ObservationDeadline::new(Duration::ZERO);
+        assert!(deadline.expired());
+        assert_eq!(deadline.remaining(), None);
+        assert_eq!(deadline.clamp(Duration::from_secs(5)), Duration::ZERO);
     }
 }
