@@ -74,6 +74,12 @@ implements `readback`; otherwise the command fails at wait with a structured
 capability error and no host bytes change. Dropping a pending command releases
 its reservations and completion record without claiming that unknown GPU work
 retired; the backend's retention policy still governs GPU storage.
+Submit-time provider failures follow the same no-partial-landing rule. A
+`DeviceLost` refusal keeps its observed token when one exists, marks the
+command `Failed` and refuses later work until the provider is recreated; an
+`Exhausted` refusal reports `provider_unavailable` with `NotSubmitted`.
+Native Metal reports `DeviceLost` for `MTLCommandBufferError::DeviceRemoved`
+(code 11) on both the synchronous and completion-handler paths.
 `CommandBuffer::cancel` does the same explicitly: it calls
 `ComputeProvider::cancel`, drops the host reservations and marks the command
 `Failed` with `CompletionUnavailable(Cancelled)`. A cancel that races a
@@ -125,6 +131,14 @@ stand in for object captures.
 
 ## Verification checkpoint
 
+- 2026-09-08 submit-time error matrix: object commands now assert that
+  submit-time `DeviceLost` (token preserved) and `Exhausted` (`NotSubmitted`)
+  failures leave status `Failed`, make `submission()` return the same error
+  and change no host buffer. Native device removal is classified from the
+  `MTLCommandBufferError` code 11 on both the synchronous and
+  completion-handler paths. 159 Rust tests passed (core 100, native 9,
+  Vulkan 36, capture 14) and 115 Python tests passed; v8 direct and
+  async-object Lavapipe captures matched.
 - 147 Rust tests passed: core 92, native 7, Vulkan 34, capture 14. The eight
   new core tests cover asynchronous `Submitted` finalization, readback
   validation, non-terminal wait retries, terminal failure/unknown completion,

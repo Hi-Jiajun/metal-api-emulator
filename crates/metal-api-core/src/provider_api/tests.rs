@@ -2,8 +2,8 @@ use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, BufferAccess, BufferBindingContract, BufferWriteback,
     CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof, FunctionIdentity,
-    PipelineContract, ProviderErrorClass, ProviderPhase, SemanticDigest, ShaderSource, StorageMode,
-    SubmissionId, ValidatedComputeTrace,
+    PipelineContract, ProviderErrorClass, ProviderPhase, Retryability, SemanticDigest,
+    ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -27,6 +27,8 @@ const ASYNC_DEVICE_LOST: usize = 16;
 const CANCEL_GOOD: usize = 17;
 const CANCEL_RACE_COMPLETED: usize = 18;
 const CANCEL_REFUSED: usize = 19;
+const SUBMIT_DEVICE_LOST: usize = 20;
+const SUBMIT_EXHAUSTED: usize = 21;
 
 const fn is_async_mode(mode: usize) -> bool {
     matches!(
@@ -131,6 +133,28 @@ impl ComputeProvider for FakeProvider {
             release.wait();
         }
         let mode = self.mode.load(Ordering::SeqCst);
+        if mode == SUBMIT_DEVICE_LOST {
+            let mut error = ProviderError::new(
+                ProviderPhase::Submit,
+                ProviderErrorClass::DeviceLost,
+                "device_lost",
+            )
+            .unwrap()
+            .with_completion(CompletionDisposition::DeviceLost { token: Some(token) });
+            error.retryability = Retryability::RetryAfterRecreate;
+            return Err(error);
+        }
+        if mode == SUBMIT_EXHAUSTED {
+            let mut error = ProviderError::new(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Resource,
+                "provider_unavailable",
+            )
+            .unwrap()
+            .with_completion(CompletionDisposition::NotSubmitted);
+            error.retryability = Retryability::RetryAfterRecreate;
+            return Err(error);
+        }
         if mode == FAIL {
             return Err(self.error(token));
         }
@@ -704,6 +728,70 @@ fn provider_failures_and_invalid_results_never_partially_land() {
         assert_eq!(
             provider.released_completions.lock().unwrap().len(),
             usize::from(mode != PANIC_SUBMIT)
+        );
+    }
+}
+
+#[test]
+fn submit_time_device_errors_never_land() {
+    for mode in [SUBMIT_DEVICE_LOST, SUBMIT_EXHAUSTED] {
+        let (provider, device) = setup();
+        provider.mode.store(mode, Ordering::SeqCst);
+        let pipeline = pipeline(&device, "wide:2");
+        let (a, av) = buffer(&device, 1);
+        let (b, bv) = buffer(&device, 2);
+        let command = command(&device, &pipeline, &[(0, &av), (1, &bv)]);
+        let error = command.commit().unwrap_err();
+        let Error::Provider(provider_error) = &error else {
+            panic!("mode={mode}: {error:?}");
+        };
+        assert_eq!(provider_error.phase, ProviderPhase::Submit, "mode={mode}");
+        assert_eq!(
+            provider_error.retryability,
+            Retryability::RetryAfterRecreate,
+            "mode={mode}"
+        );
+        match mode {
+            SUBMIT_DEVICE_LOST => {
+                assert_eq!(
+                    provider_error.class,
+                    ProviderErrorClass::DeviceLost,
+                    "mode={mode}"
+                );
+                assert_eq!(provider_error.slug, "device_lost", "mode={mode}");
+                assert!(
+                    matches!(
+                        provider_error.completion,
+                        CompletionDisposition::DeviceLost { token: Some(_) }
+                    ),
+                    "mode={mode}"
+                );
+            }
+            SUBMIT_EXHAUSTED => {
+                assert_eq!(
+                    provider_error.class,
+                    ProviderErrorClass::Resource,
+                    "mode={mode}"
+                );
+                assert_eq!(provider_error.slug, "provider_unavailable", "mode={mode}");
+                assert_eq!(
+                    provider_error.completion,
+                    CompletionDisposition::NotSubmitted,
+                    "mode={mode}"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(command.status().unwrap(), CommandBufferStatus::Failed);
+        assert_eq!(command.wait_until_completed(), Err(error.clone()));
+        assert_eq!(command.submission(), Err(error.clone()));
+        assert_eq!(a.read().unwrap(), vec![1; 8], "mode={mode}");
+        assert_eq!(b.read().unwrap(), vec![2; 8], "mode={mode}");
+        drop(command);
+        assert_eq!(
+            provider.released_completions.lock().unwrap().len(),
+            usize::from(mode == SUBMIT_DEVICE_LOST),
+            "mode={mode}"
         );
     }
 }

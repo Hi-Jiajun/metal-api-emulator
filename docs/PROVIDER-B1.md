@@ -51,10 +51,14 @@ uses the same wait/readback semantics.
    `with_abandonment_budget` raises or lowers the bound. When the bound is
    reached, `health()` reports `Exhausted` and new compile/submit calls are
    refused with `provider_unavailable` and `Retryability::RetryAfterRecreate`.
-   A confirmed `VK_ERROR_DEVICE_LOST` takes the `DeviceLost` path instead:
-   `health()` reports `DeviceLost`, the lost device's handles are destroyed
-   rather than leaked, and new work is refused until the caller recreates the
-   provider.
+   A confirmed `VK_ERROR_DEVICE_LOST`, or a native
+   `MTLCommandBufferError::DeviceRemoved` (code 11) observed on a terminal
+   command buffer, takes the `DeviceLost` path instead: `health()` reports
+   `DeviceLost`, the lost device's handles are destroyed rather than leaked,
+   and new work is refused with the provider's device-loss slug (`device_lost`
+   on Vulkan, `metal_device_removed` on native Metal) and
+   `Retryability::RetryAfterRecreate`. A device-loss failure does not consume
+   the abandonment budget.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
@@ -72,9 +76,13 @@ ordering, general MTLB resolution and native Metal remain unimplemented.
 ## Execution failures and visibility
 
 Failures retain Resolve/Compile/Encode/Submit/Wait/Readback phase information.
-Vulkan return codes determine device-loss classification; diagnostic strings
-are not parsed. This mapping is an experimental Vulkan mapping, not an agreed
-native/Vulkan error vocabulary.
+Vulkan return codes and the native `NSError` code determine device-loss
+classification; diagnostic strings are not parsed. Native Metal maps
+`MTLCommandBufferError::DeviceRemoved` (code 11) to `DeviceLost` on both the
+synchronous and completion-handler paths; every other terminal command-buffer
+error keeps the `metal_command_failed` path and marks the provider
+`Exhausted`. The Vulkan and native slugs remain distinct (`device_lost` versus
+`metal_device_removed`), so this is not yet a shared error vocabulary.
 
 - Before queue submission: `NotSubmitted`.
 - Queue OOM failures: `NotSubmitted`, because Vulkan guarantees referenced
@@ -110,6 +118,17 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 native device-removal increment: 159 Rust tests passed (core 100,
+  native 9, Vulkan 36, capture 14) and 115 Python tests passed. Native Metal
+  classifies `MTLCommandBufferError::DeviceRemoved` (code 11) as `DeviceLost`
+  on both the synchronous and completion-handler paths and refuses new work
+  with `metal_device_removed`/`RetryAfterRecreate`. The object API now covers
+  submit-time `DeviceLost` (observed token preserved) and `Exhausted`
+  (`NotSubmitted`) failures that leave the command `Failed` with no host
+  bytes changed. Linux/Lavapipe ran the v8 direct and async-object captures
+  with unchanged host-visible writebacks. Formatting, Clippy with
+  `-D warnings`, rustdoc and the macOS cross-target check passed. No real
+  device-removal error was injected.
 - 2026-09-08 binary-AIR encoding increment: 151 Rust tests passed (core 96,
   native 7, Vulkan 34, capture 14) and 115 Python tests passed. `suite-v8.json`
   reuses the v7 cases with raw and Apple-wrapped bitcode; Lavapipe and the

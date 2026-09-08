@@ -1,7 +1,10 @@
 //! Metal handles stay behind one lock. No guest pointers or caller-owned
 //! memory are passed to Metal; submission copies admitted view contents.
 
-use crate::{bounded_contract, refusal, unknown_completion};
+use crate::{
+    bounded_contract, classify_command_buffer_error, device_lost_refusal, refusal,
+    unknown_completion, CommandBufferFailure,
+};
 use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -36,6 +39,7 @@ struct State {
     next_pipeline: u64,
     next_submission: u64,
     abandoned: bool,
+    device_lost: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -142,6 +146,7 @@ impl NativeMetalProvider {
                     next_pipeline: 1,
                     next_submission: 1,
                     abandoned: false,
+                    device_lost: Arc::new(AtomicBool::new(false)),
                 }),
                 completions: Mutex::new(BTreeMap::new()),
                 abandonment_budget: AbandonmentBudget::new(8, 64 * 1024 * 1024),
@@ -185,11 +190,16 @@ impl NativeMetalProvider {
 
     /// Report whether this provider can still admit new work.
     pub fn health(&self) -> ProviderHealth {
-        let state_abandoned = match self.state.lock() {
-            Ok(state) => state.abandoned,
-            Err(poisoned) => poisoned.into_inner().abandoned,
+        let (state_abandoned, device_lost) = match self.state.lock() {
+            Ok(state) => (state.abandoned, state.device_lost.load(Ordering::SeqCst)),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.abandoned, state.device_lost.load(Ordering::SeqCst))
+            }
         };
-        if state_abandoned || self.async_abandoned.load(Ordering::SeqCst) {
+        if device_lost {
+            ProviderHealth::DeviceLost
+        } else if state_abandoned || self.async_abandoned.load(Ordering::SeqCst) {
             ProviderHealth::Exhausted
         } else {
             ProviderHealth::Usable
@@ -229,6 +239,9 @@ impl NativeMetalProvider {
     }
 
     fn ensure_usable(&self, state: &State) -> Result<(), ProviderError> {
+        if state.device_lost.load(Ordering::SeqCst) {
+            return Err(device_lost_refusal(ProviderPhase::Resolve, None));
+        }
         if state.abandoned || self.async_abandoned.load(Ordering::SeqCst) {
             let mut error = resource_error("provider_unavailable");
             error.retryability = Retryability::RetryAfterRecreate;
@@ -292,6 +305,10 @@ impl NativeMetalProvider {
             .with_detail(error.to_string())
         })
     }
+}
+
+fn device_lost_error(token: CompletionToken, detail: String) -> ProviderError {
+    device_lost_refusal(ProviderPhase::Wait, Some(token)).with_detail(detail)
 }
 
 impl PipelineProvider for NativeMetalProvider {
@@ -653,11 +670,15 @@ fn execute(
         match resources.command.status() {
             MTLCommandBufferStatus::Completed => break,
             MTLCommandBufferStatus::Error => {
-                state.abandoned = true;
-                let detail = unsafe {
+                let (detail, code) = unsafe {
                     let error: *mut Object = msg_send![resources.command.as_ref(), error];
-                    error_description(error)
+                    (error_description(error), command_buffer_error_code(error))
                 };
+                if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                    state.device_lost.store(true, Ordering::SeqCst);
+                    return Err(device_lost_error(token, detail));
+                }
+                state.abandoned = true;
                 return Err(refusal(
                     ProviderPhase::Wait,
                     ProviderErrorClass::Execute,
@@ -747,6 +768,7 @@ impl NativeMetalProvider {
             },
         );
         let abandoned = Arc::clone(&self.async_abandoned);
+        let device_lost = Arc::clone(&state.device_lost);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -756,18 +778,23 @@ impl NativeMetalProvider {
                 objc::rc::autoreleasepool(|| match command.status() {
                     MTLCommandBufferStatus::Completed => Ok(collect_writebacks(&pool, &buffers)),
                     MTLCommandBufferStatus::Error => {
-                        abandoned.store(true, Ordering::SeqCst);
-                        let detail = unsafe {
+                        let (detail, code) = unsafe {
                             let error: *mut Object = msg_send![command, error];
-                            error_description(error)
+                            (error_description(error), command_buffer_error_code(error))
                         };
-                        Err(refusal(
-                            ProviderPhase::Wait,
-                            ProviderErrorClass::Execute,
-                            "metal_command_failed",
-                        )
-                        .with_detail(detail)
-                        .with_completion(CompletionDisposition::Failed { token: Some(token) }))
+                        if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                            device_lost.store(true, Ordering::SeqCst);
+                            Err(device_lost_error(token, detail))
+                        } else {
+                            abandoned.store(true, Ordering::SeqCst);
+                            Err(refusal(
+                                ProviderPhase::Wait,
+                                ProviderErrorClass::Execute,
+                                "metal_command_failed",
+                            )
+                            .with_detail(detail)
+                            .with_completion(CompletionDisposition::Failed { token: Some(token) }))
+                        }
                     }
                     _ => Err(refusal(
                         ProviderPhase::Wait,
@@ -829,6 +856,14 @@ fn unknown_pipeline(id: PipelineId) -> ProviderError {
         "unknown_pipeline",
     )
     .with_field("pipeline", FieldValue::Unsigned(id.get()))
+}
+
+/// Called only inside an autorelease pool with nil or a live NSError pointer.
+unsafe fn command_buffer_error_code(error: *mut Object) -> Option<i64> {
+    if error.is_null() {
+        return None;
+    }
+    Some(msg_send![error, code])
 }
 
 /// Called only inside an autorelease pool with nil or a live NSError pointer.

@@ -44,8 +44,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   budget remains intact. A provider-scoped `AbandonmentBudget` bounds how many
   unobservable submissions it tolerates; once exhausted, `health()` reports
   `Exhausted` and new work is refused with `provider_unavailable` and
-  `RetryAfterRecreate`. A confirmed device loss reports `DeviceLost` and
-  destroys the lost device's handles. `ComputeProvider::cancel` and
+  `RetryAfterRecreate`. A confirmed device loss reports `DeviceLost`,
+  destroys the lost device's handles and refuses new work until the provider
+  is recreated; Vulkan derives it from `VK_ERROR_DEVICE_LOST`, while native
+  Metal derives it from `MTLCommandBufferError::DeviceRemoved` (code 11).
+  `ComputeProvider::cancel` and
   `CommandBuffer::cancel` release a pending observation without claiming device
   retirement.
 - Shared provider API: compilation, pipeline metadata and release now use

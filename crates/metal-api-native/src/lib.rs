@@ -29,6 +29,41 @@ fn refusal(phase: ProviderPhase, class: ProviderErrorClass, slug: &'static str) 
     error
 }
 
+/// A device that reported `DeviceRemoved` stays unusable until recreation.
+#[cfg(any(target_os = "macos", test))]
+fn device_lost_refusal(phase: ProviderPhase, token: Option<CompletionToken>) -> ProviderError {
+    let mut error = refusal(
+        phase,
+        ProviderErrorClass::DeviceLost,
+        "metal_device_removed",
+    );
+    error.retryability = Retryability::RetryAfterRecreate;
+    error.completion = CompletionDisposition::DeviceLost { token };
+    error
+}
+
+/// `MTLCommandBufferError::DeviceRemoved` from Metal 0.33.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const DEVICE_REMOVED_ERROR_CODE: i64 = 11;
+
+/// How a terminal `MTLCommandBufferStatus::Error` must be classified.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommandBufferFailure {
+    DeviceLost,
+    Other,
+}
+
+/// Classify a command-buffer error code without loading Metal.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn classify_command_buffer_error(code: Option<i64>) -> CommandBufferFailure {
+    if code == Some(DEVICE_REMOVED_ERROR_CODE) {
+        CommandBufferFailure::DeviceLost
+    } else {
+        CommandBufferFailure::Other
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn unknown_completion(token: CompletionToken) -> ProviderError {
     // The record may have been explicitly released. Its absence cannot prove
@@ -152,6 +187,55 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
 mod tests {
     use super::*;
     use metal_api_core::provider::{DeviceEpoch, SemanticDigest, SubmissionId};
+
+    #[test]
+    fn device_removed_is_distinct_from_other_command_buffer_errors() {
+        assert_eq!(
+            classify_command_buffer_error(Some(DEVICE_REMOVED_ERROR_CODE)),
+            CommandBufferFailure::DeviceLost
+        );
+        assert_eq!(
+            classify_command_buffer_error(Some(2)),
+            CommandBufferFailure::Other
+        );
+        assert_eq!(
+            classify_command_buffer_error(None),
+            CommandBufferFailure::Other
+        );
+    }
+
+    #[test]
+    fn device_loss_requires_recreation_and_keeps_the_observed_token() {
+        let unavailable = device_lost_refusal(ProviderPhase::Resolve, None);
+        assert_eq!(unavailable.phase, ProviderPhase::Resolve);
+        assert_eq!(unavailable.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(unavailable.slug, "metal_device_removed");
+        assert_eq!(unavailable.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            unavailable.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+
+        let token = CompletionToken {
+            submission_id: SubmissionId::new(7),
+            device_epoch: DeviceEpoch::new(3),
+        };
+        let observed = device_lost_refusal(ProviderPhase::Wait, Some(token));
+        assert_eq!(observed.phase, ProviderPhase::Wait);
+        assert_eq!(
+            observed.completion,
+            CompletionDisposition::DeviceLost { token: Some(token) }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_device_removed_code_matches_the_local_classifier() {
+        assert_eq!(
+            metal::MTLCommandBufferError::DeviceRemoved as i64,
+            DEVICE_REMOVED_ERROR_CODE
+        );
+    }
 
     fn request(entry: &str, source: &str) -> PipelineCompileRequest {
         PipelineCompileRequest {
