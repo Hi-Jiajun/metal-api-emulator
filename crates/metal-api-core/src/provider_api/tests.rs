@@ -2,8 +2,8 @@ use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, BufferAccess, BufferBindingContract, BufferWriteback,
     CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof, FunctionIdentity,
-    PipelineContract, ProviderErrorClass, ProviderPhase, Retryability, SemanticDigest,
-    ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
+    PipelineContract, ProviderErrorClass, ProviderHealth, ProviderPhase, Retryability,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -108,6 +108,13 @@ impl ComputeProvider for FakeProvider {
             storage_modes: vec![StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: false,
+        }
+    }
+    fn health(&self) -> ProviderHealth {
+        match self.mode.load(Ordering::SeqCst) {
+            SUBMIT_DEVICE_LOST | ASYNC_DEVICE_LOST => ProviderHealth::DeviceLost,
+            SUBMIT_EXHAUSTED => ProviderHealth::Exhausted,
+            _ => ProviderHealth::Usable,
         }
     }
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
@@ -794,6 +801,18 @@ fn submit_time_device_errors_never_land() {
             "mode={mode}"
         );
     }
+}
+
+#[test]
+fn device_reports_provider_health_without_waiting_for_a_submit() {
+    let (provider, device) = setup();
+    assert_eq!(device.health(), ProviderHealth::Usable);
+    provider.mode.store(SUBMIT_DEVICE_LOST, Ordering::SeqCst);
+    assert_eq!(device.health(), ProviderHealth::DeviceLost);
+    provider.mode.store(SUBMIT_EXHAUSTED, Ordering::SeqCst);
+    assert_eq!(device.health(), ProviderHealth::Exhausted);
+    provider.mode.store(ASYNC_DEVICE_LOST, Ordering::SeqCst);
+    assert_eq!(device.health(), ProviderHealth::DeviceLost);
 }
 
 #[test]

@@ -1847,6 +1847,16 @@ fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("lost provider refused with the wrong error: {refusal:?}").into());
     }
+    let lost_object = metal_api_core::provider_api::Device::new(Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?,
+    ));
+    if lost_object.health() != ProviderHealth::DeviceLost {
+        return Err(format!(
+            "object API did not expose the lost health: {:?}",
+            lost_object.health()
+        )
+        .into());
+    }
     drop(provider);
 
     let recovered_executor = VulkanExecutor::new()?;
@@ -1870,8 +1880,19 @@ fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
     let result = submit_and_wait(&recovered, &trace)?;
     check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
     release_case(&recovered, &pipeline, &result)?;
+    let recovered_object = metal_api_core::provider_api::Device::new(Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+            .map_err(provider_error)?,
+    ));
+    if recovered_object.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "object API did not expose the recovered health: {:?}",
+            recovered_object.health()
+        )
+        .into());
+    }
     println!(
-        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost retry=RetryAfterRecreate recreated=true writeback=exact"
+        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost retry=RetryAfterRecreate object_health=exposed recreated=true writeback=exact"
     );
     Ok(())
 }

@@ -72,9 +72,10 @@ uses the same wait/readback semantics.
    `health()` must report `DeviceLost`, the next `compile_pipeline` must be
    refused with `device_lost` and `RetryAfterRecreate`, and a newly created
    executor/provider pair must complete a fresh `copy_word` submission with an
-   exact writeback. The hook exists because CI cannot produce a deterministic
-   `VK_ERROR_DEVICE_LOST`; the case validates the state machine, not a real
-   device loss.
+   exact writeback. The object API's `Device::health()` must expose the lost
+   and recovered states on the same executors. The hook exists because CI
+   cannot produce a deterministic `VK_ERROR_DEVICE_LOST`; the case validates
+   the state machine, not a real device loss.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with

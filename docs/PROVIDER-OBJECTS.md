@@ -78,6 +78,10 @@ Submit-time provider failures follow the same no-partial-landing rule. A
 `DeviceLost` refusal keeps its observed token when one exists, marks the
 command `Failed` and refuses later work until the provider is recreated; an
 `Exhausted` refusal reports `provider_unavailable` with `NotSubmitted`.
+`Device::health()` exposes the provider's current `ProviderHealth` without
+waiting for a submission, so a caller can detect `DeviceLost` or `Exhausted`
+before attempting new work; a remote provider whose command channel fails
+reports `Exhausted` rather than claiming the device is usable.
 Native Metal reports `DeviceLost` for `MTLCommandBufferError::DeviceRemoved`
 (code 11) on both the synchronous and completion-handler paths.
 `CommandBuffer::cancel` does the same explicitly: it calls

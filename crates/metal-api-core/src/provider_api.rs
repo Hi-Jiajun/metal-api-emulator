@@ -19,7 +19,7 @@ use crate::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionToken,
     ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType, OperationId,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderSubmission, ResourceTableSnapshot, ViewId, MAX_SERIAL_RESOURCES,
+    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, ViewId, MAX_SERIAL_RESOURCES,
     PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
@@ -143,6 +143,13 @@ impl Device {
                 provider,
             }),
         }
+    }
+
+    /// Current provider health. A caller must recreate the device/provider
+    /// pair when this is not [`ProviderHealth::Usable`]; tokens already
+    /// observed as terminal remain observable per the provider contract.
+    pub fn health(&self) -> ProviderHealth {
+        self.state.provider.health()
     }
 
     pub fn compile_pipeline(&self, request: PipelineCompileRequest) -> Result<Pipeline, Error> {

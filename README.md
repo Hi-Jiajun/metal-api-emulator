@@ -218,9 +218,10 @@ case, so every request travels as chunk frames and the child reassembles it
 before decoding. A final case injects a simulated device loss into a dedicated
 executor: `health` must report `DeviceLost`, new compilation must be refused
 with `device_lost`/`RetryAfterRecreate`, and a freshly created
-executor/provider pair must resume work with an exact writeback. The injection
-exercises the lifecycle state machine; it is not a real GPU device loss. This
-is a provider/legacy Vulkan comparison, not a native Metal oracle.
+executor/provider pair must resume work with an exact writeback. The object
+API's `Device::health()` must expose the same lost and recovered states. The
+injection exercises the lifecycle state machine; it is not a real GPU device
+loss. This is a provider/legacy Vulkan comparison, not a native Metal oracle.
 
 The indexed case launches a 10x3 grid with an 8x2 nominal threadgroup, exercises
 a barrier and checks all 30 output words. Its source and reference output are
