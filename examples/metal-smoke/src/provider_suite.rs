@@ -8,13 +8,13 @@ use metal_api_core::completion::wire::{
     CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate, MirrorOutcome,
 };
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BufferAccess, BufferLease, BufferSource, BufferView,
-    CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass, ComputeProvider,
-    ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, LeaseId,
-    LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, OperationId,
-    PipelineCompileRequest, PipelineProvider, ProviderError, ProviderSubmission,
-    ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease, SubmissionId, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
+    BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
+    ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+    FootprintProof, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
+    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
+    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
+    StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{Device, Library};
 use metal_api_ipc::receiver::CompletionReceiver;
@@ -75,6 +75,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_completion_ipc(Arc::clone(&executor))?;
     run_completion_ipc_process()?;
     run_staged_lease(Arc::clone(&executor))?;
+    run_borrowed_lease(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -736,6 +737,287 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
         "PASS provider_staged_lease lease=97 writeback=exact retired=true refusal=lease_not_imported"
     );
     Ok(())
+}
+
+/// Owner host memory imported without copying. Two submissions prove the
+/// provider reads and writes the live mapping: one mutates owner memory after
+/// import and observes the new value on the GPU, and one writes through the
+/// GPU directly into owner memory.
+fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err("provider does not advertise VK_EXT_external_memory_host".into());
+    }
+    if !provider
+        .capabilities()
+        .storage_modes
+        .contains(&StorageMode::BorrowedNoCopy)
+    {
+        return Err("provider does not advertise the borrowed no-copy storage mode".into());
+    }
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"borrowed_lease".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let lease_id = LeaseId::new(98);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(298),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 64,
+    };
+    let mut owner = AlignedBuffer::new(64, alignment as usize)?;
+    owner.as_mut_slice().fill(0xcd);
+    owner.as_mut_slice()[..4].copy_from_slice(&0xaaaa_aaaa_u32.to_le_bytes());
+    // A misaligned owner pointer must be refused before any Vulkan import.
+    let misaligned = unsafe {
+        provider.import_borrowed_lease(BorrowedLease::new(
+            reservation,
+            owner.as_ptr() as usize + 1,
+        )?)
+    }
+    .expect_err("misaligned borrowed lease must be refused");
+    if misaligned.slug != "lease_alignment_unsupported" {
+        return Err(format!("misaligned borrowed lease refused with {}", misaligned.slug).into());
+    }
+    // SAFETY: `owner` stays alive until both submissions retire and the
+    // provider releases the import below.
+    unsafe {
+        provider
+            .import_borrowed_lease(BorrowedLease::new(reservation, owner.as_ptr() as usize)?)
+            .map_err(provider_error)?;
+    }
+
+    // The owner may change its mapping after import. A provider that had
+    // snapshotted the bytes would observe the old word.
+    owner.as_mut_slice()[..4].copy_from_slice(&0xbbbb_bbbb_u32.to_le_bytes());
+    let read_trace = borrowed_lease_trace(
+        &provider,
+        &pipeline,
+        lease_id,
+        BufferAccess::Read,
+        BufferSource::OwnedBytes(vec![0; 4]),
+        397,
+        398,
+    );
+    let read_resources = borrowed_lease_resources(&provider, reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(read_trace.clone(), read_resources.clone())
+        .map_err(provider_error)?;
+    let read_result = provider.submit(admitted).map_err(provider_error)?;
+    read_result.validate_for_trace(&read_trace)?;
+    let CompletionDisposition::CompletedVisible { token: read_token } = read_result.completion
+    else {
+        return Err(format!(
+            "borrowed lease read submission did not complete: {:?}",
+            read_result.completion
+        )
+        .into());
+    };
+    check_writeback(&read_trace, &read_result, 1, &0xbbbb_bbbb_u32.to_le_bytes())?;
+
+    let word = 0x1234_5678_u32;
+    let write_trace = borrowed_lease_trace(
+        &provider,
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(word.to_le_bytes().to_vec()),
+        399,
+        400,
+    );
+    let write_resources = borrowed_lease_resources(&provider, reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources.clone())
+        .map_err(provider_error)?;
+    let write_result = provider.submit(admitted).map_err(provider_error)?;
+    write_result.validate_for_trace(&write_trace)?;
+    let CompletionDisposition::CompletedVisible { token: write_token } = write_result.completion
+    else {
+        return Err(format!(
+            "borrowed lease write submission did not complete: {:?}",
+            write_result.completion
+        )
+        .into());
+    };
+    // The GPU wrote through the import; no writeback was applied to `owner`.
+    if owner.as_slice()[..4] != word.to_le_bytes() {
+        return Err(format!(
+            "borrowed lease did not write in place: {:02x?}",
+            &owner.as_slice()[..4]
+        )
+        .into());
+    }
+    check_writeback(&write_trace, &write_result, 1, &word.to_le_bytes())?;
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    for token in [read_token, write_token] {
+        ledger.bind(lease_id, token)?;
+        if ledger.observe(token, CompletionDisposition::CompletedVisible { token })?
+            != LeaseObservation::Retired
+        {
+            return Err("borrowed lease completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed lease was not release-ready".into());
+    }
+    if provider.borrowed_registry().outstanding(lease_id) != Some(0) {
+        return Err("borrowed lease retains were not retired".into());
+    }
+    provider
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources)
+        .map_err(provider_error)?;
+    let error = provider
+        .submit(admitted)
+        .expect_err("released borrowed lease must be refused");
+    if error.slug != "lease_not_imported" {
+        return Err(format!("released borrowed lease refused with {}", error.slug).into());
+    }
+
+    provider
+        .release_completion(read_token)
+        .map_err(provider_error)?;
+    provider
+        .release_completion(write_token)
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    println!(
+        "PASS provider_borrowed_lease lease=98 alignment={alignment} copy_in=live copy_out=in_place retired=true refusal=lease_not_imported"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_lease_trace(
+    provider: &VulkanComputeProvider,
+    pipeline: &CompiledComputePipeline,
+    lease_id: LeaseId,
+    lease_access: BufferAccess,
+    owned: BufferSource,
+    lease_view_id: u64,
+    owned_view_id: u64,
+) -> ComputeTrace {
+    let owned_access = match lease_access {
+        BufferAccess::Read => BufferAccess::Write,
+        BufferAccess::Write => BufferAccess::Read,
+        other => panic!("borrowed lease fixture cannot use {other:?}"),
+    };
+    let lease_view = |metal_binding| BufferView {
+        view_id: ViewId::new(lease_view_id),
+        metal_binding,
+        allocation_id: AllocationId::new(298),
+        offset: 0,
+        length: 4,
+        access: lease_access,
+        attribute_stride: None,
+        source: BufferSource::BorrowedNoCopy(lease_id),
+    };
+    let owned_view = |metal_binding| BufferView {
+        view_id: ViewId::new(owned_view_id),
+        metal_binding,
+        allocation_id: AllocationId::new(299),
+        offset: 0,
+        length: 4,
+        access: owned_access,
+        attribute_stride: None,
+        source: owned.clone(),
+    };
+    let buffers = match lease_access {
+        BufferAccess::Read => vec![lease_view(0), owned_view(1)],
+        BufferAccess::Write => vec![owned_view(0), lease_view(1)],
+        other => panic!("borrowed lease fixture cannot use {other:?}"),
+    };
+    ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(lease_view_id),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        }],
+        completion_policy: CompletionPolicy::HostReadback,
+    }
+}
+
+fn borrowed_lease_resources(
+    provider: &VulkanComputeProvider,
+    reservation: LeaseReservation,
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    let mut resources = ResourceTableSnapshot::new();
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(298),
+        owner_epoch: provider.device_epoch(),
+        size: 64,
+    })?;
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(299),
+        owner_epoch: provider.device_epoch(),
+        size: 32,
+    })?;
+    resources.insert_lease(reservation)?;
+    Ok(resources)
+}
+
+/// Page-aligned owner allocation for `VK_EXT_external_memory_host` imports.
+struct AlignedBuffer {
+    pointer: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, alignment: usize) -> Result<Self, Box<dyn Error>> {
+        let layout = std::alloc::Layout::from_size_align(len, alignment)?;
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        let pointer = std::ptr::NonNull::new(pointer).ok_or("aligned allocation failed")?;
+        Ok(Self { pointer, layout })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.layout.size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+    }
 }
 
 fn run_indexed_and_refusals(

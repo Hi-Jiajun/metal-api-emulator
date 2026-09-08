@@ -1225,6 +1225,281 @@ impl LeaseRegistry {
     }
 }
 
+/// Owner-issued no-copy lease backed by a host mapping in the provider's
+/// address space.
+///
+/// The reservation window is `reservation.length` bytes starting at
+/// `host_pointer`. The owner must keep that range valid, and at the same
+/// address, until every submission that imported it has retirement evidence
+/// and the provider has released the import. Unlike [`StagedLease`], the
+/// provider never copies these bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BorrowedLease {
+    pub reservation: LeaseReservation,
+    pub host_pointer: usize,
+}
+
+impl BorrowedLease {
+    /// Build a borrowed lease and validate its identity and pointer range.
+    pub fn new(reservation: LeaseReservation, host_pointer: usize) -> Result<Self, ContractError> {
+        let borrowed = Self {
+            reservation,
+            host_pointer,
+        };
+        borrowed.validate()?;
+        Ok(borrowed)
+    }
+
+    /// Validate identities, the reservation range and the pointer range.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let lease_id = self.reservation.lease.lease_id;
+        if lease_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("borrowed lease id"));
+        }
+        if self.reservation.lease.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity(
+                "borrowed lease allocation id",
+            ));
+        }
+        if self.reservation.lease.owner_epoch.is_zero() {
+            return Err(ContractError::InvalidIdentity("borrowed lease owner epoch"));
+        }
+        self.reservation.end()?;
+        if self.host_pointer == 0 {
+            return Err(ContractError::NullHostPointer(lease_id));
+        }
+        let length = usize::try_from(self.reservation.length)
+            .map_err(|_| ContractError::ArithmeticOverflow("borrowed lease length"))?;
+        self.host_pointer
+            .checked_add(length)
+            .ok_or(ContractError::ArithmeticOverflow("borrowed lease range"))?;
+        Ok(())
+    }
+
+    /// Lease identity the pointer is borrowed for.
+    pub const fn lease_id(&self) -> LeaseId {
+        self.reservation.lease.lease_id
+    }
+}
+
+/// Provider-side store of no-copy lease imports.
+///
+/// The registry tracks owner memory, not copies. [`BorrowedLeaseRegistry::retain`]
+/// marks a submission that will read or write the owner mapping;
+/// [`BorrowedLeaseRegistry::retire`] is called once the provider knows the GPU
+/// can no longer use it. [`BorrowedLeaseRegistry::release`] refuses while any
+/// retain is outstanding, so a provider cannot free an import under in-flight
+/// work.
+#[derive(Debug, Default)]
+pub struct BorrowedLeaseRegistry {
+    leases: Mutex<BTreeMap<LeaseId, BorrowedEntry>>,
+}
+
+#[derive(Debug)]
+struct BorrowedEntry {
+    lease: BorrowedLease,
+    outstanding: u64,
+}
+
+/// A no-copy view resolved inside one imported reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BorrowedView {
+    pub pointer: usize,
+    pub len: usize,
+    /// Valid bytes from `pointer` to the end of the imported reservation.
+    pub capacity: usize,
+}
+
+impl BorrowedLeaseRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of imported leases.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether no lease is imported.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of outstanding retains, or `None` if the lease is unknown.
+    pub fn outstanding(&self, lease_id: LeaseId) -> Option<u64> {
+        self.lock().get(&lease_id).map(|entry| entry.outstanding)
+    }
+
+    /// Import one owner mapping. A duplicate identity is refused until
+    /// [`BorrowedLeaseRegistry::release`] drops the previous import.
+    pub fn import(&self, borrowed: BorrowedLease) -> Result<(), ProviderError> {
+        borrowed.validate().map_err(contract_error_refusal)?;
+        let lease_id = borrowed.lease_id();
+        let mut leases = self.lock();
+        if leases.contains_key(&lease_id) {
+            return Err(lease_error(
+                "lease_already_imported",
+                lease_id,
+                ProviderErrorClass::Args,
+            ));
+        }
+        leases.insert(
+            lease_id,
+            BorrowedEntry {
+                lease: borrowed,
+                outstanding: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Retain one lease for a submission that will use the owner mapping.
+    pub fn retain(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        let mut leases = self.lock();
+        let entry = leases
+            .get_mut(&lease_id)
+            .ok_or_else(|| lease_error("lease_not_imported", lease_id, ProviderErrorClass::Args))?;
+        entry.outstanding = entry.outstanding.checked_add(1).ok_or_else(|| {
+            lease_error(
+                "lease_retain_overflow",
+                lease_id,
+                ProviderErrorClass::Internal,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Retain every listed lease, rolling back on the first refusal.
+    pub fn retain_all(&self, lease_ids: &[LeaseId]) -> Result<(), ProviderError> {
+        let mut retained = Vec::with_capacity(lease_ids.len());
+        for &lease_id in lease_ids {
+            if let Err(error) = self.retain(lease_id) {
+                self.retire_all(&retained);
+                return Err(error);
+            }
+            retained.push(lease_id);
+        }
+        Ok(())
+    }
+
+    /// Drop one retain. Idempotent for unknown leases because teardown may
+    /// race with release.
+    pub fn retire(&self, lease_id: LeaseId) {
+        if let Some(entry) = self.lock().get_mut(&lease_id) {
+            entry.outstanding = entry.outstanding.saturating_sub(1);
+        }
+    }
+
+    /// Drop one retain for every listed lease.
+    pub fn retire_all(&self, lease_ids: &[LeaseId]) {
+        for &lease_id in lease_ids {
+            self.retire(lease_id);
+        }
+    }
+
+    /// Drop one imported lease. Refused while a retain is outstanding.
+    pub fn release(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        let mut leases = self.lock();
+        let entry = leases
+            .get(&lease_id)
+            .ok_or_else(|| lease_error("lease_not_imported", lease_id, ProviderErrorClass::Args))?;
+        if entry.outstanding > 0 {
+            return Err(
+                lease_error("lease_in_use", lease_id, ProviderErrorClass::Resource)
+                    .with_field("outstanding", FieldValue::Unsigned(entry.outstanding)),
+            );
+        }
+        leases.remove(&lease_id);
+        Ok(())
+    }
+
+    /// Resolve the view to owner memory without copying.
+    ///
+    /// The admitted snapshot is authoritative: the imported reservation must
+    /// match it exactly, and the view must fall inside it.
+    pub fn view_pointer(
+        &self,
+        lease_id: LeaseId,
+        view: &BufferView,
+        device_epoch: DeviceEpoch,
+        resources: &ResourceTableSnapshot,
+    ) -> Result<BorrowedView, ProviderError> {
+        let leases = self.lock();
+        let entry = leases
+            .get(&lease_id)
+            .ok_or_else(|| lease_error("lease_not_imported", lease_id, ProviderErrorClass::Args))?;
+        let reservation = resources.lease(lease_id).ok_or_else(|| {
+            lease_error("lease_not_admitted", lease_id, ProviderErrorClass::Resource)
+        })?;
+        if entry.lease.reservation != reservation {
+            return Err(lease_error(
+                "lease_snapshot_mismatch",
+                lease_id,
+                ProviderErrorClass::Resource,
+            ));
+        }
+        if reservation.lease.owner_epoch != device_epoch {
+            return Err(lease_error(
+                "lease_epoch_mismatch",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+            .with_field("expected", FieldValue::Unsigned(device_epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(reservation.lease.owner_epoch.get()),
+            ));
+        }
+        let lease_end = reservation.end().map_err(contract_error_refusal)?;
+        let view_end = view.offset.checked_add(view.length).ok_or_else(|| {
+            contract_error_refusal(ContractError::ArithmeticOverflow(
+                "borrowed lease view range",
+            ))
+        })?;
+        let start = view.offset.checked_sub(reservation.offset).ok_or_else(|| {
+            lease_error(
+                "lease_range_out_of_bounds",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+        })?;
+        if view_end > lease_end {
+            return Err(lease_error(
+                "lease_range_out_of_bounds",
+                lease_id,
+                ProviderErrorClass::Resource,
+            )
+            .with_field("view_end", FieldValue::Unsigned(view_end))
+            .with_field("lease_end", FieldValue::Unsigned(lease_end)));
+        }
+        let start = usize::try_from(start).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease offset"))
+        })?;
+        let len = usize::try_from(view.length).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow(
+                "borrowed lease view length",
+            ))
+        })?;
+        let pointer = entry.lease.host_pointer.checked_add(start).ok_or_else(|| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease pointer"))
+        })?;
+        let capacity = usize::try_from(lease_end - view.offset).map_err(|_| {
+            contract_error_refusal(ContractError::ArithmeticOverflow("borrowed lease capacity"))
+        })?;
+        Ok(BorrowedView {
+            pointer,
+            len,
+            capacity,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<LeaseId, BorrowedEntry>> {
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 fn lease_error(slug: &'static str, lease_id: LeaseId, class: ProviderErrorClass) -> ProviderError {
     ProviderError::new(ProviderPhase::Resolve, class, slug)
         .expect("non-empty lease error slug")
@@ -1243,6 +1518,32 @@ pub trait LeaseImporter {
 
     /// Drop the staged bytes for `lease_id`.
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError>;
+}
+
+/// Provider-side import of owner-issued no-copy lease backing.
+///
+/// A provider advertising [`StorageMode::BorrowedNoCopy`] implements this
+/// trait. The provider imports the owner mapping directly; it must not copy
+/// the bytes, and it must keep every retain until the GPU can no longer use
+/// the mapping.
+pub trait NoCopyLeaseImporter {
+    /// Required host-pointer alignment in bytes, or zero when the provider
+    /// cannot import host memory.
+    fn no_copy_alignment(&self) -> u64;
+
+    /// Import `borrowed` without copying.
+    ///
+    /// # Safety
+    ///
+    /// `borrowed.host_pointer` must point to `borrowed.reservation.length`
+    /// readable and writable bytes aligned to [`Self::no_copy_alignment`].
+    /// The owner must keep that mapping valid and at the same address until
+    /// every retained submission is retired and
+    /// [`Self::release_borrowed_lease`] has returned.
+    unsafe fn import_borrowed_lease(&self, borrowed: BorrowedLease) -> Result<(), ProviderError>;
+
+    /// Drop one imported lease. Refused while a retain is outstanding.
+    fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError>;
 }
 
 /// Explicit identities needed when the legacy snapshot API is converted into
@@ -2327,6 +2628,7 @@ pub enum ContractError {
         expected: u64,
         actual: u64,
     },
+    NullHostPointer(LeaseId),
     DuplicateAllocation(AllocationId),
     UnknownAllocation(AllocationId),
     AllocationEpochMismatch {
@@ -2483,6 +2785,9 @@ impl fmt::Display for ContractError {
                 formatter,
                 "lease {lease:?} staged length {actual} does not match reservation length {expected}"
             ),
+            Self::NullHostPointer(lease) => {
+                write!(formatter, "lease {lease:?} borrowed host pointer is null")
+            }
             Self::DuplicateAllocation(allocation) => {
                 write!(formatter, "duplicate allocation {:?}", allocation)
             }
@@ -4558,6 +4863,117 @@ mod tests {
         assert_eq!(error.slug, "lease_epoch_mismatch");
         assert_eq!(error.fields.get("expected"), Some(&FieldValue::Unsigned(1)));
         assert_eq!(error.fields.get("actual"), Some(&FieldValue::Unsigned(2)));
+    }
+
+    #[test]
+    fn borrowed_lease_validates_identity_pointer_and_range() {
+        let reservation = lease_reservation(1, 2, 8, 16);
+        assert!(BorrowedLease::new(reservation, 0x4000).is_ok());
+        assert_eq!(
+            BorrowedLease::new(reservation, 0),
+            Err(ContractError::NullHostPointer(LeaseId::new(1)))
+        );
+        assert_eq!(
+            BorrowedLease::new(lease_reservation(0, 2, 8, 16), 0x4000),
+            Err(ContractError::InvalidIdentity("borrowed lease id"))
+        );
+        assert_eq!(
+            BorrowedLease::new(lease_reservation(1, 2, 8, 0), 0x4000),
+            Err(ContractError::ZeroLength("lease reservation"))
+        );
+        assert_eq!(
+            BorrowedLease::new(reservation, usize::MAX),
+            Err(ContractError::ArithmeticOverflow("borrowed lease range"))
+        );
+    }
+
+    #[test]
+    fn borrowed_lease_registry_resolves_views_and_gates_release() {
+        let registry = BorrowedLeaseRegistry::new();
+        assert!(registry.is_empty());
+        let reservation = lease_reservation(1, 2, 8, 16);
+        let borrowed = BorrowedLease::new(reservation, 0x4000).unwrap();
+        registry.import(borrowed).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.outstanding(LeaseId::new(1)), Some(0));
+        assert_eq!(
+            registry.import(borrowed).unwrap_err().slug,
+            "lease_already_imported"
+        );
+
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(2),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 64,
+            })
+            .unwrap();
+        resources.insert_lease(reservation).unwrap();
+
+        let mut view = buffer(1, 0);
+        view.allocation_id = AllocationId::new(2);
+        view.offset = 12;
+        view.length = 4;
+        view.source = BufferSource::BorrowedNoCopy(LeaseId::new(1));
+        assert_eq!(
+            registry
+                .view_pointer(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap(),
+            BorrowedView {
+                pointer: 0x4004,
+                len: 4,
+                capacity: 12,
+            }
+        );
+
+        let mut outside = view.clone();
+        outside.offset = 24;
+        assert_eq!(
+            registry
+                .view_pointer(LeaseId::new(1), &outside, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_range_out_of_bounds"
+        );
+        assert_eq!(
+            registry
+                .view_pointer(LeaseId::new(1), &view, DeviceEpoch::new(2), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_epoch_mismatch"
+        );
+
+        registry.retain(LeaseId::new(1)).unwrap();
+        assert_eq!(registry.outstanding(LeaseId::new(1)), Some(1));
+        let in_use = registry.release(LeaseId::new(1)).unwrap_err();
+        assert_eq!(in_use.slug, "lease_in_use");
+        assert_eq!(
+            in_use.fields.get("outstanding"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        registry.retain_all(&[LeaseId::new(1)]).unwrap();
+        assert_eq!(registry.outstanding(LeaseId::new(1)), Some(2));
+        registry.retire(LeaseId::new(1));
+        registry.retire_all(&[LeaseId::new(1)]);
+        assert_eq!(registry.outstanding(LeaseId::new(1)), Some(0));
+        registry.release(LeaseId::new(1)).unwrap();
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry
+                .view_pointer(LeaseId::new(1), &view, DeviceEpoch::new(1), &resources)
+                .unwrap_err()
+                .slug,
+            "lease_not_imported"
+        );
+        assert_eq!(
+            registry.retain(LeaseId::new(9)).unwrap_err().slug,
+            "lease_not_imported"
+        );
+        assert_eq!(
+            registry.release(LeaseId::new(9)).unwrap_err().slug,
+            "lease_not_imported"
+        );
     }
 
     #[test]

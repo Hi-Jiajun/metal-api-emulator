@@ -73,9 +73,14 @@ This is a core lifetime contract. The Vulkan provider also imports owner-issued
 `StagedLease` backing: `LeaseImporter::import_staged_lease` copies the
 reservation window into provider-owned storage, `StorageMode::StagedLease` is
 advertised in its capabilities, and a view is resolved from the imported bytes
-at submit time. The native provider still accepts only `OwnedBytes`; true
-no-copy import (external memory or `newBufferWithBytesNoCopy`) remains future
-work.
+at submit time. When the device exposes `VK_EXT_external_memory_host`, the same
+provider also advertises `StorageMode::BorrowedNoCopy`: `NoCopyLeaseImporter`
+imports an aligned owner host mapping with `VkImportMemoryHostPointerInfoEXT`,
+`BorrowedLeaseRegistry` tracks per-submission retains, and GPU writes land in
+the owner mapping in place. A retained in-flight submission keeps the import
+held, and release is refused with `lease_in_use` until a destroying execution
+drop retires it. The native provider still accepts only `OwnedBytes`;
+guest-memory import and `newBufferWithBytesNoCopy` remain future work.
 
 ## Cross-process completion notifications
 

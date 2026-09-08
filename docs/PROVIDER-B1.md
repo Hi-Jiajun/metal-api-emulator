@@ -75,8 +75,8 @@ ordering, general MTLB resolution and native Metal remain unimplemented. The
 core `LeaseLedger` defines completion-driven lease release, and
 `metal_api_core::completion::wire` defines the transport-independent
 notification stream and its sender-side publisher that will carry those tokens
-between processes; provider-side guest/no-copy lease import and the actual IPC
-transport remain unimplemented.
+between processes; provider-side guest-memory import, the owner-to-provider
+command transport and native no-copy import remain unimplemented.
 
 ## Execution failures and visibility
 
@@ -121,6 +121,7 @@ on one executor, unknown completion tokens, use after registry release,
 zero-deadline reclamation, explicit cancellation with a recorded outbox stream,
 single-process completion over a Unix socket, a staged lease import where the
 owner supplies the reservation window and the provider executes and retires it,
+a no-copy host-memory import that proves live reads and in-place GPU writes,
 and a two-process owner/provider completion hop. The runner spawns itself with
 `--completion-child`: the child owns the Vulkan device and publishes admission
 and `CompletedVisible` through the real outbox and writer thread, while the
@@ -130,6 +131,17 @@ parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 Vulkan no-copy lease import: `metal_api_core::provider` gains
+  `BorrowedLease`, `BorrowedLeaseRegistry` and the `NoCopyLeaseImporter` trait.
+  The Vulkan provider advertises `StorageMode::BorrowedNoCopy` only when the
+  device exposes `VK_EXT_external_memory_host`, imports the owner's aligned host
+  mapping with `VkImportMemoryHostPointerInfoEXT`, and reads and writes it in
+  place. Per-submission retains gate release (`lease_in_use`); a destroying
+  execution drop retires them, while a retained in-flight submission keeps them
+  held. Two new core tests cover pointer/range validation and retain/release
+  resolution. Lavapipe reports `provider_borrowed_lease lease=98
+  alignment=4096 copy_in=live copy_out=in_place retired=true
+  refusal=lease_not_imported`.
 - 2026-09-08 Vulkan staged lease import: `metal_api_core::provider` gains
   `StagedLease`, `LeaseRegistry` and the `LeaseImporter` trait. The Vulkan
   provider advertises `StorageMode::StagedLease`, copies the owner's reservation

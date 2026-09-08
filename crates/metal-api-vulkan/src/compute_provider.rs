@@ -1,7 +1,8 @@
-//! Owned-byte implementation of the first compute provider slice.
+//! Compute provider over the shared Vulkan executor: owned bytes, staged
+//! lease copies and host-memory no-copy imports.
 
 use crate::{
-    execute_pipeline_sequence_with_status, BoundDispatch, ContextHealth, PendingExecution,
+    execute_pool_sequence_with_status, BoundDispatch, ContextHealth, PendingExecution, PoolBinding,
     TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
@@ -15,6 +16,7 @@ use metal_api_core::provider::{
     ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, ValidatedComputeTrace,
 };
+use metal_api_core::provider::{BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter};
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +39,50 @@ struct CompletionSlot {
     deadline: ObservationDeadline,
 }
 
+/// Retains no-copy leases for one submission until a pending execution owns
+/// them. If any step before the hand-off fails, Drop returns the retains so
+/// the owner is not blocked by a submission that never reached the queue.
+struct BorrowedRetains {
+    registry: Arc<BorrowedLeaseRegistry>,
+    lease_ids: Vec<LeaseId>,
+    armed: bool,
+}
+
+impl BorrowedRetains {
+    fn new(registry: Arc<BorrowedLeaseRegistry>, lease_ids: Vec<LeaseId>) -> Self {
+        Self {
+            registry,
+            lease_ids,
+            armed: false,
+        }
+    }
+
+    fn retain(&mut self) -> Result<(), ProviderError> {
+        self.registry.retain_all(&self.lease_ids)?;
+        self.armed = true;
+        Ok(())
+    }
+
+    fn take(&mut self) -> Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        Some((
+            Arc::clone(&self.registry),
+            std::mem::take(&mut self.lease_ids),
+        ))
+    }
+}
+
+impl Drop for BorrowedRetains {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.retire_all(&self.lease_ids);
+        }
+    }
+}
+
 /// One provider identity sharing the standalone executor's Vulkan device owner.
 ///
 /// This implementation admits up to eight serial exact-thread dispatches
@@ -48,8 +94,9 @@ struct CompletionSlot {
 /// and submits on the calling thread, returns `Submitted`, and defers the
 /// device-fence wait and readback to `wait`/`readback`; no worker is created
 /// per submission. Tokens and metadata are process-local, and no-copy leases
-/// are refused. Callers can explicitly release registered pipelines and
-/// completion records.
+/// are imported through `VK_EXT_external_memory_host` when the device
+/// advertises it and refused otherwise. Callers can explicitly release
+/// registered pipelines and completion records.
 pub struct VulkanComputeProvider {
     executor: Arc<VulkanExecutor>,
     epoch: DeviceEpoch,
@@ -63,6 +110,7 @@ pub struct VulkanComputeProvider {
     async_execution: bool,
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
+    borrowed: Arc<BorrowedLeaseRegistry>,
 }
 
 impl VulkanComputeProvider {
@@ -89,6 +137,9 @@ impl VulkanComputeProvider {
         {
             capabilities.storage_modes.push(StorageMode::StagedLease);
         }
+        if executor.context.external_memory_host_alignment() > 0 {
+            capabilities.storage_modes.push(StorageMode::BorrowedNoCopy);
+        }
         Ok(Self {
             executor,
             epoch,
@@ -102,6 +153,7 @@ impl VulkanComputeProvider {
             async_execution: false,
             completion_outbox: None,
             staging: LeaseRegistry::new(),
+            borrowed: Arc::new(BorrowedLeaseRegistry::new()),
         })
     }
 
@@ -459,6 +511,11 @@ impl VulkanComputeProvider {
     pub fn lease_registry(&self) -> &LeaseRegistry {
         &self.staging
     }
+
+    /// No-copy lease registry owned by this provider.
+    pub fn borrowed_registry(&self) -> &Arc<BorrowedLeaseRegistry> {
+        &self.borrowed
+    }
 }
 
 impl LeaseImporter for VulkanComputeProvider {
@@ -480,6 +537,48 @@ impl LeaseImporter for VulkanComputeProvider {
 
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
         self.staging.release(lease_id)
+    }
+}
+
+impl NoCopyLeaseImporter for VulkanComputeProvider {
+    fn no_copy_alignment(&self) -> u64 {
+        self.executor.context.external_memory_host_alignment()
+    }
+
+    unsafe fn import_borrowed_lease(&self, borrowed: BorrowedLease) -> Result<(), ProviderError> {
+        if borrowed.reservation.lease.owner_epoch != self.epoch {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "lease_epoch_mismatch",
+            )
+            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field(
+                "actual",
+                FieldValue::Unsigned(borrowed.reservation.lease.owner_epoch.get()),
+            ));
+        }
+        let alignment = self.no_copy_alignment();
+        if alignment == 0 {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "storage_mode_unsupported",
+            ));
+        }
+        let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
+        if !borrowed.host_pointer.is_multiple_of(alignment) {
+            return Err(borrowed_alignment_error(
+                borrowed.lease_id(),
+                borrowed.host_pointer,
+                alignment as u64,
+            ));
+        }
+        self.borrowed.import(borrowed)
+    }
+
+    fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        self.borrowed.release(lease_id)
     }
 }
 
@@ -615,34 +714,6 @@ impl ComputeProvider for VulkanComputeProvider {
                 bindings,
             });
         }
-        let buffers = pool
-            .iter()
-            .enumerate()
-            .map(|(position, resource)| {
-                let bytes = match &resource.source {
-                    BufferSource::OwnedBytes(bytes) => bytes.clone(),
-                    BufferSource::StagedLease(lease_id) => self.staging.view_bytes(
-                        *lease_id,
-                        resource,
-                        self.epoch,
-                        admitted.resources(),
-                    )?,
-                    BufferSource::BorrowedNoCopy(_) => {
-                        return Err(refusal(
-                            ProviderPhase::Resolve,
-                            ProviderErrorClass::Capability,
-                            "storage_mode_unsupported",
-                        ));
-                    }
-                };
-                Ok(BufferBinding {
-                    // The validated pool has at most 64 resources. First-use
-                    // Metal binding labels may repeat across different passes.
-                    index: position as u32,
-                    bytes,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let token = CompletionToken {
             submission_id: SubmissionId::new(next_identity(
                 &self.next_submission,
@@ -650,24 +721,88 @@ impl ComputeProvider for VulkanComputeProvider {
             )?),
             device_epoch: self.epoch,
         };
+        let alignment = self.no_copy_alignment();
+        let mut buffers = Vec::with_capacity(pool.len());
+        let mut borrowed_leases = Vec::new();
+        for (position, resource) in pool.iter().enumerate() {
+            // The validated pool has at most 64 resources. First-use Metal
+            // binding labels may repeat across different passes.
+            let index = position as u32;
+            match &resource.source {
+                BufferSource::OwnedBytes(bytes) => {
+                    buffers.push(PoolBinding::Owned(BufferBinding {
+                        index,
+                        bytes: bytes.clone(),
+                    }))
+                }
+                BufferSource::StagedLease(lease_id) => {
+                    let bytes = self.staging.view_bytes(
+                        *lease_id,
+                        resource,
+                        self.epoch,
+                        admitted.resources(),
+                    )?;
+                    buffers.push(PoolBinding::Owned(BufferBinding { index, bytes }));
+                }
+                BufferSource::BorrowedNoCopy(lease_id) => {
+                    if alignment == 0 {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "storage_mode_unsupported",
+                        ));
+                    }
+                    let view = self.borrowed.view_pointer(
+                        *lease_id,
+                        resource,
+                        self.epoch,
+                        admitted.resources(),
+                    )?;
+                    let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
+                    if !view.pointer.is_multiple_of(alignment) {
+                        return Err(borrowed_alignment_error(
+                            *lease_id,
+                            view.pointer,
+                            alignment as u64,
+                        ));
+                    }
+                    borrowed_leases.push(*lease_id);
+                    buffers.push(PoolBinding::Imported {
+                        index,
+                        pointer: view.pointer,
+                        len: view.len,
+                        capacity: view.capacity,
+                    });
+                }
+            }
+        }
+        let mut retains = BorrowedRetains::new(Arc::clone(&self.borrowed), borrowed_leases);
+        retains.retain()?;
         if self.async_execution {
-            let result = self.submit_async(pool, artifacts, buffers, dispatches, token);
+            let result =
+                self.submit_async(pool, artifacts, buffers, dispatches, token, &mut retains);
             self.sync_completion_health();
             return result;
         }
-        let result = execute_on_context(&self.executor, &artifacts, buffers, &dispatches)
-            .and_then(|updates| {
-                let writebacks = map_writebacks(&pool, updates, token)?;
-                let output = ProviderSubmission {
-                    completion: CompletionDisposition::CompletedVisible { token },
-                    writebacks,
-                };
-                output.validate_for_trace(trace).map_err(|error| {
-                    output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
-                })?;
-                Ok(output)
-            })
-            .map_err(|error| attach_token(error, token));
+        let result = execute_on_context(
+            &self.executor,
+            &artifacts,
+            &buffers,
+            &dispatches,
+            &mut retains,
+        )
+        .and_then(|updates| {
+            let writebacks = map_writebacks(&pool, updates, token)?;
+            let output = ProviderSubmission {
+                completion: CompletionDisposition::CompletedVisible { token },
+                writebacks,
+            };
+            output.validate_for_trace(trace).map_err(|error| {
+                output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
+            })?;
+            Ok(output)
+        })
+        .map_err(|error| attach_token(error, token));
         let observation = match &result {
             Ok(output) => Some(self.terminal_record(token, output.writebacks.clone())),
             Err(error) if error.completion.token().is_some() => {
@@ -727,9 +862,10 @@ impl VulkanComputeProvider {
         &self,
         pool: Vec<BufferView>,
         artifacts: Vec<Arc<VulkanPipelineArtifact>>,
-        buffers: Vec<BufferBinding>,
+        buffers: Vec<PoolBinding>,
         dispatches: Vec<BoundDispatch>,
         token: CompletionToken,
+        retains: &mut BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
         let pending = {
             let _execution = self
@@ -739,7 +875,13 @@ impl VulkanComputeProvider {
                 .lock()
                 .map_err(|_| registry_poisoned())?;
             ensure_executor_usable(&self.executor)?;
-            PendingExecution::submit(&self.executor.context, &artifacts, &buffers, &dispatches)?
+            PendingExecution::submit(
+                &self.executor.context,
+                &artifacts,
+                &buffers,
+                &dispatches,
+                retains.take(),
+            )?
         };
         let record = match &self.completion_outbox {
             Some(outbox) => {
@@ -890,8 +1032,9 @@ fn map_writebacks(
 fn execute_on_context(
     executor: &Arc<VulkanExecutor>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
-    buffers: Vec<BufferBinding>,
+    buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
+    retains: &mut BorrowedRetains,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let _execution = executor
         .context
@@ -899,7 +1042,13 @@ fn execute_on_context(
         .lock()
         .map_err(|_| registry_poisoned())?;
     ensure_executor_usable(executor)?;
-    execute_pipeline_sequence_with_status(&executor.context, artifacts, buffers, dispatches)
+    execute_pool_sequence_with_status(
+        &executor.context,
+        artifacts,
+        buffers,
+        dispatches,
+        retains.take(),
+    )
 }
 
 fn ensure_executor_usable(executor: &VulkanExecutor) -> Result<(), ProviderError> {
@@ -999,6 +1148,17 @@ fn unknown_completion(token: CompletionToken) -> ProviderError {
         "unknown_completion",
     )
     .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) })
+}
+
+fn borrowed_alignment_error(lease_id: LeaseId, pointer: usize, alignment: u64) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "lease_alignment_unsupported",
+    )
+    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+    .with_field("pointer", FieldValue::Unsigned(pointer as u64))
+    .with_field("alignment", FieldValue::Unsigned(alignment))
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! as the dispatch contract; unsupported resources fail before any Vulkan work
 //! is submitted.
 
+use ash::ext::external_memory_host;
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
@@ -13,8 +14,8 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
 use metal_api_core::provider::{
-    CompletionDisposition, PipelineContract, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
+    BorrowedLeaseRegistry, CompletionDisposition, LeaseId, PipelineContract, ProviderCapabilities,
+    ProviderError, ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -59,9 +60,9 @@ impl VulkanExecutor {
 
     /// Report the selected Vulkan device as neutral provider capabilities.
     ///
-    /// The snapshot executor intentionally exposes only owned host bytes and
-    /// synchronous readback today; it does not claim no-copy leases or a
-    /// submit-only completion API.
+    /// The snapshot executor exposes owned host bytes and synchronous
+    /// readback. `VulkanComputeProvider` adds staged and, when
+    /// `VK_EXT_external_memory_host` is present, borrowed no-copy leases.
     pub fn provider_capabilities(&self) -> ProviderCapabilities {
         provider::capabilities_from_limits(&self.context.properties.limits)
     }
@@ -137,7 +138,22 @@ impl TranslatedComputePipeline {
         buffers: &[BufferBinding],
         threads_per_grid: [u32; 3],
     ) -> Result<(), ExecutorError> {
-        validate_bound_buffers(&self.reflection, buffers, threads_per_grid)
+        let widths = buffers
+            .iter()
+            .map(|binding| (binding.index, binding.bytes.len()))
+            .collect::<Vec<_>>();
+        self.validate_binding_widths(&widths, threads_per_grid)
+    }
+
+    /// Validate `(Metal binding index, byte length)` pairs. No-copy bindings
+    /// have a host pointer instead of owned bytes, so width is the only
+    /// property shared with `BufferBinding`.
+    pub(crate) fn validate_binding_widths(
+        &self,
+        widths: &[(u32, usize)],
+        threads_per_grid: [u32; 3],
+    ) -> Result<(), ExecutorError> {
+        validate_bound_buffers(&self.reflection, widths, threads_per_grid)
     }
 
     pub fn validate_threadgroup(&self, local_size: [u32; 3]) -> Result<(), ExecutorError> {
@@ -199,6 +215,7 @@ pub(crate) struct VulkanContext {
     entry: ManuallyDrop<Entry>,
     instance: Instance,
     device: AshDevice,
+    external_memory_host: Option<ExternalMemoryHost>,
     queue_family: u32,
     queue: vk::Queue,
     properties: vk::PhysicalDeviceProperties,
@@ -210,6 +227,13 @@ pub(crate) struct VulkanContext {
     device_lost: AtomicBool,
     abandonment_budget: AbandonmentBudget,
     abandonment: Mutex<AbandonmentLedger>,
+}
+
+/// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
+/// device requires for imported host pointers.
+struct ExternalMemoryHost {
+    device: external_memory_host::Device,
+    min_alignment: u64,
 }
 
 /// Provider-facing view of one Vulkan context's remaining usability.
@@ -247,9 +271,29 @@ impl VulkanContext {
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
+        let extensions = match unsafe { instance.enumerate_device_extension_properties(physical) } {
+            Ok(extensions) => extensions,
+            Err(error) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(failure(format!(
+                    "enumerate Vulkan device extensions: {error}"
+                )));
+            }
+        };
+        let has_external_memory_host = extensions.iter().any(|extension| {
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|name| name == external_memory_host::NAME)
+        });
+        let enabled_extensions = if has_external_memory_host {
+            vec![external_memory_host::NAME.as_ptr()]
+        } else {
+            Vec::new()
+        };
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
+            .enabled_extension_names(&enabled_extensions)
             .push_next(&mut vulkan13);
         let device = match unsafe { instance.create_device(physical, &device_info, None) } {
             Ok(device) => device,
@@ -264,11 +308,22 @@ impl VulkanContext {
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let external_memory_host = has_external_memory_host.then(|| {
+            let mut host_properties = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut properties2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut host_properties);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+            ExternalMemoryHost {
+                device: external_memory_host::Device::new(&instance, &device),
+                min_alignment: host_properties.min_imported_host_pointer_alignment,
+            }
+        });
 
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
             device,
+            external_memory_host,
             queue_family,
             queue,
             properties,
@@ -359,6 +414,14 @@ impl VulkanContext {
                     required.as_raw()
                 ))
             })
+    }
+
+    /// Alignment required for `VK_EXT_external_memory_host` imports, or zero
+    /// when the extension is unavailable.
+    pub(crate) fn external_memory_host_alignment(&self) -> u64 {
+        self.external_memory_host
+            .as_ref()
+            .map_or(0, |host| host.min_alignment)
     }
 }
 
@@ -530,6 +593,23 @@ pub(crate) fn execute_pipeline_sequence_with_status(
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let buffers = buffers
+        .into_iter()
+        .map(PoolBinding::Owned)
+        .collect::<Vec<_>>();
+    execute_pool_sequence_with_status(context, artifacts, &buffers, dispatches, None)
+}
+
+/// Execute a pool whose bindings are either provider-owned copies or owner
+/// host mappings imported without copying. `borrowed` carries the registry and
+/// the leases retained for this submission; their Drop retires every retain.
+pub(crate) fn execute_pool_sequence_with_status(
+    context: &Arc<VulkanContext>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: &[PoolBinding],
+    dispatches: &[BoundDispatch],
+    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
     for artifact in artifacts {
         if !Arc::ptr_eq(context, &artifact.context) {
             return Err(dispatch_args_error(failure(
@@ -537,7 +617,7 @@ pub(crate) fn execute_pipeline_sequence_with_status(
             )));
         }
     }
-    let result = execute_submission_stages(context, artifacts, &buffers, dispatches);
+    let result = execute_submission_stages(context, artifacts, buffers, dispatches, borrowed);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -550,10 +630,11 @@ pub(crate) fn execute_pipeline_sequence_with_status(
 fn execute_submission_stages(
     context: &Arc<VulkanContext>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
-    buffers: &[BufferBinding],
+    buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
+    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let mut pending = PendingExecution::submit(context, artifacts, buffers, dispatches)?;
+    let mut pending = PendingExecution::submit(context, artifacts, buffers, dispatches, borrowed)?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
         context.poisoned.store(true, Ordering::Release);
         return Err(ExecutionFailure::vulkan(
@@ -587,9 +668,12 @@ impl PendingExecution {
     pub(crate) fn submit(
         context: &Arc<VulkanContext>,
         artifacts: &[Arc<VulkanPipelineArtifact>],
-        buffers: &[BufferBinding],
+        buffers: &[PoolBinding],
         dispatches: &[BoundDispatch],
+        borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
     ) -> Result<Self, ProviderError> {
+        let mut resources = ExecutionResources::new(Arc::clone(context));
+        resources.set_borrowed_leases(borrowed);
         let translated = artifacts
             .iter()
             .map(|artifact| &artifact.translated)
@@ -599,11 +683,10 @@ impl PendingExecution {
         let plans = &planned.plans;
         if plans.iter().all(|plan| plan.regions.is_empty()) {
             return Ok(Self {
-                resources: ExecutionResources::new(Arc::clone(context)),
+                resources,
                 writable_pool_keys: BTreeSet::new(),
             });
         }
-        let mut resources = ExecutionResources::new(Arc::clone(context));
         resources
             .create_pipeline_objects(&translated, plans)
             .map_err(|error| {
@@ -707,8 +790,8 @@ fn validate_dispatch_count(count: usize) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn identity_dispatches(
-    buffers: &[BufferBinding],
+fn identity_dispatches<T: PoolWidth>(
+    buffers: &[T],
     dispatches: &[([u32; 3], [u32; 3])],
 ) -> Vec<BoundDispatch> {
     dispatches
@@ -718,16 +801,16 @@ fn identity_dispatches(
             local,
             bindings: buffers
                 .iter()
-                .map(|buffer| (buffer.index, buffer.index))
+                .map(|buffer| (buffer.pool_index(), buffer.pool_index()))
                 .collect(),
         })
         .collect()
 }
 
 #[cfg(test)]
-fn plan_serial_submission(
+fn plan_serial_submission<T: PoolWidth>(
     translated: &TranslatedComputePipeline,
-    buffers: &[BufferBinding],
+    buffers: &[T],
     limits: &vk::PhysicalDeviceLimits,
     first_dispatch: ([u32; 3], [u32; 3]),
     dispatches: &[([u32; 3], [u32; 3])],
@@ -744,9 +827,9 @@ struct ReboundSubmissionPlan {
 }
 
 #[cfg(test)]
-fn plan_rebound_submission(
+fn plan_rebound_submission<T: PoolWidth>(
     translated: &TranslatedComputePipeline,
-    buffers: &[BufferBinding],
+    buffers: &[T],
     limits: &vk::PhysicalDeviceLimits,
     dispatches: &[BoundDispatch],
 ) -> Result<ReboundSubmissionPlan, ProviderError> {
@@ -757,9 +840,9 @@ fn plan_rebound_submission(
 /// Pure preflight: no request-specific Vulkan objects exist until this returns.
 /// Each pass uniquely maps its reflected Metal slots into the shared pool.
 /// Every uploaded resource must be used by at least one pass in the sequence.
-fn plan_pipeline_sequence(
+fn plan_pipeline_sequence<T: PoolWidth>(
     translated: &[&TranslatedComputePipeline],
-    buffers: &[BufferBinding],
+    buffers: &[T],
     limits: &vk::PhysicalDeviceLimits,
     dispatches: &[BoundDispatch],
 ) -> Result<ReboundSubmissionPlan, ProviderError> {
@@ -784,10 +867,10 @@ fn plan_pipeline_sequence(
     }
     let mut pool = BTreeMap::new();
     for buffer in buffers {
-        if pool.insert(buffer.index, buffer).is_some() {
+        if pool.insert(buffer.pool_index(), buffer).is_some() {
             return Err(dispatch_args_error(failure(format!(
                 "buffer pool key {} occurs more than once",
-                buffer.index
+                buffer.pool_index()
             ))));
         }
     }
@@ -806,7 +889,7 @@ fn plan_pipeline_sequence(
             ))));
         }
         let mut pass_pool_keys = BTreeSet::new();
-        let mut bindings = Vec::with_capacity(dispatch.bindings.len());
+        let mut widths = Vec::with_capacity(dispatch.bindings.len());
         for &(metal_index, pool_key) in &dispatch.bindings {
             let buffer = pool.get(&pool_key).ok_or_else(|| {
                 dispatch_args_error(failure(format!("unknown buffer pool key {pool_key}")))
@@ -816,14 +899,11 @@ fn plan_pipeline_sequence(
                     "buffer pool key {pool_key} is bound more than once in one pass",
                 ))));
             }
-            bindings.push(BufferBinding {
-                index: metal_index,
-                bytes: buffer.bytes.clone(),
-            });
+            widths.push((metal_index, buffer.pool_len()));
         }
         validate_local_size(limits, dispatch.local).map_err(resolve_capability)?;
         translated
-            .validate_buffers(&bindings, dispatch.grid)
+            .validate_binding_widths(&widths, dispatch.grid)
             .map_err(dispatch_args_error)?;
         used_pool_keys.extend(pass_pool_keys);
         for &(metal_index, pool_key) in &dispatch.bindings {
@@ -862,7 +942,8 @@ fn plan_pipeline_sequence(
         )));
     }
     for buffer in buffers {
-        validate_storage_buffer_size(limits, buffer).map_err(resolve_capability)?;
+        validate_storage_buffer_size(limits, buffer.pool_index(), buffer.pool_len())
+            .map_err(resolve_capability)?;
     }
     Ok(ReboundSubmissionPlan {
         plans,
@@ -954,14 +1035,15 @@ fn validate_descriptor_limits(
 
 fn validate_storage_buffer_size(
     limits: &vk::PhysicalDeviceLimits,
-    supplied: &BufferBinding,
+    index: u32,
+    len: usize,
 ) -> Result<(), ExecutorError> {
-    let size = u64::try_from(supplied.bytes.len())
-        .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
+    let size =
+        u64::try_from(len).map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
     if size > u64::from(limits.max_storage_buffer_range) {
         return Err(failure(format!(
-            "buffer {} length {size} exceeds maxStorageBufferRange {}",
-            supplied.index, limits.max_storage_buffer_range
+            "buffer {index} length {size} exceeds maxStorageBufferRange {}",
+            limits.max_storage_buffer_range
         )));
     }
     Ok(())
@@ -1141,7 +1223,7 @@ fn validate_pipeline_reflection(
 
 fn validate_bound_buffers(
     reflection: &ShaderReflection,
-    buffers: &[BufferBinding],
+    buffers: &[(u32, usize)],
     grid: [u32; 3],
 ) -> Result<(), ExecutorError> {
     let metal_indices = reflection
@@ -1150,24 +1232,18 @@ fn validate_bound_buffers(
         .map(|binding| binding.metal_index)
         .collect::<BTreeSet<_>>();
     let mut supplied = BTreeSet::new();
-    for binding in buffers {
-        if binding.bytes.is_empty() {
-            return Err(failure(format!(
-                "buffer {} has an empty bound range",
-                binding.index
-            )));
+    for &(index, len) in buffers {
+        if len == 0 {
+            return Err(failure(format!("buffer {index} has an empty bound range")));
         }
-        if !supplied.insert(binding.index) {
-            return Err(failure(format!(
-                "buffer {} is bound more than once",
-                binding.index
-            )));
+        if !supplied.insert(index) {
+            return Err(failure(format!("buffer {index} is bound more than once")));
         }
         let reflected = reflection
             .bindings
             .iter()
-            .find(|candidate| candidate.metal_index == binding.index)
-            .ok_or_else(|| failure(format!("buffer {} is not reflected", binding.index)))?;
+            .find(|candidate| candidate.metal_index == index)
+            .ok_or_else(|| failure(format!("buffer {index} is not reflected")))?;
         let mut required = u64::from(reflected.declared_size.unwrap_or(0));
         if let Some(BufferExtent::Object { bytes }) = reflected.extent {
             required = required.max(u64::from(bytes));
@@ -1177,18 +1253,19 @@ fn validate_bound_buffers(
             .as_ref()
             .expect("pipeline validation requires a footprint");
         for range in &footprint.static_ranges {
-            let end = range.offset.checked_add(range.size).ok_or_else(|| {
-                failure(format!("buffer {} footprint overflows u64", binding.index))
-            })?;
+            let end = range
+                .offset
+                .checked_add(range.size)
+                .ok_or_else(|| failure(format!("buffer {index} footprint overflows u64")))?;
             required = required.max(end);
         }
         required = required.max(
             strided_footprint_reach(footprint, grid)
-                .map_err(|error| failure(format!("buffer {} {error}", binding.index)))?,
+                .map_err(|error| failure(format!("buffer {index} {error}")))?,
         );
-        let supplied_len = u64::try_from(binding.bytes.len())
-            .map_err(|_| failure(format!("buffer {} length overflows u64", binding.index)))?;
-        ensure_buffer_reach(binding.index, supplied_len, required)?;
+        let supplied_len = u64::try_from(len)
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+        ensure_buffer_reach(index, supplied_len, required)?;
     }
     if supplied != metal_indices {
         return Err(failure(format!(
@@ -1241,11 +1318,67 @@ fn strided_footprint_reach(
     Ok(required)
 }
 
+/// One execution buffer, either copied into provider memory or imported from
+/// an owner host mapping.
+#[derive(Debug)]
+pub(crate) enum PoolBinding {
+    Owned(BufferBinding),
+    Imported {
+        index: u32,
+        pointer: usize,
+        len: usize,
+        capacity: usize,
+    },
+}
+
+impl PoolBinding {
+    pub(crate) fn index(&self) -> u32 {
+        match self {
+            Self::Owned(binding) => binding.index,
+            Self::Imported { index, .. } => *index,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(binding) => binding.bytes.len(),
+            Self::Imported { len, .. } => *len,
+        }
+    }
+}
+
+/// Width view shared by owned bindings and no-copy pool bindings.
+trait PoolWidth {
+    fn pool_index(&self) -> u32;
+    fn pool_len(&self) -> usize;
+}
+
+impl PoolWidth for BufferBinding {
+    fn pool_index(&self) -> u32 {
+        self.index
+    }
+
+    fn pool_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl PoolWidth for PoolBinding {
+    fn pool_index(&self) -> u32 {
+        self.index()
+    }
+
+    fn pool_len(&self) -> usize {
+        self.len()
+    }
+}
+
 struct GpuBuffer {
     index: u32,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     len: usize,
+    host_pointer: Option<usize>,
 }
 
 /// A pass owns every object derived from its shader's reflection. Keeping this
@@ -1271,6 +1404,7 @@ struct ExecutionResources {
     device_lost: bool,
     leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 }
 
 /// How `ExecutionResources::drop` must treat still-submitted handles.
@@ -1585,13 +1719,24 @@ impl ExecutionResources {
             device_lost: false,
             leak_is_budgeted: false,
             buffers: Vec::new(),
+            borrowed: None,
         }
     }
 
     fn owned_bytes(&self) -> u64 {
         self.buffers.iter().fold(0_u64, |total, buffer| {
+            if buffer.host_pointer.is_some() {
+                return total;
+            }
             total.saturating_add(u64::try_from(buffer.len).unwrap_or(u64::MAX))
         })
+    }
+
+    fn set_borrowed_leases(
+        &mut self,
+        borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    ) {
+        self.borrowed = borrowed;
     }
 
     fn mark_device_lost(&mut self) {
@@ -1619,15 +1764,23 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_buffers(&mut self, bindings: &[BufferBinding]) -> Result<(), ExecutionFailure> {
+    fn create_buffers(&mut self, bindings: &[PoolBinding]) -> Result<(), ExecutionFailure> {
         for supplied in bindings {
-            self.create_buffer(supplied)?;
+            match supplied {
+                PoolBinding::Owned(binding) => self.create_owned_buffer(binding)?,
+                PoolBinding::Imported {
+                    index,
+                    pointer,
+                    len,
+                    capacity,
+                } => self.import_host_buffer(*index, *pointer, *len, *capacity)?,
+            }
         }
         self.buffers.sort_by_key(|buffer| buffer.index);
         Ok(())
     }
 
-    fn create_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
+    fn create_owned_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
         let size = u64::try_from(supplied.bytes.len())
             .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
         let buffer_info = vk::BufferCreateInfo::default()
@@ -1705,6 +1858,107 @@ impl ExecutionResources {
             buffer,
             memory,
             len: supplied.bytes.len(),
+            host_pointer: None,
+        });
+        Ok(())
+    }
+
+    /// Import the owner's host mapping for `pointer` without copying. The
+    /// buffer covers `len` bytes; the imported allocation may be larger, and
+    /// `capacity` is the number of valid bytes the owner reserved after
+    /// `pointer`.
+    fn import_host_buffer(
+        &mut self,
+        index: u32,
+        pointer: usize,
+        len: usize,
+        capacity: usize,
+    ) -> Result<(), ExecutionFailure> {
+        let Some(host) = self.context.external_memory_host.as_ref() else {
+            return Err(failure(format!(
+                "buffer {index} needs VK_EXT_external_memory_host, which is unavailable"
+            ))
+            .into());
+        };
+        let size = u64::try_from(len)
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create buffer {index}: {error}"))
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let capacity = u64::try_from(capacity).unwrap_or(u64::MAX);
+        if requirements.size > capacity {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(failure(format!(
+                "buffer {index} needs {} imported bytes but the lease reserves {capacity}",
+                requirements.size
+            ))
+            .into());
+        }
+        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (host.device.fp().get_memory_host_pointer_properties_ext)(
+                host.device.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                pointer as *const std::ffi::c_void,
+                &mut properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(ExecutionFailure::vulkan(
+                result,
+                format!("query buffer {index} host pointer: {result}"),
+            ));
+        }
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits & properties.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+            .host_pointer(pointer as *mut std::ffi::c_void);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut import);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("import buffer {index} host memory: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind buffer {index} imported memory: {error}"),
+            ));
+        }
+        self.buffers.push(GpuBuffer {
+            index,
+            buffer,
+            memory,
+            len,
+            host_pointer: Some(pointer),
         });
         Ok(())
     }
@@ -1972,23 +2226,33 @@ impl ExecutionResources {
                 .iter()
                 .find(|buffer| buffer.index == pool_key)
                 .expect("validated GPU buffer");
-            let mapped = unsafe {
-                self.context.device.map_memory(
-                    gpu.memory,
-                    0,
-                    gpu.len as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|error| {
-                ExecutionFailure::vulkan(
-                    error,
-                    format!("map buffer {} for readback: {error}", gpu.index),
-                )
-            })?;
-            let bytes =
-                unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), gpu.len).to_vec() };
-            unsafe { self.context.device.unmap_memory(gpu.memory) };
+            let bytes = match gpu.host_pointer {
+                // Imported memory is the owner's mapping; read it directly.
+                Some(pointer) => unsafe {
+                    std::slice::from_raw_parts(pointer as *const u8, gpu.len).to_vec()
+                },
+                None => {
+                    let mapped = unsafe {
+                        self.context.device.map_memory(
+                            gpu.memory,
+                            0,
+                            gpu.len as u64,
+                            vk::MemoryMapFlags::empty(),
+                        )
+                    }
+                    .map_err(|error| {
+                        ExecutionFailure::vulkan(
+                            error,
+                            format!("map buffer {} for readback: {error}", gpu.index),
+                        )
+                    })?;
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(mapped.cast::<u8>(), gpu.len).to_vec()
+                    };
+                    unsafe { self.context.device.unmap_memory(gpu.memory) };
+                    bytes
+                }
+            };
             updates.push(BufferUpdate {
                 index: gpu.index,
                 offset: 0,
@@ -2002,6 +2266,8 @@ impl ExecutionResources {
 
 impl Drop for ExecutionResources {
     fn drop(&mut self) {
+        // A retained in-flight submission may still read or write borrowed
+        // owner memory, so only a destroying drop retires its retains.
         if resource_drop_policy(self.submitted, self.completed, self.device_lost)
             == ResourceDropPolicy::Retain
         {
@@ -2020,6 +2286,9 @@ impl Drop for ExecutionResources {
                 std::mem::forget(objects);
             }
             return;
+        }
+        if let Some((registry, lease_ids)) = self.borrowed.take() {
+            registry.retire_all(&lease_ids);
         }
         unsafe {
             if self.fence != vk::Fence::null() {
