@@ -60,6 +60,14 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   pipeline/buffer objects into one complete trace and submits it once. Host
   buffer writes land only after complete output validation. See
   [PROVIDER-OBJECTS.md](docs/PROVIDER-OBJECTS.md) for lifecycle and validation.
+- Cross-process completion: `metal_api_core::completion::wire` defines a
+  transport-independent `CompletionMessage` stream and a receiver-side
+  `CompletionMirror`. Per-stream sequences make duplicate, reordered and
+  coalesced notifications safe; the first terminal observation wins,
+  `Exhausted` keeps in-flight tokens observable, and `DeviceLost` is terminal
+  teardown evidence. The mirror composes with `LeaseLedger` through
+  `observe_into`; the actual transport and provider-side publisher remain
+  future work.
 - Cloud validation: commit `489b489c11b43afbf821295d9d5fe8d9303e1e79` passed
   the full v1-v7 five-path comparison: Swift native, Vulkan direct, Rust Metal
   provider, Vulkan object API and Rust Metal object API. The archived evidence
@@ -74,7 +82,8 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   same v1-v8 direct, object and async-object rails on an NVIDIA GeForce
   RTX 5060 with matching host-visible writebacks.
 - Open design work: device-loss reclamation beyond the bounded abandonment
-  budget, cross-process completion, provider-side lease import (the core
+  budget, the cross-process completion transport and provider-side publisher
+  (the core wire mirror now exists), provider-side lease import (the core
   `LeaseLedger` release contract now exists), general native shader admission,
   CPU uploads during command-buffer execution and aliases.
   Resource snapshots do not hold live guest pages.

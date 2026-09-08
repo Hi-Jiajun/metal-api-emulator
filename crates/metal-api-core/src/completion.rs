@@ -4,6 +4,9 @@
 //! asynchronous provider inserts a running record and fills it from a worker
 //! thread or device completion handler. `wait` reports non-terminal timeouts;
 //! `readback` returns host-visible writebacks only after completion.
+//!
+//! The [`wire`] submodule carries the same terminal semantics across a process
+//! boundary as transport-independent notifications.
 
 use crate::provider::{
     BufferWriteback, CompletionDisposition, CompletionReadback, CompletionToken, ProviderError,
@@ -11,6 +14,8 @@ use crate::provider::{
 };
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+pub mod wire;
 
 enum CompletionState {
     Running,

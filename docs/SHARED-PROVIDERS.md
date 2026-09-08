@@ -71,8 +71,28 @@ idempotent, and one token may cover several leases.
 
 This is a core lifetime contract. Both providers still accept only
 `OwnedBytes` sources; importing owner-issued guest or no-copy leases remains
-future work, as does the cross-process completion protocol that would carry
-these tokens between processes.
+future work.
+
+## Cross-process completion notifications
+
+`metal_api_core::completion::wire` is the transport-independent half of a
+cross-process completion protocol. The provider process publishes
+`CompletionMessage` values; the owner process applies them to a
+`CompletionMirror` that converges to the same terminal semantics as the
+in-process `CompletionRecord`. Every per-token and device-health stream carries
+a monotonic `CompletionSequence`, so duplicate, reordered and coalesced
+notifications are safe to replay. A token's first terminal observation wins;
+when two conflicting terminals arrive in different orders, the lower sequence
+wins. `Exhausted` refuses new admissions but keeps in-flight tokens observable,
+while `DeviceLost` marks every non-terminal token and is teardown evidence.
+`TimedOut` is owner-local and never appears on the wire, and `CompletedVisible`
+means the owner may request the readback over the separate data channel.
+
+`CompletionMirror::observe_into` applies the converged observation to a
+`LeaseLedger`, so the owner can release a lease only after a terminal with
+retirement evidence or device loss. The wire types have no serialization
+dependency; a pipe, socket, shared ring or RPC layer chooses the encoding. The
+provider-side publisher and the actual transport remain future work.
 
 The macOS workflow builds/tests the native crate before running the Swift GPU
 probe. Only after successful eligible Swift captures does it run Rust-native

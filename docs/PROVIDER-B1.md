@@ -72,8 +72,11 @@ when its fence signals. Resources whose fence never signals are retained to
 process exit, but the abandonment budget bounds how many such submissions a
 provider will tolerate before it fails closed. Live guest leases, multi-pass
 ordering, general MTLB resolution and native Metal remain unimplemented. The
-core `LeaseLedger` now defines completion-driven lease release; provider-side
-guest/no-copy lease import is still unimplemented.
+core `LeaseLedger` defines completion-driven lease release, and
+`metal_api_core::completion::wire` defines the transport-independent
+notification stream that will carry those tokens between processes;
+provider-side guest/no-copy lease import and the actual transport remain
+unimplemented.
 
 ## Execution failures and visibility
 
@@ -120,6 +123,14 @@ Metal parity.
 
 ## Verification of this local increment
 
+- 2026-09-08 cross-process completion wire contract:
+  `metal-api-core::completion::wire` adds `CompletionMessage`,
+  `CompletionMirror`, `CompletionSequence` and `CompletionFailure` with 12
+  unit tests covering duplicate/reordered delivery, first-terminal-wins,
+  lower-sequence terminal convergence, `Exhausted`/`DeviceLost` health
+  propagation, identity validation and `LeaseLedger` composition. 177 Rust
+  tests passed (core 118, native 9, Vulkan 36, capture 14) and 115 Python tests
+  passed.
 - 2026-09-08 completion-driven lease ledger: `LeaseLedger` and
   `disposition_retires_resources` were added to `metal-api-core::provider`
   with six unit tests covering multi-token retirement, idempotent binding,
