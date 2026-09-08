@@ -49,7 +49,12 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 /// Four queues are enough to demonstrate independent in-flight work without
 /// over-subscribing drivers whose family reports many queues. A family with a
 /// single queue (Lavapipe) keeps the previous single-queue behaviour.
-const MAX_DEVICE_QUEUES: usize = 4;
+const MAX_QUEUES_PER_FAMILY: usize = 4;
+
+/// Total device queues created across the primary and dedicated compute
+/// families. Compute-only queues can overlap with graphics work on drivers
+/// that expose a separate family, so the scheduler may use up to two families.
+const MAX_DEVICE_QUEUES: usize = 8;
 
 /// Native Vulkan implementation of the Phase 1 compute subset.
 pub struct VulkanExecutor {
@@ -88,9 +93,16 @@ impl VulkanExecutor {
         self.context.mark_device_lost();
     }
 
-    /// Number of device queues created for the selected queue family.
+    /// Number of device queues created across the primary and dedicated
+    /// compute families.
     pub fn queue_count(&self) -> usize {
         self.context.queue_count()
+    }
+
+    /// Number of distinct device queue families used by the scheduler.
+    #[doc(hidden)]
+    pub fn queue_family_count(&self) -> usize {
+        self.context.queue_family_count()
     }
 
     /// Successful submissions recorded per device queue.
@@ -286,7 +298,7 @@ pub(crate) struct VulkanContext {
     instance: Instance,
     device: AshDevice,
     external_memory_host: Option<ExternalMemoryHost>,
-    queue_family: u32,
+    queue_families: Vec<u32>,
     queues: Vec<vk::Queue>,
     next_queue: AtomicUsize,
     queue_submissions: Vec<AtomicUsize>,
@@ -341,19 +353,48 @@ impl VulkanContext {
                 return Err(error);
             }
         };
-        let queue_families =
+        let queue_family_properties =
             unsafe { instance.get_physical_device_queue_family_properties(physical) };
-        let available_queues = queue_families
+        let primary_queues = queue_family_properties
             .get(queue_family as usize)
             .map(|family| family.queue_count as usize)
-            .unwrap_or(1);
-        let queue_count = available_queues.clamp(1, MAX_DEVICE_QUEUES);
-        let priorities = vec![1.0_f32; queue_count];
-        let mut queue_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities);
-        queue_info.queue_count = queue_count as u32;
-        let queue_info = [queue_info];
+            .unwrap_or(1)
+            .clamp(1, MAX_QUEUES_PER_FAMILY);
+        let mut family_plans = vec![(queue_family, primary_queues)];
+        let dedicated_compute = queue_family_properties
+            .iter()
+            .enumerate()
+            .filter(|(index, family)| {
+                *index as u32 != queue_family
+                    && family.queue_count > 0
+                    && family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                    && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            })
+            .max_by_key(|(_, family)| family.queue_count)
+            .map(|(index, family)| {
+                (
+                    index as u32,
+                    (family.queue_count as usize).clamp(1, MAX_QUEUES_PER_FAMILY),
+                )
+            });
+        if let Some(plan) = dedicated_compute {
+            family_plans.push(plan);
+        }
+        let priority_sets = family_plans
+            .iter()
+            .map(|(_, count)| vec![1.0_f32; *count])
+            .collect::<Vec<_>>();
+        let queue_infos = family_plans
+            .iter()
+            .zip(&priority_sets)
+            .map(|((family, count), priorities)| {
+                let mut info = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(*family)
+                    .queue_priorities(priorities);
+                info.queue_count = *count as u32;
+                info
+            })
+            .collect::<Vec<_>>();
         let extensions = match unsafe { instance.enumerate_device_extension_properties(physical) } {
             Ok(extensions) => extensions,
             Err(error) => {
@@ -375,7 +416,7 @@ impl VulkanContext {
         };
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
         let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_info)
+            .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enabled_extensions)
             .push_next(&mut vulkan13);
         let device = match unsafe { instance.create_device(physical, &device_info, None) } {
@@ -385,9 +426,15 @@ impl VulkanContext {
                 return Err(failure(format!("create Vulkan device: {error}")));
             }
         };
-        let queues = (0..queue_count)
-            .map(|index| unsafe { device.get_device_queue(queue_family, index as u32) })
-            .collect::<Vec<_>>();
+        let mut queues = Vec::new();
+        let mut queue_families = Vec::new();
+        for (family, count) in &family_plans {
+            for index in 0..*count {
+                queues.push(unsafe { device.get_device_queue(*family, index as u32) });
+                queue_families.push(*family);
+            }
+        }
+        let queue_count = queues.len();
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
@@ -409,7 +456,7 @@ impl VulkanContext {
             instance,
             device,
             external_memory_host,
-            queue_family,
+            queue_families,
             queues,
             next_queue: AtomicUsize::new(0),
             queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
@@ -484,6 +531,13 @@ impl VulkanContext {
 
     pub(crate) fn queue_count(&self) -> usize {
         self.queues.len()
+    }
+
+    pub(crate) fn queue_family_count(&self) -> usize {
+        let mut families = self.queue_families.clone();
+        families.sort_unstable();
+        families.dedup();
+        families.len()
     }
 
     pub(crate) fn queue_submission_counts(&self) -> Vec<usize> {
@@ -856,7 +910,9 @@ impl PendingExecution {
         resources
             .create_descriptors(&translated, dispatches)
             .map_err(encode_error)?;
-        resources.record(&translated, plans).map_err(encode_error)?;
+        resources
+            .record(&translated, plans, queue_index)
+            .map_err(encode_error)?;
         if let Err(error) = resources.submit(queue_index) {
             let device_lost = error.is_device_lost();
             if error.is_pending() {
@@ -2196,9 +2252,10 @@ impl ExecutionResources {
         &mut self,
         translated: &[&TranslatedComputePipeline],
         plans: &[KernelDispatchPlan],
+        queue_index: usize,
     ) -> Result<(), ExecutionFailure> {
         let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(self.context.queue_family)
+            .queue_family_index(self.context.queue_families[queue_index])
             .flags(vk::CommandPoolCreateFlags::TRANSIENT);
         self.command_pool = unsafe { self.context.device.create_command_pool(&pool_info, None) }
             .map_err(|error| {

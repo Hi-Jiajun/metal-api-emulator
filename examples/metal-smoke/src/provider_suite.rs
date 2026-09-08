@@ -2040,6 +2040,7 @@ fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let queues = executor.queue_count();
+    let families = executor.queue_family_count();
     let counts = executor.queue_submission_counts();
     let submissions: usize = counts.iter().sum();
     if submissions != 2 {
@@ -2055,7 +2056,7 @@ fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
         .into());
     }
     println!(
-        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 queues={queues} distributed={distributed} writeback=exact"
+        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 queues={queues} families={families} distributed={distributed} writeback=exact"
     );
     Ok(())
 }
@@ -2161,6 +2162,7 @@ fn run_object_concurrent_enqueue_inner(
     entered_rx: &std::sync::mpsc::Receiver<usize>,
     release: &Arc<(Mutex<bool>, std::sync::Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
+    let families = executor.queue_family_count();
     let release_probe = || {
         let (lock, condvar) = &**release;
         *lock.lock().expect("enqueue probe mutex") = true;
@@ -2184,93 +2186,99 @@ fn run_object_concurrent_enqueue_inner(
             ),
         })
         .map_err(|error| format!("compile concurrent-enqueue fixture: {error:?}"))?;
-    let word_a = 0x3333_3333_u32.to_le_bytes().to_vec();
-    let word_b = 0x4444_4444_u32.to_le_bytes().to_vec();
-    let input_a = device.new_buffer_with_bytes(word_a.clone())?;
-    let input_b = device.new_buffer_with_bytes(word_b.clone())?;
-    let output_a = device.new_buffer_with_bytes(vec![0_u8; 4])?;
-    let output_b = device.new_buffer_with_bytes(vec![0_u8; 4])?;
     let queue = device.new_command_queue();
-    let first = queue.command_buffer();
-    {
-        let mut encoder = first.compute_command_encoder()?;
-        encoder.set_compute_pipeline_state(&pipeline)?;
-        encoder.set_buffer(0, &input_a.view(0, 4)?)?;
-        encoder.set_buffer(1, &output_a.view(0, 4)?)?;
-        encoder.dispatch_threads(
-            metal_api_core::Size::new(1, 1, 1)?,
-            metal_api_core::Size::new(1, 1, 1)?,
-        )?;
-        encoder.end_encoding()?;
-    }
-    let second = queue.command_buffer();
-    {
-        let mut encoder = second.compute_command_encoder()?;
-        encoder.set_compute_pipeline_state(&pipeline)?;
-        encoder.set_buffer(0, &input_b.view(0, 4)?)?;
-        encoder.set_buffer(1, &output_b.view(0, 4)?)?;
-        encoder.dispatch_threads(
-            metal_api_core::Size::new(1, 1, 1)?,
-            metal_api_core::Size::new(1, 1, 1)?,
-        )?;
-        encoder.end_encoding()?;
-    }
-    let first_thread = std::thread::spawn(move || -> Result<_, String> {
-        first
-            .commit()
-            .map_err(|error| format!("first concurrent commit: {error:?}"))?;
-        Ok(first)
-    });
-    let first_queue = match entered_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(queue) => queue,
-        Err(error) => {
-            release_probe();
-            let _ = first_thread.join();
-            return Err(format!("first enqueue did not enter the probe: {error}").into());
+    let mut words = Vec::new();
+    let mut outputs = Vec::new();
+    let mut commands = Vec::new();
+    for index in 0..queues {
+        let word = (0x1000_0000_u32 | index as u32).to_le_bytes().to_vec();
+        let input = device.new_buffer_with_bytes(word.clone())?;
+        let output = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder()?;
+            encoder.set_compute_pipeline_state(&pipeline)?;
+            encoder.set_buffer(0, &input.view(0, 4)?)?;
+            encoder.set_buffer(1, &output.view(0, 4)?)?;
+            encoder.dispatch_threads(
+                metal_api_core::Size::new(1, 1, 1)?,
+                metal_api_core::Size::new(1, 1, 1)?,
+            )?;
+            encoder.end_encoding()?;
         }
-    };
-    let second_thread = std::thread::spawn(move || -> Result<_, String> {
-        second
-            .commit()
-            .map_err(|error| format!("second concurrent commit: {error:?}"))?;
-        Ok(second)
-    });
-    let second_queue = match entered_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(queue) => queue,
-        Err(_) => {
-            release_probe();
-            let _ = first_thread.join();
-            let _ = second_thread.join();
-            return Err("second enqueue did not enter while the first queue lock was held".into());
+        words.push(word);
+        outputs.push(output);
+        commands.push(command);
+    }
+    let mut threads = Vec::new();
+    for command in commands {
+        threads.push(std::thread::spawn(move || -> Result<_, String> {
+            command
+                .commit()
+                .map_err(|error| format!("concurrent commit: {error:?}"))?;
+            Ok(command)
+        }));
+    }
+    let mut entered = Vec::new();
+    let mut failure = None;
+    for position in 0..queues {
+        match entered_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(queue) => entered.push(queue),
+            Err(error) => {
+                failure = Some(format!(
+                    "enqueue {}/{queues} did not enter the probe: {error}",
+                    position + 1
+                ));
+                break;
+            }
         }
-    };
+    }
     release_probe();
-    let first = first_thread
-        .join()
-        .map_err(|_| "first concurrent commit thread panicked")?
-        .map_err(|error| -> Box<dyn Error> { error.into() })?;
-    let second = second_thread
-        .join()
-        .map_err(|_| "second concurrent commit thread panicked")?
-        .map_err(|error| -> Box<dyn Error> { error.into() })?;
-    first.wait_until_completed()?;
-    second.wait_until_completed()?;
-    if output_a.read()? != word_a || output_b.read()? != word_b {
-        return Err(format!(
-            "concurrent enqueue writebacks differ: a={:02x?} b={:02x?}",
-            output_a.read()?,
-            output_b.read()?
-        )
-        .into());
+    let mut completed = Vec::new();
+    for thread in threads {
+        match thread.join() {
+            Ok(Ok(command)) => completed.push(command),
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+            Err(_) => {
+                if failure.is_none() {
+                    failure = Some("concurrent commit thread panicked".to_owned());
+                }
+            }
+        }
     }
-    if first_queue == second_queue {
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    for command in &completed {
+        command.wait_until_completed()?;
+    }
+    for (index, (output, word)) in outputs.iter().zip(&words).enumerate() {
+        let observed = output.read()?;
+        if observed.as_slice() != word.as_slice() {
+            return Err(format!(
+                "submission {index} writeback differs: {observed:02x?} != {word:02x?}"
+            )
+            .into());
+        }
+    }
+    let distinct = entered
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() != queues {
         return Err(format!(
-            "concurrent submissions shared queue {first_queue}; expected distinct enqueue locks"
+            "enqueue probes entered {} distinct queues, expected {queues}: {entered:?}",
+            distinct.len()
         )
         .into());
     }
     println!(
-        "PASS provider_object_concurrent_enqueue queues={queues} queue_a={first_queue} queue_b={second_queue} host_enqueue=concurrent writeback=exact"
+        "PASS provider_object_concurrent_enqueue submissions={queues} queues={queues} families={families} distinct={} host_enqueue=concurrent writeback=exact",
+        distinct.len()
     );
     Ok(())
 }

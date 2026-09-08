@@ -90,13 +90,14 @@ pending, so independent submissions stay in flight at once. A third case
 records two dispatches in one command buffer with a data dependency and checks
 that the inter-pass compute barrier makes the first pass's write visible to the
 second. The executor creates up to four queues in the selected family (clamped
-to the family's queue count) and the async provider picks the least-loaded
+to the family's queue count) plus up to four in a dedicated compute-only family
+when the device exposes one, and the async provider picks the least-loaded
 queue, breaking ties with a round-robin cursor. Each queue has its own host
 enqueue lock, so independent queues can submit concurrently while submissions
-to one queue stay serialized; a probe-backed case holds two queue locks at once
-on the Windows RTX 5060. Lavapipe reports `queues=1 distributed=false` and
-skips the concurrency case; the Windows RTX 5060 reports
-`queues=4 distributed=true`.
+to one queue stay serialized; a probe-backed case commits one command buffer per
+queue and requires every queue lock to be held at once. Lavapipe reports
+`queues=1 families=1` and skips the concurrency case; the Windows RTX 5060
+reports `queues=8 families=2 distinct=8`.
 There is no end-to-end deadline on compilation, locks, initialization or
 submit. The synchronous fence wait keeps a fixed 20-second bound; a configured
 observation deadline reports unknown completion and retires the submission
