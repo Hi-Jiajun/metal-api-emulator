@@ -46,13 +46,16 @@ struct CompletionSlot {
 /// allowing pipeline changes and binding permutations for exact fixtures.
 ///
 /// A submission has a configurable observation deadline (20 seconds by
-/// default). Unknown retirement or a GPU error permanently disables new work
-/// in this context and retains its submitted backing until process exit.
-/// `wait` reads the recorded terminal observation; releasing that record does
-/// not retire GPU resources. By default `submit` waits for GPU completion and
-/// readback. Calling [`NativeMetalProvider::with_async_execution`] with `true`
-/// instead returns `Submitted` immediately and fills the completion record from
-/// an `MTLCommandBuffer` completion handler.
+/// default). A deadline expiry records `SubmittedUnknown` but leaves the
+/// context usable: the completion handler retains the device, queue, pipeline
+/// and buffer references until Metal reports a terminal status, then releases
+/// them. A completion handler that observes `Error` permanently disables new
+/// work in this context. `wait` reads the recorded terminal observation;
+/// releasing that record does not retire GPU resources. By default `submit`
+/// waits for GPU completion and readback. Calling
+/// [`NativeMetalProvider::with_async_execution`] with `true` instead returns
+/// `Submitted` immediately and fills the completion record from an
+/// `MTLCommandBuffer` completion handler.
 pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
@@ -204,7 +207,6 @@ impl NativeMetalProvider {
         )
         .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) });
         slot.record.fail(error.clone());
-        self.async_abandoned.store(true, Ordering::SeqCst);
         error
     }
 

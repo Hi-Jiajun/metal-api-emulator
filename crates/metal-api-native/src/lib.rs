@@ -418,4 +418,106 @@ mod tests {
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.slug, "native_metal_platform_unavailable");
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deadline_expiry_keeps_the_native_provider_usable() {
+        use metal_api_core::provider::{
+            AllocationId, AllocationRecord, BufferSource, BufferView, CompletionPolicy,
+            ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType, OperationId,
+            PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+        };
+        use std::time::Duration;
+
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native deadline test: no eligible Metal device");
+            return;
+        };
+        let provider = provider
+            .with_async_execution(true)
+            .with_observation_deadline(Duration::ZERO);
+        let pipeline = provider
+            .compile(request("copy_word", COPY))
+            .expect("reviewed copy_word fixture compiles");
+        let make_trace = || ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: provider.device_epoch(),
+            operation_id: OperationId::new(1),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ViewId::new(1),
+                        metal_binding: 0,
+                        allocation_id: AllocationId::new(1),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(0x1122_3344_u32.to_le_bytes().to_vec()),
+                    },
+                    BufferView {
+                        view_id: ViewId::new(2),
+                        metal_binding: 1,
+                        allocation_id: AllocationId::new(2),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 4]),
+                    },
+                ],
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let resources = || {
+            let mut snapshot = ResourceTableSnapshot::new();
+            for allocation in 1..=2 {
+                snapshot
+                    .insert_allocation(AllocationRecord {
+                        allocation_id: AllocationId::new(allocation),
+                        owner_epoch: provider.device_epoch(),
+                        size: 4,
+                    })
+                    .unwrap();
+            }
+            snapshot
+        };
+        let first = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(make_trace(), resources())
+                    .unwrap(),
+            )
+            .unwrap();
+        let first_token = first.completion.token().unwrap();
+        let error = provider.wait(first_token, Duration::ZERO).unwrap_err();
+        assert_eq!(error.slug, "metal_completion_unknown");
+        // The completion handler retains and releases the timed-out submission;
+        // an observation deadline must not permanently disable the context.
+        let second = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(make_trace(), resources())
+                    .unwrap(),
+            )
+            .expect("provider must accept work after a deadline observation");
+        let second_token = second.completion.token().unwrap();
+        assert!(matches!(
+            second.completion,
+            CompletionDisposition::Submitted { .. }
+        ));
+        provider.release_completion(first_token).unwrap();
+        provider.release_completion(second_token).unwrap();
+        provider.release_pipeline(&pipeline).unwrap();
+    }
 }
