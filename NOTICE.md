@@ -10,8 +10,8 @@ included.
 The indexed-dispatch LLVM fixture
 `examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll`
 derives from the public fixture of the same name in
-[steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan/blob/9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c/validation/fixtures/public/kernel_dispatch_threads_boundary_barrier.ll) at
-`9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c` (LGPL-3.0-or-later).
+[steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan/blob/43c46ac8a24adf1a6e872b8a52c706ec9614fad0/validation/fixtures/public/kernel_dispatch_threads_boundary_barrier.ll) at
+`43c46ac8a24adf1a6e872b8a52c706ec9614fad0` (LGPL-3.0-or-later).
 The local variant removes an i32-to-i64 extension and uses an i32 GEP index
 to keep the optional SPIR-V Int64 capability outside this prototype's subset.
 The expected output is the upstream-qualified 120-byte Metal result, recorded
@@ -31,7 +31,7 @@ own license terms and notices. Cargo.lock records the exact resolved sources.
 `conformance/shaders/indexed_boundary.metal` is the source counterpart to the
 same public boundary/barrier case, with renamed local variables and comments.
 Its original source is
-[the pinned public MSL fixture](https://github.com/steelbrain/metal2vulkan/blob/9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c/validation/fixtures/public/kernel_dispatch_threads_boundary_barrier.metal),
+[the pinned public MSL fixture](https://github.com/steelbrain/metal2vulkan/blob/43c46ac8a24adf1a6e872b8a52c706ec9614fad0/validation/fixtures/public/kernel_dispatch_threads_boundary_barrier.metal),
 under the same LGPL-3.0-or-later terms. `conformance/shaders/copy_word.metal`
 is owned synthetic source paired with the existing copy LLVM fixture.
 

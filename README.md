@@ -93,7 +93,7 @@ project's current scope. See the [collaboration draft](UPSTREAM-DISCUSSION-DRAFT
 Install Rust, a C linker and Git. The current preparation is tested with Rust
 1.96.0; the manifests retain the previous 1.87 minimum, which has not yet been
 separately verified. A first build downloads Cargo dependencies, including
-metal2vulkan at `9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c`.
+metal2vulkan at `43c46ac8a24adf1a6e872b8a52c706ec9614fad0`.
 
 ```sh
 cargo test --workspace --locked

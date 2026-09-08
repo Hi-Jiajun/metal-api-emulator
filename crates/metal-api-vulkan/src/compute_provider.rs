@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const TRANSLATOR_REVISION: &[u8] = b"9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c";
+const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
 
 struct RegisteredPipeline {
     metadata: CompiledComputePipeline,
