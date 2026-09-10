@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v8 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v9 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -71,6 +71,7 @@ private struct CaseDefinition: Decodable {
     let local: [UInt64]
     let dispatches: [DispatchDefinition]?
     let programs: [ProgramDefinition]?
+    let command_buffers: [[Int]]?
     let air: SourceDefinition
     let metal: SourceDefinition
     let buffers: [BufferDefinition]
@@ -92,6 +93,7 @@ private struct ValidatedBuffer {
 private struct ValidatedCase {
     let definition: CaseDefinition
     let dispatches: [DispatchDefinition]
+    let commandBuffers: [[Int]]
     let programs: [(definition: ProgramDefinition, source: String)]
     let buffers: [ValidatedBuffer]
 }
@@ -297,7 +299,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
     try require(definition.local.reduce(UInt64(1), *) <= 1024,
                 "\(definition.id): excessive threads per threadgroup")
     let dispatches: [DispatchDefinition]
-    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" || suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
+    if suite == "compute-buffer-v3" || suite == "compute-buffer-v4" || suite == "compute-buffer-v5" || suite == "compute-buffer-v6" || suite == "compute-buffer-v7" || suite == "compute-buffer-v8" || suite == "compute-buffer-v9" {
         let expectedCount: Int
         switch definition.id {
         case "transform_twice", "transform_pingpong_two", "copy_pingpong", "pipeline_chain_two", "layout_chain_two", "subset_chain_two": expectedCount = 2
@@ -315,7 +317,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         let expected = try (0..<expectedCount).map { index -> DispatchDefinition in
             var mapping: [UInt64]? = nil
             var program: Int? = (suite == "compute-buffer-v5" || suite == "compute-buffer-v6") ? index % 2 : nil
-            if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
+            if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" || suite == "compute-buffer-v9" {
                 let views = definition.buffers.map { $0.view }
                 try require(views.count == (expectedCount == 2 ? 4 : 5), "Missing subset-chain resources")
                 switch index % 4 {
@@ -387,7 +389,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
                     && definition.buffers.contains { $0.binding == 5 && $0.access == "write" && $0.length == 120 },
                     "\(definition.id): expected 120-byte read/write at 0, 4-byte read at 2, and 120-byte write at 5")
     case "subset_chain_two", "subset_chain_four", "subset_chain_eight":
-        try require((suite == "compute-buffer-v7" || suite == "compute-buffer-v8") && definition.entry == "transform_3d"
+        try require((suite == "compute-buffer-v7" || suite == "compute-buffer-v8" || suite == "compute-buffer-v9") && definition.entry == "transform_3d"
                     && definition.grid == [5, 3, 2] && definition.local == [4, 2, 2],
                     "\(definition.id): unsupported entry or dispatch shape")
         let expectedLabels: [UInt64] = definition.id == "subset_chain_two" ? [0, 2, 5, 8] : [0, 2, 5, 8, 9]
@@ -403,6 +405,34 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         throw OracleError("Unsupported case: \(definition.id)")
     }
     return dispatches
+}
+
+// Dispatch indices per command buffer. Legacy fixtures record one command
+// buffer; the v9 suite splits the same reviewed sequence across several that
+// commit and complete in order.
+private func validateCommandBuffers(_ definition: CaseDefinition, suite: String,
+                                    dispatches: [DispatchDefinition]) throws -> [[Int]] {
+    guard let groups = definition.command_buffers else {
+        try require(suite != "compute-buffer-v9",
+                    "\(definition.id): v9 fixture requires command buffer groups")
+        return [Array(0..<dispatches.count)]
+    }
+    try require(suite == "compute-buffer-v9",
+                "\(definition.id): command buffer groups require compute-buffer-v9")
+    try require(groups.count >= 2 && groups.count <= 4,
+                "\(definition.id): v9 fixture needs two to four command buffers")
+    var expected = 0
+    for group in groups {
+        try require(!group.isEmpty, "\(definition.id): command buffer group cannot be empty")
+        for index in group {
+            try require(index == expected,
+                        "\(definition.id): command buffer groups must partition the dispatch order")
+            expected += 1
+        }
+    }
+    try require(expected == dispatches.count,
+                "\(definition.id): command buffer groups must partition the dispatch order")
+    return groups
 }
 
 // Legacy fixtures use their original interface; v6/v7 choose an independently
@@ -504,8 +534,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     case "compute-buffer-v8":
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
+    case "compute-buffer-v9":
+        expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v8 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v9 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -516,6 +548,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         // buffer payload or reading shader files from the supplied manifest.
         let programs = try validatePrograms(definition, suite: suite.suite)
         let dispatches = try validateShape(definition, suite: suite.suite)
+        let commandBuffers = try validateCommandBuffers(definition, suite: suite.suite,
+                                                        dispatches: dispatches)
         var usedViews = Set<UInt64>()
         for dispatch in dispatches {
             try require(programs.indices.contains(dispatch.program ?? 0), "Unknown selected program")
@@ -537,6 +571,7 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
             (definition: program, source: try loadProgram(program, root: root))
         }
         cases.append(ValidatedCase(definition: definition, dispatches: dispatches,
+                                   commandBuffers: commandBuffers,
                                    programs: loaded, buffers: buffers))
     }
     return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
@@ -599,7 +634,7 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
 private func validatePrograms(_ definition: CaseDefinition, suite: String) throws -> [ProgramDefinition] {
     let primary = ProgramDefinition(entry: definition.entry, air: definition.air,
                                     metal: definition.metal, buffer_slots: nil)
-    if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" {
+    if suite == "compute-buffer-v7" || suite == "compute-buffer-v8" || suite == "compute-buffer-v9" {
         guard let supplied = definition.programs else { throw OracleError("Program table required") }
         var expected = try [reviewedProgram("transform_3d", explicitSlots: true),
                             reviewedProgram("copy_3d", explicitSlots: true)]
@@ -655,13 +690,6 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
                     "\(definition.id) pass \(index): local thread count exceeds pipeline limit")
     }
 
-    // makeCommandBuffer() retains referenced resources until GPU completion.
-    // In particular, a CPU timeout below must not release submitted buffers.
-    guard let commandBuffer = queue.makeCommandBuffer() else {
-        throw OracleError("\(definition.id): cannot create a command buffer")
-    }
-    try require(commandBuffer.retainedReferences, "\(definition.id): command buffer does not retain resources")
-    commandBuffer.label = "native oracle: \(definition.id)"
     var resources = [MTLBuffer]()
     for buffer in fixture.buffers {
         try require(buffer.backing.count <= device.maxBufferLength,
@@ -679,37 +707,49 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         }
         resources.append(resource)
     }
-    // The default encoder is serial. Direct bindings of device-created tracked
-    // buffers let MTLCommandQueue synchronize writes between successive passes:
-    // https://developer.apple.com/documentation/metal/resource-synchronization
-    // Keep one buffer set and command buffer so no CPU upload resets earlier writes.
-    for dispatch in fixture.dispatches {
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw OracleError("\(definition.id): cannot create a compute encoder")
+    // makeCommandBuffer() retains referenced resources until GPU completion.
+    // In particular, a CPU timeout below must not release submitted buffers.
+    // One command buffer commits and completes before the next group is
+    // recorded, so later commands observe earlier landed writes.
+    for (groupIndex, group) in fixture.commandBuffers.enumerated() {
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw OracleError("\(definition.id): cannot create a command buffer")
         }
-        encoder.setComputePipelineState(pipelines[dispatch.program ?? 0])
-        for (index, slot) in bufferSlots(definition, program: dispatch.program ?? 0).enumerated() {
-            let view = dispatch.bindings?[index] ?? fixture.buffers[index].definition.view
-            guard let poolIndex = fixture.buffers.firstIndex(where: { $0.definition.view == view }) else {
-                throw OracleError("Unknown bound resource")
+        try require(commandBuffer.retainedReferences, "\(definition.id): command buffer does not retain resources")
+        commandBuffer.label = "native oracle: \(definition.id) cb\(groupIndex)"
+        // The default encoder is serial. Direct bindings of device-created tracked
+        // buffers let MTLCommandQueue synchronize writes between successive passes:
+        // https://developer.apple.com/documentation/metal/resource-synchronization
+        // Keep one buffer set across command buffers so no CPU upload resets earlier writes.
+        for dispatchIndex in group {
+            let dispatch = fixture.dispatches[dispatchIndex]
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw OracleError("\(definition.id): cannot create a compute encoder")
             }
-            let resource = fixture.buffers[poolIndex]
-            encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.binding))
+            encoder.setComputePipelineState(pipelines[dispatch.program ?? 0])
+            for (index, slot) in bufferSlots(definition, program: dispatch.program ?? 0).enumerated() {
+                let view = dispatch.bindings?[index] ?? fixture.buffers[index].definition.view
+                guard let poolIndex = fixture.buffers.firstIndex(where: { $0.definition.view == view }) else {
+                    throw OracleError("Unknown bound resource")
+                }
+                let resource = fixture.buffers[poolIndex]
+                encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.binding))
+            }
+            encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
+            encoder.endEncoding()
         }
-        encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
-        encoder.endEncoding()
-    }
 
-    let completed = DispatchSemaphore(value: 0)
-    commandBuffer.addCompletedHandler { _ in completed.signal() }
-    commandBuffer.commit()
-    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
-        // Throwing reaches the top-level nonzero exit. No other case is run,
-        // buffers are not inspected, and no partial report is published.
-        throw OracleError("\(definition.id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+        let completed = DispatchSemaphore(value: 0)
+        commandBuffer.addCompletedHandler { _ in completed.signal() }
+        commandBuffer.commit()
+        guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+            // Throwing reaches the top-level nonzero exit. No other case is run,
+            // buffers are not inspected, and no partial report is published.
+            throw OracleError("\(definition.id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+        }
+        try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                    "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
     }
-    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
-                "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
 
     var allocations = [AllocationResult]()
     var writebacks = [Writeback]()

@@ -171,7 +171,7 @@ recognizes the conventional `C:\msys64\mingw64\bin` installation. To run the
 optional engine comparison after building it, pass `-ReimsRunner` with the path
 to `reims-smoke.exe`. Both executables run in separate processes.
 Pass `-ProviderSmoke` to run `provider-smoke.exe` (the cross-platform provider
-suite) and `-CaptureMatrix` to write the v1-v8 direct, object and
+suite) and `-CaptureMatrix` to write the v1-v9 direct, object and
 async-object captures under `target\windows-captures`.
 
 `provider-smoke.exe` also runs on Windows. The Unix-domain-socket IPC and

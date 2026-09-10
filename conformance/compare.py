@@ -215,6 +215,26 @@ def _suite_plan(suite):
             _require(used_views == set(original_views),
                      f"{where}: unused buffer pool resources; every view must appear in a dispatch")
 
+        command_buffers = case.get("command_buffers")
+        if command_buffers is None:
+            _require(suite["suite"] != "compute-buffer-v9",
+                     f"{where}: v9 fixture requires command buffer groups")
+        else:
+            _require(suite["suite"] == "compute-buffer-v9",
+                     f"{where}: command buffer groups are only qualified by the v9 suite")
+            _require(isinstance(command_buffers, list) and 2 <= len(command_buffers) <= 4,
+                     f"{where}: v9 fixture needs two to four command buffers")
+            expected = 0
+            for group in command_buffers:
+                _require(isinstance(group, list) and group,
+                         f"{where}: command buffer group cannot be empty")
+                for index in group:
+                    _require(type(index) is int and index == expected,
+                             f"{where}: command buffer groups must partition the dispatch order")
+                    expected += 1
+            _require(expected == len(dispatches),
+                     f"{where}: command buffer groups must partition the dispatch order")
+
         writes, written_views = [], set()
         for value in _list(case.get("expected_writebacks"), f"{where}.expected_writebacks"):
             identity, data = _writeback(value, f"{where} expected writeback")

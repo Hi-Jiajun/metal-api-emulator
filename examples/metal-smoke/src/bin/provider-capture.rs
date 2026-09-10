@@ -105,6 +105,7 @@ struct Case {
     expected_writebacks: Vec<Writeback>,
     dispatches: Option<Vec<CaseDispatch>>,
     programs: Option<Vec<CaseProgram>>,
+    command_buffers: Option<Vec<Vec<usize>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -465,6 +466,11 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "subset_chain_four",
             "subset_chain_eight",
         ],
+        (1, "compute-buffer-v9") => &[
+            "subset_chain_two",
+            "subset_chain_four",
+            "subset_chain_eight",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -494,6 +500,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     for case in &suite.cases {
         validate_case_programs(case)?;
         validate_case_dispatches(case)?;
+        validate_case_command_buffers(&suite.suite, case)?;
         if !ids.insert(&case.id) {
             return Err("duplicate case identity".into());
         }
@@ -565,6 +572,106 @@ fn case_programs(case: &Case) -> Vec<CaseProgram> {
         }]
     })
 }
+
+fn dispatch_sequence(case: &Case) -> Vec<CaseDispatch> {
+    case.dispatches.clone().unwrap_or_else(|| {
+        vec![CaseDispatch {
+            grid: case.grid,
+            local: case.local,
+            bindings: None,
+            program: None,
+        }]
+    })
+}
+
+/// Dispatch indices per command buffer. Legacy fixtures submit one command
+/// buffer; the v9 suite splits the same sequence across several.
+fn case_command_buffers(case: &Case) -> Vec<Vec<usize>> {
+    case.command_buffers
+        .clone()
+        .unwrap_or_else(|| vec![(0..dispatch_sequence(case).len()).collect()])
+}
+
+fn validate_case_command_buffers(suite: &str, case: &Case) -> Result<()> {
+    let dispatches = dispatch_sequence(case);
+    let Some(groups) = &case.command_buffers else {
+        if suite == "compute-buffer-v9" {
+            return Err("v9 fixture requires command buffer groups".into());
+        }
+        return Ok(());
+    };
+    if suite != "compute-buffer-v9" {
+        return Err("command buffer groups are only qualified by the v9 suite".into());
+    }
+    if !(2..=4).contains(&groups.len()) {
+        return Err("v9 fixture needs two to four command buffers".into());
+    }
+    let mut expected = 0usize;
+    for group in groups {
+        if group.is_empty() {
+            return Err("command buffer group cannot be empty".into());
+        }
+        for index in group {
+            if *index != expected {
+                return Err("command buffer groups must partition the dispatch order".into());
+            }
+            expected += 1;
+        }
+    }
+    if expected != dispatches.len() {
+        return Err("command buffer groups must partition the dispatch order".into());
+    }
+    Ok(())
+}
+
+/// Command buffers may each report writes for the same view; the capture
+/// reports the final per-view landing, so later writes overlay earlier ones
+/// and every written view must end up fully covered.
+fn merge_writebacks(
+    case: &Case,
+    entries: impl IntoIterator<Item = (u64, u64, u64, Vec<u8>)>,
+) -> Result<Vec<Writeback>> {
+    let mut views = BTreeMap::new();
+    for buffer in &case.buffers {
+        let length = usize::try_from(buffer.length)?;
+        views.insert(
+            (buffer.allocation, buffer.view),
+            (buffer.offset, vec![0_u8; length], vec![false; length]),
+        );
+    }
+    for (allocation, view, offset, bytes) in entries {
+        let (view_offset, data, covered) = views
+            .get_mut(&(allocation, view))
+            .ok_or("writeback references an unknown view")?;
+        let start = usize::try_from(
+            offset
+                .checked_sub(*view_offset)
+                .ok_or("writeback starts before its view")?,
+        )?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or("writeback range overflow")?;
+        data.get_mut(start..end)
+            .ok_or("writeback exceeds its view")?
+            .copy_from_slice(&bytes);
+        covered[start..end].fill(true);
+    }
+    let mut writebacks = Vec::new();
+    for ((allocation, view), (offset, data, covered)) in views {
+        if covered.iter().all(|value| *value) {
+            writebacks.push(Writeback {
+                allocation,
+                view,
+                offset,
+                bytes_hex: hex(&data),
+            });
+        } else if covered.iter().any(|value| *value) {
+            return Err(format!("writebacks do not cover view {view} exactly").into());
+        }
+    }
+    Ok(writebacks)
+}
+
 fn validate_program(program: &CaseProgram) -> Result<()> {
     let (air_path, air_hash, metal_path, metal_hash) = match program.entry.as_str() {
         "copy_word" => (
@@ -974,75 +1081,83 @@ fn case_trace(
     case: &Case,
     operation: u64,
     views: &[BufferView],
+    dispatches: &[CaseDispatch],
 ) -> Result<ComputeTrace> {
+    let passes = dispatches
+        .iter()
+        .map(|dispatch| -> Result<ComputePass> {
+            let selected = &programs[dispatch.program.unwrap_or(0)];
+            let expected = selected_slots(case, dispatch);
+            if selected.contract.buffer_bindings.len() != expected.len()
+                || selected.contract.buffer_bindings.iter().zip(&expected).any(
+                    |(actual, expected)| {
+                        actual.metal_binding != expected.binding
+                            || expected.access
+                                != match actual.access {
+                                    BufferAccess::Read => "read",
+                                    BufferAccess::Write => "write",
+                                    BufferAccess::ReadWrite => "read_write",
+                                    BufferAccess::Unused => "unused",
+                                }
+                    },
+                )
+            {
+                return Err("source/fixture selected layout mismatch".into());
+            }
+            let buffers = selected
+                .contract
+                .buffer_bindings
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| {
+                    let view_id = dispatch
+                        .bindings
+                        .as_ref()
+                        .map_or(views[index].view_id.get(), |map| map[index]);
+                    let mut resource = views
+                        .iter()
+                        .find(|view| view.view_id.get() == view_id)
+                        .expect("validated binding map")
+                        .clone();
+                    resource.metal_binding = slot.metal_binding;
+                    resource.access = slot.access;
+                    resource
+                })
+                .collect();
+            Ok(ComputePass {
+                pipeline: selected.pipeline_id,
+                buffers,
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: dispatch.grid,
+                    threads_per_threadgroup: dispatch.local,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // The provider rejects unused pipeline metadata, so each command buffer
+    // carries only the programs its own passes reference.
+    let mut pipelines: Vec<CompiledComputePipeline> = Vec::new();
+    for pass in &passes {
+        if pipelines
+            .iter()
+            .any(|program| program.pipeline_id == pass.pipeline)
+        {
+            continue;
+        }
+        let program = programs
+            .iter()
+            .find(|program| program.pipeline_id == pass.pipeline)
+            .ok_or("pass pipeline is not part of the compiled program table")?;
+        pipelines.push(program.clone());
+    }
     Ok(ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch,
         operation_id: OperationId::new(operation),
-        pipelines: programs.to_vec(),
+        pipelines,
         encoder_dispatch_type: DispatchType::Serial,
-        passes: case
-            .dispatches
-            .clone()
-            .unwrap_or_else(|| {
-                vec![CaseDispatch {
-                    grid: case.grid,
-                    local: case.local,
-                    bindings: None,
-                    program: None,
-                }]
-            })
-            .into_iter()
-            .map(|dispatch| -> Result<ComputePass> {
-                let selected = &programs[dispatch.program.unwrap_or(0)];
-                let expected = selected_slots(case, &dispatch);
-                if selected.contract.buffer_bindings.len() != expected.len()
-                    || selected.contract.buffer_bindings.iter().zip(&expected).any(
-                        |(actual, expected)| {
-                            actual.metal_binding != expected.binding
-                                || expected.access
-                                    != match actual.access {
-                                        BufferAccess::Read => "read",
-                                        BufferAccess::Write => "write",
-                                        BufferAccess::ReadWrite => "read_write",
-                                        BufferAccess::Unused => "unused",
-                                    }
-                        },
-                    )
-                {
-                    return Err("source/fixture selected layout mismatch".into());
-                }
-                let buffers = selected
-                    .contract
-                    .buffer_bindings
-                    .iter()
-                    .enumerate()
-                    .map(|(index, slot)| {
-                        let view_id = dispatch
-                            .bindings
-                            .as_ref()
-                            .map_or(views[index].view_id.get(), |map| map[index]);
-                        let mut resource = views
-                            .iter()
-                            .find(|view| view.view_id.get() == view_id)
-                            .expect("validated binding map")
-                            .clone();
-                        resource.metal_binding = slot.metal_binding;
-                        resource.access = slot.access;
-                        resource
-                    })
-                    .collect();
-                Ok(ComputePass {
-                    pipeline: selected.pipeline_id,
-                    buffers,
-                    dispatch: Dispatch {
-                        kind: DispatchKind::ThreadsExact,
-                        grid: dispatch.grid,
-                        threads_per_threadgroup: dispatch.local,
-                    },
-                })
-            })
-            .collect::<Result<_>>()?,
+        passes,
         completion_policy: CompletionPolicy::HostReadback,
     })
 }
@@ -1072,76 +1187,73 @@ fn run_object_case(
         resources.insert(definition.view, (buffer, view));
     }
     let queue = device.new_command_queue();
-    let command = queue.command_buffer();
-    let dispatches = case.dispatches.clone().unwrap_or_else(|| {
-        vec![CaseDispatch {
-            grid: case.grid,
-            local: case.local,
-            bindings: None,
-            program: None,
-        }]
-    });
-    // Several dispatches on one encoder exercise snapshot-at-dispatch behavior,
-    // including changed pipelines, binding tables and later first use.
-    let mut encoder = command.compute_command_encoder()?;
-    for dispatch in &dispatches {
-        encoder.clear_buffers()?;
-        encoder.set_compute_pipeline_state(&programs[dispatch.program.unwrap_or(0)])?;
-        let slots = selected_slots(case, dispatch);
-        let views = dispatch
-            .bindings
-            .clone()
-            .unwrap_or_else(|| case.buffers.iter().map(|buffer| buffer.view).collect());
-        for (slot, view) in slots.iter().zip(views) {
-            let (_, view) = resources.get(&view).ok_or("unknown object fixture view")?;
-            encoder.set_buffer(slot.binding, view)?;
+    let dispatches = dispatch_sequence(case);
+    let groups = case_command_buffers(case);
+    let narrow = |dimensions: [u64; 3]| -> Result<Size> {
+        Ok(Size::new(
+            u32::try_from(dimensions[0])?,
+            u32::try_from(dimensions[1])?,
+            u32::try_from(dimensions[2])?,
+        )?)
+    };
+    let mut reported = Vec::new();
+    // Each command buffer commits and completes before the next one records,
+    // which matches Metal's serial queue boundary and re-snapshots the landed
+    // bytes for the following command.
+    for group in &groups {
+        let command = queue.command_buffer();
+        // Several dispatches on one encoder exercise snapshot-at-dispatch behavior,
+        // including changed pipelines, binding tables and later first use.
+        let mut encoder = command.compute_command_encoder()?;
+        for index in group {
+            let dispatch = dispatches
+                .get(*index)
+                .ok_or("command buffer dispatch index out of range")?;
+            encoder.clear_buffers()?;
+            encoder.set_compute_pipeline_state(&programs[dispatch.program.unwrap_or(0)])?;
+            let slots = selected_slots(case, dispatch);
+            let views = dispatch
+                .bindings
+                .clone()
+                .unwrap_or_else(|| case.buffers.iter().map(|buffer| buffer.view).collect());
+            for (slot, view) in slots.iter().zip(views) {
+                let (_, view) = resources.get(&view).ok_or("unknown object fixture view")?;
+                encoder.set_buffer(slot.binding, view)?;
+            }
+            encoder.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
         }
-        let narrow = |dimensions: [u64; 3]| -> Result<Size> {
-            Ok(Size::new(
-                u32::try_from(dimensions[0])?,
-                u32::try_from(dimensions[1])?,
-                u32::try_from(dimensions[2])?,
-            )?)
-        };
-        encoder.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
-    }
-    encoder.end_encoding()?;
-    command.commit()?;
-    if async_execution {
-        if command.status()? != metal_api_core::CommandBufferStatus::Committed {
-            return Err("async object commit did not leave the command pending".into());
+        encoder.end_encoding()?;
+        command.commit()?;
+        if async_execution {
+            if command.status()? != metal_api_core::CommandBufferStatus::Committed {
+                return Err("async object commit did not leave the command pending".into());
+            }
+            if !matches!(
+                command.submission()?.completion,
+                CompletionDisposition::Submitted { .. }
+            ) {
+                return Err("async object commit did not return a submitted token".into());
+            }
         }
+        command.wait_until_completed()?;
+        if command.status()? != metal_api_core::CommandBufferStatus::Completed {
+            return Err("object command did not reach Completed".into());
+        }
+        let output = command.submission()?;
         if !matches!(
-            command.submission()?.completion,
-            CompletionDisposition::Submitted { .. }
+            output.completion,
+            CompletionDisposition::CompletedVisible { .. }
         ) {
-            return Err("async object commit did not return a submitted token".into());
+            return Err("object capture requires completed visible results".into());
+        }
+        for write in output.writebacks {
+            let &(allocation, view) = report_ids
+                .get(&(write.allocation_id, write.view_id))
+                .ok_or("unknown object writeback identity")?;
+            reported.push((allocation, view, write.offset, write.bytes));
         }
     }
-    command.wait_until_completed()?;
-    if command.status()? != metal_api_core::CommandBufferStatus::Completed {
-        return Err("object command did not reach Completed".into());
-    }
-    let output = command.submission()?;
-    if !matches!(
-        output.completion,
-        CompletionDisposition::CompletedVisible { .. }
-    ) {
-        return Err("object capture requires completed visible results".into());
-    }
-    let mut writebacks = Vec::new();
-    for write in output.writebacks {
-        let &(allocation, view) = report_ids
-            .get(&(write.allocation_id, write.view_id))
-            .ok_or("unknown object writeback identity")?;
-        writebacks.push(Writeback {
-            allocation,
-            view,
-            offset: write.offset,
-            bytes_hex: hex(&write.bytes),
-        });
-    }
-    writebacks.sort_by_key(|write| (write.allocation, write.view));
+    let writebacks = merge_writebacks(case, reported)?;
     let mut allocations = Vec::new();
     for definition in &case.buffers {
         let (buffer, _) = &resources[&definition.view];
@@ -1154,8 +1266,9 @@ fn run_object_case(
     }
     allocations.sort_by_key(|allocation| allocation.allocation);
     eprintln!(
-        "objects command completed: {} passes={}",
+        "objects command completed: {} command_buffers={} passes={}",
         case.id,
+        groups.len(),
         dispatches.len()
     );
     Ok(CaseResult {
@@ -1174,15 +1287,8 @@ fn run_case(
     guard: u8,
 ) -> Result<CaseResult> {
     let mut resources = ResourceTableSnapshot::new();
-    let mut views = Vec::new();
-    let mut allocations = Vec::new();
+    let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
     for buffer in &case.buffers {
-        let access = match buffer.access.as_str() {
-            "read" => BufferAccess::Read,
-            "write" => BufferAccess::Write,
-            "read_write" => BufferAccess::ReadWrite,
-            _ => return Err("unsupported access".into()),
-        };
         let initial = unhex(&buffer.initial_hex)?;
         let mut backing = vec![guard; usize::try_from(buffer.allocation_size)?];
         let start = usize::try_from(buffer.offset)?;
@@ -1193,20 +1299,52 @@ fn run_case(
             owner_epoch: provider.device_epoch(),
             size: buffer.allocation_size,
         })?;
-        views.push(BufferView {
-            view_id: ViewId::new(buffer.view),
-            metal_binding: buffer.binding,
-            allocation_id: AllocationId::new(buffer.allocation),
-            offset: buffer.offset,
-            length: buffer.length,
-            access,
-            attribute_stride: None,
-            source: BufferSource::OwnedBytes(initial),
-        });
     }
-    let trace = case_trace(provider.device_epoch(), programs, case, operation, &views)?;
+    // Every command buffer snapshots the bytes landed so far, so a later
+    // command reads what an earlier command wrote.
+    let case_views = |allocations: &[(u64, Vec<u8>)]| -> Result<Vec<BufferView>> {
+        case.buffers
+            .iter()
+            .map(|buffer| {
+                let access = match buffer.access.as_str() {
+                    "read" => BufferAccess::Read,
+                    "write" => BufferAccess::Write,
+                    "read_write" => BufferAccess::ReadWrite,
+                    _ => return Err("unsupported access".into()),
+                };
+                let (_, backing) = allocations
+                    .iter()
+                    .find(|(allocation, _)| *allocation == buffer.allocation)
+                    .ok_or("unknown fixture allocation")?;
+                let start = usize::try_from(buffer.offset)?;
+                let end = start + usize::try_from(buffer.length)?;
+                Ok(BufferView {
+                    view_id: ViewId::new(buffer.view),
+                    metal_binding: buffer.binding,
+                    allocation_id: AllocationId::new(buffer.allocation),
+                    offset: buffer.offset,
+                    length: buffer.length,
+                    access,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(backing[start..end].to_vec()),
+                })
+            })
+            .collect()
+    };
+    let dispatches = dispatch_sequence(case);
+    let groups = case_command_buffers(case);
+    let initial_views = case_views(&allocations)?;
+    // Refusal guards run on the complete sequence before any submission.
+    let guard_trace = case_trace(
+        provider.device_epoch(),
+        programs,
+        case,
+        operation,
+        &initial_views,
+        &dispatches,
+    )?;
     if case.entry == "transform_3d" {
-        let mut short = trace.clone();
+        let mut short = guard_trace.clone();
         let shortened = short.passes[0].buffers[0].view_id;
         for pass in &mut short.passes {
             if let Some(view) = pass
@@ -1226,7 +1364,7 @@ fn run_case(
         }
     }
     if programs.len() > 1 {
-        let mut forged = trace.clone();
+        let mut forged = guard_trace.clone();
         forged.pipelines[1].contract.buffer_bindings[0].footprint =
             FootprintProof::Static { max_bytes: 1 };
         let input = provider
@@ -1241,7 +1379,7 @@ fn run_case(
                     .into(),
             );
         }
-        let mut unknown = trace.clone();
+        let mut unknown = guard_trace.clone();
         let original_id = unknown.pipelines[1].pipeline_id;
         let missing = metal_api_core::provider::PipelineId::new(u64::MAX);
         unknown.pipelines[1].pipeline_id = missing;
@@ -1263,42 +1401,70 @@ fn run_case(
         }
         eprintln!("Checked second-pipeline refusal guards: {}", case.id);
     }
-    let admitted = provider
-        .capabilities()
-        .validate_trace(trace.clone(), resources)
-        .map_err(|error| format!("admit {}: {error:?}", case.id))?;
-    let output = provider
-        .submit(admitted)
-        .map_err(|error| format!("submit {}: {error:?}", case.id))?;
-    output.validate_for_trace(&trace)?;
-    let CompletionDisposition::CompletedVisible { token } = output.completion else {
-        return Err("provider capture requires completed visible results".into());
-    };
-    if provider
-        .wait(token, Duration::ZERO)
-        .map_err(|error| format!("wait: {error:?}"))?
-        != output.completion
-    {
-        return Err("provider completion observation changed".into());
+    let mut reported = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let views = case_views(&allocations)?;
+        let selected = group
+            .iter()
+            .map(|position| {
+                dispatches
+                    .get(*position)
+                    .cloned()
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        "command buffer dispatch index out of range".into()
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let trace_operation = if groups.len() == 1 {
+            operation
+        } else {
+            operation * 100 + index as u64 + 1
+        };
+        let trace = case_trace(
+            provider.device_epoch(),
+            programs,
+            case,
+            trace_operation,
+            &views,
+            &selected,
+        )?;
+        let admitted = provider
+            .capabilities()
+            .validate_trace(trace.clone(), resources.clone())
+            .map_err(|error| format!("admit {}: {error:?}", case.id))?;
+        let output = provider
+            .submit(admitted)
+            .map_err(|error| format!("submit {}: {error:?}", case.id))?;
+        output.validate_for_trace(&trace)?;
+        let CompletionDisposition::CompletedVisible { token } = output.completion else {
+            return Err("provider capture requires completed visible results".into());
+        };
+        if provider
+            .wait(token, Duration::ZERO)
+            .map_err(|error| format!("wait: {error:?}"))?
+            != output.completion
+        {
+            return Err("provider completion observation changed".into());
+        }
+        for write in output.writebacks {
+            let (_, backing) = allocations
+                .iter_mut()
+                .find(|(id, _)| *id == write.allocation_id.get())
+                .ok_or("unknown writeback allocation")?;
+            let start = usize::try_from(write.offset)?;
+            backing[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+            reported.push((
+                write.allocation_id.get(),
+                write.view_id.get(),
+                write.offset,
+                write.bytes,
+            ));
+        }
+        provider
+            .release_completion(token)
+            .map_err(|error| format!("release completion: {error:?}"))?;
     }
-    let mut writebacks = Vec::new();
-    for write in output.writebacks {
-        let (_, backing) = allocations
-            .iter_mut()
-            .find(|(id, _)| *id == write.allocation_id.get())
-            .ok_or("unknown writeback allocation")?;
-        let start = usize::try_from(write.offset)?;
-        backing[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
-        writebacks.push(Writeback {
-            allocation: write.allocation_id.get(),
-            view: write.view_id.get(),
-            offset: write.offset,
-            bytes_hex: hex(&write.bytes),
-        });
-    }
-    provider
-        .release_completion(token)
-        .map_err(|error| format!("release completion: {error:?}"))?;
+    let writebacks = merge_writebacks(case, reported)?;
     allocations.sort_by_key(|(id, _)| *id);
     Ok(CaseResult {
         id: case.id.clone(),
@@ -1388,6 +1554,48 @@ mod tests {
         assert!(validate_suite(&s).is_err());
         assert!(unhex("0aFF").is_err());
         assert!(unhex("0").is_err());
+    }
+
+    #[test]
+    fn v9_splits_the_reviewed_sequence_across_command_buffers() {
+        let load = || {
+            serde_json::from_str::<Suite>(include_str!("../../../../conformance/suite-v9.json"))
+                .unwrap()
+        };
+        let s = load();
+        validate_suite(&s).unwrap();
+        for case in &s.cases {
+            let groups = case_command_buffers(case);
+            assert_eq!(
+                groups.len(),
+                if case.id == "subset_chain_four" {
+                    2
+                } else {
+                    groups.len()
+                }
+            );
+            let flattened: Vec<usize> = groups.iter().flatten().copied().collect();
+            assert_eq!(
+                flattened,
+                (0..dispatch_sequence(case).len()).collect::<Vec<_>>()
+            );
+            assert!(groups.iter().all(|group| !group.is_empty()));
+        }
+        let mut s = load();
+        s.cases[0].command_buffers = None;
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].command_buffers = Some(vec![vec![1], vec![0]]);
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].command_buffers = Some(vec![vec![0, 1], vec![]]);
+        assert!(validate_suite(&s).is_err());
+        let mut s = load();
+        s.cases[0].command_buffers = Some(vec![vec![0], vec![1], vec![2]]);
+        assert!(validate_suite(&s).is_err());
+        let mut legacy = suite();
+        legacy.cases[0].command_buffers = Some(vec![vec![0]]);
+        assert!(validate_suite(&legacy).is_err());
     }
 
     #[test]
@@ -1722,7 +1930,15 @@ mod tests {
                     source: BufferSource::OwnedBytes(unhex(&buffer.initial_hex).unwrap()),
                 })
                 .collect::<Vec<_>>();
-            let trace = case_trace(DeviceEpoch::new(1), &programs, case, 1, &views).unwrap();
+            let trace = case_trace(
+                DeviceEpoch::new(1),
+                &programs,
+                case,
+                1,
+                &views,
+                &dispatch_sequence(case),
+            )
+            .unwrap();
             let resources = trace.serial_resources().unwrap();
             assert_eq!(resources.len(), case.buffers.len());
             assert_eq!(trace.passes[0].buffers.len(), 3);
@@ -1753,7 +1969,15 @@ mod tests {
                 ever_writable(case)
             );
             programs[1].contract.buffer_bindings[0].access = BufferAccess::ReadWrite;
-            assert!(case_trace(DeviceEpoch::new(1), &programs, case, 1, &views).is_err());
+            assert!(case_trace(
+                DeviceEpoch::new(1),
+                &programs,
+                case,
+                1,
+                &views,
+                &dispatch_sequence(case)
+            )
+            .is_err());
         }
     }
 

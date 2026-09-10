@@ -227,9 +227,15 @@ and submit the selected encoding; the Swift and Rust native rails keep using
 the reviewed MSL fixture. Native v8 passed
 [five-path CI](https://github.com/Hi-Jiajun/metal-api-emulator/actions/runs/34223294821).
 
+[suite-v9.json](suite-v9.json) adds a command-buffer boundary dimension:
+`provider-capture --api objects` and the Swift oracle split each reviewed
+`subset_chain_*` dispatch sequence across two to four command buffers that commit
+and complete in order, and the capture merges the per-view final landed bytes.
+See [SUITE-V9.md](SUITE-V9.md).
+
 ## Provider object entry point
 
-`provider-capture --api objects` runs the same v1-v8 fixtures through the new
+`provider-capture --api objects` runs the same v1-v9 fixtures through the new
 shared object API. Its reports identify `vulkan-objects` or
 `native-metal-provider-objects`; both report actual host-buffer landing.
 The direct trace captures remain separate, and the Swift oracle is unchanged.

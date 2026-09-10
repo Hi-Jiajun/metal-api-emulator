@@ -57,7 +57,7 @@ if ($CaptureMatrix) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $outputDir = Join-Path $PSScriptRoot "target\windows-captures\$stamp"
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    foreach ($version in 1..8) {
+    foreach ($version in 1..9) {
         $suite = if ($version -eq 1) { 'suite.json' } else { "suite-v$version.json" }
         foreach ($rail in @('direct', 'objects', 'objects-async')) {
             $output = Join-Path $outputDir "vulkan-$rail-v$version.json"

@@ -79,7 +79,7 @@ uses the same wait/readback semantics.
 
 The synchronous mode keeps the direct trace rail and existing captures
 unchanged. The async mode is used by the object-API capture path with
-`provider-capture --api objects --async`; CI runs v1-v8 this way on Lavapipe.
+`provider-capture --api objects --async`; CI runs v1-v9 this way on Lavapipe.
 `provider-smoke` also commits two object-API command buffers with a shared
 buffer dependency: the second commit blocks on the first command's reservation
 and only then submits, so the final destination proves commit-order execution
