@@ -15,7 +15,7 @@
 //! [`crate::ComputeExecutor`] object API.
 
 use crate::provider::{
-    self as contract, AllocationId, AllocationRecord, BufferSource, BufferWriteback,
+    self as contract, AllocationId, AllocationRecord, BufferRange, BufferSource, BufferWriteback,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionToken,
     ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType, OperationId,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
@@ -412,6 +412,14 @@ impl BufferView {
     }
     pub fn allocation_id(&self) -> AllocationId {
         self.buffer.allocation_id()
+    }
+    /// Byte interval of this view inside its allocation, for range hazards.
+    fn range(&self) -> BufferRange {
+        BufferRange::new(
+            self.buffer.allocation_id(),
+            self.offset as u64,
+            self.length as u64,
+        )
     }
 }
 
@@ -865,9 +873,11 @@ impl ComputeCommandEncoder {
         if !Arc::ptr_eq(&self.shared.owner, &view.buffer.inner.owner) {
             return Err(Error::ForeignBuffer);
         }
-        if let Some((first, _)) = self.buffers.iter().find(|(other, bound)| {
-            **other != index && bound.allocation_id() == view.allocation_id()
-        }) {
+        if let Some((first, _)) = self
+            .buffers
+            .iter()
+            .find(|(other, bound)| **other != index && bound.range().overlaps(&view.range()))
+        {
             return Err(ApiError::AliasedBufferBindings {
                 first: *first,
                 second: index,

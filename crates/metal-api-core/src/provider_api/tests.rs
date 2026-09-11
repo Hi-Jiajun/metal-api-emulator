@@ -58,6 +58,7 @@ struct FakeProvider {
     release_order: Mutex<Vec<&'static str>>,
     readbacks: Mutex<BTreeMap<SubmissionId, CompletionReadback>>,
     cancelled: Mutex<Vec<CompletionToken>>,
+    alias_mode: AliasMode,
     wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -75,9 +76,14 @@ impl FakeProvider {
             release_order: Mutex::new(Vec::new()),
             readbacks: Mutex::new(BTreeMap::new()),
             cancelled: Mutex::new(Vec::new()),
+            alias_mode: AliasMode::Refused,
             wait_calls: AtomicUsize::new(0),
             gate: None,
         }
+    }
+    fn with_alias_mode(mut self, alias_mode: AliasMode) -> Self {
+        self.alias_mode = alias_mode;
+        self
     }
     fn error(&self, token: CompletionToken) -> ProviderError {
         ProviderError::new(
@@ -104,7 +110,7 @@ impl ComputeProvider for FakeProvider {
             max_storage_buffer_descriptors: 128,
             max_buffer_range: 65536,
             max_push_constant_bytes: 0,
-            alias_mode: AliasMode::Refused,
+            alias_mode: self.alias_mode,
             storage_modes: vec![StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: false,
@@ -1077,4 +1083,50 @@ fn cancelling_a_recording_command_is_refused() {
         Err(Error::Api(ApiError::CommandBufferNotCommitted))
     ));
     assert!(provider.cancelled.lock().unwrap().is_empty());
+}
+
+#[test]
+fn disjoint_views_of_one_allocation_are_admitted_under_distinct_views() {
+    let provider = Arc::new(FakeProvider::new().with_alias_mode(AliasMode::DistinctViews));
+    let device = Device::new(provider.clone());
+    let pipeline = pipeline(&device, "0");
+    let buffer = device.new_buffer_with_bytes(vec![3; 16]).unwrap();
+    let first = buffer.view(0, 4).unwrap();
+    let second = buffer.view(8, 4).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&pipeline).unwrap();
+    encoder.set_buffer(0, &first).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.clear_buffers().unwrap();
+    encoder.set_buffer(0, &second).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+    assert_eq!(command.submission().unwrap().writebacks.len(), 2);
+    assert_eq!(provider.traces.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn overlapping_views_of_one_allocation_stay_refused_under_distinct_views() {
+    let provider = Arc::new(FakeProvider::new().with_alias_mode(AliasMode::DistinctViews));
+    let device = Device::new(provider.clone());
+    let pipeline = pipeline(&device, "0");
+    let buffer = device.new_buffer_with_bytes(vec![3; 16]).unwrap();
+    let first = buffer.view(0, 4).unwrap();
+    let second = buffer.view(2, 4).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&pipeline).unwrap();
+    encoder.set_buffer(0, &first).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.clear_buffers().unwrap();
+    encoder.set_buffer(0, &second).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.end_encoding().unwrap();
+    assert!(matches!(
+        command.commit(),
+        Err(Error::Provider(error)) if error.slug == "buffer_alias_unsupported"
+    ));
+    assert!(provider.traces.lock().unwrap().is_empty());
 }

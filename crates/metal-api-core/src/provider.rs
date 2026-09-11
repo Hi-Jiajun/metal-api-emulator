@@ -2290,7 +2290,7 @@ impl ProviderCapabilities {
             _ => {}
         }
 
-        let mut allocations = BTreeMap::new();
+        let mut allocations = BTreeMap::<AllocationId, BTreeMap<ViewId, BufferRange>>::new();
         for pass in &trace.passes {
             let contract = &trace
                 .pipeline(pass.pipeline)
@@ -2419,14 +2419,32 @@ impl ProviderCapabilities {
                     return Err(capability_error("storage_mode_unsupported")
                         .with_field("binding", FieldValue::Unsigned(buffer.metal_binding as u64)));
                 }
-                if let Some(previous_view) =
-                    allocations.insert(buffer.allocation_id, buffer.view_id)
-                {
-                    if previous_view == buffer.view_id {
-                        continue;
-                    }
+                let range = BufferRange::new(buffer.allocation_id, buffer.offset, buffer.length);
+                let views = allocations.entry(buffer.allocation_id).or_default();
+                if views.contains_key(&buffer.view_id) {
+                    // The same logical view may be bound by several passes; its
+                    // identity and range were settled when it was first seen.
+                    continue;
+                }
+                if !views.is_empty() {
                     match self.alias_mode {
-                        AliasMode::DistinctViews => {}
+                        AliasMode::DistinctViews => {
+                            // Ranged aliasing: several views of one allocation
+                            // are admitted only while their byte ranges stay
+                            // disjoint. Overlap keeps the original refusal so a
+                            // malformed trace cannot become an aliasing hazard.
+                            if views.values().any(|other| other.overlaps(&range)) {
+                                return Err(capability_error("buffer_alias_unsupported")
+                                    .with_field(
+                                        "binding",
+                                        FieldValue::Unsigned(buffer.metal_binding as u64),
+                                    )
+                                    .with_field(
+                                        "allocation",
+                                        FieldValue::Unsigned(buffer.allocation_id.get()),
+                                    ));
+                            }
+                        }
                         AliasMode::Refused => {
                             return Err(capability_error("buffer_alias_unsupported").with_field(
                                 "binding",
@@ -2442,6 +2460,7 @@ impl ProviderCapabilities {
                         }
                     }
                 }
+                views.insert(buffer.view_id, range);
             }
         }
         // Capability admission intentionally precedes backing/lease admission:
@@ -5755,5 +5774,77 @@ mod tests {
             .map(|range| (range.allocation_id.get(), range.offset, range.length))
             .collect::<Vec<_>>();
         assert_eq!(keys, vec![(1, 4, 4), (1, 4, 8), (1, 8, 4), (2, 0, 4)]);
+    }
+
+    fn ranged_buffer(view_id: u64, offset: u64, length: u64) -> BufferView {
+        BufferView {
+            offset,
+            length,
+            source: BufferSource::OwnedBytes(vec![0; usize::try_from(length).unwrap()]),
+            ..buffer(view_id, 0)
+        }
+    }
+
+    fn sized_resources(size: u64) -> ResourceTableSnapshot {
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(9),
+                owner_epoch: DeviceEpoch::new(1),
+                size,
+            })
+            .unwrap();
+        resources
+    }
+
+    fn ranged_capabilities(alias_mode: AliasMode) -> ProviderCapabilities {
+        ProviderCapabilities {
+            max_passes: 8,
+            alias_mode,
+            ..capabilities()
+        }
+    }
+
+    #[test]
+    fn distinct_view_ranges_are_admitted_only_while_disjoint() {
+        let mut value = trace(vec![
+            pass(4, vec![ranged_buffer(1, 0, 4)]),
+            pass(4, vec![ranged_buffer(2, 4, 4)]),
+        ]);
+        let resources = sized_resources(16);
+        let distinct = ranged_capabilities(AliasMode::DistinctViews);
+        assert!(distinct.admit(&value, &resources).is_ok());
+
+        // A refusing provider keeps refusing every second view of an allocation.
+        assert_eq!(
+            ranged_capabilities(AliasMode::Refused)
+                .admit(&value, &resources)
+                .unwrap_err()
+                .slug,
+            "buffer_alias_unsupported"
+        );
+
+        // Overlapping ranges keep the alias refusal even for read-read pairs,
+        // which stay refused conservatively in the first version.
+        value.passes[1].buffers[0] = ranged_buffer(2, 2, 4);
+        assert_eq!(
+            distinct.admit(&value, &resources).unwrap_err().slug,
+            "buffer_alias_unsupported"
+        );
+        for pass in &mut value.passes {
+            pass.buffers[0].access = BufferAccess::Read;
+        }
+        value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
+        assert_eq!(
+            distinct.admit(&value, &resources).unwrap_err().slug,
+            "buffer_alias_unsupported"
+        );
+
+        // The same logical view reused across passes is not an alias.
+        value.passes[1].buffers[0] = ranged_buffer(1, 0, 4);
+        for pass in &mut value.passes {
+            pass.buffers[0].access = BufferAccess::Read;
+        }
+        assert!(distinct.admit(&value, &resources).is_ok());
     }
 }
