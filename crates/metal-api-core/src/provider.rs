@@ -2602,6 +2602,92 @@ pub enum AliasMode {
     ExplicitPolicy,
 }
 
+/// One half-open byte range inside one allocation: `[offset, offset + length)`.
+///
+/// Ranges are the pure-value unit of provider-side hazard tracking proposed by
+/// `research/docs/14`; nothing is wired to them yet. `length == 0` is an empty
+/// range that conflicts with nothing. A range whose end overflows is treated as
+/// conflicting so hazard admission fails closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferRange {
+    pub allocation_id: AllocationId,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl BufferRange {
+    pub const fn new(allocation_id: AllocationId, offset: u64, length: u64) -> Self {
+        Self {
+            allocation_id,
+            offset,
+            length,
+        }
+    }
+
+    /// Exclusive end offset; refuses overflow like [`LeaseReservation::end`].
+    pub fn end(&self) -> Result<u64, ContractError> {
+        self.offset
+            .checked_add(self.length)
+            .ok_or(ContractError::ArithmeticOverflow("buffer range"))
+    }
+
+    /// True when both ranges describe overlapping bytes of the same allocation.
+    /// Empty ranges never overlap; an overflowing range conflicts (fail closed).
+    pub fn overlaps(&self, other: &Self) -> bool {
+        if self.allocation_id != other.allocation_id || self.length == 0 || other.length == 0 {
+            return false;
+        }
+        match (self.end(), other.end()) {
+            (Ok(left), Ok(right)) => self.offset < right && other.offset < left,
+            _ => true,
+        }
+    }
+}
+
+/// Reads and writes of one submission expressed as allocation ranges. Hazard
+/// admission compares two sets between in-flight submissions; the rule follows
+/// `research/docs/14` §3.2: any overlap involving at least one write conflicts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RangeSet {
+    pub reads: Vec<BufferRange>,
+    pub writes: Vec<BufferRange>,
+}
+
+impl RangeSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_read(mut self, range: BufferRange) -> Self {
+        self.reads.push(range);
+        self
+    }
+
+    pub fn with_write(mut self, range: BufferRange) -> Self {
+        self.writes.push(range);
+        self
+    }
+
+    /// True when any write of `self` overlaps a write or read of `other`, or
+    /// any read of `self` overlaps a write of `other`.
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.writes.iter().any(|write| {
+            other.writes.iter().any(|other| write.overlaps(other))
+                || other.reads.iter().any(|other| write.overlaps(other))
+        }) || self
+            .reads
+            .iter()
+            .any(|read| other.writes.iter().any(|write| read.overlaps(write)))
+    }
+}
+
+/// Sort ranges into the canonical order from `research/docs/14` §3.4:
+/// allocation, then offset, then length. Exact duplicates keep their relative
+/// order.
+pub fn sort_canonical(ranges: &mut [BufferRange]) {
+    ranges.sort_by_key(|range| (range.allocation_id, range.offset, range.length));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageMode {
     OwnedBytes,
@@ -5603,5 +5689,71 @@ mod tests {
             token: submission.completion.token().unwrap(),
         };
         submission.validate_for_trace(&trace).unwrap();
+    }
+
+    #[test]
+    fn buffer_ranges_are_half_open_and_allocation_scoped() {
+        let allocation = AllocationId::new(7);
+        let other = AllocationId::new(8);
+        let range = BufferRange::new(allocation, 10, 10);
+        assert_eq!(range.end(), Ok(20));
+        assert!(range.overlaps(&BufferRange::new(allocation, 0, 11)));
+        assert!(range.overlaps(&BufferRange::new(allocation, 19, 1)));
+        assert!(!range.overlaps(&BufferRange::new(allocation, 20, 4)));
+        assert!(!range.overlaps(&BufferRange::new(allocation, 0, 10)));
+        assert!(!range.overlaps(&BufferRange::new(other, 10, 10)));
+    }
+
+    #[test]
+    fn empty_ranges_conflict_with_nothing_but_overflow_fails_closed() {
+        let allocation = AllocationId::new(9);
+        let empty = BufferRange::new(allocation, 4, 0);
+        assert_eq!(empty.end(), Ok(4));
+        assert!(!empty.overlaps(&BufferRange::new(allocation, 0, 8)));
+        assert!(!BufferRange::new(allocation, 0, 8).overlaps(&empty));
+        let overflowing = BufferRange::new(allocation, u64::MAX, 2);
+        assert_eq!(
+            overflowing.end(),
+            Err(ContractError::ArithmeticOverflow("buffer range"))
+        );
+        assert!(overflowing.overlaps(&BufferRange::new(allocation, 0, 8)));
+        assert!(BufferRange::new(allocation, 0, 8).overlaps(&overflowing));
+    }
+
+    #[test]
+    fn range_set_conflicts_only_when_a_write_is_involved() {
+        let allocation = AllocationId::new(3);
+        let write = BufferRange::new(allocation, 16, 32);
+        let read = BufferRange::new(allocation, 40, 8);
+        let disjoint = BufferRange::new(allocation, 48, 8);
+
+        let writer = RangeSet::new().with_write(write);
+        let reader = RangeSet::new().with_read(read);
+        let disjoint_reader = RangeSet::new().with_read(disjoint);
+        let disjoint_writer = RangeSet::new().with_write(disjoint);
+
+        assert!(writer.conflicts_with(&reader));
+        assert!(reader.conflicts_with(&writer));
+        assert!(writer.conflicts_with(&writer.clone()));
+        assert!(!reader.conflicts_with(&RangeSet::new().with_read(read)));
+        assert!(!reader.conflicts_with(&disjoint_reader));
+        assert!(!writer.conflicts_with(&disjoint_writer));
+        assert!(!RangeSet::new().conflicts_with(&writer));
+    }
+
+    #[test]
+    fn canonical_order_sorts_ranges_by_allocation_offset_and_length() {
+        let mut ranges = vec![
+            BufferRange::new(AllocationId::new(2), 0, 4),
+            BufferRange::new(AllocationId::new(1), 8, 4),
+            BufferRange::new(AllocationId::new(1), 4, 8),
+            BufferRange::new(AllocationId::new(1), 4, 4),
+        ];
+        sort_canonical(&mut ranges);
+        let keys = ranges
+            .iter()
+            .map(|range| (range.allocation_id.get(), range.offset, range.length))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![(1, 4, 4), (1, 4, 8), (1, 8, 4), (2, 0, 4)]);
     }
 }
