@@ -1009,6 +1009,10 @@ fn encode(
         };
         let stride = NSUInteger::try_from(width.saturating_mul(4)).unwrap_or(NSUInteger::MAX);
         created.replace_region(region, 0, bytes.as_ptr().cast(), stride);
+        // A texture upload is a copy-in like a buffer upload, so the v11 count
+        // contract sees one operation per touched allocation
+        // (`research/docs/18` step 3).
+        counters.uploads.fetch_add(1, Ordering::Relaxed);
         bound_textures.insert(texture.view_id, TextureRef { texture: created });
     }
     let command = unsafe {
