@@ -154,6 +154,7 @@ fn render_pass(
         }],
         viewport: [0, 0, width as u32, height as u32],
         vertices: 3,
+        present: None,
     }
 }
 

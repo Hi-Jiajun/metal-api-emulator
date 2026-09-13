@@ -215,6 +215,13 @@ impl NativeMetalProvider {
                 max_color_attachments: render_bits.max_color_attachments,
                 max_attachment_dimension: render_bits.max_attachment_dimension,
                 supported_color_formats: render_bits.supported_color_formats,
+                // The present bits come from the same rail value as the render
+                // bits, so this snapshot cannot claim a present action the rail
+                // does not run (`research/docs/24` §4.2, §6 Step 3).
+                supports_presentation: render_bits.supports_presentation,
+                max_present_targets: render_bits.max_present_targets,
+                supported_present_modes: render_bits.supported_present_modes,
+                max_present_image_count: render_bits.max_present_image_count,
             };
             Ok(Self {
                 epoch: allocate_device_epoch()?,

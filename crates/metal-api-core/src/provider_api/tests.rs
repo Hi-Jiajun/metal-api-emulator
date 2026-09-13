@@ -118,6 +118,10 @@ impl ComputeProvider for FakeProvider {
             max_color_attachments: 0,
             max_attachment_dimension: [0, 0],
             supported_color_formats: Vec::new(),
+            supports_presentation: false,
+            max_present_targets: 0,
+            supported_present_modes: Vec::new(),
+            max_present_image_count: 0,
         }
     }
     fn health(&self) -> ProviderHealth {

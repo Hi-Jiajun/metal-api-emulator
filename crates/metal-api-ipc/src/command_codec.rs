@@ -1718,6 +1718,9 @@ fn get_render_pass(decoder: &mut Decoder<'_>) -> Result<RenderPassDescriptor, Co
             decoder.u32()?,
         ],
         vertices: decoder.u32()?,
+        // The pre-present layout has no room for a present action, so a frame
+        // it decodes describes an offscreen render pass (`docs/24` §4.3).
+        present: None,
     })
 }
 
@@ -2296,6 +2299,15 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         max_color_attachments: 0,
         max_attachment_dimension: [0, 0],
         supported_color_formats: Vec::new(),
+        // A legacy payload cannot have declared presentation, so the present
+        // bits take the same "cannot present" defaults the render bits take
+        // here (`docs/24` §4.2): a decoder that predates the present tag reads
+        // a provider as present-refusing, which is exactly what that provider
+        // was.
+        supports_presentation: false,
+        max_present_targets: 0,
+        supported_present_modes: Vec::new(),
+        max_present_image_count: 0,
     })
 }
 

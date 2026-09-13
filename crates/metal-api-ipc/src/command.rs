@@ -1577,6 +1577,7 @@ mod tests {
             color_attachments: vec![render_attachment(width, height)],
             viewport: [0, 0, width as u32, height as u32],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            present: None,
         }
     }
 
@@ -1980,6 +1981,10 @@ mod tests {
                     max_color_attachments: 0,
                     max_attachment_dimension: [0, 0],
                     supported_color_formats: Vec::new(),
+                    supports_presentation: false,
+                    max_present_targets: 0,
+                    supported_present_modes: Vec::new(),
+                    max_present_image_count: 0,
                 },
             },
             CommandResponse::Compiled {
@@ -2329,6 +2334,10 @@ mod tests {
             max_color_attachments: 0,
             max_attachment_dimension: [0, 0],
             supported_color_formats: Vec::new(),
+            supports_presentation: false,
+            max_present_targets: 0,
+            supported_present_modes: Vec::new(),
+            max_present_image_count: 0,
         }
     }
 

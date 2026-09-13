@@ -1704,6 +1704,7 @@ mod tests {
             }],
             viewport: [0, 0, 2, 2],
             vertices: 3,
+            present: None,
         }
     }
 

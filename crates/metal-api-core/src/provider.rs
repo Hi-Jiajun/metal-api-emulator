@@ -1357,6 +1357,17 @@ pub struct RenderPassDescriptor {
     /// Vertices of the single non-indexed draw. The first milestone draws
     /// [`FULL_SCREEN_TRIANGLE_VERTICES`].
     pub vertices: u32,
+    /// The present action this pass hands its own attachment on to, or `None`
+    /// for the offscreen-only pass.
+    ///
+    /// This is `research/docs/24` §3.5's shape one — present as the render
+    /// pass's tail action — chosen by `docs/24` §4.1 and executed here: the
+    /// descriptor hangs off the pass it renders, which is what makes §3.3's
+    /// first ordering rule ("the target's writer completes before the present")
+    /// structurally unbreakable rather than merely checked. A compute-only or
+    /// offscreen trace leaves the field `None` and keeps the pre-present bytes
+    /// exactly (`docs/24` §4.3).
+    pub present: Option<PresentDescriptor>,
 }
 
 impl RenderPassDescriptor {
@@ -1404,6 +1415,16 @@ impl RenderPassDescriptor {
                 viewport: [width, height],
                 attachment: [attachment.width, attachment.height],
             });
+        }
+        // The present action is validated by Step 1's own rules, not a second
+        // copy of them: `validate_against` is the same entry point the
+        // standalone Step 1 tests exercised, so a trace cannot reach execution
+        // through a weaker gate than the one the contract already published.
+        // `docs/24` §4.2 leaves the capability half (whether a snapshot can
+        // present at all) to admission, which is why nothing here reads a
+        // `ProviderCapabilities`.
+        if let Some(present) = &self.present {
+            present.validate_against(self)?;
         }
         Ok(())
     }
@@ -3418,6 +3439,32 @@ impl ComputeTrace {
             .any(|pass| matches!(pass, TracePass::Render(_)))
     }
 
+    /// Every present action in pass order, tagged with the index of the trace
+    /// entry that carries it (`research/docs/24` §3.5 shape one, where the
+    /// present hangs off a render pass).
+    ///
+    /// Present admission, `MCC1` and the Step 3 execution step walk this list.
+    /// A trace with no present action yields nothing, so the pre-present bytes,
+    /// the serial pool and the render budget all keep their previous values
+    /// (`docs/24` §4.3).
+    pub fn present_actions(&self) -> impl Iterator<Item = (usize, &PresentDescriptor)> {
+        self.passes
+            .iter()
+            .enumerate()
+            .filter_map(|(pass_index, pass)| {
+                pass.as_render()
+                    .and_then(|render| render.present.as_ref())
+                    .map(|present| (pass_index, present))
+            })
+    }
+
+    /// Whether this trace carries at least one present action. A present action
+    /// only exists on a render pass (shape one), so this is a narrowing of
+    /// [`ComputeTrace::has_render_passes`] rather than an alternative to it.
+    pub fn has_present_actions(&self) -> bool {
+        self.present_actions().next().is_some()
+    }
+
     /// Look up metadata without recursively validating the trace. Providers
     /// must still check this caller-supplied metadata against their registry.
     pub fn pipeline(&self, id: PipelineId) -> Result<&CompiledComputePipeline, ContractError> {
@@ -4201,17 +4248,64 @@ pub struct ProviderCapabilities {
     /// own format family; its wire codes are the `MCC1` texture-format codes,
     /// so no second mapping is needed (`docs/23` §3.1).
     pub supported_color_formats: Vec<AttachmentFormat>,
+    /// Whether this snapshot can execute the present action of
+    /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
+    /// contract and the refusals, while the Vulkan "readable swapchain
+    /// equivalent" is `docs/24` §6 Step 3, so a present-bearing trace is
+    /// refused during admission instead of being silently downgraded to an
+    /// offscreen render (`docs/24` §4.2).
+    ///
+    /// The three fields below are the increments this bit narrows, declared in
+    /// the same "the field exists but the value is refused" style
+    /// [`PresentTarget::image_count`] uses. They stay at their defaults
+    /// (`0`/empty/`0`) for a snapshot that cannot present, so a caller reading
+    /// them without checking this bit cannot read a limit as an admission.
+    pub supports_presentation: bool,
+    /// Present targets this snapshot admits in one trace. `0` means the
+    /// snapshot cannot present at all; the first increment admits
+    /// [`MAX_PRESENT_TARGETS`].
+    pub max_present_targets: u32,
+    /// Present modes this snapshot admits. Empty means none; the first
+    /// increment admits [`PresentMode::ADMITTED`] (`Fifo` only, `docs/24`
+    /// §3.1). Compared by value rather than by wire code so the contract's own
+    /// enum is the single vocabulary (`docs/24` §4.2).
+    pub supported_present_modes: Vec<PresentMode>,
+    /// Images behind one present target this snapshot admits. `0` means none;
+    /// the first increment admits [`MAX_PRESENT_IMAGE_COUNT`], because
+    /// multi-buffering needs the in-flight state machine `docs/24` §3.4
+    /// schedules after this increment.
+    pub max_present_image_count: u32,
 }
 
 impl ProviderCapabilities {
-    /// Whether any render bit differs from the pre-render defaults. `MCC1`
-    /// uses this to keep a compute-only provider's capability frame at its
-    /// exact legacy bytes and to carry the render bits only when they exist.
+    /// Whether any extended bit differs from its default. `MCC1` uses this to
+    /// keep a compute-only, non-presenting provider's capability frame at its
+    /// exact legacy bytes and to carry the render and present bits only when
+    /// they exist (`docs/24` §4.2).
+    ///
+    /// The present bits are part of the same question on purpose: a snapshot
+    /// that declared presentation without declaring render would otherwise keep
+    /// sending the legacy payload, and its present bits would be lost on the
+    /// wire — the exact "declared a bit that travels as the old bytes" failure
+    /// `docs/24` §4.2 calls out.
     pub fn declares_render_support(&self) -> bool {
         self.supports_render_passes
             || self.max_color_attachments != 0
             || self.max_attachment_dimension != [0, 0]
             || !self.supported_color_formats.is_empty()
+            || self.declares_presentation_support()
+    }
+
+    /// Whether any present bit differs from its default.
+    ///
+    /// A snapshot with all four bits at their defaults is treated as unable to
+    /// present: [`ProviderCapabilities::admit`] refuses any present-bearing
+    /// trace it sees, and `MCC1` never has to carry the bits.
+    pub fn declares_presentation_support(&self) -> bool {
+        self.supports_presentation
+            || self.max_present_targets != 0
+            || !self.supported_present_modes.is_empty()
+            || self.max_present_image_count != 0
     }
 
     /// Freeze a trace and its resource snapshot after admission. The returned
@@ -4245,6 +4339,13 @@ impl ProviderCapabilities {
         // provider that cannot render refuses the whole trace here, and a
         // compute-only trace never enters the walk (`docs/23` §4.2).
         self.admit_render_passes(trace)?;
+
+        // Present admission is the second gate and sits just as early
+        // (`research/docs/24` §4.2): Step 2 publishes the contract and the
+        // refusal, Step 3 owns execution, so a snapshot that cannot present
+        // refuses a present-bearing trace before any resource action instead of
+        // running its render half and dropping the present.
+        self.admit_present_actions(trace)?;
 
         if trace.passes.len() > self.max_passes as usize {
             return Err(capability_error("pass_count_limit")
@@ -4539,6 +4640,59 @@ impl ProviderCapabilities {
             render
                 .validate_against(pass)
                 .map_err(contract_error_refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Present admission, the second capability gate (`research/docs/24` §4.2).
+    ///
+    /// The order repeats the render gate's deliberate choice: the bits a
+    /// snapshot can answer on its own come first, so a provider whose present
+    /// bits stay at their defaults refuses the whole trace with
+    /// `present_targets_unsupported` and never reports a per-target detail
+    /// about work it would not execute. A compute-only or offscreen-only trace
+    /// has no present action, so it never enters the walk and keeps the
+    /// pre-present admission exactly (`docs/24` §4.3).
+    ///
+    /// Only a snapshot that declares presentation reaches the target-count,
+    /// mode and image-count bits. Their refusals are therefore statements about
+    /// this snapshot's declared limits; the trace's own shape was already ruled
+    /// on by `trace.validate()`, which runs Step 1's present rules through
+    /// [`RenderPassDescriptor::validate`] before this gate.
+    fn admit_present_actions(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        let targets = trace.present_actions().count();
+        if targets == 0 {
+            return Ok(());
+        }
+        if !self.supports_presentation {
+            return Err(capability_error("present_targets_unsupported")
+                .with_field("targets", FieldValue::Unsigned(targets as u64)));
+        }
+        if targets > self.max_present_targets as usize {
+            return Err(capability_error("present_target_limit")
+                .with_field("requested", FieldValue::Unsigned(targets as u64))
+                .with_field(
+                    "maximum",
+                    FieldValue::Unsigned(self.max_present_targets as u64),
+                ));
+        }
+        for (pass_index, present) in trace.present_actions() {
+            if !self.supported_present_modes.contains(&present.mode) {
+                return Err(capability_error("present_mode_unsupported")
+                    .with_field("mode", FieldValue::Unsigned(u64::from(present.mode.code())))
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64)));
+            }
+            if present.target.image_count > self.max_present_image_count {
+                return Err(capability_error("present_image_count_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(u64::from(present.target.image_count)),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(u64::from(self.max_present_image_count)),
+                    ));
+            }
         }
         Ok(())
     }
@@ -7095,6 +7249,7 @@ mod tests {
             }],
             viewport: [0, 0, width as u32, height as u32],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            present: None,
         })
     }
 
@@ -7329,6 +7484,10 @@ mod tests {
             max_color_attachments: 0,
             max_attachment_dimension: [0, 0],
             supported_color_formats: Vec::new(),
+            supports_presentation: false,
+            max_present_targets: 0,
+            supported_present_modes: Vec::new(),
+            max_present_image_count: 0,
         }
     }
 
@@ -10262,6 +10421,7 @@ mod tests {
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
             viewport: [0, 0, 2, 2],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            present: None,
         }
     }
 
@@ -10621,6 +10781,7 @@ mod tests {
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],
             color_attachments: vec![attachment],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            present: None,
         })
     }
 
@@ -11745,5 +11906,223 @@ mod tests {
         present_descriptor()
             .validate_against(&render_pass())
             .unwrap();
+    }
+
+    // Presentation contract, Step 2 (`research/docs/24` §4.1, §4.2): the render
+    // pass carries the present action and admission gains the present gate.
+    // Execution stays Step 3, so nothing here acquires or presents anything —
+    // the tests pin the shape, the reuse of Step 1's refusals, and the
+    // capability refusals that keep an unexecutable present from being run as an
+    // offscreen render.
+
+    /// The present action that hands `attachment` on, built from the Step 1
+    /// fixture so the target restates the attachment's identity, format and
+    /// extent exactly as `docs/24` §3.2 requires.
+    fn present_for(attachment: &RenderAttachment) -> PresentDescriptor {
+        let mut present = present_descriptor();
+        present.target.view_id = attachment.view_id;
+        present.target.allocation_id = attachment.allocation_id;
+        present.target.format = attachment.format;
+        present.target.width = attachment.width;
+        present.target.height = attachment.height;
+        present.source = attachment.view_id;
+        present
+    }
+
+    /// The offscreen render trace the presenting trace is built from: the same
+    /// two passes, with the render pass handing nothing on.
+    fn offscreen_render_trace() -> ComputeTrace {
+        attachment_trace(landing_view(7, 9), attachment_into(7, 9))
+    }
+
+    /// The smallest trace that needs the present bits: an admitted offscreen
+    /// render trace whose render pass hands its own attachment on.
+    fn presenting_trace() -> ComputeTrace {
+        let mut value = offscreen_render_trace();
+        let Some(TracePass::Render(pass)) = value.passes.last_mut() else {
+            panic!("the fixture ends in a render pass");
+        };
+        pass.present = Some(present_for(&pass.color_attachments[0]));
+        value
+    }
+
+    /// A snapshot that declares the four present bits (`docs/24` §4.2) on top of
+    /// the render bits the fixture already declares.
+    fn presenting_capabilities() -> ProviderCapabilities {
+        let mut provider = render_capabilities();
+        provider.supports_presentation = true;
+        provider.max_present_targets = MAX_PRESENT_TARGETS as u32;
+        provider.supported_present_modes = PresentMode::ADMITTED.to_vec();
+        provider.max_present_image_count = MAX_PRESENT_IMAGE_COUNT;
+        provider
+    }
+
+    #[test]
+    fn present_capability_bits_default_to_unsupported() {
+        // Every snapshot that predates this step keeps its exact behaviour: the
+        // present bits stay at "cannot present", so no present action is
+        // admitted and `MCC1` keeps sending the legacy capability bytes.
+        let default = capabilities();
+        assert!(!default.supports_presentation);
+        assert_eq!(default.max_present_targets, 0);
+        assert!(default.supported_present_modes.is_empty());
+        assert_eq!(default.max_present_image_count, 0);
+        assert!(!default.declares_presentation_support());
+        assert!(!default.declares_render_support());
+
+        // A render-declaring snapshot that never declared presentation keeps the
+        // two halves from disagreeing silently: it renders and does not present.
+        let render_only = render_capabilities();
+        assert!(render_only.declares_render_support());
+        assert!(!render_only.declares_presentation_support());
+
+        // The present bits travel in the same extended payload as the render
+        // bits, so a snapshot that declared presentation on its own still has to
+        // ask for that payload (`docs/24` §4.2). This is the case that would
+        // otherwise be written to the wire as the legacy bytes.
+        let mut presenting_only = capabilities();
+        presenting_only.supports_presentation = true;
+        assert!(presenting_only.declares_presentation_support());
+        assert!(presenting_only.declares_render_support());
+    }
+
+    #[test]
+    fn present_trace_is_refused_before_any_resource_action_without_the_bit() {
+        let trace = presenting_trace();
+        let resources = landing_resources();
+
+        // Control: the same trace without the present action admits, and the
+        // present-bit snapshot admits the very same trace. The pair is what
+        // proves the gate is the capability bit and not the trace shape.
+        offscreen_render_trace()
+            .validate()
+            .expect("the offscreen fixture is well formed");
+        render_capabilities()
+            .admit(&offscreen_render_trace(), &resources)
+            .expect("an offscreen render trace needs no present bit");
+        presenting_capabilities()
+            .admit(&trace, &resources)
+            .expect("a declared present bit admits the presenting trace");
+
+        // The refusal is a capability refusal, and it arrives with an empty
+        // resource namespace: if the gate sat anywhere after the resource walk,
+        // this call would report the missing allocation instead of the present
+        // bit, which is exactly the "before any resource action" ordering
+        // `docs/24` §4.2 asks for.
+        let refusal = render_capabilities()
+            .admit(&trace, &ResourceTableSnapshot::new())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "present_targets_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refusal.fields.get("targets"),
+            Some(&FieldValue::Unsigned(1)),
+            "the refusal has to carry the target count it refused"
+        );
+
+        // The trace's own contract is well formed, so the refusal above is the
+        // capability gate rather than a shape error wearing a capability slug.
+        trace
+            .validate()
+            .expect("the presenting trace is well formed");
+        assert_eq!(
+            render_capabilities()
+                .admit(&trace, &resources)
+                .unwrap_err()
+                .slug,
+            "present_targets_unsupported"
+        );
+    }
+
+    #[test]
+    fn present_capability_narrows_the_declared_modes_targets_and_images() {
+        let trace = presenting_trace();
+        let resources = landing_resources();
+
+        // A snapshot that declares the bit but no mode refuses the trace's mode
+        // by wire code, naming the pass that carried it.
+        let mut no_modes = presenting_capabilities();
+        no_modes.supported_present_modes.clear();
+        let refusal = no_modes.admit(&trace, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "present_mode_unsupported");
+        assert_eq!(
+            refusal.fields.get("mode"),
+            Some(&FieldValue::Unsigned(u64::from(PresentMode::Fifo.code())))
+        );
+        assert_eq!(
+            refusal.fields.get("pass"),
+            Some(&FieldValue::Unsigned(1)),
+            "the refusal names the pass index that carried the present"
+        );
+
+        // The target count is a separate increment: the bit alone does not admit
+        // an unbounded number of targets.
+        let mut no_targets = presenting_capabilities();
+        no_targets.max_present_targets = 0;
+        let refusal = no_targets.admit(&trace, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "present_target_limit");
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // And the image count is the multi-buffering bound `docs/24` §3.4
+        // defers, refused by the same declared-limits style.
+        let mut no_images = presenting_capabilities();
+        no_images.max_present_image_count = 0;
+        let refusal = no_images.admit(&trace, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "present_image_count_limit");
+        assert_eq!(
+            refusal.fields.get("requested"),
+            Some(&FieldValue::Unsigned(u64::from(MAX_PRESENT_IMAGE_COUNT)))
+        );
+    }
+
+    #[test]
+    fn render_pass_carries_its_present_and_reuses_the_step_one_refusals() {
+        let mut value = presenting_trace();
+        value
+            .validate()
+            .expect("the presenting trace is well formed");
+
+        // The present is reachable through the trace and points at the render
+        // pass's own attachment, which is what shape one buys: a present cannot
+        // be attached to a pass that did not render its source.
+        let actions = value.present_actions().collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].0, 1, "the render entry carries the present");
+        assert_eq!(actions[0].1.source, ViewId::new(7));
+        assert!(value.has_present_actions());
+
+        // A source that the pass does not render into is refused by Step 1's own
+        // rule, reached through the pass rather than restated here.
+        let Some(TracePass::Render(pass)) = value.passes.last_mut() else {
+            panic!("the fixture ends in a render pass");
+        };
+        pass.present
+            .as_mut()
+            .expect("the fixture carries a present")
+            .source = ViewId::new(99);
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::PresentSourceUnknown {
+                source: ViewId::new(99)
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::PresentSourceUnknown {
+                source: ViewId::new(99)
+            })
+            .slug,
+            "present_source_unknown"
+        );
+
+        // Control: the offscreen trace has no present action at all, so the
+        // pre-present paths see exactly the trace they saw before this step.
+        let offscreen = offscreen_render_trace();
+        assert!(!offscreen.has_present_actions());
+        assert_eq!(offscreen.present_actions().count(), 0);
+        offscreen.validate().unwrap();
     }
 }

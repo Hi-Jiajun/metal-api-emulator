@@ -35,7 +35,7 @@
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferView, BufferWriteback, ClearColor, ComputeTrace, ContractError,
-    FieldValue, LoadOp, PipelineId, ProviderError, ProviderErrorClass, ProviderPhase,
+    FieldValue, LoadOp, PipelineId, PresentMode, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, ViewId,
 };
 use std::collections::BTreeMap;
@@ -97,6 +97,16 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) max_color_attachments: u32,
     pub(crate) max_attachment_dimension: [u64; 2],
     pub(crate) supported_color_formats: Vec<AttachmentFormat>,
+    /// Present bits, declared next to the render bits for the same reason: the
+    /// snapshot and the rail cannot disagree about what this provider runs.
+    /// They stay at "cannot present" because `research/docs/24` §6 leaves the
+    /// "readable swapchain equivalent" to Step 3, so core admission refuses a
+    /// present-bearing trace with `present_targets_unsupported` instead of
+    /// running the offscreen render and silently dropping the present.
+    pub(crate) supports_presentation: bool,
+    pub(crate) max_present_targets: u32,
+    pub(crate) supported_present_modes: Vec<PresentMode>,
+    pub(crate) max_present_image_count: u32,
 }
 
 /// The render bits this provider declares as of the Step 7 flip.
@@ -114,6 +124,10 @@ pub(crate) fn capability_bits() -> RenderCapabilityBits {
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+        supports_presentation: false,
+        max_present_targets: 0,
+        supported_present_modes: Vec::new(),
+        max_present_image_count: 0,
     }
 }
 
@@ -896,6 +910,7 @@ mod tests {
             }],
             viewport: [0, 0, 2, 2],
             vertices: 3,
+            present: None,
         }
     }
 
@@ -1309,6 +1324,10 @@ mod tests {
             max_color_attachments: bits.max_color_attachments,
             max_attachment_dimension: bits.max_attachment_dimension,
             supported_color_formats: bits.supported_color_formats.clone(),
+            supports_presentation: bits.supports_presentation,
+            max_present_targets: bits.max_present_targets,
+            supported_present_modes: bits.supported_present_modes.clone(),
+            max_present_image_count: bits.max_present_image_count,
         }
     }
 

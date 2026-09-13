@@ -2516,6 +2516,7 @@ fn run_render_case(
             u32::try_from(case.viewport[3])?,
         ],
         vertices: u32::try_from(case.vertices)?,
+        present: None,
     }));
 
     let admitted = provider

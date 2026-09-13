@@ -59,6 +59,15 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
+        // Presentation stays undeclared: `research/docs/24` §4.2 schedules the
+        // bits here, but §6 Step 3 owns the "readable swapchain equivalent", so
+        // this snapshot names no present target at all and core admission
+        // refuses a present-bearing trace with `present_targets_unsupported`
+        // rather than running the render half and dropping the present.
+        supports_presentation: false,
+        max_present_targets: 0,
+        supported_present_modes: Vec::new(),
+        max_present_image_count: 0,
     }
 }
 
