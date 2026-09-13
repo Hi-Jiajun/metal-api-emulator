@@ -840,9 +840,24 @@ impl ComputeProvider for VulkanComputeProvider {
         }
         let mut retains = BorrowedRetains::new(Arc::clone(&self.borrowed), borrowed_leases);
         retains.retain()?;
+        let textures = trace.serial_texture_resources().map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "resource_contract_invalid",
+            )
+            .with_detail(error.to_string())
+        })?;
         if self.async_execution {
-            let result =
-                self.submit_async(pool, artifacts, buffers, dispatches, token, &mut retains);
+            let result = self.submit_async(
+                pool,
+                textures,
+                artifacts,
+                buffers,
+                dispatches,
+                token,
+                &mut retains,
+            );
             self.sync_completion_health();
             return result;
         }
@@ -852,6 +867,7 @@ impl ComputeProvider for VulkanComputeProvider {
             &buffers,
             &dispatches,
             &mut retains,
+            &textures,
         )
         .and_then(|updates| {
             let writebacks = map_writebacks(&pool, updates, token)?;
@@ -920,9 +936,11 @@ impl ComputeProvider for VulkanComputeProvider {
 }
 
 impl VulkanComputeProvider {
+    #[allow(clippy::too_many_arguments)]
     fn submit_async(
         &self,
         pool: Vec<BufferView>,
+        textures: Vec<metal_api_core::provider::TextureView>,
         artifacts: Vec<Arc<VulkanPipelineArtifact>>,
         buffers: Vec<PoolBinding>,
         dispatches: Vec<BoundDispatch>,
@@ -944,7 +962,7 @@ impl VulkanComputeProvider {
                 &buffers,
                 &dispatches,
                 retains.take(),
-                &[],
+                &textures,
             )?
         };
         let record = match &self.completion_outbox {
@@ -1099,6 +1117,7 @@ fn execute_on_context(
     buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
     retains: &mut BorrowedRetains,
+    textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let _execution = executor
         .context
@@ -1111,7 +1130,7 @@ fn execute_on_context(
         buffers,
         dispatches,
         retains.take(),
-        &[],
+        textures,
     )
 }
 
