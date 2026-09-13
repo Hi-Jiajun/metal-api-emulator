@@ -129,6 +129,12 @@ def _suite_plan(suite):
             allocations[allocation][offset:offset + length] = initial
             views[view] = (allocation, offset, length, access)
             bindings.add(binding)
+        if len(allocations) != len(buffers):
+            # Several buffers naming one allocation is the ranged-alias shape.
+            # Overlap was refused above, so only disjoint views survive.
+            _require(suite["suite"] == "compute-buffer-v10",
+                     f"{where}: several views of one allocation are only qualified "
+                     "by the v10 suite")
 
         writable_views = set()
         dispatches = case.get("dispatches")

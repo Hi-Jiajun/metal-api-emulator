@@ -233,9 +233,19 @@ the reviewed MSL fixture. Native v8 passed
 and complete in order, and the capture merges the per-view final landed bytes.
 See [SUITE-V9.md](SUITE-V9.md).
 
+## Ranged aliasing
+
+[suite-v10.json](suite-v10.json) binds two **disjoint views of one allocation**
+through the reviewed `copy_word` program, so a real provider must admit the
+ranged-alias shape and land both views into a single allocation extent. The
+reversed case swaps which offset is the source so an offset mix-up cannot pass.
+The comparator compares each allocation once, refuses overlapping
+initialization ranges, and refuses shared allocations outside this suite. See
+[SUITE-V10.md](SUITE-V10.md).
+
 ## Provider object entry point
 
-`provider-capture --api objects` runs the same v1-v9 fixtures through the new
+`provider-capture --api objects` runs the same v1-v10 fixtures through the new
 shared object API. Its reports identify `vulkan-objects` or
 `native-metal-provider-objects`; both report actual host-buffer landing.
 The direct trace captures remain separate, and the Swift oracle is unchanged.

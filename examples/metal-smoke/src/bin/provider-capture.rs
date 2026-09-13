@@ -471,6 +471,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "subset_chain_four",
             "subset_chain_eight",
         ],
+        (1, "compute-buffer-v10") => &["alias_disjoint_pair", "alias_disjoint_pair_reversed"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -514,7 +515,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 format!("case {} is outside the qualified dispatch subset", case.id).into(),
             );
         }
-        let mut allocations = BTreeSet::new();
+        let mut allocations = BTreeMap::<u64, Vec<(u64, u64)>>::new();
         let mut views = BTreeSet::new();
         for (index, buffer) in case.buffers.iter().enumerate() {
             let end = buffer
@@ -531,14 +532,30 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 || !buffer.offset.is_multiple_of(4)
                 || buffer.allocation == 0
                 || buffer.view == 0
-                || !allocations.insert(buffer.allocation)
                 || !views.insert(buffer.view)
             {
                 return Err(format!("invalid buffer declaration in {}", case.id).into());
             }
+            // Several buffers may name one allocation while their byte ranges
+            // stay disjoint: that is the v10 ranged-alias shape. Overlapping
+            // ranges would make the observed allocation image depend on write
+            // order, so they are refused here exactly as provider admission
+            // refuses them.
+            let ranges = allocations.entry(buffer.allocation).or_default();
+            if ranges
+                .iter()
+                .any(|(start, other_end)| buffer.offset < *other_end && *start < end)
+            {
+                return Err(format!(
+                    "overlapping views of allocation {} in {}",
+                    buffer.allocation, case.id
+                )
+                .into());
+            }
             if unhex(&buffer.initial_hex)?.len() as u64 != buffer.length {
                 return Err("initial data length differs from declared view length".into());
             }
+            ranges.push((buffer.offset, end));
         }
         let mut writable: Vec<_> = case
             .buffers
@@ -817,6 +834,9 @@ fn case_shape(id: &str) -> Result<CaseShape> {
     };
     Ok(match id {
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
+        // v10: two disjoint views of one allocation. The reversed pair binds
+        // the source above the destination so an offset mix-up cannot pass.
+        "alias_disjoint_pair" | "alias_disjoint_pair_reversed" => copy,
         "indexed_boundary" | "indexed_tail" => indexed([8, 2, 1]),
         "indexed_full" => indexed([5, 3, 1]),
         "indexed_small_grid" => indexed([16, 4, 1]),
@@ -1173,13 +1193,38 @@ fn run_object_case(
     // its own allocation/view identities before they are mapped back here.
     let mut resources = BTreeMap::new();
     let mut report_ids = BTreeMap::new();
+    // One device Buffer per allocation. A v10 fixture binds several disjoint
+    // views of the same allocation, and sharing the object is what makes the
+    // provider exercise ranged aliasing instead of seeing unrelated
+    // allocations. Guard bytes outside every view stay in the shared image so
+    // an offset or extent mistake stays observable.
+    let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &case.buffers {
-        let mut initial = vec![guard; usize::try_from(definition.allocation_size)?];
+        let size = usize::try_from(definition.allocation_size)?;
         let offset = usize::try_from(definition.offset)?;
         let bytes = unhex(&definition.initial_hex)?;
-        initial[offset..offset + bytes.len()].copy_from_slice(&bytes);
-        let buffer = device.new_buffer_with_bytes(initial)?;
-        let view = buffer.view(offset, usize::try_from(definition.length)?)?;
+        let image = images
+            .entry(definition.allocation)
+            .or_insert_with(|| vec![guard; size]);
+        image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+    let mut allocation_buffers = BTreeMap::<u64, objects::Buffer>::new();
+    for definition in &case.buffers {
+        let buffer = match allocation_buffers.get(&definition.allocation) {
+            Some(existing) => existing.clone(),
+            None => {
+                let image = images
+                    .remove(&definition.allocation)
+                    .ok_or("missing allocation image")?;
+                let created = device.new_buffer_with_bytes(image)?;
+                allocation_buffers.insert(definition.allocation, created.clone());
+                created
+            }
+        };
+        let view = buffer.view(
+            usize::try_from(definition.offset)?,
+            usize::try_from(definition.length)?,
+        )?;
         report_ids.insert(
             (view.allocation_id(), view.view_id()),
             (definition.allocation, definition.view),
@@ -1255,12 +1300,12 @@ fn run_object_case(
     }
     let writebacks = merge_writebacks(case, reported)?;
     let mut allocations = Vec::new();
-    for definition in &case.buffers {
-        let (buffer, _) = &resources[&definition.view];
+    for (allocation, buffer) in &allocation_buffers {
         // Observe the object's actual host landing, rather than replaying the
-        // returned writebacks into a second synthetic allocation.
+        // returned writebacks into a second synthetic allocation. Exactly one
+        // entry per allocation: several views may share it.
         allocations.push(Allocation {
-            allocation: definition.allocation,
+            allocation: *allocation,
             bytes_hex: hex(&buffer.read()?),
         });
     }
@@ -1287,18 +1332,36 @@ fn run_case(
     guard: u8,
 ) -> Result<CaseResult> {
     let mut resources = ResourceTableSnapshot::new();
+    // One backing image and one AllocationRecord per allocation. A v10 fixture
+    // binds two disjoint views of the same allocation, so every view's initial
+    // bytes land in that allocation's single image and the trace carries one
+    // record with two view ranges.
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut recorded = BTreeSet::new();
     for buffer in &case.buffers {
         let initial = unhex(&buffer.initial_hex)?;
-        let mut backing = vec![guard; usize::try_from(buffer.allocation_size)?];
         let start = usize::try_from(buffer.offset)?;
-        backing[start..start + initial.len()].copy_from_slice(&initial);
-        allocations.push((buffer.allocation, backing));
-        resources.insert_allocation(AllocationRecord {
-            allocation_id: AllocationId::new(buffer.allocation),
-            owner_epoch: provider.device_epoch(),
-            size: buffer.allocation_size,
-        })?;
+        let position = match allocations
+            .iter()
+            .position(|(allocation, _)| *allocation == buffer.allocation)
+        {
+            Some(position) => position,
+            None => {
+                allocations.push((
+                    buffer.allocation,
+                    vec![guard; usize::try_from(buffer.allocation_size)?],
+                ));
+                allocations.len() - 1
+            }
+        };
+        if recorded.insert(buffer.allocation) {
+            resources.insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(buffer.allocation),
+                owner_epoch: provider.device_epoch(),
+                size: buffer.allocation_size,
+            })?;
+        }
+        allocations[position].1[start..start + initial.len()].copy_from_slice(&initial);
     }
     // Every command buffer snapshots the bytes landed so far, so a later
     // command reads what an earlier command wrote.

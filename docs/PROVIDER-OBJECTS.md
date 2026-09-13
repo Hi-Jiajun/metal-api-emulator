@@ -93,7 +93,7 @@ lands unvalidated bytes.
 ## Capture and comparison
 
 No shader or suite is added. `provider-capture --api objects` reruns the same
-32 cases from v1-v9, including multiple dispatches on one encoder, pipeline
+34 cases from v1-v10, including multiple dispatches on one encoder, pipeline
 changes, changed slot counts, buffers first used later, and v9 dispatch
 sequences split across successively committed command buffers (each capture
 reports the merged final per-view landing). The capture maps
@@ -167,7 +167,7 @@ stand in for object captures.
   handler; a configurable observation deadline (20 seconds by default) reports
   unknown completion and abandons the provider. The default synchronous mode,
   direct trace rail and all five comparison paths are unchanged. CI runs
-  `provider-capture --api objects --async` for v1-v9 on Lavapipe and, when a
+  `provider-capture --api objects --async` for v1-v10 on Lavapipe and, when a
   native device is eligible, on macOS.
 - All 26 v1-v7 object cases passed on Linux/Lavapipe and Windows/RTX 5060.
   Results agree per allocation/view with fresh Linux direct-trace captures and

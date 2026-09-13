@@ -85,11 +85,21 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   establish general Metal conformance. The Windows Vulkan provider ran the
   same v1-v8 direct, object and async-object rails on an NVIDIA GeForce
   RTX 5060 with matching host-visible writebacks.
-- Open design work: device-loss reclamation beyond the bounded abandonment
-  budget, the cross-process completion transport and provider wiring (the core
-  wire publisher and mirror now exist), provider-side lease import (the core
-  `LeaseLedger` release contract now exists), general native shader admission,
-  CPU uploads during command-buffer execution and aliases.
+- Ranged aliasing: both providers declare `AliasMode::DistinctViews`, so two
+  disjoint views of one allocation are admitted and executed while any overlap
+  (including read-read) stays refused. The [v10 suite](conformance/SUITE-V10.md)
+  binds two disjoint views of one 16-byte allocation through the reviewed
+  `copy_word` program, and the comparator compares that allocation as a single
+  extent. Disjoint ranges cannot exchange data through the allocation because
+  each view's footprint proof bounds its accesses inside its own half-open
+  range. This is not a concurrency claim: the whole allocation is still
+  reserved for the commit-to-completion window, so disjoint commands serialize.
+- Open design work: range-level reservations in the object API (so disjoint
+  commands of one allocation can overlap), device-loss reclamation beyond the
+  bounded abandonment budget, the cross-process completion transport and
+  provider wiring (the core wire publisher and mirror now exist), provider-side
+  lease import (the core `LeaseLedger` release contract now exists), general
+  native shader admission and CPU uploads during command-buffer execution.
   Resource snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
   textures, rendering, presentation, heaps, ICBs or production
@@ -171,7 +181,7 @@ recognizes the conventional `C:\msys64\mingw64\bin` installation. To run the
 optional engine comparison after building it, pass `-ReimsRunner` with the path
 to `reims-smoke.exe`. Both executables run in separate processes.
 Pass `-ProviderSmoke` to run `provider-smoke.exe` (the cross-platform provider
-suite) and `-CaptureMatrix` to write the v1-v9 direct, object and
+suite) and `-CaptureMatrix` to write the v1-v10 direct, object and
 async-object captures under `target\windows-captures`.
 
 `provider-smoke.exe` also runs on Windows. The Unix-domain-socket IPC and

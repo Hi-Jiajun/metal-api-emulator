@@ -459,15 +459,20 @@ private func writableViews(_ definition: CaseDefinition) -> Set<UInt64> {
 
 private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) throws -> [ValidatedBuffer] {
     var bindings = Set<UInt64>()
-    var allocations = Set<UInt64>()
     var views = Set<UInt64>()
     var buffers = [ValidatedBuffer]()
+    // One image per allocation. A v10 fixture binds two disjoint views of the
+    // same allocation, and every view of it must be bound against that single
+    // image so the reported allocation can be compared as one extent. Guard
+    // bytes outside every view stay in the image, which keeps an offset or
+    // extent mistake observable.
+    var images = [UInt64: Data]()
+    var ranges = [UInt64: [(UInt64, UInt64)]]()
     try require(definition.buffers.map { $0.binding } == definition.buffers.map { $0.binding }.sorted(),
                 "Bindings must be in canonical order")
     for buffer in definition.buffers {
         let context = "\(definition.id) binding \(buffer.binding)"
         try require(bindings.insert(buffer.binding).inserted, "\(context): duplicate binding")
-        try require(allocations.insert(buffer.allocation).inserted, "\(context): duplicate allocation")
         try require(views.insert(buffer.view).inserted, "\(context): duplicate view")
         try require(buffer.allocation > 0 && buffer.view > 0, "\(context): zero resource identity")
         try require(buffer.access == "read" || buffer.access == "write" || buffer.access == "read_write",
@@ -485,9 +490,28 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
                     "\(context): expected at least four guard bytes before and after the view")
         let initial = try decodeHex(buffer.initial_hex, context: context)
         try require(UInt64(initial.count) == buffer.length, "\(context): initial data length mismatch")
-        var backing = Data(repeating: guardByte, count: Int(buffer.allocation_size))
-        backing.replaceSubrange(Int(buffer.offset)..<Int(end), with: initial)
-        buffers.append(ValidatedBuffer(definition: buffer, backing: backing))
+        // Several buffers may name one allocation while their byte ranges stay
+        // disjoint. Overlapping ranges would make the observed image depend on
+        // write order, so they are refused here exactly as provider admission
+        // refuses them.
+        let existing = ranges[buffer.allocation] ?? []
+        try require(!existing.contains { buffer.offset < $0.1 && $0.0 < end },
+                    "\(context): overlapping views of allocation \(buffer.allocation)")
+        ranges[buffer.allocation] = existing + [(buffer.offset, end)]
+        var image = images[buffer.allocation]
+            ?? Data(repeating: guardByte, count: Int(buffer.allocation_size))
+        try require(image.count == Int(buffer.allocation_size),
+                    "\(context): inconsistent allocation size")
+        image.replaceSubrange(Int(buffer.offset)..<Int(end), with: initial)
+        images[buffer.allocation] = image
+    }
+    // Every view shares its allocation's final image, so a view never observes
+    // a partial initialization of a sibling view.
+    for buffer in definition.buffers {
+        guard let image = images[buffer.allocation] else {
+            throw OracleError("\(definition.id): missing allocation image")
+        }
+        buffers.append(ValidatedBuffer(definition: buffer, backing: image))
     }
 
     let written = writableViews(definition)
@@ -536,8 +560,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     case "compute-buffer-v9":
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
+    case "compute-buffer-v10":
+        expectedIDs = ["alias_disjoint_pair", "alias_disjoint_pair_reversed"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v9 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v10 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -751,9 +777,12 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
                     "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
     }
 
-    var allocations = [AllocationResult]()
     var writebacks = [Writeback]()
     let writtenViews = writableViews(definition)
+    // Several views may share one allocation. Each view owns its own Metal
+    // buffer over the shared image, so the reported allocation is composed by
+    // overlaying every view's observed bytes onto that one extent.
+    var observedImages = [UInt64: Data]()
     for (buffer, resource) in zip(fixture.buffers, resources) {
         let specification = buffer.definition
         // Only completed shared resources are CPU-visible. Copy the complete
@@ -770,7 +799,13 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
             writebacks.append(Writeback(allocation: specification.allocation, view: specification.view,
                 offset: specification.offset, bytes_hex: hex(observed.subdata(in: start..<end))))
         }
-        allocations.append(AllocationResult(allocation: specification.allocation, bytes_hex: hex(observed)))
+        var image = observedImages[specification.allocation] ?? buffer.backing
+        image.replaceSubrange(start..<end, with: observed.subdata(in: start..<end))
+        observedImages[specification.allocation] = image
+    }
+    var allocations = [AllocationResult]()
+    for allocation in observedImages.keys.sorted() {
+        allocations.append(AllocationResult(allocation: allocation, bytes_hex: hex(observedImages[allocation]!)))
     }
     writebacks.sort { ($0.allocation, $0.view) < ($1.allocation, $1.view) }
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
