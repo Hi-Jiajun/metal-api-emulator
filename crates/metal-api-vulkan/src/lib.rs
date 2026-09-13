@@ -112,6 +112,14 @@ impl VulkanExecutor {
         self.context.buffer_copy_counts()
     }
 
+    /// Cumulative device-buffer copy-in / copy-out bytes. Smoke tests use it
+    /// to prove that a view that cannot read copies nothing in
+    /// (`research/docs/15` step 4).
+    #[doc(hidden)]
+    pub fn buffer_copy_bytes(&self) -> (usize, usize) {
+        self.context.buffer_copy_bytes()
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -323,6 +331,11 @@ pub(crate) struct VulkanContext {
     /// device buffer (`research/docs/15` §3.3).
     buffer_uploads: AtomicUsize,
     buffer_readbacks: AtomicUsize,
+    /// Bytes actually copied in or out. A write-only view copies nothing in,
+    /// which is the observable form of the footprint-bounded transfer
+    /// (`research/docs/15` step 4).
+    buffer_upload_bytes: AtomicUsize,
+    buffer_readback_bytes: AtomicUsize,
     abandonment_budget: AbandonmentBudget,
     abandonment: Mutex<AbandonmentLedger>,
 }
@@ -474,6 +487,8 @@ impl VulkanContext {
             queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             buffer_uploads: AtomicUsize::new(0),
             buffer_readbacks: AtomicUsize::new(0),
+            buffer_upload_bytes: AtomicUsize::new(0),
+            buffer_readback_bytes: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
@@ -558,14 +573,30 @@ impl VulkanContext {
         self.buffer_uploads.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_buffer_upload_bytes(&self, bytes: usize) {
+        self.buffer_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_buffer_readback(&self) {
         self.buffer_readbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffer_readback_bytes(&self, bytes: usize) {
+        self.buffer_readback_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn buffer_copy_counts(&self) -> (usize, usize) {
         (
             self.buffer_uploads.load(Ordering::Relaxed),
             self.buffer_readbacks.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn buffer_copy_bytes(&self) -> (usize, usize) {
+        (
+            self.buffer_upload_bytes.load(Ordering::Relaxed),
+            self.buffer_readback_bytes.load(Ordering::Relaxed),
         )
     }
 
@@ -1565,9 +1596,10 @@ pub(crate) enum PoolBinding {
     SharedOwned {
         index: u32,
         allocation: u64,
-        size: usize,
         offset: usize,
         length: usize,
+        /// Whether the view can read. A write-only view uploads nothing.
+        access: metal_api_core::provider::BufferAccess,
         bytes: Vec<u8>,
     },
     Imported {
@@ -1636,7 +1668,13 @@ struct GpuBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     len: usize,
+    /// Borrowed mappings are the owner's pointer; owned mappings are the
+    /// device mapping made at creation time and kept for sparse uploads.
     host_pointer: Option<usize>,
+    mapping: Option<usize>,
+    /// Byte ranges already copied into this backing, keyed by their view
+    /// offset. A write-only view copies nothing in and leaves no entry.
+    uploaded_ranges: BTreeMap<usize, usize>,
 }
 
 /// A pass owns every object derived from its shader's reflection. Keeping this
@@ -2028,6 +2066,28 @@ impl ExecutionResources {
     }
 
     fn create_buffers(&mut self, bindings: &[PoolBinding]) -> Result<(), ExecutionFailure> {
+        // Every shared backing must be sized before any of them is created:
+        // the first view of an allocation may not be its largest end offset.
+        let mut shared_sizes = BTreeMap::<u64, usize>::new();
+        for supplied in bindings {
+            if let PoolBinding::SharedOwned {
+                allocation,
+                offset,
+                length,
+                ..
+            } = supplied
+            {
+                let end = offset.checked_add(*length).ok_or_else(|| {
+                    failure(format!(
+                        "shared buffer {allocation} view range overflows usize"
+                    ))
+                })?;
+                shared_sizes
+                    .entry(*allocation)
+                    .and_modify(|size| *size = (*size).max(end))
+                    .or_insert(end);
+            }
+        }
         for supplied in bindings {
             match supplied {
                 PoolBinding::Owned(binding) => {
@@ -2039,32 +2099,64 @@ impl ExecutionResources {
                 PoolBinding::SharedOwned {
                     index,
                     allocation,
-                    size,
                     offset,
                     length,
+                    access,
                     bytes,
                 } => {
-                    // The first view of an allocation carries the image and
-                    // uploads it; every later view reuses that backing by
-                    // allocation identity and must not send a second image.
+                    // A shared backing is created once per allocation and
+                    // covers the largest end offset of its views. Only the
+                    // view's own bytes are ever copied in, at the view's own
+                    // offset: a write-only view carries no snapshot and its
+                    // upload region stays undefined, which the footprint
+                    // proof allows because nothing reads outside a view's own
+                    // accesses (`research/docs/15` step 4).
+                    if bytes.len() != *length {
+                        return Err(failure(format!(
+                            "shared buffer {allocation} view has {} bytes, expected {length}",
+                            bytes.len()
+                        ))
+                        .into());
+                    }
                     if self
                         .buffers
                         .iter()
                         .all(|buffer| buffer.index != *allocation)
                     {
-                        if bytes.len() != *size {
+                        let size = *shared_sizes
+                            .get(allocation)
+                            .expect("shared view sizing pass covered every allocation");
+                        self.create_owned_backing(*allocation, size, &[])?;
+                    }
+                    let gpu = self
+                        .buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.index == *allocation)
+                        .expect("shared backing was just created");
+                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
+                        &bytes[..0]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    if !upload.is_empty() {
+                        if gpu.uploaded_ranges.contains_key(offset) {
                             return Err(failure(format!(
-                                "shared buffer {allocation} image has {} bytes, expected {size}",
-                                bytes.len()
+                                "shared buffer {allocation} already uploaded bytes at offset {offset}"
                             ))
                             .into());
                         }
-                        self.create_owned_backing(*allocation, bytes)?;
-                    } else if !bytes.is_empty() {
-                        return Err(failure(format!(
-                            "shared buffer {allocation} image was supplied twice"
-                        ))
-                        .into());
+                        let mapping = gpu
+                            .host_pointer
+                            .unwrap_or_else(|| gpu.mapping.expect("created backing is mapped"));
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                upload.as_ptr(),
+                                (mapping as *mut u8).add(*offset),
+                                upload.len(),
+                            );
+                        }
+                        gpu.uploaded_ranges.insert(*offset, upload.len());
+                        self.context.record_buffer_upload_bytes(upload.len());
                     }
                     self.register_view(*index, *allocation, *offset, *length)?;
                 }
@@ -2127,13 +2219,25 @@ impl ExecutionResources {
     }
 
     fn create_owned_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
-        self.create_owned_backing(u64::from(supplied.index), &supplied.bytes)
+        self.create_owned_backing(
+            u64::from(supplied.index),
+            supplied.bytes.len(),
+            &supplied.bytes,
+        )
     }
 
     /// One host-visible device buffer, uploaded once from `bytes`. A shared view
     /// names it by its allocation identity instead of by its pool key.
-    fn create_owned_backing(&mut self, index: u64, bytes: &[u8]) -> Result<(), ExecutionFailure> {
-        let size = u64::try_from(bytes.len())
+    fn create_owned_backing(
+        &mut self,
+        index: u64,
+        size: usize,
+        upload: &[u8],
+    ) -> Result<(), ExecutionFailure> {
+        // The device buffer spans every byte any of the allocation's views can
+        // address; the bytes actually copied in cover only the views that can
+        // read (`research/docs/15` step 4).
+        let size = u64::try_from(size)
             .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
@@ -2195,16 +2299,20 @@ impl ExecutionResources {
             }
         };
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
-            self.context.device.unmap_memory(memory);
+            if !upload.is_empty() {
+                std::ptr::copy_nonoverlapping(upload.as_ptr(), mapped.cast::<u8>(), upload.len());
+            }
         }
         self.context.record_buffer_upload();
+        self.context.record_buffer_upload_bytes(upload.len());
         self.buffers.push(GpuBuffer {
             index,
             buffer,
             memory,
-            len: bytes.len(),
+            len: usize::try_from(size).unwrap_or(usize::MAX),
             host_pointer: None,
+            mapping: Some(mapped as usize),
+            uploaded_ranges: BTreeMap::new(),
         });
         Ok(())
     }
@@ -2305,6 +2413,8 @@ impl ExecutionResources {
             memory,
             len,
             host_pointer: Some(pointer),
+            mapping: None,
+            uploaded_ranges: BTreeMap::new(),
         });
         Ok(())
     }
@@ -2578,54 +2688,37 @@ impl ExecutionResources {
         writable_pool_keys: &BTreeSet<u32>,
     ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
         let mut updates = Vec::new();
-        // One read per device buffer, then one slice per view: a shared backing
-        // is copied out once even when several of its views are writable.
-        let mut images = BTreeMap::<u64, Vec<u8>>::new();
+        // One readback operation per distinct device buffer, then one slice per
+        // writable view: a shared backing is read once even when several of its
+        // views are writable.
+        let mut read_buffers = BTreeSet::<u64>::new();
         for &pool_key in writable_pool_keys {
             let window = self.view_window(pool_key);
             let gpu = self.gpu_buffer(window.buffer_key);
-            let bytes = match gpu.host_pointer {
-                // Imported memory is the owner's mapping; read it directly.
-                Some(pointer) => unsafe {
-                    std::slice::from_raw_parts(pointer as *const u8, gpu.len).to_vec()
-                },
-                None => {
-                    let mapped = unsafe {
-                        self.context.device.map_memory(
-                            gpu.memory,
-                            0,
-                            gpu.len as u64,
-                            vk::MemoryMapFlags::empty(),
-                        )
-                    }
-                    .map_err(|error| {
-                        ExecutionFailure::vulkan(
-                            error,
-                            format!("map buffer {} for readback: {error}", gpu.index),
-                        )
-                    })?;
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(mapped.cast::<u8>(), gpu.len).to_vec()
-                    };
-                    unsafe { self.context.device.unmap_memory(gpu.memory) };
-                    bytes
-                }
-            };
-            // One read per device buffer, however many of its views are
-            // writable in this submission.
-            let image = images.entry(window.buffer_key).or_insert_with(|| {
+            // Owned backings were mapped once at creation and are unmapped only
+            // when the execution resources are destroyed; imported backings are
+            // the owner's own mapping.
+            let mapping = gpu
+                .host_pointer
+                .or(gpu.mapping)
+                .ok_or_else(|| failure(format!("buffer {} is not mapped", gpu.index)))?;
+            if read_buffers.insert(window.buffer_key) {
                 self.context.record_buffer_readback();
-                bytes
-            });
+            }
             let end = window.offset + window.length;
-            let bytes = image
-                .get(window.offset..end)
-                .ok_or_else(|| {
-                    ExecutionFailure::from(failure(format!(
-                        "buffer pool key {pool_key} window ends at {end}, beyond its backing"
-                    )))
-                })?
-                .to_vec();
+            if end > gpu.len {
+                return Err(failure(format!(
+                    "buffer pool key {pool_key} window ends at {end}, beyond its backing"
+                ))
+                .into());
+            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts((mapping as *const u8).add(window.offset), window.length)
+            };
+            let bytes = bytes.to_vec();
+            if !bytes.is_empty() {
+                self.context.record_buffer_readback_bytes(bytes.len());
+            }
             updates.push(BufferUpdate {
                 index: pool_key,
                 offset: 0,

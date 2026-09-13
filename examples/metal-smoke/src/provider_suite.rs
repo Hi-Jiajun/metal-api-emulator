@@ -2000,6 +2000,7 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
     // The judge for a shared device buffer (research/docs/15 §3.3): two views
     // of one allocation must cost one copy in and one copy out, not two.
     let (uploads_before, readbacks_before) = executor.buffer_copy_counts();
+    let (upload_bytes_before, readback_bytes_before) = executor.buffer_copy_bytes();
     command.commit()?;
     command.wait_until_completed()?;
     let (uploads, readbacks) = executor.buffer_copy_counts();
@@ -2008,6 +2009,17 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
     if uploads != 1 || readbacks != 1 {
         return Err(format!(
             "two views of one allocation copied in {uploads} and out {readbacks} times, expected 1 and 1"
+        )
+        .into());
+    }
+    // Step 4: the read-only view copies exactly its 4 bytes in and the
+    // write-only view copies nothing in; one writable view copies 4 bytes out.
+    let (upload_bytes, readback_bytes) = executor.buffer_copy_bytes();
+    let upload_bytes = upload_bytes - upload_bytes_before;
+    let readback_bytes = readback_bytes - readback_bytes_before;
+    if upload_bytes != 4 || readback_bytes != 4 {
+        return Err(format!(
+            "partially transferred disjoint views copied in {upload_bytes} bytes and out {readback_bytes} bytes, expected 4 and 4"
         )
         .into());
     }
@@ -2043,7 +2055,7 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
         Ok(()) => return Err("overlapping views of one allocation were admitted".into()),
     }
     println!(
-        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused copy_in={uploads} copy_out={readbacks}"
+        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused copy_in={uploads} copy_out={readbacks} copy_in_bytes={upload_bytes} copy_out_bytes={readback_bytes}"
     );
     Ok(())
 }
@@ -2114,6 +2126,7 @@ fn run_object_same_allocation_parallel() -> Result<(), Box<dyn Error>> {
         )?;
         encoder.end_encoding()?;
     }
+    let (upload_bytes_before, readback_bytes_before) = executor.buffer_copy_bytes();
     first.commit()?;
     let (committed, wait_for_commit) = std::sync::mpsc::channel();
     let queued = std::thread::spawn(move || {
@@ -2142,8 +2155,19 @@ fn run_object_same_allocation_parallel() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("same-allocation writebacks differ: {observed:02x?}").into());
     }
+    // Two substitutions, each touching one read-only source and one
+    // write-only target: 4 bytes copied in and 4 bytes copied out per command.
+    let (upload_bytes, readback_bytes) = executor.buffer_copy_bytes();
+    let upload_bytes = upload_bytes - upload_bytes_before;
+    let readback_bytes = readback_bytes - readback_bytes_before;
+    if upload_bytes != 8 || readback_bytes != 8 {
+        return Err(format!(
+            "two same-allocation commands copied in {upload_bytes} bytes and out {readback_bytes} bytes, expected 8 and 8"
+        )
+        .into());
+    }
     println!(
-        "PASS provider_object_same_allocation_parallel command_buffers=2 allocation=1 views=4 in_flight=2 writeback=exact"
+        "PASS provider_object_same_allocation_parallel command_buffers=2 allocation=1 views=4 in_flight=2 writeback=exact copy_in_bytes={upload_bytes} copy_out_bytes={readback_bytes}"
     );
     Ok(())
 }
