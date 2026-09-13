@@ -2736,36 +2736,41 @@ fn put_capabilities(
         encoder.u8(mode.code());
     }
     encoder.u32(capabilities.max_present_image_count);
-    // The heap and ICB bits (`research/docs/25-heaps与ICB设计.md` §4.1)
-    // travel in the same extended payload as the render and present bits. A
-    // snapshot whose heap and ICB bits all stay at their defaults never
-    // reaches this function, because `declares_render_support` treats them as
-    // part of the same question — which keeps both current providers' frames
-    // at their previous bytes.
-    encoder.bool(capabilities.supports_heaps);
-    encoder.u64(capabilities.max_heap_bytes);
-    if capabilities.supported_heap_storage_modes.len() > MAX_SUPPORTED_HEAP_STORAGE_MODES {
-        return Err(CodecError::HeapStorageModeCount {
-            count: capabilities.supported_heap_storage_modes.len(),
-            maximum: MAX_SUPPORTED_HEAP_STORAGE_MODES,
-        });
-    }
-    encoder.u64(capabilities.supported_heap_storage_modes.len() as u64);
-    for mode in &capabilities.supported_heap_storage_modes {
-        put_storage_mode(encoder, *mode);
-    }
-    encoder.bool(capabilities.supports_heap_aliasing);
-    encoder.bool(capabilities.supports_indirect_command_buffers);
-    encoder.u32(capabilities.max_indirect_commands);
-    if capabilities.supported_indirect_commands.len() > MAX_SUPPORTED_INDIRECT_COMMANDS {
-        return Err(CodecError::IndirectCommandKindCount {
-            count: capabilities.supported_indirect_commands.len(),
-            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
-        });
-    }
-    encoder.u64(capabilities.supported_indirect_commands.len() as u64);
-    for kind in &capabilities.supported_indirect_commands {
-        encoder.u8(kind.code());
+    // The heap and ICB bits (`research/docs/25-heaps与ICB设计.md` §4.1) are an
+    // *optional tail* of the extended payload: a snapshot whose heap and ICB
+    // bits all stay at their defaults keeps the exact bytes of the pre-heap
+    // frame, so a provider that only declares render and/or present bits (both
+    // current providers) is wire-identical to what it was before this
+    // increment. The decoder reads the tail only while bytes remain, which is
+    // the same additive rule the render and present bits follow: an old
+    // decoder sees the frame it always saw, and a new tail is refused with a
+    // typed error rather than silently truncated.
+    if capabilities.declares_heap_support() || capabilities.declares_icb_support() {
+        encoder.bool(capabilities.supports_heaps);
+        encoder.u64(capabilities.max_heap_bytes);
+        if capabilities.supported_heap_storage_modes.len() > MAX_SUPPORTED_HEAP_STORAGE_MODES {
+            return Err(CodecError::HeapStorageModeCount {
+                count: capabilities.supported_heap_storage_modes.len(),
+                maximum: MAX_SUPPORTED_HEAP_STORAGE_MODES,
+            });
+        }
+        encoder.u64(capabilities.supported_heap_storage_modes.len() as u64);
+        for mode in &capabilities.supported_heap_storage_modes {
+            put_storage_mode(encoder, *mode);
+        }
+        encoder.bool(capabilities.supports_heap_aliasing);
+        encoder.bool(capabilities.supports_indirect_command_buffers);
+        encoder.u32(capabilities.max_indirect_commands);
+        if capabilities.supported_indirect_commands.len() > MAX_SUPPORTED_INDIRECT_COMMANDS {
+            return Err(CodecError::IndirectCommandKindCount {
+                count: capabilities.supported_indirect_commands.len(),
+                maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+            });
+        }
+        encoder.u64(capabilities.supported_indirect_commands.len() as u64);
+        for kind in &capabilities.supported_indirect_commands {
+            encoder.u8(kind.code());
+        }
     }
     Ok(())
 }
@@ -2897,6 +2902,13 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
     }
     capabilities.supported_present_modes = supported_present_modes;
     capabilities.max_present_image_count = decoder.u32()?;
+    // The heap and ICB tail is optional: a frame that ended after the present
+    // bits is a snapshot with no heap or ICB declaration, and its bits keep the
+    // "cannot" defaults (`research/docs/25` §4.1). A frame with any bytes left
+    // must carry the whole tail; a truncated one is a typed error.
+    if decoder.remaining() == 0 {
+        return Ok(capabilities);
+    }
     capabilities.supports_heaps = decoder.bool()?;
     capabilities.max_heap_bytes = decoder.u64()?;
     let heap_mode_count =

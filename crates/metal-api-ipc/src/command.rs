@@ -2578,6 +2578,40 @@ mod tests {
     }
 
     #[test]
+    fn capability_frames_without_heap_bits_keep_the_pre_heap_bytes() {
+        // A provider that declares render and present bits but neither heap nor
+        // ICB bits must keep the frame the pre-heap codec produced: the heap/ICB
+        // section is an optional tail (`research/docs/25` §4.5), so this pin is
+        // what stops it from being appended unconditionally.
+        let mut both = fake_capabilities();
+        both.supports_render_passes = true;
+        both.max_color_attachments = 1;
+        both.max_attachment_dimension = [2, 2];
+        both.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        both.supports_presentation = true;
+        both.max_present_targets = 1;
+        both.supported_present_modes = vec![PresentMode::Fifo];
+        both.max_present_image_count = MAX_PRESENT_IMAGE_COUNT;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: both,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        let hex = frame
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        // Captured from the pre-heap codec at `2ad57d1` and re-checked against
+        // this encoder: the frames are byte-identical.
+        assert_eq!(
+            hex,
+            "4d43433102000000950a00000000000000070000000101000100000000000000000100000000000000010000000000000001000000000000000100000000000000010000000000000001000000000000000100000001000000000000040000000000000000000000000001000100010000000100000000000000020000000000000002000000000000000102010000000100000000000000010200000001"
+        );
+    }
+
+    #[test]
     fn round_trips_every_request_and_response() {
         let request = compile_request();
         let compiled = pipeline(&request);
