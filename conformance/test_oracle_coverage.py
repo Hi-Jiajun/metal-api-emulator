@@ -46,6 +46,20 @@ VULKAN_TRACE_RAIL = "vulkan"
 PENDING_RENDER_RAILS = ("native-metal", "native-metal-provider",
                         "native-metal-provider-objects", "vulkan-objects")
 
+# The CI rail names that cannot carry an attachment observation yet. The
+# Vulkan object-API rails are the exception: they run the same provider as the
+# Vulkan trace rail, so they do report one.
+RAILS_WITHOUT_ATTACHMENT_OBSERVATION = frozenset({
+    "native oracle capture",
+    "native-metal provider capture",
+    "three-way parity comparison",
+})
+
+
+def _rail_cannot_report_attachments(rail_name):
+    """Whether a CI rail is unable to report a render attachment today."""
+    return rail_name in RAILS_WITHOUT_ATTACHMENT_OBSERVATION
+
 # Every command rail in the CI workflow that writes its suites out explicitly.
 # Order matters: a parity line also contains `compare.py --suite`, and the
 # object-API lines contain a `--bin provider-capture --` prefix, so the first
@@ -322,10 +336,11 @@ class SuiteCoverageTests(unittest.TestCase):
 
     def test_ci_rails_each_run_every_committed_suite(self):
         # A suite whose render cases are marked for the Vulkan trace rail only
-        # is reported by the local Vulkan rails and stays out of the CI rails
-        # until the macOS capture step lands (`conformance/RENDER-CAPTURE.md`
-        # §4); every other suite has to be named on all four.
-        fixtures = set(suite_fixtures()) - locally_reported_suites()
+        # is reported by the Vulkan rails -- including the CI ones -- and stays
+        # out of the rails that cannot carry an attachment observation until the
+        # macOS capture step lands (`conformance/RENDER-CAPTURE.md` §4). Every
+        # other suite has to be named on all four.
+        locally_rendered = locally_reported_suites()
         found = {name: set() for name, _ in CI_RAILS}
         for line in _workflow_lines():
             for name, marker in CI_RAILS:
@@ -336,15 +351,20 @@ class SuiteCoverageTests(unittest.TestCase):
             with self.subTest(rail=name):
                 self.assertTrue(found[name], name + ": no suite file is named on any line "
                                 "with marker " + repr(marker))
-                self.assertEqual(found[name], fixtures, name + " suite coverage: "
-                                 + _suite_difference(fixtures, found[name]))
+                # The two object-API rails and the macOS oracle cannot report a
+                # render attachment yet, so the Vulkan-only suites are expected
+                # to be absent from them.
+                expected = (set(suite_fixtures()) - locally_rendered
+                            if _rail_cannot_report_attachments(name)
+                            else set(suite_fixtures()))
+                self.assertEqual(found[name], expected, name + " suite coverage: "
+                                 + _suite_difference(expected, found[name]))
 
     def test_ci_version_loops_pin_every_committed_suite(self):
-        fixtures = suite_fixtures()
-        locally = locally_reported_suites()
-        fixtures = {identity: ids for identity, ids in fixtures.items() if identity not in locally}
-        expected = {"compute-buffer-v" + str(version)
-                    for version in sorted(_version(identity) for identity in fixtures)}
+        locally_rendered = locally_reported_suites()
+        committed = {"compute-buffer-v" + str(version)
+                     for version in sorted(_version(identity) for identity in suite_fixtures())}
+        expected_without_attachments = committed - locally_rendered
         loops = []
         for line in _workflow_lines():
             for match in CI_VERSION_LOOP.finditer(line):
@@ -355,6 +375,10 @@ class SuiteCoverageTests(unittest.TestCase):
                          "CI_EXPECTED_LOOPS with ci.yml if a rail was added or removed")
         for index, loop in enumerate(loops):
             with self.subTest(loop=index):
+                # The loops appear in workflow order: the two Vulkan object-API
+                # captures read the attachment, the two Rust Metal captures do
+                # not report one yet (`RENDER-CAPTURE.md` §4).
+                expected = (expected_without_attachments if index >= 2 else committed)
                 self.assertEqual(loop, expected, "version loop %d coverage: " % index
                                  + _suite_difference(expected, loop))
 
