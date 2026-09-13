@@ -1008,6 +1008,11 @@ fn encode(
             },
         };
         let stride = NSUInteger::try_from(width.saturating_mul(4)).unwrap_or(NSUInteger::MAX);
+        // `replace_region` takes the *source* stride and owns the texture-side
+        // layout, so this upload cannot repeat the Vulkan rail's defect: there
+        // the host had to guess the destination `VkSubresourceLayout.rowPitch`,
+        // while Metal keeps that distance inside the driver. The tightly packed
+        // stride is the AIR fixture's row order and nothing else.
         created.replace_region(region, 0, bytes.as_ptr().cast(), stride);
         // A texture upload is a copy-in like a buffer upload, so the v11 count
         // contract sees one operation per touched allocation

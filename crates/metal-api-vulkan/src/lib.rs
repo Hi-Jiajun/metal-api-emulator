@@ -2645,17 +2645,58 @@ impl ExecutionResources {
                     ));
                 }
             };
-            // Linear host-visible images keep rows tightly packed for R32Uint,
-            // so the owned bytes are the rows in order.
-            let row_pitch = usize::try_from(texture.width)
+            // The owned bytes are tightly packed `width * 4` byte rows, but a
+            // linear image's rows are only *at least* that far apart: the
+            // driver chooses `VkSubresourceLayout.rowPitch`, and Lavapipe
+            // returns 64 bytes for a 4x4 R32Uint image whose rows hold 16.
+            // Writing row `r` at `r * width * 4` then lands every row after the
+            // first in bytes the driver never reads, so `texture.read(x, y)`
+            // reports 0 for every V != 0 texel while V == 0 still looks right.
+            // Ask the driver for the layout instead of inferring the stride
+            // from the extent.
+            let tight_row_bytes = usize::try_from(texture.width)
                 .ok()
                 .and_then(|width| width.checked_mul(4))
                 .ok_or_else(|| failure("texture row pitch overflows usize"))?;
-            for (row, chunk) in bytes.chunks(row_pitch).enumerate() {
+            let (base_offset, row_pitch, depth_pitch) = if texture.height == 1 && texture.depth == 1
+            {
+                // A single row (down to a single texel) carries no row distance
+                // to get wrong, so its tightly packed copy stays byte-for-byte
+                // the previous behaviour and skips the layout query.
+                (0, tight_row_bytes, 0)
+            } else {
+                let subresource = vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    array_layer: 0,
+                };
+                let layout = unsafe {
+                    self.context
+                        .device
+                        .get_image_subresource_layout(image, subresource)
+                };
+                (
+                    usize::try_from(layout.offset)
+                        .map_err(|_| failure("texture row offset overflows usize"))?,
+                    usize::try_from(layout.row_pitch)
+                        .map_err(|_| failure("texture device row pitch overflows usize"))?,
+                    // Only D2 depth-1 images are admitted today, so the depth
+                    // pitch stays zero; consuming it anyway keeps a future
+                    // depth > 1 shape from silently assuming tight slices.
+                    usize::try_from(layout.depth_pitch)
+                        .map_err(|_| failure("texture device depth pitch overflows usize"))?,
+                )
+            };
+            let rows_per_slice = usize::try_from(texture.height)
+                .map_err(|_| failure("texture height overflows usize"))?;
+            for (row, chunk) in bytes.chunks(tight_row_bytes).enumerate() {
+                let destination = base_offset
+                    + (row / rows_per_slice) * depth_pitch
+                    + (row % rows_per_slice) * row_pitch;
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         chunk.as_ptr(),
-                        (mapped.cast::<u8>()).add(row * row_pitch),
+                        (mapped.cast::<u8>()).add(destination),
                         chunk.len(),
                     );
                 }
