@@ -157,6 +157,11 @@ class PresentSelftestValidationTests(unittest.TestCase):
             ([{"bytes_hex": self.TARGET}], []),
             ([], [{"bytes_hex": self.TARGET}]),
             ([{"bytes_hex": self.TARGET}] * 2, [{"bytes_hex": self.TARGET}]),
+            # The bytes concatenated still equal [expected, expected], so these
+            # two only fail because the shape itself is pinned: two writebacks
+            # with no allocation, and the reverse.
+            ([{"bytes_hex": self.TARGET}] * 2, []),
+            ([], [{"bytes_hex": self.TARGET}] * 2),
         ):
             with self.subTest(writebacks=writebacks, allocations=allocations):
                 report = {"completion": "CompletedVisible",

@@ -342,9 +342,11 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 * that `getBytes` on a `usage = .renderTarget`, `storageMode = .shared` 2x2
   texture returns the tightly packed rows this report assumes;
 * a render case from the native rail in a committed suite: the oracle's
-  `--render-selftest` output exists (§5), and CI now asks for the suite capture
-  (`run_native.py --suite conformance/suite-v13.json`) and for the Rust
-  provider's v13 capture, but neither has produced a report yet;
+  `--render-selftest` output exists (§5), and CI asks for the suite capture
+  (`run_native.py --suite conformance/suite-v13.json`) plus the Rust provider's
+  v13 capture. Both ran on CI run `34781060564`: the oracle reported the v13
+  attachment, and the Rust provider printed
+  `render case completed: offscreen_triangle_clear_2x2 attachment=4080c0ff...`;
 * the Rust provider's render path end to end — `render::plan_trace` plus the
   encoder body, and the writeback that lands the attachment bytes on the
   trace's view. Its refusal and planning halves are host-verified; the encoder
@@ -355,7 +357,53 @@ every eligible runner (§5). On the Paravirtual device of run `34774478149` that
 check built the reviewed two-stage pipeline state, cleared the 2x2 `rgba8Unorm`
 attachment and read it back through `getBytes` as `4080c0ff` four times — the
 bullets that name the pipeline state, `loadAction = .clear`, the texel bytes and
-the tightly packed readback, on the oracle's own path. It does not establish the
-`.load` branch or the Rust provider's own encoder path. The suite capture this
-job also runs is what asks for the first suite-reported case, and the flipped
-capability bit is what lets the same runner exercise the provider's encoder.
+the tightly packed readback, on the oracle's own path. The `.load` branch is what
+`--present-selftest` exercises (§7). Since the capability flip, the same runner
+also captures committed suites through the Rust provider's own encoder: run
+`34781060564` captured v13 and run `34782615760` captured v14 with
+`render case completed: present_triangle_clear_2x2 attachment=4080c0ff...`.
+
+## 7. The present milestone (suite-v14)
+
+`suite-v14.json` is v13's 2x2 `rgba8_unorm` render case plus a `present` section
+(`research/docs/24` §3.1, §6 Step 3): the render pass's own attachment is a
+provider-owned present target that starts as the `efefefef` sentinel, is
+acquired once, is rendered into, and is made readable by one explicit
+`COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL` transition followed by the
+same `vkCmdCopyImageToBuffer` readback every other case uses. A successful case
+reports the target through the existing `writebacks`/`allocations` shape and adds
+`"present": {"acquire": 1, "present": 1}`.
+
+The marker rule is the same one §4 describes, with one extra consequence: the
+Swift oracle does not report provider counters (`research/docs/24` §5.1), so a
+present-bearing case cannot be marked for `native-metal`. Suite-v14 marks
+`vulkan` and `native-metal-provider`; the object-API rails skip it exactly as
+they skip v13's render case. The Apple half of the evidence is the oracle's
+`--present-selftest` (§5): it presets the sentinel, runs the reviewed render
+equivalent and fails if the readback is the sentinel instead of `4080c0ff` x4.
+
+What the comparator enforces for a marked rail (`conformance/compare.py`,
+`conformance/test_suite_v14.py`):
+
+* the suite's `present` object is a whitelist (`mode = "fifo"`, `image_count = 1`,
+  `acquire = present = 1`), and `initial_hex`, when present, is four bytes that
+  differ from the expected texel — the same falsifiability rule the clear value
+  and the loaded initial texels already follow;
+* a rail the marker names has to report the counts the suite declares, and a rail
+  the marker does not name has to leave them out; a suite with no `present`
+  section may not see the key at all;
+* the counts are additive observations, not substitutes: the attachment bytes,
+  the `copy_in`/`copy_out` pair and the v9 `group_counts` rules are unchanged;
+* the target's bytes still travel the attachment's writeback, so a buffer
+  writeback standing in for it, a dropped texel or a tampered byte is refused as
+  it is for v13.
+
+Evidence. Lavapipe (`tools/lavapipe-smoke.sh`) runs all three Vulkan shapes for
+v14 and every `compare.py --check` passes; CI run `34782615760` is green with
+five-rail parity for v14, the Rust native provider executing the presenting case
+on an Apple Paravirtual device, and `--present-selftest` passing; the RTX 5060
+run is archived in `evidence/windows-rtx5060-v14-1f8adc1-2026-09-14/` (direct
+capture: `present = {"acquire": 1, "present": 1}`, bytes
+`4080c0ff4080c0ff4080c0ff4080c0ff`; object and async-object captures pass because
+the marker does not name them). The object-API present action is still open
+(`research/docs/24` §6 Step 5), so the object rails continue to skip the case.

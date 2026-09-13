@@ -141,6 +141,22 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `native-oracle --render-selftest` on an Apple Paravirtual device and read
   `40 80 c0 ff` four times back, and the suite path afterwards captured the same
   bytes through the Rust native provider. See `conformance/RENDER-CAPTURE.md`.
+- Surfaceless presentation runs on the provider rails: `suite-v14` adds a present
+  action to the same 2x2 render case — a provider-owned, sentinel-preset target
+  that is acquired once, rendered into, made host-readable and reported as
+  `present: {"acquire": 1, "present": 1}` through the same writeback channel as
+  every other observation. The contract and trace values landed in
+  `6ba8834`/`e4f451f`/`541be0c`, the Vulkan executor in `8fdd61b` (with the
+  target-layout serialization and colour-write scope fixes in `c45f001`), the
+  comparator rules in `725a557`, the native equivalent and its Apple self-test in
+  `5f09fa3`/`7c528f2`, and the v14 suite plus CI wiring in `1f8adc1`/`49e68a2`.
+  CI run `34782615760` is green: the Rust native provider executes the presenting
+  case on an Apple Paravirtual device, Lavapipe runs it on the Vulkan rail,
+  `--present-selftest` passes on the Swift oracle, and compare-captures reports
+  five-rail parity for v14; the RTX 5060 run is archived in
+  `evidence/windows-rtx5060-v14-1f8adc1-2026-09-14/`. This is a *readable-target
+  equivalent*: it does not create a `VkSurfaceKHR`, a swapchain or a window, and
+  it models neither multi-buffering nor vsync (`research/docs/24` §3.6).
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
@@ -166,11 +182,13 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
 - Not implemented: render features beyond the one-additional-suite increment
   (vertex buffers and MRT, `LoadOp::Load`, `StoreOp::DontCare`, formats beyond
   `rgba8_unorm` inside a suite), sampler and
-  texture generalisation beyond the sampled fixture, presentation and
-  swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
-  compilation, arbitrary AIR/MSL compilation and reflection, and production
-  reims integration (Gate 2/3). This is not a Metal.framework ABI
-  implementation.
+  texture generalisation beyond the sampled fixture, presentation beyond the
+  surfaceless readable-target equivalent (real surfaces and swapchains,
+  multi-buffering, present modes other than FIFO, vsync, suboptimal handling),
+  the object-API present action (`research/docs/24` §6 Step 5), heaps, ICBs,
+  general MTLB function-name resolution, Windows MSL compilation, arbitrary
+  AIR/MSL compilation and reflection, and production reims integration
+  (Gate 2/3). This is not a Metal.framework ABI implementation.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
 shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift

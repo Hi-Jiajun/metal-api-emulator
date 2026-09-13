@@ -63,6 +63,15 @@ def validate_present_selftest(report):
     writebacks = report.get("writebacks", [])
     allocations = report.get("allocations", [])
     expected = "4080c0ff" * 4
+    # The shape is part of the claim: the reviewed fixture produces exactly one
+    # writeback and one allocation, so a report that reached the same bytes by
+    # another route (for example two writebacks and no allocation) is refused
+    # rather than compared as if it were the same observation.
+    if len(writebacks) != 1 or len(allocations) != 1:
+        raise NativeRunError(
+            "present selftest: expected one writeback and one allocation, got "
+            + repr((len(writebacks), len(allocations)))
+        )
     observed = [entry.get("bytes_hex") for entry in writebacks + allocations]
     if observed != [expected, expected]:
         raise NativeRunError(

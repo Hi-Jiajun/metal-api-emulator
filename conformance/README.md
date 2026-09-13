@@ -1,5 +1,14 @@
 # Native Metal reference capture
 
+Current state: the harness now covers thirteen compute/alias/texture/command-buffer
+suites plus two render-bearing suites — `suite-v13.json` (offscreen 2x2 colour
+attachment) and `suite-v14.json` (the same attachment as a surfaceless present
+target, with `research/docs/24`'s acquire/present counts). The render and present
+observation rules live in [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7; the
+per-suite rules are exercised by `python3 -m unittest discover -s conformance`.
+The v1/v2 description below is the historical starting point and is kept for the
+suite's own record.
+
 This directory contains the native Metal/Vulkan comparison harness for bounded
 buffer-compute cases. The native runner is a standalone Swift program using
 Metal; it is not a Rust `ComputeProvider` implementation. Its source is prepared
