@@ -3444,6 +3444,10 @@ fn tier_distance(tier: QueuePriority, nominated: QueuePriority) -> (u8, u8) {
 /// `priorities` is read positionally. A missing entry defaults to
 /// [`QueuePriority::Default`] and extra entries are ignored, so a caller cannot
 /// make the scheduler panic by passing a differently sized slice.
+/// The slice is the tier table a provider's submit path carries for its device
+/// queues, so the same expression serves the default path (every queue at
+/// [`QueuePriority::Default`], or no table at all) and a provider that installs
+/// mixed tiers (`research/docs/21` §6 marks the queues with it).
 /// `round_robin_start` is the caller's monotonic selection counter: it is both
 /// the position inside the policy window and the tie-break cursor, so the
 /// caller keeps advancing it by one per selection exactly as
@@ -7774,6 +7778,56 @@ mod tests {
 
         // Four high slots, two default slots, then the one low slot.
         assert_eq!(picks, vec![0, 0, 0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn priority_selection_carries_the_submit_path_tier_table_over_ten_windows() {
+        // The starting point of the real-device experiment in `research/docs/21`
+        // §6: one high queue, one default queue and six low queues, with the
+        // cursor advancing once per submission and every submission retired
+        // before the next one is enqueued. `VulkanExecutor` reports exactly this
+        // sequence through `queue_submission_counts()`.
+        let policy = QueueSchedulingPolicy::default();
+        let tiers = [
+            QueuePriority::High,
+            QueuePriority::Default,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+        ];
+        let in_flight = [0_usize; 8];
+        let picks: Vec<usize> = (0..70)
+            .map(|cursor| select_queue_with_priority(&in_flight, &tiers, cursor, policy))
+            .collect();
+
+        let share = |tier: QueuePriority| picks.iter().filter(|pick| tiers[**pick] == tier).count();
+        assert_eq!(share(QueuePriority::High), 40);
+        assert_eq!(share(QueuePriority::Default), 20);
+        assert_eq!(share(QueuePriority::Low), 10);
+
+        let mut longest_high_run = 0_usize;
+        let mut run = 0_usize;
+        for pick in &picks {
+            if tiers[*pick] == QueuePriority::High {
+                run += 1;
+                longest_high_run = longest_high_run.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert_eq!(
+            longest_high_run,
+            policy.high_priority_streak_limit() as usize
+        );
+        for window in picks.chunks(policy.window() as usize) {
+            assert!(
+                window.iter().any(|pick| tiers[*pick] == QueuePriority::Low),
+                "low tier starved in {window:?}"
+            );
+        }
     }
 
     #[test]

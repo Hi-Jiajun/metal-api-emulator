@@ -4,9 +4,9 @@ use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
     DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId,
-    PipelineCompileRequest, PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    PipelineCompileRequest, PipelineProvider, QueuePriority, QueueSchedulingPolicy,
+    ResourceTableSnapshot, SemanticDigest, ShaderSource, TextureAccess, TextureFormat,
+    TextureSource, TextureType, TextureView, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(target_os = "macos")]
@@ -20,7 +20,7 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -75,14 +75,284 @@ impl CopyCounters {
     }
 }
 
+/// The `research/docs/21` §6 queue marking: one high queue, one default queue
+/// and six low queues.
+fn default_queue_priorities() -> Vec<QueuePriority> {
+    let mut tiers = vec![QueuePriority::Low; 8];
+    tiers[0] = QueuePriority::High;
+    tiers[1] = QueuePriority::Default;
+    tiers
+}
+
+fn parse_queue_priorities(value: &str) -> Result<Vec<QueuePriority>> {
+    value
+        .split(',')
+        .map(|entry| match entry.trim() {
+            "low" => Ok(QueuePriority::Low),
+            "default" => Ok(QueuePriority::Default),
+            "high" => Ok(QueuePriority::High),
+            other => Err(format!("unknown queue tier {other:?}; use low, default or high").into()),
+        })
+        .collect()
+}
+
+fn format_queue_tiers(tiers: &[QueuePriority]) -> String {
+    tiers
+        .iter()
+        .map(|tier| match tier {
+            QueuePriority::Low => "low",
+            QueuePriority::Default => "default",
+            QueuePriority::High => "high",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Install one scheduling tier per device queue, truncating or padding the
+/// request so the table always describes the device exactly (Lavapipe exposes a
+/// single queue, so the §6 marking degenerates to one high queue there).
+fn install_queue_priorities(executor: &VulkanExecutor, requested: &[QueuePriority]) -> Result<()> {
+    let queues = executor.queue_count();
+    let mut tiers = vec![QueuePriority::Default; queues];
+    for (index, tier) in requested.iter().take(queues).enumerate() {
+        tiers[index] = *tier;
+    }
+    executor
+        .set_queue_priorities(&tiers)
+        .map_err(|error| format!("install queue priorities: {error:?}"))?;
+    println!(
+        "queue_priority_probe device={} queues={} requested={} installed={} truncated={} padded={}",
+        executor.device_name(),
+        queues,
+        format_queue_tiers(requested),
+        format_queue_tiers(&tiers),
+        requested.len().saturating_sub(queues),
+        queues.saturating_sub(requested.len()),
+    );
+    Ok(())
+}
+
+/// `research/docs/21` §6 on a real device: mark the queues, submit `submissions`
+/// mutually independent command buffers through the queue-selecting submit path
+/// and report what both observation surfaces see.
+///
+/// Every command buffer is committed and retired before the next one is
+/// recorded, so the device queues are idle at each selection and the policy
+/// window — not the in-flight load — decides the tier. Lavapipe exposes one
+/// queue: the probe still runs (the single-queue degenerate path) and skips the
+/// window contract, which a one-tier device cannot show.
+///
+/// Only the asynchronous object path selects a queue; the synchronous path
+/// stays pinned to queue 0, so the priority table is observable here and
+/// nowhere else.
+fn run_queue_priority_probe(executor: &Arc<VulkanExecutor>, submissions: usize) -> Result<()> {
+    let installed = executor.queue_priorities();
+    if installed.len() != executor.queue_count() {
+        return Err("the installed queue priority table does not describe the device".into());
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+        if let Ok(mut sequence) = sink.lock() {
+            sequence.push(queue);
+        }
+    }));
+    let provider: Arc<dyn PipelineProvider> = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(executor))
+            .map_err(|error| format!("create Vulkan provider: {error:?}"))?
+            .with_async_execution(true),
+    );
+    let device = objects::Device::new(provider);
+    let pipeline = device.compile_pipeline(PipelineCompileRequest {
+        entry_name: "read_texture_2d".to_owned(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"queue-priority-probe".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../../shaders/kernel_read_texture_2d.ll").to_owned(),
+        ),
+    })?;
+    let mut texels = Vec::with_capacity(64);
+    for value in 0..16_u32 {
+        texels.extend_from_slice(&value.to_le_bytes());
+    }
+    let texture = device.new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)?;
+    let output = device.new_buffer_with_bytes(vec![0_u8; 64])?;
+    let queue = device.new_command_queue();
+    for _ in 0..submissions {
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder()?;
+            encoder.set_compute_pipeline_state(&pipeline)?;
+            encoder.set_texture(0, &texture)?;
+            encoder.set_buffer(0, &output.view(0, 64)?)?;
+            encoder.dispatch_threads(Size::new(1, 1, 1)?, Size::new(1, 1, 1)?)?;
+            encoder.end_encoding()?;
+        }
+        command.commit()?;
+        if command.status()? != metal_api_core::CommandBufferStatus::Committed {
+            return Err("async commit did not leave the probe command pending".into());
+        }
+        command.wait_until_completed()?;
+    }
+    executor.clear_enqueue_probe_for_test();
+    if output.read()?[..4] != 0_u32.to_le_bytes() {
+        return Err("the queue priority probe landed unexpected bytes".into());
+    }
+    let sequence = observed
+        .lock()
+        .map_err(|_| "the enqueue probe sequence is poisoned")?
+        .clone();
+    report_queue_priority_probe(executor, &installed, &sequence, submissions)
+}
+
+/// Cross-check both observation surfaces and the §6 assertions, printing one
+/// machine-greppable PASS or SKIP line per contract.
+fn report_queue_priority_probe(
+    executor: &VulkanExecutor,
+    installed: &[QueuePriority],
+    sequence: &[usize],
+    submissions: usize,
+) -> Result<()> {
+    let queues = installed.len();
+    if sequence.len() != submissions {
+        return Err(format!(
+            "the enqueue probe observed {} of {submissions} submissions",
+            sequence.len()
+        )
+        .into());
+    }
+    if let Some(index) = sequence.iter().find(|index| **index >= queues) {
+        return Err(format!("the enqueue probe observed queue {index} outside the device").into());
+    }
+    let counts = executor.queue_submission_counts();
+    if counts.len() != queues || counts.iter().sum::<usize>() != submissions {
+        return Err(format!(
+            "queue_submission_counts() reports {counts:?} for {submissions} submissions"
+        )
+        .into());
+    }
+    for (index, count) in counts.iter().enumerate() {
+        let observed = sequence.iter().filter(|picked| **picked == index).count();
+        if *count != observed {
+            return Err(format!(
+                "queue {index}: queue_submission_counts={count} enqueue_probe={observed}"
+            )
+            .into());
+        }
+    }
+
+    let policy = QueueSchedulingPolicy::default();
+    let tier_of = |index: usize| installed[index];
+    let share = |tier: QueuePriority| {
+        sequence
+            .iter()
+            .filter(|index| tier_of(**index) == tier)
+            .count()
+    };
+    println!(
+        "queue_priority_probe sequence={}",
+        sequence
+            .iter()
+            .map(|index| match tier_of(*index) {
+                QueuePriority::Low => 'L',
+                QueuePriority::Default => 'D',
+                QueuePriority::High => 'H',
+            })
+            .collect::<String>()
+    );
+    println!(
+        "queue_priority_probe index_counts={}",
+        counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "queue_priority_probe tier_counts=high={} default={} low={}",
+        share(QueuePriority::High),
+        share(QueuePriority::Default),
+        share(QueuePriority::Low)
+    );
+    println!(
+        "PASS queue_priority_probe submissions={submissions} queues={queues} \
+         probe_matches_counts=exact writeback=exact"
+    );
+
+    let window = usize::try_from(policy.window())?;
+    let present = installed.iter().collect::<BTreeSet<_>>().len();
+    if queues < window || present < 3 {
+        println!(
+            "SKIP queue_priority_probe_window reason=insufficient_queues queues={queues} \
+             tiers_present={present} window={window}"
+        );
+        return Ok(());
+    }
+    let windows = submissions / window;
+    if windows == 0 {
+        return Err(
+            format!("{submissions} submissions do not fill one {window}-slot window").into(),
+        );
+    }
+    let tiers: Vec<QueuePriority> = sequence.iter().map(|index| tier_of(*index)).collect();
+    let mut streak = 0_usize;
+    let mut longest = 0_usize;
+    for tier in &tiers {
+        streak = if *tier == QueuePriority::High {
+            streak + 1
+        } else {
+            0
+        };
+        longest = longest.max(streak);
+    }
+    let limit = policy.high_priority_streak_limit() as usize;
+    if longest > limit {
+        return Err(format!("the high tier ran {longest} times in a row, limit {limit}").into());
+    }
+    let mut low_per_window_min = usize::MAX;
+    for window_tiers in tiers.chunks(window).take(windows) {
+        let lows = window_tiers
+            .iter()
+            .filter(|tier| **tier == QueuePriority::Low)
+            .count();
+        low_per_window_min = low_per_window_min.min(lows);
+    }
+    if low_per_window_min == 0 {
+        return Err("a window starved the low tier".into());
+    }
+    let expected_high = policy.high_weight() as usize * windows;
+    let expected_default = policy.medium_weight() as usize * windows;
+    let high = share(QueuePriority::High);
+    let default = share(QueuePriority::Default);
+    if high != expected_high || default != expected_default {
+        return Err(format!(
+            "window shares high={high} default={default} low={} do not match {expected_high}:{expected_default}",
+            share(QueuePriority::Low)
+        )
+        .into());
+    }
+    println!(
+        "PASS queue_priority_probe_window windows={windows} high={high} default={default} \
+         low={} max_high_streak={longest} limit={limit} low_per_window_min={low_per_window_min}",
+        share(QueuePriority::Low)
+    );
+    Ok(())
+}
+
 fn create_provider(
     backend: Backend,
     async_execution: bool,
+    queue_priorities: Option<&[QueuePriority]>,
 ) -> Result<(Arc<dyn PipelineProvider>, String, CopyCounters)> {
     match backend {
         Backend::Vulkan => {
             let executor = VulkanExecutor::new()
                 .map_err(|error| format!("create Vulkan executor: {error:?}"))?;
+            if let Some(requested) = queue_priorities {
+                install_queue_priorities(&executor, requested)?;
+            }
             let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
                 .map_err(|error| format!("create Vulkan provider: {error:?}"))?
                 .with_async_execution(async_execution);
@@ -273,16 +543,46 @@ fn main() -> Result<()> {
     let mut backend = None;
     let mut api = None;
     let mut async_execution = false;
+    let mut queue_priorities = None;
+    let mut probe = false;
+    let mut probe_submissions = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
                 "usage: provider-capture --suite conformance/suite.json [--output capture.json] \
-                 [--backend vulkan|native-metal-provider] [--api trace|objects] [--async]"
+                 [--backend vulkan|native-metal-provider] [--api trace|objects] [--async] \
+                 [--queue-priorities low,default,high,...]\n\
+                 usage: provider-capture --queue-priority-probe \
+                 [--queue-priorities low,default,high,...] [--queue-priority-submissions N]"
             );
             return Ok(());
         }
         if flag == "--async" {
             async_execution = true;
+            continue;
+        }
+        if flag == "--queue-priority-probe" {
+            probe = true;
+            continue;
+        }
+        if flag == "--queue-priorities" && queue_priorities.is_none() {
+            let value = args.next().ok_or("missing argument value")?;
+            queue_priorities = Some(parse_queue_priorities(
+                value
+                    .to_str()
+                    .ok_or("--queue-priorities must be valid UTF-8")?,
+            )?);
+            continue;
+        }
+        if flag == "--queue-priority-submissions" && probe_submissions.is_none() {
+            let value = args.next().ok_or("missing argument value")?;
+            probe_submissions = Some(
+                value
+                    .to_str()
+                    .ok_or("--queue-priority-submissions must be valid UTF-8")?
+                    .parse()
+                    .map_err(|error| format!("--queue-priority-submissions: {error}"))?,
+            );
             continue;
         }
         if flag == "--backend" && backend.is_none() {
@@ -319,6 +619,32 @@ fn main() -> Result<()> {
     if async_execution && api != EntryApi::Objects {
         return Err("--async requires --api objects".into());
     }
+    if probe {
+        if suite_path.is_some() || output_path.is_some() || async_execution {
+            return Err(
+                "--queue-priority-probe runs its own scenario: it takes neither --suite, \
+                 --output nor --async"
+                    .into(),
+            );
+        }
+        if backend == Backend::NativeMetalProvider {
+            return Err("--queue-priority-probe requires the Vulkan backend".into());
+        }
+        if probe_submissions.is_some_and(|submissions| submissions == 0) {
+            return Err("--queue-priority-submissions must be greater than zero".into());
+        }
+        let requested = queue_priorities.unwrap_or_else(default_queue_priorities);
+        if requested.is_empty() {
+            return Err("--queue-priorities must name at least one queue".into());
+        }
+        let executor =
+            VulkanExecutor::new().map_err(|error| format!("create Vulkan executor: {error:?}"))?;
+        install_queue_priorities(&executor, &requested)?;
+        return run_queue_priority_probe(&executor, probe_submissions.unwrap_or(70));
+    }
+    if probe_submissions.is_some() {
+        return Err("--queue-priority-submissions requires --queue-priority-probe".into());
+    }
     let suite_path = suite_path.ok_or("--suite is required")?;
     if output_path.as_ref().is_some_and(|path| path.exists()) {
         return Err("refusing to overwrite an existing capture".into());
@@ -352,7 +678,8 @@ fn main() -> Result<()> {
         }
     }
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name, counters) = create_provider(backend, async_execution)?;
+    let (provider, device_name, counters) =
+        create_provider(backend, async_execution, queue_priorities.as_deref())?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
     let mut results = Vec::new();

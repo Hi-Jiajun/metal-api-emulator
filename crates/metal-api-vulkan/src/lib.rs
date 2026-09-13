@@ -15,7 +15,8 @@ use metal2vulkan::reflect::{
 use metal_api_core::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
 use metal_api_core::provider::{
     BorrowedLeaseRegistry, CompletionDisposition, LeaseId, PipelineContract, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
+    ProviderError, ProviderErrorClass, ProviderPhase, QueuePriority, QueueSchedulingPolicy,
+    SemanticDigest, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -97,6 +98,31 @@ impl VulkanExecutor {
     /// compute families.
     pub fn queue_count(&self) -> usize {
         self.context.queue_count()
+    }
+
+    /// Host-side scheduling tier installed on each device queue.
+    ///
+    /// The tier is a provider scheduling attribute, not a
+    /// `VkDeviceQueueCreateInfo::pQueuePriorities` value: Vulkan fixes queue
+    /// priorities at device creation, so the provider expresses priority in its
+    /// own scheduler (`research/docs/21` §2). Every queue starts at
+    /// [`QueuePriority::Default`].
+    pub fn queue_priorities(&self) -> Vec<QueuePriority> {
+        self.context.queue_priorities()
+    }
+
+    /// Mark each device queue with a host-side scheduling tier.
+    ///
+    /// `tiers[i]` is the tier of device queue `i`, so the slice must have
+    /// exactly [`Self::queue_count`] entries: a differently sized table is
+    /// refused rather than padded, which keeps "queue `i` has tier
+    /// `tiers[i]`" true for every later submission. The table is read on each
+    /// queue selection, and with every queue at [`QueuePriority::Default`] that
+    /// selection is the previous least-loaded rule. Installing a tier only
+    /// changes which device queue carries the submission: dependency order,
+    /// reservations and writeback results are unaffected.
+    pub fn set_queue_priorities(&self, tiers: &[QueuePriority]) -> Result<(), ExecutorError> {
+        self.context.set_queue_priorities(tiers).map_err(failure)
     }
 
     /// Number of distinct device queue families used by the scheduler.
@@ -287,10 +313,14 @@ impl ComputeExecutor for VulkanExecutor {
     }
 }
 
-/// Pick the least-loaded queue, breaking ties from `round_robin_start`.
+/// Pre-priority queue choice: the least-loaded queue, breaking ties from
+/// `round_robin_start`.
 ///
-/// The cursor is advanced by the caller; keeping the policy pure lets it be
-/// unit tested without a Vulkan device.
+/// This is the implementation the live path used before the core policy was
+/// wired in, kept as the oracle for the equivalence test below
+/// (`queue_priority_policy_reduces_to_select_queue_on_one_tier`). The live path
+/// is [`VulkanContext::pick_queue`] and always goes through the core policy.
+#[cfg(test)]
 fn select_queue(in_flight: &[usize], round_robin_start: usize) -> usize {
     if in_flight.is_empty() {
         return 0;
@@ -308,26 +338,23 @@ fn select_queue(in_flight: &[usize], round_robin_start: usize) -> usize {
     best
 }
 
-/// Priority-aware form of [`select_queue`], used only by the tests below.
+/// Queue choice for one submission: the whole live view of the core policy.
 ///
-/// Every queue a provider creates today shares one tier, and the live choice
-/// still goes through [`select_queue`]; wiring the core policy into the device
-/// path needs per-queue priorities on the trace/wire boundary, which is left to
-/// a later round (`research/docs/21-队列优先级与公平性设计.md` §6). This wrapper
-/// exists so the equivalence test can pin the stronger contract: with equal
-/// tiers the new policy must reproduce [`select_queue`] for every load vector.
-#[cfg(test)]
-fn select_queue_with_priority_policy(
+/// `cursor` is the provider's monotonic selection counter, not a value already
+/// folded by the queue count: the policy takes the tie-break cursor from
+/// `cursor % queues` itself, and folding the counter first would alias the
+/// window phase with the queue count (8 queues, a 7-slot window). The tests
+/// below call this function with the same cursor the live path passes.
+fn select_queue_for_submission(
     in_flight: &[usize],
-    priorities: &[metal_api_core::provider::QueuePriority],
-    round_robin_start: usize,
-    policy: metal_api_core::provider::QueueSchedulingPolicy,
+    tiers: &[QueuePriority],
+    cursor: usize,
 ) -> usize {
     metal_api_core::provider::select_queue_with_priority(
         in_flight,
-        priorities,
-        round_robin_start,
-        policy,
+        tiers,
+        cursor,
+        QueueSchedulingPolicy::default(),
     )
 }
 
@@ -346,6 +373,12 @@ pub(crate) struct VulkanContext {
     device_name: String,
     queue_locks: Vec<Mutex<()>>,
     enqueue_probe: Mutex<Option<EnqueueProbe>>,
+    /// Host-side scheduling tier of each device queue, read by every queue
+    /// selection. A provider-owned attribute, not a
+    /// `VkDeviceQueueCreateInfo::pQueuePriorities` value (`research/docs/21`
+    /// §2); every queue starts at [`QueuePriority::Default`], which is what
+    /// keeps the pre-priority choice the default.
+    queue_priorities: Mutex<Vec<QueuePriority>>,
     poisoned: AtomicBool,
     abandoned: AtomicBool,
     device_lost: AtomicBool,
@@ -522,6 +555,7 @@ impl VulkanContext {
             device_name,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
             enqueue_probe: Mutex::new(None),
+            queue_priorities: Mutex::new(vec![QueuePriority::Default; queue_count]),
             poisoned: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             device_lost: AtomicBool::new(false),
@@ -540,19 +574,66 @@ impl VulkanContext {
         }
     }
 
-    /// Least-loaded device queue for the next independent submission.
+    /// Device queue for the next independent submission.
     ///
-    /// Ties are broken by a round-robin cursor so idle devices still spread
-    /// submissions evenly. A single-queue family always returns zero,
-    /// preserving the previous behaviour on devices such as Lavapipe.
+    /// The choice is the core priority/fairness policy (`research/docs/21` §4)
+    /// applied to the tiers installed by [`Self::set_queue_priorities`]: an idle
+    /// queue still beats a busy one whatever the tiers, and among equally loaded
+    /// queues the rotation window nominates a tier, breaking ties from the
+    /// selection cursor. Every queue a provider creates starts at
+    /// [`QueuePriority::Default`], where the policy is the previous least-loaded
+    /// rule for every load vector — the equivalence test in this module pins
+    /// that. A single-queue family always returns zero, preserving the previous
+    /// behaviour on devices such as Lavapipe.
     pub(crate) fn pick_queue(&self) -> usize {
         let len = self.queues.len();
-        let start = self.next_queue.fetch_add(1, Ordering::Relaxed) % len;
+        if len == 0 {
+            return 0;
+        }
+        // Both the window phase and the tie-break cursor come from the
+        // monotonic selection counter. Folding it by the queue count *before*
+        // the policy would alias the two: with 8 queues and a 7-slot window,
+        // cursors 7 and 8 would nominate the same slot and let the high tier
+        // run longer than its weight.
+        let cursor = self.next_queue.fetch_add(1, Ordering::Relaxed);
         let mut loads = [0_usize; MAX_DEVICE_QUEUES];
         for (slot, counter) in loads.iter_mut().zip(&self.queue_in_flight) {
             *slot = counter.load(Ordering::Relaxed);
         }
-        select_queue(&loads[..len], start)
+        let tiers = self
+            .queue_priorities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A table shorter than the device is not an error here: the core policy
+        // reads missing entries as `Default`. `set_queue_priorities` refuses
+        // that shape, so it only happens if a device grows queues later.
+        let ranked = tiers.len().min(len);
+        select_queue_for_submission(&loads[..len], &tiers[..ranked], cursor)
+    }
+
+    /// Install the scheduling tier of every device queue.
+    ///
+    /// The table is read on each queue selection, so the slice must describe
+    /// the device exactly: a differently sized table is refused instead of
+    /// silently padded.
+    pub(crate) fn set_queue_priorities(&self, tiers: &[QueuePriority]) -> Result<(), &'static str> {
+        let mut installed = self
+            .queue_priorities
+            .lock()
+            .map_err(|_| "Vulkan queue priority table is poisoned")?;
+        if tiers.len() != installed.len() {
+            return Err("Vulkan queue priority table size mismatch");
+        }
+        installed.copy_from_slice(tiers);
+        Ok(())
+    }
+
+    /// Snapshot of the tiers currently installed on the device queues.
+    pub(crate) fn queue_priorities(&self) -> Vec<QueuePriority> {
+        self.queue_priorities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Lock the host-side enqueue section of one device queue.
@@ -4738,9 +4819,8 @@ mod tests {
 
     #[test]
     fn queue_priority_policy_reduces_to_select_queue_on_one_tier() {
-        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+        use metal_api_core::provider::QueuePriority;
 
-        let policy = QueueSchedulingPolicy::default();
         let probes = 3_usize;
         for len in 0..=3_usize {
             for encoded in 0..probes.pow(len as u32) {
@@ -4751,9 +4831,12 @@ mod tests {
                     rest /= probes;
                 }
                 let priorities = vec![QueuePriority::Default; len];
-                for cursor in 0..6_usize {
+                // The cursor range crosses the 7-slot window boundary on
+                // purpose: the default path must stay the least-loaded rule for
+                // every cursor, not only for the first window.
+                for cursor in 0..32_usize {
                     assert_eq!(
-                        select_queue_with_priority_policy(&loads, &priorities, cursor, policy),
+                        select_queue_for_submission(&loads, &priorities, cursor),
                         select_queue(&loads, cursor),
                         "loads {loads:?} cursor {cursor} must keep the least-loaded rule"
                     );
@@ -4771,16 +4854,220 @@ mod tests {
         let priorities = [QueuePriority::Low, QueuePriority::High];
         // Window slot 0 nominates the high tier, so the high queue wins even
         // though both queues are idle.
-        assert_eq!(
-            select_queue_with_priority_policy(&loads, &priorities, 0, policy),
-            1
-        );
+        assert_eq!(select_queue_for_submission(&loads, &priorities, 0), 1);
         // The last slot of the window belongs to the low tier, so the idle high
         // queue yields instead of running again.
         let low_slot = (policy.window() - 1) as usize;
         assert_eq!(
-            select_queue_with_priority_policy(&loads, &priorities, low_slot, policy),
+            select_queue_for_submission(&loads, &priorities, low_slot),
             0
         );
+    }
+
+    /// The `research/docs/21` §6 queue shape: one high queue, one default queue
+    /// and six low queues, the marking the RTX 5060 experiment installs.
+    fn rtx_5060_queue_tiers() -> Vec<QueuePriority> {
+        use metal_api_core::provider::QueuePriority;
+
+        vec![
+            QueuePriority::High,
+            QueuePriority::Default,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+        ]
+    }
+
+    /// Assert the window contract on an observed tier sequence: the weighted
+    /// shares, the high-tier streak bound, and one low tier per window.
+    fn assert_queue_priority_window(tiers_seen: &[QueuePriority]) {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let policy = QueueSchedulingPolicy::default();
+        let window = usize::try_from(policy.window()).expect("window fits usize");
+        assert_eq!(window, 7);
+        assert_eq!(
+            tiers_seen.len(),
+            70,
+            "the contract is stated over 10 windows"
+        );
+        let count = |tier: QueuePriority| tiers_seen.iter().filter(|seen| **seen == tier).count();
+        assert_eq!(count(QueuePriority::High), 40);
+        assert_eq!(count(QueuePriority::Default), 20);
+        assert_eq!(count(QueuePriority::Low), 10);
+
+        let mut streak = 0_usize;
+        let mut longest = 0_usize;
+        for tier in tiers_seen {
+            streak = if *tier == QueuePriority::High {
+                streak + 1
+            } else {
+                0
+            };
+            longest = longest.max(streak);
+        }
+        assert_eq!(
+            u32::try_from(longest).expect("streak fits u32"),
+            policy.high_priority_streak_limit(),
+            "the high tier must not exceed its weight in a row"
+        );
+        for start in (0..tiers_seen.len() - window + 1).step_by(window) {
+            let lows = tiers_seen[start..start + window]
+                .iter()
+                .filter(|seen| **seen == QueuePriority::Low)
+                .count();
+            assert!(lows >= 1, "window {start} starved the low tier: {lows}");
+        }
+    }
+
+    #[test]
+    fn queue_priority_window_spreads_the_submission_tiers_over_the_rtx_5060_shape() {
+        let tiers = rtx_5060_queue_tiers();
+        // Every submission retires before the next one is enqueued, so the tier
+        // table is the only state the policy sees. The cursor is the monotonic
+        // selection counter, exactly as `VulkanContext::pick_queue` advances it.
+        let loads = vec![0_usize; tiers.len()];
+        let tiers_seen: Vec<QueuePriority> = (0..70_usize)
+            .map(|cursor| tiers[select_queue_for_submission(&loads, &tiers, cursor)])
+            .collect();
+        assert_queue_priority_window(&tiers_seen);
+    }
+
+    #[test]
+    fn queue_priority_tiers_never_override_the_least_loaded_rule() {
+        // The high queue is busy while six low queues are idle: window slot 0
+        // nominates the high tier, and the high queue still must not jump ahead
+        // of an idle queue (`research/docs/21` §3 invariant 1).
+        let tiers = rtx_5060_queue_tiers();
+        let mut loads = vec![0_usize; tiers.len()];
+        loads[0] = 7;
+        for cursor in 0..14_usize {
+            let picked = select_queue_for_submission(&loads, &tiers, cursor);
+            assert_ne!(picked, 0, "cursor {cursor} picked the busy high queue");
+            assert_eq!(loads[picked], 0, "cursor {cursor} picked a busy queue");
+        }
+    }
+
+    #[test]
+    fn queue_priority_table_reaches_the_async_object_submit_path() {
+        use metal_api_core::provider::{PipelineCompileRequest, ShaderSource, TextureFormat};
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        assert!(queues >= 1, "a selected device exposes at least one queue");
+        // The §6 marking, truncated to the device: Lavapipe exposes one queue
+        // and therefore keeps the degenerate one-tier table.
+        let installed: Vec<QueuePriority> =
+            rtx_5060_queue_tiers().into_iter().take(queues).collect();
+        executor
+            .set_queue_priorities(&installed)
+            .expect("a table with one entry per queue is accepted");
+        assert_eq!(executor.queue_priorities(), installed);
+        assert!(
+            executor
+                .set_queue_priorities(&installed[..queues - 1])
+                .is_err(),
+            "a table that does not describe the device is refused"
+        );
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+            if let Ok(mut sequence) = sink.lock() {
+                sequence.push(queue);
+            }
+        }));
+
+        // Only the asynchronous object path selects a queue; the synchronous
+        // path stays pinned to queue 0, so the table has to be observed here.
+        let provider = crate::VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .expect("provider")
+            .with_async_execution(true);
+        let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"queue_priority_table".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = device
+            .new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)
+            .expect("texture object");
+        let output = device
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = device.new_command_queue();
+        let submissions = 70_usize;
+        for _ in 0..submissions {
+            let command = queue.command_buffer();
+            {
+                let mut encoder = command.compute_command_encoder().expect("encoder");
+                encoder
+                    .set_compute_pipeline_state(&pipeline)
+                    .expect("pipeline state");
+                encoder.set_texture(0, &texture).expect("texture binding");
+                encoder
+                    .set_buffer(0, &output.view(0, 64).unwrap())
+                    .expect("buffer binding");
+                encoder
+                    .dispatch_threads(
+                        metal_api_core::Size::new(1, 1, 1).unwrap(),
+                        metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    )
+                    .expect("dispatch");
+                encoder.end_encoding().expect("end encoding");
+            }
+            command.commit().expect("commit");
+            command.wait_until_completed().expect("completion");
+        }
+        executor.clear_enqueue_probe_for_test();
+        // Priority only steers queue selection: the landing bytes are the same
+        // ones the synchronous path produces.
+        assert_eq!(output.read().expect("readback")[..4], 0_u32.to_le_bytes());
+
+        let sequence = observed.lock().expect("probe sequence").clone();
+        assert_eq!(sequence.len(), submissions, "one probe call per commit");
+        assert!(sequence.iter().all(|index| *index < queues));
+        let counts = executor.queue_submission_counts();
+        assert_eq!(counts.len(), queues);
+        assert_eq!(counts.iter().sum::<usize>(), submissions);
+        for (index, count) in counts.iter().enumerate() {
+            assert_eq!(
+                *count,
+                sequence.iter().filter(|picked| **picked == index).count(),
+                "queue {index} counts disagree with the enqueue probe"
+            );
+        }
+        if queues < 7 || installed.iter().collect::<BTreeSet<_>>().len() < 3 {
+            eprintln!(
+                "SKIP queue priority window: queues={queues} tiers={installed:?} \
+                 submissions={submissions}"
+            );
+            return;
+        }
+        let tiers_seen: Vec<QueuePriority> =
+            sequence.iter().map(|index| installed[*index]).collect();
+        assert_queue_priority_window(&tiers_seen);
     }
 }
