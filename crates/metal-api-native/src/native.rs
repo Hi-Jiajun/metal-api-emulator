@@ -19,10 +19,10 @@ use metal_api_core::completion::{
 };
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,15 @@ fn trace_owned_bytes(trace: &ComputeTrace) -> u64 {
 /// [`NativeMetalProvider::with_async_execution`] with `true` instead returns
 /// `Submitted` immediately and fills the completion record from an
 /// `MTLCommandBuffer` completion handler.
+/// Device-buffer copy-in and copy-out operations. One of each per touched
+/// allocation, not per view: owned views of one allocation share one MTLBuffer
+/// (`research/docs/15` §3.3).
+#[derive(Default)]
+struct CopyCounters {
+    uploads: AtomicUsize,
+    readbacks: AtomicUsize,
+}
+
 pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
@@ -87,6 +96,7 @@ pub struct NativeMetalProvider {
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
     borrowed: Arc<BorrowedLeaseRegistry>,
+    counters: Arc<CopyCounters>,
 }
 
 impl NativeMetalProvider {
@@ -162,6 +172,7 @@ impl NativeMetalProvider {
                     device_lost: Arc::new(AtomicBool::new(false)),
                 }),
                 completions: Mutex::new(BTreeMap::new()),
+                counters: Arc::new(CopyCounters::default()),
                 abandonment_budget: AbandonmentBudget::new(8, 64 * 1024 * 1024),
                 abandonment: Mutex::new(AbandonmentLedger::default()),
                 async_execution: false,
@@ -623,7 +634,15 @@ impl ComputeProvider for NativeMetalProvider {
             return result;
         }
         let result = objc::rc::autoreleasepool(|| {
-            execute(&mut state, trace, pipelines, token, &resolve, retains)
+            execute(
+                &mut state,
+                &self.counters,
+                trace,
+                pipelines,
+                token,
+                &resolve,
+                retains,
+            )
         });
         let observation = match &result {
             Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
@@ -780,6 +799,7 @@ type BufferResolver<'a> = dyn Fn(&BufferView) -> Result<ResolvedBuffer, Provider
 
 fn encode(
     state: &mut State,
+    counters: &CopyCounters,
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
     resolve: &BufferResolver<'_>,
@@ -873,6 +893,7 @@ fn encode(
                         if created.is_null() {
                             return Err(resource_error("metal_buffer_allocation_failed"));
                         }
+                        counters.uploads.fetch_add(1, Ordering::Relaxed);
                         shared_buffers.insert(view.allocation_id, created);
                         created
                     }
@@ -889,6 +910,7 @@ fn encode(
                 if pointer.is_null() {
                     return Err(resource_error("metal_buffer_allocation_failed"));
                 }
+                counters.uploads.fetch_add(1, Ordering::Relaxed);
                 (Buffer::from_ptr(pointer), 0)
             },
             ResolvedBuffer::Borrowed {
@@ -972,6 +994,7 @@ fn encode(
 
 fn execute(
     state: &mut State,
+    counters: &CopyCounters,
     trace: &ComputeTrace,
     pipelines: Vec<ComputePipelineState>,
     token: CompletionToken,
@@ -979,7 +1002,7 @@ fn execute(
     retains: BorrowedRetains,
 ) -> Result<ProviderSubmission, ProviderError> {
     let EncodedSubmission { mut pending, pool } =
-        encode(state, trace, pipelines, resolve, retains)?;
+        encode(state, counters, trace, pipelines, resolve, retains)?;
     pending.submitted = true;
     let resources = pending.resources.as_ref().expect("encoded resources");
     resources.command.commit();
@@ -1020,7 +1043,7 @@ fn execute(
     // Shared memory on the admitted device is now CPU visible. Only a known
     // completed command permits the guard to release its backing resources.
     pending.submitted = false;
-    let writebacks = collect_writebacks(&pool, &resources.buffers);
+    let writebacks = collect_writebacks(&pool, &resources.buffers, counters);
     let submission = ProviderSubmission {
         completion: CompletionDisposition::CompletedVisible { token },
         writebacks,
@@ -1037,10 +1060,16 @@ fn execute(
     Ok(submission)
 }
 
-fn collect_writebacks(pool: &[BufferView], buffers: &[BoundBuffer]) -> Vec<BufferWriteback> {
+fn collect_writebacks(
+    pool: &[BufferView],
+    buffers: &[BoundBuffer],
+    counters: &CopyCounters,
+) -> Vec<BufferWriteback> {
+    let mut read_buffers = BTreeSet::<usize>::new();
     let mut writebacks = Vec::new();
     for (view, bound) in pool.iter().zip(buffers) {
         if view.access.is_writable() {
+            read_buffers.insert(bound.buffer.as_ptr() as usize);
             let bytes = unsafe {
                 // Admission bounded length to 1 MiB, contents was checked
                 // before commit, and this completed buffer remains retained.
@@ -1059,11 +1088,24 @@ fn collect_writebacks(pool: &[BufferView], buffers: &[BoundBuffer]) -> Vec<Buffe
             });
         }
     }
+    counters
+        .readbacks
+        .fetch_add(read_buffers.len(), Ordering::Relaxed);
     writebacks.sort_by_key(|writeback| (writeback.allocation_id, writeback.view_id));
     writebacks
 }
 
 impl NativeMetalProvider {
+    /// Cumulative device-buffer copy-in / copy-out operations. Tests use it to
+    /// prove that several views of one allocation share one copy.
+    #[doc(hidden)]
+    pub fn buffer_copy_counts(&self) -> (usize, usize) {
+        (
+            self.counters.uploads.load(Ordering::Relaxed),
+            self.counters.readbacks.load(Ordering::Relaxed),
+        )
+    }
+
     /// Staged lease registry owned by this provider.
     pub fn lease_registry(&self) -> &LeaseRegistry {
         &self.staging
@@ -1084,7 +1126,7 @@ impl NativeMetalProvider {
         retains: BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
         let EncodedSubmission { mut pending, pool } =
-            encode(state, trace, pipelines, resolve, retains)?;
+            encode(state, &self.counters, trace, pipelines, resolve, retains)?;
         let SubmissionResources {
             _device,
             _queue,
@@ -1112,6 +1154,7 @@ impl NativeMetalProvider {
         let abandoned = Arc::clone(&self.async_abandoned);
         let device_lost = Arc::clone(&state.device_lost);
         let outbox = self.completion_outbox.clone();
+        let counters = Arc::clone(&self.counters);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -1119,7 +1162,9 @@ impl NativeMetalProvider {
             let _retain = (&_device, &_queue, &retained_pipelines, &_borrowed);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 objc::rc::autoreleasepool(|| match command.status() {
-                    MTLCommandBufferStatus::Completed => Ok(collect_writebacks(&pool, &buffers)),
+                    MTLCommandBufferStatus::Completed => {
+                        Ok(collect_writebacks(&pool, &buffers, &counters))
+                    }
                     MTLCommandBufferStatus::Error => {
                         let (detail, code) = unsafe {
                             let error: *mut Object = msg_send![command, error];

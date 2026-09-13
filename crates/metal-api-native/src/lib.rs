@@ -662,6 +662,166 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    /// Two owned views of one allocation must share one MTLBuffer: one copy in
+    /// and one copy out (`research/docs/15` §3.3). The judge is falsified by
+    /// disabling the sharing in `encode`, which reports two copy-ins.
+    #[test]
+    fn owned_views_of_one_allocation_share_one_copy() {
+        use metal_api_core::provider::{
+            AllocationId, AllocationRecord, BufferSource, BufferView, CompletionPolicy,
+            ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType, OperationId,
+            PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+        };
+
+        let Ok(provider) = NativeMetalProvider::new() else {
+            eprintln!("skipping native shared-copy test: no eligible Metal device");
+            return;
+        };
+        let provider = provider.with_async_execution(false);
+        let pipeline = provider
+            .compile(request("copy_word", COPY))
+            .expect("reviewed copy_word fixture compiles");
+        let word = 0x1122_3344_u32.to_le_bytes();
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: provider.device_epoch(),
+            operation_id: OperationId::new(1),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ViewId::new(1),
+                        metal_binding: 0,
+                        allocation_id: AllocationId::new(1),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(word.to_vec()),
+                    },
+                    BufferView {
+                        view_id: ViewId::new(2),
+                        metal_binding: 1,
+                        allocation_id: AllocationId::new(1),
+                        offset: 4,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 4]),
+                    },
+                ],
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let mut snapshot = ResourceTableSnapshot::new();
+        snapshot
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(1),
+                owner_epoch: provider.device_epoch(),
+                size: 8,
+            })
+            .unwrap();
+        let (uploads_before, readbacks_before) = provider.buffer_copy_counts();
+        let submission = provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(trace, snapshot)
+                    .unwrap(),
+            )
+            .unwrap();
+        let (uploads, readbacks) = provider.buffer_copy_counts();
+        let uploads = uploads - uploads_before;
+        let readbacks = readbacks - readbacks_before;
+        assert_eq!(
+            uploads, 1,
+            "two owned views of one allocation uploaded {uploads} images"
+        );
+        assert_eq!(
+            readbacks, 1,
+            "two owned views of one allocation were read back {readbacks} times"
+        );
+        let observed: Vec<_> = submission
+            .writebacks
+            .iter()
+            .map(|writeback| (writeback.offset, writeback.bytes.clone()))
+            .collect();
+        assert_eq!(observed, vec![(4, word.to_vec())]);
+        // The counter must respond to sharing: the same two views on two
+        // allocations still cost two uploads, so a green run above is not an
+        // artefact of the counter always reporting one.
+        let split = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: provider.device_epoch(),
+            operation_id: OperationId::new(2),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ViewId::new(3),
+                        metal_binding: 0,
+                        allocation_id: AllocationId::new(1),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(word.to_vec()),
+                    },
+                    BufferView {
+                        view_id: ViewId::new(4),
+                        metal_binding: 1,
+                        allocation_id: AllocationId::new(2),
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0; 4]),
+                    },
+                ],
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let mut split_snapshot = ResourceTableSnapshot::new();
+        for allocation in 1..=2 {
+            split_snapshot
+                .insert_allocation(AllocationRecord {
+                    allocation_id: AllocationId::new(allocation),
+                    owner_epoch: provider.device_epoch(),
+                    size: 4,
+                })
+                .unwrap();
+        }
+        let (split_before, _) = provider.buffer_copy_counts();
+        provider
+            .submit(
+                provider
+                    .capabilities()
+                    .validate_trace(split, split_snapshot)
+                    .unwrap(),
+            )
+            .unwrap();
+        let (split_after, _) = provider.buffer_copy_counts();
+        assert_eq!(
+            split_after - split_before,
+            2,
+            "two allocations must still cost two uploads"
+        );
+    }
+    #[cfg(target_os = "macos")]
     #[test]
     fn staged_lease_import_copies_and_retires_a_window() {
         use metal_api_core::provider::{
