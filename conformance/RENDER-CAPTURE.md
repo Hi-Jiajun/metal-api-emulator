@@ -212,14 +212,15 @@ refusals.
 ## 5. The one-device check
 
 `native-oracle --render-selftest` runs the same reviewed fixture and the same
-`runRenderCase` a suite would, without needing a suite. Run it from the
-repository root (the reviewed module is resolved relative to the working
-directory, and its hash is checked):
+`runRenderCase` a suite would, without needing a suite. Run it from
+`conformance/` — the reviewed module (`shaders/render_offscreen_2x2.metal`) is
+resolved relative to the working directory, exactly like a suite resolves its
+pins against the suite file's directory, and its hash is checked:
 
 ```sh
 swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal \
   -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
-/tmp/native-oracle --render-selftest
+(cd conformance && /tmp/native-oracle --render-selftest)
 ```
 
 It prints the case result as JSON and exits non-zero unless the readback matches

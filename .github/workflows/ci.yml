@@ -237,8 +237,11 @@ jobs:
           echo "render selftest: device eligible; running the reviewed 2x2 offscreen render" >> "$log"
           # stdout is the JSON report and stderr is the oracle's diagnostics; they
           # stay apart so the report remains parseable, then share one log.
+          # The self-test resolves the reviewed MSL pin (`shaders/...`) against
+          # the working directory, exactly like a suite resolves it against the
+          # suite file's directory, so it has to run from `conformance/`.
           status=0
-          /tmp/native-oracle --render-selftest \
+          (cd conformance && /tmp/native-oracle --render-selftest) \
             > /tmp/native-evidence/render-selftest.json \
             2>> "$log" || status=$?
           cat /tmp/native-evidence/render-selftest.json >> "$log"
