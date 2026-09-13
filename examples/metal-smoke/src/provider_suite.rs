@@ -9,13 +9,14 @@ use metal_api_core::completion::wire::{
     CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
 };
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
-    BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
-    ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
-    FootprintProof, HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation,
-    LeaseReservation, NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider,
-    ProviderError, ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    disposition_retires_resources, AllocationId, AllocationRecord, BorrowedLease, BufferAccess,
+    BufferLease, BufferSource, BufferView, CompletionDisposition, CompletionPolicy,
+    CompletionToken, ComputePass, ComputeProvider, ComputeTrace, ContractError, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FieldValue, FootprintProof, GuestWindow, GuestWindows,
+    HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
+    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
+    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
@@ -1708,22 +1709,27 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-/// Owner host memory imported without copying. Two submissions prove the
-/// provider reads and writes the live mapping: one mutates owner memory after
-/// import and observes the new value on the GPU, and one writes through the
-/// GPU directly into owner memory.
-/// Guest memory step 2 (`research/docs/19`): the owner registers one host
-/// address range, derives a page-aligned window from it, imports the window
-/// without copying, writes through it on the device and observes the change in
-/// place before releasing the lease. This is the owner-side lifecycle the VM
-/// line will use for guest RAM.
+/// Owner host memory imported without copying, driven end to end from the
+/// registration granularity the backend reports. Guest memory step 2
+/// (`research/docs/19`): the owner registers one host address range, derives a
+/// page-aligned window from it, imports the window without copying, writes
+/// through it on the device, observes the change in place and only then
+/// releases the lease. The same case walks the alignment matrix and the
+/// retirement chain of `research/docs/20` §3.5: illegal windows are refused by
+/// the owner type with a nameable error, and the registration cannot be
+/// reclaimed before the completion that retired the GPU work.
 fn run_host_region_window(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
     let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
     let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    // The window granularity is the backend's measured
+    // `minImportedHostPointerAlignment`, never an assumed page size: a region
+    // registered finer than the backend requires would hand a provider host
+    // memory it cannot import.
     let alignment = provider.no_copy_alignment();
     if alignment == 0 {
         return Err("provider does not advertise VK_EXT_external_memory_host".into());
     }
+    let page = alignment;
     let function = device
         .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
         .function("copy_word")?;
@@ -1734,39 +1740,92 @@ fn run_host_region_window(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
         )
         .map_err(provider_error)?;
 
-    // The "guest RAM" registration: 8 KiB of page-aligned host memory.
-    let page = alignment.max(4096);
-    let mut owner = AlignedBuffer::new(2 * usize::try_from(page)?, usize::try_from(page)?)?;
-    owner.as_mut_slice().fill(0);
+    // The "guest RAM" registration: eight pages of host memory aligned to twice
+    // the granularity the backend reports, so the same mapping can also carry
+    // the coarser registration derived below.
+    let page_bytes = usize::try_from(page)?;
+    let mut owner = AlignedBuffer::new(8 * page_bytes, 2 * page_bytes)?;
+    owner.as_mut_slice().fill(0xcd);
     let region = HostRegion {
         lease_id: LeaseId::new(120),
         owner_epoch: provider.device_epoch(),
         host_pointer: owner.as_ptr() as usize,
-        length: 2 * page,
+        length: 8 * page,
         page_size: page,
     };
     region.validate()?;
-    // A window outside the registration must be refused by the owner type
-    // before any provider sees a pointer.
-    let refused = region
-        .borrowed_window(AllocationId::new(320), 0, 3 * page)
-        .expect_err("an out-of-bounds window must be refused");
-    if !matches!(
-        refused,
-        metal_api_core::provider::ContractError::HostRegionWindowOutOfBounds { .. }
-    ) {
-        return Err(format!("out-of-bounds window refused with {refused:?}").into());
+
+    // Three illegal windows must each be refused by the owner type, with the
+    // failing field and the granularity still visible, before any provider sees
+    // a pointer.
+    let refusals = [
+        (
+            "unaligned_offset",
+            borrowed_window_refusal(&region, 320, 1, page)?,
+        ),
+        (
+            "unaligned_length",
+            borrowed_window_refusal(&region, 320, page, page + 1)?,
+        ),
+        (
+            "out_of_bounds",
+            borrowed_window_refusal(&region, 320, page, 8 * page)?,
+        ),
+    ];
+    for (expected, refusal) in &refusals {
+        if !refusal.starts_with(expected) {
+            return Err(format!("window refusal {expected} arrived as {refusal}").into());
+        }
+    }
+    let refusal_detail = refusals
+        .iter()
+        .map(|(_, refusal)| refusal.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    // The registration's own granularity is what gates a window: the same range
+    // registered at twice the measured granularity refuses an offset that is
+    // page-aligned but not registration-aligned, and still accepts one that is.
+    // Without this the case would keep passing on a backend that happens to
+    // report 4096 no matter which page size the owner really used.
+    let coarse = HostRegion {
+        page_size: 2 * page,
+        ..region
+    };
+    coarse.validate()?;
+    let coarse_refusal = borrowed_window_refusal(&coarse, 320, page, 2 * page)?;
+    if !coarse_refusal.starts_with("unaligned_offset") {
+        return Err(
+            format!("coarser registration accepted a finer offset: {coarse_refusal}").into(),
+        );
+    }
+    let coarse_pointer = coarse
+        .borrowed_window(AllocationId::new(320), 2 * page, 2 * page)?
+        .host_pointer;
+    if coarse_pointer != owner.as_ptr() as usize + 2 * page_bytes {
+        return Err("registration-aligned window does not name the registration base".into());
     }
 
-    let word = 0xfeed_face_u32;
-    let second_page = usize::try_from(page)?;
-    owner.as_mut_slice()[second_page..second_page + 4].copy_from_slice(&word.to_le_bytes());
-    // The lease window names the whole registered range (a provider slices one
-    // backing per allocation), and the payload lives in the second page.
-    let borrowed = region.borrowed_window(AllocationId::new(320), 0, 2 * page)?;
-    if borrowed.host_pointer != owner.as_ptr() as usize {
-        return Err("window pointer does not name the registration base".into());
+    // One lease window inside the registration, at an offset that is not the
+    // registration base. The owner registers the window before its lease is
+    // imported and reclaims it only after the completion retires the GPU work.
+    let window_offset = 3 * page;
+    let window_length = 2 * page;
+    let borrowed = region.borrowed_window(AllocationId::new(320), window_offset, window_length)?;
+    if borrowed.host_pointer != owner.as_ptr() as usize + usize::try_from(window_offset)? {
+        return Err("window pointer does not name the registration offset".into());
     }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(borrowed.reservation)?;
+    let mut windows = GuestWindows::new();
+    let window = GuestWindow {
+        lease: region.lease_id,
+        allocation_id: AllocationId::new(320),
+        offset: window_offset,
+        length: window_length,
+    };
+    windows.register(window)?;
+
     // SAFETY: `owner` outlives the import and the submission below, and the
     // window was validated against the registration above.
     unsafe {
@@ -1775,46 +1834,166 @@ fn run_host_region_window(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
             .map_err(provider_error)?;
     }
 
+    let word = 0xfeed_face_u32;
     let trace = borrowed_lease_trace_for(
         provider.device_epoch(),
         &pipeline,
         region.lease_id,
+        window_offset,
         BufferAccess::Write,
         BufferSource::OwnedBytes(word.to_le_bytes().to_vec()),
         401,
         402,
         320,
     );
-    let resources =
-        borrowed_lease_resources_for(provider.device_epoch(), borrowed.reservation, 320, 2 * page)?;
+    // The lease reservation is region-relative (`HostRegion::borrowed_window`
+    // derives `host_pointer + offset`), so the allocation the resource table
+    // describes is the whole registration, not the window inside it.
+    let resources = borrowed_lease_resources_for(
+        provider.device_epoch(),
+        borrowed.reservation,
+        320,
+        region.length,
+    )?;
     let admitted = provider
         .capabilities()
         .validate_trace(trace.clone(), resources)
         .map_err(provider_error)?;
     let result = provider.submit(admitted).map_err(provider_error)?;
     result.validate_for_trace(&trace)?;
-    if !matches!(
-        result.completion,
-        CompletionDisposition::CompletedVisible { .. }
-    ) {
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
         return Err(format!(
             "host region window submission did not complete: {:?}",
             result.completion
         )
         .into());
-    }
-    let observed = &owner.as_slice()[second_page..second_page + 4];
+    };
+
+    // The device wrote into the owner mapping itself: the window's first word
+    // carries the GPU value and no byte outside the window moved.
+    let start = usize::try_from(window_offset)?;
+    let end = start + usize::try_from(window_length)?;
+    let observed = &owner.as_slice()[start..start + 4];
     if observed != word.to_le_bytes() {
         return Err(format!("guest window was not written in place: {observed:02x?}").into());
+    }
+    let untouched = owner.as_slice()[..start].iter().all(|byte| *byte == 0xcd)
+        && owner.as_slice()[end..].iter().all(|byte| *byte == 0xcd);
+    if !untouched {
+        return Err("device writeback escaped the registered window".into());
+    }
+
+    // Retirement chain (`research/docs/20` §3.4): the completion is the
+    // evidence, not the submission. Until the owner observes it the window is
+    // active, so reclaim is refused and the backing is not releasable.
+    ledger.bind(region.lease_id, token)?;
+    if ledger.release_ready(region.lease_id) {
+        return Err("lease became releasable before its token retired".into());
+    }
+    if windows.is_reclaimable(region.lease_id) {
+        return Err("active window already reports reclaimable".into());
+    }
+    let active_refusal = reclaim_refusal(&mut windows, region.lease_id)?;
+    if active_refusal != "guest_window_still_active" {
+        return Err(format!("active window reclaim refused with {active_refusal}").into());
+    }
+    if !disposition_retires_resources(result.completion) {
+        return Err(format!(
+            "completion {:?} is not retirement evidence",
+            result.completion
+        )
+        .into());
+    }
+    if ledger.observe(token, result.completion)? != LeaseObservation::Retired {
+        return Err("observing the completion did not retire the lease".into());
+    }
+    windows.retire(region.lease_id)?;
+    if !windows.is_reclaimable(region.lease_id) {
+        return Err("retired window is not reclaimable".into());
+    }
+    let reclaimed = windows.reclaim(region.lease_id)?;
+    if reclaimed != window {
+        return Err(format!("reclaim returned {reclaimed:?} instead of {window:?}").into());
+    }
+    if !ledger.release_ready(region.lease_id) {
+        return Err("retired lease is still held by a token".into());
+    }
+    if !windows.is_empty() {
+        return Err("reclaimed window is still registered".into());
     }
     provider
         .release_borrowed_lease(region.lease_id)
         .map_err(provider_error)?;
 
     println!(
-        "PASS provider_host_region_window page={page} window=1 import=no-copy write=in-place release=ok"
+        "PASS provider_host_region_window page_size={page} page_source=backend_measured \
+         window_offset={window_offset} window_length={window_length} \
+         refusals=unaligned_offset|unaligned_length|out_of_bounds|granularity \
+         refusal_detail=[{refusal_detail}] import=no-copy write=in-place \
+         granularity_gate=[{coarse_refusal}] outside_window=untouched release=ok"
+    );
+    println!(
+        "PASS provider_guest_window_reclaim lease={} retired=false reclaimable=false \
+         refusal={active_refusal} outstanding=1 release_ready=false",
+        region.lease_id.get()
+    );
+    println!(
+        "PASS provider_guest_window_reclaim lease={} retired=true reclaimable=true \
+         reclaimed=true release_ready=true release=ok",
+        region.lease_id.get()
     );
     Ok(())
+}
+
+/// Derive one window that must be refused, and report the refusal as a
+/// nameable kind. A refused window must not produce a lease at all.
+fn borrowed_window_refusal(
+    region: &HostRegion,
+    allocation_id: u64,
+    offset: u64,
+    length: u64,
+) -> Result<String, Box<dyn Error>> {
+    match region.borrowed_window(AllocationId::new(allocation_id), offset, length) {
+        Ok(borrowed) => Err(format!(
+            "window offset={offset} length={length} must be refused, derived {borrowed:?}"
+        )
+        .into()),
+        Err(error) => Ok(host_region_refusal_kind(&error)),
+    }
+}
+
+/// The identifiable kind of an owner-side window refusal. `research/docs/20`
+/// §3.5 maps these contract errors to the `host_region_invalid` provider slug,
+/// so the failing field and the granularity must survive into the message
+/// instead of collapsing into one opaque failure.
+fn host_region_refusal_kind(error: &ContractError) -> String {
+    use ContractError as E;
+    match error {
+        E::UnalignedHostRegion {
+            field,
+            value,
+            page_size,
+        } => format!("unaligned_{field} value={value} page_size={page_size}"),
+        E::HostRegionWindowOutOfBounds { end, region_length } => {
+            format!("out_of_bounds end={end} region_length={region_length}")
+        }
+        E::InvalidHostRegionPageSize(page_size) => {
+            format!("invalid_page_size value={page_size}")
+        }
+        other => format!("unexpected {other}"),
+    }
+}
+
+/// Reclaim one window that must still be active, reported with the slug the
+/// provider layer uses for the same contract error.
+fn reclaim_refusal(windows: &mut GuestWindows, lease: LeaseId) -> Result<String, Box<dyn Error>> {
+    match windows.reclaim(lease) {
+        Ok(window) => Err(format!("active window {window:?} was reclaimed").into()),
+        Err(ContractError::GuestWindowStillActive(_)) => {
+            Ok("guest_window_still_active".to_string())
+        }
+        Err(other) => Ok(format!("unexpected {other}")),
+    }
 }
 
 fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
@@ -2937,6 +3116,9 @@ fn borrowed_lease_trace(
         epoch,
         pipeline,
         lease_id,
+        // The default fixture borrows a window that starts at the allocation
+        // base, so its views carry the allocation's own offsets.
+        0,
         lease_access,
         owned,
         lease_view_id,
@@ -2950,6 +3132,7 @@ fn borrowed_lease_trace_for(
     epoch: DeviceEpoch,
     pipeline: &CompiledComputePipeline,
     lease_id: LeaseId,
+    lease_offset: u64,
     lease_access: BufferAccess,
     owned: BufferSource,
     lease_view_id: u64,
@@ -2965,7 +3148,10 @@ fn borrowed_lease_trace_for(
         view_id: ViewId::new(lease_view_id),
         metal_binding,
         allocation_id: AllocationId::new(lease_allocation),
-        offset: 0,
+        // Views are allocation-relative, so a window that starts inside the
+        // registration names its own offset here; the reservation bounds
+        // admission check against it (`LeaseRangeOutOfBounds`).
+        offset: lease_offset,
         length: 4,
         access: lease_access,
         attribute_stride: None,
