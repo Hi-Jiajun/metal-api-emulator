@@ -1420,6 +1420,13 @@ fn validate_pipeline_identity(
 /// executed in an order the bytes would not reflect — core admission already
 /// refuses the write/write half of the pair with
 /// `AttachmentComputeConflict`.
+///
+/// Core admission owns both halves now (`ContractError::
+/// RenderPassOrderUnsupported`, slug `render_pass_order_unsupported`, review
+/// item I4, 2026-09-14), and every submitted trace reached it through
+/// `ProviderCapabilities::admit`. This walk stays as the rail's own defense for
+/// a value-level plan: it compares view identities, so it is at least as strict
+/// as the contract's byte ranges and never admits a trace the contract refused.
 fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderError> {
     let mut render_written = BTreeMap::<ViewId, usize>::new();
     for (index, entry) in trace.passes.iter().enumerate() {

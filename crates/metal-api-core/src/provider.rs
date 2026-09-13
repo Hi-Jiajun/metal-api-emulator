@@ -2865,10 +2865,17 @@ impl DeclaredView {
     /// render sharing bytes: a render pass stores its attachment into the
     /// referenced view, and a compute pass writing the same view leaves the two
     /// writers' order inexpressible in the trace, so the trace is refused
-    /// rather than executed in an arbitrary order. A compute pass that only
-    /// *reads* the view stays admissible: serial order gives it the bytes as
-    /// they were before the render pass stored
-    /// (`research/docs/23` §3.6).
+    /// rather than executed in an arbitrary order.
+    ///
+    /// A compute pass that only *reads* the view stays admissible, and the
+    /// reason is the contract rather than an assumption: this increment fixes
+    /// the execution order at "every compute pass, then every render pass", so a
+    /// read *before* the store gets the bytes as they were and a read *after* it
+    /// would not. The second shape is refused as
+    /// [`ContractError::RenderPassOrderUnsupported`] instead of being silently
+    /// reordered, which is what lets a provider execute the grouped order
+    /// without changing what the trace means (review item I4, 2026-09-14;
+    /// `research/docs/23` §3.6).
     const fn is_writable(self) -> bool {
         match self {
             Self::Buffer { access, .. } => access.is_writable(),
@@ -3109,9 +3116,13 @@ impl ComputeTrace {
     /// Render entries join the same walk (`research/docs/23` §3.6). Each
     /// attachment is resolved against the views the trace declares, its
     /// restated extent has to agree with the declaration it resolves to, and it
-    /// must not race a compute pass that writes the same view. Attachments are
-    /// pooled by view identity, so the budget that bounds one serial submission
-    /// covers them; a compute-only trace takes the pre-render path unchanged.
+    /// must not race a compute pass that writes overlapping bytes of the same
+    /// allocation. The trace's own order is part of that admission: because the
+    /// increment executes every compute pass before every render pass, a compute
+    /// pass that follows the store and binds the same bytes is refused too.
+    /// Attachments are pooled by view identity, so the budget that bounds one
+    /// serial submission covers them; a compute-only trace takes the pre-render
+    /// path unchanged.
     pub fn validate_serial_buffer_reuse(&self) -> Result<(), ContractError> {
         self.validate()?;
         if self.passes.len() > 1 && self.encoder_dispatch_type != DispatchType::Serial {
@@ -3230,6 +3241,30 @@ impl ComputeTrace {
                             view: attachment.view_id,
                             compute_view: *compute_view,
                             compute_pass: other.pass_index(),
+                        });
+                    }
+                }
+            }
+            // The read half of the same question, answered by the contract's own
+            // execution order: every compute pass runs before every render pass,
+            // so a compute pass *after* this render pass that binds overlapping
+            // bytes would see bytes the trace's order does not give it. Writes
+            // are already refused above, whichever side of the render pass they
+            // are on.
+            for (compute_view, others) in &declared {
+                for other in others {
+                    if other.pass_index() <= pass_index {
+                        continue;
+                    }
+                    if ranges
+                        .iter()
+                        .any(|range| range.overlaps(&other.byte_range()))
+                    {
+                        return Err(ContractError::RenderPassOrderUnsupported {
+                            pass_index,
+                            compute_pass: other.pass_index(),
+                            view: attachment.view_id,
+                            compute_view: *compute_view,
                         });
                     }
                 }
@@ -4231,6 +4266,13 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::AttachmentComputeConflict { .. } => {
             (ProviderErrorClass::Args, "attachment_resource_conflict")
         }
+        // The trace is well formed; the shape is one this increment's fixed
+        // compute-then-render execution order cannot honour, which is the same
+        // class the provider walk reported before core owned the rule
+        // (review item I4, 2026-09-14).
+        E::RenderPassOrderUnsupported { .. } => {
+            (ProviderErrorClass::Capability, "render_pass_order_unsupported")
+        }
         E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
@@ -5206,6 +5248,25 @@ pub enum ContractError {
         compute_view: ViewId,
         compute_pass: usize,
     },
+    /// A compute pass that follows a render pass binds bytes that render pass
+    /// stored.
+    ///
+    /// The first increment executes every compute pass before every render pass,
+    /// so this is the one shape whose meaning the execution order would change:
+    /// the trace's own order defines post-render bytes for the later compute
+    /// pass, and the grouped order would hand it pre-render ones
+    /// (review item I4, 2026-09-14). Refusing it is what makes a trace mean one
+    /// thing on every provider instead of leaving the rule to each of them.
+    RenderPassOrderUnsupported {
+        /// The render pass whose store the later compute pass overlaps.
+        pass_index: usize,
+        /// The compute pass that follows it.
+        compute_pass: usize,
+        /// The attachment the render pass stores into.
+        view: ViewId,
+        /// The view the later compute pass binds.
+        compute_view: ViewId,
+    },
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -5505,6 +5566,15 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "render pass {pass_index} attachment view {view:?} shares bytes with compute pass {compute_pass}, which writes view {compute_view:?}"
+            ),
+            Self::RenderPassOrderUnsupported {
+                pass_index,
+                compute_pass,
+                view,
+                compute_view,
+            } => write!(
+                formatter,
+                "render pass {pass_index} stores attachment view {view:?}, and compute pass {compute_pass} follows it while binding view {compute_view:?}: this increment runs every compute pass before every render pass, so the later read would see pre-render bytes"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -10581,6 +10651,50 @@ mod tests {
         // them; what this assertion is about is the byte ranges, not aliasing.
         render.alias_mode = AliasMode::DistinctViews;
         render.admit(&allowed, &resources).unwrap();
+    }
+
+    #[test]
+    fn the_contract_fixes_compute_before_render() {
+        // The increment executes every compute pass before every render pass, so
+        // a compute pass that *follows* a render store of bytes it binds would
+        // observe pre-render bytes where the trace's own order defines
+        // post-render ones. That order is now part of the contract core
+        // admission enforces, rather than an assumption only a provider walk
+        // states (review item I4, 2026-09-14).
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        value
+            .passes
+            .push(TracePass::Compute(pass(4, vec![landing_view(7, 9)])));
+        let expected = ContractError::RenderPassOrderUnsupported {
+            pass_index: 1,
+            compute_pass: 2,
+            view: ViewId::new(7),
+            compute_view: ViewId::new(7),
+        };
+        assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.phase, ProviderPhase::Resolve);
+        assert_eq!(refusal.slug, "render_pass_order_unsupported");
+
+        // The legal direction is the one the milestone case uses: the compute pass
+        // that reads the attachment's bytes comes *before* the render store, so
+        // serial order gives it the bytes the trace asked for.
+        let legal = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        legal.validate_serial_buffer_reuse().unwrap();
+
+        // A compute pass whose bytes merely neighbour the attachment's range is
+        // not reordered work: the same byte-range rule that governs the
+        // write/write pair governs the read half too.
+        let mut neighbour = landing_view(8, 9);
+        neighbour.offset = 16;
+        neighbour.length = 8;
+        neighbour.source = BufferSource::OwnedBytes(vec![0; 8]);
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        value
+            .passes
+            .push(TracePass::Compute(pass(4, vec![neighbour])));
+        value.validate_serial_buffer_reuse().unwrap();
     }
 
     #[test]

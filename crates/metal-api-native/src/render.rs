@@ -426,6 +426,13 @@ pub(crate) fn admit_trace_load(load: LoadOp) -> Result<(), ProviderError> {
 /// write/write half of the pair (`AttachmentComputeConflict`,
 /// `attachment_resource_conflict`); this is the read half, refused rather than
 /// executed in an order the bytes would not reflect.
+///
+/// Core admission owns both halves now (`ContractError::
+/// RenderPassOrderUnsupported`, slug `render_pass_order_unsupported`, review
+/// item I4, 2026-09-14), and every submitted trace reached it through
+/// `ProviderCapabilities::admit`. This walk stays as the rail's own defense for
+/// a value-level plan: it compares view identities, so it is at least as strict
+/// as the contract's byte ranges and never admits a trace the contract refused.
 pub(crate) fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderError> {
     let mut render_written = BTreeMap::<ViewId, usize>::new();
     for (index, entry) in trace.passes.iter().enumerate() {
@@ -578,8 +585,9 @@ impl TraceRenderPlan<'_> {
 ///
 /// Four decisions have to be made before the first Metal object exists, and all
 /// four are answerable from values: the order the rails run in
-/// ([`refuse_reordered_render_reads`]), the reviewed allowlist, the attachment's
-/// landing view, and the load op the trace can carry
+/// ([`refuse_reordered_render_reads`], whose rule core admission also states as
+/// part of the contract), the reviewed allowlist, the attachment's landing view,
+/// and the load op the trace can carry
 /// ([`admit_trace_load`]). `pool` is [`ComputeTrace::serial_resources`], the same
 /// pool the encoder binds, and `contracts` holds the render contracts the
 /// provider registered for the pipeline ids this trace names — a caller-supplied
@@ -1447,12 +1455,21 @@ mod tests {
     /// The ordering rule the trace path shares with the Vulkan rail: every
     /// compute pass runs before every render pass, so a compute pass that
     /// follows a render store of a view it binds would read pre-render bytes.
+    ///
+    /// Core admission states that order as part of the contract (review item
+    /// I4, 2026-09-14), so the first half observes the refusal from
+    /// `serial_resources` — the value-level entry point that runs admission —
+    /// and the second half keeps the rail's own walk covered as defense in
+    /// depth for a plan that never went through admission.
     #[test]
     fn plan_trace_refuses_a_compute_pass_that_reads_after_a_render_store() {
         let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
         trace.passes.push(TracePass::Compute(declaration_pass()));
-        let pool = trace.serial_resources().expect("admitted serial pool");
-        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert!(matches!(
+            trace.serial_resources(),
+            Err(ContractError::RenderPassOrderUnsupported { .. })
+        ));
+        let error = refuse_reordered_render_reads(&trace).unwrap_err();
         assert_eq!(error.slug, "render_pass_order_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
