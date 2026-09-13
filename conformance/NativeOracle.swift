@@ -1213,7 +1213,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
     let pass = MTLRenderPassDescriptor()
-    let color = pass.colorAttachments[0]
+    // `colorAttachments[0]` is an implicitly unwrapped optional on the Swift
+    // side of Metal, but referencing a member before unwrapping is a compile
+    // error under `-warnings-as-errors`; unwrap it once, explicitly.
+    guard let color = pass.colorAttachments[0] else {
+        throw OracleError("\(definition.id): cannot reach the colour attachment descriptor")
+    }
     color.texture = target
     color.storeAction = .store
     if attachment.load == "clear" {
