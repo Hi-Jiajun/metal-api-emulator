@@ -6,15 +6,15 @@ render case looks like, what a render capture reports, and which rails report
 one today. `conformance/suite-v13.json` is the first committed suite that
 declares render cases, `conformance/compare.py` has the matching attachment
 section, and the case is named by every rail that owns a render execution path:
-the Vulkan trace rail, the native provider's trace rail and the Swift oracle's
-suite path. One thing is still **pending**: the two object-API rails have no
-render command encoder, so they run a render-bearing suite and report its
-declaring pass only. The one-device check is no longer pending — `--render-selftest`
-in §5 ran on an Apple Paravirtual device in CI run `34774478149` and read the
-attachment back as `4080c0ff` four times — so the native provider declares
-render support and its trace rail plans, encodes and reports the same reviewed
-fixture. What no Apple GPU has run yet is the Rust provider's own encoder path
-and the oracle's suite path; CI now asks both for it (§6).
+the Vulkan trace rail, the Vulkan object rail, the native provider's trace rail
+and the Swift oracle's suite path. One rail is still **pending**: the native
+object API has no render command encoder, so it runs a render-bearing suite and
+reports its declaring pass only. The one-device check ran on an Apple
+Paravirtual device in CI run `34774478149` (`--render-selftest`, §5), and both
+Apple-side suite captures have since run too: the oracle and the Rust provider
+each read `4080c0ff` four times back for v13 (run `34781060564`) and v14
+(run `34782615760`), and the Rust provider's own encoder path is what those
+captures exercise (§6).
 
 The design it implements is `research/docs/23` §1.2 (the milestone), §3 (the
 contract), §5.1 (what the oracle needs) and §6 Steps 6–7 (where it lands).
@@ -331,9 +331,10 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   marker that names an object-API rail, which has no render command encoder;
 * that `suite-v13.json`'s attachment section is the reviewed shape, that the
   capture pins the reviewed SPIR-V stage pair and entries, that every rail the
-  marker names reports the attachment while the object-API rails omit it, and
-  that a tampered attachment byte, a dropped texel, a buffer writeback standing
-  in for the attachment (in either direction) and a wrong copy count are all
+  marker names reports the attachment while the native object rail omits it,
+  and that a tampered attachment byte, a dropped texel, a buffer writeback
+  standing in for the attachment (in either direction) and a wrong copy count
+  are all
   refused (`conformance/test_suite_v13.py`, run by `python3 -m unittest
   discover -s conformance`);
 * that the render case actually executes on Lavapipe: `provider-capture --suite
