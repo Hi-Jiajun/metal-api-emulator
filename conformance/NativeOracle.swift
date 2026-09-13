@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v10 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v12 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
