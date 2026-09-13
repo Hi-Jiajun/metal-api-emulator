@@ -135,7 +135,11 @@ impl NativeMetalProvider {
                 max_storage_buffer_descriptors: 31,
                 max_buffer_range: device.max_buffer_length().min(1024 * 1024),
                 max_push_constant_bytes: 0,
-                alias_mode: AliasMode::Refused,
+                // Same ranged-aliasing argument as the Vulkan provider: each
+                // admitted view is copied into its own MTLBuffer that starts
+                // at the view, so disjoint views of one allocation never share
+                // device bytes, and admission refuses overlapping ranges.
+                alias_mode: AliasMode::DistinctViews,
                 storage_modes: vec![
                     StorageMode::OwnedBytes,
                     StorageMode::StagedLease,

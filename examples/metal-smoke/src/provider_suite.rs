@@ -19,7 +19,7 @@ use metal_api_core::provider::{
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
-use metal_api_core::{Device, Library};
+use metal_api_core::{ApiError, Device, Library};
 use metal_api_ipc::command::{serve_provider_named, tcp as command_tcp, RemoteProvider};
 #[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix};
@@ -126,6 +126,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
     run_object_queue_ordering()?;
+    run_object_disjoint_views()?;
     run_object_parallel_commands()?;
     run_object_serial_dependency()?;
     run_object_concurrent_enqueue()?;
@@ -1951,6 +1952,85 @@ fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
+    );
+    Ok(())
+}
+
+/// One allocation carrying two disjoint views. This is the real-provider
+/// proof for ranged aliasing: the Vulkan provider must admit both views,
+/// execute the copy across them, and land the writeback at the destination
+/// view's own allocation offset. An overlapping pair keeps the refusal.
+/// Disjoint ranges cannot exchange data through one allocation because each
+/// view's footprint proof bounds its accesses inside its own half-open range.
+fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_disjoint_views".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile disjoint-view fixture: {error:?}"))?;
+    let word = 0x6745_2301_u32.to_le_bytes();
+    let shared = device.new_buffer_with_bytes([word.as_slice(), &[0_u8; 4]].concat())?;
+    let source = shared.view(0, 4)?;
+    let destination = shared.view(4, 4)?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source)?;
+        encoder.set_buffer(1, &destination)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    command.commit()?;
+    command.wait_until_completed()?;
+    let observed = shared.read()?;
+    if observed[..4] != word {
+        return Err("disjoint views: the source range was not preserved".into());
+    }
+    if observed[4..] != word {
+        return Err(format!(
+            "disjoint views: destination range holds {:02x?}, expected {word:02x?}",
+            &observed[4..]
+        )
+        .into());
+    }
+    // A pair whose allocation ranges overlap must still be refused.
+    let overlapping = device.new_buffer_with_bytes(vec![0_u8; 8])?;
+    let low = overlapping.view(0, 4)?;
+    let high = overlapping.view(2, 4)?;
+    let refused = {
+        let command = queue.command_buffer();
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &low)?;
+        encoder.set_buffer(1, &high)
+    };
+    match refused {
+        Err(metal_api_core::provider_api::Error::Api(ApiError::AliasedBufferBindings {
+            ..
+        })) => {}
+        Err(other) => {
+            return Err(format!("overlapping views refused with unexpected error {other:?}").into())
+        }
+        Ok(()) => return Err("overlapping views of one allocation were admitted".into()),
+    }
+    println!(
+        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused"
     );
     Ok(())
 }

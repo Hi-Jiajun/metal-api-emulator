@@ -9,9 +9,9 @@ use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    allocate_device_epoch, BufferSource, BufferView, BufferWriteback, CompletionDisposition,
-    CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch, FieldValue,
-    FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
+    allocate_device_epoch, AliasMode, BufferSource, BufferView, BufferWriteback,
+    CompletionDisposition, CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch,
+    FieldValue, FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
     ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, ValidatedComputeTrace,
@@ -131,6 +131,15 @@ impl VulkanComputeProvider {
         let epoch = allocate_device_epoch()?;
         let mut capabilities = executor.provider_capabilities();
         capabilities.max_passes = 8;
+        // Ranged aliasing is admitted: every pool entry owns its own device
+        // buffer, so two disjoint views of one allocation never share GPU
+        // bytes. A pass binding one view cannot observe another view's writes
+        // because each view's footprint proof bounds its accesses inside its
+        // own half-open range, and admission rejects overlapping ranges
+        // outright. Writeback stays byte-exact per view (the offset is
+        // re-based onto the allocation), and the reserved allocation is still
+        // exclusive for the commit-to-completion window.
+        capabilities.alias_mode = AliasMode::DistinctViews;
         if !capabilities
             .storage_modes
             .contains(&StorageMode::StagedLease)
