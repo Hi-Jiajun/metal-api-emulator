@@ -1158,6 +1158,8 @@ impl CommandBuffer {
             encoder_dispatch_type: DispatchType::Serial,
             passes: trace_passes,
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let admitted = owner
             .capabilities

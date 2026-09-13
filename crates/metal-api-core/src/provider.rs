@@ -2034,6 +2034,19 @@ pub struct ComputeTrace {
     /// layout, so this field is the single source of pass order.
     pub passes: Vec<TracePass>,
     pub completion_policy: CompletionPolicy,
+    /// Optional heap payload (`research/docs/25-heaps与ICB设计.md` §4.2): the
+    /// heap this trace places resources in plus its placements. `None` keeps
+    /// the pre-heap trace bytes exactly, and a heap-bearing trace is refused
+    /// during admission by any snapshot without heap bits (`docs/25` §4.5).
+    /// Boxed so the common heap-less trace does not grow the in-flight
+    /// submission state past the enum-variant size lint.
+    pub heap: Option<Box<HeapPayload>>,
+    /// Optional indirect-command payload (`research/docs/25` §4.3): the ICB
+    /// this trace encodes into and the single command it replays. `None` keeps
+    /// the pre-ICB trace bytes exactly, and an ICB-bearing trace is refused
+    /// during admission by any snapshot without ICB bits (`docs/25` §4.5).
+    /// Boxed for the same in-flight-size reason as [`ComputeTrace::heap`].
+    pub indirect: Option<Box<IndirectCommandPayload>>,
 }
 
 /// A trace and resource snapshot that have passed all structural, capability,
@@ -3186,6 +3199,8 @@ pub fn trace_from_trusted_snapshot(
             textures: Vec::new(),
         })],
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     };
     trace.validate()?;
     Ok(trace)
@@ -3467,6 +3482,16 @@ impl ComputeTrace {
         self.present_actions().next().is_some()
     }
 
+    /// Whether this trace carries a heap or an indirect-command payload.
+    ///
+    /// This is the discriminator the `MCC1` encoder reads to choose the
+    /// `SUBMIT_HEAP_ICB_REQUEST` tag and to append the tagged heap/ICB tail
+    /// after the completion policy (`docs/25` §4.5). A trace with neither
+    /// payload keeps its previous tag and bytes.
+    pub fn has_heap_or_icb(&self) -> bool {
+        self.heap.is_some() || self.indirect.is_some()
+    }
+
     /// Look up metadata without recursively validating the trace. Providers
     /// must still check this caller-supplied metadata against their registry.
     pub fn pipeline(&self, id: PipelineId) -> Result<&CompiledComputePipeline, ContractError> {
@@ -3545,6 +3570,16 @@ impl ComputeTrace {
             if !was_used {
                 return Err(ContractError::UnusedPipeline(pipeline));
             }
+        }
+        // The heap and ICB payloads carry their own structural rules, which
+        // Step 1 already published on the value types. Running them here keeps
+        // a heap/ICB-bearing trace from reaching admission through a weaker
+        // gate than the one those types expose (`docs/25` §4.5).
+        if let Some(heap) = &self.heap {
+            heap.validate()?;
+        }
+        if let Some(indirect) = &self.indirect {
+            indirect.validate()?;
         }
         Ok(())
     }
@@ -4302,20 +4337,24 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     /// Whether any extended bit differs from its default. `MCC1` uses this to
     /// keep a compute-only, non-presenting provider's capability frame at its
-    /// exact legacy bytes and to carry the render and present bits only when
-    /// they exist (`docs/24` §4.2).
+    /// exact legacy bytes and to carry the render, present, heap and ICB bits
+    /// only when they exist (`docs/24` §4.2, `docs/25` §4.5).
     ///
-    /// The present bits are part of the same question on purpose: a snapshot
-    /// that declared presentation without declaring render would otherwise keep
-    /// sending the legacy payload, and its present bits would be lost on the
-    /// wire — the exact "declared a bit that travels as the old bytes" failure
-    /// `docs/24` §4.2 calls out.
+    /// The present, heap and ICB bits are part of the same question on
+    /// purpose: a snapshot that declared one of them without declaring render
+    /// would otherwise keep sending the legacy payload, and its bits would be
+    /// lost on the wire — the exact "declared a bit that travels as the old
+    /// bytes" failure `docs/24` §4.2 calls out. They all travel in the same
+    /// `RENDER_CAPABILITIES_RESPONSE` extended payload, so this one predicate
+    /// gates the whole tail.
     pub fn declares_render_support(&self) -> bool {
         self.supports_render_passes
             || self.max_color_attachments != 0
             || self.max_attachment_dimension != [0, 0]
             || !self.supported_color_formats.is_empty()
             || self.declares_presentation_support()
+            || self.declares_heap_support()
+            || self.declares_icb_support()
     }
 
     /// Whether any present bit differs from its default.
@@ -4391,6 +4430,17 @@ impl ProviderCapabilities {
         // refuses a present-bearing trace before any resource action instead of
         // running its render half and dropping the present.
         self.admit_present_actions(trace)?;
+
+        // Heap and indirect-command admission are the third and fourth gates
+        // and sit just as early (`research/docs/25-heaps与ICB设计.md` §4.5):
+        // a snapshot without heap or ICB bits refuses a heap/ICB-bearing trace
+        // before any resource action, instead of silently dropping the payload
+        // it cannot execute. The provider-side alignment and inherited-pipeline
+        // questions are answered by Step 3/4 execution, so the neutral gate
+        // leaves them open here and refuses only the capability and structural
+        // halves.
+        self.admit_heap_payload(trace)?;
+        self.admit_indirect_payload(trace)?;
 
         if trace.passes.len() > self.max_passes as usize {
             return Err(capability_error("pass_count_limit")
@@ -4740,6 +4790,38 @@ impl ProviderCapabilities {
             }
         }
         Ok(())
+    }
+
+    /// Heap-payload admission, wired into [`ProviderCapabilities::admit`]
+    /// (`research/docs/25-heaps与ICB设计.md` §4.5, Step 2).
+    ///
+    /// This is the neutral gate a trace passes through during admission. It
+    /// refuses the capability and structural halves a snapshot can answer on
+    /// its own; the provider-side alignment half is Step 3's job, because the
+    /// device's `VkMemoryRequirements.alignment` is not part of the neutral
+    /// contract (`docs/25` §4.2). An alignment of `1` therefore means "core
+    /// does not enforce alignment here" rather than a real device value.
+    fn admit_heap_payload(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        let Some(heap) = &trace.heap else {
+            return Ok(());
+        };
+        self.admit_heap_placements(&heap.descriptor, &heap.placements, 1)
+    }
+
+    /// Indirect-command-payload admission, wired into
+    /// [`ProviderCapabilities::admit`] (`research/docs/25-heaps与ICB设计.md`
+    /// §4.5, Step 2).
+    ///
+    /// Like the heap gate, this refuses the capability and structural halves a
+    /// snapshot can answer on its own. The inherited-pipeline question is
+    /// Step 4's job, because no execution exists yet to bind the pipeline the
+    /// replayed command inherits (`docs/25` §4.3); passing `true` here means
+    /// "core does not refuse missing inheritance at the describe-only step".
+    fn admit_indirect_payload(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        let Some(indirect) = &trace.indirect else {
+            return Ok(());
+        };
+        self.admit_indirect_command(&indirect.buffer, &indirect.command, &indirect.range, true)
     }
 
     /// Heap admission gate (`research/docs/25` §4.5).
@@ -5581,6 +5663,63 @@ impl IndirectCommandBufferDescriptor {
             });
         }
         Ok(())
+    }
+}
+
+/// A heap and the resources placed inside it, carried as an optional
+/// [`ComputeTrace`] payload (`research/docs/25-heaps与ICB设计.md` §4.2).
+///
+/// The descriptor and placements are kept together because a placement is only
+/// meaningful against the heap it claims to live in: a trace that carries
+/// placements without their heap, or a heap without its placements, describes
+/// nothing a provider can bind. `None` on [`ComputeTrace::heap`] keeps the
+/// pre-heap trace bytes exactly, the same additive rule the present action used
+/// (`docs/24` §4.3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeapPayload {
+    /// The heap the placements below claim to live in.
+    pub descriptor: HeapDescriptor,
+    /// Resources placed inside `descriptor`, in trace order.
+    pub placements: Vec<HeapPlacement>,
+}
+
+impl HeapPayload {
+    /// Structural validation only. Capability refusals (whether this snapshot
+    /// can back the heap at all) belong to admission; this refuses shapes the
+    /// first increment does not define, which is every rule
+    /// [`validate_heap_placements`] already published in Step 1.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_heap_placements(&self.descriptor, &self.placements)
+    }
+}
+
+/// An indirect command buffer and one command replayed from it, carried as an
+/// optional [`ComputeTrace`] payload (`research/docs/25-heaps与ICB设计.md`
+/// §4.3).
+///
+/// The buffer, command and replay range are kept together because the command
+/// is only meaningful against the buffer that holds it and the range that
+/// selects it: a trace that carries a command without its buffer, or a range
+/// without the buffer it indexes, describes nothing an encoder can replay.
+/// `None` on [`ComputeTrace::indirect`] keeps the pre-ICB trace bytes exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndirectCommandPayload {
+    /// The buffer the command below is encoded into.
+    pub buffer: IndirectCommandBufferDescriptor,
+    /// The single command this trace encodes and replays.
+    pub command: IndirectCommandDescriptor,
+    /// The half-open command range replayed from `buffer`.
+    pub range: IndirectCommandRange,
+}
+
+impl IndirectCommandPayload {
+    /// Structural validation only. Capability refusals (whether this snapshot
+    /// can encode an ICB at all) and the inherited-pipeline question belong to
+    /// admission; this refuses the command/buffer/range shapes Step 1 already
+    /// published.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.command.validate_against(&self.buffer)?;
+        self.buffer.validate_range(&self.range)
     }
 }
 
@@ -7817,6 +7956,8 @@ mod tests {
             encoder_dispatch_type: DispatchType::Serial,
             passes: passes.into_iter().map(TracePass::Compute).collect(),
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         }
     }
 
@@ -13035,5 +13176,43 @@ mod tests {
                 .slug,
             "icb_inheritance_missing"
         );
+    }
+
+    #[test]
+    fn heap_bearing_trace_is_refused_by_admit_without_heap_bits() {
+        let mut trace = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        trace.heap = Some(Box::new(HeapPayload {
+            descriptor: heap(16),
+            placements: vec![placement(1, 0, 4), placement(1, 8, 4)],
+        }));
+        let refusal = capabilities().admit(&trace, &resources()).unwrap_err();
+        assert_eq!(refusal.slug, "heap_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        // A snapshot that declares heap bits admits the same trace, because
+        // the gate is wired into `admit` and the structural rules already
+        // passed `trace.validate()` (`docs/25-heaps与ICB设计.md` §4.5).
+        heap_capabilities().admit(&trace, &resources()).unwrap();
+    }
+
+    #[test]
+    fn icb_bearing_trace_is_refused_by_admit_without_icb_bits() {
+        let mut trace = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        trace.indirect = Some(Box::new(IndirectCommandPayload {
+            buffer: IndirectCommandBufferDescriptor {
+                max_commands: 4,
+                kinds: vec![IndirectCommandKind::Draw],
+            },
+            command: IndirectCommandDescriptor::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+            range: IndirectCommandRange { start: 0, count: 1 },
+        }));
+        let refusal = capabilities().admit(&trace, &resources()).unwrap_err();
+        assert_eq!(refusal.slug, "icb_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        icb_capabilities().admit(&trace, &resources()).unwrap();
     }
 }

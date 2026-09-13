@@ -1410,7 +1410,8 @@ mod tests {
     };
     use crate::codec::CodecError;
     use crate::command_codec::{
-        CommandCodec, MAX_PRESENT_SENTINEL_BYTES, MAX_QUEUE_PRIORITIES,
+        CommandCodec, MAX_HEAP_PLACEMENTS, MAX_PRESENT_SENTINEL_BYTES, MAX_QUEUE_PRIORITIES,
+        MAX_SUPPORTED_HEAP_STORAGE_MODES, MAX_SUPPORTED_INDIRECT_COMMANDS,
         MAX_SUPPORTED_PRESENT_MODES, MAX_TAGGED_TRACE_PASSES,
     };
     use metal_api_core::provider::{
@@ -1418,16 +1419,18 @@ mod tests {
         BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, InitialState, LeaseId,
-        LeaseImporter, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
-        PipelineContract, PipelineId, PipelineProvider, PresentDescriptor, PresentMode,
-        PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-        ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
-        RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-        StagedLease, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
-        TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexLayout, ViewId,
-        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        PROVIDER_SCHEMA_VERSION,
+        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor, HeapId,
+        HeapPayload, HeapPlacement, HeapResource, IndirectCommandBufferDescriptor,
+        IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
+        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
+        OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
+        PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+        RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+        Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp,
+        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+        TracePass, ValidatedComputeTrace, VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1508,6 +1511,8 @@ mod tests {
                 textures: Vec::new(),
             })],
             completion_policy: metal_api_core::provider::CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         }
     }
 
@@ -1597,6 +1602,8 @@ mod tests {
             encoder_dispatch_type: DispatchType::Serial,
             passes: vec![TracePass::Render(render_pass_descriptor(&compiled, 2, 2))],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         }
     }
 
@@ -1915,6 +1922,98 @@ mod tests {
         trace
     }
 
+    /// A compute-only trace that also carries a heap payload: two disjoint
+    /// buffer placements inside one `OwnedBytes` heap (`research/docs/25`
+    /// §4.2).
+    fn heap_trace() -> ComputeTrace {
+        let compiled = pipeline(&compile_request());
+        let mut trace = trace(&compiled);
+        trace.heap = Some(Box::new(HeapPayload {
+            descriptor: HeapDescriptor {
+                size: 16,
+                storage_mode: StorageMode::OwnedBytes,
+                allows_aliasing: false,
+            },
+            placements: vec![
+                HeapPlacement {
+                    heap_id: HeapId::new(61),
+                    offset: 0,
+                    resource: HeapResource::Buffer { byte_size: 8 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(61),
+                    offset: 8,
+                    resource: HeapResource::Buffer { byte_size: 8 },
+                },
+            ],
+        }));
+        trace
+    }
+
+    /// A compute-only trace that also carries an indirect-command payload: one
+    /// non-indexed draw replayed from a fixed four-slot ICB (`research/docs/25`
+    /// §4.3).
+    fn icb_trace() -> ComputeTrace {
+        let compiled = pipeline(&compile_request());
+        let mut trace = trace(&compiled);
+        trace.indirect = Some(Box::new(IndirectCommandPayload {
+            buffer: IndirectCommandBufferDescriptor {
+                max_commands: 4,
+                kinds: vec![IndirectCommandKind::Draw],
+            },
+            command: IndirectCommandDescriptor::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+            range: IndirectCommandRange { start: 0, count: 1 },
+        }));
+        trace
+    }
+
+    /// The bytes `encode_request` produces for [`heap_trace`]: the payload tag,
+    /// the tagged pass layout and the heap/ICB tail are pinned, so a later
+    /// change to the heap section cannot pass by rewriting the fixture
+    /// alongside itself (`research/docs/25-heaps与ICB设计.md` §4.5).
+    const HEAP_SUBMIT_FRAME: &[u8] = &[
+        77, 67, 67, 49, 1, 0, 0, 1, 176, 16, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 21,
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 10, 102, 105, 120, 116, 117, 114, 101, 45, 118, 49, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111,
+        112, 121, 95, 119, 111, 114, 100, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111, 112, 121, 95, 119, 111,
+        114, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 12, 98, 117, 102, 102,
+        101, 114, 45, 119, 114, 105, 116, 101, 1, 0, 0, 0, 0, 0, 0, 0, 10, 116, 114, 97, 110, 115,
+        108, 97, 116, 111, 114, 0, 0, 0, 0, 0, 0, 0, 2, 118, 49, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 4, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+        0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 61, 0, 0, 0, 0,
+        0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 41,
+        0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// The bytes `encode_request` produces for [`icb_trace`]: the same pinned
+    /// tail policy as [`HEAP_SUBMIT_FRAME`], with the indirect-command payload
+    /// in place of the heap payload.
+    const ICB_SUBMIT_FRAME: &[u8] = &[
+        77, 67, 67, 49, 1, 0, 0, 1, 138, 16, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 21,
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 10, 102, 105, 120, 116, 117, 114, 101, 45, 118, 49, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111,
+        112, 121, 95, 119, 111, 114, 100, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111, 112, 121, 95, 119, 111,
+        114, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 12, 98, 117, 102, 102,
+        101, 114, 45, 119, 114, 105, 116, 101, 1, 0, 0, 0, 0, 0, 0, 0, 10, 116, 114, 97, 110, 115,
+        108, 97, 116, 111, 114, 0, 0, 0, 0, 0, 0, 0, 2, 118, 49, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 4, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+        0, 0, 1, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 7,
+        0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
     /// The offset of the pass-kind byte in a frame whose only pass is the
     /// fixture render pass. Every other identity in the frame is a smaller
     /// number, so the first eight-byte big-endian 71 is the attachment's view
@@ -1940,6 +2039,33 @@ mod tests {
             .windows(marker.len())
             .position(|window| window == marker)
             .expect("the present target identity pair is on the wire")
+    }
+
+    /// The byte offset of the first placement's resource kind inside a
+    /// [`heap_trace`] frame. The heap id 61 appears nowhere else in the
+    /// fixture, so its first occurrence locates the placement, and the kind
+    /// sits right after the placement's heap id and offset.
+    fn heap_resource_kind_offset(frame: &[u8]) -> usize {
+        let marker = HeapId::new(61).get().to_be_bytes();
+        let position = frame
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("the heap placement identity is on the wire");
+        position + marker.len() + 8
+    }
+
+    /// The byte offset of the indirect command kind inside an [`icb_trace`]
+    /// frame. The command's vertex count (`3`) and instance count (`1`) form
+    /// an eight-byte sequence that appears nowhere else in the fixture, so the
+    /// kind is the byte that immediately precedes it.
+    fn indirect_command_kind_offset(frame: &[u8]) -> usize {
+        let mut marker = 3_u32.to_be_bytes().to_vec();
+        marker.extend_from_slice(&1_u32.to_be_bytes());
+        let position = frame
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("the indirect command counts are on the wire");
+        position - 1
     }
 
     #[test]
@@ -2132,6 +2258,166 @@ mod tests {
     }
 
     #[test]
+    fn heap_frames_use_their_own_tag_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: heap_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // The heap payload rides its own submit tag: an older decoder answers
+        // `UnknownCommandTag` instead of misreading the tagged heap/ICB tail
+        // (`research/docs/25-heaps与ICB设计.md` §4.5).
+        assert_eq!(frame[9], 0x10);
+        assert_eq!(frame, HEAP_SUBMIT_FRAME);
+
+        // Every field of the Step 1 value types survives the round trip.
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a heap submit decodes as a submit");
+        };
+        let heap = trace.heap.as_ref().expect("the fixture carries a heap");
+        assert_eq!(heap.descriptor.size, 16);
+        assert_eq!(heap.descriptor.storage_mode, StorageMode::OwnedBytes);
+        assert!(!heap.descriptor.allows_aliasing);
+        assert_eq!(heap.placements.len(), 2);
+        assert_eq!(heap.placements[0].heap_id, HeapId::new(61));
+        assert_eq!(heap.placements[0].offset, 0);
+        assert_eq!(
+            heap.placements[0].resource,
+            HeapResource::Buffer { byte_size: 8 }
+        );
+        assert_eq!(heap.placements[1].offset, 8);
+    }
+
+    #[test]
+    fn icb_frames_use_their_own_tag_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: icb_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x10);
+        assert_eq!(frame, ICB_SUBMIT_FRAME);
+
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("an ICB submit decodes as a submit");
+        };
+        let indirect = trace.indirect.as_ref().expect("the fixture carries an ICB");
+        assert_eq!(indirect.buffer.max_commands, 4);
+        assert_eq!(indirect.buffer.kinds, vec![IndirectCommandKind::Draw]);
+        assert_eq!(
+            indirect.command,
+            IndirectCommandDescriptor::Draw {
+                vertex_count: 3,
+                instance_count: 1
+            }
+        );
+        assert_eq!(indirect.range, IndirectCommandRange { start: 0, count: 1 });
+    }
+
+    #[test]
+    fn traces_without_heap_or_icb_keep_their_pre_heap_icb_bytes() {
+        // A compute-only trace without a heap or ICB payload must not pay for
+        // the heap/ICB tail: it keeps the exact bytes the pre-heap/ICB build
+        // published (`docs/25-heaps与ICB设计.md` §4.5).
+        let compiled = pipeline(&compile_request());
+        let request = CommandRequest::Submit {
+            trace: trace(&compiled),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame, LEGACY_SUBMIT_FRAME);
+        assert_eq!(frame[9], 0x03);
+
+        // And the offscreen render frame stays put too.
+        let request = CommandRequest::Submit {
+            trace: render_only_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame, LEGACY_RENDER_SUBMIT_FRAME);
+        assert_eq!(frame[9], 0x0f);
+    }
+
+    #[test]
+    fn heap_and_icb_frames_refuse_unknown_kinds_and_oversize() {
+        // The heap resource kind is a closed two-value family: an unknown code
+        // is a decoder refusal rather than a silent default.
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: heap_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let mut unknown_kind = frame.clone();
+        unknown_kind[heap_resource_kind_offset(&frame)] = 0x7e;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_kind).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "heap resource kind",
+                value: 0x7e
+            }
+        ));
+
+        // The indirect command kind is a closed three-value family, refused the
+        // same way.
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: icb_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let mut unknown_kind = frame.clone();
+        unknown_kind[indirect_command_kind_offset(&frame)] = 0x7e;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_kind).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "indirect command kind",
+                value: 0x7e
+            }
+        ));
+
+        // The encoder refuses an oversized placement list before writing a
+        // frame its own decoder would reject.
+        let mut trace = heap_trace();
+        let heap = trace.heap.as_mut().expect("the fixture carries a heap");
+        heap.placements = (0..MAX_HEAP_PLACEMENTS + 1)
+            .map(|index| HeapPlacement {
+                heap_id: HeapId::new(61),
+                offset: (index as u64) * 8,
+                resource: HeapResource::Buffer { byte_size: 8 },
+            })
+            .collect();
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap_err(),
+            CodecError::HeapPlacementCount { count, maximum }
+                if count == MAX_HEAP_PLACEMENTS + 1 && maximum == MAX_HEAP_PLACEMENTS
+        ));
+
+        // The encoder refuses an oversized indirect-command kind list too.
+        let mut trace = icb_trace();
+        let indirect = trace.indirect.as_mut().expect("the fixture carries an ICB");
+        indirect.buffer.kinds = (0..MAX_SUPPORTED_INDIRECT_COMMANDS + 1)
+            .map(|_| IndirectCommandKind::Draw)
+            .collect();
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap_err(),
+            CodecError::IndirectCommandKindCount { count, maximum }
+                if count == MAX_SUPPORTED_INDIRECT_COMMANDS + 1
+                    && maximum == MAX_SUPPORTED_INDIRECT_COMMANDS
+        ));
+    }
+
+    #[test]
     fn capability_frames_declare_present_bits_under_their_own_tag() {
         // A snapshot with no extended bits keeps the legacy capability bytes,
         // and a decoder that reads them treats it as present-refusing: that is
@@ -2204,6 +2490,125 @@ mod tests {
                 if count == MAX_SUPPORTED_PRESENT_MODES + 1
                     && maximum == MAX_SUPPORTED_PRESENT_MODES
         ));
+    }
+
+    #[test]
+    fn capability_frames_declare_heap_and_icb_bits_under_their_own_tag() {
+        // A snapshot with no heap or ICB bits keeps the legacy capability
+        // bytes, and a decoder that reads them treats it as heap/ICB-refusing:
+        // that is what such a provider was (`docs/25` §4.1).
+        let legacy = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+        };
+        let frame = CommandCodec::encode_response(&legacy).unwrap();
+        assert_eq!(frame[9], 0x01);
+        let CommandResponse::Capabilities { capabilities, .. } =
+            CommandCodec::decode_response(&frame).unwrap()
+        else {
+            panic!("a capability response decodes as a capability response");
+        };
+        assert!(!capabilities.supports_heaps);
+        assert_eq!(capabilities.max_heap_bytes, 0);
+        assert!(capabilities.supported_heap_storage_modes.is_empty());
+        assert!(!capabilities.supports_heap_aliasing);
+        assert!(!capabilities.supports_indirect_command_buffers);
+        assert_eq!(capabilities.max_indirect_commands, 0);
+        assert!(capabilities.supported_indirect_commands.is_empty());
+
+        // A snapshot that declares only heap bits still needs the extended
+        // payload, because that is where the heap/ICB bits travel.
+        let mut heaps = fake_capabilities();
+        heaps.supports_heaps = true;
+        heaps.max_heap_bytes = 64;
+        heaps.supported_heap_storage_modes = vec![StorageMode::OwnedBytes];
+        let declaring = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: heaps,
+        };
+        let frame = CommandCodec::encode_response(&declaring).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), declaring);
+
+        // A snapshot that declares only ICB bits behaves the same way.
+        let mut icbs = fake_capabilities();
+        icbs.supports_indirect_command_buffers = true;
+        icbs.max_indirect_commands = 4;
+        icbs.supported_indirect_commands = vec![IndirectCommandKind::Draw];
+        let declaring = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: icbs,
+        };
+        let frame = CommandCodec::encode_response(&declaring).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), declaring);
+
+        // The heap storage-mode list carries a bound like the present-mode
+        // list does, so a corrupt count cannot drive the encoder.
+        let mut oversize = fake_capabilities();
+        oversize.supports_heaps = true;
+        oversize.supported_heap_storage_modes =
+            vec![StorageMode::OwnedBytes; MAX_SUPPORTED_HEAP_STORAGE_MODES + 1];
+        assert!(matches!(
+            CommandCodec::encode_response(&CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(7),
+                capabilities: oversize,
+            })
+            .unwrap_err(),
+            CodecError::HeapStorageModeCount { count, maximum }
+                if count == MAX_SUPPORTED_HEAP_STORAGE_MODES + 1
+                    && maximum == MAX_SUPPORTED_HEAP_STORAGE_MODES
+        ));
+
+        // The indirect-command kind list carries the same guard.
+        let mut oversize = fake_capabilities();
+        oversize.supports_indirect_command_buffers = true;
+        oversize.supported_indirect_commands =
+            vec![IndirectCommandKind::Draw; MAX_SUPPORTED_INDIRECT_COMMANDS + 1];
+        assert!(matches!(
+            CommandCodec::encode_response(&CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(7),
+                capabilities: oversize,
+            })
+            .unwrap_err(),
+            CodecError::IndirectCommandKindCount { count, maximum }
+                if count == MAX_SUPPORTED_INDIRECT_COMMANDS + 1
+                    && maximum == MAX_SUPPORTED_INDIRECT_COMMANDS
+        ));
+    }
+
+    #[test]
+    fn capability_frames_without_heap_bits_keep_the_pre_heap_bytes() {
+        // A provider that declares render and present bits but neither heap nor
+        // ICB bits must keep the frame the pre-heap codec produced: the heap/ICB
+        // section is an optional tail (`research/docs/25` §4.5), so this pin is
+        // what stops it from being appended unconditionally.
+        let mut both = fake_capabilities();
+        both.supports_render_passes = true;
+        both.max_color_attachments = 1;
+        both.max_attachment_dimension = [2, 2];
+        both.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        both.supports_presentation = true;
+        both.max_present_targets = 1;
+        both.supported_present_modes = vec![PresentMode::Fifo];
+        both.max_present_image_count = MAX_PRESENT_IMAGE_COUNT;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: both,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        let hex = frame
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        // Captured from the pre-heap codec at `2ad57d1` and re-checked against
+        // this encoder: the frames are byte-identical.
+        assert_eq!(
+            hex,
+            "4d43433102000000950a00000000000000070000000101000100000000000000000100000000000000010000000000000001000000000000000100000000000000010000000000000001000000000000000100000001000000000000040000000000000000000000000001000100010000000100000000000000020000000000000002000000000000000102010000000100000000000000010200000001"
+        );
     }
 
     #[test]
