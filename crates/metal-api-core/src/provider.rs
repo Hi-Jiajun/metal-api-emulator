@@ -3279,6 +3279,227 @@ pub enum StorageMode {
     BorrowedNoCopy,
 }
 
+/// Priority tier of one device queue as seen by the host scheduling policy.
+///
+/// This is a host-side scheduling hint layered on top of the existing
+/// least-loaded queue choice, not a `VkDeviceQueueCreateInfo::pQueuePriorities`
+/// value: Vulkan fixes queue priorities when the queue is created, so a provider
+/// that wants to change them mid-flight has to express priority in its own
+/// scheduler (`research/docs/21-队列优先级与公平性设计.md`).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum QueuePriority {
+    /// Background work. It still must make progress: see
+    /// [`QueueSchedulingPolicy`].
+    Low,
+    /// The tier of every queue that was created without an explicit hint, and
+    /// therefore the tier of every queue a provider creates today.
+    #[default]
+    Default,
+    /// Latency-sensitive work.
+    High,
+}
+
+impl QueuePriority {
+    /// Tier rank used by the scheduler: `Low < Default < High`.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Default => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+/// Weighted, starvation-free scheduling policy for one provider's device
+/// queues.
+///
+/// The policy is a rotation window of `low_weight + medium_weight +
+/// high_weight` scheduling slots, walked highest tier first. Two properties
+/// follow from the window alone, without any per-queue accounting:
+///
+/// - weighted shares: a tier that has a queue available claims its own slots,
+///   so `Default` receives `medium_weight / window` of the slots in the long
+///   run and `Low` receives `low_weight / window`;
+/// - no starvation: every weight is clamped to at least one, so every tier
+///   owns at least one slot per window, and the longest run of consecutive
+///   `High` selections is exactly [`Self::high_priority_streak_limit`] — the
+///   `high_weight` slots at the start of the window.
+///
+/// The default weights are `High` 4, `Default` 2, `Low` 1, so the streak limit
+/// is 4 and a low-priority queue is selected at least once every 7 selections.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueSchedulingPolicy {
+    low_weight: u32,
+    medium_weight: u32,
+    high_weight: u32,
+}
+
+impl QueueSchedulingPolicy {
+    /// Weight of [`QueuePriority::Low`] in the default policy.
+    pub const DEFAULT_LOW_WEIGHT: u32 = 1;
+    /// Weight of [`QueuePriority::Default`] in the default policy.
+    pub const DEFAULT_MEDIUM_WEIGHT: u32 = 2;
+    /// Weight of [`QueuePriority::High`] in the default policy.
+    pub const DEFAULT_HIGH_WEIGHT: u32 = 4;
+
+    /// Build a weighted policy.
+    ///
+    /// A zero weight would starve its own tier, which contradicts the contract
+    /// this type exists to express, so every weight is clamped up to one
+    /// instead of being refused: the no-starvation invariant then holds for
+    /// every value the caller can pass.
+    pub const fn new(low_weight: u32, medium_weight: u32, high_weight: u32) -> Self {
+        Self {
+            low_weight: if low_weight == 0 { 1 } else { low_weight },
+            medium_weight: if medium_weight == 0 { 1 } else { medium_weight },
+            high_weight: if high_weight == 0 { 1 } else { high_weight },
+        }
+    }
+
+    /// Weight of [`QueuePriority::Low`].
+    pub const fn low_weight(self) -> u32 {
+        self.low_weight
+    }
+
+    /// Weight of [`QueuePriority::Default`].
+    pub const fn medium_weight(self) -> u32 {
+        self.medium_weight
+    }
+
+    /// Weight of [`QueuePriority::High`].
+    pub const fn high_weight(self) -> u32 {
+        self.high_weight
+    }
+
+    /// Weight of `priority` in this policy.
+    pub const fn weight(self, priority: QueuePriority) -> u32 {
+        match priority {
+            QueuePriority::Low => self.low_weight,
+            QueuePriority::Default => self.medium_weight,
+            QueuePriority::High => self.high_weight,
+        }
+    }
+
+    /// Length of one rotation window in scheduling slots.
+    pub const fn window(self) -> u64 {
+        self.low_weight as u64 + self.medium_weight as u64 + self.high_weight as u64
+    }
+
+    /// Longest run of consecutive `High` selections the window allows before a
+    /// lower tier is due.
+    ///
+    /// It is exactly the `High` weight, because the window places that tier's
+    /// slots first. A caller that only needs the bound does not have to reason
+    /// about the window at all.
+    pub const fn high_priority_streak_limit(self) -> u32 {
+        self.high_weight
+    }
+
+    /// Tier that slot `slot` of the rotation nominates.
+    pub const fn nominated_priority(self, slot: u64) -> QueuePriority {
+        let slot = slot % self.window();
+        if slot < self.high_weight as u64 {
+            QueuePriority::High
+        } else if slot < (self.high_weight + self.medium_weight) as u64 {
+            QueuePriority::Default
+        } else {
+            QueuePriority::Low
+        }
+    }
+}
+
+impl Default for QueueSchedulingPolicy {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_LOW_WEIGHT,
+            Self::DEFAULT_MEDIUM_WEIGHT,
+            Self::DEFAULT_HIGH_WEIGHT,
+        )
+    }
+}
+
+/// Tier distance used to resolve a nomination against the queues that are
+/// actually available: the nominated tier wins, then the highest tier below it
+/// (so a missing tier never hands its slots back to a greedier one), then the
+/// closest tier above it.
+fn tier_distance(tier: QueuePriority, nominated: QueuePriority) -> (u8, u8) {
+    if tier == nominated {
+        (0, 0)
+    } else if tier.rank() < nominated.rank() {
+        (1, nominated.rank() - tier.rank())
+    } else {
+        (2, tier.rank() - nominated.rank())
+    }
+}
+
+/// Pick the device queue that should receive the next submission.
+///
+/// `in_flight[i]` is the number of submissions that have not retired on queue
+/// `i`, so step one is the existing least-loaded rule: an idle queue always
+/// beats a busy one, whatever their tiers. Among the least-loaded queues the
+/// policy window decides — the nominated tier first, then a rotating choice
+/// inside that tier — which is what makes the choice weighted and, because
+/// every tier is nominated at least once per window, starvation-free.
+///
+/// `priorities` is read positionally. A missing entry defaults to
+/// [`QueuePriority::Default`] and extra entries are ignored, so a caller cannot
+/// make the scheduler panic by passing a differently sized slice.
+/// `round_robin_start` is the caller's monotonic selection counter: it is both
+/// the position inside the policy window and the tie-break cursor, so the
+/// caller keeps advancing it by one per selection exactly as
+/// `VulkanContext::select_queue` does. An empty queue list returns `0`, the
+/// same answer the least-loaded rule gives today.
+///
+/// With a single tier the function reduces to the least-loaded rule with a
+/// rotated tie-break, i.e. to the behaviour of `select_queue` in
+/// `metal-api-vulkan`.
+pub fn select_queue_with_priority(
+    in_flight: &[usize],
+    priorities: &[QueuePriority],
+    round_robin_start: usize,
+    policy: QueueSchedulingPolicy,
+) -> usize {
+    let len = in_flight.len();
+    if len == 0 {
+        return 0;
+    }
+    let start = round_robin_start % len;
+    let priority_at = |index: usize| priorities.get(index).copied().unwrap_or_default();
+
+    let min_load = in_flight.iter().copied().min().unwrap_or(0);
+    let nominated = policy.nominated_priority(round_robin_start as u64);
+
+    // The wanted tier is folded over the least-loaded queues only, so it is
+    // always a tier that at least one candidate actually has.
+    let mut wanted: Option<QueuePriority> = None;
+    for (index, load) in in_flight.iter().enumerate() {
+        if *load != min_load {
+            continue;
+        }
+        let tier = priority_at(index);
+        wanted = Some(match wanted {
+            Some(current)
+                if tier_distance(tier, nominated) >= tier_distance(current, nominated) =>
+            {
+                current
+            }
+            _ => tier,
+        });
+    }
+    let wanted = wanted.expect("non-empty in-flight slice has a candidate queue");
+
+    for step in 0..len {
+        let index = (start + step) % len;
+        if in_flight[index] == min_load && priority_at(index) == wanted {
+            return index;
+        }
+    }
+
+    // Unreachable: `wanted` is taken from a least-loaded queue, so the scan
+    // above always returns. `start` keeps the function total and in range.
+    start
+}
+
 /// Stable phase of a provider refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderPhase {
@@ -7394,5 +7615,193 @@ mod tests {
             pass.buffers[0].access = BufferAccess::Read;
         }
         assert!(distinct.admit(&value, &resources).is_ok());
+    }
+
+    #[test]
+    fn queue_priority_defaults_to_the_middle_tier() {
+        assert_eq!(QueuePriority::default(), QueuePriority::Default);
+        assert_eq!(QueuePriority::Low.rank(), 0);
+        assert_eq!(QueuePriority::Default.rank(), 1);
+        assert_eq!(QueuePriority::High.rank(), 2);
+    }
+
+    #[test]
+    fn queue_scheduling_policy_window_and_streak_limit_are_explicit() {
+        let policy = QueueSchedulingPolicy::default();
+        assert_eq!(policy.low_weight(), 1);
+        assert_eq!(policy.medium_weight(), 2);
+        assert_eq!(policy.high_weight(), 4);
+        assert_eq!(policy.weight(QueuePriority::Low), 1);
+        assert_eq!(policy.weight(QueuePriority::Default), 2);
+        assert_eq!(policy.weight(QueuePriority::High), 4);
+        assert_eq!(policy.window(), 7);
+        assert_eq!(policy.high_priority_streak_limit(), 4);
+
+        // A zero weight is clamped to one, so no tier can own an empty window.
+        let clamped = QueueSchedulingPolicy::new(0, 0, 0);
+        assert_eq!(clamped.window(), 3);
+        assert_eq!(clamped.nominated_priority(0), QueuePriority::High);
+        assert_eq!(clamped.nominated_priority(1), QueuePriority::Default);
+        assert_eq!(clamped.nominated_priority(2), QueuePriority::Low);
+        // The window is periodic in the caller's monotonic counter.
+        assert_eq!(clamped.nominated_priority(3), QueuePriority::High);
+        assert_eq!(policy.nominated_priority(7), policy.nominated_priority(0));
+    }
+
+    #[test]
+    fn priority_selection_prefers_idle_queues_before_higher_tiers() {
+        let policy = QueueSchedulingPolicy::default();
+
+        // A busy high-priority queue yields to an idle low-priority queue.
+        assert_eq!(
+            select_queue_with_priority(
+                &[1, 0],
+                &[QueuePriority::High, QueuePriority::Low],
+                0,
+                policy
+            ),
+            1
+        );
+        assert_eq!(
+            select_queue_with_priority(
+                &[0, 1],
+                &[QueuePriority::Low, QueuePriority::High],
+                2,
+                policy
+            ),
+            0
+        );
+        // When every queue is busy the least-loaded one still wins.
+        assert_eq!(
+            select_queue_with_priority(
+                &[3, 1],
+                &[QueuePriority::High, QueuePriority::Low],
+                0,
+                policy
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn priority_selection_prefers_the_higher_tier_when_loads_tie() {
+        let policy = QueueSchedulingPolicy::default();
+
+        // Slot 0 of the window nominates `High`.
+        assert_eq!(
+            select_queue_with_priority(
+                &[0, 0],
+                &[QueuePriority::Low, QueuePriority::High],
+                0,
+                policy
+            ),
+            1
+        );
+        assert_eq!(
+            select_queue_with_priority(
+                &[0, 0, 0],
+                &[
+                    QueuePriority::Default,
+                    QueuePriority::Low,
+                    QueuePriority::High
+                ],
+                1,
+                policy
+            ),
+            2
+        );
+        // Inside one tier the counter still rotates the ties.
+        assert_eq!(
+            select_queue_with_priority(
+                &[0, 0],
+                &[QueuePriority::High, QueuePriority::High],
+                1,
+                policy
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn priority_selection_yields_to_lower_tiers_without_starvation() {
+        let policy = QueueSchedulingPolicy::default();
+        let priorities = [QueuePriority::High, QueuePriority::Low];
+        let picks: Vec<usize> = (0..14)
+            .map(|cursor| select_queue_with_priority(&[0, 0], &priorities, cursor, policy))
+            .collect();
+
+        // Per seven-slot window the high tier takes four slots and the low tier
+        // takes the rest, so over two windows: 8 high, 6 low.
+        assert_eq!(picks.iter().filter(|pick| **pick == 0).count(), 8);
+        assert_eq!(picks.iter().filter(|pick| **pick == 1).count(), 6);
+
+        let mut longest_high_run = 0_usize;
+        let mut run = 0_usize;
+        for pick in &picks {
+            if *pick == 0 {
+                run += 1;
+                longest_high_run = longest_high_run.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert_eq!(
+            longest_high_run,
+            policy.high_priority_streak_limit() as usize
+        );
+
+        // The low tier is never starved: it is selected in every window.
+        for window in picks.chunks(policy.window() as usize) {
+            assert!(window.contains(&1), "low tier starved in {window:?}");
+        }
+    }
+
+    #[test]
+    fn priority_selection_gives_each_present_tier_its_share_of_a_window() {
+        let policy = QueueSchedulingPolicy::default();
+        let priorities = [
+            QueuePriority::High,
+            QueuePriority::Default,
+            QueuePriority::Low,
+        ];
+        let picks: Vec<usize> = (0..policy.window())
+            .map(|cursor| {
+                select_queue_with_priority(&[0, 0, 0], &priorities, cursor as usize, policy)
+            })
+            .collect();
+
+        // Four high slots, two default slots, then the one low slot.
+        assert_eq!(picks, vec![0, 0, 0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn priority_selection_rotates_the_cursor_within_one_tier() {
+        let policy = QueueSchedulingPolicy::default();
+        let picks: Vec<usize> = (0..6)
+            .map(|cursor| {
+                select_queue_with_priority(&[0, 0, 0], &[QueuePriority::Low; 3], cursor, policy)
+            })
+            .collect();
+
+        assert_eq!(picks, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn priority_selection_is_panic_free_for_degenerate_inputs() {
+        let policy = QueueSchedulingPolicy::default();
+
+        // Empty input keeps the least-loaded rule's answer.
+        assert_eq!(select_queue_with_priority(&[], &[], 5, policy), 0);
+        // A single queue is selected whatever the cursor and tier say.
+        assert_eq!(select_queue_with_priority(&[4], &[], 9, policy), 0);
+        assert_eq!(
+            select_queue_with_priority(&[0], &[QueuePriority::High, QueuePriority::Low], 3, policy),
+            0
+        );
+        // A missing priority entry reads as `Default` and never panics.
+        assert_eq!(
+            select_queue_with_priority(&[0, 0], &[QueuePriority::Low], 0, policy),
+            1
+        );
     }
 }
