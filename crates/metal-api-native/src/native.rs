@@ -858,25 +858,8 @@ impl Drop for BorrowedRetains {
     }
 }
 
-struct PendingSubmission {
-    resources: Option<SubmissionResources>,
-    submitted: bool,
-}
-
-impl Drop for PendingSubmission {
-    fn drop(&mut self) {
-        if self.submitted {
-            // Also protects an unwind during commit/status observation. A
-            // poisoned mutex prevents another submit after such an unwind.
-            if let Some(resources) = self.resources.take() {
-                std::mem::forget(resources);
-            }
-        }
-    }
-}
-
 struct EncodedSubmission {
-    pending: PendingSubmission,
+    pending: crate::PendingSubmission<SubmissionResources>,
     pool: Vec<BufferView>,
 }
 
@@ -1117,7 +1100,7 @@ fn encode(
         // commandBuffer is autoreleased, so retain it for the pending guard.
         CommandBufferRef::from_ptr(pointer).to_owned()
     };
-    let pending = PendingSubmission {
+    let pending = crate::PendingSubmission {
         resources: Some(SubmissionResources {
             _device: state.device.clone(),
             _queue: state.queue.clone(),
@@ -1595,6 +1578,15 @@ impl NativeMetalProvider {
             pending.submitted = true;
             let resources = pending.resources.as_ref().expect("encoded resources");
             resources.command.commit();
+            // The compute command buffer is committed and the render rail now
+            // serializes after it on the same queue, so the submission is no
+            // longer in the "commit could unwind" window the submitted guard
+            // exists for. Clear the flag before executing the render passes so
+            // a Metal render failure returns through `?` with the normal error
+            // path and releases `SubmissionResources` instead of `mem::forget`
+            // leaking the whole bundle (the sync rail clears it before render
+            // for the same reason).
+            pending.submitted = false;
             let render_writebacks = self.execute_render_passes(state, &render_plan)?;
             // The render command buffer serialized after the compute command
             // buffer, so a completed render implies a terminal compute status.
@@ -1630,7 +1622,6 @@ impl NativeMetalProvider {
                     }));
                 }
             }
-            pending.submitted = false;
             let compute_writebacks = collect_writebacks(&pool, &resources.buffers, &self.counters);
             let merged = render::merge_writebacks(compute_writebacks, render_writebacks);
             let record = self.running_record(token);
