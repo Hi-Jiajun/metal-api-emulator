@@ -611,6 +611,11 @@ impl VulkanComputeProvider {
                                 }
                             }
                             Err(error) if error.class == ProviderErrorClass::DeviceLost => {
+                                // `PendingExecution::wait` already routed the
+                                // driver's loss through the core lifecycle and
+                                // attached the fault evidence to this error;
+                                // these keep the retirement thread's own
+                                // guarantee explicit for the handles it owns.
                                 pending.mark_device_lost();
                                 context.mark_device_lost();
                             }

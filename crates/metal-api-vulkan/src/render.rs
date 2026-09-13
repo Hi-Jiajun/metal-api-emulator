@@ -942,11 +942,6 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     fn submit_and_wait(&mut self, queue_index: usize) -> Result<(), ProviderError> {
-        let queue = *self
-            .context
-            .queues
-            .get(queue_index)
-            .ok_or_else(|| execution_refusal("submit render pass", "queue index is unknown"))?;
         let _execution = self
             .context
             .lock_queue(queue_index)
@@ -960,19 +955,29 @@ impl<'a> OffscreenObjects<'a> {
         .map_err(|error| execution_refusal("create render fence", &error.to_string()))?;
         let commands = [self.command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        unsafe {
-            self.context
-                .device
-                .queue_submit(queue, &submits, self.fence)
+        if let Err(result) = self
+            .context
+            .submit_commands(queue_index, &submits, self.fence)
+        {
+            return Err(driver_refusal(
+                self.context,
+                ProviderPhase::Submit,
+                "submit render pass",
+                result,
+            ));
         }
-        .map_err(|error| submission_refusal("submit render pass", &error.to_string()))?;
         self.context.record_queue_submission(queue_index);
-        unsafe {
-            self.context
-                .device
-                .wait_for_fences(&[self.fence], true, crate::FENCE_TIMEOUT_NS)
+        if let Err(result) = self
+            .context
+            .wait_for_fence(self.fence, crate::FENCE_TIMEOUT_NS)
+        {
+            return Err(driver_refusal(
+                self.context,
+                ProviderPhase::Wait,
+                "wait for render fence",
+                result,
+            ));
         }
-        .map_err(|error| submission_refusal("wait for render fence", &error.to_string()))?;
         self.context.record_queue_retirement(queue_index);
         Ok(())
     }
@@ -1149,6 +1154,27 @@ fn submission_refusal(step: &str, detail: &str) -> ProviderError {
     .expect("static provider refusal slug");
     error.retryability = Retryability::Never;
     error.with_detail(format!("{step}: {detail}"))
+}
+
+/// Structured error for one driver answer at a render queue boundary.
+///
+/// A render submission meets the same driver as a compute submission, so a
+/// `VK_ERROR_DEVICE_LOST` here is routed through the core lifecycle exactly
+/// like the compute rail's loss: `VulkanContext::observe_device_loss` marks the
+/// instance terminal and queries `VK_EXT_device_fault`, and the error
+/// carries the raw result plus the fault record. Every other answer keeps the
+/// render rail's own refusal, whose detail is the driver text. The slug stays
+/// the rail's so a caller can still tell which boundary reported the loss.
+fn driver_refusal(
+    context: &VulkanContext,
+    phase: ProviderPhase,
+    step: &str,
+    result: vk::Result,
+) -> ProviderError {
+    if result != vk::Result::ERROR_DEVICE_LOST {
+        return submission_refusal(step, &result.to_string());
+    }
+    crate::device_loss_refusal(context, phase, "render_submission_failed", step)
 }
 
 #[cfg(test)]
@@ -1668,5 +1694,65 @@ mod tests {
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
+    /// The render rail enqueues through the same driver boundary as the
+    /// compute rail, so a loss it observes is a terminal device event too.
+    ///
+    /// Before this rail reported losses, a `VK_ERROR_DEVICE_LOST` here became
+    /// an ordinary execution refusal and the instance kept admitting work.
+    #[test]
+    fn execute_render_pass_reports_a_driver_loss_as_a_terminal_device_event() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.validate().expect("the fixture pass is a legal shape");
+        context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
+        let error = execute_render_pass(&context, &stages, &pass)
+            .expect_err("the substituted driver answer refuses the render submission");
+        eprintln!("render device loss: {error:?}");
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(error.slug, "render_submission_failed");
+        assert_eq!(error.phase, ProviderPhase::Submit);
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            error.completion,
+            metal_api_core::provider::CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            error.fields.get("vk_result"),
+            Some(&FieldValue::Text("VK_ERROR_DEVICE_LOST".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("vk_result_raw"),
+            Some(&FieldValue::Signed(i64::from(
+                vk::Result::ERROR_DEVICE_LOST.as_raw()
+            )))
+        );
+        let fault = context
+            .last_device_fault()
+            .expect("the rail recorded a fault snapshot");
+        assert_eq!(
+            error.fields.get("device_fault_extension"),
+            Some(&FieldValue::Bool(fault.extension_present))
+        );
+
+        // The loss is the core lifecycle's, so the instance stops admitting
+        // work through the documented refusal and repeats it unchanged.
+        assert_eq!(
+            context.health(),
+            metal_api_core::provider::ProviderHealth::DeviceLost
+        );
+        let first = context.admit().expect_err("a lost device admits no work");
+        let second = context.admit().expect_err("a lost device admits no work");
+        assert_eq!(first, second);
+        assert_eq!(first.slug, "device_lost");
+        assert_eq!(
+            context.queue_submission_counts().iter().sum::<usize>(),
+            0,
+            "the substituted loss never reached the driver"
+        );
     }
 }

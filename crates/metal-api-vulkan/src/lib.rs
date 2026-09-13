@@ -5,7 +5,7 @@
 //! as the dispatch contract; unsupported resources fail before any Vulkan work
 //! is submitted.
 
-use ash::ext::external_memory_host;
+use ash::ext::{device_fault, external_memory_host};
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
@@ -14,9 +14,10 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::completion::AbandonmentOutcome;
 use metal_api_core::provider::{
-    BorrowedLeaseRegistry, CompletionDisposition, LeaseId, PipelineContract, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle, ProviderPhase,
-    QueuePriority, QueueSchedulingPolicy, SemanticDigest, TerminalRefusal, MAX_SERIAL_RESOURCES,
+    BorrowedLeaseRegistry, CompletionDisposition, FieldValue, LeaseId, PipelineContract,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle,
+    ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability, SemanticDigest,
+    TerminalRefusal, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -82,6 +83,187 @@ const ABANDONMENT_BUDGET_SUBMISSIONS: u64 = 1;
 /// because abandoned device memory cannot be returned safely.
 const ABANDONMENT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// A driver boundary whose answer a test may substitute.
+///
+/// Production reaches both points through `VulkanContext::submit_commands` and
+/// `VulkanContext::wait_for_fence`, and both answer a
+/// `VK_ERROR_DEVICE_LOST` the same way: the loss goes through the core
+/// `ProviderLifecycle`. CI cannot make a live driver lose its device, so the
+/// substitution replaces the driver's answer at exactly one of those two
+/// boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceLossPoint {
+    /// `vkQueueSubmit` answers `VK_ERROR_DEVICE_LOST`.
+    Submit,
+    /// `vkWaitForFences` answers `VK_ERROR_DEVICE_LOST`.
+    Wait,
+}
+
+/// One `VkDeviceFaultAddressInfoEXT` record.
+///
+/// [`address_type`](Self::address_type) keeps the raw
+/// `VK_DEVICE_FAULT_ADDRESS_TYPE_*` value; the provider error spells the same
+/// enum as a name (`READ_INVALID`, `WRITE_INVALID`, ...) so a caller can read
+/// the fault without matching Vulkan enums.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceFaultAddress {
+    pub address_type: i32,
+    pub reported_address: u64,
+    pub address_precision: u64,
+}
+
+/// Diagnostic snapshot of one `VK_EXT_device_fault` query.
+///
+/// The extension is optional and the record is evidence, never a gate: a
+/// device that does not advertise it answers
+/// `extension_present == false` with no addresses, and a device that does but
+/// refuses the query answers the same way. Neither case changes the loss
+/// itself, which the provider reports through the core lifecycle regardless.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceFaultSnapshot {
+    /// Whether the physical device advertised `VK_EXT_device_fault`.
+    pub extension_present: bool,
+    /// Driver-supplied fault description, when the driver wrote one.
+    pub description: Option<String>,
+    /// Addresses the driver reported, in the order it returned them.
+    pub addresses: Vec<DeviceFaultAddress>,
+    /// Number of vendor fault records the driver reported.
+    pub vendor_info_count: u32,
+    /// Size in bytes of the vendor fault binary the driver can return.
+    pub vendor_binary_size: u64,
+}
+
+impl DeviceFaultSnapshot {
+    /// The record for a device that could not answer the fault query.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            extension_present: false,
+            description: None,
+            addresses: Vec::new(),
+            vendor_info_count: 0,
+            vendor_binary_size: 0,
+        }
+    }
+
+    /// The structured fields a device-loss error carries for this record.
+    ///
+    /// Addresses are capped at [`DEVICE_FAULT_ADDRESS_FIELDS`]; the count
+    /// field always reports how many the driver returned, so a truncated
+    /// listing is never mistaken for a complete one.
+    pub(crate) fn evidence_fields(&self) -> Vec<(String, FieldValue)> {
+        let mut fields = Vec::with_capacity(5 + 3 * DEVICE_FAULT_ADDRESS_FIELDS);
+        fields.push((
+            "device_fault_extension".to_owned(),
+            FieldValue::Bool(self.extension_present),
+        ));
+        if let Some(description) = &self.description {
+            fields.push((
+                "device_fault_description".to_owned(),
+                FieldValue::Text(description.clone()),
+            ));
+        }
+        fields.push((
+            "device_fault_addresses".to_owned(),
+            FieldValue::Unsigned(self.addresses.len() as u64),
+        ));
+        for (index, address) in self
+            .addresses
+            .iter()
+            .take(DEVICE_FAULT_ADDRESS_FIELDS)
+            .enumerate()
+        {
+            fields.push((
+                format!("device_fault_address_type_{index}"),
+                FieldValue::Text(device_fault_address_type_name(address.address_type).to_owned()),
+            ));
+            fields.push((
+                format!("device_fault_address_{index}"),
+                FieldValue::Unsigned(address.reported_address),
+            ));
+            fields.push((
+                format!("device_fault_address_precision_{index}"),
+                FieldValue::Unsigned(address.address_precision),
+            ));
+        }
+        fields.push((
+            "device_fault_vendor_infos".to_owned(),
+            FieldValue::Unsigned(u64::from(self.vendor_info_count)),
+        ));
+        fields.push((
+            "device_fault_vendor_binary_size".to_owned(),
+            FieldValue::Unsigned(self.vendor_binary_size),
+        ));
+        fields
+    }
+}
+
+/// Upper bound of fault addresses copied into one provider error.
+const DEVICE_FAULT_ADDRESS_FIELDS: usize = 4;
+
+/// Vulkan name of one `VkDeviceFaultAddressTypeEXT` value.
+fn device_fault_address_type_name(address_type: i32) -> &'static str {
+    match vk::DeviceFaultAddressTypeEXT::from_raw(address_type) {
+        vk::DeviceFaultAddressTypeEXT::NONE => "NONE",
+        vk::DeviceFaultAddressTypeEXT::READ_INVALID => "READ_INVALID",
+        vk::DeviceFaultAddressTypeEXT::WRITE_INVALID => "WRITE_INVALID",
+        vk::DeviceFaultAddressTypeEXT::EXECUTE_INVALID => "EXECUTE_INVALID",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_UNKNOWN => "INSTRUCTION_POINTER_UNKNOWN",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_INVALID => "INSTRUCTION_POINTER_INVALID",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_FAULT => "INSTRUCTION_POINTER_FAULT",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Vulkan name of one raw result, for the `vk_result` evidence field.
+fn vk_result_name(result: vk::Result) -> String {
+    match result {
+        vk::Result::SUCCESS => "VK_SUCCESS".to_owned(),
+        vk::Result::NOT_READY => "VK_NOT_READY".to_owned(),
+        vk::Result::TIMEOUT => "VK_TIMEOUT".to_owned(),
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY => "VK_ERROR_OUT_OF_HOST_MEMORY".to_owned(),
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => "VK_ERROR_OUT_OF_DEVICE_MEMORY".to_owned(),
+        vk::Result::ERROR_DEVICE_LOST => "VK_ERROR_DEVICE_LOST".to_owned(),
+        vk::Result::ERROR_UNKNOWN => "VK_ERROR_UNKNOWN".to_owned(),
+        other => format!("VK_RESULT_{}", other.as_raw()),
+    }
+}
+
+/// Attach a `VK_EXT_device_fault` record to a device-loss error.
+pub(crate) fn with_device_fault_evidence(
+    mut error: ProviderError,
+    fault: &DeviceFaultSnapshot,
+) -> ProviderError {
+    for (key, value) in fault.evidence_fields() {
+        error = error.with_field(key, value);
+    }
+    error
+}
+
+/// Structured provider error for a `VK_ERROR_DEVICE_LOST` observed at a driver
+/// boundary.
+///
+/// Every rail that enqueues through `VulkanContext::submit_commands` or waits
+/// through `VulkanContext::wait_for_fence` reports a loss through here,
+/// so no boundary can answer a lost device as an ordinary execution failure:
+/// the core lifecycle is marked lost (leases included) and the error carries
+/// the raw result plus the `VK_EXT_device_fault` record. `slug` stays the
+/// boundary's own, so a caller can still tell which step reported the loss.
+pub(crate) fn device_loss_refusal(
+    context: &VulkanContext,
+    phase: ProviderPhase,
+    slug: &'static str,
+    step: &str,
+) -> ProviderError {
+    let result = vk::Result::ERROR_DEVICE_LOST;
+    let error = ExecutionFailure::vulkan(result, format!("{step}: {result}")).into_provider(
+        phase,
+        ProviderErrorClass::Execute,
+        slug,
+        CompletionDisposition::DeviceLost { token: None },
+    );
+    with_device_fault_evidence(error, &context.observe_device_loss())
+}
+
 /// Native Vulkan implementation of the Phase 1 compute subset.
 pub struct VulkanExecutor {
     context: Arc<VulkanContext>,
@@ -117,6 +299,30 @@ impl VulkanExecutor {
     #[doc(hidden)]
     pub fn inject_device_loss_for_test(&self) {
         self.context.mark_device_lost();
+    }
+
+    /// Substitute the next driver answer at one queue boundary with
+    /// `VK_ERROR_DEVICE_LOST`.
+    ///
+    /// Unlike [`Self::inject_device_loss_for_test`], which marks the lifecycle
+    /// directly, this hook does not touch the lifecycle at all: the context
+    /// reaches `DeviceLost` only through the path a real driver answer takes,
+    /// so the test observes the provider's reaction (`vk::Result` evidence,
+    /// `VK_EXT_device_fault` query, terminal transition, lease retirement and
+    /// the refusal on later submissions) rather than its own setup. Tests only.
+    #[doc(hidden)]
+    pub fn inject_driver_device_loss_for_test(&self, point: DeviceLossPoint) {
+        self.context.arm_driver_loss_injection(point);
+    }
+
+    /// Diagnostic `VK_EXT_device_fault` record of the last observed device
+    /// loss.
+    ///
+    /// `None` until a loss is observed. A device without the extension still
+    /// answers a snapshot, with `extension_present == false`.
+    #[doc(hidden)]
+    pub fn last_device_fault(&self) -> Option<DeviceFaultSnapshot> {
+        self.context.last_device_fault()
     }
 
     /// Number of device queues created across the primary and dedicated
@@ -397,6 +603,13 @@ pub(crate) struct VulkanContext {
     physical: vk::PhysicalDevice,
     device: AshDevice,
     external_memory_host: Option<ExternalMemoryHost>,
+    /// `VK_EXT_device_fault` entry points, loaded only when the device
+    /// advertises the extension.
+    device_fault: Option<device_fault::Device>,
+    /// Diagnostic record of the last observed device loss, if any.
+    device_fault_record: Mutex<Option<DeviceFaultSnapshot>>,
+    /// Test-only substitution of the next driver answer at one queue boundary.
+    driver_loss_injection: Mutex<Option<DeviceLossPoint>>,
     queue_families: Vec<u32>,
     queues: Vec<vk::Queue>,
     next_queue: AtomicUsize,
@@ -519,6 +732,11 @@ impl VulkanContext {
                 .extension_name_as_c_str()
                 .is_ok_and(|name| name == external_memory_host::NAME)
         });
+        let has_device_fault = extensions.iter().any(|extension| {
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|name| name == device_fault::NAME)
+        });
         let enabled_extensions = if has_external_memory_host {
             vec![external_memory_host::NAME.as_ptr()]
         } else {
@@ -564,6 +782,10 @@ impl VulkanContext {
                 min_alignment: host_properties.min_imported_host_pointer_alignment,
             }
         });
+        // The fault query is diagnostic evidence, so the entry points are only
+        // loaded for a device that advertises the extension; an absent
+        // extension never fails device creation.
+        let device_fault = has_device_fault.then(|| device_fault::Device::new(&instance, &device));
 
         Ok(Self {
             entry: ManuallyDrop::new(entry),
@@ -571,6 +793,9 @@ impl VulkanContext {
             physical,
             device,
             external_memory_host,
+            device_fault,
+            device_fault_record: Mutex::new(None),
+            driver_loss_injection: Mutex::new(None),
             queue_families,
             queues,
             next_queue: AtomicUsize::new(0),
@@ -818,6 +1043,157 @@ impl VulkanContext {
 
     pub(crate) fn mark_device_lost(&self) {
         self.lock_lifecycle().mark_device_lost();
+    }
+
+    /// Diagnostic `VK_EXT_device_fault` record of the last observed loss.
+    ///
+    /// `None` until a loss is observed on this context.
+    pub(crate) fn last_device_fault(&self) -> Option<DeviceFaultSnapshot> {
+        self.device_fault_record
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Query `VK_EXT_device_fault` for the fault the driver last reported.
+    ///
+    /// The record is diagnostic evidence and never a gate. A device that does
+    /// not advertise the extension answers
+    /// [`DeviceFaultSnapshot::unavailable`]; a driver that does but refuses the
+    /// query answers the same shape with `extension_present == true` and no
+    /// addresses. Refusing a loss report because the diagnostics were
+    /// unavailable would throw away the loss itself.
+    fn query_device_fault(&self) -> DeviceFaultSnapshot {
+        let Some(loader) = self.device_fault.as_ref() else {
+            return DeviceFaultSnapshot::unavailable();
+        };
+        let mut snapshot = DeviceFaultSnapshot {
+            extension_present: true,
+            ..DeviceFaultSnapshot::unavailable()
+        };
+        // The driver reports the counts it wants to write first; the second
+        // call fills the arrays sized from that answer. `vendorBinarySize` is
+        // recorded but the binary itself is never requested: this is a
+        // diagnostic snapshot, not a crash dump.
+        let entry = loader.fp().get_device_fault_info_ext;
+        let mut counts = vk::DeviceFaultCountsEXT::default();
+        if unsafe { entry(loader.device(), &mut counts, std::ptr::null_mut()) }
+            != vk::Result::SUCCESS
+        {
+            return snapshot;
+        }
+        let mut addresses =
+            vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+        let mut vendor_infos =
+            vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+        let mut info = vk::DeviceFaultInfoEXT::<'_> {
+            p_address_infos: addresses.as_mut_ptr(),
+            p_vendor_infos: vendor_infos.as_mut_ptr(),
+            ..Default::default()
+        };
+        counts.address_info_count = addresses.len() as u32;
+        counts.vendor_info_count = vendor_infos.len() as u32;
+        if unsafe { entry(loader.device(), &mut counts, &mut info) } != vk::Result::SUCCESS {
+            return snapshot;
+        }
+        snapshot.description = info
+            .description_as_c_str()
+            .ok()
+            .map(|description| description.to_string_lossy().into_owned())
+            .filter(|description| !description.is_empty());
+        snapshot.addresses = addresses
+            .iter()
+            .take(counts.address_info_count as usize)
+            .map(|address| DeviceFaultAddress {
+                address_type: address.address_type.as_raw(),
+                reported_address: address.reported_address,
+                address_precision: address.address_precision,
+            })
+            .collect();
+        snapshot.vendor_info_count = counts.vendor_info_count;
+        snapshot.vendor_binary_size = counts.vendor_binary_size;
+        snapshot
+    }
+
+    /// Record one device loss observed at a driver boundary.
+    ///
+    /// This is the only bridge from a raw `VK_ERROR_DEVICE_LOST` into the core
+    /// lifecycle: the terminal state comes from
+    /// [`ProviderLifecycle::mark_device_lost`], so the instance stops admitting
+    /// work through the documented `device_lost` refusal and every lease in the
+    /// lifecycle ledger retires as a teardown guarantee. The returned record is
+    /// the evidence the caller attaches to its error.
+    pub(crate) fn observe_device_loss(&self) -> DeviceFaultSnapshot {
+        let fault = self.query_device_fault();
+        if let Ok(mut record) = self.device_fault_record.lock() {
+            *record = Some(fault.clone());
+        }
+        self.mark_device_lost();
+        fault
+    }
+
+    /// Arm the test-only driver-answer substitution at one queue boundary.
+    fn arm_driver_loss_injection(&self, point: DeviceLossPoint) {
+        if let Ok(mut slot) = self.driver_loss_injection.lock() {
+            *slot = Some(point);
+        }
+    }
+
+    /// Consume the substitution armed for `point`, if any.
+    fn take_driver_loss_injection(&self, point: DeviceLossPoint) -> bool {
+        let Ok(mut slot) = self.driver_loss_injection.lock() else {
+            return false;
+        };
+        if *slot == Some(point) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `vkQueueSubmit` on one selected device queue.
+    ///
+    /// Every submission in this crate enqueues here, so the substitution sits
+    /// exactly where the driver's answer would arrive. An armed substitution
+    /// skips the call instead of overwriting a successful one: a device that
+    /// answers `VK_ERROR_DEVICE_LOST` has not executed the submission, and a
+    /// test that enqueued it anyway would leave real work in flight on a device
+    /// the provider is about to treat as gone.
+    pub(crate) fn submit_commands(
+        &self,
+        queue_index: usize,
+        submits: &[vk::SubmitInfo],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        if self.take_driver_loss_injection(DeviceLossPoint::Submit) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        let queue = *self
+            .queues
+            .get(queue_index)
+            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+        unsafe { self.device.queue_submit(queue, submits, fence) }
+    }
+
+    /// `vkWaitForFences` on one completion fence.
+    ///
+    /// A driver answer of `VK_ERROR_DEVICE_LOST` says nothing about whether the
+    /// fence was reached, so an armed substitution may only replace an answer
+    /// that observed completion: the real wait runs first, and a wait that
+    /// timed out keeps the substitution armed and reports the timeout it really
+    /// received. That is what lets the provider destroy the handles of a
+    /// waiting submission without leaving in-flight work behind.
+    pub(crate) fn wait_for_fence(
+        &self,
+        fence: vk::Fence,
+        timeout_ns: u64,
+    ) -> Result<(), vk::Result> {
+        let wait = unsafe { self.device.wait_for_fences(&[fence], true, timeout_ns) };
+        if wait.is_ok() && self.take_driver_loss_injection(DeviceLossPoint::Wait) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        wait
     }
 
     fn abandon(self: &Arc<Self>, resources: ExecutionResources) {
@@ -1165,10 +1541,11 @@ pub(crate) fn execute_pool_sequence_with_status(
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
     {
-        // A device-loss-class failure is not the same as an observed device
-        // loss: the instance stops admitting work through the abandonment
-        // cause unless the submit path already marked the device lost.
-        context.mark_unobservable_submission();
+        // Every `DeviceLost`-class error is produced where a driver answer was
+        // observed, and that site already routed the loss through the core
+        // lifecycle. This is the fail-closed net: a loss-class error must never
+        // leave the instance admitting work, whatever path produced it.
+        context.mark_device_lost();
     }
     result
 }
@@ -1273,17 +1650,20 @@ impl PendingExecution {
         resources
             .record(&translated, plans, queue_index)
             .map_err(encode_error)?;
-        if let Err(error) = resources.submit(queue_index) {
-            let device_lost = error.is_device_lost();
-            if error.is_pending() {
-                if device_lost {
-                    resources.mark_device_lost();
-                    context.mark_device_lost();
-                } else {
-                    context.abandon(resources);
-                }
+        if let Err(failure) = resources.submit(queue_index) {
+            // The provider error is built while `resources` is still owned, so
+            // the fault record observed at the driver boundary is attached
+            // before an abandonment hands the resources to the context.
+            let abandon = failure.is_pending() && !failure.is_device_lost();
+            let error = resources.attach_device_loss_fault(failure.into_provider());
+            // `ExecutionResources::submit` already routed a driver-reported
+            // device loss through the core lifecycle and marked its own
+            // handles for destruction. Only an unobservable submission that is
+            // *not* a loss is abandoned, which retains its handles.
+            if abandon {
+                context.abandon(resources);
             }
-            return Err(error.into_provider());
+            return Err(error);
         }
         Ok(Self {
             resources,
@@ -1298,9 +1678,12 @@ impl PendingExecution {
             self.resources.completed = true;
             return Ok(true);
         }
-        self.resources
-            .wait(timeout_ns)
-            .map_err(SubmissionFailure::into_provider)
+        match self.resources.wait(timeout_ns) {
+            Ok(retired) => Ok(retired),
+            Err(failure) => Err(self
+                .resources
+                .attach_device_loss_fault(failure.into_provider())),
+        }
     }
 
     pub(crate) fn read_updates(&self) -> Result<Vec<BufferUpdate>, ProviderError> {
@@ -2192,6 +2575,8 @@ struct ExecutionResources {
     submitted: bool,
     completed: bool,
     device_lost: bool,
+    /// `VK_EXT_device_fault` record of the loss this submission observed.
+    device_loss_fault: Option<DeviceFaultSnapshot>,
     leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
     /// Sampled textures addressed by their Metal argument index.
@@ -2250,10 +2635,27 @@ impl ExecutionFailure {
         } else {
             completion
         };
-        ProviderError::new(phase, class, slug)
+        let mut error = ProviderError::new(phase, class, slug)
             .expect("static Vulkan error slug")
             .with_completion(completion)
-            .with_detail(self.detail)
+            .with_detail(self.detail);
+        if device_lost {
+            // The driver's own answer is the evidence for a loss, and the
+            // documented recovery is the same one the core refusal spells:
+            // recreate the provider. Other failures keep the caller's class and
+            // retryability and carry the driver text in `detail` only.
+            error.retryability = Retryability::RetryAfterRecreate;
+            error = error
+                .with_field(
+                    "vk_result",
+                    FieldValue::Text(vk_result_name(vk::Result::ERROR_DEVICE_LOST)),
+                )
+                .with_field(
+                    "vk_result_raw",
+                    FieldValue::Signed(i64::from(vk::Result::ERROR_DEVICE_LOST.as_raw())),
+                );
+        }
+        error
     }
 
     fn into_readback_provider(self) -> ProviderError {
@@ -2518,6 +2920,7 @@ impl ExecutionResources {
             submitted: false,
             completed: false,
             device_lost: false,
+            device_loss_fault: None,
             leak_is_budgeted: false,
             buffers: Vec::new(),
             textures: Vec::new(),
@@ -2544,6 +2947,15 @@ impl ExecutionResources {
 
     fn mark_device_lost(&mut self) {
         self.device_lost = true;
+    }
+
+    /// Attach the fault record of this submission's device loss, if it
+    /// observed one, and hand the provider error on unchanged otherwise.
+    fn attach_device_loss_fault(&mut self, error: ProviderError) -> ProviderError {
+        match self.device_loss_fault.take() {
+            Some(fault) => with_device_fault_evidence(error, &fault),
+            None => error,
+        }
     }
 
     fn retain_after_budgeted_abandon(&mut self) {
@@ -3454,18 +3866,27 @@ impl ExecutionResources {
         })?;
         let commands = [self.command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        if let Err(error) = unsafe {
-            self.context
-                .device
-                .queue_submit(self.context.queues[queue_index], &submits, self.fence)
-        } {
-            // The queue did not confirm the submission, so nothing about this
-            // context may be reused: the outcome of the fence is unknown.
-            self.context.mark_unobservable_submission();
+        if let Err(result) = self
+            .context
+            .submit_commands(queue_index, &submits, self.fence)
+        {
             let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
-                error,
-                format!("submit compute command buffer: {error}"),
+                result,
+                format!("submit compute command buffer: {result}"),
             ));
+            if failure.is_device_lost() {
+                // A driver-reported loss is a terminal device event, not an
+                // execution failure: the queue never confirmed the submission,
+                // and the device is gone, so these handles are destroyed
+                // instead of retained (`resource_drop_policy`).
+                self.mark_device_lost();
+                self.device_loss_fault = Some(self.context.observe_device_loss());
+            } else {
+                // The queue did not confirm the submission, so nothing about
+                // this context may be reused: the outcome of the fence is
+                // unknown.
+                self.context.mark_unobservable_submission();
+            }
             self.submitted = failure.is_pending();
             return Err(failure);
         }
@@ -3475,11 +3896,7 @@ impl ExecutionResources {
     }
 
     fn wait(&mut self, timeout_ns: u64) -> Result<bool, SubmissionFailure> {
-        let wait = unsafe {
-            self.context
-                .device
-                .wait_for_fences(&[self.fence], true, timeout_ns)
-        };
+        let wait = self.context.wait_for_fence(self.fence, timeout_ns);
         match wait {
             Ok(()) => {
                 if !self.completed {
@@ -3489,13 +3906,29 @@ impl ExecutionResources {
                 Ok(true)
             }
             Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
-            Err(error) => {
+            Err(result) if result == vk::Result::ERROR_DEVICE_LOST => {
+                // The loss is observed while waiting, so the submission
+                // reached the queue and its handles are still unknowns: the
+                // resources stay submitted and are destroyed by the device
+                // loss, and the context stops admitting work through the core
+                // lifecycle.
+                self.mark_device_lost();
+                self.device_loss_fault = Some(self.context.observe_device_loss());
+                Err(SubmissionFailure::Pending {
+                    phase: ProviderPhase::Wait,
+                    error: ExecutionFailure::vulkan(
+                        result,
+                        format!("wait for compute completion failed: {result}"),
+                    ),
+                })
+            }
+            Err(result) => {
                 self.context.mark_unobservable_submission();
                 Err(SubmissionFailure::Pending {
                     phase: ProviderPhase::Wait,
                     error: ExecutionFailure::vulkan(
-                        error,
-                        format!("wait for compute completion failed: {error}"),
+                        result,
+                        format!("wait for compute completion failed: {result}"),
                     ),
                 })
             }
@@ -5702,5 +6135,450 @@ mod tests {
         // The marking is scheduler state: two submissions neither consume it
         // nor end the context that admits them.
         assert_eq!(executor.queue_priorities(), installed);
+    }
+
+    // -------------------------------------------------------------------
+    // Real device-loss path: the driver's answer at a queue boundary.
+    // -------------------------------------------------------------------
+
+    use metal_api_core::provider::{
+        AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView, CompletionPolicy,
+        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
+        DispatchType, LeaseReservation, OperationId, ResourceTableSnapshot, SubmissionId,
+        TerminalLeaseState, TerminalState, TracePass, ValidatedComputeTrace, ViewId,
+        PROVIDER_SCHEMA_VERSION,
+    };
+
+    /// The fault-address-name mapping the evidence field reports.
+    #[test]
+    fn device_fault_evidence_names_every_reported_address() {
+        let snapshot = DeviceFaultSnapshot {
+            extension_present: true,
+            description: Some("page fault".to_owned()),
+            addresses: vec![
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::READ_INVALID.as_raw(),
+                    reported_address: 0x1000,
+                    address_precision: 0x40,
+                },
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::WRITE_INVALID.as_raw(),
+                    reported_address: 0x2000,
+                    address_precision: 0x10,
+                },
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_FAULT.as_raw(),
+                    reported_address: 0x3000,
+                    address_precision: 4,
+                },
+                DeviceFaultAddress {
+                    address_type: 99,
+                    reported_address: 0x4000,
+                    address_precision: 1,
+                },
+                // Beyond the reported cap: counted, not listed.
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::NONE.as_raw(),
+                    reported_address: 0x5000,
+                    address_precision: 1,
+                },
+            ],
+            vendor_info_count: 2,
+            vendor_binary_size: 4096,
+        };
+        let fields: BTreeMap<String, FieldValue> = snapshot.evidence_fields().into_iter().collect();
+        assert_eq!(
+            fields.get("device_fault_extension"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert_eq!(
+            fields.get("device_fault_description"),
+            Some(&FieldValue::Text("page fault".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(5))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_0"),
+            Some(&FieldValue::Text("READ_INVALID".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_0"),
+            Some(&FieldValue::Unsigned(0x1000))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_precision_0"),
+            Some(&FieldValue::Unsigned(0x40))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_1"),
+            Some(&FieldValue::Text("WRITE_INVALID".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_2"),
+            Some(&FieldValue::Text("INSTRUCTION_POINTER_FAULT".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_3"),
+            Some(&FieldValue::Text("UNKNOWN".to_owned()))
+        );
+        assert!(
+            !fields.contains_key("device_fault_address_type_4"),
+            "the listing is capped at {DEVICE_FAULT_ADDRESS_FIELDS} addresses"
+        );
+        assert_eq!(
+            fields.get("device_fault_vendor_infos"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            fields.get("device_fault_vendor_binary_size"),
+            Some(&FieldValue::Unsigned(4096))
+        );
+
+        // An unavailable record is evidence too, and it never claims a fault.
+        let unavailable: BTreeMap<String, FieldValue> = DeviceFaultSnapshot::unavailable()
+            .evidence_fields()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            unavailable.get("device_fault_extension"),
+            Some(&FieldValue::Bool(false))
+        );
+        assert_eq!(
+            unavailable.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert!(!unavailable.contains_key("device_fault_description"));
+    }
+
+    /// Only a loss carries the raw `vk::Result`: the field means "the driver
+    /// answered this", so an ordinary failure must not claim it.
+    #[test]
+    fn device_loss_error_carries_the_raw_vk_result_and_the_documented_recovery() {
+        let lost = ExecutionFailure::vulkan(vk::Result::ERROR_DEVICE_LOST, "queue device lost")
+            .into_provider(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Execute,
+                "vulkan-queue-submit",
+                CompletionDisposition::SubmittedUnknown { token: None },
+            );
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(lost.slug, "vulkan-queue-submit");
+        assert_eq!(lost.phase, ProviderPhase::Submit);
+        assert_eq!(lost.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            lost.fields.get("vk_result"),
+            Some(&FieldValue::Text("VK_ERROR_DEVICE_LOST".to_owned()))
+        );
+        assert_eq!(
+            lost.fields.get("vk_result_raw"),
+            Some(&FieldValue::Signed(i64::from(
+                vk::Result::ERROR_DEVICE_LOST.as_raw()
+            )))
+        );
+        assert_eq!(lost.detail.as_deref(), Some("queue device lost"));
+
+        let ordinary = ExecutionFailure::vulkan(vk::Result::ERROR_UNKNOWN, "queue unknown")
+            .into_provider(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Execute,
+                "vulkan-queue-submit",
+                CompletionDisposition::SubmittedUnknown { token: None },
+            );
+        assert_eq!(ordinary.class, ProviderErrorClass::Execute);
+        assert_eq!(ordinary.retryability, Retryability::Unknown);
+        assert!(!ordinary.fields.contains_key("vk_result"));
+        assert!(!ordinary.fields.contains_key("vk_result_raw"));
+    }
+
+    /// A provider over a fresh device, or `None` when the box has none.
+    fn device_loss_executor() -> Option<Arc<VulkanExecutor>> {
+        match VulkanExecutor::new() {
+            Ok(executor) => Some(executor),
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                None
+            }
+        }
+    }
+
+    /// A one-dispatch owner-readback trace over the shared `copy_word` fixture.
+    ///
+    /// The fixture reads binding 0 and writes binding 1, so a writeback proves
+    /// the device executed the submission that carried the fence.
+    fn copy_word_trace(
+        provider: &VulkanComputeProvider,
+        executor: &Arc<VulkanExecutor>,
+    ) -> (ComputeTrace, ResourceTableSnapshot) {
+        let device = metal_api_core::Device::new(
+            Arc::clone(executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_copy_word.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("copy_word")
+            .expect("the fixture entry exists");
+        let pipeline = provider
+            .compile_pipeline(
+                &function,
+                SemanticDigest::new("metal-smoke-fixture-v1", b"driver_device_loss".to_vec())
+                    .expect("digest"),
+            )
+            .expect("the fixture pipeline compiles");
+        let mut buffers = Vec::new();
+        for (index, offset, bytes) in [
+            (0_u32, 8_u64, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1_u32, 16_u64, vec![0_u8; 4]),
+        ] {
+            let access = pipeline
+                .contract
+                .buffer_bindings
+                .iter()
+                .find(|binding| binding.metal_binding == index)
+                .expect("fixture binding is reflected")
+                .access;
+            buffers.push(BufferView {
+                view_id: ViewId::new(200 + u64::from(index)),
+                metal_binding: index,
+                allocation_id: AllocationId::new(100 + u64::from(index)),
+                offset,
+                length: u64::try_from(bytes.len()).expect("fixture byte length"),
+                access,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(bytes),
+            });
+        }
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: pipeline.device_epoch,
+            operation_id: OperationId::new(77),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Compute(ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers,
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            })],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        for view in &trace.passes[0]
+            .as_compute()
+            .expect("fixture pass is a compute pass")
+            .buffers
+        {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: view.allocation_id,
+                    owner_epoch: trace.device_epoch,
+                    size: view.offset + view.length + 8,
+                })
+                .expect("fixture allocation registers");
+        }
+        (trace, resources)
+    }
+
+    fn admitted_trace(
+        provider: &VulkanComputeProvider,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> ValidatedComputeTrace {
+        provider
+            .capabilities()
+            .validate_trace(trace.clone(), resources.clone())
+            .expect("the fixture trace admits")
+    }
+
+    /// A loss reported by `vkQueueSubmit` or `vkWaitForFences`.
+    ///
+    /// Both boundaries answer the same way: the raw result arrives as a
+    /// structured `device_lost`, the core lifecycle reports `DeviceLost`, every
+    /// in-flight lease retires, later submissions are refused with the same
+    /// typed reason, and only a recreated provider resumes work.
+    #[test]
+    fn driver_reported_submit_loss_is_terminal_and_keeps_vk_result_evidence() {
+        assert_driver_loss_is_terminal(DeviceLossPoint::Submit);
+    }
+
+    #[test]
+    fn driver_reported_wait_loss_is_terminal_and_keeps_vk_result_evidence() {
+        assert_driver_loss_is_terminal(DeviceLossPoint::Wait);
+    }
+
+    fn assert_driver_loss_is_terminal(point: DeviceLossPoint) {
+        let Some(executor) = device_loss_executor() else {
+            return;
+        };
+        let provider =
+            VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider creates");
+        let (trace, resources) = copy_word_trace(&provider, &executor);
+        let context = Arc::clone(&executor.context);
+        assert_eq!(context.health(), ProviderHealth::Usable);
+
+        // The owner mapping an in-flight submission reads. The lifecycle
+        // ledger is the teardown authority for it (`research/docs/13` §5): a
+        // device loss releases every lease even when no completion was ever
+        // observed.
+        let lease_id = LeaseId::new(7);
+        let lease_token = CompletionToken {
+            submission_id: SubmissionId::new(1),
+            device_epoch: provider.device_epoch(),
+        };
+        {
+            let mut lifecycle = context.lock_lifecycle();
+            lifecycle
+                .leases_mut()
+                .register(LeaseReservation {
+                    lease: BufferLease {
+                        lease_id,
+                        allocation_id: AllocationId::new(100),
+                        owner_epoch: provider.device_epoch(),
+                    },
+                    offset: 0,
+                    length: 4,
+                })
+                .expect("the in-flight lease registers");
+            lifecycle
+                .leases_mut()
+                .bind(lease_id, lease_token)
+                .expect("the submission token binds to the lease");
+        }
+        assert_eq!(
+            context.lock_lifecycle().leases().leased(),
+            vec![(lease_id, TerminalLeaseState::Outstanding(1))],
+            "the lease is held while the submission is in flight"
+        );
+
+        executor.inject_driver_device_loss_for_test(point);
+        let error = provider
+            .submit(admitted_trace(&provider, &trace, &resources))
+            .expect_err("the substituted driver answer refuses the submission");
+
+        // 1. The first error is structured and carries the driver's own answer.
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+        let (expected_phase, expected_slug, expected_enqueues) = match point {
+            DeviceLossPoint::Submit => (ProviderPhase::Submit, "vulkan-queue-submit", 0),
+            DeviceLossPoint::Wait => (ProviderPhase::Wait, "vulkan-wait", 1),
+        };
+        assert_eq!(error.phase, expected_phase);
+        assert_eq!(error.slug, expected_slug);
+        assert_eq!(
+            error.fields.get("vk_result"),
+            Some(&FieldValue::Text("VK_ERROR_DEVICE_LOST".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("vk_result_raw"),
+            Some(&FieldValue::Signed(i64::from(
+                vk::Result::ERROR_DEVICE_LOST.as_raw()
+            )))
+        );
+        let CompletionDisposition::DeviceLost { token: Some(token) } = error.completion else {
+            panic!("the loss error lost its submission token: {error:?}");
+        };
+        let observed: usize = context.queue_submission_counts().iter().sum();
+        assert_eq!(
+            observed, expected_enqueues,
+            "a submit-time loss never reaches the driver; a wait-time loss does"
+        );
+        // The device-fault snapshot is evidence, and its absence is not an
+        // error: a device without `VK_EXT_device_fault` answers an empty record.
+        let fault = executor
+            .last_device_fault()
+            .expect("the loss recorded a fault snapshot");
+        assert_eq!(
+            error.fields.get("device_fault_extension"),
+            Some(&FieldValue::Bool(fault.extension_present))
+        );
+        assert_eq!(
+            error.fields.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(fault.addresses.len() as u64))
+        );
+        if !fault.extension_present {
+            assert!(fault.addresses.is_empty());
+            assert!(fault.description.is_none());
+        }
+
+        // 2. Health and the lease ledger come from the core lifecycle.
+        assert_eq!(context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(context.lock_lifecycle().state(), TerminalState::DeviceLost);
+        let lifecycle = context.lock_lifecycle();
+        assert!(lifecycle.leases().is_device_lost());
+        assert_eq!(
+            lifecycle.leases().leased(),
+            vec![(lease_id, TerminalLeaseState::Released)],
+            "a lost device is a teardown guarantee for in-flight leases"
+        );
+        assert!(lifecycle.leases().release_ready(lease_id));
+        drop(lifecycle);
+
+        // 3. Later submissions answer the same typed refusal, and the refusal
+        // itself is idempotent: two calls compare equal, token included.
+        let first = context.admit().expect_err("a lost context admits no work");
+        let second = context.admit().expect_err("a lost context admits no work");
+        assert_eq!(first, second);
+        assert_eq!(first.slug, "device_lost");
+        assert_eq!(first.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(first.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            first.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".to_owned()))
+        );
+        for _ in 0..2 {
+            let refused = provider
+                .submit(admitted_trace(&provider, &trace, &resources))
+                .expect_err("a lost provider admits no work");
+            assert_eq!(refused.slug, "device_lost");
+            assert_eq!(refused.class, ProviderErrorClass::DeviceLost);
+            assert_eq!(
+                refused.fields.get("terminal"),
+                Some(&FieldValue::Text("device_lost".to_owned()))
+            );
+        }
+
+        // 4. The lost instance is not reusable, and recreation is the repair.
+        assert_eq!(provider.health(), ProviderHealth::DeviceLost);
+        assert_eq!(context.abandonment_stats(), (0, 0));
+        let Some(recovered_executor) = device_loss_executor() else {
+            return;
+        };
+        let recovered = VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+            .expect("the recreated provider");
+        let (trace, resources) = copy_word_trace(&recovered, &recovered_executor);
+        let submission = recovered
+            .submit(admitted_trace(&recovered, &trace, &resources))
+            .expect("a recreated provider admits work");
+        assert_eq!(recovered.health(), ProviderHealth::Usable);
+        let [writeback] = submission.writebacks.as_slice() else {
+            panic!("the recovered submission needs exactly one writeback");
+        };
+        assert_eq!(writeback.bytes, 0x6745_2301_u32.to_le_bytes());
+        assert!(matches!(
+            submission.completion,
+            CompletionDisposition::CompletedVisible { .. }
+        ));
+        eprintln!(
+            "PASS driver_device_loss point={point:?} phase={expected_phase:?} slug={expected_slug} \
+             vk_result=VK_ERROR_DEVICE_LOST raw={} enqueues={observed} health={:?} \
+             leases=Released fault_extension={} fault_addresses={} token={} recovered=exact",
+            vk::Result::ERROR_DEVICE_LOST.as_raw(),
+            provider.health(),
+            fault.extension_present,
+            fault.addresses.len(),
+            token.submission_id.get(),
+        );
     }
 }
