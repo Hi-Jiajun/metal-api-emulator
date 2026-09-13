@@ -48,6 +48,30 @@ def validate_probe(probe):
         raise NativeRunError("probe: eligibility and capabilities disagree")
 
 
+def validate_present_selftest(report):
+    """One present self-test report carries exactly one writeback and one
+    allocation, both the reviewed 2x2 present target (`4080c0ff` four times),
+    and never the `fefefefe` sentinel (`research/docs/24` §6 Step 7).
+
+    The CI step reuses this instead of inlining its byte comparison, so the
+    comparison is exercised by `test_run_native.py` on a host without Metal.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("present selftest: report is not an object")
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError("present selftest: completion is not CompletedVisible")
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    expected = "4080c0ff" * 4
+    observed = [entry.get("bytes_hex") for entry in writebacks + allocations]
+    if observed != [expected, expected]:
+        raise NativeRunError(
+            "present selftest: observed bytes " + repr(observed)
+            + " do not match the reviewed target " + expected
+        )
+    return observed
+
+
 def run_capture(oracle, suite_path, output_dir, *, require_metal=False, revision=None,
                 run_command=subprocess.run):
     """Create a new evidence directory. A partial or failed capture cannot pass."""
