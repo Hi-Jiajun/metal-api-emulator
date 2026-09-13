@@ -976,6 +976,76 @@ fn concurrent_async_commands_serialize_on_overlapping_reservations() {
     assert_eq!(b.read().unwrap(), vec![2, 2, 4, 4, 4, 4, 2, 2]);
 }
 
+/// Ranged reservations: while one asynchronous command keeps a range of an
+/// allocation reserved, a sibling commit of a disjoint range of the same
+/// allocation must still be accepted. A whole-allocation reservation would
+/// park it until the first command completed. The channel timeout keeps the
+/// regression a failure instead of a hang.
+#[test]
+fn disjoint_ranges_of_one_allocation_stay_in_flight_together() {
+    let (provider, device) = setup();
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "0");
+    let shared = device.new_buffer_with_bytes(vec![7_u8; 8]).unwrap();
+    let low = shared.view(0, 4).unwrap();
+    let high = shared.view(4, 4).unwrap();
+    let first = command(&device, &pipeline, &[(0, &low)]);
+    let second = command(&device, &pipeline, &[(0, &high)]);
+    first.commit().unwrap();
+    let second = std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sibling = scope.spawn(move || {
+            let outcome = second.commit();
+            let _ = tx.send(());
+            (outcome, second)
+        });
+        let committed = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        if !committed {
+            // Unblock the sibling so the scope can join before reporting.
+            first.wait_until_completed().unwrap();
+        }
+        assert!(
+            committed,
+            "a disjoint range of one allocation waited for an in-flight sibling (whole-allocation reservation)"
+        );
+        let (outcome, second) = sibling.join().unwrap();
+        assert_eq!(outcome, Ok(()));
+        second
+    });
+    first.wait_until_completed().unwrap();
+    second.wait_until_completed().unwrap();
+}
+
+/// The negative side of the same probe: an overlapping range must keep waiting
+/// for the in-flight command to complete.
+#[test]
+fn overlapping_ranges_of_one_allocation_still_serialize() {
+    let (provider, device) = setup();
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let pipeline = pipeline(&device, "0");
+    let shared = device.new_buffer_with_bytes(vec![7_u8; 8]).unwrap();
+    let low = shared.view(0, 4).unwrap();
+    let overlapping = shared.view(2, 4).unwrap();
+    let first = command(&device, &pipeline, &[(0, &low)]);
+    let second = command(&device, &pipeline, &[(0, &overlapping)]);
+    first.commit().unwrap();
+    let second = std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sibling = scope.spawn(move || {
+            let outcome = second.commit();
+            let _ = tx.send(());
+            (outcome, second)
+        });
+        let blocked = rx.recv_timeout(Duration::from_millis(500)).is_err();
+        first.wait_until_completed().unwrap();
+        assert!(blocked, "an overlapping range did not serialize");
+        let (outcome, second) = sibling.join().unwrap();
+        assert_eq!(outcome, Ok(()));
+        second
+    });
+    second.wait_until_completed().unwrap();
+}
+
 #[test]
 fn invalid_compile_metadata_is_refused_and_retired() {
     let (provider, device) = setup();

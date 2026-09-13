@@ -128,6 +128,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_object_queue_ordering()?;
     run_object_disjoint_views()?;
     run_object_parallel_commands()?;
+    run_object_same_allocation_parallel()?;
     run_object_serial_dependency()?;
     run_object_concurrent_enqueue()?;
     run_device_lifecycle()?;
@@ -2040,6 +2041,100 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
 /// submissions stay in flight at once. The test is a host-reservation
 /// granularity check; it does not claim overlapping GPU execution or
 /// multi-queue scheduling.
+/// Two command buffers whose ranges are disjoint but live in the same
+/// allocation must both be in flight. Under whole-allocation reservations the
+/// second commit stays parked until the first completes, and the receive
+/// timeout below reports that instead of hanging.
+fn run_object_same_allocation_parallel() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_same_allocation_parallel".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile same-allocation fixture: {error:?}"))?;
+    let word_a = 0x3333_3333_u32.to_le_bytes();
+    let word_b = 0x4444_4444_u32.to_le_bytes();
+    // One 16-byte allocation carries two independent source/target pairs, so
+    // both commands reserve ranges of the same allocation.
+    let mut image = vec![0_u8; 16];
+    image[0..4].copy_from_slice(&word_a);
+    image[8..12].copy_from_slice(&word_b);
+    let shared = device.new_buffer_with_bytes(image)?;
+    let source_a = shared.view(0, 4)?;
+    let target_a = shared.view(4, 4)?;
+    let source_b = shared.view(8, 4)?;
+    let target_b = shared.view(12, 4)?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source_a)?;
+        encoder.set_buffer(1, &target_a)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source_b)?;
+        encoder.set_buffer(1, &target_b)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    first.commit()?;
+    let (committed, wait_for_commit) = std::sync::mpsc::channel();
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second same-allocation commit: {error:?}"))?;
+        committed
+            .send(())
+            .map_err(|_| "same-allocation commit signal receiver dropped".to_string())?;
+        Ok::<_, String>(second)
+    });
+    wait_for_commit
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "a disjoint range of one allocation blocked on the first reservation")?;
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "same-allocation commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    let observed = shared.read()?;
+    if observed[0..4] != word_a
+        || observed[4..8] != word_a
+        || observed[8..12] != word_b
+        || observed[12..16] != word_b
+    {
+        return Err(format!("same-allocation writebacks differ: {observed:02x?}").into());
+    }
+    println!(
+        "PASS provider_object_same_allocation_parallel command_buffers=2 allocation=1 views=4 in_flight=2 writeback=exact"
+    );
+    Ok(())
+}
 fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
     let executor = VulkanExecutor::new()?;
     let provider = Arc::new(

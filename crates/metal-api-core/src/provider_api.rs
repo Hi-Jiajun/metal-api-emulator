@@ -15,12 +15,12 @@
 //! [`crate::ComputeExecutor`] object API.
 
 use crate::provider::{
-    self as contract, AllocationId, AllocationRecord, BufferRange, BufferSource, BufferWriteback,
-    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionToken,
-    ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType, OperationId,
-    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, ViewId, MAX_SERIAL_RESOURCES,
-    PROVIDER_SCHEMA_VERSION,
+    self as contract, AllocationId, AllocationRecord, BufferAccess, BufferRange, BufferSource,
+    BufferWriteback, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    CompletionToken, ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType,
+    OperationId, PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities,
+    ProviderError, ProviderHealth, ProviderSubmission, ResourceTableSnapshot, ViewId,
+    MAX_SERIAL_RESOURCES, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -194,7 +194,7 @@ impl Device {
                 allocation_id: AllocationId::new(next_id()?),
                 length,
                 bytes: Mutex::new(bytes),
-                reservations: Mutex::new(0),
+                reservations: Mutex::new(Vec::new()),
                 available: Condvar::new(),
             }),
         })
@@ -235,8 +235,30 @@ struct BufferInner {
     allocation_id: AllocationId,
     length: usize,
     bytes: Mutex<Vec<u8>>,
-    reservations: Mutex<usize>,
+    reservations: Mutex<Vec<RangeHold>>,
     available: Condvar,
+}
+
+/// One in-flight byte range held by a submission, tagged with the reservation
+/// that owns it so release removes exactly its own entries.
+struct RangeHold {
+    reservation: u64,
+    start: usize,
+    end: usize,
+    write: bool,
+}
+
+impl RangeHold {
+    /// Ranged hazard rule from `research/docs/14` §3.2: an overlap conflicts
+    /// when at least one side writes, so read-read pairs never conflict.
+    fn conflicts(&self, start: usize, end: usize, write: bool) -> bool {
+        self.start < end && start < self.end && (write || self.write)
+    }
+}
+
+/// True when any in-flight range conflicts with `[start, end)`.
+fn ranges_conflict(holds: &[RangeHold], start: usize, end: usize, write: bool) -> bool {
+    holds.iter().any(|hold| hold.conflicts(start, end, write))
 }
 
 /// Fixed-size CPU storage. Reads and writes wait while a command uses it.
@@ -249,11 +271,11 @@ impl Buffer {
         self.inner.allocation_id
     }
     pub fn read(&self) -> Result<Vec<u8>, Error> {
-        Ok(self.lock_unreserved()?.clone())
+        Ok(self.lock_unreserved(0, self.inner.length, false)?.clone())
     }
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         let end = checked_range(offset, bytes.len(), self.inner.length)?;
-        self.lock_unreserved()?[offset..end].copy_from_slice(bytes);
+        self.lock_unreserved(offset, end, true)?[offset..end].copy_from_slice(bytes);
         Ok(())
     }
     /// Allocate a distinct logical view. Clone the returned view to reuse its
@@ -271,15 +293,20 @@ impl Buffer {
         })
     }
 
-    /// Wait until no command reserves this allocation, then hold its bytes.
-    /// A reservation may be acquired between the count check and this lock;
-    /// re-check under the bytes guard and retry so CPU access is linearized
-    /// either completely before the commit-time snapshot or completely after
-    /// the command releases its reservation.
-    fn lock_unreserved(&self) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
+    /// Wait until no in-flight range conflicts with `[start, end)`, then hold
+    /// the bytes. A reservation may be acquired between the conflict check and
+    /// this lock; re-check under the bytes guard and retry so CPU access is
+    /// linearized either completely before the commit-time snapshot or
+    /// completely after the command releases its range.
+    fn lock_unreserved(
+        &self,
+        start: usize,
+        end: usize,
+        write: bool,
+    ) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
         loop {
             let mut reservations = lock(&self.inner.reservations, "provider buffer reservation")?;
-            while *reservations != 0 {
+            while ranges_conflict(&reservations, start, end, write) {
                 reservations = self
                     .inner
                     .available
@@ -288,34 +315,58 @@ impl Buffer {
             }
             drop(reservations);
             let bytes = lock(&self.inner.bytes, "provider buffer")?;
-            if *lock(&self.inner.reservations, "provider buffer reservation")? == 0 {
+            let clear = !ranges_conflict(
+                &lock(&self.inner.reservations, "provider buffer reservation")?,
+                start,
+                end,
+                write,
+            );
+            if clear {
                 return Ok(bytes);
             }
             drop(bytes);
         }
     }
 
-    fn reserve(&self) -> Result<BufferReservation, Error> {
+    /// Register every range of one submission against this allocation, waiting
+    /// while any of them conflicts with an in-flight range. Disjoint commands
+    /// of one allocation therefore proceed instead of serializing on the whole
+    /// allocation; `research/docs/14` §5 step 3.
+    fn reserve_ranges(&self, ranges: &[(usize, usize, bool)]) -> Result<BufferReservation, Error> {
+        let identity = next_id()?;
         let mut reservations = lock(&self.inner.reservations, "provider buffer reservation")?;
-        while *reservations != 0 {
+        while ranges
+            .iter()
+            .any(|&(start, end, write)| ranges_conflict(&reservations, start, end, write))
+        {
             reservations = self
                 .inner
                 .available
                 .wait(reservations)
                 .map_err(|_| ApiError::StatePoisoned("provider buffer reservation"))?;
         }
-        *reservations = 1;
+        for &(start, end, write) in ranges {
+            reservations.push(RangeHold {
+                reservation: identity,
+                start,
+                end,
+                write,
+            });
+        }
         Ok(BufferReservation {
             inner: Arc::clone(&self.inner),
+            identity,
         })
     }
 }
 
-/// Exclusive commit-through-completion reservation for one allocation. The
-/// guard is `Send` so finalization may run on the waiting thread, and dropping
-/// it wakes CPU accessors even when a pending command is abandoned.
+/// Commit-through-completion reservation for a set of byte ranges of one
+/// allocation. The guard is `Send` so finalization may run on the waiting
+/// thread, and dropping it wakes CPU accessors and sibling commands even when a
+/// pending command is abandoned.
 struct BufferReservation {
     inner: Arc<BufferInner>,
+    identity: u64,
 }
 impl BufferReservation {
     fn allocation_id(&self) -> AllocationId {
@@ -327,9 +378,12 @@ impl BufferReservation {
 }
 impl Drop for BufferReservation {
     fn drop(&mut self) {
+        fn release(holds: &mut Vec<RangeHold>, identity: u64) {
+            holds.retain(|hold| hold.reservation != identity);
+        }
         match self.inner.reservations.lock() {
-            Ok(mut reservations) => *reservations = reservations.saturating_sub(1),
-            Err(poisoned) => *poisoned.into_inner() = 0,
+            Ok(mut reservations) => release(&mut reservations, self.identity),
+            Err(poisoned) => release(&mut poisoned.into_inner(), self.identity),
         }
         self.inner.available.notify_all();
     }
@@ -348,16 +402,33 @@ fn checked_range(offset: usize, length: usize, allocation_length: usize) -> Resu
         })
 }
 
-/// Reserve every allocation in identity order. All commands use the same order,
-/// so overlapping commands serialize while disjoint commands proceed.
+/// Reserve every range a command touches, allocating in identity order. All
+/// commands use the same order, so overlapping ranges serialize while disjoint
+/// ranges of one allocation proceed. A binding whose access the reflected
+/// contract does not describe is treated as a write, so an unknown binding can
+/// never widen concurrency.
 fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
-    let mut buffers = BTreeMap::<AllocationId, &Buffer>::new();
+    let mut buffers = BTreeMap::<AllocationId, (&Buffer, Vec<(usize, usize, bool)>)>::new();
     for pass in passes {
-        for view in pass.buffers.values() {
-            buffers.insert(view.allocation_id(), &view.buffer);
+        let metadata = pass.pipeline.metadata();
+        for (binding, view) in &pass.buffers {
+            let write = metadata
+                .contract
+                .buffer_bindings
+                .iter()
+                .find(|value| value.metal_binding == *binding)
+                .is_none_or(|value| value.access != BufferAccess::Read);
+            buffers
+                .entry(view.allocation_id())
+                .or_insert_with(|| (&view.buffer, Vec::new()))
+                .1
+                .push((view.offset, view.offset + view.length, write));
         }
     }
-    buffers.into_values().map(Buffer::reserve).collect()
+    buffers
+        .into_values()
+        .map(|(buffer, ranges)| buffer.reserve_ranges(&ranges))
+        .collect()
 }
 
 /// Validate every writeback range before copying any host byte, then land all

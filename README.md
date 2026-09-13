@@ -92,11 +92,17 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `copy_word` program, and the comparator compares that allocation as a single
   extent. Disjoint ranges cannot exchange data through the allocation because
   each view's footprint proof bounds its accesses inside its own half-open
-  range. This is not a concurrency claim: the whole allocation is still
-  reserved for the commit-to-completion window, so disjoint commands serialize.
-- Open design work: range-level reservations in the object API (so disjoint
-  commands of one allocation can overlap), device-loss reclamation beyond the
-  bounded abandonment budget, the cross-process completion transport and
+  range.
+- Ranged reservations: the object API reserves the byte ranges a command
+  actually touches, and a reservation conflicts only when the ranges overlap
+  and at least one side writes. Two command buffers that touch disjoint ranges
+  of one allocation are therefore both accepted and stay in flight together,
+  which `provider-smoke` checks on a real device. The host byte snapshot and
+  landing still take one whole-allocation guard, so a synchronous submit
+  excludes disjoint CPU access for its duration.
+- Open design work: splitting that host bytes guard per range, device-loss
+  reclamation beyond the bounded abandonment budget, the cross-process
+  completion transport and
   provider wiring (the core wire publisher and mirror now exist), provider-side
   lease import (the core `LeaseLedger` release contract now exists), general
   native shader admission and CPU uploads during command-buffer execution.

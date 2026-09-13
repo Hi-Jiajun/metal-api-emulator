@@ -48,12 +48,21 @@ and operation identities are generated internally. Limits remain at most eight
 serial passes and 64 views, additionally constrained by provider capabilities.
 
 Initial CPU bytes are read at commit time. The API reserves every participating
-buffer in allocation order and keeps those reservations until completion,
-validation and landing finish. Concurrent CPU reads/writes and overlapping
-commands wait for that boundary. Commands sharing buffers acquire reservations
-in the same order. Every readback and destination range is checked before the
-first host write, so an invalid later result cannot leave an earlier buffer
-partially updated.
+**byte range** in allocation order and keeps those reservations until
+completion, validation and landing finish. A reservation conflicts with an
+in-flight one when the ranges overlap and at least one side writes, so two
+commands that touch disjoint ranges of the same allocation are both accepted
+and stay in flight together; overlapping ranges and every CPU access that
+overlaps a reserved write keep waiting. Commands acquire reservations in the
+same order. Every readback and destination range is checked before the first
+host write, so an invalid later result cannot leave an earlier buffer partially
+updated.
+
+The reserved ranges are a hazard boundary, not a lock split of the host bytes:
+`execute` still snapshots and later lands a whole allocation under one bytes
+guard, so a synchronous `submit` excludes disjoint CPU access to the same
+allocation for its duration. Splitting that guard is part of the shared
+per-allocation device buffer work and is not claimed here.
 
 Provider implementations must not synchronously reenter these same object
 buffers during `submit`, `wait` or `readback`: the caller holds their
