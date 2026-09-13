@@ -27,12 +27,13 @@
 //! and one submission carries both rails' writebacks.
 
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
-    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
-    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue, LoadOp,
-    OperationId, PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    SemanticDigest, StoreOp, TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
+    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
+    InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
+    TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
@@ -612,4 +613,139 @@ fn admit_error(
     capabilities
         .admit(trace, resources)
         .expect_err("the trace is refused")
+}
+
+/// The `InitialState::Sentinel` bytes a present fixture pre-fills its target
+/// with. Distinct from both the rendered colour and the clear sentinel, so
+/// "the present never happened" (a readback still showing these bytes) is
+/// falsifiable (`docs/24` §3.1).
+const PRESENT_SENTINEL: [u8; 4] = [0xfe; 4];
+
+/// Attach the first increment's present action to a fixture's render pass: the
+/// target is the attachment's own allocation/view, handed on once in `Fifo`
+/// mode with a blocking acquire.
+fn presenting_fixture() -> Option<Fixture> {
+    let mut fixture = fixture(AttachmentFormat::Rgba8Unorm)?;
+    let Some(TracePass::Render(pass)) = fixture.trace.passes.last_mut() else {
+        panic!("the fixture ends in a render pass");
+    };
+    pass.present = Some(PresentDescriptor {
+        target: PresentTarget {
+            allocation_id: ATTACHMENT_ALLOCATION,
+            view_id: ATTACHMENT_VIEW,
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            image_count: 1,
+            initial: InitialState::Sentinel(PRESENT_SENTINEL.to_vec()),
+        },
+        source: ATTACHMENT_VIEW,
+        mode: PresentMode::Fifo,
+        acquire: AcquirePolicy::Blocking,
+    });
+    Some(fixture)
+}
+
+/// The milestone's present case end to end: one render pass hands its own 2×2
+/// attachment on as a present target, the target lands the fragment output
+/// (not the sentinel), and the submission counts exactly one acquire and one
+/// present (`research/docs/24` §6 Step 3).
+#[test]
+fn present_target_lands_rendered_bytes_and_counts_one_acquire_one_present() {
+    let Some(fixture) = presenting_fixture() else {
+        return;
+    };
+    let (acquires_before, presents_before) = fixture.provider.present_counts();
+
+    let writebacks = submit_fixture(&fixture);
+    let attachment = attachment_readback(&fixture, &writebacks);
+
+    assert_eq!(attachment.len(), 16);
+    assert_eq!(attachment, expected_texels(fixture.format).repeat(4));
+    assert!(
+        !attachment
+            .chunks_exact(4)
+            .any(|texel| texel == PRESENT_SENTINEL),
+        "a surviving present sentinel means the present never overwrote the target: {}",
+        hex(&attachment)
+    );
+    assert_ne!(PRESENT_SENTINEL, expected_texels(fixture.format));
+
+    // Exactly one acquire and one present for the single present action
+    // (`docs/24` §5.3).
+    let (acquires_after, presents_after) = fixture.provider.present_counts();
+    assert_eq!(
+        acquires_after - acquires_before,
+        1,
+        "one acquire per present action"
+    );
+    assert_eq!(
+        presents_after - presents_before,
+        1,
+        "one present per present action"
+    );
+
+    // The target is provider-owned, so it survives the submission (`docs/24`
+    // §3.3 rule 2) and stays reusable after `wait`.
+    assert_eq!(
+        fixture.provider.present_target_count(),
+        1,
+        "one present target stays alive after the submission"
+    );
+}
+
+/// A second present of the same allocation/view reuses the provider-owned
+/// target rather than recreating it: the target image survives across
+/// submissions until the lease is released (`docs/24` §5.2).
+#[test]
+fn a_second_present_reuses_the_same_target_image() {
+    let Some(fixture) = presenting_fixture() else {
+        return;
+    };
+    let first = submit_fixture(&fixture);
+    let second = submit_fixture(&fixture);
+
+    for writebacks in [first, second] {
+        let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+        assert_eq!(attachment, expected_texels(fixture.format).repeat(4));
+        assert!(
+            !attachment
+                .chunks_exact(4)
+                .any(|texel| texel == PRESENT_SENTINEL),
+            "the reused target still lands the fragment output, not the sentinel: {}",
+            hex(&attachment)
+        );
+    }
+
+    // Two presents, one target: reuse is observable as a stable target count.
+    assert_eq!(fixture.provider.present_target_count(), 1);
+    assert_eq!(fixture.provider.present_counts(), (2, 2));
+}
+
+/// The typed refusal for an unsupported snapshot is unchanged by the execution
+/// rail: a snapshot without the present bits still refuses a present-bearing
+/// trace with `present_targets_unsupported` before any resource action
+/// (`docs/24` §4.2).
+#[test]
+fn a_presenting_trace_is_refused_when_the_snapshot_declares_no_presentation() {
+    let Some(fixture) = presenting_fixture() else {
+        return;
+    };
+    let declared = fixture.provider.capabilities();
+    assert!(declared.supports_presentation);
+    declared
+        .admit(&fixture.trace, &fixture.resources)
+        .expect("the declared present bits admit the fixture");
+
+    let mut without_presentation = declared.clone();
+    without_presentation.supports_presentation = false;
+    without_presentation.max_present_targets = 0;
+    without_presentation.supported_present_modes.clear();
+    without_presentation.max_present_image_count = 0;
+    let refused = without_presentation
+        .admit(&fixture.trace, &fixture.resources)
+        .unwrap_err();
+    eprintln!("present bits off: refused: {refused:?}");
+    assert_eq!(refused.slug, "present_targets_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
 }

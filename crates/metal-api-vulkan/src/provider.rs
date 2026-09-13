@@ -10,8 +10,9 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
-    DispatchKind, FootprintProof, PipelineContract, ProviderCapabilities, SemanticDigest,
-    StorageMode, MAX_COLOR_ATTACHMENTS,
+    DispatchKind, FootprintProof, PipelineContract, PresentMode, ProviderCapabilities,
+    SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+    MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
 
@@ -59,15 +60,17 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
-        // Presentation stays undeclared: `research/docs/24` §4.2 schedules the
-        // bits here, but §6 Step 3 owns the "readable swapchain equivalent", so
-        // this snapshot names no present target at all and core admission
-        // refuses a present-bearing trace with `present_targets_unsupported`
-        // rather than running the render half and dropping the present.
-        supports_presentation: false,
-        max_present_targets: 0,
-        supported_present_modes: Vec::new(),
-        max_present_image_count: 0,
+        // Presentation is declared: `render.rs` executes the "readable
+        // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
+        // target, one `Fifo` present, single buffering. Evidence:
+        // `tests/render_e2e.rs` (2×2 target lands `40 80 c0 ff`×4 and counts
+        // acquire/present 1/1 on Lavapipe; see the run log). The bits name
+        // exactly that window, so a wider present request is still refused by
+        // core admission rather than silently narrowed.
+        supports_presentation: true,
+        max_present_targets: MAX_PRESENT_TARGETS as u32,
+        supported_present_modes: PresentMode::ADMITTED.to_vec(),
+        max_present_image_count: MAX_PRESENT_IMAGE_COUNT,
     }
 }
 
@@ -371,5 +374,19 @@ mod tests {
             AttachmentFormat::ADMITTED.to_vec()
         );
         assert!(capabilities.declares_render_support());
+        // The present bits name the readable-swapchain-equivalent window the
+        // rail executes (`research/docs/24` §6 Step 3): one target, Fifo only,
+        // single buffering.
+        assert!(capabilities.supports_presentation);
+        assert_eq!(capabilities.max_present_targets, MAX_PRESENT_TARGETS as u32);
+        assert_eq!(
+            capabilities.supported_present_modes,
+            PresentMode::ADMITTED.to_vec()
+        );
+        assert_eq!(
+            capabilities.max_present_image_count,
+            MAX_PRESENT_IMAGE_COUNT
+        );
+        assert!(capabilities.declares_presentation_support());
     }
 }

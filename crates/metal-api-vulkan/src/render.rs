@@ -29,6 +29,7 @@ use metal_api_core::provider::{
     ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp,
 };
 use std::ffi::{CStr, CString};
+use std::sync::{Arc, Mutex};
 
 use crate::VulkanContext;
 
@@ -271,6 +272,22 @@ pub(crate) fn execute_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
 ) -> Result<Vec<u8>, ProviderError> {
+    let request = prepare_render_request(stages, pass)?;
+    execute_offscreen_render(context, &request)
+}
+
+/// Validate one render pass against the pipeline it names and build the
+/// rail-side request both execution shapes consume.
+///
+/// Shared by [`execute_render_pass`] and [`execute_present_render`]: the two
+/// shapes disagree only about *which* image the pass renders into and whether a
+/// present tail action follows, not about the pass's own contract. Keeping the
+/// agreement check in one place means a present pass cannot reach execution
+/// through a weaker gate than the offscreen one.
+fn prepare_render_request<'a>(
+    stages: &'a RenderStages,
+    pass: &RenderPassDescriptor,
+) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
         .validate_against(pass)
@@ -328,7 +345,7 @@ pub(crate) fn execute_render_pass(
             spirv: &stages.vertex_spirv,
         },
     };
-    execute_offscreen_render(context, &request)
+    Ok(request)
 }
 
 /// Narrow one attachment dimension to the `u32` the Vulkan image extent uses.
@@ -539,6 +556,362 @@ pub(crate) fn execute_offscreen_render(
     Ok(texels)
 }
 
+/// One provider-owned presentable target image (`research/docs/24` §3.6).
+///
+/// Unlike the one-shot attachment [`OffscreenObjects`] creates per pass, this
+/// image is owned by the provider and survives every submission until the
+/// allocation lease it backs is released. That is what makes `docs/24` §3.3's
+/// second rule ("the target stays readable after `wait`") hold: the target's
+/// bytes have to remain observable after a submission, so the image cannot live
+/// in the pass's own drop scope (`docs/24` §5.2). It is created once per
+/// `(allocation, view)` identity and reused by later submissions that present
+/// the same target.
+///
+/// The image carries `TRANSFER_DST` in addition to the
+/// `COLOR_ATTACHMENT | TRANSFER_SRC` pair the offscreen attachment uses: the
+/// sentinel pre-fill (`docs/24` §3.1) uploads through
+/// `vkCmdClearColorImage`, which is a transfer-destination operation.
+pub(crate) struct PresentTargetImage {
+    context: Arc<VulkanContext>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// The layout the image is currently in. `UNDEFINED` until a sentinel is
+    /// preset or a pass has presented once; a preset sentinel ends in
+    /// `COLOR_ATTACHMENT_OPTIMAL`, and each present ends in
+    /// `TRANSFER_SRC_OPTIMAL` so the next render pass can start there.
+    layout: Mutex<vk::ImageLayout>,
+}
+
+impl PresentTargetImage {
+    pub(crate) fn create(
+        context: Arc<VulkanContext>,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+    ) -> Result<Self, ProviderError> {
+        let vk_format = attachment_vk_format(format)?;
+        let width = narrow_dimension(width)?;
+        let height = narrow_dimension(height)?;
+        if width == 0 || height == 0 {
+            return Err(contract_refusal("present target has a zero dimension"));
+        }
+        let tiling = vk::ImageTiling::OPTIMAL;
+        admit_color_attachment(&context, vk_format, tiling)?;
+        let features = format_features(&context, vk_format, tiling);
+        for (bit, name) in [
+            (vk::FormatFeatureFlags::TRANSFER_SRC, "transfer_src"),
+            (vk::FormatFeatureFlags::TRANSFER_DST, "transfer_dst"),
+        ] {
+            if !features.contains(bit) {
+                return Err(attachment_format_refusal()
+                    .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field("missing_feature", FieldValue::Text(name.to_owned()))
+                    .with_detail("a present target is read back and sentinel-preset"));
+            }
+        }
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, _) = crate::allocate_image_backing(
+            &context,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "present target",
+        )
+        .map_err(|error| execution_refusal("create present target image", &error.detail))?;
+        let view = crate::create_color_image_view(&context, image, vk_format, "present target")
+            .map_err(|error| execution_refusal("create present target view", &error.detail))?;
+        Ok(Self {
+            context,
+            image,
+            memory,
+            view,
+            layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+        })
+    }
+
+    /// Pre-fill the target with one sentinel texel tiled over the whole image,
+    /// then leave it in `COLOR_ATTACHMENT_OPTIMAL` for the pass that will clear
+    /// and draw over it (`docs/24` §3.1). `vkCmdClearColorImage` is the byte
+    /// upload, with the sentinel's four bytes mapped onto the format's
+    /// component order by the same [`clear_value_for`] the render clear uses.
+    pub(crate) fn preset_sentinel(
+        &mut self,
+        format: AttachmentFormat,
+        sentinel: &[u8],
+    ) -> Result<(), ProviderError> {
+        let context = &self.context;
+        let clear = ClearColor::new(
+            sentinel
+                .try_into()
+                .map_err(|_| contract_refusal("a present sentinel is exactly four bytes"))?,
+        );
+        crate::terminal_refusal(&context.lock_lifecycle())?;
+        let queue_index = select_graphics_queue(context)?;
+        let family = context
+            .queue_families
+            .get(queue_index)
+            .copied()
+            .ok_or_else(|| {
+                execution_refusal("preset present sentinel", "queue index is unknown")
+            })?;
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family);
+        let pool =
+            unsafe { context.device.create_command_pool(&pool_info, None) }.map_err(|error| {
+                execution_refusal("create sentinel command pool", &error.to_string())
+            })?;
+        let command = unsafe {
+            context.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|error| {
+            execution_refusal("allocate sentinel command buffer", &error.to_string())
+        })?[0];
+
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            context
+                .device
+                .begin_command_buffer(command, &begin)
+                .map_err(|error| {
+                    execution_refusal("begin sentinel command buffer", &error.to_string())
+                })?;
+            let undefined_to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .image(self.image)
+                .subresource_range(subresource);
+            context.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[undefined_to_dst],
+            );
+            context.device.cmd_clear_color_image(
+                command,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_value_for(format, clear),
+                &[subresource],
+            );
+            let dst_to_color = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .image(self.image)
+                .subresource_range(subresource);
+            context.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[dst_to_color],
+            );
+            context
+                .device
+                .end_command_buffer(command)
+                .map_err(|error| {
+                    execution_refusal("end sentinel command buffer", &error.to_string())
+                })?;
+        }
+
+        let result = (|| {
+            let _execution = context.lock_queue(queue_index).map_err(|_| {
+                submission_refusal("submit present sentinel", "queue lock is poisoned")
+            })?;
+            context.notify_enqueue(queue_index);
+            let fence = unsafe {
+                context
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            }
+            .map_err(|error| execution_refusal("create sentinel fence", &error.to_string()))?;
+            let commands = [command];
+            let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+            let submitted = context
+                .submit_commands(queue_index, &submits, fence)
+                .map_err(|result| {
+                    driver_refusal(
+                        context,
+                        ProviderPhase::Submit,
+                        "submit present sentinel",
+                        result,
+                    )
+                });
+            if let Err(error) = submitted {
+                unsafe { context.device.destroy_fence(fence, None) };
+                return Err(error);
+            }
+            context.record_queue_submission(queue_index);
+            let waited = context
+                .wait_for_fence(fence, crate::FENCE_TIMEOUT_NS)
+                .map_err(|result| {
+                    driver_refusal(
+                        context,
+                        ProviderPhase::Wait,
+                        "wait for present sentinel",
+                        result,
+                    )
+                });
+            unsafe { context.device.destroy_fence(fence, None) };
+            waited?;
+            context.record_queue_retirement(queue_index);
+            Ok(())
+        })();
+        unsafe { context.device.destroy_command_pool(pool, None) };
+        result?;
+        *self
+            .layout
+            .get_mut()
+            .expect("unlocked present target layout") = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        Ok(())
+    }
+
+    pub(crate) fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub(crate) fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+        *self.layout_lock()
+    }
+
+    pub(crate) fn mark_presented(&self) {
+        *self.layout_lock() = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+    }
+
+    fn layout_lock(&self) -> std::sync::MutexGuard<'_, vk::ImageLayout> {
+        self.layout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for PresentTargetImage {
+    fn drop(&mut self) {
+        unsafe {
+            if self.view != vk::ImageView::null() {
+                self.context.device.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                self.context.device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
+/// Execute one render pass whose attachment is a provider-owned present target,
+/// and return the target's tightly packed texel bytes.
+///
+/// The pass renders into `target` (rather than a fresh offscreen image), then
+/// records the present action's terminal transition and copy-out in the same
+/// command buffer. The one acquire and one present are counted around the pass
+/// (`docs/24` §5.3). The target image itself is not destroyed here: it is the
+/// provider's, so it stays readable after `wait` (`docs/24` §3.3 rule 2).
+pub(crate) fn execute_present_render(
+    context: &VulkanContext,
+    stages: &RenderStages,
+    pass: &RenderPassDescriptor,
+    target: &PresentTargetImage,
+) -> Result<Vec<u8>, ProviderError> {
+    let request = prepare_render_request(stages, pass)?;
+    let [width, height] = request.extent;
+    if width == 0 || height == 0 {
+        return Err(contract_refusal("render attachment has a zero dimension"));
+    }
+    let byte_length = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|texels| texels.checked_mul(BYTES_PER_TEXEL))
+        .ok_or_else(|| contract_refusal("render attachment bytes overflow u64"))?;
+
+    crate::terminal_refusal(&context.lock_lifecycle())?;
+    let queue_index = select_graphics_queue(context)?;
+    let fragment_spirv = solid_fragment_spirv(request.format)?;
+    let vk_format = attachment_vk_format(request.format)?;
+    let vertex_words = spirv_words(request.vertex.spirv)
+        .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
+    let fragment_words = spirv_words(fragment_spirv)
+        .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
+    let vertex_entry = stage_entry_cstring("vertex", request.vertex.entry)?;
+    let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
+
+    // One acquire per present action, before the pass runs (`docs/24` §3.6).
+    context.record_present_acquire();
+    let mut objects = OffscreenObjects::new(context);
+    objects.attach_present_target(target);
+    objects.create_render_pass(vk_format)?;
+    objects.create_framebuffer(width, height)?;
+    objects.create_pipeline(
+        &vertex_words,
+        &fragment_words,
+        &vertex_entry,
+        &fragment_entry,
+    )?;
+    let readback_mapping = objects.create_readback(byte_length)?;
+    objects.create_command_pool(queue_index)?;
+    objects.record(request.format, request.clear, width, height)?;
+    objects.submit_and_wait(queue_index)?;
+
+    let texels = unsafe {
+        std::slice::from_raw_parts(readback_mapping as *const u8, byte_length as usize).to_vec()
+    };
+    context.record_buffer_readback();
+    context.record_buffer_readback_bytes(texels.len());
+    // One present per present action, after the terminal transition and
+    // readback have landed (`docs/24` §3.6).
+    context.record_present();
+    target.mark_presented();
+    Ok(texels)
+}
+
 /// The queue this rail submits graphics work to.
 ///
 /// The selected device only *may* have created a graphics-capable family: the
@@ -576,6 +949,21 @@ struct OffscreenObjects<'a> {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// Whether this scope created `image`/`memory`/`view` and must destroy them
+    /// on Drop. A present pass borrows the provider-owned [`PresentTargetImage`]
+    /// instead, so its per-pass scope must not destroy the target when it
+    /// finishes (`docs/24` §5.2: the target survives the submission).
+    owns_attachment: bool,
+    /// Whether this pass hands its attachment on as a present target. When set,
+    /// the render pass ends in `COLOR_ATTACHMENT_OPTIMAL` and `record` inserts
+    /// the explicit present layout transition before the copy-out
+    /// (`docs/24` §3.3 rule 1).
+    present: bool,
+    /// The layout `image` is in when the render pass begins. Offscreen
+    /// attachments start `UNDEFINED`; a present target may have been preset
+    /// with a sentinel (→ `COLOR_ATTACHMENT_OPTIMAL`) or already presented once
+    /// (→ `TRANSFER_SRC_OPTIMAL`).
+    initial_layout: vk::ImageLayout,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     pipeline_layout: vk::PipelineLayout,
@@ -596,6 +984,9 @@ impl<'a> OffscreenObjects<'a> {
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
+            owns_attachment: true,
+            present: false,
+            initial_layout: vk::ImageLayout::UNDEFINED,
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -608,6 +999,18 @@ impl<'a> OffscreenObjects<'a> {
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
         }
+    }
+
+    /// Render this pass into a provider-owned present target instead of a
+    /// freshly created offscreen attachment. The target's image and view are
+    /// borrowed for the pass's lifetime; its memory stays owned by the provider
+    /// (`docs/24` §5.2).
+    fn attach_present_target(&mut self, target: &PresentTargetImage) {
+        self.image = target.image();
+        self.view = target.view();
+        self.owns_attachment = false;
+        self.present = true;
+        self.initial_layout = target.current_layout();
     }
 
     /// The 2D single-sample optimal-tiling colour attachment.
@@ -653,9 +1056,17 @@ impl<'a> OffscreenObjects<'a> {
     /// The single-colour-attachment render pass with the probe's dependency
     /// pair: `EXTERNAL → 0` makes the clear/write visible to colour output, and
     /// `0 → EXTERNAL` makes the stored texels visible to the copy that reads
-    /// them. `finalLayout = TRANSFER_SRC_OPTIMAL` is what lets the copy run
-    /// without a further layout transition (`research/docs/23` §7.1).
+    /// them. An offscreen pass ends directly in
+    /// `finalLayout = TRANSFER_SRC_OPTIMAL` so the copy runs without a further
+    /// transition (`research/docs/23` §7.1); a present pass ends in
+    /// `COLOR_ATTACHMENT_OPTIMAL` instead, and `record` inserts the explicit
+    /// present layout transition before the copy (`docs/24` §3.3).
     fn create_render_pass(&mut self, format: vk::Format) -> Result<(), ProviderError> {
+        let final_layout = if self.present {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        };
         let attachments = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -663,30 +1074,42 @@ impl<'a> OffscreenObjects<'a> {
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
+            .initial_layout(self.initial_layout)
+            .final_layout(final_layout)];
         let color_refs = [vk::AttachmentReference::default()
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
         let subpasses = [vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs)];
-        let dependencies = [
+        let mut dependencies = vec![vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+        dependencies.push(if self.present {
+            // The present path does its own `COLOR_ATTACHMENT_OPTIMAL →
+            // TRANSFER_SRC_OPTIMAL` transition in `record`, so the render pass
+            // only has to make the store available to the barrier that follows
+            // (`docs/24` §3.3 rule 1).
             vk::SubpassDependency::default()
-                .src_subpass(vk::SUBPASS_EXTERNAL)
-                .dst_subpass(0)
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
                 .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
                 .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)
+        } else {
             vk::SubpassDependency::default()
                 .src_subpass(0)
                 .dst_subpass(vk::SUBPASS_EXTERNAL)
                 .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
                 .dst_stage_mask(vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST)
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::HOST_READ),
-        ];
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::HOST_READ)
+        });
         let info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpasses)
@@ -963,6 +1386,41 @@ impl<'a> OffscreenObjects<'a> {
             self.context.device.cmd_end_render_pass(self.command);
         }
 
+        if self.present {
+            // The present action's "terminal transition": make the completed
+            // colour store visible to the copy-out, in the same command buffer
+            // as the render so the present cannot run before its writer
+            // (`docs/24` §3.3 rule 1). The equivalent terminal state is
+            // `TRANSFER_SRC_OPTIMAL`, i.e. "readable by the host after `wait`"
+            // (`docs/24` §3.6), not a real `VkQueuePresentKHR`.
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
+
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(0)
             .buffer_row_length(0)
@@ -1074,14 +1532,16 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_render_pass(self.render_pass, None);
             }
-            if self.view != vk::ImageView::null() {
-                self.context.device.destroy_image_view(self.view, None);
-            }
-            if self.image != vk::Image::null() {
-                self.context.device.destroy_image(self.image, None);
-            }
-            if self.memory != vk::DeviceMemory::null() {
-                self.context.device.free_memory(self.memory, None);
+            if self.owns_attachment {
+                if self.view != vk::ImageView::null() {
+                    self.context.device.destroy_image_view(self.view, None);
+                }
+                if self.image != vk::Image::null() {
+                    self.context.device.destroy_image(self.image, None);
+                }
+                if self.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(self.memory, None);
+                }
             }
             if self.readback_memory != vk::DeviceMemory::null() {
                 self.context.device.unmap_memory(self.readback_memory);
