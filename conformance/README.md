@@ -275,3 +275,33 @@ before/after captures, the count contract and the limits.
 Compare all five paths with the additional `--vulkan-objects` and
 `--metal-objects` arguments. See [PROVIDER-OBJECTS.md](../docs/PROVIDER-OBJECTS.md)
 for object lifetimes, result validation and the current verification boundary.
+
+## Suite coverage checks without macOS
+
+`NativeOracle.swift` is compiled and executed only by the macOS job, and both its
+suite list and its per-suite case ids are hand-written. The same case ids appear
+again in `examples/metal-smoke/src/bin/provider-capture.rs`, and
+`.github/workflows/ci.yml` names the suite file each rail runs. None of that is
+executable on Linux, so `test_oracle_coverage.py` compares the three tables with
+`conformance/suite*.json` as text:
+
+- the suite identities in the oracle's `loadSuite` switch and in the provider's
+  `validate_suite` match are exactly the committed suite files (`suite.json` is
+  v1 and `suite-vN.json` is vN, and the name must agree with the identity the
+  JSON declares);
+- every suite pins exactly the case ids its JSON lists, in both the Swift and the
+  Rust table, and the failure message names the missing and extra ids;
+- the reviewed source pins in the oracle's `reviewedProgram` table are exactly
+  the `air`/`metal` identities the suite files declare, and every pinned SHA-256
+  still matches the committed shader or AIR bytes on disk;
+- each explicit CI rail (`run_native.py`, the Vulkan capture, the native-metal
+  provider capture and the three-way parity comparison) names every suite, and
+  the four object-API `for version in ...; do` loops pin every version;
+- the oracle's "v1 through vN" diagnostic names the last committed suite.
+
+This is metadata consistency, not evidence: it cannot compile Swift and says
+nothing about a case body, a shader hash, GPU execution or cross-backend
+agreement. There is currently no exemption list, so a new suite or case must be
+added to all three tables; a case intended for one rail only has to change them
+deliberately and update this note. If a table is reshaped so it can no longer be
+parsed, the check fails instead of silently comparing empty sets.
