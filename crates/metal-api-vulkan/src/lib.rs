@@ -1300,22 +1300,56 @@ fn validate_descriptor_limits(
     limits: &vk::PhysicalDeviceLimits,
     reflection: &ShaderReflection,
 ) -> Result<(), ExecutorError> {
-    let buffer_count = u32::try_from(reflection.bindings.len())
-        .map_err(|_| failure("reflected buffer count overflows u32"))?;
+    let buffer_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::Buffer)
+            .count(),
+    )
+    .map_err(|_| failure("reflected buffer count overflows u32"))?;
+    // Sampled textures bind as combined image samplers: one sampled image and
+    // one sampler per binding.
+    let sampled_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, ResourceKind::Texture))
+            .count(),
+    )
+    .map_err(|_| failure("reflected texture count overflows u32"))?;
     if limits.max_bound_descriptor_sets == 0
         || buffer_count > limits.max_per_stage_descriptor_storage_buffers
         || buffer_count > limits.max_descriptor_set_storage_buffers
-        || buffer_count > limits.max_per_stage_resources
+        || sampled_count > limits.max_per_stage_descriptor_sampled_images
+        || sampled_count > limits.max_descriptor_set_sampled_images
+        || sampled_count > limits.max_per_stage_descriptor_samplers
+        || sampled_count > limits.max_descriptor_set_samplers
+        || buffer_count.saturating_add(sampled_count) > limits.max_per_stage_resources
     {
         return Err(failure(format!(
-            "{buffer_count} storage buffers exceed Vulkan descriptor limits per-stage={} per-set={} all-resources={} bound-sets={}",
+            "{buffer_count} storage buffers and {sampled_count} sampled textures exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
             limits.max_per_stage_descriptor_storage_buffers,
             limits.max_descriptor_set_storage_buffers,
+            limits.max_per_stage_descriptor_sampled_images,
+            limits.max_per_stage_descriptor_samplers,
             limits.max_per_stage_resources,
             limits.max_bound_descriptor_sets
         )));
     }
     Ok(())
+}
+
+/// Descriptor type one reflected binding needs. Sampled textures use a
+/// combined image sampler because the translator synthesizes the sampler and
+/// the provider supplies one per sampled image (`research/docs/16` §4.3).
+fn descriptor_type_for_binding(
+    binding: &metal2vulkan::reflect::ResourceBinding,
+) -> vk::DescriptorType {
+    match binding.kind {
+        ResourceKind::Texture => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        _ => vk::DescriptorType::STORAGE_BUFFER,
+    }
 }
 
 fn validate_storage_buffer_size(
@@ -1439,30 +1473,30 @@ fn validate_pipeline_reflection(
             "pipeline uses Metal resources or specialization state outside the Phase 1 buffer-compute subset",
         ));
     }
-    let mut metal_indices = BTreeSet::new();
     let mut descriptor_bindings = BTreeSet::new();
     for binding in &reflection.bindings {
-        if binding.kind != ResourceKind::Buffer {
+        if binding.kind != ResourceKind::Buffer && binding.kind != ResourceKind::Texture {
             return Err(failure(format!(
-                "Phase 1 supports only Metal buffers, not {:?}",
+                "Phase 1 supports only Metal buffers and sampled textures, not {:?}",
                 binding.kind
             )));
         }
-        if !metal_indices.insert(binding.metal_index) {
-            return Err(failure(format!(
-                "duplicate reflected Metal buffer index {}",
-                binding.metal_index
-            )));
-        }
+        // A texture and a buffer may share the Metal argument index; the
+        // Vulkan descriptor binding is the unique key (checked below).
+        let what = if binding.kind == ResourceKind::Buffer {
+            "buffer"
+        } else {
+            "texture"
+        };
         let descriptor = binding.descriptor.ok_or_else(|| {
             failure(format!(
-                "Metal buffer {} has no Vulkan descriptor",
+                "Metal {what} {} has no Vulkan descriptor",
                 binding.metal_index
             ))
         })?;
         if descriptor.set != 0 || descriptor.count != 1 {
             return Err(failure(format!(
-                "Metal buffer {} uses unsupported descriptor set={} count={}",
+                "Metal {what} {} uses unsupported descriptor set={} count={}",
                 binding.metal_index, descriptor.set, descriptor.count
             )));
         }
@@ -1471,6 +1505,21 @@ fn validate_pipeline_reflection(
                 "duplicate Vulkan descriptor binding {}",
                 descriptor.binding
             )));
+        }
+        if binding.kind == ResourceKind::Texture {
+            if binding.access != Some(ResourceAccess::Sampled) {
+                return Err(failure(format!(
+                    "Metal texture {} is not a sampled read ({:?})",
+                    binding.metal_index, binding.access
+                )));
+            }
+            if binding.texture_shape.is_none() {
+                return Err(failure(format!(
+                    "Metal texture {} has no reflected shape",
+                    binding.metal_index
+                )));
+            }
+            continue;
         }
         if binding.extent.is_none() {
             return Err(failure(format!(
@@ -1924,7 +1973,7 @@ impl PipelineObjects {
                 let descriptor = binding.descriptor.expect("validated descriptor");
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(descriptor.binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_type(descriptor_type_for_binding(binding))
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
             })
@@ -2465,16 +2514,32 @@ impl ExecutionResources {
     ) -> Result<(), ExecutionFailure> {
         let pass_count = u32::try_from(dispatches.len())
             .map_err(|_| failure("descriptor set count overflows u32"))?;
-        let descriptor_count = translated
-            .iter()
-            .try_fold(0_u32, |total, pipeline| {
-                total.checked_add(u32::try_from(pipeline.reflection().bindings.len()).ok()?)
-            })
-            .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
-        let sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count,
-        }];
+        let mut storage_buffer_count = 0_u32;
+        let mut sampled_image_count = 0_u32;
+        for pipeline in translated {
+            for binding in &pipeline.reflection().bindings {
+                let counter = match descriptor_type_for_binding(binding) {
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER => &mut sampled_image_count,
+                    _ => &mut storage_buffer_count,
+                };
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
+            }
+        }
+        let mut sizes = Vec::with_capacity(2);
+        if storage_buffer_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: storage_buffer_count,
+            });
+        }
+        if sampled_image_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: sampled_image_count,
+            });
+        }
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(pass_count)
             .pool_sizes(&sizes);
@@ -2854,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_fixture_reaches_pipeline_creation_on_the_selected_device() {
+    fn texture_fixture_creates_a_compute_pipeline_on_the_selected_device() {
         let executor = match VulkanExecutor::new() {
             Ok(executor) => executor,
             Err(error) => {
@@ -2871,10 +2936,13 @@ mod tests {
         let function = library
             .function("read_texture_2d")
             .expect("the fixture entry exists");
-        match device.new_compute_pipeline_state(&function) {
-            Ok(_) => eprintln!("pipeline created for a texture-reading kernel"),
-            Err(error) => eprintln!("pipeline creation stopped at: {error}"),
-        }
+        // The pipeline creates once reflection admits a sampled texture: the
+        // descriptor-set layout carries a combined image sampler for it. The
+        // execution path still has to create the image, sampler and descriptor
+        // write (`research/docs/16` §4.3).
+        device
+            .new_compute_pipeline_state(&function)
+            .expect("a texture-reading pipeline creates its descriptor layout");
     }
 
     fn serial_fixture() -> (
