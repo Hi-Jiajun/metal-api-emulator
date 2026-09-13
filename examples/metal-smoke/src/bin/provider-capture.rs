@@ -1204,43 +1204,12 @@ fn main() -> Result<()> {
     for case in &suite.render_cases {
         verified_source(directory, &case.metal)?;
     }
-    // Every rail has to agree about which cases it owns. A rail a render case's
-    // marker names has to be able to report the case; both trace rails own a
-    // render execution path (`conformance/RENDER-CAPTURE.md` §4), and the
-    // Vulkan object rail now owns one too (`research/docs/24` §6 Step 5). The
-    // native object rail still carries no render command encoder, so a suite
-    // that asks it for one is refused instead of silently reporting fewer
-    // cases than the marker requires.
-    let render_rail =
-        api == EntryApi::Trace || (api == EntryApi::Objects && backend == Backend::Vulkan);
-    for case in &suite.render_cases {
-        if !render_rail
-            && case
-                .capture_rails
-                .iter()
-                .any(|rail| rail == backend.report_name(api))
-        {
-            if case.present.is_some() {
-                // The object rail has no present execution in this increment
-                // (`research/docs/24` §6 Step 5), so a present-bearing case
-                // must fail typed, never silently drop the present.
-                return Err(format!(
-                    "present_unsupported_on_object_api: render case {} carries a present action \
-                     but the {} rail has no present execution",
-                    case.id,
-                    backend.report_name(api)
-                )
-                .into());
-            }
-            return Err(format!(
-                "render case {} is marked executable on {} but this rail cannot execute a \
-                 render pass",
-                case.id,
-                backend.report_name(api)
-            )
-            .into());
-        }
-    }
+    // Every rail owns a render execution path now: both trace rails
+    // (`conformance/RENDER-CAPTURE.md` §4) and both object rails — the Vulkan
+    // object rail landed it in `research/docs/24` §6 Step 5, and the native
+    // object rail now runs the same reviewed pass through the native provider's
+    // render entry point. A rail a render case's marker names therefore always
+    // reports the case rather than omitting it.
     let identity = hex(&Sha256::digest(&raw));
     let (provider, device_name, counters, render_registrar) =
         create_provider(backend, async_execution, queue_priorities.as_deref())?;
@@ -1362,18 +1331,14 @@ fn main() -> Result<()> {
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
         results.push(result);
     }
-    // Render cases run after the compute cases, on the rails that own a render
-    // execution path (`research/docs/23` §6 Step 7): the Vulkan trace rail and
-    // the native provider's trace rail (`conformance/RENDER-CAPTURE.md` §4).
-    // The Vulkan object rail joins them (`research/docs/24` §6 Step 5); every
-    // other rail omits them, which is what the suite's `capture_rails` marker
-    // declares.
+    // Render cases run after the compute cases on every rail, since every rail
+    // now owns a render execution path: the Vulkan trace rail, the native
+    // provider's trace rail (`conformance/RENDER-CAPTURE.md` §4), and both
+    // object rails (`research/docs/24` §6 Step 5 plus the native object rail's
+    // render entry point added here).
     let mut render_pipeline: Option<CompiledComputePipeline> = None;
     let mut object_render_pipeline: Option<objects::RenderPipeline> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
-        if !render_rail {
-            continue;
-        }
         let declaring = suite
             .cases
             .iter()

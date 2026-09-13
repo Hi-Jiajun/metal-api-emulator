@@ -2,9 +2,9 @@ use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof,
-    FunctionIdentity, FunctionSource, PipelineContract, PipelineId, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability, SemanticDigest,
-    ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace, VertexLayout,
+    FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace, VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -62,6 +62,7 @@ struct FakeProvider {
     alias_mode: AliasMode,
     wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    render: bool,
 }
 
 impl FakeProvider {
@@ -80,10 +81,15 @@ impl FakeProvider {
             alias_mode: AliasMode::Refused,
             wait_calls: AtomicUsize::new(0),
             gate: None,
+            render: false,
         }
     }
     fn with_alias_mode(mut self, alias_mode: AliasMode) -> Self {
         self.alias_mode = alias_mode;
+        self
+    }
+    fn with_render(mut self) -> Self {
+        self.render = true;
         self
     }
     fn error(&self, token: CompletionToken) -> ProviderError {
@@ -115,14 +121,22 @@ impl ComputeProvider for FakeProvider {
             storage_modes: vec![StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: false,
-            supports_render_passes: false,
-            max_color_attachments: 0,
-            max_attachment_dimension: [0, 0],
-            supported_color_formats: Vec::new(),
-            supports_presentation: false,
-            max_present_targets: 0,
-            supported_present_modes: Vec::new(),
-            max_present_image_count: 0,
+            supports_render_passes: self.render,
+            max_color_attachments: u32::from(self.render),
+            max_attachment_dimension: [u64::from(self.render) * 4096; 2],
+            supported_color_formats: self
+                .render
+                .then_some(AttachmentFormat::Rgba8Unorm)
+                .into_iter()
+                .collect(),
+            supports_presentation: self.render,
+            max_present_targets: u32::from(self.render),
+            supported_present_modes: self
+                .render
+                .then_some(PresentMode::Fifo)
+                .into_iter()
+                .collect(),
+            max_present_image_count: u32::from(self.render),
             supports_heaps: false,
             max_heap_bytes: 0,
             supported_heap_storage_modes: Vec::new(),
@@ -228,6 +242,34 @@ impl ComputeProvider for FakeProvider {
                 bytes: contents[&view.view_id].clone(),
             })
             .collect::<Vec<_>>();
+        // A render pass stores the reviewed fragment texel into its colour
+        // attachment. The attachment view is declared read-only by the compute
+        // pass, so the compute loop above leaves it out; the render half lands
+        // its own writeback at the view's offset.
+        for pass in trace.render_passes() {
+            for attachment in &pass.color_attachments {
+                let view = resources
+                    .iter()
+                    .find(|view| {
+                        view.view_id == attachment.view_id
+                            && view.allocation_id == attachment.allocation_id
+                    })
+                    .expect("the attachment view is in the serial pool");
+                let texels = usize::try_from(attachment.expected_bytes().unwrap()).unwrap();
+                // The render rail runs last, so its texels replace the
+                // pre-render bytes the compute loop parked for the same view.
+                writebacks.retain(|write| {
+                    write.allocation_id != attachment.allocation_id
+                        || write.view_id != attachment.view_id
+                });
+                writebacks.push(BufferWriteback {
+                    allocation_id: attachment.allocation_id,
+                    view_id: attachment.view_id,
+                    offset: view.offset,
+                    bytes: [0x40, 0x80, 0xc0, 0xff].repeat(texels / 4),
+                });
+            }
+        }
         writebacks.sort_by_key(|write| (write.allocation_id, write.view_id));
         if mode == BAD_LAST_WRITE {
             writebacks.last_mut().unwrap().offset += 1;
@@ -329,6 +371,10 @@ impl PipelineProvider for FakeProvider {
     ) -> Result<CompiledComputePipeline, ProviderError> {
         let bindings = if request.entry_name == "copy" {
             vec![(4, BufferAccess::Read), (9, BufferAccess::Write)]
+        } else if request.entry_name == "declare" {
+            // A render case's declaring pass: one read-only view of the
+            // attachment the render pass later stores into.
+            vec![(0, BufferAccess::Read)]
         } else if let Some(count) = request.entry_name.strip_prefix("wide:") {
             (0..count.parse().unwrap())
                 .map(|slot| (slot, BufferAccess::ReadWrite))
@@ -1385,4 +1431,76 @@ fn render_encoder_end_encoding_requires_a_draw() {
         encoder.end_encoding(),
         Err(Error::Api(ApiError::MissingDispatch))
     ));
+}
+
+#[test]
+fn object_render_commit_routes_the_attachment_through_submit_and_lands_texels() {
+    let provider = Arc::new(FakeProvider::new().with_render());
+    let device = Device::new(provider.clone());
+
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata(&provider);
+    // `register_render_pipeline` is a concrete-context entry point, not part of
+    // `PipelineProvider`; the fake admits the table entry here the way the real
+    // rails register it before any command names it.
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                Some(PresentInitial::Sentinel([0xef; 4])),
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(
+        attachment.read().unwrap(),
+        [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        "the render pass lands the reviewed fragment texel into the attachment"
+    );
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].passes.len(), 2);
+    assert!(traces[0].passes[0].as_compute().is_some());
+    let render_pass = traces[0].passes[1].as_render().expect("render pass");
+    assert_eq!(render_pass.color_attachments.len(), 1);
+    assert_eq!(
+        render_pass.color_attachments[0].view_id,
+        attachment_view.view_id()
+    );
+    assert_eq!(
+        render_pass.color_attachments[0].allocation_id,
+        attachment_view.allocation_id()
+    );
+    assert!(
+        render_pass.present.is_some(),
+        "the present tail rides the same recorded render pass"
+    );
 }

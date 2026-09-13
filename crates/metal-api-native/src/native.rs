@@ -83,6 +83,12 @@ struct CompletionSlot {
     record: Arc<CompletionRecord>,
     deadline: ObservationDeadline,
     owned_bytes: u64,
+    /// Render-bearing deferred submissions finish their render rail inside
+    /// `submit` and park the merged writebacks here. `wait`/`readback` land
+    /// them into the record, so `cancel` can still abandon the observation
+    /// before either lands it. `None` for synchronous and compute-only
+    /// submissions.
+    deferred_writebacks: Option<Vec<BufferWriteback>>,
 }
 
 fn trace_owned_bytes(trace: &ComputeTrace) -> u64 {
@@ -385,6 +391,26 @@ impl NativeMetalProvider {
             .get(&token.submission_id)
             .cloned()
             .ok_or_else(|| unknown_completion(token))
+    }
+
+    /// Land a render-bearing deferred submission's parked writebacks into its
+    /// record. Idempotent: a terminal transition that already won (a cancel or
+    /// a deadline failure) is not overwritten, and a compute-only submission
+    /// parks nothing.
+    fn land_deferred(&self, slot: &CompletionSlot) {
+        if let Some(writebacks) = &slot.deferred_writebacks {
+            slot.record.complete(writebacks.clone());
+        }
+    }
+
+    fn running_record(&self, token: CompletionToken) -> Arc<CompletionRecord> {
+        match &self.completion_outbox {
+            Some(outbox) => {
+                let _ = outbox.submitted(token);
+                CompletionRecord::running_with_observer(token, outbox.observer())
+            }
+            None => CompletionRecord::running(),
+        }
     }
 
     fn terminal_record(
@@ -696,22 +722,6 @@ impl ComputeProvider for NativeMetalProvider {
                 }
             }
         };
-        // The render rail completes inside `submit`: it needs the command
-        // buffer's terminal status before it can read the attachment back. The
-        // deferred path records now and reports at `wait`, so admitting render
-        // work there would report bytes no rail read
-        // (`crates/metal-api-vulkan` refuses the same shape).
-        if self.async_execution && trace.has_render_passes() {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Capability,
-                "render_async_unsupported",
-            )
-            .with_detail(
-                "the render rail completes inside submit; the deferred submission path \
-                 executes no graphics work in this increment",
-            ));
-        }
         if self.async_execution {
             let result = self.submit_async(&mut state, trace, pipelines, token, &resolve, retains);
             self.publish_health(self.lifecycle.health());
@@ -734,6 +744,7 @@ impl ComputeProvider for NativeMetalProvider {
                     record,
                     deadline: ObservationDeadline::new(self.observation_deadline),
                     owned_bytes: trace_owned_bytes(trace),
+                    deferred_writebacks: None,
                 },
             );
         }
@@ -748,6 +759,7 @@ impl ComputeProvider for NativeMetalProvider {
     ) -> Result<CompletionDisposition, ProviderError> {
         self.check_token(token)?;
         let slot = self.slot(token)?;
+        self.land_deferred(&slot);
         if !slot.record.is_running() {
             let result = slot.record.wait(token, timeout);
             self.sync_completion_health();
@@ -779,7 +791,9 @@ impl ComputeProvider for NativeMetalProvider {
 
     fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
         self.check_token(token)?;
-        self.slot(token)?.record.readback(token)
+        let slot = self.slot(token)?;
+        self.land_deferred(&slot);
+        slot.record.readback(token)
     }
 }
 
@@ -1566,6 +1580,74 @@ impl NativeMetalProvider {
     ) -> Result<ProviderSubmission, ProviderError> {
         let EncodedSubmission { mut pending, pool } =
             encode(state, &self.counters, trace, pipelines, resolve, retains)?;
+        if trace.has_render_passes() {
+            // Render-bearing deferred submission. The render rail runs on the
+            // same Metal queue, so it serializes after the compute command
+            // buffer. Committing compute first and then executing the render
+            // synchronously blocks until both complete; the shared-storage
+            // compute buffers are then CPU-visible, so they are read back
+            // directly instead of through a completion handler. The record
+            // stays `Running` and the merged writebacks are parked, so `cancel`
+            // can still abandon the observation before `wait` lands it — the
+            // same shape the Vulkan object rail reports.
+            let render_contracts = self.render_contracts(trace)?;
+            let render_plan = render::plan_trace(trace, &pool, &render_contracts)?;
+            pending.submitted = true;
+            let resources = pending.resources.as_ref().expect("encoded resources");
+            resources.command.commit();
+            let render_writebacks = self.execute_render_passes(state, &render_plan)?;
+            // The render command buffer serialized after the compute command
+            // buffer, so a completed render implies a terminal compute status.
+            match resources.command.status() {
+                MTLCommandBufferStatus::Completed => {}
+                MTLCommandBufferStatus::Error => {
+                    let (detail, code) = unsafe {
+                        let error: *mut Object = msg_send![resources.command.as_ref(), error];
+                        (error_description(error), command_buffer_error_code(error))
+                    };
+                    if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                        self.lifecycle.mark_device_lost();
+                        return Err(device_lost_error(token, detail));
+                    }
+                    self.lifecycle.mark_unobservable_submission();
+                    return Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Execute,
+                        "metal_command_failed",
+                    )
+                    .with_detail(detail)
+                    .with_completion(CompletionDisposition::Failed { token: Some(token) }));
+                }
+                _ => {
+                    self.lifecycle.mark_unobservable_submission();
+                    return Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Internal,
+                        "metal_completion_unknown",
+                    )
+                    .with_completion(CompletionDisposition::SubmittedUnknown {
+                        token: Some(token),
+                    }));
+                }
+            }
+            pending.submitted = false;
+            let compute_writebacks = collect_writebacks(&pool, &resources.buffers, &self.counters);
+            let merged = render::merge_writebacks(compute_writebacks, render_writebacks);
+            let record = self.running_record(token);
+            self.completions()?.insert(
+                token.submission_id,
+                CompletionSlot {
+                    record,
+                    deadline: ObservationDeadline::new(self.observation_deadline),
+                    owned_bytes: trace_owned_bytes(trace),
+                    deferred_writebacks: Some(merged),
+                },
+            );
+            return Ok(ProviderSubmission {
+                completion: CompletionDisposition::Submitted { token },
+                writebacks: Vec::new(),
+            });
+        }
         let SubmissionResources {
             _device,
             _queue,
@@ -1576,19 +1658,14 @@ impl NativeMetalProvider {
             _borrowed,
         } = pending.resources.take().expect("encoded resources");
         pending.submitted = true;
-        let record = match &self.completion_outbox {
-            Some(outbox) => {
-                let _ = outbox.submitted(token);
-                CompletionRecord::running_with_observer(token, outbox.observer())
-            }
-            None => CompletionRecord::running(),
-        };
+        let record = self.running_record(token);
         self.completions()?.insert(
             token.submission_id,
             CompletionSlot {
                 record: Arc::clone(&record),
                 deadline: ObservationDeadline::new(self.observation_deadline),
                 owned_bytes: trace_owned_bytes(trace),
+                deferred_writebacks: None,
             },
         );
         // The completion handler runs after this call returned, so it holds the
