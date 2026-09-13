@@ -712,14 +712,17 @@ impl ComputePass {
                 return Err(ContractError::DuplicateView(buffer.view_id));
             }
         }
-        // Texture bindings are carried by the trace and the command channel,
-        // but no provider executes them yet. Refuse them here instead of
-        // ignoring a binding the caller asked for (`research/docs/16` §4.2).
-        if let Some(texture) = self.textures.first() {
+        // Texture bindings validated here; a provider that cannot execute them
+        // refuses the trace during admission with its own capability error
+        // (`research/docs/16` §4.6).
+        for texture in &self.textures {
             texture.validate_shape()?;
-            return Err(ContractError::TextureBindingUnsupported(
-                texture.metal_binding,
-            ));
+            if views.contains_key(&texture.view_id) {
+                return Err(ContractError::DuplicateView(texture.view_id));
+            }
+            // A texture and a buffer may share the Metal argument index (the
+            // translator reports texture 0 / buffer 0), so only the Vulkan
+            // descriptor namespace is checked for uniqueness here.
         }
         if let Some(required_local_size) = pipeline_contract.required_local_size {
             let actual = self.dispatch.threads_per_threadgroup;
@@ -2025,6 +2028,31 @@ impl ComputeTrace {
                 } else {
                     positions.insert(view.view_id, resources.len());
                     resources.push(view.clone());
+                }
+            }
+        }
+        Ok(resources)
+    }
+
+    /// The stable texture pool for serial execution, in first-use order. Each
+    /// view's access is the union of its uses across all passes; the first use
+    /// keeps its binding label. Mirrors [`Self::serial_resources`] for the
+    /// sampled-texture increment (`research/docs/16` §4.6).
+    pub fn serial_texture_resources(&self) -> Result<Vec<TextureView>, ContractError> {
+        let mut resources = Vec::<TextureView>::new();
+        let mut positions = BTreeMap::<ViewId, usize>::new();
+        for pass in &self.passes {
+            for texture in &pass.textures {
+                if let Some(&position) = positions.get(&texture.view_id) {
+                    let resource = &mut resources[position];
+                    resource.access = match (resource.access, texture.access) {
+                        (TextureAccess::Unused, access) | (access, TextureAccess::Unused) => access,
+                        (left, right) if left == right => left,
+                        _ => TextureAccess::Storage,
+                    };
+                } else {
+                    positions.insert(texture.view_id, resources.len());
+                    resources.push(texture.clone());
                 }
             }
         }
@@ -3656,7 +3684,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_bindings_are_refused_until_a_provider_executes_them() {
+    fn texture_bindings_validate_and_normalize_like_buffer_views() {
         let contract = unbound_pipeline_contract();
         let mut pass = ComputePass {
             pipeline: PipelineId::new(5),
@@ -3681,13 +3709,10 @@ mod tests {
             sample_count: 1,
             bytes: vec![0; 64],
         }));
-        assert!(matches!(
-            pass.validate(&contract),
-            Err(ContractError::TextureBindingUnsupported(3))
-        ));
+        pass.validate(&contract)
+            .expect("a well-formed texture binding validates");
 
-        // A malformed texture binding reports its shape error first, so the
-        // refusal never hides an invalid value behind a capability gate.
+        // A malformed texture binding reports its shape error.
         pass.textures[0].width = 0;
         assert!(matches!(
             pass.validate(&contract),
