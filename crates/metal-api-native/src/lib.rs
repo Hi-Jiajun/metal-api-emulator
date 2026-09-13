@@ -18,6 +18,12 @@ mod native;
 #[cfg(target_os = "macos")]
 pub use native::NativeMetalProvider;
 
+// The admission and terminal-state wiring is provider logic, not platform
+// logic, so it is compiled for the macOS provider and for the unit tests that
+// pin its behavior on a host that cannot load Metal.
+#[cfg(any(target_os = "macos", test))]
+mod lifecycle;
+
 #[cfg(not(target_os = "macos"))]
 mod unsupported;
 #[cfg(not(target_os = "macos"))]
