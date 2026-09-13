@@ -126,13 +126,15 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   device write in place on both drivers, `DirtySet` accumulates the pages a
   submission wrote, and `GuestWindows` refuses to reclaim a window until its
   lease is retired. See `research/docs/19`.
-- Open design work: device-loss reclamation beyond the bounded abandonment
-  budget, the cross-process completion transport and provider wiring (the
-  core wire publisher and mirror now exist), provider-side lease import (the
-  core `LeaseLedger` release contract now exists), general native shader
-  admission and CPU uploads during command-buffer execution, guest-memory
-  lifecycle wiring beyond the owner-side contract, and priority/fairness in
-  queue scheduling. Resource snapshots do not hold live guest pages.
+- Open design work: host-side wiring of the core terminal lifecycle (the
+  `ProviderLifecycle` admission/refusal and lease-retirement contract now
+  exists, while the Vulkan context still tracks the same state separately),
+  the cross-process completion transport and provider wiring (the core wire
+  publisher and mirror now exist), provider-side lease import (the core
+  `LeaseLedger` release contract now exists), general native shader admission
+  and CPU uploads during command-buffer execution, guest-memory lifecycle
+  wiring beyond the owner-side contract, and priority/fairness in queue
+  scheduling. Resource snapshots do not hold live guest pages.
 - Not implemented: rendering (render pipelines, render passes, sampler and
   texture generalisation beyond the sampled fixture), presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL

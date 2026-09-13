@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
+
 /// Current version of the pure-value provider trace schema.
 pub const PROVIDER_SCHEMA_VERSION: u16 = 2;
 
@@ -1349,6 +1351,19 @@ struct LeaseState {
     outstanding: usize,
 }
 
+/// Observable state of one lease under a [`LeaseLedger`].
+///
+/// A lease with any outstanding token is still held. `Released` means either
+/// every bound token retired or a device-loss teardown cleared the ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalLeaseState {
+    /// The number of bound tokens that have not retired. Non-zero means the
+    /// backing is still held.
+    Outstanding(usize),
+    /// No token holds the lease; the owner may release the backing.
+    Released,
+}
+
 /// Result of observing one completion token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaseObservation {
@@ -1483,6 +1498,27 @@ impl LeaseLedger {
         self.leases
             .get(&lease_id)
             .is_some_and(|state| self.device_lost || state.outstanding == 0)
+    }
+
+    /// Every tracked lease paired with its observable terminal state.
+    ///
+    /// The order is stable (lease id). A lease carrying outstanding tokens
+    /// reports [`TerminalLeaseState::Outstanding`]; a lease whose tokens all
+    /// retired, or every lease after device loss, reports
+    /// [`TerminalLeaseState::Released`]. A released lease is removed, so it
+    /// never appears twice and no dangling entry can hide here.
+    pub fn leased(&self) -> Vec<(LeaseId, TerminalLeaseState)> {
+        self.leases
+            .iter()
+            .map(|(lease_id, state)| {
+                let state = if self.device_lost || state.outstanding == 0 {
+                    TerminalLeaseState::Released
+                } else {
+                    TerminalLeaseState::Outstanding(state.outstanding)
+                };
+                (*lease_id, state)
+            })
+            .collect()
     }
 
     /// Remove and return a lease whose backing may be released.
@@ -3289,6 +3325,261 @@ pub enum ProviderHealth {
 impl ProviderHealth {
     pub fn is_usable(self) -> bool {
         matches!(self, Self::Usable)
+    }
+}
+
+/// Deterministic terminal state of one provider instance.
+///
+/// This is the admission authority the bounded-abandonment contract was
+/// missing. [`AbandonmentBudget`] and [`AbandonmentLedger`] only report how
+/// many unobservable submissions were tolerated; they do not decide what a new
+/// submission must answer afterwards. `ProviderLifecycle` composes the budget
+/// ledger with the [`LeaseLedger`] that owns lease retirement, so the two
+/// documented terminal causes stay distinguishable end to end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalState {
+    /// New work may still be admitted.
+    Usable,
+    /// The bounded abandonment budget is exhausted. The device was not
+    /// necessarily observed as lost; abandoned resources stay retained until
+    /// the process or provider instance goes away.
+    Exhausted { submissions: u64, bytes: u64 },
+    /// The device was observed as lost. Lease retirement is a teardown
+    /// guarantee, so every lease is released regardless of outstanding tokens.
+    DeviceLost,
+}
+
+/// Why a new submission was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalRefusalReason {
+    /// Bounded abandonment budget exhausted; the device may still be alive.
+    AbandonmentBudget,
+    /// The device is gone.
+    DeviceLost,
+}
+
+/// Structured refusal of a new submission against a terminal provider instance.
+///
+/// Callers can branch on [`TerminalRefusal::reason`] or on the normalized
+/// [`ProviderError`] fields instead of matching message strings. The refusal is
+/// produced for every attempt while the provider stays terminal, so repeated
+/// calls observe the same typed reason.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalRefusal {
+    reason: TerminalRefusalReason,
+    state: TerminalState,
+    error: ProviderError,
+}
+
+impl TerminalRefusal {
+    /// The terminal cause that refused this submission.
+    pub const fn reason(&self) -> TerminalRefusalReason {
+        self.reason
+    }
+
+    /// The terminal state observed when the refusal was produced.
+    pub const fn state(&self) -> TerminalState {
+        self.state
+    }
+
+    /// Whether recreating the provider is the documented recovery.
+    pub const fn requires_recreate(&self) -> bool {
+        matches!(self.error.retryability, Retryability::RetryAfterRecreate)
+    }
+
+    /// Structured provider error with a stable class, slug, fields and
+    /// retryability; callers may surface it directly across the provider
+    /// boundary.
+    pub const fn error(&self) -> &ProviderError {
+        &self.error
+    }
+
+    /// Consume the refusal and return the structured provider error.
+    pub fn into_error(self) -> ProviderError {
+        self.error
+    }
+
+    fn abandonment_budget(state: TerminalState) -> Self {
+        let (submissions, bytes) = match state {
+            TerminalState::Exhausted { submissions, bytes } => (submissions, bytes),
+            _ => (0, 0),
+        };
+        let mut error = ProviderError::new(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Resource,
+            "provider_unavailable",
+        )
+        .expect("static provider refusal slug")
+        .with_field("terminal", FieldValue::Text("abandonment_budget".into()))
+        .with_field("abandoned_submissions", FieldValue::Unsigned(submissions))
+        .with_field("abandoned_bytes", FieldValue::Unsigned(bytes));
+        error.retryability = Retryability::RetryAfterRecreate;
+        Self {
+            reason: TerminalRefusalReason::AbandonmentBudget,
+            state,
+            error,
+        }
+    }
+
+    fn device_lost(state: TerminalState) -> Self {
+        let mut error = ProviderError::new(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::DeviceLost,
+            "device_lost",
+        )
+        .expect("static provider refusal slug")
+        .with_field("terminal", FieldValue::Text("device_lost".into()));
+        error.retryability = Retryability::RetryAfterRecreate;
+        error.completion = CompletionDisposition::DeviceLost { token: None };
+        Self {
+            reason: TerminalRefusalReason::DeviceLost,
+            state,
+            error,
+        }
+    }
+}
+
+/// Provider-scoped admission and terminal-state authority.
+///
+/// States are monotonic and never return to `Usable`. `Exhausted` and
+/// `DeviceLost` are terminal for one instance, so callers must recreate the
+/// provider before retrying; `health` on this lifecycle is therefore the
+/// single source of truth for admission. `ProviderHealth::Exhausted` only
+/// tells the caller *that* the budget ran out, not that the device was
+/// observed as lost:
+///
+/// - `Exhausted` means abandoned submissions, not a lost device. A recreated
+///   provider may reuse the same physical device.
+/// - `DeviceLost` means the device is gone. Recreate the provider, and treat
+///   the epoch change as the proof that prior GPU work can no longer retire.
+///   Lease retirement is still a teardown guarantee, so
+///   [`ProviderLifecycle::leases`] releases every lease even when no
+///   completion was ever observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderLifecycle {
+    budget: AbandonmentBudget,
+    ledger: AbandonmentLedger,
+    leases: LeaseLedger,
+    state: TerminalState,
+    poisoned: bool,
+}
+
+impl ProviderLifecycle {
+    /// Build a usable lifecycle for one provider instance.
+    ///
+    /// `max_submissions` is the abandoned count at which the budget is
+    /// exhausted; a value of 1 fails closed on the first abandonment.
+    pub fn new(max_submissions: u64, max_bytes: u64) -> Self {
+        Self {
+            budget: AbandonmentBudget::new(max_submissions, max_bytes),
+            ledger: AbandonmentLedger::default(),
+            leases: LeaseLedger::new(),
+            state: TerminalState::Usable,
+            poisoned: false,
+        }
+    }
+
+    /// The admission budget this lifecycle enforces.
+    pub const fn budget(&self) -> AbandonmentBudget {
+        self.budget
+    }
+
+    /// Provider health for this instance. `Usable` is the only state that may
+    /// admit new work.
+    pub const fn health(&self) -> ProviderHealth {
+        match self.state {
+            TerminalState::Usable => ProviderHealth::Usable,
+            TerminalState::Exhausted { .. } => ProviderHealth::Exhausted,
+            TerminalState::DeviceLost => ProviderHealth::DeviceLost,
+        }
+    }
+
+    /// The full terminal state, including the abandoned counters for
+    /// `Exhausted`. Callers that only need admission use [`Self::health`].
+    pub const fn state(&self) -> TerminalState {
+        self.state
+    }
+
+    /// Whether this instance is still usable.
+    pub const fn is_usable(&self) -> bool {
+        matches!(self.state, TerminalState::Usable)
+    }
+
+    /// Whether termination came from an observed device loss. This is the
+    /// query that separates `DeviceLost` from budget exhaustion; it is `false`
+    /// both while usable and after budget exhaustion.
+    pub const fn ended_by_device_loss(&self) -> bool {
+        matches!(self.state, TerminalState::DeviceLost)
+    }
+
+    /// Whether termination came from the bounded abandonment budget.
+    pub const fn ended_by_abandonment_budget(&self) -> bool {
+        matches!(self.state, TerminalState::Exhausted { .. })
+    }
+
+    /// Admit one new submission.
+    ///
+    /// While usable this returns `Ok(())`. Once terminal it returns the same
+    /// structured refusal on every call, so retries are deterministic and
+    /// idempotent instead of string-matched.
+    pub fn admit(&self) -> Result<(), TerminalRefusal> {
+        match self.state {
+            TerminalState::Usable => Ok(()),
+            TerminalState::Exhausted { .. } => Err(TerminalRefusal::abandonment_budget(self.state)),
+            TerminalState::DeviceLost => Err(TerminalRefusal::device_lost(self.state)),
+        }
+    }
+
+    /// Record one submission whose completion can no longer be observed.
+    ///
+    /// The first abandonment that reaches the configured submission or byte
+    /// limit makes the instance terminal. Recording after that point is a
+    /// no-op for admission: the state stays `Exhausted` and the returned
+    /// outcome stays `Exhausted`, so callers can repeat the call safely.
+    pub fn record_abandonment(&mut self, bytes: u64) -> AbandonmentOutcome {
+        if !matches!(self.state, TerminalState::Usable) {
+            return AbandonmentOutcome::Exhausted;
+        }
+        let outcome = self.ledger.record(self.budget, bytes);
+        if outcome == AbandonmentOutcome::Exhausted {
+            self.poisoned = true;
+            self.state = TerminalState::Exhausted {
+                submissions: self.ledger.submissions(),
+                bytes: self.ledger.bytes(),
+            };
+        }
+        outcome
+    }
+
+    /// Mark the device as lost.
+    ///
+    /// This is the test-injection entry point that mirrors
+    /// `inject_device_loss_for_test()`. It is terminal and idempotent, and it
+    /// retires every lease because a lost device is a teardown guarantee.
+    pub fn mark_device_lost(&mut self) {
+        self.leases.device_lost();
+        self.poisoned = true;
+        self.state = TerminalState::DeviceLost;
+    }
+
+    /// Whether the instance has been poisoned by exhaustion or device loss.
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Abandonment counters `(submissions, bytes)` recorded so far.
+    pub const fn abandonment(&self) -> (u64, u64) {
+        (self.ledger.submissions(), self.ledger.bytes())
+    }
+
+    /// Lease ledger for this lifecycle.
+    pub fn leases(&self) -> &LeaseLedger {
+        &self.leases
+    }
+
+    /// Mutable lease ledger for registration and binding.
+    pub fn leases_mut(&mut self) -> &mut LeaseLedger {
+        &mut self.leases
     }
 }
 
@@ -6002,6 +6293,256 @@ mod tests {
         assert_eq!(
             ledger.register(lease_reservation(5, 2, 0, 0)),
             Err(ContractError::ZeroLength("lease reservation"))
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_keeps_admitting_while_the_budget_is_intact() {
+        let mut lifecycle = ProviderLifecycle::new(3, 4096);
+        assert!(lifecycle.is_usable());
+        assert_eq!(lifecycle.health(), ProviderHealth::Usable);
+        assert_eq!(lifecycle.state(), TerminalState::Usable);
+        assert!(lifecycle.admit().is_ok());
+        assert_eq!(
+            lifecycle.record_abandonment(16),
+            AbandonmentOutcome::Admitted
+        );
+        assert!(lifecycle.is_usable());
+        assert!(lifecycle.admit().is_ok());
+        assert_eq!(
+            lifecycle.record_abandonment(16),
+            AbandonmentOutcome::Admitted
+        );
+        assert!(lifecycle.admit().is_ok());
+        assert_eq!(lifecycle.abandonment(), (2, 32));
+        assert_eq!(lifecycle.state(), TerminalState::Usable);
+        assert!(!lifecycle.is_poisoned());
+        assert!(!lifecycle.ended_by_abandonment_budget());
+        assert!(!lifecycle.ended_by_device_loss());
+    }
+
+    #[test]
+    fn provider_lifecycle_refuses_new_work_after_budget_exhaustion() {
+        let mut lifecycle = ProviderLifecycle::new(2, 1024);
+        assert_eq!(
+            lifecycle.record_abandonment(64),
+            AbandonmentOutcome::Admitted
+        );
+        assert!(lifecycle.admit().is_ok());
+        assert_eq!(
+            lifecycle.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(
+            lifecycle.state(),
+            TerminalState::Exhausted {
+                submissions: 2,
+                bytes: 128
+            }
+        );
+        assert_eq!(lifecycle.health(), ProviderHealth::Exhausted);
+        assert!(lifecycle.is_poisoned());
+        assert!(lifecycle.ended_by_abandonment_budget());
+        assert!(!lifecycle.ended_by_device_loss());
+
+        let refusal = lifecycle
+            .admit()
+            .expect_err("exhausted instance refuses work");
+        assert_eq!(refusal.reason(), TerminalRefusalReason::AbandonmentBudget);
+        assert!(refusal.requires_recreate());
+        let error = refusal.error();
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(error.class, ProviderErrorClass::Resource);
+        assert_eq!(error.slug, "provider_unavailable");
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            error.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_eq!(
+            error.fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            error.fields.get("abandoned_bytes"),
+            Some(&FieldValue::Unsigned(128))
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_exhaustion_and_refusals_are_idempotent() {
+        let mut lifecycle = ProviderLifecycle::new(1, 4096);
+        assert_eq!(
+            lifecycle.record_abandonment(32),
+            AbandonmentOutcome::Exhausted
+        );
+        let first = lifecycle
+            .admit()
+            .expect_err("exhausted instance refuses work");
+        let counters = lifecycle.abandonment();
+        assert_eq!(counters, (1, 32));
+        for _ in 0..3 {
+            // Repeating the abandonment cannot double count or change state.
+            assert_eq!(
+                lifecycle.record_abandonment(32),
+                AbandonmentOutcome::Exhausted
+            );
+            assert_eq!(lifecycle.state(), first.state());
+            assert_eq!(lifecycle.abandonment(), counters);
+            assert_eq!(lifecycle.admit(), Err(first.clone()));
+        }
+        assert_eq!(lifecycle.health(), ProviderHealth::Exhausted);
+    }
+
+    #[test]
+    fn provider_lifecycle_terminates_on_the_byte_budget_before_the_count_limit() {
+        let mut lifecycle = ProviderLifecycle::new(16, 64);
+        assert_eq!(
+            lifecycle.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(lifecycle.abandonment(), (1, 64));
+        let refusal = lifecycle.admit().expect_err("byte budget refuses work");
+        assert_eq!(
+            refusal.error().fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(
+            refusal.error().fields.get("abandoned_bytes"),
+            Some(&FieldValue::Unsigned(64))
+        );
+        assert!(lifecycle.ended_by_abandonment_budget());
+    }
+
+    #[test]
+    fn provider_lifecycle_device_loss_retires_leases_and_refuses_work() {
+        let mut lifecycle = ProviderLifecycle::new(4, 4096);
+        let first = lease_reservation(1, 2, 0, 64);
+        let second = lease_reservation(3, 4, 8, 16);
+        lifecycle.leases_mut().register(first).unwrap();
+        lifecycle.leases_mut().register(second).unwrap();
+        lifecycle
+            .leases_mut()
+            .bind(first.lease.lease_id, lease_token(10))
+            .unwrap();
+        lifecycle
+            .leases_mut()
+            .bind(second.lease.lease_id, lease_token(11))
+            .unwrap();
+        assert_eq!(
+            lifecycle.leases().leased(),
+            vec![
+                (LeaseId::new(1), TerminalLeaseState::Outstanding(1)),
+                (LeaseId::new(3), TerminalLeaseState::Outstanding(1)),
+            ]
+        );
+        assert!(lifecycle.admit().is_ok());
+
+        lifecycle.mark_device_lost();
+        assert_eq!(lifecycle.health(), ProviderHealth::DeviceLost);
+        assert_eq!(lifecycle.state(), TerminalState::DeviceLost);
+        assert!(lifecycle.is_poisoned());
+        assert!(lifecycle.ended_by_device_loss());
+        assert!(!lifecycle.ended_by_abandonment_budget());
+        assert!(lifecycle.leases().is_device_lost());
+        // Every in-flight lease is observable in its terminal state: no
+        // dangling entry and no lease withheld behind a missing completion.
+        assert_eq!(
+            lifecycle.leases().leased(),
+            vec![
+                (LeaseId::new(1), TerminalLeaseState::Released),
+                (LeaseId::new(3), TerminalLeaseState::Released),
+            ]
+        );
+        assert_eq!(lifecycle.leases_mut().release_all_ready().len(), 2);
+        assert!(lifecycle.leases().leased().is_empty());
+
+        let refusal = lifecycle.admit().expect_err("device loss refuses work");
+        assert_eq!(refusal.reason(), TerminalRefusalReason::DeviceLost);
+        assert!(refusal.requires_recreate());
+        let error = refusal.error();
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(error.slug, "device_lost");
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            error.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".into()))
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_device_loss_wins_over_a_later_budget_abandonment() {
+        let mut lifecycle = ProviderLifecycle::new(2, 4096);
+        lifecycle.mark_device_lost();
+        // A device-lost provider no longer observes completions, so recording
+        // an abandonment afterwards must not relabel the terminal cause.
+        assert_eq!(
+            lifecycle.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(lifecycle.state(), TerminalState::DeviceLost);
+        assert_eq!(lifecycle.health(), ProviderHealth::DeviceLost);
+        assert_eq!(lifecycle.abandonment(), (0, 0));
+        assert_eq!(
+            lifecycle
+                .admit()
+                .expect_err("device loss refuses work")
+                .reason(),
+            TerminalRefusalReason::DeviceLost
+        );
+    }
+
+    #[test]
+    fn lease_ledger_reports_every_lease_terminal_state_without_duplicates() {
+        let mut ledger = LeaseLedger::new();
+        let first = lease_reservation(1, 2, 0, 64);
+        let second = lease_reservation(3, 4, 8, 16);
+        ledger.register(first).unwrap();
+        ledger.register(second).unwrap();
+        assert_eq!(
+            ledger.leased(),
+            vec![
+                (LeaseId::new(1), TerminalLeaseState::Released),
+                (LeaseId::new(3), TerminalLeaseState::Released),
+            ]
+        );
+        ledger.bind(first.lease.lease_id, lease_token(10)).unwrap();
+        ledger.bind(second.lease.lease_id, lease_token(11)).unwrap();
+        assert_eq!(
+            ledger.leased(),
+            vec![
+                (LeaseId::new(1), TerminalLeaseState::Outstanding(1)),
+                (LeaseId::new(3), TerminalLeaseState::Outstanding(1)),
+            ]
+        );
+        ledger.retire(lease_token(10));
+        // The retired lease stays observable until the owner releases it.
+        assert_eq!(
+            ledger.leased(),
+            vec![
+                (LeaseId::new(1), TerminalLeaseState::Released),
+                (LeaseId::new(3), TerminalLeaseState::Outstanding(1)),
+            ]
+        );
+        // Repeating the retirement is idempotent and creates no second entry.
+        ledger.retire(lease_token(10));
+        assert_eq!(ledger.leased().len(), 2);
+        let mut released = ledger.release_all_ready();
+        released.sort_by_key(|reservation| reservation.lease.lease_id.get());
+        assert_eq!(
+            released
+                .iter()
+                .map(|reservation| reservation.lease.lease_id)
+                .collect::<Vec<_>>(),
+            vec![LeaseId::new(1)]
+        );
+        assert_eq!(
+            ledger.leased(),
+            vec![(LeaseId::new(3), TerminalLeaseState::Outstanding(1))]
         );
     }
 
