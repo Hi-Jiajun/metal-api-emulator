@@ -24,6 +24,13 @@ pub use native::NativeMetalProvider;
 #[cfg(any(target_os = "macos", test))]
 mod lifecycle;
 
+// The render rail's validation, format mapping and clear-value decoding are
+// provider logic too, so they are compiled for the macOS provider and for the
+// unit tests that pin them on a host that cannot load Metal. Only the encoder
+// body behind them is macOS-only.
+#[cfg(any(target_os = "macos", test))]
+mod render;
+
 #[cfg(not(target_os = "macos"))]
 mod unsupported;
 #[cfg(not(target_os = "macos"))]

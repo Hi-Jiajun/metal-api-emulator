@@ -1,6 +1,13 @@
 // Capture native Metal observations for the bounded compute-buffer-v1 through v12 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
+//
+// The render path is present but no committed suite reaches it yet: no fixture
+// declares `render_cases`, because the observable a render case reports (an
+// attachment's texels) is not part of `conformance/compare.py`'s plan model
+// until the render milestone's fixture step lands. `--render-selftest` is the
+// one path that runs it on a device today, and `conformance/RENDER-CAPTURE.md`
+// lists what a suite has to change to switch it on.
 import Foundation
 import Metal
 import CoreGraphics
@@ -90,11 +97,71 @@ private struct TextureDefinition: Decodable {
     let initial_hex: String
 }
 
+/// The reviewed render fixture's source identity.
+///
+/// Deliberately a distinct type from `SourceDefinition`: a render pipeline is
+/// one module carrying two stage entries, so the review pins the pair. The pin
+/// is still code-side (`reviewedRenderModule`), because re-hashing a fixture
+/// must not be enough to admit a different module for execution.
+private struct RenderSourcePin: Decodable, Equatable {
+    let path: String
+    let sha256: String
+}
+
+/// The colour attachment a render case draws into.
+///
+/// The fields mirror `metal_api_core::provider::RenderAttachment`: identity,
+/// format, extent and the load/store pair. `clear_hex` is the four-byte clear
+/// value the contract carries in memory order, and `initial_hex` is what a
+/// `load` case keeps from its previous contents.
+private struct RenderAttachmentDefinition: Decodable {
+    let allocation: UInt64
+    let view: UInt64
+    let format: String
+    let width: Int
+    let height: Int
+    let load: String
+    let store: String
+    let clear_hex: String?
+    let initial_hex: String?
+}
+
+/// One offscreen render case (`research/docs/23` §1.2, §5.1).
+private struct RenderCaseDefinition: Decodable {
+    let id: String
+    let vertex_entry: String
+    let fragment_entry: String
+    let metal: RenderSourcePin
+    let vertices: UInt64
+    let viewport: [UInt64]
+    let attachment: RenderAttachmentDefinition
+    let expected_hex: String
+}
+
+/// A render case whose shape, source identity and expectation are reviewed.
+private struct ValidatedRender {
+    let definition: RenderCaseDefinition
+    let source: String
+    let attachment: ValidatedRenderAttachment
+}
+
+private struct ValidatedRenderAttachment {
+    let allocation: UInt64
+    let view: UInt64
+    let width: Int
+    let height: Int
+    let load: String
+    let clearComponents: [Double]
+    let initial: Data?
+    let expected: Data
+}
+
 private struct SuiteDefinition: Decodable {
     let schema_version: UInt64
     let suite: String
     let guard_byte: UInt8
     let cases: [CaseDefinition]
+    let render_cases: [RenderCaseDefinition]?
 }
 
 private struct ValidatedBuffer {
@@ -120,6 +187,7 @@ private struct ValidatedSuite {
     let name: String
     let sha256: String
     let cases: [ValidatedCase]
+    let renderCases: [ValidatedRender]
 }
 
 private struct AllocationResult: Encodable {
@@ -179,12 +247,14 @@ private struct Options {
     let output: URL?
     let validateOnly: Bool
     let probe: Bool
+    let renderSelfTest: Bool
 }
 
 private let usage = """
 Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --suite PATH --validate-suite
        native-metal-oracle --probe
+       native-metal-oracle --render-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -194,6 +264,11 @@ the fixture and both shader source hashes without creating a Metal device.
 --probe needs no suite and reports default-device eligibility as JSON to stdout.
 It cannot be combined with other options. Probe success means the query succeeded;
 it does not mean a device is eligible or that any Metal compute work executed.
+--render-selftest needs no suite: it captures the reviewed 2x2 offscreen render
+fixture, resolved relative to the current working directory, and prints the
+observed attachment bytes as JSON. It fails unless all four texels read back as
+the reviewed fragment output rather than the clear sentinel, and it cannot be
+combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -202,6 +277,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var output: URL?
     var validateOnly = false
     var probe = false
+    var renderSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -227,14 +303,23 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!probe, "Duplicate --probe option")
             probe = true
             index += 1
+        case "--render-selftest":
+            try require(!renderSelfTest, "Duplicate --render-selftest option")
+            renderSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, or --render-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: true, renderSelfTest: false)
+    }
+    if renderSelfTest {
         try require(suite == nil && output == nil && !validateOnly,
-                    "--probe cannot be combined with --suite, --output, or --validate-suite")
-        return Options(suite: nil, output: nil, validateOnly: false, probe: true)
+                    "--render-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false, renderSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -242,7 +327,8 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
         try require(!FileManager.default.fileExists(atPath: outputURL.path),
                     "Output already exists: \(outputURL.path)")
     }
-    return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false)
+    return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
+                   renderSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -679,7 +765,146 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
                                    programs: loaded, buffers: buffers,
                                    textures: textures))
     }
-    return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
+    // Render cases are reviewed after the compute cases, and their ids share the
+    // same identity space so a report cannot name two cases the same way.
+    let renderCases = try loadRenderCases(suite, root: root)
+    return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases,
+                          renderCases: renderCases)
+}
+
+private struct ReviewedRenderModule {
+    let vertex_entry: String
+    let fragment_entry: String
+    let metal: RenderSourcePin
+}
+
+/// The reviewed render fixture.
+///
+/// Code-side, like `reviewedProgram`'s table: an updated fixture hash must not
+/// be enough to admit a different module for execution. `RenderSourcePin` is a
+/// distinct type from `SourceDefinition` on purpose — the suite-coverage check
+/// cross-references compute `air`/`metal` pins only, and a render pipeline is
+/// one module with two stage entries rather than an air/metal pair.
+private func reviewedRenderModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_fullscreen_triangle",
+        fragment_entry: "render_solid_rgba8",
+        metal: RenderSourcePin(path: "shaders/render_offscreen_2x2.metal",
+                               sha256: "7430cd19a3497582618226066e95fb6f4ead9071f83b00c53398ccab8ba9d7de"))
+}
+
+@available(macOS 11.0, *)
+private func loadRenderSource(_ pin: RenderSourcePin, root: URL) throws -> Data {
+    // The same review rule as the compute pins (`validateSource`): the identity
+    // is part of the manual proof, so a re-hashed fixture cannot admit new
+    // source for execution.
+    let bytes = try readBoundedFile(root.appendingPathComponent(pin.path).standardizedFileURL)
+    try require(sha256(bytes) == pin.sha256, "Render shader SHA-256 mismatch: \(pin.path)")
+    return bytes
+}
+
+@available(macOS 11.0, *)
+private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [ValidatedRender] {
+    var cases = [ValidatedRender]()
+    for definition in suite.render_cases ?? [] {
+        cases.append(try validateRenderCase(definition, root: root))
+    }
+    let ids = cases.map { $0.definition.id }
+    try require(Set(ids).count == ids.count, "\(suite.suite): duplicate render case id")
+    let computeIDs = Set(suite.cases.map { $0.id })
+    for id in ids {
+        try require(!computeIDs.contains(id),
+                    "\(suite.suite): render case \(id) repeats a compute case id")
+    }
+    return cases
+}
+
+/// The render milestone's shape, admitted as a whitelist rather than as a
+/// per-case table.
+///
+/// The first render increment has exactly one render shape (`research/docs/23`
+/// §1.2, §3), so the shape itself is the review and a fixture cannot widen it by
+/// renaming a case. Everything the runtime reads is decoded and checked here,
+/// before a device exists, exactly as `validateShape` does for compute.
+@available(macOS 11.0, *)
+private func validateRenderCase(_ definition: RenderCaseDefinition,
+                                root: URL) throws -> ValidatedRender {
+    let reviewed = reviewedRenderModule()
+    try require(definition.vertex_entry == reviewed.vertex_entry
+                && definition.fragment_entry == reviewed.fragment_entry
+                && definition.metal == reviewed.metal,
+                "\(definition.id): unreviewed render pipeline identity")
+    let sourceBytes = try loadRenderSource(reviewed.metal, root: root)
+    guard let source = String(data: sourceBytes, encoding: .utf8) else {
+        throw OracleError("\(definition.id): reviewed MSL source is not UTF-8")
+    }
+    let attachment = definition.attachment
+    try require(attachment.format == "rgba8_unorm",
+                "\(definition.id): unsupported attachment format")
+    try require(attachment.width == 2 && attachment.height == 2,
+                "\(definition.id): the first render increment renders into a 2x2 attachment")
+    try require(attachment.allocation > 0 && attachment.view > 0,
+                "\(definition.id): zero attachment identity")
+    try require(attachment.store == "store",
+                "\(definition.id): the attachment has to be stored for a byte comparison")
+    try require(definition.vertices == 3,
+                "\(definition.id): expected the full-screen triangle")
+    try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
+                "\(definition.id): the viewport must cover the attachment")
+    let byteCount = attachment.width * attachment.height * 4
+    let expected = try decodeHex(definition.expected_hex, context: "\(definition.id) expected texels")
+    try require(expected.count == byteCount,
+                "\(definition.id): expected texel bytes do not match the attachment")
+    // Full coverage is the milestone's whole point (`research/docs/23` §1.3): the
+    // expectation admits only identical texels, so a partially covered
+    // attachment cannot be asserted as correct.
+    let texel = Data(expected.prefix(4))
+    var texels = 0
+    for offset in stride(from: 0, to: expected.count, by: 4) {
+        try require(Data(expected[offset..<(offset + 4)]) == texel,
+                    "\(definition.id): the milestone expects every texel to equal the fragment output")
+        texels += 1
+    }
+    try require(texels == attachment.width * attachment.height,
+                "\(definition.id): attachment texel count mismatch")
+    let clearComponents: [Double]
+    let initial: Data?
+    switch attachment.load {
+    case "clear":
+        guard let clearHex = attachment.clear_hex else {
+            throw OracleError("\(definition.id): a clear attachment needs clear_hex")
+        }
+        let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+        try require(clearBytes.count == 4, "\(definition.id): a clear colour is four bytes")
+        // The sentinel has to be distinguishable from the fragment output, or a
+        // pass that never ran would satisfy the expectation.
+        try require(clearBytes != texel,
+                    "\(definition.id): the clear colour equals the expected texel")
+        try require(attachment.initial_hex == nil,
+                    "\(definition.id): a cleared attachment carries no initial bytes")
+        clearComponents = [Double(clearBytes[0]) / 255.0, Double(clearBytes[1]) / 255.0,
+                           Double(clearBytes[2]) / 255.0, Double(clearBytes[3]) / 255.0]
+        initial = nil
+    case "load":
+        guard let initialHex = attachment.initial_hex else {
+            throw OracleError("\(definition.id): a loaded attachment needs its previous texels")
+        }
+        let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
+        try require(previous.count == byteCount,
+                    "\(definition.id): initial texels do not match the attachment")
+        try require(previous != expected,
+                    "\(definition.id): the initial texels equal the expectation")
+        clearComponents = []
+        initial = previous
+    default:
+        throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
+    }
+    return ValidatedRender(definition: definition, source: source,
+                           attachment: ValidatedRenderAttachment(
+                               allocation: attachment.allocation, view: attachment.view,
+                               width: attachment.width, height: attachment.height,
+                               load: attachment.load, clearComponents: clearComponents,
+                               initial: initial, expected: expected))
 }
 
 private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throws -> ProgramDefinition {
@@ -931,6 +1156,165 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
 }
 
+/// One offscreen render case: a 2x2 `rgba8Unorm` attachment, the reviewed
+/// two-entry pipeline and a full-screen-triangle draw, read back as texels.
+///
+/// The observable is the attachment's tightly packed texels, reported in the
+/// same `writebacks`/`allocations` shape every other case uses, so a render case
+/// needs no second observation channel (`research/docs/23` §1.1). The milestone
+/// assertion is falsifiable in two ways: the expectation covers every texel, and
+/// it has to differ from the sentinel the pass started from.
+@available(macOS 11.0, *)
+private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
+                           queue: MTLCommandQueue) throws -> CaseResult {
+    let definition = fixture.definition
+    let attachment = fixture.attachment
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: attachment.width,
+        height: attachment.height,
+        mipmapped: false)
+    // The attachment is a render target, not a sampled source. Shared storage is
+    // what makes its texels CPU-visible for the readback on the unified-memory
+    // device this oracle requires, the same reason the sampled texture rail uses
+    // it (`research/docs/16` §4.8).
+    descriptor.usage = .renderTarget
+    descriptor.storageMode = .shared
+    guard let target = device.makeTexture(descriptor: descriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the colour attachment")
+    }
+    target.label = "native oracle: \(definition.id)"
+    if let initial = attachment.initial {
+        initial.withUnsafeBytes { bytes in
+            if let source = bytes.baseAddress {
+                target.replace(region: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
+                               mipmapLevel: 0,
+                               withBytes: source,
+                               bytesPerRow: attachment.width * 4)
+            }
+        }
+    }
+    // The two stage entries come from the one reviewed module; `loadSuite`
+    // already proved the identity, so only the lookup can still fail.
+    let library = try device.makeLibrary(source: fixture.source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: definition.vertex_entry) else {
+        throw OracleError("\(definition.id): vertex entry \(definition.vertex_entry) was not found")
+    }
+    guard let fragmentFunction = library.makeFunction(name: definition.fragment_entry) else {
+        throw OracleError("\(definition.id): fragment entry \(definition.fragment_entry) was not found")
+    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: \(definition.id)"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    // Attachment 0 is the only colour attachment the first increment admits, and
+    // its pixel format is the one the reviewed fragment was written for.
+    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+    let pass = MTLRenderPassDescriptor()
+    let color = pass.colorAttachments[0]
+    color.texture = target
+    color.storeAction = .store
+    if attachment.load == "clear" {
+        color.loadAction = .clear
+        guard attachment.clearComponents.count == 4 else {
+            throw OracleError("\(definition.id): a clear colour is four components")
+        }
+        color.clearColor = MTLClearColor(red: attachment.clearComponents[0],
+                                         green: attachment.clearComponents[1],
+                                         blue: attachment.clearComponents[2],
+                                         alpha: attachment.clearComponents[3])
+    } else {
+        color.loadAction = .load
+    }
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("\(definition.id): cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "\(definition.id): command buffer does not retain resources")
+    commandBuffer.label = "native oracle: \(definition.id)"
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("\(definition.id): cannot create a render encoder")
+    }
+    encoder.setRenderPipelineState(pipeline)
+    // The viewport is explicit because the contract carries it, even though the
+    // first increment only accepts the attachment-covering default.
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(attachment.width),
+                                    height: Double(attachment.height),
+                                    znear: 0, zfar: 1))
+    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: Int(definition.vertices))
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        // Throwing reaches the top-level nonzero exit. No other case is run, the
+        // attachment is not inspected, and no partial report is published.
+        throw OracleError("\(definition.id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+
+    var observed = Data(count: attachment.width * attachment.height * 4)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            target.getBytes(destination,
+                            bytesPerRow: attachment.width * 4,
+                            from: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
+                            mipmapLevel: 0)
+        }
+    }
+    try require(observed == attachment.expected,
+                "\(definition.id): attachment bytes \(hex(observed)) do not match the reviewed expectation \(hex(attachment.expected))")
+    // One allocation, one writeback: the attachment's own texels.
+    return CaseResult(id: definition.id, completion: "CompletedVisible",
+                      writebacks: [Writeback(allocation: attachment.allocation, view: attachment.view,
+                                             offset: 0, bytes_hex: hex(observed))],
+                      allocations: [AllocationResult(allocation: attachment.allocation,
+                                                     bytes_hex: hex(observed))])
+}
+
+/// The milestone's own render fixture, constructed in code.
+///
+/// No committed suite declares `render_cases` yet, so this is the one path that
+/// reaches `runRenderCase` on a device today — and the one command the provider's
+/// render-bit flip condition refers to (`conformance/RENDER-CAPTURE.md`). It
+/// reads the reviewed module relative to the current working directory, so it is
+/// meant to run from the repository root, and it fails unless all four
+/// attachment texels read back as the fragment's `40 80 c0 ff` instead of the
+/// `fe` clear sentinel.
+@available(macOS 11.0, *)
+private func renderSelfTest() throws -> CaseResult {
+    let reviewed = reviewedRenderModule()
+    let definition = RenderCaseDefinition(
+        id: "render_offscreen_2x2",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        vertices: 3,
+        viewport: [0, 0, 2, 2],
+        attachment: RenderAttachmentDefinition(
+            allocation: 900, view: 910, format: "rgba8_unorm",
+            width: 2, height: 2, load: "clear", store: "store",
+            clear_hex: "fefefefe", initial_hex: nil),
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff")
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fixture = try validateRenderCase(definition, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the render self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native render self-test: device=\(device.name) platform=\(eligibility.platform)")
+    return try runRenderCase(fixture, device: device, queue: queue)
+}
+
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -981,6 +1365,11 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
         }
         results.append(try runCase(fixture, device: device, queue: queue, pipelines: selected))
     }
+    // Render cases run last: they compile the reviewed render module instead of
+    // the compute fixtures, and their observable is the attachment's texels.
+    for fixture in suite.renderCases {
+        results.append(try runRenderCase(fixture, device: device, queue: queue))
+    }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",
         device: device.name, platform: eligibility.platform, results: results)
@@ -1014,6 +1403,14 @@ do {
     if options.probe {
         // Query capabilities only: no suite, queue, shader, or GPU submission.
         try writeJSON(assessDevice(MTLCreateSystemDefaultDevice()))
+        exit(EXIT_SUCCESS)
+    }
+    if options.renderSelfTest {
+        // The one path that reaches the render capture on a device today. The
+        // reported bytes are the evidence: four `40 80 c0 ff` texels, never the
+        // `fe` clear sentinel the pass started from.
+        let result = try renderSelfTest()
+        try writeJSON(result)
         exit(EXIT_SUCCESS)
     }
     guard let suiteURL = options.suite else { throw OracleError("--suite is required") }

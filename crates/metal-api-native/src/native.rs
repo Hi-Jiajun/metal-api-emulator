@@ -158,8 +158,26 @@ impl NativeMetalProvider {
                 ],
                 host_readback: true,
                 submit_only: false,
-                // Compute-only device snapshot: the native provider has no
-                // render execution path, so admission refuses render traces.
+                // Compute-only device snapshot. The render rail (`crate::render`)
+                // exists, but it has never run on an Apple GPU, so every render
+                // bit stays at its default and admission refuses a render-bearing
+                // trace with `render_passes_unsupported`
+                // (`research/docs/23` §4.2, §6 Step 6).
+                //
+                // Flip condition, deliberately conservative: the single-device
+                // check in `conformance/RENDER-CAPTURE.md` —
+                // `native-oracle --render-selftest` on Apple hardware — has to
+                // read the 2x2 attachment back as `40 80 c0 ff` four times,
+                // which is only possible if the full-screen triangle covered
+                // every texel and the reviewed MSL pin matched. Then:
+                //   supports_render_passes: true,
+                //   max_color_attachments: crate::render::MAX_COLOR_ATTACHMENTS,
+                //   max_attachment_dimension: crate::render::MAX_ATTACHMENT_DIMENSION,
+                //   supported_color_formats:
+                //       crate::render::SUPPORTED_COLOR_FORMATS.to_vec(),
+                // and connect the trace path to
+                // `render::execute_offscreen_render` (`research/docs/23` §6
+                // Step 7).
                 supports_render_passes: false,
                 max_color_attachments: 0,
                 max_attachment_dimension: [0, 0],
