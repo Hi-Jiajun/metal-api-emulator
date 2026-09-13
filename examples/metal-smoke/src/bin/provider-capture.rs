@@ -10,7 +10,7 @@ use metal_api_core::provider::{
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
-use metal_api_vulkan::VulkanComputeProvider;
+use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,26 +54,54 @@ impl Backend {
     }
 }
 
+/// Where a capture reads its device-buffer copy counters. The rails take a
+/// `dyn PipelineProvider`, so the concrete handle has to be kept here to read
+/// the counters around each case (`research/docs/15` §5).
+enum CopyCounters {
+    Vulkan(Arc<VulkanExecutor>),
+    #[cfg(target_os = "macos")]
+    Native(Arc<NativeMetalProvider>),
+}
+
+impl CopyCounters {
+    /// Cumulative (copy-in, copy-out) device-buffer operations.
+    fn read(&self) -> (usize, usize) {
+        match self {
+            Self::Vulkan(executor) => executor.buffer_copy_counts(),
+            #[cfg(target_os = "macos")]
+            Self::Native(provider) => provider.buffer_copy_counts(),
+        }
+    }
+}
+
 fn create_provider(
     backend: Backend,
     async_execution: bool,
-) -> Result<(Arc<dyn PipelineProvider>, String)> {
+) -> Result<(Arc<dyn PipelineProvider>, String, CopyCounters)> {
     match backend {
         Backend::Vulkan => {
-            let provider = VulkanComputeProvider::new()
+            let executor = VulkanExecutor::new()
+                .map_err(|error| format!("create Vulkan executor: {error:?}"))?;
+            let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
                 .map_err(|error| format!("create Vulkan provider: {error:?}"))?
                 .with_async_execution(async_execution);
             let name = provider.device_name().to_owned();
-            Ok((Arc::new(provider), name))
+            Ok((Arc::new(provider), name, CopyCounters::Vulkan(executor)))
         }
         Backend::NativeMetalProvider => {
             #[cfg(target_os = "macos")]
             {
-                let provider = NativeMetalProvider::new()
-                    .map_err(|error| format!("create native Metal provider: {error:?}"))?
-                    .with_async_execution(async_execution);
+                let provider = Arc::new(
+                    NativeMetalProvider::new()
+                        .map_err(|error| format!("create native Metal provider: {error:?}"))?
+                        .with_async_execution(async_execution),
+                );
                 let name = provider.device_name().to_owned();
-                Ok((Arc::new(provider), name))
+                Ok((
+                    Arc::clone(&provider) as Arc<dyn PipelineProvider>,
+                    name,
+                    CopyCounters::Native(provider),
+                ))
             }
             #[cfg(not(target_os = "macos"))]
             Err("native-metal-provider requires macOS".into())
@@ -184,6 +212,12 @@ struct CaseResult {
     completion: &'static str,
     writebacks: Vec<Writeback>,
     allocations: Vec<Allocation>,
+    /// Device-buffer copy-in / copy-out operations for this case, summed over
+    /// its submissions. One of each per touched allocation, not per view
+    /// (`research/docs/15` §3.3). Absent from the Swift reference oracle,
+    /// which is not a provider.
+    copy_in: Option<u32>,
+    copy_out: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -284,7 +318,7 @@ fn main() -> Result<()> {
         }
     }
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name) = create_provider(backend, async_execution)?;
+    let (provider, device_name, counters) = create_provider(backend, async_execution)?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
     let mut results = Vec::new();
@@ -372,7 +406,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        results.push(if let Some(device) = &object_device {
+        let before = counters.read();
+        let mut result = if let Some(device) = &object_device {
             let programs = case_programs(case)
                 .iter()
                 .map(|program| {
@@ -388,7 +423,11 @@ fn main() -> Result<()> {
                 index as u64 + 1,
                 suite.guard_byte,
             )?
-        });
+        };
+        let after = counters.read();
+        result.copy_in = Some(u32::try_from(after.0 - before.0)?);
+        result.copy_out = Some(u32::try_from(after.1 - before.1)?);
+        results.push(result);
     }
     if api == EntryApi::Trace {
         for pipeline in pipelines.values() {
@@ -1321,6 +1360,8 @@ fn run_object_case(
         completion: "CompletedVisible",
         writebacks,
         allocations,
+        copy_in: None,
+        copy_out: None,
     })
 }
 
@@ -1540,6 +1581,8 @@ fn run_case(
                 bytes_hex: hex(&bytes),
             })
             .collect(),
+        copy_in: None,
+        copy_out: None,
     })
 }
 

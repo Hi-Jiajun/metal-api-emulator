@@ -282,8 +282,22 @@ def validate_capture(suite, digest, report, required_backend=None):
     _string(report["platform"], "capture.platform")
     results = _list(report["results"], "capture.results")
     seen = set()
+    cases = {case.get("id"): case for case in suite["cases"] if isinstance(case, dict)}
+    # The Swift reference oracle reports bytes but not device-buffer copy
+    # counters: it is not a provider. The count contract therefore applies to
+    # every other backend (research/docs/15 §5).
+    provider_backend = report["backend"] != "native-metal"
     for result in results:
-        _object(result, ("id", "completion", "writebacks", "allocations"), "capture result")
+        _require(isinstance(result, dict) and "id" in result,
+                 "capture result: expected an object with an id")
+        base = {"id", "completion", "writebacks", "allocations"}
+        counted = base | {"copy_in", "copy_out"}
+        _require(set(result) in (base, counted),
+                 "capture result: expected fields "
+                 + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out")
+        counts = (result.get("copy_in"), result.get("copy_out"))
+        _require((counts[0] is None) == (counts[1] is None),
+                 "capture result: copy_in and copy_out are recorded together")
         case_id = _string(result["id"], "capture result.id")
         where = f"case {case_id}"
         _require(case_id in plan, f"{where}: unknown case")
@@ -318,6 +332,26 @@ def validate_capture(suite, digest, report, required_backend=None):
             _same_bytes(actual, expected_allocations[allocation], f"{where} allocation {allocation}")
         missing = set(expected_allocations) - seen_allocations
         _require(not missing, f"{where}: missing allocations {sorted(missing)}")
+
+        if provider_backend and suite["suite"] == "compute-buffer-v11":
+            _require(counts[0] is not None,
+                     f"{where}: the v11 count contract requires copy_in and copy_out")
+        if counts[0] is not None:
+            _integer(counts[0], f"{where}.copy_in")
+            _integer(counts[1], f"{where}.copy_out")
+        # A case split across command buffers submits once per group and the
+        # counters accumulate, so the derived expectation only applies to cases
+        # with a single submission (research/docs/15 §5).
+        single_submission = "command_buffers" not in cases.get(case_id, {})
+        if provider_backend and single_submission and counts[0] is not None:
+            expected_in = len(expected_allocations)
+            expected_out = len({identity[0] for identity, _ in expected_writes})
+            _require(counts[0] == expected_in,
+                     f"{where}: copy_in {counts[0]} does not match {expected_in} "
+                     "touched allocations")
+            _require(counts[1] == expected_out,
+                     f"{where}: copy_out {counts[1]} does not match {expected_out} "
+                     "written allocations")
     missing = set(plan) - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
 
