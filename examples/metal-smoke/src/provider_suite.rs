@@ -128,6 +128,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_object_queue_ordering()?;
     run_object_disjoint_views()?;
     run_sampled_texture_read(Arc::clone(&executor))?;
+    run_object_sampled_texture()?;
     run_object_parallel_commands()?;
     run_object_same_allocation_parallel()?;
     run_object_serial_dependency()?;
@@ -1956,6 +1957,56 @@ fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
     println!(
         "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
     );
+    Ok(())
+}
+
+/// The same texel read through the object API: Device::new_texture_with_bytes,
+/// encoder.set_texture, commit/wait/readback. This is the path v11's texture
+/// case will use, so it must pass on both drivers (`research/docs/16` §4.8).
+fn run_object_sampled_texture() -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        PipelineCompileRequest, SemanticDigest, ShaderSource, TextureFormat,
+    };
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+    let pipeline = device.compile_pipeline(PipelineCompileRequest {
+        entry_name: "read_texture_2d".to_owned(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"object_sampled_texture".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_read_texture_2d.ll").to_owned(),
+        ),
+    })?;
+    let mut texels = Vec::with_capacity(64);
+    for value in 0..16_u32 {
+        texels.extend_from_slice(&value.to_le_bytes());
+    }
+    let texture = device.new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)?;
+    let output = device.new_buffer_with_bytes(vec![0_u8; 64])?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_texture(0, &texture)?;
+        encoder.set_buffer(0, &output.view(0, 64)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    command.commit()?;
+    command.wait_until_completed()?;
+    let observed = output.read()?;
+    if observed[..4] != 0_u32.to_le_bytes() {
+        return Err(format!("object texture read landed {:02x?}", &observed[..4]).into());
+    }
+    println!("PASS provider_object_sampled_texture texture=4x4-r32uint texel=(0,0) value=0");
     Ok(())
 }
 
