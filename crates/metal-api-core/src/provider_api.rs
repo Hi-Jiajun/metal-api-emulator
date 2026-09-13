@@ -991,6 +991,10 @@ impl CommandBuffer {
     /// backing when the device retires it. A command whose result already
     /// landed, or whose provider refuses cancellation, cannot be cancelled and
     /// reports the corresponding error.
+    ///
+    /// A present tail action was performed at `submit` time: cancel does not
+    /// roll back its acquire/present count or the target's terminal layout. It
+    /// abandons only the observation and the landing of the writebacks.
     pub fn cancel(&self) -> Result<(), Error> {
         let pending = {
             let mut inner = lock(&self.shared.inner, "provider command")?;
@@ -1445,7 +1449,9 @@ impl Drop for ComputeCommandEncoder {
 /// submission exactly as the compute encoder does. One call to
 /// [`RenderCommandEncoder::draw_render_pass`] records one colour-attachment
 /// render pass with the covering viewport, the three-vertex full-screen
-/// triangle and an optional present tail.
+/// triangle and an optional present tail. That present tail executes when the
+/// command is submitted: its acquire/present count and target terminal layout
+/// are not rolled back by a later `cancel` or deadline.
 pub struct RenderCommandEncoder {
     shared: Arc<CommandShared>,
     pipeline: Option<RenderPipeline>,
@@ -1470,6 +1476,13 @@ impl RenderCommandEncoder {
     /// `present` selects the optional present tail action on that same
     /// attachment. Every other shape is refused here with a typed error rather
     /// than deferred to provider admission.
+    ///
+    /// A present tail is an action of the command's `submit`, not of its
+    /// `wait`: when the command is submitted the provider counts the one
+    /// acquire and one present and advances the target to its terminal layout.
+    /// [`CommandBuffer::wait_until_completed`] only makes the attachment
+    /// writeback host-visible; [`CommandBuffer::cancel`] or a deadline abandons
+    /// that observation without rolling the present action back.
     pub fn draw_render_pass(
         &mut self,
         attachment: &BufferView,

@@ -1268,10 +1268,20 @@ impl ComputeProvider for VulkanComputeProvider {
                     &textures,
                 )?
             };
-            // The render rail completes inside `submit` even in deferred mode,
-            // after the compute submission is on the same queue, so a later
-            // render pass observes the compute order the trace declares. Its
-            // bytes are merged with the deferred pool readback at `wait`.
+            // The render rail completes inside `submit` even in deferred mode:
+            // each render/present pass executes here, so a present tail's
+            // acquire/present counters and the target's terminal layout are
+            // advanced before `submit` returns. `wait` only decides whether
+            // those writebacks become host-visible; `cancel` or a deadline
+            // abandons the observation and in-flight reclaim but does NOT roll
+            // the present action back (`docs/24` §9 leaves a truly cancellable
+            // present as a future contract). The render passes do not share the
+            // compute queue: they select a graphics-capable family through
+            // `render::select_graphics_queue`, so ordering against the compute
+            // dispatch is guaranteed by core admission
+            // (`AttachmentComputeConflict` / `RenderPassOrderUnsupported`)
+            // rather than by a shared queue submission. Its bytes are merged
+            // with the deferred pool readback at `wait`.
             let render_writebacks = match self.execute_render_passes(trace, &pool, &render_plan) {
                 Ok(writebacks) => writebacks,
                 Err(error) => {
