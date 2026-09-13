@@ -57,15 +57,25 @@ if ($CaptureMatrix) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $outputDir = Join-Path $PSScriptRoot "target\windows-captures\$stamp"
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    foreach ($version in 1..9) {
-        $suite = if ($version -eq 1) { 'suite.json' } else { "suite-v$version.json" }
+    # Discover every committed suite the way tools/lavapipe-smoke.sh does:
+    # suite.json is v1, suite-vN.json is vN, and the list grows with the repo
+    # instead of stopping at a hand-maintained version.
+    $suites = @((Join-Path $suiteDir 'suite.json'))
+    $version = 2
+    while (Test-Path (Join-Path $suiteDir "suite-v$version.json")) {
+        $suites += (Join-Path $suiteDir "suite-v$version.json")
+        $version++
+    }
+    foreach ($suitePath in $suites) {
+        $suite = Split-Path $suitePath -Leaf
+        $label = if ($suite -eq 'suite.json') { 'v1' } else { $suite -replace '^suite-', '' }
         foreach ($rail in @('direct', 'objects', 'objects-async')) {
-            $output = Join-Path $outputDir "vulkan-$rail-v$version.json"
-            $captureArgs = @('--suite', (Join-Path $suiteDir $suite), '--output', $output)
+            $output = Join-Path $outputDir "vulkan-$rail-$label.json"
+            $captureArgs = @('--suite', $suitePath, '--output', $output)
             if ($rail -ne 'direct') { $captureArgs += @('--api', 'objects') }
             if ($rail -eq 'objects-async') { $captureArgs += '--async' }
             & $captureRunner @captureArgs
-            if ($LASTEXITCODE -ne 0) { throw "Capture failed: $rail v$version" }
+            if ($LASTEXITCODE -ne 0) { throw "Capture failed: $rail $label" }
         }
     }
     Write-Host "Captures written to $outputDir"
