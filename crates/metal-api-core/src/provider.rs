@@ -4662,7 +4662,7 @@ impl fmt::Display for ContractError {
                 allocation_size,
             } => write!(
                 formatter,
-                "lease {:?} range end {end} exceeds reservation {allocation_size}",
+                "lease {:?} range end {end} exceeds allocation size {allocation_size}",
                 lease
             ),
             Self::OverlappingWritableViews {
