@@ -3,8 +3,8 @@
 //! staged lease windows.
 
 use crate::{
-    bounded_contract, classify_command_buffer_error, device_lost_refusal, refusal,
-    unknown_completion, CommandBufferFailure,
+    bounded_contract, classify_command_buffer_error, device_lost_refusal,
+    lifecycle::NativeLifecycle, refusal, unknown_completion, CommandBufferFailure,
 };
 use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -15,15 +15,13 @@ use metal::{
     MTLTextureType, MTLTextureUsage, NSUInteger, Texture, TextureDescriptor,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
-use metal_api_core::completion::{
-    AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome, CompletionRecord, ObservationDeadline,
-};
+use metal_api_core::completion::{AbandonmentBudget, CompletionRecord, ObservationDeadline};
 use metal_api_core::provider::*;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -41,8 +39,6 @@ struct State {
     pipelines: BTreeMap<PipelineId, RegisteredPipeline>,
     next_pipeline: u64,
     next_submission: u64,
-    abandoned: bool,
-    device_lost: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -89,11 +85,15 @@ pub struct NativeMetalProvider {
     capabilities: ProviderCapabilities,
     state: Mutex<State>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
-    abandonment_budget: AbandonmentBudget,
-    abandonment: Mutex<AbandonmentLedger>,
+    /// Admission, health and the abandonment counters of this instance.
+    ///
+    /// One `metal_api_core` lifecycle is the only terminal-state authority, so
+    /// the provider cannot report one health while refusing on another. It is
+    /// shared with the Metal completion handlers, which run on a driver thread
+    /// after `submit` has returned and therefore cannot borrow the provider.
+    lifecycle: Arc<NativeLifecycle>,
     async_execution: bool,
     observation_deadline: Duration,
-    async_abandoned: Arc<AtomicBool>,
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
     borrowed: Arc<BorrowedLeaseRegistry>,
@@ -169,16 +169,12 @@ impl NativeMetalProvider {
                     pipelines: BTreeMap::new(),
                     next_pipeline: 1,
                     next_submission: 1,
-                    abandoned: false,
-                    device_lost: Arc::new(AtomicBool::new(false)),
                 }),
                 completions: Mutex::new(BTreeMap::new()),
                 counters: Arc::new(CopyCounters::default()),
-                abandonment_budget: AbandonmentBudget::new(8, 64 * 1024 * 1024),
-                abandonment: Mutex::new(AbandonmentLedger::default()),
+                lifecycle: Arc::new(NativeLifecycle::new()),
                 async_execution: false,
                 observation_deadline: GPU_DEADLINE,
-                async_abandoned: Arc::new(AtomicBool::new(false)),
                 completion_outbox: None,
                 staging: LeaseRegistry::new(),
                 borrowed: Arc::new(BorrowedLeaseRegistry::new()),
@@ -237,48 +233,29 @@ impl NativeMetalProvider {
     /// Bound how many deferred submissions may become unobservable before the
     /// provider refuses new work. The default tolerates eight abandonments.
     pub fn with_abandonment_budget(mut self, budget: AbandonmentBudget) -> Self {
-        self.abandonment_budget = budget;
+        self.lifecycle = Arc::new(NativeLifecycle::with_budget(budget));
         self
     }
 
     /// Report whether this provider can still admit new work.
+    ///
+    /// Health and admission are the same query on the same lifecycle, so a
+    /// provider that reports `Usable` here also admits the next submission.
     pub fn health(&self) -> ProviderHealth {
-        match self.state.lock() {
-            Ok(state) => self.health_from_state(&state),
-            Err(poisoned) => self.health_from_state(&poisoned.into_inner()),
-        }
-    }
-
-    fn health_from_state(&self, state: &State) -> ProviderHealth {
-        if state.device_lost.load(Ordering::SeqCst) {
-            ProviderHealth::DeviceLost
-        } else if state.abandoned || self.async_abandoned.load(Ordering::SeqCst) {
-            ProviderHealth::Exhausted
-        } else {
-            ProviderHealth::Usable
-        }
+        self.lifecycle.health()
     }
 
     /// Report `(abandoned submissions, abandoned bytes)` for this provider.
     pub fn abandonment_stats(&self) -> (u64, u64) {
-        match self.abandonment.lock() {
-            Ok(ledger) => (ledger.submissions(), ledger.bytes()),
-            Err(poisoned) => {
-                let ledger = poisoned.into_inner();
-                (ledger.submissions(), ledger.bytes())
-            }
-        }
+        self.lifecycle.abandonment()
     }
 
-    fn record_abandonment(&self, bytes: u64) -> AbandonmentOutcome {
-        let outcome = match self.abandonment.lock() {
-            Ok(mut ledger) => ledger.record(self.abandonment_budget, bytes),
-            Err(poisoned) => poisoned.into_inner().record(self.abandonment_budget, bytes),
-        };
-        if outcome == AbandonmentOutcome::Exhausted {
-            self.async_abandoned.store(true, Ordering::SeqCst);
-        }
-        outcome
+    /// Give up on one submission whose completion is no longer observable.
+    ///
+    /// The shared lifecycle charges the budget, so the provider turns terminal
+    /// in the same transition that reaches the bound.
+    fn record_abandonment(&self, bytes: u64) {
+        self.lifecycle.record_abandonment(bytes);
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, ProviderError> {
@@ -289,18 +266,6 @@ impl NativeMetalProvider {
                 "provider_registry_poisoned",
             )
         })
-    }
-
-    fn ensure_usable(&self, state: &State) -> Result<(), ProviderError> {
-        if state.device_lost.load(Ordering::SeqCst) {
-            return Err(device_lost_refusal(ProviderPhase::Resolve, None));
-        }
-        if state.abandoned || self.async_abandoned.load(Ordering::SeqCst) {
-            let mut error = resource_error("provider_unavailable");
-            error.retryability = Retryability::RetryAfterRecreate;
-            return Err(error);
-        }
-        Ok(())
     }
 
     fn completions(
@@ -415,7 +380,7 @@ impl PipelineProvider for NativeMetalProvider {
     ) -> Result<CompiledComputePipeline, ProviderError> {
         let contract = bounded_contract(&request)?;
         let mut state = self.lock()?;
-        self.ensure_usable(&state)?;
+        self.lifecycle.admit()?;
         objc::rc::autoreleasepool(|| {
             let ShaderSource::MetalSource(source) = &request.source else {
                 unreachable!("checked bounded source")
@@ -506,7 +471,7 @@ impl ComputeProvider for NativeMetalProvider {
         self.check_epoch(trace.device_epoch)?;
         self.capabilities.admit(trace, admitted.resources())?;
         let mut state = self.lock()?;
-        self.ensure_usable(&state)?;
+        self.lifecycle.admit()?;
         // Resolve and retain every pass's pipeline under the same registry
         // lock, checking all metadata and local limits before GPU allocation.
         let mut pipelines = Vec::with_capacity(trace.passes.len());
@@ -631,19 +596,11 @@ impl ComputeProvider for NativeMetalProvider {
         };
         if self.async_execution {
             let result = self.submit_async(&mut state, trace, pipelines, token, &resolve, retains);
-            self.publish_health(self.health_from_state(&state));
+            self.publish_health(self.lifecycle.health());
             return result;
         }
         let result = objc::rc::autoreleasepool(|| {
-            execute(
-                &mut state,
-                &self.counters,
-                trace,
-                pipelines,
-                token,
-                &resolve,
-                retains,
-            )
+            self.execute(&mut state, trace, pipelines, token, &resolve, retains)
         });
         let observation = match &result {
             Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
@@ -662,7 +619,7 @@ impl ComputeProvider for NativeMetalProvider {
                 },
             );
         }
-        self.publish_health(self.health_from_state(&state));
+        self.publish_health(self.lifecycle.health());
         result
     }
 
@@ -1079,72 +1036,90 @@ fn encode(
     Ok(EncodedSubmission { pending, pool })
 }
 
-fn execute(
-    state: &mut State,
-    counters: &CopyCounters,
-    trace: &ComputeTrace,
-    pipelines: Vec<ComputePipelineState>,
-    token: CompletionToken,
-    resolve: &BufferResolver<'_>,
-    retains: BorrowedRetains,
-) -> Result<ProviderSubmission, ProviderError> {
-    let EncodedSubmission { mut pending, pool } =
-        encode(state, counters, trace, pipelines, resolve, retains)?;
-    pending.submitted = true;
-    let resources = pending.resources.as_ref().expect("encoded resources");
-    resources.command.commit();
-    let started = Instant::now();
-    loop {
-        match resources.command.status() {
-            MTLCommandBufferStatus::Completed => break,
-            MTLCommandBufferStatus::Error => {
-                let (detail, code) = unsafe {
-                    let error: *mut Object = msg_send![resources.command.as_ref(), error];
-                    (error_description(error), command_buffer_error_code(error))
-                };
-                if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
-                    state.device_lost.store(true, Ordering::SeqCst);
-                    return Err(device_lost_error(token, detail));
+impl NativeMetalProvider {
+    /// Run one synchronous submission to a terminal command-buffer status.
+    ///
+    /// The lifecycle and the copy counters are the provider's, which is why
+    /// this is a method: a terminal command buffer has to record its outcome on
+    /// the same admission state `submit` read before the work was encoded.
+    fn execute(
+        &self,
+        state: &mut State,
+        trace: &ComputeTrace,
+        pipelines: Vec<ComputePipelineState>,
+        token: CompletionToken,
+        resolve: &BufferResolver<'_>,
+        retains: BorrowedRetains,
+    ) -> Result<ProviderSubmission, ProviderError> {
+        let EncodedSubmission { mut pending, pool } =
+            encode(state, &self.counters, trace, pipelines, resolve, retains)?;
+        pending.submitted = true;
+        let resources = pending.resources.as_ref().expect("encoded resources");
+        resources.command.commit();
+        let started = Instant::now();
+        loop {
+            match resources.command.status() {
+                MTLCommandBufferStatus::Completed => break,
+                MTLCommandBufferStatus::Error => {
+                    let (detail, code) = unsafe {
+                        let error: *mut Object = msg_send![resources.command.as_ref(), error];
+                        (error_description(error), command_buffer_error_code(error))
+                    };
+                    if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
+                        self.lifecycle.mark_device_lost();
+                        return Err(device_lost_error(token, detail));
+                    }
+                    // Every other terminal command-buffer failure keeps the
+                    // `metal_command_failed` path and seals the instance
+                    // without charging the abandonment budget
+                    // (`docs/PROVIDER-B1.md`, "Execution failures and
+                    // visibility").
+                    self.lifecycle.mark_unobservable_submission();
+                    return Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Execute,
+                        "metal_command_failed",
+                    )
+                    .with_detail(detail)
+                    .with_completion(CompletionDisposition::Failed { token: Some(token) }));
                 }
-                state.abandoned = true;
-                return Err(refusal(
-                    ProviderPhase::Wait,
-                    ProviderErrorClass::Execute,
-                    "metal_command_failed",
-                )
-                .with_detail(detail)
-                .with_completion(CompletionDisposition::Failed { token: Some(token) }));
+                _ if started.elapsed() >= GPU_DEADLINE => {
+                    // The command buffer never reached a terminal status, so
+                    // the instance stops trusting the device; this is a
+                    // classified unknown completion, not booked abandoned GPU
+                    // work.
+                    self.lifecycle.mark_unobservable_submission();
+                    return Err(refusal(
+                        ProviderPhase::Wait,
+                        ProviderErrorClass::Execute,
+                        "metal_completion_unknown",
+                    )
+                    .with_completion(CompletionDisposition::SubmittedUnknown {
+                        token: Some(token),
+                    }));
+                }
+                _ => std::thread::sleep(Duration::from_millis(1)),
             }
-            _ if started.elapsed() >= GPU_DEADLINE => {
-                state.abandoned = true;
-                return Err(refusal(
-                    ProviderPhase::Wait,
-                    ProviderErrorClass::Execute,
-                    "metal_completion_unknown",
-                )
-                .with_completion(CompletionDisposition::SubmittedUnknown { token: Some(token) }));
-            }
-            _ => std::thread::sleep(Duration::from_millis(1)),
         }
+        // Shared memory on the admitted device is now CPU visible. Only a known
+        // completed command permits the guard to release its backing resources.
+        pending.submitted = false;
+        let writebacks = collect_writebacks(&pool, &resources.buffers, &self.counters);
+        let submission = ProviderSubmission {
+            completion: CompletionDisposition::CompletedVisible { token },
+            writebacks,
+        };
+        submission.validate_for_trace(trace).map_err(|error| {
+            refusal(
+                ProviderPhase::Readback,
+                ProviderErrorClass::Internal,
+                "writeback_contract_invalid",
+            )
+            .with_detail(error.to_string())
+            .with_completion(CompletionDisposition::Failed { token: Some(token) })
+        })?;
+        Ok(submission)
     }
-    // Shared memory on the admitted device is now CPU visible. Only a known
-    // completed command permits the guard to release its backing resources.
-    pending.submitted = false;
-    let writebacks = collect_writebacks(&pool, &resources.buffers, counters);
-    let submission = ProviderSubmission {
-        completion: CompletionDisposition::CompletedVisible { token },
-        writebacks,
-    };
-    submission.validate_for_trace(trace).map_err(|error| {
-        refusal(
-            ProviderPhase::Readback,
-            ProviderErrorClass::Internal,
-            "writeback_contract_invalid",
-        )
-        .with_detail(error.to_string())
-        .with_completion(CompletionDisposition::Failed { token: Some(token) })
-    })?;
-    Ok(submission)
 }
 
 fn collect_writebacks(
@@ -1239,8 +1214,9 @@ impl NativeMetalProvider {
                 owned_bytes: trace_owned_bytes(trace),
             },
         );
-        let abandoned = Arc::clone(&self.async_abandoned);
-        let device_lost = Arc::clone(&state.device_lost);
+        // The completion handler runs after this call returned, so it holds the
+        // shared lifecycle instead of borrowing the provider.
+        let lifecycle = Arc::clone(&self.lifecycle);
         let outbox = self.completion_outbox.clone();
         let counters = Arc::clone(&self.counters);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
@@ -1259,10 +1235,10 @@ impl NativeMetalProvider {
                             (error_description(error), command_buffer_error_code(error))
                         };
                         if classify_command_buffer_error(code) == CommandBufferFailure::DeviceLost {
-                            device_lost.store(true, Ordering::SeqCst);
+                            lifecycle.mark_device_lost();
                             Err(device_lost_error(token, detail))
                         } else {
-                            abandoned.store(true, Ordering::SeqCst);
+                            lifecycle.mark_unobservable_submission();
                             Err(refusal(
                                 ProviderPhase::Wait,
                                 ProviderErrorClass::Execute,
@@ -1297,13 +1273,7 @@ impl NativeMetalProvider {
                 ),
             }
             if let Some(outbox) = &outbox {
-                let health = if device_lost.load(Ordering::SeqCst) {
-                    ProviderHealth::DeviceLost
-                } else if abandoned.load(Ordering::SeqCst) {
-                    ProviderHealth::Exhausted
-                } else {
-                    ProviderHealth::Usable
-                };
+                let health = lifecycle.health();
                 if outbox.health() != health {
                     let _ = outbox.publish_device(health);
                 }
