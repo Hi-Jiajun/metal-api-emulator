@@ -214,6 +214,32 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
     })
 }
 
+/// Guard that owns one encoded submission's Metal resources until the command
+/// buffer is known to be terminal. Once the work is submitted, dropping the
+/// guard deliberately `mem::forget`s the whole resource bundle rather than
+/// releasing it under the driver; the render rail relies on the same invariant
+/// as the compute rail. The resource bundle is generic so that invariant is
+/// unit-testable on a host that cannot load Metal: `native.rs` instantiates it
+/// with its macOS-only `SubmissionResources`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct PendingSubmission<R> {
+    pub(crate) resources: Option<R>,
+    pub(crate) submitted: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<R> Drop for PendingSubmission<R> {
+    fn drop(&mut self) {
+        if self.submitted {
+            // Also protects an unwind during commit/status observation. A
+            // poisoned mutex prevents another submit after such an unwind.
+            if let Some(resources) = self.resources.take() {
+                std::mem::forget(resources);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +248,7 @@ mod tests {
         CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
     };
     use metal_api_core::provider::{DeviceEpoch, SemanticDigest, SubmissionId};
+    use std::cell::Cell;
     #[cfg(target_os = "macos")]
     use std::sync::{Arc, Mutex};
 
@@ -278,6 +305,51 @@ mod tests {
         assert_eq!(
             observed.completion,
             CompletionDisposition::DeviceLost { token: Some(token) }
+        );
+    }
+
+    #[test]
+    fn pending_submission_forgets_resources_while_submitted() {
+        struct Probe<'a>(&'a Cell<bool>);
+        impl Drop for Probe<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Cell::new(false);
+        {
+            let pending = PendingSubmission {
+                resources: Some(Probe(&dropped)),
+                submitted: true,
+            };
+            drop(pending);
+        }
+        assert!(
+            !dropped.get(),
+            "a submitted pending submission must forget its resources, not drop them"
+        );
+    }
+
+    #[test]
+    fn pending_submission_drops_resources_before_submission() {
+        struct Probe<'a>(&'a Cell<bool>);
+        impl Drop for Probe<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Cell::new(false);
+        {
+            let _pending = PendingSubmission {
+                resources: Some(Probe(&dropped)),
+                submitted: false,
+            };
+        }
+        assert!(
+            dropped.get(),
+            "an unsubmitted pending submission must drop its resources normally"
         );
     }
 
