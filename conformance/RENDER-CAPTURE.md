@@ -7,7 +7,9 @@ one today. `conformance/suite-v13.json` is the first committed suite that
 declares render cases, `conformance/compare.py` has the matching attachment
 section, and the Vulkan trace rail executes the case end to end. Two things are
 still **pending**: the two object-API rails have no render command encoder, and
-nothing on the Apple side has run on an Apple GPU.
+no run on an Apple GPU has been observed yet. The macOS job does run the
+one-device check itself — `--render-selftest` in §5 — but its result is still an
+outstanding observation, not a recorded one.
 
 The design it implements is `research/docs/23` §1.2 (the milestone), §3 (the
 contract), §5.1 (what the oracle needs) and §6 Steps 6–7 (where it lands).
@@ -186,11 +188,13 @@ report the declaring case only. `conformance/test_oracle_coverage.py` checks the
 marker against `compare.py`'s backend vocabulary and keeps the marked suite out
 of the four CI rails and version loops until the macOS half exists.
 
-The macOS half is the pending step, and it is deliberately not wired:
+The macOS half is still the pending step, but its first part is now wired: the
+one-device check runs in CI (§5). What is deliberately still **not** wired is
+the suite itself:
 
 * `NativeOracle.swift` accepts `compute-buffer-v13` and its render capture path
   reports the attachment in exactly this shape, but the path has never run on
-  Apple hardware — `--render-selftest` (§5) and, after that,
+  Apple hardware — the CI self-test (§5) and, after it,
   `run_native.py --suite conformance/suite-v13.json` are what would turn the
   claim into evidence;
 * the Rust native provider needs its own `supports_render_passes` flip, whose
@@ -200,9 +204,10 @@ The macOS half is the pending step, and it is deliberately not wired:
 
 Until that lands, the suite is run by the three Vulkan rails locally
 (`tools/lavapipe-smoke.sh` discovers it from `conformance/suite*.json`), and
-`.github/workflows/ci.yml` does not name it: no CI job depends on the macOS
-half. The coverage check keeps that split explicit rather than silent, and
-`conformance/test_suite_v13.py` holds the schema, the plan and the refusals.
+`.github/workflows/ci.yml` does not name its suite file: no CI job reports the
+macOS attachment yet. The coverage check keeps that split explicit rather than
+silent, and `conformance/test_suite_v13.py` holds the schema, the plan and the
+refusals.
 
 ## 5. The one-device check
 
@@ -221,6 +226,26 @@ It prints the case result as JSON and exits non-zero unless the readback matches
 the reviewed expectation exactly. The evidence is the `bytes_hex`, which has to
 be `4080c0ff` four times — the fragment's texel — and never the `fefefefe`
 sentinel the pass started from.
+
+CI runs this check in `native-oracle-build`, on that job's own
+`/tmp/native-oracle`, after the compute capture steps so a render regression
+cannot discard their evidence. The step decides from the oracle's `--probe` —
+the same eligibility `renderSelfTest` itself enforces — so a host whose device
+the oracle would refuse prints
+`render selftest: SKIP (no Metal device)` and passes the job, while a probe that
+cannot be read (`probe unreadable`, `unexpected probe kind`) or exits non-zero
+fails it. On an eligible host the report is written to
+`/tmp/native-evidence/render-selftest.json`, the oracle's diagnostics and the
+step's log to `/tmp/native-evidence/render-selftest.log`, and the job fails
+unless both the exit status and the report's single writeback and single
+allocation read `4080c0ff` four times; a successful log ends with
+`render_selftest: PASS`. The job's existing `native-evidence` artifact upload
+archives those files on every run, including a SKIP.
+
+The flip therefore needs one CI run whose log carries both `4080c0ff` four
+times and `render_selftest: PASS`. A green job whose log says `SKIP` is not that
+evidence: it reports that the runner had no eligible device, not that the
+reviewed path ran.
 
 This is the check the native provider's `supports_render_passes` flip condition
 names (`crates/metal-api-native/src/native.rs`).
@@ -263,3 +288,7 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   a committed suite;
 * the provider's render path end to end, including the writeback that would
   land the attachment bytes on the trace's view.
+
+`native-oracle-build` now runs the first of those bullets on every eligible
+runner (§5). Until a run reports `render_selftest: PASS`, however, none of the
+six has an Apple observation behind it.

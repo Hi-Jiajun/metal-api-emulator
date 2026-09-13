@@ -187,6 +187,81 @@ jobs:
             target/debug/provider-capture --api objects --async --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-async-v${version}.json"
             python3 conformance/compare.py --suite "$suite" --check "/tmp/native-evidence/metal-objects-async-v${version}.json"
           done
+      # The one-device render check (`conformance/RENDER-CAPTURE.md` §5). It runs
+      # after the compute capture on purpose: a render regression has to fail the
+      # job without discarding the compute evidence those steps produced. The
+      # oracle's own probe decides, so a host whose device it would refuse can
+      # only SKIP -- never a false PASS -- and an eligible host's failure is the
+      # wanted signal.
+      - name: Run native render self-test when a Metal device is eligible
+        run: |
+          # `tee` would otherwise mask a failing check's exit status.
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/render-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/render-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "render selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/render-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('render selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('render selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('render selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "render selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "render selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "render selftest: device eligible; running the reviewed 2x2 offscreen render" >> "$log"
+          # stdout is the JSON report and stderr is the oracle's diagnostics; they
+          # stay apart so the report remains parseable, then share one log.
+          status=0
+          /tmp/native-oracle --render-selftest \
+            > /tmp/native-evidence/render-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/render-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "render selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          report = json.loads(Path('/tmp/native-evidence/render-selftest.json').read_text())
+          writebacks = report.get('writebacks', [])
+          allocations = report.get('allocations', [])
+          expected = '4080c0ff' * 4
+          # One writeback and one allocation, both holding the observed image
+          # (`conformance/RENDER-CAPTURE.md` §3): the flip's evidence is these bytes.
+          observed = [entry.get('bytes_hex') for entry in writebacks + allocations]
+          passed = observed == [expected, expected]
+          print('render_selftest: ' + ('PASS' if passed else 'FAIL')
+                + ' (' + (expected if passed else 'observed ' + repr(observed)) + ')')
+          raise SystemExit(0 if passed else 1)
+          PY
       - name: Preserve native probe, status and any completed capture
         if: always()
         uses: actions/upload-artifact@v4

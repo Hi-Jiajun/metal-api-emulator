@@ -148,6 +148,13 @@ those errors are not downgraded to unavailable. Probe output, command logs and
 status are preserved in `native-evidence`, and the Linux report is preserved
 in `vulkan-capture` workflow artifacts.
 
+The same job also runs the offscreen render self-test
+([RENDER-CAPTURE.md](RENDER-CAPTURE.md) §5) whenever the oracle's probe calls
+the device eligible, and prints `render selftest: SKIP (no Metal device)`
+instead of failing when it does not. Only a log carrying `4080c0ff` four times
+and `render_selftest: PASS` is evidence that the reviewed render path executed
+on Apple hardware; a SKIP is an infrastructure outcome, not a native result.
+
 For a collaborator's machine, the same orchestration can require a GPU:
 
 ```sh
@@ -327,4 +334,6 @@ case only: they carry no render command encoder in this increment, so the
 suite's `capture_rails` marker names `vulkan` and `compare.py` requires the
 attachment exactly from that rail. Wiring the case into the macOS rails (the
 Swift oracle and the Rust native provider) is the pending step §4 of
-RENDER-CAPTURE.md lists; the render path has never run on Apple hardware.
+RENDER-CAPTURE.md lists; no render run on Apple hardware has been observed yet,
+and the macOS job's `--render-selftest` step is what would produce the first
+one.
