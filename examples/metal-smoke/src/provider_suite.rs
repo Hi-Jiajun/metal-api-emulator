@@ -19,7 +19,7 @@ use metal_api_core::provider::{
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
-use metal_api_core::{ApiError, Device, Library};
+use metal_api_core::{ApiError, ComputeExecutor, Device, Library};
 use metal_api_ipc::command::{serve_provider_named, tcp as command_tcp, RemoteProvider};
 #[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix};
@@ -127,6 +127,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_borrowed_lease(Arc::clone(&executor))?;
     run_object_queue_ordering()?;
     run_object_disjoint_views()?;
+    run_sampled_texture_read(Arc::clone(&executor))?;
     run_object_parallel_commands()?;
     run_object_same_allocation_parallel()?;
     run_object_serial_dependency()?;
@@ -1954,6 +1955,71 @@ fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
+    );
+    Ok(())
+}
+
+/// Read one R32Uint texel through the sampled-texture path. This is the first
+/// provider-level texture case that runs on both Lavapipe and the RTX 5060;
+/// the multi-invocation variant is blocked by the translator defect recorded
+/// in `research/docs/16` §4.5, so this case stays single invocation.
+fn run_sampled_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let library = device
+        .new_library_with_air(include_str!("../shaders/kernel_read_texture_2d.ll").to_owned())?;
+    let function = library.function("read_texture_2d")?;
+    let pipeline = executor.new_compute_pipeline(&function)?;
+    let mut texels = Vec::with_capacity(64);
+    for value in 0..16_u32 {
+        texels.extend_from_slice(&value.to_le_bytes());
+    }
+    let texture = TextureView {
+        view_id: ViewId::new(900),
+        metal_binding: 0,
+        allocation_id: AllocationId::new(901),
+        texture_type: TextureType::D2,
+        format: TextureFormat::R32Uint,
+        width: 4,
+        height: 4,
+        depth: 1,
+        array_length: 1,
+        sample_count: 1,
+        access: TextureAccess::Sampled,
+        source: TextureSource::OwnedBytes(texels),
+    };
+    let submission = metal_api_core::ComputeSubmission {
+        pipeline,
+        buffers: vec![metal_api_core::BufferBinding {
+            index: 0,
+            bytes: vec![0_u8; 64],
+        }],
+        textures: vec![texture],
+        threads_per_grid: metal_api_core::Size::new(1, 1, 1)?,
+        threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1)?,
+    };
+    let updates = executor
+        .execute(submission)
+        .map_err(|error| format!("sampled texture read failed: {}", error.message()))?;
+    let update = updates
+        .iter()
+        .find(|update| update.index == 0)
+        .ok_or("sampled texture read returned no writeback")?;
+    let word = update
+        .bytes
+        .get(..4)
+        .ok_or("sampled texture writeback is shorter than one word")?;
+    if word != 0_u32.to_le_bytes() {
+        return Err(format!(
+            "sampled texture read landed {:02x?}, expected texel 0",
+            word
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_sampled_texture_read texture=4x4-r32uint texel=(0,0) value=0 copy_in=1"
     );
     Ok(())
 }
