@@ -124,6 +124,14 @@ pub(crate) struct PresentCapabilityBits {
     pub(crate) max_present_image_count: u32,
 }
 
+/// The first presentation increment's target cap, spelled once so the snapshot
+/// and its tests cannot drift from core's value (`research/docs/24` §3.1).
+pub(crate) const MAX_PRESENT_TARGETS: u32 = metal_api_core::provider::MAX_PRESENT_TARGETS as u32;
+
+/// The first presentation increment's image cap, same rule as
+/// [`MAX_PRESENT_TARGETS`].
+pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PRESENT_IMAGE_COUNT;
+
 /// The render bits this provider declares as of the Step 7 flip.
 ///
 /// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
@@ -147,26 +155,27 @@ pub(crate) fn capability_bits() -> RenderCapabilityBits {
     }
 }
 
-/// The present bits this provider declares as of the Step 7 flip.
+/// The present bits this provider declares as of the present-track flip.
 ///
-/// They stay at "cannot present" so core admission refuses a present-bearing
-/// trace with `present_targets_unsupported` instead of running the offscreen
-/// render and silently dropping the present (`research/docs/24` §4.2). The
-/// flip is one change here plus the comment below: set `supports_presentation:
-/// true`, `max_present_targets: MAX_PRESENT_TARGETS`,
-/// `supported_present_modes: PresentMode::ADMITTED.to_vec()` and
-/// `max_present_image_count: MAX_PRESENT_IMAGE_COUNT`, once the Swift oracle's
-/// `--present-selftest` runs on an Apple GPU in CI and reports
-/// `present_selftest: PASS` (the reviewed 2x2 target read back as `4080c0ff`
-/// four times, never the `fefefefe` sentinel). A green job whose log said
-/// `SKIP` is not that evidence: it reports a runner without an eligible
-/// device, not an executed reviewed present path.
+/// Flip evidence (`research/docs/24` §6 Step 7): CI run `34781060564`, job
+/// `native-oracle-build`, step "Run native present self-test when a Metal
+/// device is eligible". The probe reported an eligible Apple Paravirtual
+/// device (`supports_apple4: true`), the oracle then ran the reviewed 2x2
+/// present equivalent (`load: load`, `fefefefe`-sentinel preset) and printed
+/// `present_selftest: PASS (4080c0ff4080c0ff4080c0ff4080c0ff)` — four
+/// expected texels, never the sentinel. A green job whose log said `SKIP` is
+/// not that evidence: it reports a runner without an eligible device, not an
+/// executed reviewed present path. Before the flip these bits were all at
+/// their defaults, so core admission refused a present-bearing trace with
+/// `present_targets_unsupported` instead of running the offscreen render and
+/// silently dropping the present (`research/docs/24` §4.2); the test below
+/// keeps that refusal path pinned on a constructed pre-flip snapshot.
 pub(crate) fn present_capability_bits() -> PresentCapabilityBits {
     PresentCapabilityBits {
-        supports_presentation: false,
-        max_present_targets: 0,
-        supported_present_modes: Vec::new(),
-        max_present_image_count: 0,
+        supports_presentation: true,
+        max_present_targets: MAX_PRESENT_TARGETS,
+        supported_present_modes: PresentMode::ADMITTED.to_vec(),
+        max_present_image_count: MAX_PRESENT_IMAGE_COUNT,
     }
 }
 
@@ -1568,17 +1577,48 @@ mod tests {
         assert_eq!(refused.phase, ProviderPhase::Resolve);
     }
 
-    /// The present bits stay at their defaults, so a present-bearing trace is
-    /// refused in the second admission gate (`present_targets_unsupported`)
-    /// before any resource action. Flipping them is a separate Apple-GPU
-    /// observation (`research/docs/24` §6 Step 7), not a silent side effect.
+    /// The flipped snapshot admits the present-bearing trace in the second
+    /// admission gate, and its present bits are the rail's own limits rather
+    /// than a second spelling that could drift from the contract's. The flip
+    /// evidence is the Apple-GPU `--present-selftest` run recorded on
+    /// [`present_capability_bits`].
     #[test]
-    fn the_current_snapshot_refuses_a_present_bearing_trace() {
+    fn declared_present_capabilities_admit_what_the_rail_plans() {
         let bits = capability_bits();
-        assert!(!bits.supports_presentation);
-        assert_eq!(bits.max_present_targets, 0);
-        assert!(bits.supported_present_modes.is_empty());
-        assert_eq!(bits.max_present_image_count, 0);
+        assert!(bits.supports_presentation);
+        assert_eq!(bits.max_present_targets, MAX_PRESENT_TARGETS);
+        assert_eq!(bits.supported_present_modes, PresentMode::ADMITTED.to_vec());
+        assert_eq!(bits.max_present_image_count, MAX_PRESENT_IMAGE_COUNT);
+        // The first increment admits exactly one target, one image and FIFO
+        // (`research/docs/24` §3.1), which is what those constants say.
+        assert_eq!(
+            bits.max_present_targets,
+            metal_api_core::provider::MAX_PRESENT_TARGETS as u32
+        );
+        assert_eq!(
+            bits.max_present_image_count,
+            metal_api_core::provider::MAX_PRESENT_IMAGE_COUNT
+        );
+
+        let (trace, resources) = milestone_present_trace();
+        capabilities(&bits)
+            .admit(&trace, &resources)
+            .expect("the declared bits admit the present milestone trace");
+    }
+
+    /// The pre-flip snapshot — the same bits with the present gate closed —
+    /// still refuses the present-bearing trace in the second admission gate
+    /// (`present_targets_unsupported`) before any resource action. Keeping the
+    /// refusal pinned on a constructed snapshot is what makes the flipped
+    /// production bits above falsifiable: it is the same trace and the same
+    /// gate, only the declaration differs.
+    #[test]
+    fn the_pre_flip_snapshot_refuses_a_present_bearing_trace() {
+        let mut bits = capability_bits();
+        bits.supports_presentation = false;
+        bits.max_present_targets = 0;
+        bits.supported_present_modes = Vec::new();
+        bits.max_present_image_count = 0;
 
         let (trace, resources) = milestone_present_trace();
         let refused = capabilities(&bits).admit(&trace, &resources).unwrap_err();
