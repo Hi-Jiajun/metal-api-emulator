@@ -104,14 +104,20 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   access stays excluded for the whole commit-to-completion window by the
   reservations themselves, and `lock_unreserved` re-checks them under the
   guard.
-- Open design work: sharing one device buffer per allocation (the guest memory
-  entry point), device-loss
-  reclamation beyond the bounded abandonment budget, the cross-process
-  completion transport and
-  provider wiring (the core wire publisher and mirror now exist), provider-side
-  lease import (the core `LeaseLedger` release contract now exists), general
-  native shader admission and CPU uploads during command-buffer execution.
-  Resource snapshots do not hold live guest pages.
+- One device buffer per allocation is implemented in both providers: the
+  Vulkan backing and the native `MTLBuffer` are sized from the allocation's
+  views and created once, each view binds its own `(offset, length)` window,
+  and the Vulkan provider copies in only the bytes a view can read
+  (write-only views copy nothing in). `provider-smoke` asserts the exact
+  operation and byte counts, and the comparator enforces the allocation-level
+  copy contract on every suite. See `research/docs/15` for the design and
+  `conformance/SUITE-V10.md` for the disjoint-view suite.
+- Open design work: device-loss reclamation beyond the bounded abandonment
+  budget, the cross-process completion transport and provider wiring (the
+  core wire publisher and mirror now exist), provider-side lease import (the
+  core `LeaseLedger` release contract now exists), general native shader
+  admission and CPU uploads during command-buffer execution. Resource
+  snapshots do not hold live guest pages.
 - Not implemented: general MTLB function-name resolution, Windows MSL compilation,
   textures, rendering, presentation, heaps, ICBs or production
   reims integration. This is not a Metal.framework ABI implementation.
