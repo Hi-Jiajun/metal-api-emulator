@@ -120,6 +120,15 @@ def main(argv=None):
     except (NativeRunError, CaptureError, KeyError, OSError, UnicodeError,
             json.JSONDecodeError, subprocess.SubprocessError) as error:
         print("FAIL native capture: " + str(error), file=sys.stderr)
+        # The oracle writes its rejection reason to the captured stderr; surface
+        # it so a suite or oracle mismatch is diagnosable from CI alone.
+        for name in ("validate-suite", "capture"):
+            diagnostic = args.output_dir / (name + ".stderr")
+            if diagnostic.is_file():
+                text = diagnostic.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    print("--- " + name + ".stderr ---", file=sys.stderr)
+                    print(text, file=sys.stderr)
         return 1
 
 
