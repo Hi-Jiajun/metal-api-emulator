@@ -11,7 +11,7 @@ use metal_api_core::completion::wire::{
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
     BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
-    ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+    ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
     FootprintProof, HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation,
     LeaseReservation, NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider,
     ProviderError, ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest,
@@ -2782,6 +2782,11 @@ fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("lost provider refused with the wrong error: {refusal:?}").into());
     }
+    // The refusal is the core lifecycle's, field included: the provider does
+    // not re-spell `terminal` on its side of the boundary.
+    if refusal.fields.get("terminal") != Some(&FieldValue::Text("device_lost".to_owned())) {
+        return Err(format!("lost provider refusal lost its terminal field: {refusal:?}").into());
+    }
     let lost_object = metal_api_core::provider_api::Device::new(Arc::new(
         VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?,
     ));
@@ -2827,7 +2832,7 @@ fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
         .into());
     }
     println!(
-        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost retry=RetryAfterRecreate object_health=exposed recreated=true writeback=exact"
+        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost terminal=device_lost retry=RetryAfterRecreate object_health=exposed recreated=true writeback=exact"
     );
     Ok(())
 }

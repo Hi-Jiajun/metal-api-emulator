@@ -128,7 +128,8 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   lease is retired. See `research/docs/19`.
 - Open design work: host-side wiring of the core terminal lifecycle (the
   `ProviderLifecycle` admission/refusal and lease-retirement contract now
-  exists, while the Vulkan context still tracks the same state separately),
+  exists, and the Vulkan context admits and reports health through it, while
+  the native Metal provider still tracks the same state separately),
   the cross-process completion transport and provider wiring (the core wire
   publisher and mirror now exist), provider-side lease import (the core
   `LeaseLedger` release contract now exists), general native shader admission

@@ -2,8 +2,8 @@
 //! lease copies and host-memory no-copy imports.
 
 use crate::{
-    execute_pool_sequence_with_status, Binding, BoundDispatch, ContextHealth, PendingExecution,
-    PoolBinding, PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    execute_pool_sequence_with_status, Binding, BoundDispatch, PendingExecution, PoolBinding,
+    PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
     VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
@@ -219,12 +219,11 @@ impl VulkanComputeProvider {
     }
 
     /// Report whether this provider can still admit new work.
+    ///
+    /// Health and admission are the same query on the same lifecycle, so a
+    /// provider that reports `Usable` here also admits the next submission.
     pub fn health(&self) -> ProviderHealth {
-        match self.executor.context.health() {
-            ContextHealth::Usable => ProviderHealth::Usable,
-            ContextHealth::DeviceLost => ProviderHealth::DeviceLost,
-            ContextHealth::Exhausted => ProviderHealth::Exhausted,
-        }
+        self.executor.context.health()
     }
 
     /// Report `(abandoned submissions, abandoned bytes)` for this context.
@@ -1154,43 +1153,20 @@ fn ensure_executor_usable(executor: &VulkanExecutor) -> Result<(), ProviderError
 }
 
 fn sync_context_health(context: &VulkanContext, outbox: &CompletionOutbox) {
-    let health = match context.health() {
-        ContextHealth::Usable => ProviderHealth::Usable,
-        ContextHealth::Exhausted => ProviderHealth::Exhausted,
-        ContextHealth::DeviceLost => ProviderHealth::DeviceLost,
-    };
+    let health = context.health();
     if outbox.health() != health {
         let _ = outbox.publish_device(health);
     }
 }
 
+/// Refuse new work on a terminal context.
+///
+/// The context's `metal_api_core` lifecycle is the only admission authority,
+/// so this is a pass-through: the structured refusal the provider returns is
+/// exactly the one the lifecycle produced, `terminal` field and abandoned
+/// counters included. There is no second mapping to keep in step.
 fn ensure_context_usable(context: &VulkanContext) -> Result<(), ProviderError> {
-    match context.health() {
-        ContextHealth::Usable => Ok(()),
-        ContextHealth::DeviceLost => Err(device_lost_error()),
-        ContextHealth::Exhausted => Err(provider_unavailable_error()),
-    }
-}
-
-fn device_lost_error() -> ProviderError {
-    let mut error = refusal(
-        ProviderPhase::Resolve,
-        ProviderErrorClass::DeviceLost,
-        "device_lost",
-    );
-    error.retryability = Retryability::RetryAfterRecreate;
-    error.completion = CompletionDisposition::DeviceLost { token: None };
-    error
-}
-
-fn provider_unavailable_error() -> ProviderError {
-    let mut error = refusal(
-        ProviderPhase::Resolve,
-        ProviderErrorClass::Resource,
-        "provider_unavailable",
-    );
-    error.retryability = Retryability::RetryAfterRecreate;
-    error
+    context.admit()
 }
 
 fn duration_to_nanos(duration: Duration) -> u64 {
@@ -1262,11 +1238,17 @@ fn borrowed_alignment_error(lease_id: LeaseId, pointer: usize, alignment: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metal_api_core::provider::{AllocationId, BufferAccess, ViewId};
+    use metal_api_core::provider::{AllocationId, BufferAccess, ProviderLifecycle, ViewId};
 
+    /// The provider no longer spells its own terminal refusals: the core
+    /// lifecycle owns the terminal state and its refusal, and the Vulkan side
+    /// returns that error unchanged. These assertions are the ones the two
+    /// local builders used to carry, now checked against the single source.
     #[test]
     fn unavailable_provider_errors_require_recreation() {
-        let lost = device_lost_error();
+        let mut lost_lifecycle = ProviderLifecycle::new(1, 4096);
+        lost_lifecycle.mark_device_lost();
+        let lost = crate::terminal_refusal(&lost_lifecycle).expect_err("lost device refuses work");
         assert_eq!(lost.phase, ProviderPhase::Resolve);
         assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
         assert_eq!(lost.slug, "device_lost");
@@ -1275,13 +1257,35 @@ mod tests {
             lost.completion,
             CompletionDisposition::DeviceLost { token: None }
         );
+        assert_eq!(
+            lost.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".into()))
+        );
 
-        let exhausted = provider_unavailable_error();
+        let mut exhausted_lifecycle = ProviderLifecycle::new(1, 4096);
+        assert_eq!(
+            exhausted_lifecycle.record_abandonment(512),
+            AbandonmentOutcome::Exhausted
+        );
+        let exhausted = crate::terminal_refusal(&exhausted_lifecycle)
+            .expect_err("exhausted budget refuses work");
         assert_eq!(exhausted.phase, ProviderPhase::Resolve);
         assert_eq!(exhausted.class, ProviderErrorClass::Resource);
         assert_eq!(exhausted.slug, "provider_unavailable");
         assert_eq!(exhausted.retryability, Retryability::RetryAfterRecreate);
         assert_eq!(exhausted.completion, CompletionDisposition::NotSubmitted);
+        assert_eq!(
+            exhausted.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_eq!(
+            exhausted.fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(
+            exhausted.fields.get("abandoned_bytes"),
+            Some(&FieldValue::Unsigned(512))
+        );
     }
 
     #[test]

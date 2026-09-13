@@ -12,10 +12,11 @@ use metal2vulkan::reflect::{
     BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, KernelDispatchPlan,
     ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
 };
-use metal_api_core::completion::{AbandonmentBudget, AbandonmentLedger, AbandonmentOutcome};
+use metal_api_core::completion::AbandonmentOutcome;
 use metal_api_core::provider::{
     BorrowedLeaseRegistry, CompletionDisposition, LeaseId, PipelineContract, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderPhase, SemanticDigest, MAX_SERIAL_RESOURCES,
+    ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle, ProviderPhase,
+    SemanticDigest, TerminalRefusal, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
@@ -26,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod compute_provider;
@@ -44,6 +45,19 @@ fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
 }
 
+/// Admit one submission against a provider lifecycle and return the refusal
+/// the provider boundary reports.
+///
+/// This is the whole mapping between the two crates. The core
+/// [`ProviderLifecycle`] owns the terminal state and spells its refusal once
+/// (`provider_unavailable` or `device_lost`, the `terminal` field, the
+/// abandoned counters and `RetryAfterRecreate`); unwrapping it here keeps the
+/// Vulkan side from re-encoding a slug, a field or a retryability that could
+/// then drift from the contract. Nothing matches on message text.
+fn terminal_refusal(lifecycle: &ProviderLifecycle) -> Result<(), ProviderError> {
+    lifecycle.admit().map_err(TerminalRefusal::into_error)
+}
+
 /// Device queues created per selected queue family.
 ///
 /// Four queues are enough to demonstrate independent in-flight work without
@@ -55,6 +69,17 @@ const MAX_QUEUES_PER_FAMILY: usize = 4;
 /// families. Compute-only queues can overlap with graphics work on drivers
 /// that expose a separate family, so the scheduler may use up to two families.
 const MAX_DEVICE_QUEUES: usize = 8;
+
+/// Abandonment budget of one Vulkan device.
+///
+/// The direct executor and the provider share one context, so they share one
+/// bound: the first submission whose completion can no longer be observed ends
+/// the instance, which then has to be recreated (`docs/PROVIDER-B1.md` §7).
+const ABANDONMENT_BUDGET_SUBMISSIONS: u64 = 1;
+
+/// Byte bound of the same budget. Bytes are accounted but never refunded,
+/// because abandoned device memory cannot be returned safely.
+const ABANDONMENT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Native Vulkan implementation of the Phase 1 compute subset.
 pub struct VulkanExecutor {
@@ -346,9 +371,14 @@ pub(crate) struct VulkanContext {
     device_name: String,
     queue_locks: Vec<Mutex<()>>,
     enqueue_probe: Mutex<Option<EnqueueProbe>>,
-    poisoned: AtomicBool,
-    abandoned: AtomicBool,
-    device_lost: AtomicBool,
+    /// The single admission and terminal-state authority for this device.
+    ///
+    /// Admission, health and the abandonment counters all come from this
+    /// `metal_api_core` lifecycle, so the executor cannot report one state
+    /// while refusing on another. The lifecycle owns the budget, the ledger
+    /// and the spelling of a terminal refusal; this crate never keeps a second
+    /// copy of that state.
+    lifecycle: Mutex<ProviderLifecycle>,
     /// Device-buffer copy-in and copy-out operations. One of each per touched
     /// allocation, not per view: several views of one allocation share one
     /// device buffer (`research/docs/15` §3.3).
@@ -359,8 +389,6 @@ pub(crate) struct VulkanContext {
     /// (`research/docs/15` step 4).
     buffer_upload_bytes: AtomicUsize,
     buffer_readback_bytes: AtomicUsize,
-    abandonment_budget: AbandonmentBudget,
-    abandonment: Mutex<AbandonmentLedger>,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -368,14 +396,6 @@ pub(crate) struct VulkanContext {
 struct ExternalMemoryHost {
     device: external_memory_host::Device,
     min_alignment: u64,
-}
-
-/// Provider-facing view of one Vulkan context's remaining usability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ContextHealth {
-    Usable,
-    Exhausted,
-    DeviceLost,
 }
 
 impl VulkanContext {
@@ -522,22 +542,52 @@ impl VulkanContext {
             device_name,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
             enqueue_probe: Mutex::new(None),
-            poisoned: AtomicBool::new(false),
-            abandoned: AtomicBool::new(false),
-            device_lost: AtomicBool::new(false),
-            abandonment_budget: AbandonmentBudget::new(1, 64 * 1024 * 1024),
-            abandonment: Mutex::new(AbandonmentLedger::default()),
+            lifecycle: Mutex::new(ProviderLifecycle::new(
+                ABANDONMENT_BUDGET_SUBMISSIONS,
+                ABANDONMENT_BUDGET_BYTES,
+            )),
         })
     }
 
+    /// Lock the lifecycle for one transition or query.
+    ///
+    /// Terminal states are monotonic and admission never unwinds through this
+    /// mutex, so a poison left by an unrelated panic still protects the last
+    /// admitted state; recovering the guard keeps refusal available instead of
+    /// turning one panic into a second, unrelated failure.
+    fn lock_lifecycle(&self) -> MutexGuard<'_, ProviderLifecycle> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Admit one new submission against the lifecycle.
+    ///
+    /// The core refusal is returned unchanged, so the slug, class, phase,
+    /// `terminal` field, abandoned counters and retryability the provider
+    /// boundary reports are exactly the contract's.
+    pub(crate) fn admit(&self) -> Result<(), ProviderError> {
+        terminal_refusal(&self.lock_lifecycle())
+    }
+
+    /// Provider health, straight from the lifecycle.
+    pub(crate) fn health(&self) -> ProviderHealth {
+        self.lock_lifecycle().health()
+    }
+
+    /// Refuse new work on a terminal context for the direct `ComputeExecutor`
+    /// API, which can only carry a message.
+    ///
+    /// The structured refusal is not lost — it is what [`VulkanContext::admit`]
+    /// returns — and the message is derived from it instead of from a second
+    /// state check, so both APIs always agree on why work was refused.
     fn ensure_usable(&self) -> Result<(), ExecutorError> {
-        if self.poisoned.load(Ordering::Acquire) {
-            Err(failure(
-                "Vulkan executor is poisoned after an incomplete submission",
+        self.admit().map_err(|error| {
+            failure(format!(
+                "Vulkan executor is unavailable: {} ({:?})",
+                error.slug, error.retryability
             ))
-        } else {
-            Ok(())
-        }
+        })
     }
 
     /// Least-loaded device queue for the next independent submission.
@@ -634,48 +684,41 @@ impl VulkanContext {
             .collect()
     }
 
-    pub(crate) fn health(&self) -> ContextHealth {
-        if self.device_lost.load(Ordering::Acquire) {
-            ContextHealth::DeviceLost
-        } else if self.abandoned.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
-            ContextHealth::Exhausted
-        } else {
-            ContextHealth::Usable
-        }
-    }
-
+    /// Record one submission whose completion can no longer be observed.
+    ///
+    /// The lifecycle charges the budget, so the returned outcome is what tells
+    /// a caller whether it may keep the context in service or whether this
+    /// abandonment already ended it.
     pub(crate) fn record_abandonment(&self, bytes: u64) -> AbandonmentOutcome {
-        let outcome = match self.abandonment.lock() {
-            Ok(mut ledger) => ledger.record(self.abandonment_budget, bytes),
-            Err(poisoned) => poisoned.into_inner().record(self.abandonment_budget, bytes),
-        };
-        if outcome == AbandonmentOutcome::Exhausted {
-            self.poisoned.store(true, Ordering::Release);
-            self.abandoned.store(true, Ordering::Release);
-        }
-        outcome
+        self.lock_lifecycle().record_abandonment(bytes)
     }
 
+    /// Report `(abandoned submissions, abandoned bytes)` recorded so far.
     pub(crate) fn abandonment_stats(&self) -> (u64, u64) {
-        match self.abandonment.lock() {
-            Ok(ledger) => (ledger.submissions(), ledger.bytes()),
-            Err(poisoned) => {
-                let ledger = poisoned.into_inner();
-                (ledger.submissions(), ledger.bytes())
-            }
-        }
+        self.lock_lifecycle().abandonment()
+    }
+
+    /// Fail the context closed for a submission whose completion can no longer
+    /// be observed, without charging the budget.
+    ///
+    /// The queue-refused and post-retirement classification paths report here:
+    /// the submission is not abandoned GPU work (so the counters stay honest),
+    /// but the context stops trusting the device and refuses new work.
+    pub(crate) fn mark_unobservable_submission(&self) {
+        self.lock_lifecycle().mark_unobservable_submission();
     }
 
     pub(crate) fn mark_device_lost(&self) {
-        self.device_lost.store(true, Ordering::Release);
-        self.poisoned.store(true, Ordering::Release);
-        self.abandoned.store(true, Ordering::Release);
+        self.lock_lifecycle().mark_device_lost();
     }
 
     fn abandon(self: &Arc<Self>, resources: ExecutionResources) {
         let _ = self.record_abandonment(resources.owned_bytes());
-        self.poisoned.store(true, Ordering::Release);
-        self.abandoned.store(true, Ordering::Release);
+        // A queue that never told us whether it accepted the submission leaves
+        // the context terminal even when the budget still has room: the
+        // submission below is leaked rather than retired, and no caller can
+        // prove the device state afterwards.
+        self.mark_unobservable_submission();
         // The queue may still access every handle in `resources`. Keep both it
         // and one context reference alive until process exit; destroying either
         // after a host timeout would violate Vulkan object lifetime rules.
@@ -713,9 +756,16 @@ impl VulkanContext {
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
-        if self.abandoned.load(Ordering::Acquire) && !self.device_lost.load(Ordering::Acquire) {
+        let lifecycle = self.lock_lifecycle();
+        let abandoned = lifecycle.abandonment().0 > 0;
+        let device_lost = lifecycle.ended_by_device_loss();
+        drop(lifecycle);
+        if abandoned && !device_lost {
+            // A recorded abandonment may still be executing on the queue.
             // Timeout paths leak an extra Arc, so this arm is defensive rather
             // than expected. Never unload the Vulkan loader under pending work.
+            // A lost device is the other case: nothing can be observed
+            // anymore, so the device objects are destroyed without waiting.
             return;
         }
         unsafe {
@@ -965,7 +1015,10 @@ pub(crate) fn execute_pool_sequence_with_status(
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
     {
-        context.poisoned.store(true, Ordering::Release);
+        // A device-loss-class failure is not the same as an observed device
+        // loss: the instance stops admitting work through the abandonment
+        // cause unless the submit path already marked the device lost.
+        context.mark_unobservable_submission();
     }
     result
 }
@@ -982,7 +1035,7 @@ fn execute_submission_stages(
         context, 0, artifacts, buffers, dispatches, borrowed, textures,
     )?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
-        context.poisoned.store(true, Ordering::Release);
+        context.mark_unobservable_submission();
         return Err(ExecutionFailure::vulkan(
             vk::Result::TIMEOUT,
             "compute completion timed out after 20 seconds",
@@ -3179,7 +3232,9 @@ impl ExecutionResources {
                 .device
                 .queue_submit(self.context.queues[queue_index], &submits, self.fence)
         } {
-            self.context.poisoned.store(true, Ordering::Release);
+            // The queue did not confirm the submission, so nothing about this
+            // context may be reused: the outcome of the fence is unknown.
+            self.context.mark_unobservable_submission();
             let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
                 error,
                 format!("submit compute command buffer: {error}"),
@@ -3208,7 +3263,7 @@ impl ExecutionResources {
             }
             Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
             Err(error) => {
-                self.context.poisoned.store(true, Ordering::Release);
+                self.context.mark_unobservable_submission();
                 Err(SubmissionFailure::Pending {
                     phase: ProviderPhase::Wait,
                     error: ExecutionFailure::vulkan(
@@ -3275,8 +3330,10 @@ impl Drop for ExecutionResources {
             == ResourceDropPolicy::Retain
         {
             if !self.leak_is_budgeted {
-                self.context.poisoned.store(true, Ordering::Release);
-                self.context.abandoned.store(true, Ordering::Release);
+                // Retaining an unretirable submission is exactly what the
+                // bounded abandonment budget accounts for: recording it ends
+                // the context in the same transition that counts it.
+                self.context.record_abandonment(self.owned_bytes());
             }
             // A panic between queue submission and the explicit wait outcome
             // cannot unwind into destruction of in-flight handles. Raw Vulkan
@@ -3328,6 +3385,8 @@ impl Drop for ExecutionResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal_api_core::provider::{FieldValue, Retryability};
+
     /// Test-only helper: turn (metal_index, pool index) pairs into bindings,
     /// taking each binding's width from the pool it names.
     fn test_bindings(pairs: &[(u32, u32)], pool: &[BufferBinding]) -> Vec<Binding> {
@@ -4525,6 +4584,236 @@ mod tests {
             resource_drop_policy(false, false, false),
             ResourceDropPolicy::Destroy
         );
+    }
+
+    /// Build a context for the lifecycle tests, following the skip pattern the
+    /// other device-backed tests use.
+    fn lifecycle_context() -> Option<Arc<VulkanContext>> {
+        match VulkanContext::new() {
+            Ok(context) => Some(Arc::new(context)),
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                None
+            }
+        }
+    }
+
+    /// Health, admission and the refusal fields have to describe one state.
+    ///
+    /// This is the single-source check: a context that reports `Usable` admits,
+    /// and a context that reports a terminal health returns the refusal naming
+    /// that same terminal cause.
+    fn assert_health_and_refusal_agree(context: &VulkanContext) {
+        let health = context.health();
+        match context.admit() {
+            Ok(()) => assert_eq!(health, ProviderHealth::Usable),
+            Err(error) => {
+                assert!(
+                    !health.is_usable(),
+                    "usable context refused work: {error:?}"
+                );
+                let expected = match health {
+                    ProviderHealth::DeviceLost => "device_lost",
+                    ProviderHealth::Exhausted => "abandonment_budget",
+                    ProviderHealth::Usable => unreachable!("handled by the match above"),
+                };
+                assert_eq!(error.phase, ProviderPhase::Resolve);
+                assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+                assert_eq!(
+                    error.fields.get("terminal"),
+                    Some(&FieldValue::Text(expected.to_owned())),
+                    "refusal field disagrees with the reported health: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_lifecycle_refuses_new_work_idempotently() {
+        let Some(context) = lifecycle_context() else {
+            return;
+        };
+        assert_eq!(context.health(), ProviderHealth::Usable);
+        assert!(context.admit().is_ok());
+        assert_eq!(context.abandonment_stats(), (0, 0));
+
+        // One unretirable submission is the whole Vulkan budget, so the first
+        // abandonment is what ends this instance.
+        assert_eq!(
+            context.record_abandonment(4096),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(context.abandonment_stats(), (1, 4096));
+        assert_eq!(context.health(), ProviderHealth::Exhausted);
+
+        let refusal = context
+            .admit()
+            .expect_err("exhausted context admitted work");
+        assert_eq!(refusal.class, ProviderErrorClass::Resource);
+        assert_eq!(refusal.slug, "provider_unavailable");
+        assert_eq!(refusal.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(refusal.completion, CompletionDisposition::NotSubmitted);
+        assert_eq!(
+            refusal.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_eq!(
+            refusal.fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(
+            refusal.fields.get("abandoned_bytes"),
+            Some(&FieldValue::Unsigned(4096))
+        );
+
+        // Retries answer the same structured refusal and neither re-charge the
+        // budget nor drift into another reason.
+        for _ in 0..3 {
+            assert_eq!(
+                context
+                    .admit()
+                    .expect_err("exhausted context admitted work"),
+                refusal
+            );
+            assert_eq!(
+                context.record_abandonment(4096),
+                AbandonmentOutcome::Exhausted
+            );
+            assert_eq!(context.abandonment_stats(), (1, 4096));
+        }
+        assert_eq!(context.health(), ProviderHealth::Exhausted);
+    }
+
+    #[test]
+    fn device_loss_and_budget_exhaustion_stay_distinguishable() {
+        let Some(lost_context) = lifecycle_context() else {
+            return;
+        };
+        let Some(exhausted_context) = lifecycle_context() else {
+            return;
+        };
+        assert_eq!(
+            exhausted_context.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        lost_context.mark_device_lost();
+
+        assert_eq!(lost_context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(exhausted_context.health(), ProviderHealth::Exhausted);
+
+        let lost = lost_context.admit().expect_err("lost device admitted work");
+        let exhausted = exhausted_context
+            .admit()
+            .expect_err("exhausted context admitted work");
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(lost.slug, "device_lost");
+        assert_eq!(lost.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            lost.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".into()))
+        );
+        assert_eq!(exhausted.class, ProviderErrorClass::Resource);
+        assert_eq!(exhausted.slug, "provider_unavailable");
+        assert_eq!(exhausted.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(exhausted.completion, CompletionDisposition::NotSubmitted);
+        assert_eq!(
+            exhausted.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_ne!(lost.slug, exhausted.slug);
+
+        // An observed device loss outranks an exhausted budget, so the cause is
+        // upgraded instead of being masked by the earlier abandonment.
+        exhausted_context.mark_device_lost();
+        assert_eq!(exhausted_context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(
+            exhausted_context
+                .admit()
+                .expect_err("lost device admitted work")
+                .slug,
+            "device_lost"
+        );
+    }
+
+    #[test]
+    fn health_admission_and_refusals_follow_one_lifecycle() {
+        let Some(context) = lifecycle_context() else {
+            return;
+        };
+        // Control: the normal path still admits and still executes. The
+        // `copy_word` fixture writes buffer 1 from buffer 0, so an exact
+        // writeback proves admission, submission and readback all ran.
+        assert_health_and_refusal_agree(&context);
+        let executor = Arc::new(VulkanExecutor {
+            context: Arc::clone(&context),
+        });
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_copy_word.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("copy_word")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![
+                metal_api_core::BufferBinding {
+                    index: 0,
+                    bytes: 0x6745_2301_u32.to_le_bytes().to_vec(),
+                },
+                metal_api_core::BufferBinding {
+                    index: 1,
+                    bytes: vec![0_u8; 4],
+                },
+            ],
+            textures: Vec::new(),
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).expect("grid size"),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).expect("local size"),
+        };
+        let updates = executor.execute(submission).expect("the copy executes");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].index, 1);
+        assert_eq!(updates[0].bytes, 0x6745_2301_u32.to_le_bytes());
+        assert_eq!(context.health(), ProviderHealth::Usable);
+        assert_eq!(context.abandonment_stats(), (0, 0));
+        assert_health_and_refusal_agree(&context);
+
+        // Every terminal transition keeps the same agreement, including the
+        // sealed cause that records no abandoned work.
+        let Some(sealed) = lifecycle_context() else {
+            return;
+        };
+        sealed.mark_unobservable_submission();
+        assert_eq!(sealed.health(), ProviderHealth::Exhausted);
+        assert_eq!(
+            sealed.abandonment_stats(),
+            (0, 0),
+            "a queue-refused submission is not abandoned GPU work"
+        );
+        assert_health_and_refusal_agree(&sealed);
+
+        let Some(exhausted) = lifecycle_context() else {
+            return;
+        };
+        exhausted.record_abandonment(1024);
+        assert_health_and_refusal_agree(&exhausted);
+
+        let Some(lost) = lifecycle_context() else {
+            return;
+        };
+        lost.mark_device_lost();
+        assert_health_and_refusal_agree(&lost);
     }
 
     #[test]
