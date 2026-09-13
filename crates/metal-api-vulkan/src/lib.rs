@@ -377,6 +377,13 @@ impl VulkanExecutor {
         self.context.buffer_copy_bytes()
     }
 
+    /// Cumulative present acquire / present completions of the presentation
+    /// rail. Smoke tests use it to prove a presenting case reports one of each.
+    #[doc(hidden)]
+    pub fn present_counts(&self) -> (usize, usize) {
+        self.context.present_counts()
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -644,6 +651,13 @@ pub(crate) struct VulkanContext {
     /// (`research/docs/15` step 4).
     buffer_upload_bytes: AtomicUsize,
     buffer_readback_bytes: AtomicUsize,
+    /// Presentation completions of the first present increment
+    /// (`research/docs/24` §3.3, §5.3): one acquire when the provider takes
+    /// ownership of a present target for a pass, one present when the target's
+    /// terminal transition and readback complete. Both count per present
+    /// action, so a case with one present reports `1/1`.
+    present_acquires: AtomicUsize,
+    present_presents: AtomicUsize,
 }
 
 /// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
@@ -804,6 +818,8 @@ impl VulkanContext {
             buffer_readbacks: AtomicUsize::new(0),
             buffer_upload_bytes: AtomicUsize::new(0),
             buffer_readback_bytes: AtomicUsize::new(0),
+            present_acquires: AtomicUsize::new(0),
+            present_presents: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
@@ -1000,6 +1016,26 @@ impl VulkanContext {
         (
             self.buffer_uploads.load(Ordering::Relaxed),
             self.buffer_readbacks.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one acquire of a present target. Counted once per present action,
+    /// before the pass that renders into the target runs (`docs/24` §3.6).
+    pub(crate) fn record_present_acquire(&self) {
+        self.present_acquires.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed present. Counted once per present action, after the
+    /// target's terminal transition and readback have landed (`docs/24` §3.6).
+    pub(crate) fn record_present(&self) {
+        self.present_presents.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative (acquire, present) completions of the presentation rail.
+    pub(crate) fn present_counts(&self) -> (usize, usize) {
+        (
+            self.present_acquires.load(Ordering::Relaxed),
+            self.present_presents.load(Ordering::Relaxed),
         )
     }
 

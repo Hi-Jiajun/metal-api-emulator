@@ -14,10 +14,10 @@ use metal_api_core::provider::{
     CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
     ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, LeaseId,
     LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
-    PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-    ProviderPhase, ProviderSubmission, QueuePriority, RenderPassDescriptor, RenderPipelineContract,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TracePass,
-    ValidatedComputeTrace, ViewId,
+    PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -149,6 +149,7 @@ pub struct VulkanComputeProvider {
     next_submission: AtomicU64,
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
     render_pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredRenderPipeline>>>,
+    present_targets: Mutex<BTreeMap<(AllocationId, ViewId), Arc<render::PresentTargetImage>>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
     observation_deadline: Duration,
@@ -202,6 +203,7 @@ impl VulkanComputeProvider {
             next_submission: AtomicU64::new(1),
             pipelines: Mutex::new(BTreeMap::new()),
             render_pipelines: Mutex::new(BTreeMap::new()),
+            present_targets: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             retire_tx: Mutex::new(None),
             observation_deadline: GPU_DEADLINE,
@@ -577,11 +579,22 @@ impl VulkanComputeProvider {
             } else {
                 None
             };
-            let texels = render::execute_render_pass(
-                &self.executor.context,
-                &planned.stages,
-                &planned.pass,
-            )?;
+            let texels = match &planned.pass.present {
+                Some(present) => {
+                    let target = self.present_target(present, attachment)?;
+                    render::execute_present_render(
+                        &self.executor.context,
+                        &planned.stages,
+                        &planned.pass,
+                        &target,
+                    )?
+                }
+                None => render::execute_render_pass(
+                    &self.executor.context,
+                    &planned.stages,
+                    &planned.pass,
+                )?,
+            };
             if let Some(view) = view {
                 writebacks.push(BufferWriteback {
                     view_id: view.view_id,
@@ -592,6 +605,60 @@ impl VulkanComputeProvider {
             }
         }
         Ok(writebacks)
+    }
+
+    /// Resolve the provider-owned present target for one present descriptor,
+    /// creating it (and, for a `Sentinel` initial state, pre-filling it) on
+    /// first use. The image is keyed by the target's allocation/view identity
+    /// and reused across submissions, so it survives the pass's own drop scope
+    /// (`docs/24` §5.2).
+    fn present_target(
+        &self,
+        present: &PresentDescriptor,
+        attachment: &RenderAttachment,
+    ) -> Result<Arc<render::PresentTargetImage>, ProviderError> {
+        let key = (present.target.allocation_id, present.target.view_id);
+        if let Some(existing) = self
+            .present_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .get(&key)
+        {
+            return Ok(Arc::clone(existing));
+        }
+        let mut image = render::PresentTargetImage::create(
+            Arc::clone(&self.executor.context),
+            attachment.format,
+            attachment.width,
+            attachment.height,
+        )?;
+        if let Some(sentinel) = present.target.initial.sentinel() {
+            image.preset_sentinel(attachment.format, sentinel)?;
+        }
+        let mut registry = self
+            .present_targets
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let existing = registry.entry(key).or_insert_with(|| Arc::new(image));
+        Ok(Arc::clone(existing))
+    }
+
+    /// Number of provider-owned present targets still alive. Exposed for the
+    /// cross-submission test that proves a target is reused, not recreated,
+    /// across two presents of the same allocation/view.
+    #[doc(hidden)]
+    pub fn present_target_count(&self) -> usize {
+        self.present_targets
+            .lock()
+            .map(|registry| registry.len())
+            .unwrap_or(0)
+    }
+
+    /// Cumulative present acquire / present completions of the presentation
+    /// rail. Smoke tests use it to prove a presenting case reports one of each.
+    #[doc(hidden)]
+    pub fn present_counts(&self) -> (usize, usize) {
+        self.executor.present_counts()
     }
 
     fn retire(&self, pending: PendingExecution) {

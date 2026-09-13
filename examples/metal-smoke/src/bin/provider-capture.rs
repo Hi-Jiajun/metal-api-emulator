@@ -4,13 +4,14 @@ use metal_api_core::provider::queue_priorities_for_device;
 #[cfg(unix)]
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
-    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
-    ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineProvider, QueuePriority, QueueSchedulingPolicy,
-    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    SemanticDigest, ShaderSource, StoreOp, TextureAccess, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
+    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
+    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
+    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
+    ShaderSource, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+    TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -147,6 +148,17 @@ impl CopyCounters {
             Self::Vulkan(executor) => executor.buffer_copy_counts(),
             #[cfg(target_os = "macos")]
             Self::Native(provider) => provider.buffer_copy_counts(),
+        }
+    }
+
+    /// Cumulative present acquire / present completions of the presentation
+    /// rail. The native rail has no present execution in this increment
+    /// (`research/docs/24` §6 Step 7), so it reports nothing to count.
+    fn present_counts(&self) -> (usize, usize) {
+        match self {
+            Self::Vulkan(executor) => executor.present_counts(),
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => (0, 0),
         }
     }
 }
@@ -850,6 +862,12 @@ struct RenderCase {
     /// The capture backends this case is executable on. A rail in this list has
     /// to report the case; a rail outside it has to omit it.
     capture_rails: Vec<String>,
+    /// Optional present action (`research/docs/24` §6 Step 3). When present the
+    /// render case hands its own attachment on as a present target; the
+    /// expected `acquire`/`present` counts are the fixture's own assertion,
+    /// checked against the provider's counters when the case runs.
+    #[serde(default)]
+    present: Option<PresentDefinition>,
 }
 
 /// The colour attachment a render case draws into. The fields mirror
@@ -867,6 +885,20 @@ struct RenderAttachmentDefinition {
     load: String,
     store: String,
     clear_hex: Option<String>,
+    initial_hex: Option<String>,
+}
+
+/// The suite-side shape of a render case's present action (the capture suite's
+/// present input contract, shared with the compare rail). `initial_hex`
+/// defaults to absent, i.e. `InitialState::Undefined`.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresentDefinition {
+    mode: String,
+    image_count: u32,
+    acquire: u64,
+    present: u64,
+    #[serde(default)]
     initial_hex: Option<String>,
 }
 
@@ -950,6 +982,14 @@ struct GroupCounts {
     copy_out: u32,
 }
 
+/// Present acquire / present completions for one render case, reported when the
+/// case carries a present action (`research/docs/24` §5.3).
+#[derive(Serialize)]
+struct PresentCounts {
+    acquire: u32,
+    present: u32,
+}
+
 #[derive(Serialize)]
 struct CaseResult {
     id: String,
@@ -968,6 +1008,11 @@ struct CaseResult {
     /// (`research/docs/15` §5b).
     #[serde(skip_serializing_if = "Option::is_none")]
     group_counts: Option<Vec<GroupCounts>>,
+    /// The present action's `acquire`/`present` completions. Absent from cases
+    /// that carry no present, and from the Swift reference oracle which is not
+    /// a provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    present: Option<PresentCounts>,
 }
 
 #[derive(Serialize)]
@@ -1171,6 +1216,18 @@ fn main() -> Result<()> {
                 .iter()
                 .any(|rail| rail == backend.report_name(api))
         {
+            if case.present.is_some() {
+                // The object rail has no present execution in this increment
+                // (`research/docs/24` §6 Step 5), so a present-bearing case
+                // must fail typed, never silently drop the present.
+                return Err(format!(
+                    "present_unsupported_on_object_api: render case {} carries a present action \
+                     but the {} rail has no present execution",
+                    case.id,
+                    backend.report_name(api)
+                )
+                .into());
+            }
             return Err(format!(
                 "render case {} is marked executable on {} but this rail cannot execute a \
                  render pass",
@@ -1329,6 +1386,7 @@ fn main() -> Result<()> {
             }
         };
         let before = counters.read();
+        let (acquires_before, presents_before) = counters.present_counts();
         let mut result = run_render_case(
             provider.as_ref(),
             &programs,
@@ -1339,8 +1397,15 @@ fn main() -> Result<()> {
             suite.guard_byte,
         )?;
         let after = counters.read();
+        let (acquires_after, presents_after) = counters.present_counts();
         result.copy_in = Some(u32::try_from(after.0 - before.0)?);
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
+        if case.present.is_some() {
+            result.present = Some(PresentCounts {
+                acquire: u32::try_from(acquires_after - acquires_before)?,
+                present: u32::try_from(presents_after - presents_before)?,
+            });
+        }
         results.push(result);
     }
     if api == EntryApi::Trace {
@@ -1608,6 +1673,29 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     }
     if case.viewport != [0, 0, attachment.width, attachment.height] {
         return Err(format!("{where_}: the viewport must cover the attachment").into());
+    }
+    if let Some(present) = &case.present {
+        if present.mode != "fifo" {
+            return Err(format!(
+                "{where_}: unsupported present mode {:?}; the first increment admits fifo",
+                present.mode
+            )
+            .into());
+        }
+        if present.image_count != 1 {
+            return Err(format!("{where_}: the first present increment admits one image").into());
+        }
+        if present.acquire != 1 || present.present != 1 {
+            return Err(format!(
+                "{where_}: the first present increment counts exactly one acquire and one present"
+            )
+            .into());
+        }
+        if let Some(hex) = &present.initial_hex {
+            if unhex(hex)?.len() != 4 {
+                return Err(format!("{where_}: a present sentinel is four bytes").into());
+            }
+        }
     }
     if case.vertex_entry != RENDER_MSL_VERTEX_ENTRY
         || case.fragment_entry != RENDER_MSL_FRAGMENT_ENTRY
@@ -2493,6 +2581,26 @@ fn run_render_case(
             .as_deref()
             .ok_or("a clear attachment needs clear_hex")?,
     )?;
+    let present = match &case.present {
+        Some(definition) => Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(attachment.allocation),
+                view_id: ViewId::new(attachment.view),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: attachment.width,
+                height: attachment.height,
+                image_count: definition.image_count,
+                initial: match &definition.initial_hex {
+                    Some(hex) => InitialState::Sentinel(unhex(hex)?),
+                    None => InitialState::Undefined,
+                },
+            },
+            source: ViewId::new(attachment.view),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        }),
+        None => None,
+    };
     trace.pipelines.push(render_pipeline.clone());
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
@@ -2516,7 +2624,7 @@ fn run_render_case(
             u32::try_from(case.viewport[3])?,
         ],
         vertices: u32::try_from(case.vertices)?,
-        present: None,
+        present,
     }));
 
     let admitted = provider
@@ -2594,6 +2702,7 @@ fn run_render_case(
         copy_in: None,
         copy_out: None,
         group_counts: None,
+        present: None,
     })
 }
 
@@ -2764,6 +2873,7 @@ fn run_object_case(
         copy_in: None,
         copy_out: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
+        present: None,
     })
 }
 
@@ -3044,6 +3154,7 @@ fn run_case(
         copy_in: None,
         copy_out: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
+        present: None,
     })
 }
 
