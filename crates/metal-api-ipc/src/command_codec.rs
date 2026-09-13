@@ -18,7 +18,7 @@ use metal_api_core::provider::{
     OperationId, PipelineCompileRequest, PipelineContract, PipelineId, ProviderCapabilities,
     ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
     ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
-    SubmissionId, ViewId,
+    SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
 };
 use std::io::{Read, Write};
 
@@ -1078,6 +1078,137 @@ fn get_view(decoder: &mut Decoder<'_>) -> Result<BufferView, CodecError> {
     })
 }
 
+fn put_texture_type(encoder: &mut Encoder, texture_type: TextureType) {
+    encoder.u8(match texture_type {
+        TextureType::D1 => 0,
+        TextureType::D1Array => 1,
+        TextureType::D2 => 2,
+        TextureType::D2Array => 3,
+        TextureType::D2Multisample => 4,
+        TextureType::D2MultisampleArray => 5,
+        TextureType::D3 => 6,
+    });
+}
+
+fn get_texture_type(decoder: &mut Decoder<'_>) -> Result<TextureType, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TextureType::D1),
+        1 => Ok(TextureType::D1Array),
+        2 => Ok(TextureType::D2),
+        3 => Ok(TextureType::D2Array),
+        4 => Ok(TextureType::D2Multisample),
+        5 => Ok(TextureType::D2MultisampleArray),
+        6 => Ok(TextureType::D3),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "texture type",
+            value,
+        }),
+    }
+}
+
+fn put_texture_format(encoder: &mut Encoder, format: TextureFormat) {
+    encoder.u8(match format {
+        TextureFormat::R32Uint => 0,
+        TextureFormat::R32Float => 1,
+        TextureFormat::Rgba8Unorm => 2,
+        TextureFormat::Bgra8Unorm => 3,
+    });
+}
+
+fn get_texture_format(decoder: &mut Decoder<'_>) -> Result<TextureFormat, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TextureFormat::R32Uint),
+        1 => Ok(TextureFormat::R32Float),
+        2 => Ok(TextureFormat::Rgba8Unorm),
+        3 => Ok(TextureFormat::Bgra8Unorm),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "texture format",
+            value,
+        }),
+    }
+}
+
+fn put_texture_access(encoder: &mut Encoder, access: TextureAccess) {
+    encoder.u8(match access {
+        TextureAccess::Sampled => 0,
+        TextureAccess::Storage => 1,
+        TextureAccess::Unused => 2,
+    });
+}
+
+fn get_texture_access(decoder: &mut Decoder<'_>) -> Result<TextureAccess, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TextureAccess::Sampled),
+        1 => Ok(TextureAccess::Storage),
+        2 => Ok(TextureAccess::Unused),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "texture access",
+            value,
+        }),
+    }
+}
+
+fn put_texture_source(encoder: &mut Encoder, source: &TextureSource) {
+    match source {
+        TextureSource::OwnedBytes(bytes) => {
+            encoder.u8(0);
+            encoder.blob(bytes);
+        }
+        TextureSource::StagedLease(lease_id) => {
+            encoder.u8(1);
+            encoder.u64(lease_id.get());
+        }
+        TextureSource::BorrowedNoCopy(lease_id) => {
+            encoder.u8(2);
+            encoder.u64(lease_id.get());
+        }
+    }
+}
+
+fn get_texture_source(decoder: &mut Decoder<'_>) -> Result<TextureSource, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TextureSource::OwnedBytes(decoder.blob()?)),
+        1 => Ok(TextureSource::StagedLease(LeaseId::new(decoder.u64()?))),
+        2 => Ok(TextureSource::BorrowedNoCopy(LeaseId::new(decoder.u64()?))),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "texture source",
+            value,
+        }),
+    }
+}
+
+fn put_texture(encoder: &mut Encoder, texture: &TextureView) {
+    encoder.u64(texture.view_id.get());
+    encoder.u32(texture.metal_binding);
+    encoder.u64(texture.allocation_id.get());
+    put_texture_type(encoder, texture.texture_type);
+    put_texture_format(encoder, texture.format);
+    encoder.u64(texture.width);
+    encoder.u64(texture.height);
+    encoder.u64(texture.depth);
+    encoder.u64(texture.array_length);
+    encoder.u64(texture.sample_count);
+    put_texture_access(encoder, texture.access);
+    put_texture_source(encoder, &texture.source);
+}
+
+fn get_texture(decoder: &mut Decoder<'_>) -> Result<TextureView, CodecError> {
+    Ok(TextureView {
+        view_id: ViewId::new(decoder.u64()?),
+        metal_binding: decoder.u32()?,
+        allocation_id: AllocationId::new(decoder.u64()?),
+        texture_type: get_texture_type(decoder)?,
+        format: get_texture_format(decoder)?,
+        width: decoder.u64()?,
+        height: decoder.u64()?,
+        depth: decoder.u64()?,
+        array_length: decoder.u64()?,
+        sample_count: decoder.u64()?,
+        access: get_texture_access(decoder)?,
+        source: get_texture_source(decoder)?,
+    })
+}
+
 fn put_dispatch(encoder: &mut Encoder, dispatch: &Dispatch) {
     put_dispatch_kind(encoder, dispatch.kind);
     encoder.array3(dispatch.grid);
@@ -1144,6 +1275,10 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) {
         for view in &pass.buffers {
             put_view(encoder, view);
         }
+        encoder.u64(pass.textures.len() as u64);
+        for texture in &pass.textures {
+            put_texture(encoder, texture);
+        }
         put_dispatch(encoder, &pass.dispatch);
     }
     put_completion_policy(encoder, trace.completion_policy);
@@ -1179,10 +1314,20 @@ fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
         for _ in 0..view_count {
             buffers.push(get_view(decoder)?);
         }
+        let texture_count =
+            usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+                needed: usize::MAX,
+                remaining: decoder.remaining(),
+            })?;
+        let mut textures = Vec::with_capacity(texture_count.min(1024));
+        for _ in 0..texture_count {
+            textures.push(get_texture(decoder)?);
+        }
         passes.push(ComputePass {
             pipeline,
             buffers,
             dispatch: get_dispatch(decoder)?,
+            textures,
         });
     }
     Ok(ComputeTrace {

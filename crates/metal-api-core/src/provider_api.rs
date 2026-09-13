@@ -777,6 +777,7 @@ impl CommandBuffer {
                 pipeline: metadata.pipeline_id,
                 buffers: views,
                 dispatch: pass.dispatch,
+                textures: Vec::new(),
             });
         }
         // Snapshot complete: no later step of this command reads the host bytes.

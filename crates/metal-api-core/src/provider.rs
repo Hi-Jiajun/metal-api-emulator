@@ -676,6 +676,11 @@ impl PipelineContract {
 pub struct ComputePass {
     pub pipeline: PipelineId,
     pub buffers: Vec<BufferView>,
+    /// Texture bindings for this pass. The first texture increment carries the
+    /// values through the trace and the command channel, but no provider
+    /// executes them yet: admission refuses a non-empty list with a typed
+    /// capability error (`research/docs/16` §4.2).
+    pub textures: Vec<TextureView>,
     pub dispatch: Dispatch,
 }
 
@@ -706,6 +711,15 @@ impl ComputePass {
             if views.insert(buffer.view_id, ()).is_some() {
                 return Err(ContractError::DuplicateView(buffer.view_id));
             }
+        }
+        // Texture bindings are carried by the trace and the command channel,
+        // but no provider executes them yet. Refuse them here instead of
+        // ignoring a binding the caller asked for (`research/docs/16` §4.2).
+        if let Some(texture) = self.textures.first() {
+            texture.validate_shape()?;
+            return Err(ContractError::TextureBindingUnsupported(
+                texture.metal_binding,
+            ));
         }
         if let Some(required_local_size) = pipeline_contract.required_local_size {
             let actual = self.dispatch.threads_per_threadgroup;
@@ -1879,6 +1893,7 @@ pub fn trace_from_trusted_snapshot(
                 grid,
                 threads_per_threadgroup: local,
             },
+            textures: Vec::new(),
         }],
         completion_policy: CompletionPolicy::HostReadback,
     };
@@ -2726,6 +2741,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::TextureSampleCountMismatch { .. } | E::TextureArrayLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "texture_shape_mismatch")
         }
+        E::TextureBindingUnsupported(_) => (
+            ProviderErrorClass::Capability,
+            "texture_binding_unsupported",
+        ),
         E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
@@ -3030,6 +3049,7 @@ pub enum ContractError {
         texture_type: TextureType,
         array_length: u64,
     },
+    TextureBindingUnsupported(u32),
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -3197,6 +3217,10 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "texture type {texture_type:?} does not admit array length {array_length}"
+            ),
+            Self::TextureBindingUnsupported(binding) => write!(
+                formatter,
+                "texture binding {binding} is carried by the trace but not yet executed"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -3618,6 +3642,59 @@ mod tests {
         ));
     }
 
+    fn unbound_pipeline_contract() -> PipelineContract {
+        PipelineContract {
+            dispatch_kind: DispatchKind::ThreadsExact,
+            required_local_size: None,
+            fixed_grid: None,
+            push_constant_offset: 0,
+            push_constant_bytes: 0,
+            buffer_bindings: Vec::new(),
+            shader_capabilities: Vec::new(),
+            translator_revision: None,
+        }
+    }
+
+    #[test]
+    fn texture_bindings_are_refused_until_a_provider_executes_them() {
+        let contract = unbound_pipeline_contract();
+        let mut pass = ComputePass {
+            pipeline: PipelineId::new(5),
+            buffers: Vec::new(),
+            textures: Vec::new(),
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        };
+        pass.validate(&contract)
+            .expect("a pass without texture bindings validates");
+
+        pass.textures.push(texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: vec![0; 64],
+        }));
+        assert!(matches!(
+            pass.validate(&contract),
+            Err(ContractError::TextureBindingUnsupported(3))
+        ));
+
+        // A malformed texture binding reports its shape error first, so the
+        // refusal never hides an invalid value behind a capability gate.
+        pass.textures[0].width = 0;
+        assert!(matches!(
+            pass.validate(&contract),
+            Err(ContractError::ZeroDimension { .. })
+        ));
+    }
+
     fn compile_request(source: ShaderSource) -> PipelineCompileRequest {
         PipelineCompileRequest {
             entry_name: "copy_word".to_owned(),
@@ -3872,6 +3949,7 @@ mod tests {
                 grid: [10, 3, 1],
                 threads_per_threadgroup: [8, 2, 1],
             },
+            textures: Vec::new(),
         }
     }
 

@@ -1191,6 +1191,7 @@ fn case_trace(
                     grid: dispatch.grid,
                     threads_per_threadgroup: dispatch.local,
                 },
+                textures: Vec::new(),
             })
         })
         .collect::<Result<Vec<_>>>()?;

@@ -585,6 +585,7 @@ mod tests {
                     grid: [1, 1, 1],
                     threads_per_threadgroup: [1, 1, 1],
                 },
+                textures: Vec::new(),
             }],
             completion_policy: CompletionPolicy::HostReadback,
         };
@@ -717,6 +718,7 @@ mod tests {
                     grid: [1, 1, 1],
                     threads_per_threadgroup: [1, 1, 1],
                 },
+                textures: Vec::new(),
             }],
             completion_policy: CompletionPolicy::HostReadback,
         };
@@ -792,6 +794,7 @@ mod tests {
                     grid: [1, 1, 1],
                     threads_per_threadgroup: [1, 1, 1],
                 },
+                textures: Vec::new(),
             }],
             completion_policy: CompletionPolicy::HostReadback,
         };
@@ -889,6 +892,7 @@ mod tests {
                     grid: [1, 1, 1],
                     threads_per_threadgroup: [1, 1, 1],
                 },
+                textures: Vec::new(),
             }],
             completion_policy: CompletionPolicy::HostReadback,
         };
@@ -1090,6 +1094,7 @@ mod tests {
                         grid: [1, 1, 1],
                         threads_per_threadgroup: [1, 1, 1],
                     },
+                    textures: Vec::new(),
                 }],
                 completion_policy: CompletionPolicy::HostReadback,
             }

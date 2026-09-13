@@ -1365,7 +1365,8 @@ mod tests {
         PipelineContract, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
         ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
         ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
-        SubmissionId, ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
+        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+        ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1440,6 +1441,7 @@ mod tests {
                     grid: [1, 1, 1],
                     threads_per_threadgroup: [1, 1, 1],
                 },
+                textures: Vec::new(),
             }],
             completion_policy: metal_api_core::provider::CompletionPolicy::HostReadback,
         }
@@ -1526,6 +1528,31 @@ mod tests {
         strided.passes[0].buffers[0].attribute_stride = Some(16);
         let request = CommandRequest::Submit {
             trace: strided,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+
+        // The wire format carries texture bindings even though provider
+        // admission refuses them until a provider executes them
+        // (research/docs/16 §4.2).
+        let mut textured = trace.clone();
+        textured.passes[0].textures.push(TextureView {
+            view_id: ViewId::new(71),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(41),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(vec![0x5a; 64]),
+        });
+        let request = CommandRequest::Submit {
+            trace: textured,
             resources: resources(),
         };
         let frame = CommandCodec::encode_request(&request).unwrap();

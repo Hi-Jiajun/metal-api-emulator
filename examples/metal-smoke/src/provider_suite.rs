@@ -1638,6 +1638,7 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
                 grid: [1, 1, 1],
                 threads_per_threadgroup: [1, 1, 1],
             },
+            textures: Vec::new(),
         }],
         completion_policy: CompletionPolicy::HostReadback,
     };
@@ -2662,6 +2663,7 @@ fn borrowed_lease_trace(
                 grid: [1, 1, 1],
                 threads_per_threadgroup: [1, 1, 1],
             },
+            textures: Vec::new(),
         }],
         completion_policy: CompletionPolicy::HostReadback,
     }
@@ -2859,6 +2861,7 @@ fn make_trace(
             pipeline: pipeline.pipeline_id,
             buffers,
             dispatch,
+            textures: Vec::new(),
         }],
         completion_policy: CompletionPolicy::HostReadback,
     })
