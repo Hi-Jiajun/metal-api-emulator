@@ -1,5 +1,8 @@
 //! Capture a provider run of the shared, versioned native-oracle suite.
 
+use metal_api_core::provider::queue_priorities_for_device;
+#[cfg(unix)]
+use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
@@ -9,6 +12,8 @@ use metal_api_core::provider::{
     TextureSource, TextureType, TextureView, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
+#[cfg(unix)]
+use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
 use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
@@ -18,8 +23,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -110,13 +119,12 @@ fn format_queue_tiers(tiers: &[QueuePriority]) -> String {
 
 /// Install one scheduling tier per device queue, truncating or padding the
 /// request so the table always describes the device exactly (Lavapipe exposes a
-/// single queue, so the §6 marking degenerates to one high queue there).
+/// single queue, so the §6 marking degenerates to one high queue there). The
+/// expansion is the core `queue_priorities_for_device`, i.e. the same rule a
+/// provider applies to a marking that arrives over the command channel.
 fn install_queue_priorities(executor: &VulkanExecutor, requested: &[QueuePriority]) -> Result<()> {
     let queues = executor.queue_count();
-    let mut tiers = vec![QueuePriority::Default; queues];
-    for (index, tier) in requested.iter().take(queues).enumerate() {
-        tiers[index] = *tier;
-    }
+    let tiers = queue_priorities_for_device(queues, requested);
     executor
         .set_queue_priorities(&tiers)
         .map_err(|error| format!("install queue priorities: {error:?}"))?;
@@ -142,9 +150,10 @@ fn install_queue_priorities(executor: &VulkanExecutor, requested: &[QueuePriorit
 /// queue: the probe still runs (the single-queue degenerate path) and skips the
 /// window contract, which a one-tier device cannot show.
 ///
-/// Only the asynchronous object path selects a queue; the synchronous path
-/// stays pinned to queue 0, so the priority table is observable here and
-/// nowhere else.
+/// The probe submits through the deferred object path, which reports one probe
+/// call per commit and therefore carries the whole selection sequence. The
+/// synchronous paths select through the same policy, but they report one queue
+/// per submit rather than a sequence, so the window contract is asserted here.
 fn run_queue_priority_probe(executor: &Arc<VulkanExecutor>, submissions: usize) -> Result<()> {
     let installed = executor.queue_priorities();
     if installed.len() != executor.queue_count() {
@@ -162,6 +171,23 @@ fn run_queue_priority_probe(executor: &Arc<VulkanExecutor>, submissions: usize) 
             .map_err(|error| format!("create Vulkan provider: {error:?}"))?
             .with_async_execution(true),
     );
+    drive_priority_probe(provider, submissions)?;
+    executor.clear_enqueue_probe_for_test();
+    let sequence = observed
+        .lock()
+        .map_err(|_| "the enqueue probe sequence is poisoned")?
+        .clone();
+    report_queue_priority_probe(executor, &installed, &sequence, submissions)
+}
+
+/// Submit `submissions` mutually independent command buffers through the
+/// queue-selecting object path and assert the landing bytes.
+///
+/// The provider is a parameter so the same scenario drives a provider in this
+/// process and a provider in another one (`--command-socket`); only the local
+/// run can read the selection sequence back, because the enqueue probe is
+/// host state inside the provider process.
+fn drive_priority_probe(provider: Arc<dyn PipelineProvider>, submissions: usize) -> Result<()> {
     let device = objects::Device::new(provider);
     let pipeline = device.compile_pipeline(PipelineCompileRequest {
         entry_name: "read_texture_2d".to_owned(),
@@ -196,15 +222,10 @@ fn run_queue_priority_probe(executor: &Arc<VulkanExecutor>, submissions: usize) 
         }
         command.wait_until_completed()?;
     }
-    executor.clear_enqueue_probe_for_test();
     if output.read()?[..4] != 0_u32.to_le_bytes() {
         return Err("the queue priority probe landed unexpected bytes".into());
     }
-    let sequence = observed
-        .lock()
-        .map_err(|_| "the enqueue probe sequence is poisoned")?
-        .clone();
-    report_queue_priority_probe(executor, &installed, &sequence, submissions)
+    Ok(())
 }
 
 /// Cross-check both observation surfaces and the §6 assertions, printing one
@@ -337,6 +358,229 @@ fn report_queue_priority_probe(
         "PASS queue_priority_probe_window windows={windows} high={high} default={default} \
          low={} max_high_streak={longest} limit={limit} low_per_window_min={low_per_window_min}",
         share(QueuePriority::Low)
+    );
+    Ok(())
+}
+
+/// Log one selection sequence as the tier letter of each selected queue.
+#[cfg(unix)]
+fn format_queue_sequence(installed: &[QueuePriority], sequence: &[usize]) -> String {
+    sequence
+        .iter()
+        .map(|index| match installed[*index] {
+            QueuePriority::Low => 'L',
+            QueuePriority::Default => 'D',
+            QueuePriority::High => 'H',
+        })
+        .collect()
+}
+
+/// `--queue-priority-probe --command-socket <path>`: the probe scenario with
+/// the provider in another process.
+///
+/// The owner sets the marking, drives the same submissions the in-process probe
+/// drives, and compares the provider's own report of the tiers it read against
+/// the table its marking installed. The enqueue probe is host state inside the
+/// provider process, so the provider prints its selection sequence itself; the
+/// owner asserts the two sides agree before this returns.
+#[cfg(unix)]
+fn run_remote_queue_priority_probe(
+    command_path: &Path,
+    requested: &[QueuePriority],
+    submissions: usize,
+) -> Result<()> {
+    use metal_api_ipc::command::unix::UnixListenerCommandTransport;
+
+    let listener = UnixListenerCommandTransport::bind(command_path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--queue-priority-child")
+        .arg(command_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("the queue priority child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let transport = match listener.accept() {
+        Ok(transport) => transport,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("accept the queue priority child: {error}").into());
+        }
+    };
+    let remote = RemoteProvider::connect(transport)?;
+    // The response is the provider's own expansion of the marking, so this is
+    // the table the scheduler in the child process reads.
+    let installed = remote
+        .set_queue_priorities(requested)
+        .map_err(|error| format!("install remote queue priorities: {error:?}"))?;
+    println!(
+        "queue_priority_probe owner=remote child=command-socket sent={} installed={} queues={}",
+        format_queue_tiers(requested),
+        format_queue_tiers(&installed),
+        installed.len()
+    );
+    // Dropping the device closes the command channel, which is how the child
+    // learns that the session is over.
+    drive_priority_probe(Arc::new(remote) as Arc<dyn PipelineProvider>, submissions)?;
+
+    let mut child_lines = Vec::new();
+    for line in &mut lines {
+        child_lines.push(line?);
+    }
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(command_path);
+    for line in &child_lines {
+        println!("child: {line}");
+    }
+    if !status.success() {
+        return Err(format!("the queue priority child exited with {status}").into());
+    }
+
+    // Owner-side assertion of the provider-side read: the child reports the
+    // table it installed, and it has to be the table this marking installed.
+    let report = child_lines
+        .iter()
+        .find(|line| line.starts_with("queue_priority_child read="))
+        .ok_or("the queue priority child did not report the tiers it read")?;
+    let field = |name: &str| {
+        report
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(name))
+    };
+    let read = field("read=").ok_or("the child report has no read= field")?;
+    let queues = field("queues=").ok_or("the child report has no queues= field")?;
+    if read != format_queue_tiers(&installed) || queues != installed.len().to_string() {
+        return Err(format!(
+            "the provider read {read} on {queues} queues, the owner installed {} on {}",
+            format_queue_tiers(&installed),
+            installed.len()
+        )
+        .into());
+    }
+    if !child_lines
+        .iter()
+        .any(|line| line.starts_with("PASS queue_priority_child"))
+    {
+        return Err("the queue priority child did not report a passing observation".into());
+    }
+    println!(
+        "PASS queue_priority_probe_remote sent={} read={} queues={} submissions={submissions} \
+         probe_matches_counts=exact writeback=exact",
+        format_queue_tiers(requested),
+        read,
+        installed.len()
+    );
+    Ok(())
+}
+
+/// `--queue-priority-probe --command-socket <path>` on a platform without Unix
+/// domain sockets.
+#[cfg(not(unix))]
+fn run_remote_queue_priority_probe(
+    _command_path: &Path,
+    _requested: &[QueuePriority],
+    _submissions: usize,
+) -> Result<()> {
+    Err("--queue-priority-probe --command-socket requires Unix domain sockets".into())
+}
+
+/// Entry point for `--queue-priority-child`.
+fn run_queue_priority_child_mode(path: std::ffi::OsString) -> Result<()> {
+    #[cfg(unix)]
+    {
+        run_queue_priority_child(&path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err("--queue-priority-child requires Unix domain sockets".into())
+    }
+}
+
+/// `--queue-priority-child <command-socket>`: the provider half of the remote
+/// probe.
+///
+/// It owns a Vulkan device, serves the command channel, and once the owner
+/// closes it reports the queue table it read, the selection sequence it
+/// observed and the two provider-side observation surfaces it cross-checked.
+/// This line is the provider-side half of the cross-process evidence.
+#[cfg(unix)]
+fn run_queue_priority_child(command_path: &std::ffi::OsStr) -> Result<()> {
+    let executor = Arc::new(
+        VulkanExecutor::new().map_err(|error| format!("create Vulkan executor: {error:?}"))?,
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+        if let Ok(mut sequence) = sink.lock() {
+            sequence.push(queue);
+        }
+    }));
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(|error| format!("create Vulkan provider: {error:?}"))?
+        .with_async_execution(true);
+    let mut transport = command_unix::connect(command_path)?;
+    serve_provider_unix(&provider, &mut transport)?;
+    drop(transport);
+    drop(provider);
+    executor.clear_enqueue_probe_for_test();
+
+    let installed = executor.queue_priorities();
+    let counts = executor.queue_submission_counts();
+    let sequence = observed
+        .lock()
+        .map_err(|_| "the enqueue probe sequence is poisoned")?
+        .clone();
+    if sequence.iter().any(|index| *index >= installed.len()) {
+        return Err("the enqueue probe observed a queue outside the device".into());
+    }
+    let tiers: Vec<QueuePriority> = sequence.iter().map(|index| installed[*index]).collect();
+    let share = |tier: QueuePriority| tiers.iter().filter(|seen| **seen == tier).count();
+    println!(
+        "queue_priority_child read={} queues={} submissions={} sequence={} index_counts={} \
+         tier_counts=high={} default={} low={}",
+        format_queue_tiers(&installed),
+        installed.len(),
+        sequence.len(),
+        format_queue_sequence(&installed, &sequence),
+        counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        share(QueuePriority::High),
+        share(QueuePriority::Default),
+        share(QueuePriority::Low)
+    );
+
+    // The two provider-side observation surfaces have to agree, exactly as the
+    // in-process probe requires.
+    if counts.len() != installed.len() || counts.iter().sum::<usize>() != sequence.len() {
+        return Err(format!(
+            "queue_submission_counts() reports {counts:?} for {} submissions",
+            sequence.len()
+        )
+        .into());
+    }
+    for (index, count) in counts.iter().enumerate() {
+        let seen = sequence.iter().filter(|picked| **picked == index).count();
+        if *count != seen {
+            return Err(format!(
+                "queue {index}: queue_submission_counts={count} enqueue_probe={seen}"
+            )
+            .into());
+        }
+    }
+    println!(
+        "PASS queue_priority_child queues={} submissions={} read={} probe_matches_counts=exact",
+        installed.len(),
+        sequence.len(),
+        format_queue_tiers(&installed)
     );
     Ok(())
 }
@@ -546,6 +790,7 @@ fn main() -> Result<()> {
     let mut queue_priorities = None;
     let mut probe = false;
     let mut probe_submissions = None;
+    let mut command_socket = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!(
@@ -553,9 +798,17 @@ fn main() -> Result<()> {
                  [--backend vulkan|native-metal-provider] [--api trace|objects] [--async] \
                  [--queue-priorities low,default,high,...]\n\
                  usage: provider-capture --queue-priority-probe \
-                 [--queue-priorities low,default,high,...] [--queue-priority-submissions N]"
+                 [--queue-priorities low,default,high,...] [--queue-priority-submissions N] \
+                 [--command-socket <path>]\n\
+                 usage: provider-capture --queue-priority-child <command-socket>"
             );
             return Ok(());
+        }
+        if flag == "--queue-priority-child" {
+            let path = args
+                .next()
+                .ok_or("--queue-priority-child requires a command socket")?;
+            return run_queue_priority_child_mode(path);
         }
         if flag == "--async" {
             async_execution = true;
@@ -563,6 +816,12 @@ fn main() -> Result<()> {
         }
         if flag == "--queue-priority-probe" {
             probe = true;
+            continue;
+        }
+        if flag == "--command-socket" && command_socket.is_none() {
+            command_socket = Some(PathBuf::from(
+                args.next().ok_or("--command-socket requires a path")?,
+            ));
             continue;
         }
         if flag == "--queue-priorities" && queue_priorities.is_none() {
@@ -637,6 +896,15 @@ fn main() -> Result<()> {
         if requested.is_empty() {
             return Err("--queue-priorities must name at least one queue".into());
         }
+        if let Some(path) = command_socket {
+            // The provider lives in another process, so the marking and the
+            // scenario both travel over the command channel.
+            return run_remote_queue_priority_probe(
+                &path,
+                &requested,
+                probe_submissions.unwrap_or(70),
+            );
+        }
         let executor =
             VulkanExecutor::new().map_err(|error| format!("create Vulkan executor: {error:?}"))?;
         install_queue_priorities(&executor, &requested)?;
@@ -644,6 +912,9 @@ fn main() -> Result<()> {
     }
     if probe_submissions.is_some() {
         return Err("--queue-priority-submissions requires --queue-priority-probe".into());
+    }
+    if command_socket.is_some() {
+        return Err("--command-socket requires --queue-priority-probe".into());
     }
     let suite_path = suite_path.ok_or("--suite is required")?;
     if output_path.as_ref().is_some_and(|path| path.exists()) {

@@ -67,6 +67,7 @@ pub enum CodecError {
     ChunkTotalMismatch { declared: u64, actual: u64 },
     ChunkInterrupted { received: u64, declared: u64 },
     ChunkedPayloadTooLarge { total: u64, maximum: usize },
+    QueuePriorityCount { count: usize, maximum: usize },
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
@@ -124,6 +125,10 @@ impl fmt::Display for CodecError {
             Self::ChunkedPayloadTooLarge { total, maximum } => write!(
                 formatter,
                 "chunked command payload length {total} exceeds maximum {maximum}"
+            ),
+            Self::QueuePriorityCount { count, maximum } => write!(
+                formatter,
+                "queue priority table carries {count} tiers, maximum {maximum}"
             ),
             Self::UnknownEnumValue { field, value } => {
                 write!(formatter, "unknown {field} value {value}")
