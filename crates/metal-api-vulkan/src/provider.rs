@@ -71,6 +71,13 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_present_targets: MAX_PRESENT_TARGETS as u32,
         supported_present_modes: PresentMode::ADMITTED.to_vec(),
         max_present_image_count: MAX_PRESENT_IMAGE_COUNT,
+        supports_heaps: false,
+        max_heap_bytes: 0,
+        supported_heap_storage_modes: Vec::new(),
+        supports_heap_aliasing: false,
+        supports_indirect_command_buffers: false,
+        max_indirect_commands: 0,
+        supported_indirect_commands: Vec::new(),
     }
 }
 

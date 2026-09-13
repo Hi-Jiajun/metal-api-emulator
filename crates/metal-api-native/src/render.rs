@@ -1510,6 +1510,13 @@ mod tests {
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
             max_present_image_count: bits.max_present_image_count,
+            supports_heaps: false,
+            max_heap_bytes: 0,
+            supported_heap_storage_modes: Vec::new(),
+            supports_heap_aliasing: false,
+            supports_indirect_command_buffers: false,
+            max_indirect_commands: 0,
+            supported_indirect_commands: Vec::new(),
         }
     }
 
