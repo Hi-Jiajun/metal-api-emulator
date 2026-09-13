@@ -1409,20 +1409,24 @@ mod tests {
         serve_provider, serve_provider_named, CommandRequest, CommandResponse, RemoteProvider,
     };
     use crate::codec::CodecError;
-    use crate::command_codec::{CommandCodec, MAX_QUEUE_PRIORITIES, MAX_TAGGED_TRACE_PASSES};
+    use crate::command_codec::{
+        CommandCodec, MAX_PRESENT_SENTINEL_BYTES, MAX_QUEUE_PRIORITIES,
+        MAX_SUPPORTED_PRESENT_MODES, MAX_TAGGED_TRACE_PASSES,
+    };
     use metal_api_core::provider::{
-        AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferBindingContract,
-        BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
+        AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess,
+        BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, LeaseId, LeaseImporter,
-        LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
-        PipelineId, PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass,
-        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-        RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-        SemanticDigest, ShaderSource, StagedLease, StoreOp, SubmissionId, TextureAccess,
-        TextureFormat, TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace,
-        VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
+        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, InitialState, LeaseId,
+        LeaseImporter, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
+        PipelineContract, PipelineId, PipelineProvider, PresentDescriptor, PresentMode,
+        PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+        ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+        RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+        StagedLease, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
+        TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexLayout, ViewId,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
         PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1823,6 +1827,382 @@ mod tests {
             .unwrap_err(),
             CodecError::ColorAttachmentCount { count, maximum }
                 if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
+    }
+
+    /// The bytes `encode_request` produced at commit `6ba8834` for the trace
+    /// [`render_only_trace`] builds, i.e. before the present action existed.
+    /// Captured by encoding the same fixture in a clean checkout of that commit.
+    ///
+    /// An offscreen render pass has to keep producing exactly these bytes: the
+    /// present tag is additive, so a provider built before it keeps decoding
+    /// every render frame it decoded before (`research/docs/24` §4.3).
+    const LEGACY_RENDER_SUBMIT_FRAME: &[u8] = &[
+        77, 67, 67, 49, 1, 0, 0, 1, 113, 15, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 21,
+        0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 10, 102, 105, 120, 116, 117, 114, 101, 45, 118, 49, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111,
+        112, 121, 95, 119, 111, 114, 100, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111, 112, 121, 95, 119, 111,
+        114, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 12, 98, 117, 102, 102,
+        101, 114, 45, 119, 114, 105, 116, 101, 1, 0, 0, 0, 0, 0, 0, 0, 10, 116, 114, 97, 110, 115,
+        108, 97, 116, 111, 114, 0, 0, 0, 0, 0, 0, 0, 2, 118, 49, 0, 0, 0, 0, 0, 0, 0, 18, 102, 117,
+        108, 108, 95, 115, 99, 114, 101, 101, 110, 95, 118, 101, 114, 116, 101, 120, 0, 0, 0, 0, 0,
+        0, 0, 20, 115, 111, 108, 105, 100, 95, 99, 111, 108, 111, 114, 95, 102, 114, 97, 103, 109,
+        101, 110, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 71, 0, 0, 0, 0, 0, 0, 0, 41, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
+        0, 0, 0, 0, 0, 2, 0, 254, 254, 254, 254, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2,
+        0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 7, 0,
+        0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// The bytes `encode_request` produces for the same fixture with its render
+    /// pass handing its own attachment on (`research/docs/24` §4.1, shape one).
+    ///
+    /// This is the present half's hardcoded frame: the payload tag, the pass
+    /// kind, the field order and the two optional discriminators are pinned, so
+    /// a later change to the present section cannot pass by rewriting the
+    /// fixture alongside itself.
+    const PRESENT_SUBMIT_FRAME: &[u8] = &[
+        77, 67, 67, 49, 1, 0, 0, 1, 173, 15, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 21,
+        0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 10, 102, 105, 120, 116, 117, 114, 101, 45, 118, 49, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111,
+        112, 121, 95, 119, 111, 114, 100, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111, 112, 121, 95, 119, 111,
+        114, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 12, 98, 117, 102, 102,
+        101, 114, 45, 119, 114, 105, 116, 101, 1, 0, 0, 0, 0, 0, 0, 0, 10, 116, 114, 97, 110, 115,
+        108, 97, 116, 111, 114, 0, 0, 0, 0, 0, 0, 0, 2, 118, 49, 0, 0, 0, 0, 0, 0, 0, 18, 102, 117,
+        108, 108, 95, 115, 99, 114, 101, 101, 110, 95, 118, 101, 114, 116, 101, 120, 0, 0, 0, 0, 0,
+        0, 0, 20, 115, 111, 108, 105, 100, 95, 99, 111, 108, 111, 114, 95, 102, 114, 97, 103, 109,
+        101, 110, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+        0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 71, 0, 0, 0, 0, 0, 0, 0, 41, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
+        0, 0, 0, 0, 0, 2, 0, 254, 254, 254, 254, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2,
+        0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 71, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0,
+        0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 4, 64, 128, 192, 255, 0, 0, 0, 0,
+        0, 0, 0, 71, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0,
+        7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// Byte offsets inside [`PRESENT_SUBMIT_FRAME`]'s present section, derived
+    /// from the field order a decoder reads (`docs/24` §3.1). They are stated
+    /// as offsets from the section's first byte so the mutation cases below
+    /// change one field rather than a hand-counted position in the whole frame.
+    const PRESENT_INITIAL_TAG: usize = 37;
+    const PRESENT_SENTINEL_LENGTH: usize = 38;
+    const PRESENT_MODE: usize = 58;
+    const PRESENT_ACQUIRE: usize = 59;
+
+    /// The fixture's render pass handing its own attachment on: the smallest
+    /// trace that carries a present action (`docs/24` §3.5, shape one).
+    fn presenting_trace() -> ComputeTrace {
+        let mut trace = render_only_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(41),
+                view_id: ViewId::new(71),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: MAX_PRESENT_IMAGE_COUNT,
+                initial: InitialState::Sentinel(vec![0x40, 0x80, 0xc0, 0xff]),
+            },
+            source: ViewId::new(71),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        trace
+    }
+
+    /// The offset of the pass-kind byte in a frame whose only pass is the
+    /// fixture render pass. Every other identity in the frame is a smaller
+    /// number, so the first eight-byte big-endian 71 is the attachment's view
+    /// id, and the attachment count, the pipeline id and the pass kind precede
+    /// it.
+    fn render_pass_kind_offset(frame: &[u8]) -> usize {
+        let view_id = ViewId::new(71).get().to_be_bytes();
+        frame
+            .windows(view_id.len())
+            .position(|window| window == view_id)
+            .expect("the fixture attachment view id is on the wire")
+            - 17
+    }
+
+    /// The offset of the present section in a presenting frame. Its first two
+    /// identities are the target's allocation and view, a pair that appears
+    /// nowhere else: the render attachment writes the same pair in the other
+    /// order.
+    fn present_section_offset(frame: &[u8]) -> usize {
+        let mut marker = AllocationId::new(41).get().to_be_bytes().to_vec();
+        marker.extend_from_slice(&ViewId::new(71).get().to_be_bytes());
+        frame
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("the present target identity pair is on the wire")
+    }
+
+    #[test]
+    fn render_frames_without_a_present_keep_their_pre_present_bytes() {
+        let request = CommandRequest::Submit {
+            trace: render_only_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // Byte for byte what the render track published before the present
+        // action existed: an offscreen pass is not a presenting pass, so it
+        // must not pay for the present half (`docs/24` §4.3).
+        assert_eq!(frame, LEGACY_RENDER_SUBMIT_FRAME);
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(frame[render_pass_kind_offset(&frame)], 0x01);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+
+        // And it decodes with no present action, which is what makes the
+        // compute-only and offscreen paths keep the pre-present behaviour.
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        assert!(trace.passes[0]
+            .as_render()
+            .expect("the fixture is a render pass")
+            .present
+            .is_none());
+    }
+
+    #[test]
+    fn present_frames_use_their_own_pass_kind_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: presenting_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // The present half rides the submit tag shape one already uses, so no
+        // new payload tag was needed (`docs/24` §4.1) and the completion, lease
+        // and borrowed channels are untouched.
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(frame, PRESENT_SUBMIT_FRAME);
+        assert_eq!(
+            frame[render_pass_kind_offset(&frame)],
+            0x02,
+            "a presenting pass carries its own pass kind"
+        );
+
+        // Every field of the Step 1 value type survives the round trip,
+        // including the two optional discriminators.
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a present submit decodes as a submit");
+        };
+        let present = trace.passes[0]
+            .as_render()
+            .expect("the fixture is a render pass")
+            .present
+            .as_ref()
+            .expect("the fixture carries a present");
+        assert_eq!(present.target.allocation_id, AllocationId::new(41));
+        assert_eq!(present.target.view_id, ViewId::new(71));
+        assert_eq!(present.target.image_count, MAX_PRESENT_IMAGE_COUNT);
+        assert_eq!(
+            present.target.initial,
+            InitialState::Sentinel(vec![0x40, 0x80, 0xc0, 0xff])
+        );
+        assert_eq!(present.source, ViewId::new(71));
+        assert_eq!(present.mode, PresentMode::Fifo);
+        assert_eq!(present.acquire, AcquirePolicy::Blocking);
+
+        // The two values this increment refuses but keeps expressible on the
+        // wire travel too: a trace that asks for a deadline or for an undefined
+        // target is decoded, and the refusal is core admission's job rather
+        // than a decode-time downgrade (`docs/24` §3.1).
+        let mut expressive = presenting_trace();
+        let Some(TracePass::Render(pass)) = expressive.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let carried = pass
+            .present
+            .as_mut()
+            .expect("the fixture carries a present");
+        carried.target.initial = InitialState::Undefined;
+        carried.acquire = AcquirePolicy::Timeout(5);
+        let request = CommandRequest::Submit {
+            trace: expressive,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+    }
+
+    #[test]
+    fn present_frames_refuse_truncation_oversize_and_unknown_kinds() {
+        let request = CommandRequest::Submit {
+            trace: presenting_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let present = present_section_offset(&frame);
+
+        // An unknown pass kind is a tag the decoder refuses, so a frame that
+        // claims a pass shape this build does not know cannot be read as a
+        // render pass with a stray tail.
+        let mut unknown_pass = frame.clone();
+        let pass_kind = render_pass_kind_offset(&frame);
+        unknown_pass[pass_kind] = 0x7e;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_pass).unwrap_err(),
+            CodecError::UnknownPassTag(0x7e)
+        ));
+
+        // The three closed values inside the present section each refuse an
+        // unknown code instead of folding to a default.
+        let mut unknown_initial = frame.clone();
+        unknown_initial[present + PRESENT_INITIAL_TAG] = 0x02;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_initial).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "present initial state",
+                value: 0x02
+            }
+        ));
+        let mut unknown_mode = frame.clone();
+        unknown_mode[present + PRESENT_MODE] = 0x04;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_mode).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "present mode",
+                value: 0x04
+            }
+        ));
+        let mut unknown_acquire = frame.clone();
+        unknown_acquire[present + PRESENT_ACQUIRE] = 0x02;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_acquire).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "present acquire policy",
+                value: 0x02
+            }
+        ));
+
+        // An oversized sentinel length is refused by the present bound before
+        // the decoder treats it as the rest of the frame.
+        let mut oversize = frame.clone();
+        oversize[present + PRESENT_SENTINEL_LENGTH..present + PRESENT_SENTINEL_LENGTH + 8]
+            .copy_from_slice(&((MAX_PRESENT_SENTINEL_BYTES + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            CommandCodec::decode_request(&oversize).unwrap_err(),
+            CodecError::PresentSentinelLength { length, maximum }
+                if length == MAX_PRESENT_SENTINEL_BYTES + 1
+                    && maximum == MAX_PRESENT_SENTINEL_BYTES
+        ));
+
+        // A frame that declares its own (short) length must fail inside the
+        // payload rather than decoding a partial present.
+        let payload = &frame[9..];
+        let mut truncated = b"MCC1".to_vec();
+        truncated.push(0x01);
+        truncated.extend_from_slice(&((payload.len() - 8) as u32).to_be_bytes());
+        truncated.extend_from_slice(&payload[..payload.len() - 8]);
+        assert!(matches!(
+            CommandCodec::decode_request(&truncated).unwrap_err(),
+            CodecError::TruncatedPayload { .. }
+        ));
+
+        // The encoder refuses the same protocol bound instead of writing a
+        // frame its own decoder would reject.
+        let mut trace = presenting_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.present
+            .as_mut()
+            .expect("the fixture carries a present")
+            .target
+            .initial = InitialState::Sentinel(vec![0; MAX_PRESENT_SENTINEL_BYTES + 1]);
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap_err(),
+            CodecError::PresentSentinelLength { length, maximum }
+                if length == MAX_PRESENT_SENTINEL_BYTES + 1
+                    && maximum == MAX_PRESENT_SENTINEL_BYTES
+        ));
+    }
+
+    #[test]
+    fn capability_frames_declare_present_bits_under_their_own_tag() {
+        // A snapshot with no extended bits keeps the legacy capability bytes,
+        // and a decoder that reads them treats it as present-refusing: that is
+        // what such a provider was (`docs/24` §4.2).
+        let legacy = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+        };
+        let frame = CommandCodec::encode_response(&legacy).unwrap();
+        assert_eq!(frame[9], 0x01);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), legacy);
+        let CommandResponse::Capabilities { capabilities, .. } =
+            CommandCodec::decode_response(&frame).unwrap()
+        else {
+            panic!("a capability response decodes as a capability response");
+        };
+        assert!(!capabilities.supports_presentation);
+        assert_eq!(capabilities.max_present_targets, 0);
+        assert!(capabilities.supported_present_modes.is_empty());
+        assert_eq!(capabilities.max_present_image_count, 0);
+
+        // A snapshot that declares presentation without any render bit still
+        // needs the extended payload, because that is where the present bits
+        // travel. This is the case the expanded `declares_render_support`
+        // predicate exists for.
+        let mut presenting = fake_capabilities();
+        presenting.supports_presentation = true;
+        presenting.max_present_targets = 1;
+        presenting.supported_present_modes = vec![PresentMode::Fifo];
+        presenting.max_present_image_count = MAX_PRESENT_IMAGE_COUNT;
+        let declaring = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: presenting,
+        };
+        let frame = CommandCodec::encode_response(&declaring).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), declaring);
+
+        // Both halves travel in the same frame, so a snapshot that declares
+        // render and present together round trips too.
+        let mut both = fake_capabilities();
+        both.supports_render_passes = true;
+        both.max_color_attachments = 1;
+        both.max_attachment_dimension = [2, 2];
+        both.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        both.supports_presentation = true;
+        both.max_present_targets = 1;
+        both.supported_present_modes = vec![PresentMode::Fifo];
+        both.max_present_image_count = MAX_PRESENT_IMAGE_COUNT;
+        let declaring = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: both,
+        };
+        let frame = CommandCodec::encode_response(&declaring).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), declaring);
+
+        // The mode list carries a bound like the colour-format list does, so a
+        // corrupt count cannot drive the decoder or the encoder.
+        let mut oversize = fake_capabilities();
+        oversize.supports_presentation = true;
+        oversize.supported_present_modes = vec![PresentMode::Fifo; MAX_SUPPORTED_PRESENT_MODES + 1];
+        assert!(matches!(
+            CommandCodec::encode_response(&CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(7),
+                capabilities: oversize,
+            })
+            .unwrap_err(),
+            CodecError::PresentModeCount { count, maximum }
+                if count == MAX_SUPPORTED_PRESENT_MODES + 1
+                    && maximum == MAX_SUPPORTED_PRESENT_MODES
         ));
     }
 

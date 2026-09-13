@@ -71,6 +71,8 @@ pub enum CodecError {
     TracePassCount { count: usize, maximum: usize },
     ColorAttachmentCount { count: usize, maximum: usize },
     SupportedColorFormatCount { count: usize, maximum: usize },
+    PresentModeCount { count: usize, maximum: usize },
+    PresentSentinelLength { length: usize, maximum: usize },
     UnknownPassTag(u8),
     UnknownPipelineTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
@@ -146,6 +148,14 @@ impl fmt::Display for CodecError {
             Self::SupportedColorFormatCount { count, maximum } => write!(
                 formatter,
                 "capability snapshot names {count} colour formats, maximum {maximum}"
+            ),
+            Self::PresentSentinelLength { length, maximum } => write!(
+                formatter,
+                "present target sentinel carries {length} bytes, maximum {maximum}"
+            ),
+            Self::PresentModeCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} present modes, maximum {maximum}"
             ),
             Self::UnknownPassTag(tag) => {
                 write!(formatter, "unknown trace pass tag {tag:#04x}")

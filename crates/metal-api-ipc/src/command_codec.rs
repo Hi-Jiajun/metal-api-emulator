@@ -10,14 +10,15 @@
 use crate::codec::CodecError;
 use crate::command::{CommandRequest, CommandResponse};
 use metal_api_core::provider::{
-    AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord, AttachmentFormat,
-    BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback,
-    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
+    AttachmentFormat, BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView,
+    BufferWriteback, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
-    LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
-    PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
-    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
+    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
     StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
     TextureType, TextureView, TracePass, VertexLayout, ViewId, MAX_COLOR_ATTACHMENTS,
@@ -87,6 +88,19 @@ const ERROR_RESPONSE: u8 = 0x7f;
 /// Pass discriminator inside the tagged trace layout.
 const PASS_KIND_COMPUTE: u8 = 0x00;
 const PASS_KIND_RENDER: u8 = 0x01;
+/// A render pass that also carries a present action
+/// (`research/docs/24` §4.1 and §3.5, shape one: present as the render pass's
+/// tail action).
+///
+/// The discriminator is a pass kind rather than a presence byte inside the
+/// render payload so an offscreen-only render pass keeps the exact bytes the
+/// render track published: a decoder that predates this tag answers
+/// [`CodecError::UnknownPassTag`] for a presenting pass instead of reading the
+/// present tail as the trace's completion policy. That is the same additive
+/// policy [`PASS_KIND_RENDER`] itself used, and it is the shape `docs/24` §4.1
+/// leaves open for the tagged payload ("extend the `SUBMIT_RENDER_REQUEST`
+/// payload or add a tag").
+const PASS_KIND_RENDER_PRESENT: u8 = 0x02;
 
 /// Pipeline-table discriminator inside the tagged trace layout.
 ///
@@ -114,6 +128,27 @@ pub const MAX_TAGGED_TRACE_PASSES: usize = 4096;
 /// refuse a well-formed snapshot; it only stops a corrupt count from driving
 /// the decoder.
 pub const MAX_SUPPORTED_COLOR_FORMATS: usize = 16;
+
+/// Maximum present modes one capability snapshot may declare.
+///
+/// [`PresentMode`] is a closed four-value family (the four
+/// `VkPresentModeKHR` modes, `research/docs/24` §3.1), so this bound can never
+/// refuse a well-formed snapshot; like [`MAX_SUPPORTED_COLOR_FORMATS`] it only
+/// stops a corrupt count from driving the decoder.
+pub const MAX_SUPPORTED_PRESENT_MODES: usize = 8;
+
+/// Maximum number of bytes one present target's sentinel may carry.
+///
+/// The contract's own rule is stronger — a sentinel is exactly one tightly
+/// packed texel of its format (`PresentTarget::validate_shape`, four bytes for
+/// every admitted format) — but that rule needs the format, which is decoded
+/// next to the bytes. This bound is the protocol's guard instead: it stops a
+/// corrupt length from being read as a payload, so a malformed present section
+/// is refused as [`CodecError::PresentSentinelLength`] before it is mistaken
+/// for the rest of the pass. It is deliberately looser than the contract rule
+/// so the contract, not the codec, reports a sentinel that is merely the wrong
+/// size for its format.
+pub const MAX_PRESENT_SENTINEL_BYTES: usize = 64;
 
 /// Maximum number of queue tiers one frame may carry.
 ///
@@ -1517,8 +1552,16 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 }
                 // `tagged` is true whenever a render entry exists, so the tag
                 // below always belongs to the extended layout.
-                encoder.u8(PASS_KIND_RENDER);
-                put_render_pass(encoder, pass);
+                // The pass kind carries the present half: an offscreen pass
+                // keeps `PASS_KIND_RENDER` and its previous bytes exactly, and
+                // a presenting pass is a tag an older decoder refuses
+                // (`docs/24` §4.1, §4.3).
+                encoder.u8(if pass.present.is_some() {
+                    PASS_KIND_RENDER_PRESENT
+                } else {
+                    PASS_KIND_RENDER
+                });
+                put_render_pass(encoder, pass)?;
             }
         }
     }
@@ -1539,7 +1582,7 @@ fn put_compute_pass(encoder: &mut Encoder, pass: &ComputePass) {
     put_dispatch(encoder, &pass.dispatch);
 }
 
-fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) {
+fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result<(), CodecError> {
     encoder.u64(pass.pipeline.get());
     encoder.u64(pass.color_attachments.len() as u64);
     for attachment in &pass.color_attachments {
@@ -1549,6 +1592,54 @@ fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) {
         encoder.u32(dimension);
     }
     encoder.u32(pass.vertices);
+    if let Some(present) = &pass.present {
+        put_present_descriptor(encoder, present)?;
+    }
+    Ok(())
+}
+
+/// Encode one present action as the render pass's trailing action
+/// (`research/docs/24` §3.5, shape one).
+///
+/// Every field is written in the order the Step 1 value type declares it, and
+/// the two optional halves are spelled as explicit tags rather than as a
+/// length-prefixed block, so a decoder reads `InitialState::Undefined` and
+/// `AcquirePolicy::Blocking` — the first increment's only admitted values —
+/// without having to interpret a sentinel budget it is not going to use.
+fn put_present_descriptor(
+    encoder: &mut Encoder,
+    present: &PresentDescriptor,
+) -> Result<(), CodecError> {
+    let target = &present.target;
+    encoder.u64(target.allocation_id.get());
+    encoder.u64(target.view_id.get());
+    put_attachment_format(encoder, target.format);
+    encoder.u64(target.width);
+    encoder.u64(target.height);
+    encoder.u32(target.image_count);
+    match &target.initial {
+        InitialState::Sentinel(bytes) => {
+            if bytes.len() > MAX_PRESENT_SENTINEL_BYTES {
+                return Err(CodecError::PresentSentinelLength {
+                    length: bytes.len(),
+                    maximum: MAX_PRESENT_SENTINEL_BYTES,
+                });
+            }
+            encoder.u8(0);
+            encoder.blob(bytes);
+        }
+        InitialState::Undefined => encoder.u8(1),
+    }
+    encoder.u64(present.source.get());
+    encoder.u8(present.mode.code());
+    // `AcquirePolicy::Timeout` carries its nanosecond budget, which is exactly
+    // what the Step 1 value type keeps expressible so a refusal can name the
+    // deadline instead of the trace losing the request (`docs/24` §3.1).
+    encoder.u8(present.acquire.code());
+    if let Some(nanos) = present.acquire.timeout_nanos() {
+        encoder.u64(nanos);
+    }
+    Ok(())
 }
 
 fn put_render_attachment(encoder: &mut Encoder, attachment: &RenderAttachment) {
@@ -1649,7 +1740,11 @@ fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecErro
     for _ in 0..pass_count {
         passes.push(match decoder.u8()? {
             PASS_KIND_COMPUTE => TracePass::Compute(get_compute_pass(decoder)?),
-            PASS_KIND_RENDER => TracePass::Render(get_render_pass(decoder)?),
+            PASS_KIND_RENDER => TracePass::Render(get_render_pass(decoder, false)?),
+            // The present half is a property of the tag, not of a field inside
+            // the render payload, so a frame cannot claim a present section it
+            // did not write (`docs/24` §4.1).
+            PASS_KIND_RENDER_PRESENT => TracePass::Render(get_render_pass(decoder, true)?),
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -1691,7 +1786,10 @@ fn get_compute_pass(decoder: &mut Decoder<'_>) -> Result<ComputePass, CodecError
     })
 }
 
-fn get_render_pass(decoder: &mut Decoder<'_>) -> Result<RenderPassDescriptor, CodecError> {
+fn get_render_pass(
+    decoder: &mut Decoder<'_>,
+    has_present: bool,
+) -> Result<RenderPassDescriptor, CodecError> {
     let pipeline = PipelineId::new(decoder.u64()?);
     let attachment_count =
         usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
@@ -1708,19 +1806,95 @@ fn get_render_pass(decoder: &mut Decoder<'_>) -> Result<RenderPassDescriptor, Co
     for _ in 0..attachment_count {
         color_attachments.push(get_render_attachment(decoder)?);
     }
+    let viewport = [
+        decoder.u32()?,
+        decoder.u32()?,
+        decoder.u32()?,
+        decoder.u32()?,
+    ];
+    let vertices = decoder.u32()?;
+    let present = if has_present {
+        Some(get_present_descriptor(decoder)?)
+    } else {
+        None
+    };
     Ok(RenderPassDescriptor {
         pipeline,
         color_attachments,
-        viewport: [
-            decoder.u32()?,
-            decoder.u32()?,
-            decoder.u32()?,
-            decoder.u32()?,
-        ],
-        vertices: decoder.u32()?,
-        // The pre-present layout has no room for a present action, so a frame
-        // it decodes describes an offscreen render pass (`docs/24` §4.3).
-        present: None,
+        viewport,
+        vertices,
+        present,
+    })
+}
+
+/// Decode one present action, the render pass's trailing action
+/// (`research/docs/24` §3.5, shape one).
+///
+/// Every closed value is read through the same `from_code` inverse the Step 1
+/// tests pinned, so an unknown mode, initial state or acquire policy is a
+/// decoder refusal rather than a silent default. The sentinel's length is
+/// bounded by [`MAX_PRESENT_SENTINEL_BYTES`] before it is read, so a corrupt
+/// length cannot be mistaken for the remainder of the frame.
+fn get_present_descriptor(decoder: &mut Decoder<'_>) -> Result<PresentDescriptor, CodecError> {
+    let allocation_id = AllocationId::new(decoder.u64()?);
+    let view_id = ViewId::new(decoder.u64()?);
+    let format = get_attachment_format(decoder)?;
+    let width = decoder.u64()?;
+    let height = decoder.u64()?;
+    let image_count = decoder.u32()?;
+    let initial = match decoder.u8()? {
+        0 => {
+            let length =
+                usize::try_from(decoder.u64()?).map_err(|_| CodecError::PresentSentinelLength {
+                    length: usize::MAX,
+                    maximum: MAX_PRESENT_SENTINEL_BYTES,
+                })?;
+            if length > MAX_PRESENT_SENTINEL_BYTES {
+                return Err(CodecError::PresentSentinelLength {
+                    length,
+                    maximum: MAX_PRESENT_SENTINEL_BYTES,
+                });
+            }
+            InitialState::Sentinel(decoder.take(length)?.to_vec())
+        }
+        1 => InitialState::Undefined,
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "present initial state",
+                value,
+            })
+        }
+    };
+    let source = ViewId::new(decoder.u64()?);
+    let mode_code = decoder.u8()?;
+    let mode = PresentMode::from_code(mode_code).ok_or(CodecError::UnknownEnumValue {
+        field: "present mode",
+        value: mode_code,
+    })?;
+    let acquire_code = decoder.u8()?;
+    let acquire = match acquire_code {
+        0 => AcquirePolicy::Blocking,
+        1 => AcquirePolicy::Timeout(decoder.u64()?),
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "present acquire policy",
+                value,
+            })
+        }
+    };
+    Ok(PresentDescriptor {
+        target: PresentTarget {
+            allocation_id,
+            view_id,
+            format,
+            width,
+            height,
+            image_count,
+            initial,
+        },
+        source,
+        mode,
+        acquire,
     })
 }
 
@@ -2232,6 +2406,25 @@ fn put_capabilities(
     for format in &capabilities.supported_color_formats {
         put_attachment_format(encoder, *format);
     }
+    // The present bits (`research/docs/24` §4.2) travel in the same extended
+    // payload as the render bits. A snapshot whose present bits all stay at
+    // their defaults never reaches this function, because
+    // `declares_render_support` treats them as part of the same question —
+    // which is what keeps both current providers' frames at their previous
+    // bytes while still carrying a future presenter's declaration.
+    encoder.bool(capabilities.supports_presentation);
+    encoder.u32(capabilities.max_present_targets);
+    if capabilities.supported_present_modes.len() > MAX_SUPPORTED_PRESENT_MODES {
+        return Err(CodecError::PresentModeCount {
+            count: capabilities.supported_present_modes.len(),
+            maximum: MAX_SUPPORTED_PRESENT_MODES,
+        });
+    }
+    encoder.u64(capabilities.supported_present_modes.len() as u64);
+    for mode in &capabilities.supported_present_modes {
+        encoder.u8(mode.code());
+    }
+    encoder.u32(capabilities.max_present_image_count);
     Ok(())
 }
 
@@ -2332,5 +2525,28 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_color_formats.push(get_attachment_format(decoder)?);
     }
     capabilities.supported_color_formats = supported_color_formats;
+    capabilities.supports_presentation = decoder.bool()?;
+    capabilities.max_present_targets = decoder.u32()?;
+    let mode_count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::PresentModeCount {
+        count: usize::MAX,
+        maximum: MAX_SUPPORTED_PRESENT_MODES,
+    })?;
+    if mode_count > MAX_SUPPORTED_PRESENT_MODES {
+        return Err(CodecError::PresentModeCount {
+            count: mode_count,
+            maximum: MAX_SUPPORTED_PRESENT_MODES,
+        });
+    }
+    let mut supported_present_modes = Vec::with_capacity(mode_count);
+    for _ in 0..mode_count {
+        let code = decoder.u8()?;
+        let mode = PresentMode::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "present mode",
+            value: code,
+        })?;
+        supported_present_modes.push(mode);
+    }
+    capabilities.supported_present_modes = supported_present_modes;
+    capabilities.max_present_image_count = decoder.u32()?;
     Ok(capabilities)
 }
