@@ -97,10 +97,15 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   actually touches, and a reservation conflicts only when the ranges overlap
   and at least one side writes. Two command buffers that touch disjoint ranges
   of one allocation are therefore both accepted and stay in flight together,
-  which `provider-smoke` checks on a real device. The host byte snapshot and
-  landing still take one whole-allocation guard, so a synchronous submit
-  excludes disjoint CPU access for its duration.
-- Open design work: splitting that host bytes guard per range, device-loss
+  which `provider-smoke` checks on a real device. The host bytes are guarded
+  only while the trace snapshots them: every view copies its bytes into the
+  trace, so the guard is released before `submit` and a parked submission no
+  longer holds the allocation against disjoint CPU access. Conflicting CPU
+  access stays excluded for the whole commit-to-completion window by the
+  reservations themselves, and `lock_unreserved` re-checks them under the
+  guard.
+- Open design work: sharing one device buffer per allocation (the guest memory
+  entry point), device-loss
   reclamation beyond the bounded abandonment budget, the cross-process
   completion transport and
   provider wiring (the core wire publisher and mirror now exist), provider-side

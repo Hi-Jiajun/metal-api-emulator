@@ -1046,6 +1046,57 @@ fn overlapping_ranges_of_one_allocation_still_serialize() {
     second.wait_until_completed().unwrap();
 }
 
+/// While a command is parked inside submit its ranges are reserved but the
+/// host bytes are not: the trace snapshot is already complete. A CPU write to
+/// a disjoint range must therefore succeed, while one that overlaps the
+/// reserved range must keep waiting. Holding the bytes guard across submit
+/// would make the disjoint writer wait too.
+#[test]
+fn a_parked_submit_does_not_hold_host_bytes_for_a_disjoint_range() {
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let mut provider = FakeProvider::new();
+    provider.gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+    provider.mode.store(ASYNC_GOOD, Ordering::SeqCst);
+    let device = Device::new(Arc::new(provider));
+    let pipeline = pipeline(&device, "0");
+    let shared = device.new_buffer_with_bytes(vec![7_u8; 8]).unwrap();
+    let low = shared.view(0, 4).unwrap();
+    let first = command(&device, &pipeline, &[(0, &low)]);
+    std::thread::scope(|scope| {
+        let submit = scope.spawn(|| first.commit());
+        entered.wait();
+        let shared_ref = &shared;
+        let (disjoint_tx, disjoint_rx) = std::sync::mpsc::channel();
+        let disjoint = scope.spawn(move || {
+            let outcome = shared_ref.write(4, &[9; 4]);
+            let _ = disjoint_tx.send(());
+            outcome
+        });
+        let wrote = disjoint_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let (overlap_tx, overlap_rx) = std::sync::mpsc::channel();
+        let shared_ref = &shared;
+        let overlapping = scope.spawn(move || {
+            let outcome = shared_ref.write(0, &[5; 4]);
+            let _ = overlap_tx.send(());
+            outcome
+        });
+        let overlapped = overlap_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        release.wait();
+        assert_eq!(submit.join().unwrap(), Ok(()));
+        first.wait_until_completed().unwrap();
+        assert!(
+            wrote,
+            "a disjoint CPU write waited for a parked submit: the host bytes are still held across submit"
+        );
+        assert!(
+            !overlapped,
+            "an overlapping CPU write did not wait for its reserved range"
+        );
+        disjoint.join().unwrap().unwrap();
+        overlapping.join().unwrap().unwrap();
+    });
+}
 #[test]
 fn invalid_compile_metadata_is_refused_and_retired() {
     let (provider, device) = setup();

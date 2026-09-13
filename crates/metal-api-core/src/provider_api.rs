@@ -730,9 +730,14 @@ impl CommandBuffer {
                 size: reservation.inner.length as u64,
             })?;
         }
-        // Reservations exclude CPU access for the whole commit-to-completion
-        // window. These guards are local to this call and are released before a
-        // pending command returns to the caller.
+        // The host bytes must stay stable only while the trace snapshots them:
+        // every view copies its bytes into the trace, so the provider never
+        // reads the host buffer again. Conflicting CPU access is excluded for
+        // the whole commit-to-completion window by the range reservations, and
+        // `lock_unreserved` re-checks them under these guards, so releasing the
+        // guards before `submit` cannot admit a conflicting CPU write. It does
+        // let a sibling command with a disjoint range of the same allocation
+        // take its own snapshot while this one is still inside `submit`.
         let mut guards = Vec::with_capacity(reservations.len());
         for reservation in &reservations {
             guards.push(reservation.lock_bytes()?);
@@ -774,6 +779,8 @@ impl CommandBuffer {
                 dispatch: pass.dispatch,
             });
         }
+        // Snapshot complete: no later step of this command reads the host bytes.
+        drop(guards);
         let trace = contract::ComputeTrace {
             schema_version: PROVIDER_SCHEMA_VERSION,
             device_epoch: owner.epoch,
@@ -805,7 +812,6 @@ impl CommandBuffer {
                 if observed != submission.completion {
                     return Err(Error::CompletionObservationMismatch);
                 }
-                drop(guards);
                 apply_writebacks(&reservations, &submission.writebacks)?;
                 Ok(ExecutionOutcome::Completed(submission))
             }
@@ -813,7 +819,6 @@ impl CommandBuffer {
                 if token.as_ref() != Some(&submitted) {
                     return Err(Error::CompletionObservationMismatch);
                 }
-                drop(guards);
                 Ok(ExecutionOutcome::Pending(
                     submission,
                     PendingCompletion {

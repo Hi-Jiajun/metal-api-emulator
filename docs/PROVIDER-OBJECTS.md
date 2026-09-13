@@ -58,11 +58,15 @@ same order. Every readback and destination range is checked before the first
 host write, so an invalid later result cannot leave an earlier buffer partially
 updated.
 
-The reserved ranges are a hazard boundary, not a lock split of the host bytes:
-`execute` still snapshots and later lands a whole allocation under one bytes
-guard, so a synchronous `submit` excludes disjoint CPU access to the same
-allocation for its duration. Splitting that guard is part of the shared
-per-allocation device buffer work and is not claimed here.
+The host bytes are guarded only while the trace snapshots them. Every view
+copies its bytes into the trace, so `execute` releases the bytes guard before
+`provider.submit` and never reads the host buffer again; landing re-acquires
+it in `apply_writebacks`. A submission parked inside `submit` therefore holds
+its **ranges** but not the allocation, so a disjoint CPU write proceeds while
+an overlapping one keeps waiting. Conflicting CPU access is excluded for the
+whole commit-to-completion window by the reservations, and `lock_unreserved`
+re-checks them under the guard, so releasing early cannot admit a conflicting
+write.
 
 Provider implementations must not synchronously reenter these same object
 buffers during `submit`, `wait` or `readback`: the caller holds their
