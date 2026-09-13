@@ -72,6 +72,12 @@ pub(crate) fn pipeline_contract(
 
     let mut buffer_bindings = Vec::with_capacity(reflection.bindings.len());
     for binding in &reflection.bindings {
+        // Sampled textures are execution resources, not contract buffer
+        // bindings; the provider's reflection validation already admitted them
+        // (`research/docs/16` §4.7).
+        if binding.kind == ResourceKind::Texture {
+            continue;
+        }
         if binding.kind != ResourceKind::Buffer {
             return Err(failure(format!(
                 "provider contract only maps Metal buffers, found {:?} at {}",

@@ -3381,6 +3381,68 @@ mod tests {
     }
 
     #[test]
+    fn object_api_binds_and_executes_a_sampled_texture() {
+        use metal_api_core::provider::TextureFormat;
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+        let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = device
+            .compile_pipeline(metal_api_core::provider::PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_sampled_texture".to_vec(),
+                )
+                .expect("digest"),
+                source: metal_api_core::provider::ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = device
+            .new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)
+            .expect("texture object");
+        let output = device
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("encoder");
+            encoder
+                .set_compute_pipeline_state(&pipeline)
+                .expect("pipeline state");
+            encoder.set_texture(0, &texture).expect("texture binding");
+            encoder
+                .set_buffer(0, &output.view(0, 64).unwrap())
+                .expect("buffer binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end encoding");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        let observed = output.read().expect("readback");
+        assert_eq!(observed[..4], 0_u32.to_le_bytes());
+    }
+
+    #[test]
     fn texture_fixture_executes_a_texel_read_on_the_selected_device() {
         use metal_api_core::provider::{
             AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,

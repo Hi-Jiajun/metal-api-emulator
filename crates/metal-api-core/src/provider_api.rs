@@ -39,6 +39,7 @@ pub enum Error {
     Contract(ContractError),
     Provider(ProviderError),
     ForeignBuffer,
+    ForeignTexture,
     IdentityExhausted,
     InvalidPipelineMetadata,
     PassLimit { requested: usize, maximum: usize },
@@ -58,6 +59,7 @@ impl fmt::Display for Error {
                 error.phase, error.slug, error.detail
             ),
             Self::ForeignBuffer => f.write_str("buffer belongs to a different object device"),
+            Self::ForeignTexture => f.write_str("texture belongs to a different object device"),
             Self::IdentityExhausted => f.write_str("object identity space exhausted"),
             Self::InvalidPipelineMetadata => {
                 f.write_str("provider returned inconsistent pipeline metadata")
@@ -200,6 +202,48 @@ impl Device {
         })
     }
 
+    /// Declare one sampled texture with its initial contents. Only the first
+    /// increment's shape is accepted here (`research/docs/16` §4.7): a 2D,
+    /// single-sample `R32Uint` texture whose byte length matches the tightly
+    /// packed extent.
+    pub fn new_texture_with_bytes(
+        &self,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
+        if width == 0 || height == 0 {
+            return Err(ApiError::ZeroSize.into());
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::EmptyBuffer.into());
+        }
+        let expected = width
+            .checked_mul(height)
+            .and_then(|extent| extent.checked_mul(format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("texture extent"))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
+            return Err(ContractError::SourceLengthMismatch {
+                view: ViewId::new(u64::MAX),
+                expected,
+                actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        Ok(Texture {
+            inner: Arc::new(TextureInner {
+                owner: Arc::clone(&self.state),
+                allocation_id: AllocationId::new(next_id()?),
+                view_id: ViewId::new(next_id()?),
+                format,
+                width,
+                height,
+                bytes,
+            }),
+        })
+    }
+
     pub fn new_command_queue(&self) -> CommandQueue {
         CommandQueue {
             owner: Arc::clone(&self.state),
@@ -237,6 +281,61 @@ struct BufferInner {
     bytes: Mutex<Vec<u8>>,
     reservations: Mutex<Vec<RangeHold>>,
     available: Condvar,
+}
+
+/// One sampled texture declared through the object API. The snapshot is the
+/// owned bytes captured at declaration time; the provider uploads them once per
+/// submission (`research/docs/16` §4.7).
+struct TextureInner {
+    owner: Arc<DeviceState>,
+    allocation_id: AllocationId,
+    view_id: ViewId,
+    format: contract::TextureFormat,
+    width: u64,
+    height: u64,
+    bytes: Vec<u8>,
+}
+
+/// A sampled texture handle. Clone is cheap and shares the same allocation.
+#[derive(Clone)]
+pub struct Texture {
+    inner: Arc<TextureInner>,
+}
+
+impl Texture {
+    pub fn allocation_id(&self) -> AllocationId {
+        self.inner.allocation_id
+    }
+
+    pub fn view_id(&self) -> ViewId {
+        self.inner.view_id
+    }
+
+    pub fn format(&self) -> contract::TextureFormat {
+        self.inner.format
+    }
+
+    pub fn dimensions(&self) -> (u64, u64) {
+        (self.inner.width, self.inner.height)
+    }
+
+    /// The contract view for one binding, mirroring `BufferView`'s snapshot.
+    fn view(&self, metal_binding: u32) -> contract::TextureView {
+        contract::TextureView {
+            view_id: self.inner.view_id,
+            metal_binding,
+            allocation_id: self.inner.allocation_id,
+            texture_type: contract::TextureType::D2,
+            format: self.inner.format,
+            width: self.inner.width,
+            height: self.inner.height,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: contract::TextureAccess::Sampled,
+            source: contract::TextureSource::OwnedBytes(self.inner.bytes.clone()),
+        }
+    }
 }
 
 /// One in-flight byte range held by a submission, tagged with the reservation
@@ -407,6 +506,21 @@ fn checked_range(offset: usize, length: usize, allocation_length: usize) -> Resu
 /// ranges of one allocation proceed. A binding whose access the reflected
 /// contract does not describe is treated as a write, so an unknown binding can
 /// never widen concurrency.
+/// Distinct textures referenced by the recorded passes, in first-use order.
+/// The provider uploads each allocation once per submission.
+fn collect_textures(passes: &[RecordedPass]) -> Vec<Texture> {
+    let mut textures = Vec::new();
+    let mut seen = BTreeSet::new();
+    for pass in passes {
+        for texture in pass.textures.values() {
+            if seen.insert(texture.view_id()) {
+                textures.push(texture.clone());
+            }
+        }
+    }
+    textures
+}
+
 fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
     let mut buffers = BTreeMap::<AllocationId, (&Buffer, Vec<(usize, usize, bool)>)>::new();
     for pass in passes {
@@ -523,6 +637,7 @@ impl CommandQueue {
 struct RecordedPass {
     pipeline: Pipeline,
     buffers: BTreeMap<u32, BufferView>,
+    textures: BTreeMap<u32, Texture>,
     dispatch: Dispatch,
 }
 struct CommandInner {
@@ -594,6 +709,7 @@ impl CommandBuffer {
             shared: Arc::clone(&self.shared),
             pipeline: None,
             buffers: BTreeMap::new(),
+            textures: BTreeMap::new(),
             dispatch_count: 0,
             ended: false,
         })
@@ -623,7 +739,8 @@ impl CommandBuffer {
         let mut token = None;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let reservations = reserve_buffers(&passes)?;
-            self.execute(&passes, reservations, &mut token)
+            let textures = collect_textures(&passes);
+            self.execute(&passes, reservations, textures, &mut token)
         }))
         .unwrap_or(Err(Error::ProviderPanicked));
         let mut inner = lock(&self.shared.inner, "provider command")?;
@@ -717,6 +834,7 @@ impl CommandBuffer {
         &self,
         passes: &[RecordedPass],
         reservations: Vec<BufferReservation>,
+        textures: Vec<Texture>,
         token: &mut Option<CompletionToken>,
     ) -> Result<ExecutionOutcome, Error> {
         let owner = &self.shared.owner;
@@ -728,6 +846,13 @@ impl CommandBuffer {
                 allocation_id: reservation.allocation_id(),
                 owner_epoch: owner.epoch,
                 size: reservation.inner.length as u64,
+            })?;
+        }
+        for texture in &textures {
+            resources.insert_allocation(AllocationRecord {
+                allocation_id: texture.inner.allocation_id,
+                owner_epoch: owner.epoch,
+                size: u64::try_from(texture.inner.bytes.len()).unwrap_or(u64::MAX),
             })?;
         }
         // The host bytes must stay stable only while the trace snapshots them:
@@ -777,7 +902,11 @@ impl CommandBuffer {
                 pipeline: metadata.pipeline_id,
                 buffers: views,
                 dispatch: pass.dispatch,
-                textures: Vec::new(),
+                textures: pass
+                    .textures
+                    .iter()
+                    .map(|(binding, texture)| texture.view(*binding))
+                    .collect(),
             });
         }
         // Snapshot complete: no later step of this command reads the host bytes.
@@ -933,6 +1062,7 @@ pub struct ComputeCommandEncoder {
     shared: Arc<CommandShared>,
     pipeline: Option<Pipeline>,
     buffers: BTreeMap<u32, BufferView>,
+    textures: BTreeMap<u32, Texture>,
     dispatch_count: usize,
     ended: bool,
 }
@@ -967,6 +1097,22 @@ impl ComputeCommandEncoder {
     pub fn clear_buffers(&mut self) -> Result<(), Error> {
         self.ensure_open()?;
         self.buffers.clear();
+        Ok(())
+    }
+    /// Bind one sampled texture to a Metal argument index. A texture and a
+    /// buffer may share an index because the translator reports them in one
+    /// argument namespace (`research/docs/16` §4.7).
+    pub fn set_texture(&mut self, index: u32, texture: &Texture) -> Result<(), Error> {
+        self.ensure_open()?;
+        if !Arc::ptr_eq(&self.shared.owner, &texture.inner.owner) {
+            return Err(Error::ForeignTexture);
+        }
+        self.textures.insert(index, texture.clone());
+        Ok(())
+    }
+    pub fn clear_textures(&mut self) -> Result<(), Error> {
+        self.ensure_open()?;
+        self.textures.clear();
         Ok(())
     }
     pub fn dispatch_threads(&mut self, grid: Size, local: Size) -> Result<(), Error> {
@@ -1015,6 +1161,7 @@ impl ComputeCommandEncoder {
         inner.passes.push(RecordedPass {
             pipeline: pipeline.clone(),
             buffers: self.buffers.clone(),
+            textures: self.textures.clone(),
             dispatch: Dispatch {
                 kind: DispatchKind::ThreadsExact,
                 grid: grid.dimensions().map(u64::from),

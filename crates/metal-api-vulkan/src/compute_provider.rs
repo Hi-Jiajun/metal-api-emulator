@@ -3,7 +3,7 @@
 
 use crate::{
     execute_pool_sequence_with_status, Binding, BoundDispatch, ContextHealth, PendingExecution,
-    PoolBinding, PoolKey, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    PoolBinding, PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
     VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
@@ -711,7 +711,7 @@ impl ComputeProvider for VulkanComputeProvider {
         for pass in &trace.passes {
             let grid = narrow_dimensions(pass.dispatch.grid)?.dimensions();
             let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?.dimensions();
-            let bindings = pass
+            let mut bindings = pass
                 .buffers
                 .iter()
                 .map(|view| {
@@ -725,7 +725,22 @@ impl ComputeProvider for VulkanComputeProvider {
                         width: usize::try_from(view.length).unwrap_or(usize::MAX),
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            // Sampled textures share the Metal argument index space with
+            // buffers, so they join the same binding map with a texture pool
+            // key (`research/docs/16` §4.7).
+            for texture in &pass.textures {
+                let width =
+                    usize::try_from(texture.expected_bytes().unwrap_or(0)).unwrap_or(usize::MAX);
+                bindings.push(Binding {
+                    metal_index: texture.metal_binding,
+                    key: PoolKey {
+                        kind: PoolKind::Texture,
+                        index: texture.metal_binding,
+                    },
+                    width,
+                });
+            }
             dispatches.push(BoundDispatch {
                 grid,
                 local,
