@@ -1128,7 +1128,7 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
     let (air_path, air_hash, metal_path, metal_hash) = match program.entry.as_str() {
         "read_texture_2d" => (
             "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
-            "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb",
+            "3e969b61d3149bc9351f44c56de6fb85a403557cbcbee7240602539ca794c8df",
             "shaders/read_texture_2d.metal",
             "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee",
         ),

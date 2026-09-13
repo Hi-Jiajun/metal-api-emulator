@@ -689,7 +689,7 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
     switch entry {
     case "read_texture_2d":
         air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
-            sha256: "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb")
+            sha256: "3e969b61d3149bc9351f44c56de6fb85a403557cbcbee7240602539ca794c8df")
         metal = SourceDefinition(path: "shaders/read_texture_2d.metal",
             sha256: "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee")
         slots = [BufferSlotDefinition(binding: 0, access: "write", length: 64)]

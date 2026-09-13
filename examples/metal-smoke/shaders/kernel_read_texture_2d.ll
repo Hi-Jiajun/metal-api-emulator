@@ -3,12 +3,15 @@
 source_filename = "kernel_read_texture_2d.metal"
 
 ; The thread position is the vector form every passing fixture uses; the
-; scalar `uint` form the translator accepts leaves later invocations with a
-; zero thread id, which the multi-invocation regression test pins.
+; scalar `uint` form the translator accepts is not exercised here. The old
+; "zero thread id" note was a misattribution: the multi-invocation failure
+; was the host upload's row pitch, fixed in 15a6be3 and covered by v12
+; (research/docs/16 §4.5 carries the correction).
 define void @read_texture_2d(ptr addrspace(1) %texture, ptr addrspace(1) %output, <3 x i32> %gid) {
 entry:
-  ; A workgroup barrier here changes nothing for the multi-invocation defect
-  ; recorded in research/docs/16 §4.5, so the fixture stays barrier-free.
+  ; A workgroup barrier here changes nothing for the (now corrected)
+  ; multi-invocation story in research/docs/16 §4.5, so the fixture stays
+  ; barrier-free.
   %sampler = call ptr addrspace(2) @air.get_read_sampler()
   %tid = extractelement <3 x i32> %gid, i32 0
   %row = extractelement <3 x i32> %gid, i32 1
