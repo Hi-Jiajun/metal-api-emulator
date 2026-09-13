@@ -7,10 +7,8 @@ source_filename = "kernel_read_texture_2d.metal"
 ; zero thread id, which the multi-invocation regression test pins.
 define void @read_texture_2d(ptr addrspace(1) %texture, ptr addrspace(1) %output, <3 x i32> %gid) {
 entry:
-  ; The reviewed multi-invocation fixtures all begin with a workgroup barrier;
-  ; it is what makes the translator materialize per-invocation positions
-  ; rather than folding them to zero.
-  tail call void @air.wg.barrier(i32 0, i32 1)
+  ; A workgroup barrier here changes nothing for the multi-invocation defect
+  ; recorded in research/docs/16 §4.5, so the fixture stays barrier-free.
   %sampler = call ptr addrspace(2) @air.get_read_sampler()
   %tid = extractelement <3 x i32> %gid, i32 0
   %row = extractelement <3 x i32> %gid, i32 1

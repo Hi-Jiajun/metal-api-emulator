@@ -2133,6 +2133,11 @@ impl PipelineObjects {
             .into_iter()
             .flat_map(u32::to_ne_bytes)
             .collect::<Vec<_>>();
+        if std::env::var_os("METAL_API_DEBUG_DISPATCH").is_some() {
+            eprintln!(
+                "PIPELINE local={local_size:?} spec_ids={KERNEL_LOCAL_SIZE_SPEC_IDS:?} data={data:?}"
+            );
+        }
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
@@ -3081,6 +3086,12 @@ impl ExecutionResources {
                         offset,
                         &bytes,
                     );
+                    if std::env::var_os("METAL_API_DEBUG_DISPATCH").is_some() {
+                        eprintln!(
+                            "DISPATCH region local={:?} groups={:?} threads_base={:?}",
+                            region.local_size, region.group_count, region.thread_base
+                        );
+                    }
                     self.context.device.cmd_dispatch(
                         self.command,
                         region.group_count[0],
