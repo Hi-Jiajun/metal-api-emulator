@@ -1207,10 +1207,12 @@ fn main() -> Result<()> {
     // Every rail has to agree about which cases it owns. A rail a render case's
     // marker names has to be able to report the case; both trace rails own a
     // render execution path (`conformance/RENDER-CAPTURE.md` §4), and the
-    // object-API rails carry no render command encoder in this increment, so a
-    // suite that asks them for one is refused instead of silently reporting
-    // fewer cases than the marker requires.
-    let render_rail = api == EntryApi::Trace;
+    // Vulkan object rail now owns one too (`research/docs/24` §6 Step 5). The
+    // native object rail still carries no render command encoder, so a suite
+    // that asks it for one is refused instead of silently reporting fewer
+    // cases than the marker requires.
+    let render_rail =
+        api == EntryApi::Trace || (api == EntryApi::Objects && backend == Backend::Vulkan);
     for case in &suite.render_cases {
         if !render_rail
             && case
@@ -1363,9 +1365,11 @@ fn main() -> Result<()> {
     // Render cases run after the compute cases, on the rails that own a render
     // execution path (`research/docs/23` §6 Step 7): the Vulkan trace rail and
     // the native provider's trace rail (`conformance/RENDER-CAPTURE.md` §4).
-    // Every other rail omits them, which is what the suite's `capture_rails`
-    // marker declares.
+    // The Vulkan object rail joins them (`research/docs/24` §6 Step 5); every
+    // other rail omits them, which is what the suite's `capture_rails` marker
+    // declares.
     let mut render_pipeline: Option<CompiledComputePipeline> = None;
+    let mut object_render_pipeline: Option<objects::RenderPipeline> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
         if !render_rail {
             continue;
@@ -1375,29 +1379,57 @@ fn main() -> Result<()> {
             .iter()
             .find(|declared| declared.id == case.declaring_case)
             .ok_or("render case declaring pass is not a case of this suite")?;
-        let programs = case_programs(declaring)
-            .iter()
-            .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
-            .collect::<Vec<_>>();
-        let pipeline = match &render_pipeline {
-            Some(pipeline) => pipeline.clone(),
-            None => {
-                let registered = register_render_pipeline(&render_registrar, &identity)?;
-                render_pipeline = Some(registered.clone());
-                registered
-            }
-        };
         let before = counters.read();
         let (acquires_before, presents_before) = counters.present_counts();
-        let mut result = run_render_case(
-            provider.as_ref(),
-            &programs,
-            declaring,
-            case,
-            &pipeline,
-            1000 + offset as u64,
-            suite.guard_byte,
-        )?;
+        let mut result = if let Some(device) = &object_device {
+            let object_programs = case_programs(declaring)
+                .iter()
+                .map(|program| {
+                    object_pipelines[&(program.entry.clone(), declaring.air_encoding)].clone()
+                })
+                .collect::<Vec<_>>();
+            let object_pipeline = match &object_render_pipeline {
+                Some(pipeline) => pipeline.clone(),
+                None => {
+                    let registered = register_render_pipeline(&render_registrar, &identity)?;
+                    let wrapped = device.render_pipeline(&registered)?;
+                    render_pipeline = Some(registered);
+                    object_render_pipeline = Some(wrapped.clone());
+                    wrapped
+                }
+            };
+            run_object_render_case(
+                device,
+                &object_programs,
+                declaring,
+                case,
+                &object_pipeline,
+                suite.guard_byte,
+                async_execution,
+            )?
+        } else {
+            let programs = case_programs(declaring)
+                .iter()
+                .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
+                .collect::<Vec<_>>();
+            let pipeline = match &render_pipeline {
+                Some(pipeline) => pipeline.clone(),
+                None => {
+                    let registered = register_render_pipeline(&render_registrar, &identity)?;
+                    render_pipeline = Some(registered.clone());
+                    registered
+                }
+            };
+            run_render_case(
+                provider.as_ref(),
+                &programs,
+                declaring,
+                case,
+                &pipeline,
+                1000 + offset as u64,
+                suite.guard_byte,
+            )?
+        };
         let after = counters.read();
         let (acquires_after, presents_after) = counters.present_counts();
         result.copy_in = Some(u32::try_from(after.0 - before.0)?);
@@ -2876,6 +2908,198 @@ fn run_object_case(
         copy_in: None,
         copy_out: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
+        present: None,
+    })
+}
+
+/// Run one render case on the object API: the declaring compute pass's own
+/// dispatch and the render pass ride in the same command buffer, so the
+/// attachment view the compute pass declares is the one the render pass stores
+/// into (`research/docs/23` §3.6). The observation is the attachment's own
+/// allocation and writeback, exactly as the trace rail reports it.
+fn run_object_render_case(
+    device: &objects::Device,
+    programs: &[objects::Pipeline],
+    declaring: &Case,
+    case: &RenderCase,
+    render_pipeline: &objects::RenderPipeline,
+    guard: u8,
+    async_execution: bool,
+) -> Result<CaseResult> {
+    let mut images = BTreeMap::<u64, Vec<u8>>::new();
+    for definition in &declaring.buffers {
+        let size = usize::try_from(definition.allocation_size)?;
+        let offset = usize::try_from(definition.offset)?;
+        let bytes = unhex(&definition.initial_hex)?;
+        let image = images
+            .entry(definition.allocation)
+            .or_insert_with(|| vec![guard; size]);
+        image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+    let mut allocation_buffers = BTreeMap::<u64, objects::Buffer>::new();
+    let mut resources = BTreeMap::<u64, (objects::Buffer, objects::BufferView)>::new();
+    let mut report_ids = BTreeMap::<(AllocationId, ViewId), (u64, u64)>::new();
+    for definition in &declaring.buffers {
+        let buffer = match allocation_buffers.get(&definition.allocation) {
+            Some(existing) => existing.clone(),
+            None => {
+                let image = images
+                    .remove(&definition.allocation)
+                    .ok_or("missing allocation image")?;
+                let created = device.new_buffer_with_bytes(image)?;
+                allocation_buffers.insert(definition.allocation, created.clone());
+                created
+            }
+        };
+        let view = buffer.view(
+            usize::try_from(definition.offset)?,
+            usize::try_from(definition.length)?,
+        )?;
+        report_ids.insert(
+            (view.allocation_id(), view.view_id()),
+            (definition.allocation, definition.view),
+        );
+        resources.insert(definition.view, (buffer, view));
+    }
+
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    let dispatches = dispatch_sequence(declaring);
+    let narrow = |dimensions: [u64; 3]| -> Result<Size> {
+        Ok(Size::new(
+            u32::try_from(dimensions[0])?,
+            u32::try_from(dimensions[1])?,
+            u32::try_from(dimensions[2])?,
+        )?)
+    };
+    let mut object_textures = BTreeMap::new();
+    for texture in &declaring.textures {
+        let initial = unhex(&texture.initial_hex)?;
+        let created = device.new_texture_with_bytes(
+            TextureFormat::R32Uint,
+            texture.width,
+            texture.height,
+            initial,
+        )?;
+        object_textures.insert(texture.binding, created);
+    }
+
+    // The declaring pass is one submission with one dispatch (`compare.py`
+    // `_render_plan` pins that shape), so it records into the same command
+    // buffer the render encoder opens below.
+    let mut compute = command.compute_command_encoder()?;
+    for dispatch in &dispatches {
+        compute.clear_buffers()?;
+        compute.clear_textures()?;
+        compute.set_compute_pipeline_state(&programs[dispatch.program.unwrap_or(0)])?;
+        for (binding, texture) in &object_textures {
+            compute.set_texture(*binding, texture)?;
+        }
+        let slots = selected_slots(declaring, dispatch);
+        let views = dispatch
+            .bindings
+            .clone()
+            .unwrap_or_else(|| declaring.buffers.iter().map(|buffer| buffer.view).collect());
+        for (slot, view) in slots.iter().zip(views) {
+            let (_, view) = resources.get(&view).ok_or("unknown object fixture view")?;
+            compute.set_buffer(slot.binding, view)?;
+        }
+        compute.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
+    }
+    compute.end_encoding()?;
+
+    let attachment_view = resources
+        .get(&case.attachment.view)
+        .ok_or("the declaring pass does not declare the attachment view")?
+        .1
+        .clone();
+    let clear = unhex(
+        case.attachment
+            .clear_hex
+            .as_deref()
+            .ok_or("a clear attachment needs clear_hex")?,
+    )?;
+    let present =
+        match &case.present {
+            Some(definition) => Some(match &definition.initial_hex {
+                Some(hex) => objects::PresentInitial::Sentinel(unhex(hex)?.try_into().map_err(
+                    |_| -> Box<dyn Error> { "a present sentinel is four bytes".into() },
+                )?),
+                None => objects::PresentInitial::Undefined,
+            }),
+            None => None,
+        };
+    let mut render = command.render_command_encoder()?;
+    render.set_render_pipeline_state(render_pipeline)?;
+    render.draw_render_pass(
+        &attachment_view,
+        AttachmentFormat::Rgba8Unorm,
+        case.attachment.width,
+        case.attachment.height,
+        clear
+            .try_into()
+            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+        present,
+    )?;
+    render.end_encoding()?;
+
+    command.commit()?;
+    if async_execution {
+        if command.status()? != metal_api_core::CommandBufferStatus::Committed {
+            return Err("async object render commit did not leave the command pending".into());
+        }
+        if !matches!(
+            command.submission()?.completion,
+            CompletionDisposition::Submitted { .. }
+        ) {
+            return Err("async object render commit did not return a submitted token".into());
+        }
+    }
+    command.wait_until_completed()?;
+    if command.status()? != metal_api_core::CommandBufferStatus::Completed {
+        return Err("object render command did not reach Completed".into());
+    }
+    let output = command.submission()?;
+    if !matches!(
+        output.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ) {
+        return Err("object render capture requires completed visible results".into());
+    }
+    let landed = output
+        .writebacks
+        .iter()
+        .find(|write| {
+            report_ids.get(&(write.allocation_id, write.view_id))
+                == Some(&(case.attachment.allocation, case.attachment.view))
+        })
+        .ok_or("the object render rail landed no attachment writeback")?;
+    let image = allocation_buffers
+        .get(&case.attachment.allocation)
+        .ok_or("the attachment allocation is missing")?
+        .read()?;
+    eprintln!(
+        "objects render case completed: {} attachment={} bytes={}",
+        case.id,
+        hex(&landed.bytes),
+        landed.bytes.len()
+    );
+    Ok(CaseResult {
+        id: case.id.clone(),
+        completion: "CompletedVisible",
+        writebacks: vec![Writeback {
+            allocation: case.attachment.allocation,
+            view: case.attachment.view,
+            offset: landed.offset,
+            bytes_hex: hex(&landed.bytes),
+        }],
+        allocations: vec![Allocation {
+            allocation: case.attachment.allocation,
+            bytes_hex: hex(&image),
+        }],
+        copy_in: None,
+        copy_out: None,
+        group_counts: None,
         present: None,
     })
 }

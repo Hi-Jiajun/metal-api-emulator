@@ -15,12 +15,15 @@
 //! [`crate::ComputeExecutor`] object API.
 
 use crate::provider::{
-    self as contract, AllocationId, AllocationRecord, BufferAccess, BufferRange, BufferSource,
-    BufferWriteback, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    CompletionToken, ComputeTrace, ContractError, Dispatch, DispatchKind, DispatchType,
-    OperationId, PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities,
-    ProviderError, ProviderHealth, ProviderSubmission, ResourceTableSnapshot, ViewId,
-    MAX_SERIAL_RESOURCES, PROVIDER_SCHEMA_VERSION,
+    self as contract, AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat,
+    BufferAccess, BufferRange, BufferSource, BufferWriteback, ClearColor, CompiledComputePipeline,
+    CompletionDisposition, CompletionPolicy, CompletionToken, ComputeTrace, ContractError,
+    Dispatch, DispatchKind, DispatchType, InitialState, LoadOp, OperationId,
+    PipelineCompileRequest, PipelineId, PipelineProvider, PresentDescriptor, PresentMode,
+    PresentTarget, ProviderCapabilities, ProviderError, ProviderHealth, ProviderSubmission,
+    RenderAttachment, RenderPassDescriptor, ResourceTableSnapshot, StoreOp, ViewId,
+    FULL_SCREEN_TRIANGLE_VERTICES, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES,
+    PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -185,6 +188,41 @@ impl Device {
         Ok(pipeline)
     }
 
+    /// Wrap a provider-registered render pipeline so a [`RenderCommandEncoder`]
+    /// can name it. The render rail is a concrete-context entry point
+    /// (`VulkanComputeProvider::register_render_pipeline` is not part of
+    /// [`PipelineProvider`]), so the caller hands the returned table metadata
+    /// back here instead of asking this device to compile a render pipeline.
+    ///
+    /// The handle owns nothing on the provider side: the caller keeps the
+    /// registration alive for the command buffers that name it and releases it
+    /// through the concrete context when it is no longer needed. A metadata
+    /// value without a render half, from another device epoch, or with a zero
+    /// identity is refused here rather than surfacing as a provider registry
+    /// mismatch later.
+    pub fn render_pipeline(
+        &self,
+        metadata: &CompiledComputePipeline,
+    ) -> Result<RenderPipeline, Error> {
+        if metadata.device_epoch != self.state.epoch || metadata.device_epoch.is_zero() {
+            return Err(Error::InvalidPipelineMetadata);
+        }
+        if metadata.pipeline_id.is_zero() {
+            return Err(Error::InvalidPipelineMetadata);
+        }
+        let render = metadata
+            .render
+            .as_ref()
+            .ok_or(Error::InvalidPipelineMetadata)?;
+        render.validate()?;
+        Ok(RenderPipeline {
+            inner: Arc::new(RenderPipelineInner {
+                owner: Arc::clone(&self.state),
+                metadata: metadata.clone(),
+            }),
+        })
+    }
+
     pub fn new_buffer_with_bytes(&self, bytes: Vec<u8>) -> Result<Buffer, Error> {
         if bytes.is_empty() {
             return Err(ApiError::EmptyBuffer.into());
@@ -271,6 +309,101 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn metadata(&self) -> &CompiledComputePipeline {
         &self.inner.metadata
+    }
+}
+
+struct RenderPipelineInner {
+    owner: Arc<DeviceState>,
+    metadata: CompiledComputePipeline,
+}
+
+/// A provider-registered render pipeline a [`RenderCommandEncoder`] names.
+///
+/// This is the render sibling of [`Pipeline`]: it carries the table entry a
+/// render pass has to reference and pins it to one device, but it does not own
+/// the provider registration. The concrete context that registered it owns
+/// retirement (`VulkanComputeProvider::release_render_pipeline`), exactly as
+/// the compute rail's render plan does for the trace path.
+#[derive(Clone)]
+pub struct RenderPipeline {
+    inner: Arc<RenderPipelineInner>,
+}
+impl RenderPipeline {
+    pub fn metadata(&self) -> &CompiledComputePipeline {
+        &self.inner.metadata
+    }
+}
+
+/// What a present action pre-seeds its target with (`research/docs/24` §3.1).
+///
+/// The first increment's render encoder accepts the sentinel as a four-byte
+/// value, mirroring the contract's [`InitialState`] but keeping the object API
+/// free of the wire-level `Vec<u8>` that carries it there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentInitial {
+    /// Leave the target's previous contents undefined.
+    Undefined,
+    /// Pre-fill the target with these tightly packed texel bytes before the
+    /// pass runs.
+    Sentinel([u8; 4]),
+}
+
+/// One recorded colour attachment: the buffer view that carries the attachment
+/// identity and byte range, plus the render-contract shape the encoder restates.
+#[derive(Clone)]
+struct RenderTarget {
+    view: BufferView,
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+    clear: [u8; 4],
+    present: Option<PresentInitial>,
+}
+
+impl RenderTarget {
+    fn descriptor(&self, pipeline_id: PipelineId) -> Result<RenderPassDescriptor, Error> {
+        let attachment = RenderAttachment {
+            view_id: self.view.view_id,
+            allocation_id: self.view.allocation_id(),
+            format: self.format,
+            width: self.width,
+            height: self.height,
+            load: LoadOp::Clear(ClearColor::new(self.clear)),
+            store: StoreOp::Store,
+        };
+        let present = self.present.map(|initial| PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: self.view.allocation_id(),
+                view_id: self.view.view_id,
+                format: self.format,
+                width: self.width,
+                height: self.height,
+                image_count: MAX_PRESENT_IMAGE_COUNT,
+                initial: match initial {
+                    PresentInitial::Undefined => InitialState::Undefined,
+                    PresentInitial::Sentinel(bytes) => InitialState::Sentinel(bytes.to_vec()),
+                },
+            },
+            source: self.view.view_id,
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        let descriptor = RenderPassDescriptor {
+            pipeline: pipeline_id,
+            color_attachments: vec![attachment],
+            viewport: [
+                0,
+                0,
+                u32::try_from(self.width)
+                    .map_err(|_| ContractError::ArithmeticOverflow("attachment width"))?,
+                u32::try_from(self.height)
+                    .map_err(|_| ContractError::ArithmeticOverflow("attachment height"))?,
+            ],
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            present,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
     }
 }
 
@@ -512,36 +645,86 @@ fn collect_textures(passes: &[RecordedPass]) -> Vec<Texture> {
     let mut textures = Vec::new();
     let mut seen = BTreeSet::new();
     for pass in passes {
-        for texture in pass.textures.values() {
-            if seen.insert(texture.view_id()) {
-                textures.push(texture.clone());
+        if let RecordedPass::Compute {
+            textures: bound, ..
+        } = pass
+        {
+            for texture in bound.values() {
+                if seen.insert(texture.view_id()) {
+                    textures.push(texture.clone());
+                }
             }
         }
     }
     textures
 }
 
-fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
-    let mut buffers = BTreeMap::<AllocationId, (&Buffer, Vec<(usize, usize, bool)>)>::new();
+/// The distinct view identities every recorded pass touches, in identity order.
+///
+/// A render pass contributes its attachment view exactly like a compute pass
+/// contributes its bindings, so the serial-resource budget covers both rails
+/// from one walk instead of growing a render-only counter.
+fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
+    let mut ids = BTreeSet::new();
     for pass in passes {
-        let metadata = pass.pipeline.metadata();
-        for (binding, view) in &pass.buffers {
-            let write = metadata
-                .contract
-                .buffer_bindings
-                .iter()
-                .find(|value| value.metal_binding == *binding)
-                .is_none_or(|value| value.access != BufferAccess::Read);
-            buffers
-                .entry(view.allocation_id())
-                .or_insert_with(|| (&view.buffer, Vec::new()))
-                .1
-                .push((view.offset, view.offset + view.length, write));
+        match pass {
+            RecordedPass::Compute { buffers, .. } => {
+                ids.extend(buffers.values().map(|view| view.view_id));
+            }
+            RecordedPass::Render { target, .. } => {
+                ids.insert(target.view.view_id);
+            }
         }
     }
-    buffers
+    ids
+}
+
+fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
+    let mut by_allocation =
+        BTreeMap::<AllocationId, (&Buffer, BTreeMap<(usize, usize), bool>)>::new();
+    for pass in passes {
+        match pass {
+            RecordedPass::Compute {
+                pipeline, buffers, ..
+            } => {
+                let metadata = pipeline.metadata();
+                for (binding, view) in buffers {
+                    let write = metadata
+                        .contract
+                        .buffer_bindings
+                        .iter()
+                        .find(|value| value.metal_binding == *binding)
+                        .is_none_or(|value| value.access != BufferAccess::Read);
+                    by_allocation
+                        .entry(view.allocation_id())
+                        .or_insert_with(|| (&view.buffer, BTreeMap::new()))
+                        .1
+                        .entry((view.offset, view.offset + view.length))
+                        .and_modify(|existing| *existing |= write)
+                        .or_insert(write);
+                }
+            }
+            RecordedPass::Render { target, .. } => {
+                let view = &target.view;
+                by_allocation
+                    .entry(view.allocation_id())
+                    .or_insert_with(|| (&view.buffer, BTreeMap::new()))
+                    .1
+                    .entry((view.offset, view.offset + view.length))
+                    .and_modify(|write| *write = true)
+                    .or_insert(true);
+            }
+        }
+    }
+    by_allocation
         .into_values()
-        .map(|(buffer, ranges)| buffer.reserve_ranges(&ranges))
+        .map(|(buffer, ranges)| {
+            let ranges = ranges
+                .into_iter()
+                .map(|((start, end), write)| (start, end, write))
+                .collect::<Vec<_>>();
+            buffer.reserve_ranges(&ranges)
+        })
         .collect()
 }
 
@@ -634,11 +817,17 @@ impl CommandQueue {
 }
 
 #[derive(Clone)]
-struct RecordedPass {
-    pipeline: Pipeline,
-    buffers: BTreeMap<u32, BufferView>,
-    textures: BTreeMap<u32, Texture>,
-    dispatch: Dispatch,
+enum RecordedPass {
+    Compute {
+        pipeline: Pipeline,
+        buffers: BTreeMap<u32, BufferView>,
+        textures: BTreeMap<u32, Texture>,
+        dispatch: Dispatch,
+    },
+    Render {
+        pipeline: RenderPipeline,
+        target: RenderTarget,
+    },
 }
 struct CommandInner {
     passes: Vec<RecordedPass>,
@@ -711,6 +900,31 @@ impl CommandBuffer {
             buffers: BTreeMap::new(),
             textures: BTreeMap::new(),
             dispatch_count: 0,
+            ended: false,
+        })
+    }
+
+    /// Open a render encoder on this command buffer.
+    ///
+    /// The encoder records the first increment's single render shape: one
+    /// colour attachment, a covering viewport, the three-vertex full-screen
+    /// triangle and, optionally, one present tail action. It shares the command
+    /// buffer's single open-encoder slot with the compute encoder, so a render
+    /// pass can follow the declaring compute passes that reserved its
+    /// attachment buffer.
+    pub fn render_command_encoder(&self) -> Result<RenderCommandEncoder, Error> {
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        if inner.status != CommandBufferStatus::Recording {
+            return Err(ApiError::CommandBufferAlreadyCommitted.into());
+        }
+        if inner.encoder_open {
+            return Err(ApiError::EncoderAlreadyOpen.into());
+        }
+        inner.encoder_open = true;
+        Ok(RenderCommandEncoder {
+            shared: Arc::clone(&self.shared),
+            pipeline: None,
+            draw_count: 0,
             ended: false,
         })
     }
@@ -870,44 +1084,65 @@ impl CommandBuffer {
         let mut pipelines = BTreeMap::<PipelineId, CompiledComputePipeline>::new();
         let mut trace_passes = Vec::with_capacity(passes.len());
         for pass in passes {
-            let metadata = pass.pipeline.metadata();
-            if let Some(previous) = pipelines.insert(metadata.pipeline_id, metadata.clone()) {
-                if previous != *metadata {
-                    return Err(Error::InvalidPipelineMetadata);
+            match pass {
+                RecordedPass::Compute {
+                    pipeline,
+                    buffers,
+                    textures,
+                    dispatch,
+                } => {
+                    let metadata = pipeline.metadata();
+                    if let Some(previous) = pipelines.insert(metadata.pipeline_id, metadata.clone())
+                    {
+                        if previous != *metadata {
+                            return Err(Error::InvalidPipelineMetadata);
+                        }
+                    }
+                    let mut views = Vec::with_capacity(buffers.len());
+                    for (binding, view) in buffers {
+                        let reflected = metadata
+                            .contract
+                            .buffer_bindings
+                            .iter()
+                            .find(|value| value.metal_binding == *binding)
+                            .ok_or(ContractError::UnknownBinding(*binding))?;
+                        let bytes = &guards[positions[&view.allocation_id()]];
+                        views.push(contract::BufferView {
+                            view_id: view.view_id,
+                            metal_binding: *binding,
+                            allocation_id: view.allocation_id(),
+                            offset: view.offset as u64,
+                            length: view.length as u64,
+                            access: reflected.access,
+                            attribute_stride: None,
+                            source: BufferSource::OwnedBytes(
+                                bytes[view.offset..view.offset + view.length].to_vec(),
+                            ),
+                        });
+                    }
+                    trace_passes.push(contract::TracePass::Compute(contract::ComputePass {
+                        pipeline: metadata.pipeline_id,
+                        buffers: views,
+                        dispatch: *dispatch,
+                        textures: textures
+                            .iter()
+                            .map(|(binding, texture)| texture.view(*binding))
+                            .collect(),
+                    }));
+                }
+                RecordedPass::Render { pipeline, target } => {
+                    let metadata = pipeline.metadata();
+                    if let Some(previous) = pipelines.insert(metadata.pipeline_id, metadata.clone())
+                    {
+                        if previous != *metadata {
+                            return Err(Error::InvalidPipelineMetadata);
+                        }
+                    }
+                    trace_passes.push(contract::TracePass::Render(
+                        target.descriptor(metadata.pipeline_id)?,
+                    ));
                 }
             }
-            let mut views = Vec::with_capacity(pass.buffers.len());
-            for (binding, view) in &pass.buffers {
-                let reflected = metadata
-                    .contract
-                    .buffer_bindings
-                    .iter()
-                    .find(|value| value.metal_binding == *binding)
-                    .ok_or(ContractError::UnknownBinding(*binding))?;
-                let bytes = &guards[positions[&view.allocation_id()]];
-                views.push(contract::BufferView {
-                    view_id: view.view_id,
-                    metal_binding: *binding,
-                    allocation_id: view.allocation_id(),
-                    offset: view.offset as u64,
-                    length: view.length as u64,
-                    access: reflected.access,
-                    attribute_stride: None,
-                    source: BufferSource::OwnedBytes(
-                        bytes[view.offset..view.offset + view.length].to_vec(),
-                    ),
-                });
-            }
-            trace_passes.push(contract::ComputePass {
-                pipeline: metadata.pipeline_id,
-                buffers: views,
-                dispatch: pass.dispatch,
-                textures: pass
-                    .textures
-                    .iter()
-                    .map(|(binding, texture)| texture.view(*binding))
-                    .collect(),
-            });
         }
         // Snapshot complete: no later step of this command reads the host bytes.
         drop(guards);
@@ -917,10 +1152,7 @@ impl CommandBuffer {
             operation_id: OperationId::new(next_id()?),
             pipelines: pipelines.into_values().collect(),
             encoder_dispatch_type: DispatchType::Serial,
-            passes: trace_passes
-                .into_iter()
-                .map(contract::TracePass::Compute)
-                .collect(),
+            passes: trace_passes,
             completion_policy: CompletionPolicy::HostReadback,
         };
         let admitted = owner
@@ -1147,13 +1379,8 @@ impl ComputeCommandEncoder {
                 maximum,
             });
         }
-        let unique = inner
-            .passes
-            .iter()
-            .flat_map(|pass| pass.buffers.values())
-            .chain(self.buffers.values())
-            .map(|view| view.view_id)
-            .collect::<BTreeSet<_>>();
+        let mut unique = recorded_view_ids(&inner.passes);
+        unique.extend(self.buffers.values().map(|view| view.view_id));
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
                 requested: unique.len(),
@@ -1161,7 +1388,7 @@ impl ComputeCommandEncoder {
             }
             .into());
         }
-        inner.passes.push(RecordedPass {
+        inner.passes.push(RecordedPass::Compute {
             pipeline: pipeline.clone(),
             buffers: self.buffers.clone(),
             textures: self.textures.clone(),
@@ -1200,6 +1427,143 @@ impl ComputeCommandEncoder {
     }
 }
 impl Drop for ComputeCommandEncoder {
+    fn drop(&mut self) {
+        if !self.ended {
+            if let Ok(mut inner) = self.shared.inner.lock() {
+                inner.encoder_open = false;
+                inner.recording_error = Some(ApiError::EncoderNotEnded.into());
+            }
+        }
+    }
+}
+
+/// Records the first increment's render shape on one command buffer.
+///
+/// [`RenderCommandEncoder`] is the render sibling of [`ComputeCommandEncoder`]:
+/// it persists a pipeline selection across draws, refuses foreign objects, and
+/// hands the recorded pass to the command buffer's commit-time reservation and
+/// submission exactly as the compute encoder does. One call to
+/// [`RenderCommandEncoder::draw_render_pass`] records one colour-attachment
+/// render pass with the covering viewport, the three-vertex full-screen
+/// triangle and an optional present tail.
+pub struct RenderCommandEncoder {
+    shared: Arc<CommandShared>,
+    pipeline: Option<RenderPipeline>,
+    draw_count: usize,
+    ended: bool,
+}
+impl RenderCommandEncoder {
+    pub fn set_render_pipeline_state(&mut self, pipeline: &RenderPipeline) -> Result<(), Error> {
+        self.ensure_open()?;
+        if !Arc::ptr_eq(&self.shared.owner, &pipeline.inner.owner) {
+            return Err(ApiError::ForeignPipeline.into());
+        }
+        self.pipeline = Some(pipeline.clone());
+        Ok(())
+    }
+
+    /// Record the milestone's single render pass.
+    ///
+    /// `attachment` names the buffer view the attachment lands in (its
+    /// allocation/view identity and byte range); `format`, `width`, `height`
+    /// and `clear` restate the attachment shape the render contract fixes, and
+    /// `present` selects the optional present tail action on that same
+    /// attachment. Every other shape is refused here with a typed error rather
+    /// than deferred to provider admission.
+    pub fn draw_render_pass(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        clear: [u8; 4],
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
+        if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        let expected_bytes = width
+            .checked_mul(height)
+            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
+        if u64::try_from(attachment.length).unwrap_or(u64::MAX) != expected_bytes {
+            return Err(ContractError::AttachmentExtentMismatch {
+                pass_index: 0,
+                view: attachment.view_id,
+                expected: expected_bytes,
+                declared: u64::try_from(attachment.length).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        let target = RenderTarget {
+            view: attachment.clone(),
+            format,
+            width,
+            height,
+            clear,
+            present,
+        };
+        let pipeline_id = pipeline.metadata().pipeline_id;
+        // Validate the descriptor the pass will become, so a wrong viewport,
+        // vertex count, attachment shape or present shape is refused before any
+        // resource is reserved.
+        target.descriptor(pipeline_id)?;
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
+            .unwrap_or(usize::MAX)
+            .min(8);
+        if inner.passes.len() >= maximum {
+            return Err(Error::PassLimit {
+                requested: inner.passes.len() + 1,
+                maximum,
+            });
+        }
+        let mut unique = recorded_view_ids(&inner.passes);
+        unique.insert(attachment.view_id);
+        if unique.len() > MAX_SERIAL_RESOURCES {
+            return Err(ContractError::SerialResourceLimit {
+                requested: unique.len(),
+                maximum: MAX_SERIAL_RESOURCES,
+            }
+            .into());
+        }
+        inner.passes.push(RecordedPass::Render {
+            pipeline: pipeline.clone(),
+            target,
+        });
+        self.draw_count += 1;
+        Ok(())
+    }
+
+    pub fn end_encoding(mut self) -> Result<(), Error> {
+        self.ensure_open()?;
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        let result = if self.draw_count == 0 {
+            Err(Error::Api(ApiError::MissingDispatch))
+        } else {
+            Ok(())
+        };
+        inner.encoder_open = false;
+        if let Err(error) = &result {
+            inner.recording_error = Some(error.clone());
+        }
+        self.ended = true;
+        result
+    }
+
+    fn ensure_open(&self) -> Result<(), Error> {
+        if self.ended {
+            return Err(ApiError::EncoderAlreadyEnded.into());
+        }
+        if lock(&self.shared.inner, "provider command")?.status != CommandBufferStatus::Recording {
+            return Err(ApiError::CommandBufferAlreadyCommitted.into());
+        }
+        Ok(())
+    }
+}
+impl Drop for RenderCommandEncoder {
     fn drop(&mut self) {
         if !self.ended {
             if let Ok(mut inner) = self.shared.inner.lock() {

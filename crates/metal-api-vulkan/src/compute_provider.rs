@@ -80,6 +80,11 @@ struct CompletionSlot {
     record: Arc<CompletionRecord>,
     pending: Option<PendingExecution>,
     pool: Vec<BufferView>,
+    /// Render writebacks produced synchronously during an async submission.
+    /// The render rail completes inside `submit` even when the compute half is
+    /// deferred, so its bytes ride alongside the deferred pool readback and are
+    /// merged into the completion record once the compute fence retires.
+    render_writebacks: Vec<BufferWriteback>,
     deadline: ObservationDeadline,
 }
 
@@ -485,17 +490,6 @@ impl VulkanComputeProvider {
         if !trace.has_render_passes() {
             return Ok(Vec::new());
         }
-        if self.async_execution {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Capability,
-                "render_async_unsupported",
-            )
-            .with_detail(
-                "the render rail completes inside submit; the deferred submission path \
-                 executes no graphics work in this increment",
-            ));
-        }
         refuse_reordered_render_reads(trace)?;
         let registrations = self
             .render_pipelines
@@ -716,22 +710,35 @@ impl VulkanComputeProvider {
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.validate_token(token)?;
-        let (record, pending, pool, deadline) = {
+        let (record, pending, pool, render_writebacks, deadline) = {
             let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
             let slot = completions
                 .get_mut(&token.submission_id)
                 .ok_or_else(|| unknown_completion(token))?;
             if !slot.record.is_running() {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
+                (
+                    Arc::clone(&slot.record),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    slot.deadline,
+                )
             } else if let Some(pending) = slot.pending.take() {
                 (
                     Arc::clone(&slot.record),
                     Some(pending),
                     slot.pool.clone(),
+                    slot.render_writebacks.clone(),
                     slot.deadline,
                 )
             } else {
-                (Arc::clone(&slot.record), None, Vec::new(), slot.deadline)
+                (
+                    Arc::clone(&slot.record),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    slot.deadline,
+                )
             }
         };
         let Some(mut pending) = pending else {
@@ -748,7 +755,11 @@ impl VulkanComputeProvider {
             {
                 Ok(writebacks) => {
                     drop(pending);
-                    record.complete(writebacks);
+                    let mut merged = BTreeMap::new();
+                    for writeback in writebacks.into_iter().chain(render_writebacks) {
+                        merged.insert((writeback.allocation_id, writeback.view_id), writeback);
+                    }
+                    record.complete(merged.into_values().collect());
                     Ok(CompletionDisposition::CompletedVisible { token })
                 }
                 Err(error) => {
@@ -1239,17 +1250,61 @@ impl ComputeProvider for VulkanComputeProvider {
             .with_detail(error.to_string())
         })?;
         if self.async_execution {
-            let result = self.submit_async(
-                pool,
-                textures,
-                artifacts,
-                buffers,
-                dispatches,
-                token,
-                &mut retains,
-            );
+            let queue_index = self.executor.context.pick_queue();
+            let pending = {
+                let _execution = self
+                    .executor
+                    .context
+                    .lock_queue(queue_index)
+                    .map_err(|_| registry_poisoned())?;
+                ensure_executor_usable(&self.executor)?;
+                PendingExecution::submit(
+                    &self.executor.context,
+                    queue_index,
+                    &artifacts,
+                    &buffers,
+                    &dispatches,
+                    retains.take(),
+                    &textures,
+                )?
+            };
+            // The render rail completes inside `submit` even in deferred mode,
+            // after the compute submission is on the same queue, so a later
+            // render pass observes the compute order the trace declares. Its
+            // bytes are merged with the deferred pool readback at `wait`.
+            let render_writebacks = match self.execute_render_passes(trace, &pool, &render_plan) {
+                Ok(writebacks) => writebacks,
+                Err(error) => {
+                    self.retire(pending);
+                    self.sync_completion_health();
+                    return Err(attach_token(error, token));
+                }
+            };
+            let record = match &self.completion_outbox {
+                Some(outbox) => {
+                    let _ = outbox.submitted(token);
+                    CompletionRecord::running_with_observer(token, outbox.observer())
+                }
+                None => CompletionRecord::running(),
+            };
+            self.completions
+                .lock()
+                .map_err(|_| registry_poisoned())?
+                .insert(
+                    token.submission_id,
+                    CompletionSlot {
+                        record,
+                        pending: Some(pending),
+                        pool,
+                        render_writebacks,
+                        deadline: ObservationDeadline::new(self.observation_deadline),
+                    },
+                );
             self.sync_completion_health();
-            return result;
+            return Ok(ProviderSubmission {
+                completion: CompletionDisposition::Submitted { token },
+                writebacks: Vec::new(),
+            });
         }
         let result = execute_on_context(
             &self.executor,
@@ -1300,6 +1355,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         record: observation,
                         pending: None,
                         pool: Vec::new(),
+                        render_writebacks: Vec::new(),
                         deadline: ObservationDeadline::new(self.observation_deadline),
                     },
                 );
@@ -1334,62 +1390,6 @@ impl ComputeProvider for VulkanComputeProvider {
             Arc::clone(&slot.record)
         };
         record.readback(token)
-    }
-}
-
-impl VulkanComputeProvider {
-    #[allow(clippy::too_many_arguments)]
-    fn submit_async(
-        &self,
-        pool: Vec<BufferView>,
-        textures: Vec<metal_api_core::provider::TextureView>,
-        artifacts: Vec<Arc<VulkanPipelineArtifact>>,
-        buffers: Vec<PoolBinding>,
-        dispatches: Vec<BoundDispatch>,
-        token: CompletionToken,
-        retains: &mut BorrowedRetains,
-    ) -> Result<ProviderSubmission, ProviderError> {
-        let queue_index = self.executor.context.pick_queue();
-        let pending = {
-            let _execution = self
-                .executor
-                .context
-                .lock_queue(queue_index)
-                .map_err(|_| registry_poisoned())?;
-            ensure_executor_usable(&self.executor)?;
-            PendingExecution::submit(
-                &self.executor.context,
-                queue_index,
-                &artifacts,
-                &buffers,
-                &dispatches,
-                retains.take(),
-                &textures,
-            )?
-        };
-        let record = match &self.completion_outbox {
-            Some(outbox) => {
-                let _ = outbox.submitted(token);
-                CompletionRecord::running_with_observer(token, outbox.observer())
-            }
-            None => CompletionRecord::running(),
-        };
-        self.completions
-            .lock()
-            .map_err(|_| registry_poisoned())?
-            .insert(
-                token.submission_id,
-                CompletionSlot {
-                    record,
-                    pending: Some(pending),
-                    pool,
-                    deadline: ObservationDeadline::new(self.observation_deadline),
-                },
-            );
-        Ok(ProviderSubmission {
-            completion: CompletionDisposition::Submitted { token },
-            writebacks: Vec::new(),
-        })
     }
 }
 

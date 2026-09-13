@@ -1,9 +1,10 @@
 use super::*;
 use crate::provider::{
-    allocate_device_epoch, AliasMode, BufferAccess, BufferBindingContract, BufferWriteback,
-    CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof, FunctionIdentity,
-    PipelineContract, ProviderErrorClass, ProviderHealth, ProviderPhase, Retryability,
-    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
+    allocate_device_epoch, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
+    BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof,
+    FunctionIdentity, FunctionSource, PipelineContract, PipelineId, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability, SemanticDigest,
+    ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace, VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -1274,4 +1275,107 @@ fn overlapping_views_of_one_allocation_stay_refused_under_distinct_views() {
         Err(Error::Provider(error)) if error.slug == "buffer_alias_unsupported"
     ));
     assert!(provider.traces.lock().unwrap().is_empty());
+}
+
+fn render_metadata(provider: &FakeProvider) -> CompiledComputePipeline {
+    CompiledComputePipeline {
+        device_epoch: provider.device_epoch(),
+        pipeline_id: PipelineId::new(9001),
+        function: FunctionIdentity {
+            entry_name: "vertex_main".into(),
+            logical_digest: SemanticDigest::new("fixture", vec![2]).unwrap(),
+            source: FunctionSource::Metallib,
+        },
+        contract: PipelineContract {
+            dispatch_kind: DispatchKind::ThreadsExact,
+            required_local_size: None,
+            fixed_grid: None,
+            push_constant_offset: 0,
+            push_constant_bytes: 0,
+            buffer_bindings: Vec::new(),
+            shader_capabilities: Vec::new(),
+            translator_revision: None,
+        },
+        render: Some(RenderPipelineContract {
+            vertex_entry: "vertex_main".into(),
+            fragment_entry: "fragment_main".into(),
+            color_format: AttachmentFormat::Rgba8Unorm,
+            vertex_layout: VertexLayout::None,
+        }),
+    }
+}
+
+#[test]
+fn render_pipeline_wraps_render_metadata_and_refuses_compute_only() {
+    let (provider, device) = setup();
+    assert!(device.render_pipeline(&render_metadata(&provider)).is_ok());
+    let mut compute_only = render_metadata(&provider);
+    compute_only.render = None;
+    assert!(matches!(
+        device.render_pipeline(&compute_only),
+        Err(Error::InvalidPipelineMetadata)
+    ));
+}
+
+#[test]
+fn render_encoder_refuses_a_foreign_pipeline() {
+    let (_provider, device) = setup();
+    let (other_provider, other_device) = setup();
+    let foreign = other_device
+        .render_pipeline(&render_metadata(&other_provider))
+        .unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    assert!(matches!(
+        encoder.set_render_pipeline_state(&foreign),
+        Err(Error::Api(ApiError::ForeignPipeline))
+    ));
+}
+
+#[test]
+fn render_encoder_refuses_attachment_extent_mismatch_and_missing_pipeline() {
+    let (provider, device) = setup();
+    let render_pipeline = device.render_pipeline(&render_metadata(&provider)).unwrap();
+    let buffer = device.new_buffer_with_bytes(vec![0; 4]).unwrap();
+    let view = buffer.view(0, 4).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    assert!(matches!(
+        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        Err(Error::Api(ApiError::MissingPipeline))
+    ));
+    encoder.set_render_pipeline_state(&render_pipeline).unwrap();
+    assert!(matches!(
+        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        Err(Error::Contract(
+            ContractError::AttachmentExtentMismatch { .. }
+        ))
+    ));
+}
+
+#[test]
+fn render_encoder_refuses_a_foreign_buffer() {
+    let (provider, device) = setup();
+    let (_other_provider, other_device) = setup();
+    let render_pipeline = device.render_pipeline(&render_metadata(&provider)).unwrap();
+    let foreign = other_device.new_buffer_with_bytes(vec![0; 16]).unwrap();
+    let view = foreign.view(0, 16).unwrap();
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render_pipeline).unwrap();
+    assert!(matches!(
+        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        Err(Error::ForeignBuffer)
+    ));
+}
+
+#[test]
+fn render_encoder_end_encoding_requires_a_draw() {
+    let (_provider, device) = setup();
+    let command = device.new_command_queue().command_buffer();
+    let encoder = command.render_command_encoder().unwrap();
+    assert!(matches!(
+        encoder.end_encoding(),
+        Err(Error::Api(ApiError::MissingDispatch))
+    ));
 }
