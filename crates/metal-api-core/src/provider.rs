@@ -1537,6 +1537,404 @@ impl RenderPipelineContract {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Presentation contract, Step 1: value types and validation only.
+//
+// This block is `research/docs/24-presentation与swapchain设计.md` §3.5, Step 1.
+// It adds `PresentMode`, `AcquirePolicy`, `InitialState` and `PresentTarget`
+// with their structural validation and nothing else: no line-format field, no
+// capability bit, no execution, no provider call site and no `ComputeTrace`
+// wiring. Step 2 owns the wire shape (`docs/24` §4.1, §6 Step 2) and Step 3
+// owns the Vulkan "readable swapchain equivalent" (`docs/24` §3.6).
+//
+// The first increment admits exactly one present target, one image and `Fifo`
+// (`docs/24` §3.1). Every widening is expressed as "the field exists but the
+// value is refused" rather than as a missing field, so a trace cannot imply
+// state the execution step does not set — the rule `docs/23` §3.2 fixed for the
+// render contract, applied to the present action.
+// ---------------------------------------------------------------------------
+
+/// How a finished present target is handed on (`research/docs/24` §3.1).
+///
+/// The variants are the four `VkPresentModeKHR` modes and carry their Vulkan
+/// codes, because the first target is the Vulkan rail (`docs/24` §5.2) and
+/// `docs/24` §7.1 records all four as available on this machine. Only
+/// [`PresentMode::Fifo`] is admitted by the first increment: it is the one mode
+/// Vulkan requires every implementation to support, so it needs no
+/// driver-specific preference to be honest about, while picking another mode
+/// would first need cross-driver parity evidence (`docs/24` §3.4) and, on the
+/// Apple side, a different vocabulary entirely (`docs/24` §7.5).
+///
+/// The three non-FIFO variants sit beside `AttachmentFormat::R32Uint` and
+/// `LoadOp::DontCare` as "expressible on the wire, refused by this increment":
+/// they pin the code values Step 2 encodes while keeping the refusal a
+/// deliberate, typed decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentMode {
+    /// `VK_PRESENT_MODE_IMMEDIATE_KHR`. Expressible, refused by the first
+    /// increment.
+    Immediate,
+    /// `VK_PRESENT_MODE_MAILBOX_KHR`. Expressible, refused by the first
+    /// increment.
+    Mailbox,
+    /// `VK_PRESENT_MODE_FIFO_KHR`. The only admitted mode.
+    Fifo,
+    /// `VK_PRESENT_MODE_FIFO_RELAXED_KHR`. Expressible, refused by the first
+    /// increment.
+    FifoRelaxed,
+}
+
+impl PresentMode {
+    /// Modes the first increment admits. One, so the trace cannot select a mode
+    /// whose parity has not been argued for.
+    pub const ADMITTED: [Self; 1] = [Self::Fifo];
+
+    /// Stable wire code, identical to the `VkPresentModeKHR` values so Step 2
+    /// reuses that mapping instead of maintaining a second one.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Immediate => 0,
+            Self::Mailbox => 1,
+            Self::Fifo => 2,
+            Self::FifoRelaxed => 3,
+        }
+    }
+
+    /// Inverse of [`PresentMode::code`]. An unknown code is a decoder error,
+    /// not a silent default.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Immediate),
+            1 => Some(Self::Mailbox),
+            2 => Some(Self::Fifo),
+            3 => Some(Self::FifoRelaxed),
+            _ => None,
+        }
+    }
+
+    /// Whether the first increment admits this mode. See
+    /// [`PresentMode::Fifo`] for the one admission.
+    pub const fn is_admitted_for_present(self) -> bool {
+        matches!(self, Self::Fifo)
+    }
+}
+
+/// How a present target's ownership is acquired before a pass writes it
+/// (`research/docs/24` §3.1).
+///
+/// The first increment admits only [`AcquirePolicy::Blocking`]. A bounded wait
+/// is a deadline object, and `docs/13`'s deadline semantics have nothing to
+/// hang on here, so `docs/24` §3.1 records the first increment as
+/// "blocking only" and §3.4 defers acquire timeouts together with frame drops
+/// and suboptimal rebuilds.
+///
+/// [`AcquirePolicy::Timeout`] carries the nanosecond budget such a deadline
+/// would need. Keeping the value expressible is what lets the refusal name the
+/// budget that has to wait, instead of the field being absent and the trace
+/// silently losing its request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcquirePolicy {
+    /// Wait for the target without a deadline.
+    Blocking,
+    /// Wait at most this many nanoseconds. Expressible, refused by the first
+    /// increment.
+    Timeout(u64),
+}
+
+impl AcquirePolicy {
+    /// Stable wire code for Step 2. `Blocking` stays `0` so a future decoder
+    /// reads the first increment's only admitted value as the default.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Blocking => 0,
+            Self::Timeout(_) => 1,
+        }
+    }
+
+    /// The nanosecond budget, or `None` for an unbounded wait.
+    pub const fn timeout_nanos(self) -> Option<u64> {
+        match self {
+            Self::Blocking => None,
+            Self::Timeout(nanos) => Some(nanos),
+        }
+    }
+
+    /// Whether the first increment admits this policy. See
+    /// [`AcquirePolicy::Blocking`] for the one admission.
+    pub const fn is_admitted_for_present(self) -> bool {
+        matches!(self, Self::Blocking)
+    }
+}
+
+/// What a present target holds before the pass that fills it runs
+/// (`research/docs/24` §3.1).
+///
+/// The sentinel is what makes "the present never happened" falsifiable, exactly
+/// as [`LoadOp::Clear`] does for the render track (`docs/23` §1.3): the bytes
+/// are compared after `wait`, so a target still holding its sentinel cannot pass
+/// as a present.
+///
+/// The sentinel carries its bytes as a `Vec<u8>` where the §3.5 sketch writes
+/// `[u8; 4]`. The invariant the contract actually needs is "one tightly packed
+/// texel", i.e. exactly `format.bytes_per_texel()` bytes; a length fixed at four
+/// would make that agreement unreachable and therefore unverified, and the
+/// sketch is explicitly field-level rather than compilable (`docs/24` §3.5).
+/// The length rule is enforced by [`PresentTarget::validate_shape`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitialState {
+    /// Pre-fill the target with these bytes before the pass runs. `docs/24`
+    /// §5.3 counts one `copy_in` for this state.
+    Sentinel(Vec<u8>),
+    /// Leave the target's previous contents undefined. `docs/24` §5.3 counts no
+    /// `copy_in` for this state, because nothing has to be written before the
+    /// pass.
+    Undefined,
+}
+
+impl InitialState {
+    /// The preset bytes, or `None` when the target declares no initial state.
+    pub fn sentinel(&self) -> Option<&[u8]> {
+        match self {
+            Self::Sentinel(bytes) => Some(bytes),
+            Self::Undefined => None,
+        }
+    }
+}
+
+/// Present targets the first increment admits in one pass: one.
+///
+/// `docs/24` §3.1 fixes "one target, one present, single buffering". The cap
+/// also stops a trace from smuggling a longer target list past the wire format
+/// before that mapping exists. Step 2 grows the matching
+/// `ProviderCapabilities::max_present_targets` field with this value
+/// (`docs/24` §4.2).
+pub const MAX_PRESENT_TARGETS: usize = 1;
+
+/// Images the first increment admits behind one present target: one.
+///
+/// `docs/24` §3.4 defers multi-buffering, because a rotating image needs a
+/// state machine for "which image is in flight" that `docs/13`'s in-flight
+/// reclamation has not settled yet. The field exists on
+/// [`PresentTarget::image_count`] but only accepts this value, so a caller
+/// asking for more is refused instead of silently getting single buffering
+/// (`docs/24` §3.1).
+pub const MAX_PRESENT_IMAGE_COUNT: u32 = 1;
+
+/// One presentable target: the resource whose contents the present hands on
+/// (`research/docs/24` §3.1, §3.5).
+///
+/// Like [`RenderAttachment`], it references an existing resource by identity and
+/// restates the shape fields the increment needs; it does not embed a
+/// [`TextureView`] (whose [`TextureAccess`] codes the `MCC1` codec has already
+/// pinned) and it allocates nothing. `docs/24` §3.2 makes the caller reserve the
+/// allocation under the existing lease semantics, so hazard tracking and
+/// write-back merging need no new mechanism (`docs/14`).
+///
+/// Deliberately absent fields, i.e. the features `docs/24` §3.4 schedules
+/// later: a surface handle, a resize/out-of-date path, a colour-space or sRGB
+/// variant, and any per-image in-flight state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentTarget {
+    /// Allocation the target's bytes live in, in the same namespace as
+    /// buffers, textures and render attachments.
+    pub allocation_id: AllocationId,
+    /// The view of that allocation the present hands on. It must be the view
+    /// the pass renders into, which is what [`PresentDescriptor::source`]
+    /// restates.
+    pub view_id: ViewId,
+    /// Format of the target. `docs/24` §3.2 inherits it from the source
+    /// attachment rather than letting a target choose its own, because byte
+    /// parity over two different formats would compare channel order and
+    /// encoding rather than the pass's output.
+    pub format: AttachmentFormat,
+    /// Tightly packed texel width, in the same unit as
+    /// [`RenderAttachment::width`].
+    pub width: u64,
+    /// Tightly packed texel height, in the same unit as
+    /// [`RenderAttachment::height`].
+    pub height: u64,
+    /// Images behind this target. The first increment admits
+    /// [`MAX_PRESENT_IMAGE_COUNT`].
+    pub image_count: u32,
+    /// What the target holds before the pass runs. See [`InitialState`].
+    pub initial: InitialState,
+}
+
+impl PresentTarget {
+    /// Tightly packed byte extent of the target, in the same texel-level unit
+    /// the byte parity compares (`docs/23` §3.5). Provider row pitches, image
+    /// layouts and allocation sizes are not part of the contract.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|texels| texels.checked_mul(self.format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("present target bytes"))
+    }
+
+    /// Structural validation only. Whether a device can present to this format
+    /// or extent at all, and whether the target can actually be acquired, are
+    /// admission's questions in Step 2 (`docs/24` §4.2).
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("present target view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity(
+                "present target allocation id",
+            ));
+        }
+        for (axis, dimension) in [self.width, self.height].into_iter().enumerate() {
+            if dimension == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "present target",
+                    axis,
+                });
+            }
+        }
+        self.expected_bytes()?;
+        if !self.format.is_admitted_for_color_attachment() {
+            // A present target reuses the render contract's admitted format set:
+            // the target's format is inherited from a colour attachment
+            // (`docs/24` §3.2), so the same capability narrowing and the same
+            // refusal slug stay correct for both halves of the pair.
+            return Err(ContractError::UnsupportedAttachmentFormat(self.format));
+        }
+        if self.image_count != MAX_PRESENT_IMAGE_COUNT {
+            return Err(ContractError::PresentImageCountUnsupported {
+                requested: self.image_count,
+                maximum: MAX_PRESENT_IMAGE_COUNT,
+            });
+        }
+        if let InitialState::Sentinel(bytes) = &self.initial {
+            let expected = self.format.bytes_per_texel();
+            let actual = bytes.len() as u64;
+            if actual != expected {
+                return Err(ContractError::PresentSentinelLengthMismatch {
+                    format: self.format,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The first increment's present action on one render pass
+/// (`research/docs/24` §3.5, shape one: `present` as the render pass's tail
+/// action).
+///
+/// Shape one is what makes `docs/24` §3.3's first ordering rule — the target's
+/// writer completes before the present — *structurally* unbreakable: the present
+/// descriptor hangs off the render pass, so a trace cannot present a target no
+/// pass rendered. `docs/24` §9 keeps that choice formally open until Step 2, so
+/// this type is written to fit either shape: it names the pass's source view
+/// explicitly instead of assuming its own position in a pass list, and
+/// [`PresentDescriptor::validate_against`] is a pure function of the pass it is
+/// asked about rather than a method on a pass that owns it.
+///
+/// This type is not referenced by [`ComputeTrace`] yet: Step 1 fixes the shape,
+/// Step 2 makes the pass carry it and extends the `MCC1` payload (`docs/24`
+/// §4.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentDescriptor {
+    /// The target the present hands on. See [`PresentTarget`].
+    pub target: PresentTarget,
+    /// View the pass renders into, which the target is handed on as. `docs/24`
+    /// §3.1 requires it to be the same view as the pass's colour attachment, so
+    /// the same lease and byte-range semantics carry over unchanged
+    /// (`docs/14`); the agreement is checked by
+    /// [`PresentDescriptor::validate_against`], which can only be asked once a
+    /// pass is in hand.
+    pub source: ViewId,
+    /// Present mode. The first increment admits [`PresentMode::Fifo`] only.
+    pub mode: PresentMode,
+    /// How the target's ownership is acquired. The first increment admits
+    /// [`AcquirePolicy::Blocking`] only.
+    pub acquire: AcquirePolicy,
+}
+
+impl PresentDescriptor {
+    /// Structural validation of the descriptor alone.
+    ///
+    /// The mode and the acquire policy are first-increment narrowings on a
+    /// well-formed request, so they are stated as refusals here rather than left
+    /// to each provider. The agreement with the pass the present hangs off is
+    /// [`PresentDescriptor::validate_against`]'s job, because it needs a pass.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.target.validate_shape()?;
+        if !self.mode.is_admitted_for_present() {
+            return Err(ContractError::PresentModeUnsupported(self.mode));
+        }
+        if !self.acquire.is_admitted_for_present() {
+            return Err(ContractError::PresentAcquirePolicyUnsupported(self.acquire));
+        }
+        Ok(())
+    }
+
+    /// Cross-check against the pass this present hands on.
+    ///
+    /// Four rules, all from `docs/24` §3.1/§3.2: the source must *be* one of the
+    /// pass's colour attachments, the target must restate that attachment's view
+    /// identity, the target's allocation must be that attachment's allocation
+    /// ("the same lease and byte-range semantics"), and the target's format and
+    /// extent are inherited from it rather than chosen. Those are the only rules
+    /// this adds; the pass's own shape rules stay
+    /// [`RenderPassDescriptor::validate`]'s job, and an empty attachment list is
+    /// reported as the pass's own [`ContractError::EmptyAttachmentList`] rather
+    /// than as a vacuous agreement about an attachment that is not there — the
+    /// same reporting [`RenderPipelineContract::validate_against`] chose.
+    ///
+    /// Deliberately **not** checked here: whether the target's [`InitialState`]
+    /// agrees with the source attachment's [`LoadOp`]. `docs/24` states the
+    /// format and extent inheritance (§3.2) but leaves the pre-pass contents to
+    /// the count 口径 Step 4 settles (§5.3, §6), so inventing a rule here would
+    /// bind the trace to a decision the design has not made.
+    pub fn validate_against(&self, pass: &RenderPassDescriptor) -> Result<(), ContractError> {
+        self.validate()?;
+        if pass.color_attachments.is_empty() {
+            return Err(ContractError::EmptyAttachmentList);
+        }
+        let Some(attachment) = pass
+            .color_attachments
+            .iter()
+            .find(|attachment| attachment.view_id == self.source)
+        else {
+            return Err(ContractError::PresentSourceUnknown {
+                source: self.source,
+            });
+        };
+        if self.target.view_id != self.source {
+            return Err(ContractError::PresentTargetViewMismatch {
+                source: self.source,
+                target: self.target.view_id,
+            });
+        }
+        if self.target.allocation_id != attachment.allocation_id {
+            return Err(ContractError::PresentTargetAllocationMismatch {
+                source: self.source,
+                target: self.target.allocation_id,
+                attachment: attachment.allocation_id,
+            });
+        }
+        if attachment.format != self.target.format {
+            return Err(ContractError::PresentFormatMismatch {
+                source: self.source,
+                target: self.target.format,
+                attachment: attachment.format,
+            });
+        }
+        if attachment.width != self.target.width || attachment.height != self.target.height {
+            return Err(ContractError::PresentExtentMismatch {
+                source: self.source,
+                target: [self.target.width, self.target.height],
+                attachment: [attachment.width, attachment.height],
+            });
+        }
+        Ok(())
+    }
+}
+
 /// v0 output policy. Guest-page landing is intentionally not a v0 value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionPolicy {
@@ -4247,6 +4645,38 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             (ProviderErrorClass::Capability, "draw_shape_unsupported")
         }
         E::ViewportExtentMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
+        // Presentation contract, Step 1. The three first-increment narrowings
+        // are capability refusals for the same reason the render track's are:
+        // the request is well formed and simply wider than this increment. The
+        // sentinel length and the two inheritance disagreements are caller-
+        // fixable trace shape instead, because they name two of the caller's own
+        // fields that disagree rather than a feature the device lacks.
+        E::PresentModeUnsupported(_) => {
+            (ProviderErrorClass::Capability, "present_mode_unsupported")
+        }
+        E::PresentAcquirePolicyUnsupported(_) => (
+            ProviderErrorClass::Capability,
+            "present_acquire_policy_unsupported",
+        ),
+        E::PresentImageCountUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "present_image_count_unsupported",
+        ),
+        E::PresentSentinelLengthMismatch { .. } => (
+            ProviderErrorClass::Args,
+            "present_sentinel_length_mismatch",
+        ),
+        E::PresentSourceUnknown { .. } => (ProviderErrorClass::Args, "present_source_unknown"),
+        E::PresentTargetViewMismatch { .. } => (
+            ProviderErrorClass::Args,
+            "present_target_view_mismatch",
+        ),
+        E::PresentTargetAllocationMismatch { .. } => (
+            ProviderErrorClass::Args,
+            "present_target_allocation_mismatch",
+        ),
+        E::PresentFormatMismatch { .. } => (ProviderErrorClass::Args, "present_format_mismatch"),
+        E::PresentExtentMismatch { .. } => (ProviderErrorClass::Args, "present_extent_mismatch"),
         // Render contract, Step 3c: an attachment that cannot be resolved in
         // the trace's own resource table names a resource the submission does
         // not have, which is the same class as an unknown allocation. A
@@ -5169,6 +5599,61 @@ pub enum ContractError {
         expected: u32,
         actual: u32,
     },
+    // Presentation contract, Step 1 (`research/docs/24` §3.1). The sentinel
+    // and source-shape refusals are caller-fixable structure; the three
+    // first-increment narrowings (image count, present mode, acquire policy) are
+    // capability refusals on a well-formed request, the way the render track
+    // already splits those two families.
+    PresentSentinelLengthMismatch {
+        format: AttachmentFormat,
+        expected: u64,
+        actual: u64,
+    },
+    /// The present names a view the pass it hangs off does not render into.
+    ///
+    /// Kept distinct from [`Self::AttachmentViewUnknown`]: that variant reports
+    /// an attachment the *trace's resource table* does not declare, while this
+    /// one reports a source the pass itself does not carry as an attachment.
+    PresentSourceUnknown {
+        source: ViewId,
+    },
+    /// The target names a view other than the source it presents.
+    ///
+    /// `docs/24` §3.1 requires `source` to be the same view as the pass's
+    /// colour attachment and §3.2 makes the target a restatement of that
+    /// resource's identity, so two different view identities in one present
+    /// describe two resources where the first increment has exactly one.
+    PresentTargetViewMismatch {
+        source: ViewId,
+        target: ViewId,
+    },
+    /// The target's allocation is not the source attachment's allocation.
+    ///
+    /// Same rule as [`Self::PresentTargetViewMismatch`], one level up: §3.1
+    /// keeps "the same lease and byte-range semantics" for the pair, so the
+    /// target cannot name a different allocation than the attachment it is
+    /// handed on from.
+    PresentTargetAllocationMismatch {
+        source: ViewId,
+        target: AllocationId,
+        attachment: AllocationId,
+    },
+    PresentFormatMismatch {
+        source: ViewId,
+        target: AttachmentFormat,
+        attachment: AttachmentFormat,
+    },
+    PresentExtentMismatch {
+        source: ViewId,
+        target: [u64; 2],
+        attachment: [u64; 2],
+    },
+    PresentImageCountUnsupported {
+        requested: u32,
+        maximum: u32,
+    },
+    PresentModeUnsupported(PresentMode),
+    PresentAcquirePolicyUnsupported(AcquirePolicy),
     // Render pipeline contract, Step 3a (`research/docs/23` §3.4). The entry
     // shape and the pipeline/attachment agreement are caller-fixable structure,
     // like the pass rules above; the colour format reuses
@@ -5483,6 +5968,58 @@ impl fmt::Display for ContractError {
             Self::DrawVertexCountMismatch { expected, actual } => write!(
                 formatter,
                 "draw vertex count mismatch: expected {expected}, received {actual}"
+            ),
+            Self::PresentSentinelLengthMismatch {
+                format,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "present sentinel is {actual} bytes, but format {format:?} has {expected}-byte texels"
+            ),
+            Self::PresentSourceUnknown { source } => write!(
+                formatter,
+                "present source view {source:?} is not a colour attachment of the pass it presents"
+            ),
+            Self::PresentTargetViewMismatch { source, target } => write!(
+                formatter,
+                "present target view {target:?} is not the source view {source:?} it presents"
+            ),
+            Self::PresentTargetAllocationMismatch {
+                source,
+                target,
+                attachment,
+            } => write!(
+                formatter,
+                "present target allocation {target:?} is not the allocation {attachment:?} of source view {source:?}"
+            ),
+            Self::PresentFormatMismatch {
+                source,
+                target,
+                attachment,
+            } => write!(
+                formatter,
+                "present target format {target:?} does not match source attachment {source:?} format {attachment:?}"
+            ),
+            Self::PresentExtentMismatch {
+                source,
+                target,
+                attachment,
+            } => write!(
+                formatter,
+                "present target extent {target:?} does not match source attachment {source:?} extent {attachment:?}"
+            ),
+            Self::PresentImageCountUnsupported { requested, maximum } => write!(
+                formatter,
+                "present target declares {requested} images, exceeding {maximum}"
+            ),
+            Self::PresentModeUnsupported(mode) => write!(
+                formatter,
+                "present mode {mode:?} is outside the first presentation increment"
+            ),
+            Self::PresentAcquirePolicyUnsupported(policy) => write!(
+                formatter,
+                "present acquire policy {policy:?} is outside the first presentation increment"
             ),
             Self::EmptyRenderPipelineEntry(stage) => write!(
                 formatter,
@@ -10791,5 +11328,422 @@ mod tests {
             read_only.serial_resources().unwrap()[0].access,
             BufferAccess::Read
         );
+    }
+
+    // Presentation contract, Step 1 (`research/docs/24` §3.1). These tests pin
+    // the value shape and the first-increment narrowings. Nothing encodes or
+    // executes a present action yet, so there is no execution to pin; the
+    // control cases exist to prove each refusal is the rule it claims to be and
+    // not a side effect of some other field.
+
+    fn present_target(format: AttachmentFormat) -> PresentTarget {
+        PresentTarget {
+            allocation_id: AllocationId::new(22),
+            view_id: ViewId::new(21),
+            format,
+            width: 2,
+            height: 2,
+            image_count: MAX_PRESENT_IMAGE_COUNT,
+            initial: InitialState::Sentinel(vec![0x40, 0x80, 0xc0, 0xff]),
+        }
+    }
+
+    fn present_descriptor() -> PresentDescriptor {
+        PresentDescriptor {
+            target: present_target(AttachmentFormat::Rgba8Unorm),
+            source: ViewId::new(21),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        }
+    }
+
+    #[test]
+    fn present_descriptor_accepts_the_first_increment_shape() {
+        let present = present_descriptor();
+        present
+            .validate_against(&render_pass())
+            .expect("the first-increment present is well formed");
+        assert_eq!(present.target.expected_bytes().expect("bounded extent"), 16);
+        assert_eq!(MAX_PRESENT_TARGETS, 1);
+        assert_eq!(MAX_PRESENT_IMAGE_COUNT, 1);
+        assert_eq!(PresentMode::ADMITTED, [PresentMode::Fifo]);
+        assert_eq!(AcquirePolicy::Blocking.timeout_nanos(), None);
+        assert_eq!(AcquirePolicy::Blocking.code(), 0);
+
+        // Every admitted format is presentable with a one-texel sentinel, which
+        // is what `docs/24` §3.2's "inherit the format" rule leaves as the only
+        // admitted target colour space.
+        for format in AttachmentFormat::ADMITTED {
+            let mut adopted = present.clone();
+            adopted.target.format = format;
+            let mut pass = render_pass();
+            pass.color_attachments[0].format = format;
+            adopted
+                .validate_against(&pass)
+                .expect("an admitted format presents");
+            assert_eq!(adopted.target.format.bytes_per_texel(), 4);
+        }
+
+        // A target that declares no pre-pass contents is expressible and
+        // admitted (`docs/24` §5.3 gives it a zero `copy_in` count); only the
+        // sentinel carries a length that has to agree with the format.
+        let mut undefined = present.clone();
+        undefined.target.initial = InitialState::Undefined;
+        undefined.target.validate_shape().unwrap();
+        assert_eq!(undefined.target.initial.sentinel(), None);
+
+        // Wire codes are pinned so Step 2 encodes the values this step tested.
+        for (mode, code) in [
+            (PresentMode::Immediate, 0),
+            (PresentMode::Mailbox, 1),
+            (PresentMode::Fifo, 2),
+            (PresentMode::FifoRelaxed, 3),
+        ] {
+            assert_eq!(mode.code(), code);
+            assert_eq!(PresentMode::from_code(code), Some(mode));
+        }
+        assert_eq!(PresentMode::from_code(4), None);
+    }
+
+    #[test]
+    fn present_refuses_a_mode_other_than_fifo() {
+        for mode in [
+            PresentMode::Immediate,
+            PresentMode::Mailbox,
+            PresentMode::FifoRelaxed,
+        ] {
+            assert!(!mode.is_admitted_for_present());
+            let mut present = present_descriptor();
+            present.mode = mode;
+            assert_eq!(
+                present.validate_against(&render_pass()),
+                Err(ContractError::PresentModeUnsupported(mode))
+            );
+        }
+        let refusal =
+            contract_error_refusal(ContractError::PresentModeUnsupported(PresentMode::Mailbox));
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.phase, ProviderPhase::Resolve);
+        assert_eq!(refusal.slug, "present_mode_unsupported");
+    }
+
+    #[test]
+    fn present_refuses_an_acquire_policy_with_a_deadline() {
+        let mut present = present_descriptor();
+        present.acquire = AcquirePolicy::Timeout(1_000_000);
+        assert!(!present.acquire.is_admitted_for_present());
+        assert_eq!(present.acquire.code(), 1);
+        assert_eq!(present.acquire.timeout_nanos(), Some(1_000_000));
+        let expected =
+            ContractError::PresentAcquirePolicyUnsupported(AcquirePolicy::Timeout(1_000_000));
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "present_acquire_policy_unsupported");
+    }
+
+    #[test]
+    fn present_refuses_a_target_that_is_not_single_buffered() {
+        for requested in [0, 2] {
+            let mut present = present_descriptor();
+            present.target.image_count = requested;
+            let expected = ContractError::PresentImageCountUnsupported {
+                requested,
+                maximum: MAX_PRESENT_IMAGE_COUNT,
+            };
+            assert_eq!(
+                present.validate_against(&render_pass()),
+                Err(expected.clone())
+            );
+            let refusal = contract_error_refusal(expected);
+            assert_eq!(refusal.class, ProviderErrorClass::Capability);
+            assert_eq!(refusal.slug, "present_image_count_unsupported");
+        }
+    }
+
+    #[test]
+    fn present_refuses_a_target_format_that_disagrees_with_its_source() {
+        let mut present = present_descriptor();
+        present.target.format = AttachmentFormat::Bgra8Unorm;
+        let expected = ContractError::PresentFormatMismatch {
+            source: ViewId::new(21),
+            target: AttachmentFormat::Bgra8Unorm,
+            attachment: AttachmentFormat::Rgba8Unorm,
+        };
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "present_format_mismatch");
+
+        // Control: the format is inherited, not fixed. A pass rendering into the
+        // target's own format is the shape that passes.
+        let mut pass = render_pass();
+        pass.color_attachments[0].format = AttachmentFormat::Bgra8Unorm;
+        present.validate_against(&pass).unwrap();
+    }
+
+    #[test]
+    fn present_refuses_a_target_extent_that_disagrees_with_its_source() {
+        let mut present = present_descriptor();
+        present.target.width = 4;
+        let expected = ContractError::PresentExtentMismatch {
+            source: ViewId::new(21),
+            target: [4, 2],
+            attachment: [2, 2],
+        };
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "present_extent_mismatch");
+
+        // Control: a target with no source to disagree with fails on the
+        // pass's own empty-attachment rule, not on a vacuous extent agreement.
+        let mut empty = render_pass();
+        empty.color_attachments.clear();
+        assert_eq!(
+            present_descriptor().validate_against(&empty),
+            Err(ContractError::EmptyAttachmentList)
+        );
+    }
+
+    #[test]
+    fn present_refuses_a_sentinel_whose_length_does_not_fit_the_format() {
+        for length in [0usize, 3, 5] {
+            let mut present = present_descriptor();
+            present.target.initial = InitialState::Sentinel(vec![0x11; length]);
+            let expected = ContractError::PresentSentinelLengthMismatch {
+                format: AttachmentFormat::Rgba8Unorm,
+                expected: 4,
+                actual: length as u64,
+            };
+            assert_eq!(
+                present.validate_against(&render_pass()),
+                Err(expected.clone())
+            );
+            let refusal = contract_error_refusal(expected);
+            assert_eq!(refusal.class, ProviderErrorClass::Args);
+            assert_eq!(refusal.slug, "present_sentinel_length_mismatch");
+        }
+
+        // Boundary: exactly one tightly packed texel is the admitted length, for
+        // every admitted format. The target's own format is what the sentinel is
+        // measured against, not the source's.
+        for format in AttachmentFormat::ADMITTED {
+            let mut present = present_descriptor();
+            present.target.format = format;
+            present.target.initial =
+                InitialState::Sentinel(vec![0x11; format.bytes_per_texel() as usize]);
+            assert_eq!(
+                present.target.initial.sentinel().map(|bytes| bytes.len()),
+                Some(4)
+            );
+            let mut pass = render_pass();
+            pass.color_attachments[0].format = format;
+            present.validate_against(&pass).unwrap();
+        }
+    }
+
+    #[test]
+    fn present_refuses_a_source_that_the_pass_does_not_render_into() {
+        let mut present = present_descriptor();
+        present.source = ViewId::new(99);
+        let expected = ContractError::PresentSourceUnknown {
+            source: ViewId::new(99),
+        };
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "present_source_unknown");
+
+        // Control: only the `source` field changed, so the refusal is about the
+        // source and not about the target's own identity.
+        present.source = ViewId::new(21);
+        present
+            .validate_against(&render_pass())
+            .expect("the pass's own view is the admitted source");
+    }
+
+    #[test]
+    fn present_refuses_a_target_without_identity_extent_or_bounded_bytes() {
+        let mut present = present_descriptor();
+        present.target.view_id = ViewId::new(0);
+        assert_eq!(
+            present.target.validate_shape(),
+            Err(ContractError::InvalidIdentity("present target view id"))
+        );
+
+        let mut present = present_descriptor();
+        present.target.allocation_id = AllocationId::new(0);
+        assert_eq!(
+            present.target.validate_shape(),
+            Err(ContractError::InvalidIdentity(
+                "present target allocation id"
+            ))
+        );
+
+        let mut zero_width = present_descriptor();
+        zero_width.target.width = 0;
+        assert_eq!(
+            zero_width.target.validate_shape(),
+            Err(ContractError::ZeroDimension {
+                field: "present target",
+                axis: 0,
+            })
+        );
+        let mut zero_height = present_descriptor();
+        zero_height.target.height = 0;
+        let expected = ContractError::ZeroDimension {
+            field: "present target",
+            axis: 1,
+        };
+        assert_eq!(zero_height.target.validate_shape(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // The byte extent fails closed rather than wrapping, exactly as the
+        // attachment's does.
+        let mut present = present_descriptor();
+        present.target.width = u64::MAX;
+        assert_eq!(
+            present.target.expected_bytes(),
+            Err(ContractError::ArithmeticOverflow("present target bytes"))
+        );
+        assert_eq!(
+            present.target.validate_shape(),
+            Err(ContractError::ArithmeticOverflow("present target bytes"))
+        );
+    }
+
+    #[test]
+    fn present_refuses_a_target_format_outside_the_render_increment() {
+        // `R32Uint` is expressible for texture symmetry but is not a colour
+        // attachment, so it cannot be an inherited present target either.
+        let mut present = present_descriptor();
+        present.target.format = AttachmentFormat::R32Uint;
+        let expected = ContractError::UnsupportedAttachmentFormat(AttachmentFormat::R32Uint);
+        assert_eq!(present.validate(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "attachment_format_unsupported");
+    }
+
+    #[test]
+    fn present_source_selects_one_of_several_attachments() {
+        // Two attachments stand in for the multi-target pass a later increment
+        // admits; the present must compare against the one its `source` names,
+        // not against `color_attachments[0]`.
+        let mut pass = render_pass();
+        let mut second = render_attachment(AttachmentFormat::Bgra8Unorm);
+        second.view_id = ViewId::new(31);
+        second.allocation_id = AllocationId::new(32);
+        pass.color_attachments.push(second);
+        // The second attachment is 2x2 like the first, so the extent rule stays
+        // out of the way of the source-selection rule under test.
+        assert_eq!(pass.color_attachments.len(), 2);
+
+        let mut present = present_descriptor();
+        present.source = ViewId::new(31);
+        present.target.view_id = ViewId::new(31);
+        present.target.allocation_id = AllocationId::new(32);
+        present.target.format = AttachmentFormat::Bgra8Unorm;
+        present
+            .validate_against(&pass)
+            .expect("the named attachment is the one that must agree");
+
+        // Same source, different target format: the refusal names the *second*
+        // attachment's format, which is what makes this the control that proves
+        // source selection rather than an accident of list order.
+        present.target.format = AttachmentFormat::Rgba8Unorm;
+        let expected = ContractError::PresentFormatMismatch {
+            source: ViewId::new(31),
+            target: AttachmentFormat::Rgba8Unorm,
+            attachment: AttachmentFormat::Bgra8Unorm,
+        };
+        assert_eq!(present.validate_against(&pass), Err(expected));
+
+        // The allocation disagreement is reported against the same named
+        // attachment, so a target cannot borrow the first attachment's
+        // allocation either.
+        present.target.format = AttachmentFormat::Bgra8Unorm;
+        present.target.allocation_id = AllocationId::new(22);
+        let expected = ContractError::PresentTargetAllocationMismatch {
+            source: ViewId::new(31),
+            target: AllocationId::new(22),
+            attachment: AllocationId::new(32),
+        };
+        assert_eq!(present.validate_against(&pass), Err(expected));
+
+        // An extent disagreement is reported against the same named attachment,
+        // so a wide target cannot pass by matching the first attachment instead.
+        present.target.allocation_id = AllocationId::new(32);
+        present.target.height = 4;
+        let expected = ContractError::PresentExtentMismatch {
+            source: ViewId::new(31),
+            target: [2, 4],
+            attachment: [2, 2],
+        };
+        assert_eq!(present.validate_against(&pass), Err(expected));
+
+        // And the first attachment is still presentable on its own terms, so the
+        // three refusals above are about the *named* attachment rather than
+        // about the second one being unusable.
+        let mut first = present_descriptor();
+        first.source = ViewId::new(21);
+        first.validate_against(&pass).unwrap();
+    }
+
+    #[test]
+    fn present_refuses_a_target_that_restates_another_view_or_allocation() {
+        // The target must restate the source attachment's identity; a view or an
+        // allocation that names a different resource is a trace that describes
+        // two resources where the first increment has one.
+        let mut present = present_descriptor();
+        present.target.view_id = ViewId::new(31);
+        let expected = ContractError::PresentTargetViewMismatch {
+            source: ViewId::new(21),
+            target: ViewId::new(31),
+        };
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "present_target_view_mismatch");
+
+        let mut present = present_descriptor();
+        present.target.allocation_id = AllocationId::new(32);
+        let expected = ContractError::PresentTargetAllocationMismatch {
+            source: ViewId::new(21),
+            target: AllocationId::new(32),
+            attachment: AllocationId::new(22),
+        };
+        assert_eq!(
+            present.validate_against(&render_pass()),
+            Err(expected.clone())
+        );
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "present_target_allocation_mismatch");
+
+        // Control: the pass's own attachment identity is the one that agrees, so
+        // both refusals are about the target's restatement and not about the
+        // identity being unwritable.
+        present_descriptor()
+            .validate_against(&render_pass())
+            .unwrap();
     }
 }
