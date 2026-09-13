@@ -847,8 +847,9 @@ pub(crate) fn execute_serial_submission_with_status(
         ),
         dispatches,
     )?;
-    let bound = identity_dispatches(&submission.buffers, dispatches);
-    execute_rebound_submission_with_status(context, artifact, submission.buffers, &bound)
+    let textures = submission.textures.clone();
+    let bound = identity_dispatches(&submission.buffers, &textures, dispatches);
+    execute_rebound_submission_with_status(context, artifact, submission.buffers, &bound, &textures)
 }
 
 /// Execute one pipeline against a selected subset of uploaded buffers per pass.
@@ -860,9 +861,10 @@ pub(crate) fn execute_rebound_submission_with_status(
     artifact: Arc<VulkanPipelineArtifact>,
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
+    textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let artifacts = vec![artifact; dispatches.len()];
-    execute_pipeline_sequence_with_status(context, &artifacts, buffers, dispatches)
+    execute_pipeline_sequence_with_status(context, &artifacts, buffers, dispatches, textures)
 }
 
 /// Execute one to eight ordered pipeline dispatches over one uploaded pool.
@@ -873,12 +875,13 @@ pub(crate) fn execute_pipeline_sequence_with_status(
     artifacts: &[Arc<VulkanPipelineArtifact>],
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
+    textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let buffers = buffers
         .into_iter()
         .map(PoolBinding::Owned)
         .collect::<Vec<_>>();
-    execute_pool_sequence_with_status(context, artifacts, &buffers, dispatches, None)
+    execute_pool_sequence_with_status(context, artifacts, &buffers, dispatches, None, textures)
 }
 
 /// Execute a pool whose bindings are either provider-owned copies or owner
@@ -890,6 +893,7 @@ pub(crate) fn execute_pool_sequence_with_status(
     buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     for artifact in artifacts {
         if !Arc::ptr_eq(context, &artifact.context) {
@@ -898,7 +902,8 @@ pub(crate) fn execute_pool_sequence_with_status(
             )));
         }
     }
-    let result = execute_submission_stages(context, artifacts, buffers, dispatches, borrowed);
+    let result =
+        execute_submission_stages(context, artifacts, buffers, dispatches, borrowed, textures);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -914,9 +919,11 @@ fn execute_submission_stages(
     buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let mut pending =
-        PendingExecution::submit(context, 0, artifacts, buffers, dispatches, borrowed)?;
+    let mut pending = PendingExecution::submit(
+        context, 0, artifacts, buffers, dispatches, borrowed, textures,
+    )?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
         context.poisoned.store(true, Ordering::Release);
         return Err(ExecutionFailure::vulkan(
@@ -954,6 +961,7 @@ impl PendingExecution {
         buffers: &[PoolBinding],
         dispatches: &[BoundDispatch],
         borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+        textures: &[metal_api_core::provider::TextureView],
     ) -> Result<Self, ProviderError> {
         let mut resources = ExecutionResources::new(Arc::clone(context));
         resources.set_borrowed_leases(borrowed);
@@ -989,6 +997,9 @@ impl PendingExecution {
             )
         };
         resources.create_buffers(buffers).map_err(encode_error)?;
+        resources
+            .create_textures(textures, dispatches)
+            .map_err(encode_error)?;
         resources
             .create_descriptors(&translated, dispatches)
             .map_err(encode_error)?;
@@ -1077,8 +1088,13 @@ fn validate_dispatch_count(count: usize) -> Result<(), ProviderError> {
 
 fn identity_dispatches<T: PoolWidth>(
     buffers: &[T],
+    textures: &[metal_api_core::provider::TextureView],
     dispatches: &[([u32; 3], [u32; 3])],
 ) -> Vec<BoundDispatch> {
+    // Textures share the Metal argument index space with buffers (a fixture
+    // reports texture 0 and buffer 0), so their pool keys are offset into a
+    // separate range.
+    const TEXTURE_POOL_KEY_BASE: u32 = 1 << 20;
     dispatches
         .iter()
         .map(|&(grid, local)| BoundDispatch {
@@ -1087,6 +1103,12 @@ fn identity_dispatches<T: PoolWidth>(
             bindings: buffers
                 .iter()
                 .map(|buffer| (buffer.pool_index(), buffer.pool_index()))
+                .chain(textures.iter().map(|texture| {
+                    (
+                        texture.metal_binding,
+                        TEXTURE_POOL_KEY_BASE + texture.metal_binding,
+                    )
+                }))
                 .collect(),
         })
         .collect()
@@ -1101,7 +1123,7 @@ fn plan_serial_submission<T: PoolWidth>(
     dispatches: &[([u32; 3], [u32; 3])],
 ) -> Result<Vec<KernelDispatchPlan>, ProviderError> {
     validate_serial_dispatches(first_dispatch, dispatches)?;
-    let bound = identity_dispatches(buffers, dispatches);
+    let bound = identity_dispatches(buffers, &[], dispatches);
     Ok(plan_rebound_submission(translated, buffers, limits, &bound)?.plans)
 }
 
@@ -1593,7 +1615,9 @@ fn validate_bound_buffers(
         let reflected = reflection
             .bindings
             .iter()
-            .find(|candidate| candidate.metal_index == index)
+            .find(|candidate| {
+                candidate.metal_index == index && candidate.kind == ResourceKind::Buffer
+            })
             .ok_or_else(|| failure(format!("buffer {index} is not reflected")))?;
         let mut required = u64::from(reflected.declared_size.unwrap_or(0));
         if let Some(BufferExtent::Object { bytes }) = reflected.extent {
@@ -1765,6 +1789,20 @@ struct GpuBuffer {
     uploaded_ranges: BTreeMap<usize, usize>,
 }
 
+/// One sampled texture owned by an execution: a host-visible `VkImage` and the
+/// sampler the provider supplies for it, because the translator synthesizes
+/// the sampler (`research/docs/16` §4.3). Only R32Uint/D2 is admitted.
+struct GpuTexture {
+    index: u64,
+    /// The descriptor writer resolves the texture through the pass binding
+    /// map, so the pool key is stored with the image.
+    pool_key: u32,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
 /// A pass owns every object derived from its shader's reflection. Keeping this
 /// ownership separate prevents using one shader's layout for a later shader.
 struct PipelineObjects {
@@ -1789,6 +1827,8 @@ struct ExecutionResources {
     device_lost: bool,
     leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+    /// Sampled textures addressed by their Metal argument index.
+    textures: Vec<GpuTexture>,
     /// Pool key to its window in `buffers`. `research/docs/15` §3.
     view_windows: BTreeMap<u32, ViewWindow>,
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
@@ -2107,6 +2147,7 @@ impl ExecutionResources {
             device_lost: false,
             leak_is_budgeted: false,
             buffers: Vec::new(),
+            textures: Vec::new(),
             view_windows: BTreeMap::new(),
             borrowed: None,
         }
@@ -2261,6 +2302,229 @@ impl ExecutionResources {
             }
         }
         self.buffers.sort_by_key(|buffer| buffer.index);
+        Ok(())
+    }
+
+    /// Upload the submission's sampled textures. Only the first increment's
+    /// shape is admitted: a D2, single-sample R32Uint texture with an owned
+    /// byte source. The provider creates the image, its view and the sampler
+    /// the translator expects at the texture binding; the descriptor write
+    /// happens in `create_descriptors`.
+    fn create_textures(
+        &mut self,
+        textures: &[metal_api_core::provider::TextureView],
+        dispatches: &[BoundDispatch],
+    ) -> Result<(), ExecutionFailure> {
+        use metal_api_core::provider::{TextureAccess, TextureFormat, TextureSource, TextureType};
+        for texture in textures {
+            texture
+                .validate_shape()
+                .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            let byte_length = texture
+                .expected_bytes()
+                .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            if texture.texture_type != TextureType::D2
+                || texture.format != TextureFormat::R32Uint
+                || texture.sample_count != 1
+                || texture.depth != 1
+                || texture.array_length != 1
+                || texture.access != TextureAccess::Sampled
+            {
+                return Err(failure(format!(
+                    "texture {} needs a D2 single-sample R32Uint sampled texture",
+                    texture.metal_binding
+                ))
+                .into());
+            }
+            let TextureSource::OwnedBytes(bytes) = &texture.source else {
+                return Err(failure(format!(
+                    "texture {} needs an owned byte source in the first increment",
+                    texture.metal_binding
+                ))
+                .into());
+            };
+            let index = u64::from(texture.metal_binding);
+            if self.textures.iter().any(|existing| existing.index == index) {
+                return Err(failure(format!(
+                    "texture {} occurs more than once",
+                    texture.metal_binding
+                ))
+                .into());
+            }
+            let extent = vk::Extent3D {
+                width: u32::try_from(texture.width)
+                    .map_err(|_| failure("texture width overflows u32"))?,
+                height: u32::try_from(texture.height)
+                    .map_err(|_| failure("texture height overflows u32"))?,
+                depth: 1,
+            };
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R32_UINT)
+                .extent(extent)
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            let image = unsafe { self.context.device.create_image(&image_info, None) }.map_err(
+                |error| ExecutionFailure::vulkan(error, format!("create texture image: {error}")),
+            )?;
+            let destroy_image = |resources: &Self| unsafe {
+                resources.context.device.destroy_image(image, None);
+            };
+            let requirements = unsafe { self.context.device.get_image_memory_requirements(image) };
+            let memory_type = match self.context.memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    destroy_image(self);
+                    return Err(error.into());
+                }
+            };
+            let allocation = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+                Ok(memory) => memory,
+                Err(error) => {
+                    destroy_image(self);
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("allocate texture memory: {error}"),
+                    ));
+                }
+            };
+            if let Err(error) = unsafe { self.context.device.bind_image_memory(image, memory, 0) } {
+                unsafe {
+                    destroy_image(self);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("bind texture memory: {error}"),
+                ));
+            }
+            let mapped = match unsafe {
+                self.context.device.map_memory(
+                    memory,
+                    0,
+                    requirements.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+            } {
+                Ok(mapped) => mapped,
+                Err(error) => {
+                    unsafe {
+                        destroy_image(self);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("map texture memory: {error}"),
+                    ));
+                }
+            };
+            // Linear host-visible images keep rows tightly packed for R32Uint,
+            // so the owned bytes are the rows in order.
+            let row_pitch = usize::try_from(texture.width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| failure("texture row pitch overflows usize"))?;
+            for (row, chunk) in bytes.chunks(row_pitch).enumerate() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.as_ptr(),
+                        (mapped.cast::<u8>()).add(row * row_pitch),
+                        chunk.len(),
+                    );
+                }
+            }
+            unsafe { self.context.device.unmap_memory(memory) };
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R32_UINT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let view = match unsafe { self.context.device.create_image_view(&view_info, None) } {
+                Ok(view) => view,
+                Err(error) => {
+                    unsafe {
+                        destroy_image(self);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("create texture view: {error}"),
+                    ));
+                }
+            };
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            let sampler = match unsafe { self.context.device.create_sampler(&sampler_info, None) } {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    unsafe {
+                        self.context.device.destroy_image_view(view, None);
+                        destroy_image(self);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("create texture sampler: {error}"),
+                    ));
+                }
+            };
+            self.context.record_buffer_upload();
+            self.context.record_buffer_upload_bytes(bytes.len());
+            // The descriptor writer resolves a sampled texture through the
+            // pass binding map, so the Metal argument index needs a pool key.
+            let pool_key = dispatches
+                .iter()
+                .flat_map(|dispatch| dispatch.bindings.iter())
+                .find(|(metal_index, _)| *metal_index == texture.metal_binding)
+                .map(|(_, pool_key)| *pool_key)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "Metal texture {} is not bound in any dispatch",
+                        texture.metal_binding
+                    ))
+                })?;
+            self.register_view(
+                pool_key,
+                index,
+                0,
+                usize::try_from(byte_length).map_err(|_| {
+                    failure(format!(
+                        "texture {} length overflows usize",
+                        texture.metal_binding
+                    ))
+                })?,
+            )?;
+            self.textures.push(GpuTexture {
+                index,
+                pool_key,
+                image,
+                memory,
+                view,
+                sampler,
+            });
+        }
         Ok(())
     }
 
@@ -2566,33 +2830,72 @@ impl ExecutionResources {
             dispatches.iter().zip(&self.descriptor_sets).zip(translated)
         {
             let reflection = translated.reflection();
-            let infos = reflection
-                .bindings
-                .iter()
-                .map(|binding| {
+            let mut writes = Vec::with_capacity(reflection.bindings.len());
+            let mut buffer_infos = Vec::with_capacity(reflection.bindings.len());
+            let mut image_infos = Vec::with_capacity(reflection.bindings.len());
+            for binding in &reflection.bindings {
+                if binding.kind == ResourceKind::Texture {
                     let &(_, pool_key) = dispatch
                         .bindings
                         .iter()
                         .find(|&&(metal_index, _)| metal_index == binding.metal_index)
                         .expect("validated pass binding");
-                    let window = self.view_window(pool_key);
-                    let gpu = self.gpu_buffer(window.buffer_key);
-                    vk::DescriptorBufferInfo::default()
-                        .buffer(gpu.buffer)
-                        .offset(window.offset as u64)
-                        .range(window.length as u64)
-                })
-                .collect::<Vec<_>>();
-            let writes = reflection
-                .bindings
-                .iter()
-                .zip(&infos)
-                .map(|(binding, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(binding.descriptor.expect("validated descriptor").binding)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(std::slice::from_ref(info))
+                    let texture = self
+                        .textures
+                        .iter()
+                        .find(|texture| texture.pool_key == pool_key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "Metal texture {} was not uploaded for this submission",
+                                binding.metal_index
+                            ))
+                        })?;
+                    let info = vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_view(texture.view)
+                        .sampler(texture.sampler);
+                    image_infos.push(info);
+                    writes.push(vk::WriteDescriptorSet::default());
+                    continue;
+                }
+                let &(_, pool_key) = dispatch
+                    .bindings
+                    .iter()
+                    .find(|&&(metal_index, _)| metal_index == binding.metal_index)
+                    .expect("validated pass binding");
+                let window = self.view_window(pool_key);
+                let gpu = self.gpu_buffer(window.buffer_key);
+                let info = vk::DescriptorBufferInfo::default()
+                    .buffer(gpu.buffer)
+                    .offset(window.offset as u64)
+                    .range(window.length as u64);
+                buffer_infos.push(info);
+                writes.push(vk::WriteDescriptorSet::default());
+            }
+            // Attach the collected infos once all pushes are done: the
+            // descriptor writes borrow the vectors, so the slices stay valid
+            // until `update_descriptor_sets` returns.
+            let mut image_cursor = 0;
+            let mut buffer_cursor = 0;
+            let writes = writes
+                .into_iter()
+                .zip(&reflection.bindings)
+                .map(|(write, binding)| {
+                    let descriptor = binding.descriptor.expect("validated descriptor");
+                    let write = write.dst_set(set).dst_binding(descriptor.binding);
+                    if binding.kind == ResourceKind::Texture {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(std::slice::from_ref(&image_infos[image_cursor]));
+                        image_cursor += 1;
+                        write
+                    } else {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&buffer_infos[buffer_cursor]));
+                        buffer_cursor += 1;
+                        write
+                    }
                 })
                 .collect::<Vec<_>>();
             unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
@@ -2630,6 +2933,33 @@ impl ExecutionResources {
                 .map_err(|error| {
                     ExecutionFailure::vulkan(error, format!("begin command buffer: {error}"))
                 })?;
+            // Host-visible linear images are uploaded in PREINITIALIZED and the
+            // sampled descriptor binds them in GENERAL, so the first transition
+            // needs only the new layout, not an access scope.
+            for texture in &self.textures {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::PREINITIALIZED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
             for (pass_index, plan) in plans.iter().enumerate() {
                 let objects = &self.pipeline_objects[pass_index];
                 let reflection = translated[pass_index].reflection();
@@ -2881,6 +3211,12 @@ impl Drop for ExecutionResources {
             for buffer in &self.buffers {
                 self.context.device.destroy_buffer(buffer.buffer, None);
                 self.context.device.free_memory(buffer.memory, None);
+            }
+            for texture in &self.textures {
+                self.context.device.destroy_sampler(texture.sampler, None);
+                self.context.device.destroy_image_view(texture.view, None);
+                self.context.device.destroy_image(texture.image, None);
+                self.context.device.free_memory(texture.memory, None);
             }
         }
     }

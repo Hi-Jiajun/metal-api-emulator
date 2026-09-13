@@ -4807,6 +4807,7 @@ mod tests {
                 index: 0,
                 bytes: vec![1, 2, 3, 4],
             }],
+            textures: Vec::new(),
             threads_per_grid: crate::Size::new(10, 3, 1).unwrap(),
             threads_per_threadgroup: crate::Size::new(8, 2, 1).unwrap(),
         }

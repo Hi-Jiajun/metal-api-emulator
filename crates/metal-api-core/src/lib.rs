@@ -252,6 +252,10 @@ pub struct BufferUpdate {
 pub struct ComputeSubmission {
     pub pipeline: PipelineArtifact,
     pub buffers: Vec<BufferBinding>,
+    /// Sampled textures bound by the pass. Providers that do not execute
+    /// textures refuse a non-empty list (`research/docs/16` §4.3); the first
+    /// Vulkan implementation admits R32Uint/D2 reads.
+    pub textures: Vec<crate::provider::TextureView>,
     pub threads_per_grid: Size,
     pub threads_per_threadgroup: Size,
 }
@@ -576,6 +580,7 @@ impl CommandBuffer {
             let updates = self.executor.execute(ComputeSubmission {
                 pipeline: Arc::clone(&pass.pipeline),
                 buffers: snapshots,
+                textures: Vec::new(),
                 threads_per_grid: pass.threads_per_grid,
                 threads_per_threadgroup: pass.threads_per_threadgroup,
             })?;

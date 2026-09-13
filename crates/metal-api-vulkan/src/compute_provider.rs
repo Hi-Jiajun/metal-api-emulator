@@ -939,6 +939,7 @@ impl VulkanComputeProvider {
                 &buffers,
                 &dispatches,
                 retains.take(),
+                &[],
             )?
         };
         let record = match &self.completion_outbox {
@@ -1105,6 +1106,7 @@ fn execute_on_context(
         buffers,
         dispatches,
         retains.take(),
+        &[],
     )
 }
 
