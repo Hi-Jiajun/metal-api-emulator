@@ -125,27 +125,41 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `15a6be3` fixed. The old attribution and its retraction are recorded in
   `research/docs/17-纹理多invocation归因修正记录.md`, which is a correction
   record rather than an upstream issue draft.
+- Offscreen rendering executes on the Vulkan trace rail: `suite-v13` declares
+  one `rgba8_unorm` 2x2 colour attachment, a two-stage graphics pipeline draws
+  the reviewed fullscreen triangle so that every texel reads `40 80 c0 ff`,
+  and the comparator observes the image through the same allocation writeback
+  channel as every other case. The contract and trace values landed in
+  `cd5bced`/`b14f496`, the
+  Vulkan executor in `2e64eff`/`0319da1`, the observation in `e581562`, and
+  `8430446` added the suite to CI on the trace rail and both Vulkan object-API
+  loops. Only that rail reports an attachment: the object API has no render
+  command encoder, and the native provider still declares
+  `supports_render_passes = false`. The macOS oracle's render capture path
+  exists but has not run on Apple hardware; see `conformance/RENDER-CAPTURE.md`.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
   device write in place on both drivers, `DirtySet` accumulates the pages a
   submission wrote, and `GuestWindows` refuses to reclaim a window until its
   lease is retired. See `research/docs/19`.
-- Open design work: host-side wiring of the core terminal lifecycle (the
-  `ProviderLifecycle` admission/refusal and lease-retirement contract now
-  exists, and both the Vulkan context and the native Metal provider admit and
-  report health through it),
-  the cross-process completion transport and provider wiring (the core wire
-  publisher and mirror now exist), provider-side lease import (the core
-  `LeaseLedger` release contract now exists), general native shader admission
-  and CPU uploads during command-buffer execution, guest-memory lifecycle
-  wiring beyond the owner-side contract, and deriving a scheduling tier from
-  the guest (the priority policy, the per-queue tiers, and the owner marking
-  that carries them to a remote provider over the command channel now exist,
-  while nothing maps an `MTLCommandQueue` to a tier yet). Resource snapshots do
-  not hold live guest pages.
-- Not implemented: rendering (render pipelines, render passes, sampler and
-  texture generalisation beyond the sampled fixture), presentation and
+- Open design work: device-loss reclamation beyond the bounded abandonment
+  budget (the `ProviderLifecycle` admission/refusal and lease-retirement
+  contract exists, and both the Vulkan context and the native Metal provider
+  admit and report health through it, but the only deterministic teardown
+  evidence is still the injected test loss rather than a real
+  `VK_ERROR_DEVICE_LOST`), general native shader admission and CPU uploads
+  during command-buffer execution, guest-memory lifecycle wiring beyond the
+  owner-side contract (the owner-side `HostRegion`/`DirtySet`/`GuestWindows`
+  pieces exist, and `research/docs/20` designs the reims-side projection and
+  registration with no call site in reims yet), and deriving a scheduling tier
+  from the guest (the priority policy, the per-queue tiers, and the owner
+  marking that carries them to a remote provider over the command channel now
+  exist, while nothing maps an `MTLCommandQueue` to a tier yet). Resource
+  snapshots do not hold live guest pages.
+- Not implemented: render passes beyond the Vulkan trace rail (no object-API
+  render command encoder and no native-provider render path), sampler and
+  texture generalisation beyond the sampled fixture, presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
   compilation, arbitrary AIR/MSL compilation and reflection, and production
   reims integration (Gate 2/3). This is not a Metal.framework ABI
