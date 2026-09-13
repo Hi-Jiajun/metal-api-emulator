@@ -305,3 +305,14 @@ agreement. There is currently no exemption list, so a new suite or case must be
 added to all three tables; a case intended for one rail only has to change them
 deliberately and update this note. If a table is reshaped so it can no longer be
 parsed, the check fails instead of silently comparing empty sets.
+
+## Offscreen render capture (pending)
+
+The first render increment's capture path exists on the Apple side — the native
+rail in `crates/metal-api-native/src/render.rs`, the reviewed MSL fixture
+`shaders/render_offscreen_2x2.metal`, and the oracle's `render_cases` section
+plus `--render-selftest`. No committed suite reaches it: `compare.py`,
+`provider-capture` and the CI rails have no render model yet, and both providers
+still refuse render-bearing traces. [RENDER-CAPTURE.md](RENDER-CAPTURE.md)
+records the case schema, the report shape, the one-command device check and the
+places that have to move together before a suite can declare a render case.
