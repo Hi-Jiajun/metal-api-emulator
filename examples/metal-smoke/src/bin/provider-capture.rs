@@ -4,19 +4,20 @@ use metal_api_core::provider::queue_priorities_for_device;
 #[cfg(unix)]
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, BufferAccess, BufferSource, BufferView,
-    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
-    DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId,
-    PipelineCompileRequest, PipelineProvider, QueuePriority, QueueSchedulingPolicy,
-    ResourceTableSnapshot, SemanticDigest, ShaderSource, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
+    AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
+    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
+    ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineProvider, QueuePriority, QueueSchedulingPolicy,
+    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+    SemanticDigest, ShaderSource, StoreOp, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
 #[cfg(target_os = "macos")]
 use metal_api_native::NativeMetalProvider;
-use metal_api_vulkan::{VulkanComputeProvider, VulkanExecutor};
+use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +35,38 @@ use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const MAX_BYTES: usize = 1024 * 1024;
+
+/// The Vulkan rail's half of the reviewed render fixture
+/// (`research/docs/23` §1.2). A render case pins the MSL module the canonical
+/// rails compile, because that module is the review surface both the native
+/// provider and the Swift oracle execute. This rail executes the same two
+/// stages as SPIR-V, so their identity is pinned here in code, exactly as
+/// `crates/metal-api-vulkan/src/render.rs` pins it in its own tests: a
+/// re-hashed fixture must not be enough to admit different modules.
+///
+/// The entry names differ from the MSL ones (`render_fullscreen_triangle` /
+/// `render_solid_rgba8`): the reviewed SPIR-V sources declare
+/// `vertex_main` / `fragment_main`, and core refuses a render contract whose
+/// two entries share a name.
+const RENDER_VERTEX_SPV: &[u8] = include_bytes!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/fullscreen_triangle.vert.spv"
+);
+const RENDER_FRAGMENT_SPV: &[u8] =
+    include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/solid_unorm8.frag.spv");
+const RENDER_VERTEX_ENTRY: &str = "vertex_main";
+const RENDER_FRAGMENT_ENTRY: &str = "fragment_main";
+
+/// The capture backends a suite may declare a render case executable on. The
+/// vocabulary is `conformance/compare.py`'s `ALLOCATION_OBSERVATIONS`, i.e. the
+/// backends a capture reports: a marker cannot name a rail that no capture can
+/// produce.
+const RENDER_RAILS: &[&str] = &[
+    "native-metal",
+    "vulkan",
+    "native-metal-provider",
+    "vulkan-objects",
+    "native-metal-provider-objects",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -72,6 +105,17 @@ enum CopyCounters {
     #[cfg(target_os = "macos")]
     Native(Arc<NativeMetalProvider>),
 }
+
+/// What one capture run keeps hold of: the trait object every rail shares, the
+/// device name, the copy counters, and the concrete Vulkan context the render
+/// rail's `register_render_pipeline` entry point lives on (it is not part of
+/// `PipelineProvider`).
+type ProviderHandles = (
+    Arc<dyn PipelineProvider>,
+    String,
+    CopyCounters,
+    Option<Arc<VulkanComputeProvider>>,
+);
 
 impl CopyCounters {
     /// Cumulative (copy-in, copy-out) device-buffer operations.
@@ -589,7 +633,7 @@ fn create_provider(
     backend: Backend,
     async_execution: bool,
     queue_priorities: Option<&[QueuePriority]>,
-) -> Result<(Arc<dyn PipelineProvider>, String, CopyCounters)> {
+) -> Result<ProviderHandles> {
     match backend {
         Backend::Vulkan => {
             let executor = VulkanExecutor::new()
@@ -597,11 +641,21 @@ fn create_provider(
             if let Some(requested) = queue_priorities {
                 install_queue_priorities(&executor, requested)?;
             }
-            let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
-                .map_err(|error| format!("create Vulkan provider: {error:?}"))?
-                .with_async_execution(async_execution);
+            let provider = Arc::new(
+                VulkanComputeProvider::with_executor(Arc::clone(&executor))
+                    .map_err(|error| format!("create Vulkan provider: {error:?}"))?
+                    .with_async_execution(async_execution),
+            );
             let name = provider.device_name().to_owned();
-            Ok((Arc::new(provider), name, CopyCounters::Vulkan(executor)))
+            // The render rail is a concrete-context entry point
+            // (`register_render_pipeline` is not part of `PipelineProvider`), so
+            // the handle is kept beside the trait object.
+            Ok((
+                Arc::clone(&provider) as Arc<dyn PipelineProvider>,
+                name,
+                CopyCounters::Vulkan(executor),
+                Some(provider),
+            ))
         }
         Backend::NativeMetalProvider => {
             #[cfg(target_os = "macos")]
@@ -616,6 +670,7 @@ fn create_provider(
                     Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                     name,
                     CopyCounters::Native(provider),
+                    None,
                 ))
             }
             #[cfg(not(target_os = "macos"))]
@@ -631,6 +686,12 @@ struct Suite {
     suite: String,
     guard_byte: u8,
     cases: Vec<Case>,
+    /// Offscreen render cases (`research/docs/23` §1.2). A render case is not a
+    /// compute case: its observable is one colour attachment's texels, so it
+    /// lives in its own array and names the compute case whose pass declares
+    /// the attachment view.
+    #[serde(default)]
+    render_cases: Vec<RenderCase>,
 }
 
 #[derive(Deserialize)]
@@ -666,6 +727,49 @@ struct Texture {
     format: String,
     access: String,
     initial_hex: String,
+}
+
+/// One offscreen render case (`research/docs/23` §1.2, §5.1).
+///
+/// The shape is a whitelist rather than a per-case table: the first render
+/// increment has exactly one render shape, so the shape *is* the review and a
+/// fixture cannot widen it by renaming a case.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderCase {
+    id: String,
+    /// The compute case of this suite whose pass declares the attachment view.
+    /// The render trace replays that pass, so the target resolves against a
+    /// resource table the trace itself carries (`research/docs/23` §3.6).
+    declaring_case: String,
+    vertex_entry: String,
+    fragment_entry: String,
+    metal: Source,
+    vertices: u64,
+    viewport: [u64; 4],
+    attachment: RenderAttachmentDefinition,
+    expected_hex: String,
+    /// The capture backends this case is executable on. A rail in this list has
+    /// to report the case; a rail outside it has to omit it.
+    capture_rails: Vec<String>,
+}
+
+/// The colour attachment a render case draws into. The fields mirror
+/// `metal_api_core::provider::RenderAttachment`: identity, format, extent and
+/// the load/store pair (`clear_hex` in memory order for a clear,
+/// `initial_hex` for the previous contents).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderAttachmentDefinition {
+    allocation: u64,
+    view: u64,
+    format: String,
+    width: u64,
+    height: u64,
+    load: String,
+    store: String,
+    clear_hex: Option<String>,
+    initial_hex: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -948,8 +1052,36 @@ fn main() -> Result<()> {
             sources.insert((program.entry, case.air_encoding), source);
         }
     }
+    // A render case pins the one reviewed MSL module; the Vulkan rail executes
+    // the matching SPIR-V pair pinned in code above, so only the module's
+    // declared identity is verified here.
+    for case in &suite.render_cases {
+        verified_source(directory, &case.metal)?;
+    }
+    // Every rail has to agree about which cases it owns. A rail a render case's
+    // marker names has to be able to report the case; the object-API rails carry
+    // no render command encoder in this increment, so a suite that asks them for
+    // one is refused instead of silently reporting fewer cases than the marker
+    // requires.
+    let render_rail = backend == Backend::Vulkan && api == EntryApi::Trace;
+    for case in &suite.render_cases {
+        if !render_rail
+            && case
+                .capture_rails
+                .iter()
+                .any(|rail| rail == backend.report_name(api))
+        {
+            return Err(format!(
+                "render case {} is marked executable on {} but this rail cannot execute a \
+                 render pass",
+                case.id,
+                backend.report_name(api)
+            )
+            .into());
+        }
+    }
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name, counters) =
+    let (provider, device_name, counters, vulkan) =
         create_provider(backend, async_execution, queue_priorities.as_deref())?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
@@ -1069,12 +1201,77 @@ fn main() -> Result<()> {
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
         results.push(result);
     }
+    // Render cases run after the compute cases, on the one rail that owns a
+    // render execution path (`research/docs/23` §6 Step 7). Every other rail
+    // omits them, which is what the suite's `capture_rails` marker declares.
+    let mut render_pipeline: Option<CompiledComputePipeline> = None;
+    for (offset, case) in suite.render_cases.iter().enumerate() {
+        if !render_rail {
+            continue;
+        }
+        let vulkan = vulkan
+            .as_ref()
+            .ok_or("render cases require the Vulkan trace rail")?;
+        let declaring = suite
+            .cases
+            .iter()
+            .find(|declared| declared.id == case.declaring_case)
+            .ok_or("render case declaring pass is not a case of this suite")?;
+        let programs = case_programs(declaring)
+            .iter()
+            .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
+            .collect::<Vec<_>>();
+        let pipeline = match &render_pipeline {
+            Some(pipeline) => pipeline.clone(),
+            None => {
+                let registered = vulkan
+                    .register_render_pipeline(RenderPipelineRequest {
+                        contract: RenderPipelineContract {
+                            vertex_entry: RENDER_VERTEX_ENTRY.to_owned(),
+                            fragment_entry: RENDER_FRAGMENT_ENTRY.to_owned(),
+                            color_format: AttachmentFormat::Rgba8Unorm,
+                            vertex_layout: VertexLayout::None,
+                        },
+                        vertex_spirv: RENDER_VERTEX_SPV.to_vec(),
+                        fragment_spirv: RENDER_FRAGMENT_SPV.to_vec(),
+                        logical_digest: SemanticDigest::new(
+                            "suite-sha256-entry-v1",
+                            format!("{identity}:offscreen_render_pipeline").into_bytes(),
+                        )?,
+                    })
+                    .map_err(|error| format!("register render pipeline: {error:?}"))?;
+                render_pipeline = Some(registered.clone());
+                registered
+            }
+        };
+        let before = counters.read();
+        let mut result = run_render_case(
+            provider.as_ref(),
+            &programs,
+            declaring,
+            case,
+            &pipeline,
+            1000 + offset as u64,
+            suite.guard_byte,
+        )?;
+        let after = counters.read();
+        result.copy_in = Some(u32::try_from(after.0 - before.0)?);
+        result.copy_out = Some(u32::try_from(after.1 - before.1)?);
+        results.push(result);
+    }
     if api == EntryApi::Trace {
         for pipeline in pipelines.values() {
             provider
                 .release_pipeline(pipeline)
                 .map_err(|error| format!("release pipeline: {error:?}"))?;
         }
+    }
+    if let Some(pipeline) = render_pipeline.as_ref() {
+        vulkan
+            .as_ref()
+            .expect("only the Vulkan trace rail registers a render pipeline")
+            .release_render_pipeline(pipeline)
+            .map_err(|error| format!("release render pipeline: {error:?}"))?;
     }
     let capture = Capture {
         schema_version: 1,
@@ -1153,6 +1350,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v10") => &["alias_disjoint_pair", "alias_disjoint_pair_reversed"],
         (1, "compute-buffer-v11") => &["sampled_texture_first_texel"],
         (1, "compute-buffer-v12") => &["texture_cell_local_4x4", "texture_cell_local_1x1"],
+        (1, "compute-buffer-v13") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -1179,6 +1377,15 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         return Err("binary AIR encodings are only qualified by the v8 suite".into());
     }
     let mut ids = BTreeSet::new();
+    // The view a render case draws into is the attachment's own allocation: the
+    // render rail reads the image back directly, so the guard-byte discipline
+    // that makes a compute case's offset mistake observable in the allocation
+    // image does not apply to it (`research/docs/23` §5.2).
+    let attachment_views = suite
+        .render_cases
+        .iter()
+        .map(|case| (case.attachment.allocation, case.attachment.view))
+        .collect::<BTreeSet<_>>();
     for case in &suite.cases {
         validate_case_programs(case)?;
         validate_case_dispatches(case)?;
@@ -1203,13 +1410,13 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 .offset
                 .checked_add(buffer.length)
                 .ok_or("view range overflow")?;
+            let attachment_target = attachment_views.contains(&(buffer.allocation, buffer.view));
             if buffer.binding != buffers[index].0
                 || buffer.access != buffers[index].1
                 || buffer.length != buffers[index].2
                 || buffer.allocation_size > MAX_BYTES as u64
                 || end > buffer.allocation_size
-                || buffer.offset < 4
-                || buffer.allocation_size - end < 4
+                || (!attachment_target && (buffer.offset < 4 || buffer.allocation_size - end < 4))
                 || !buffer.offset.is_multiple_of(4)
                 || buffer.allocation == 0
                 || buffer.view == 0
@@ -1281,6 +1488,172 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 .into());
             }
         }
+    }
+    let mut render_ids = BTreeSet::new();
+    for case in &suite.render_cases {
+        validate_render_case(suite, case)?;
+        if !render_ids.insert(&case.id) || ids.contains(&case.id) {
+            return Err("duplicate render case identity".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate one render case against the declaring case it draws into.
+///
+/// The rules mirror `conformance/compare.py`'s render plan and the Swift
+/// oracle's `validateRenderCase`, including the two falsifiability rules: every
+/// texel of the expectation has to be the fragment output, and the expectation
+/// has to differ from the value the pass started from, so "the pass never ran"
+/// cannot satisfy it.
+fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
+    let where_ = format!("render case {}", case.id);
+    let attachment = &case.attachment;
+    if attachment.format != "rgba8_unorm" {
+        return Err(format!("{where_}: unsupported attachment format").into());
+    }
+    if attachment.width != 2 || attachment.height != 2 {
+        return Err(
+            format!("{where_}: the first render increment renders into a 2x2 attachment").into(),
+        );
+    }
+    if attachment.allocation == 0 || attachment.view == 0 {
+        return Err(format!("{where_}: zero attachment identity").into());
+    }
+    if attachment.store != "store" {
+        return Err(format!("{where_}: a discarded attachment cannot be compared").into());
+    }
+    if case.vertices != 3 {
+        return Err(format!("{where_}: expected the reviewed full-screen triangle").into());
+    }
+    if case.viewport != [0, 0, attachment.width, attachment.height] {
+        return Err(format!("{where_}: the viewport must cover the attachment").into());
+    }
+    if case.vertex_entry != "render_fullscreen_triangle"
+        || case.fragment_entry != "render_solid_rgba8"
+    {
+        return Err(format!("{where_}: unreviewed render pipeline identity").into());
+    }
+    let texels = unhex(&case.expected_hex)?;
+    let extent = usize::try_from(
+        attachment
+            .width
+            .checked_mul(attachment.height)
+            .and_then(|texels| texels.checked_mul(4))
+            .ok_or("attachment extent overflows")?,
+    )?;
+    if texels.len() != extent {
+        return Err(format!("{where_}: expected texel bytes do not match the attachment").into());
+    }
+    let texel = &texels[..4];
+    if texels.chunks_exact(4).any(|chunk| chunk != texel) {
+        return Err(format!(
+            "{where_}: every texel of the expectation has to be the fragment output"
+        )
+        .into());
+    }
+    match attachment.load.as_str() {
+        "clear" => {
+            let clear = unhex(
+                attachment
+                    .clear_hex
+                    .as_deref()
+                    .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
+            )?;
+            if clear.len() != 4 {
+                return Err(format!("{where_}: a clear colour is four bytes").into());
+            }
+            if attachment.initial_hex.is_some() {
+                return Err(
+                    format!("{where_}: a cleared attachment carries no initial bytes").into(),
+                );
+            }
+            if clear == texel {
+                return Err(format!("{where_}: the clear colour equals the expected texel").into());
+            }
+        }
+        "load" => {
+            let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
+                "{where_}: a loaded attachment needs its previous texels"
+            ))?)?;
+            if attachment.clear_hex.is_some() {
+                return Err(
+                    format!("{where_}: a loaded attachment carries no clear colour").into(),
+                );
+            }
+            if initial.len() != extent {
+                return Err(format!("{where_}: initial texels do not match the attachment").into());
+            }
+            if initial == texels {
+                return Err(format!("{where_}: the initial texels equal the expectation").into());
+            }
+            // The rail has no attachment upload path in this increment: core
+            // refuses `LoadOp::Load` at admission (`render_load_unsupported`),
+            // so a case that asks for it cannot be reported honestly.
+            return Err(format!(
+                "{where_}: the Vulkan rail has no attachment upload path for LoadOp::Load yet"
+            )
+            .into());
+        }
+        other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
+    }
+    let mut rails = BTreeSet::new();
+    for rail in &case.capture_rails {
+        if !RENDER_RAILS.contains(&rail.as_str()) {
+            return Err(format!("{where_}: unknown capture rail {rail:?}").into());
+        }
+        if !rails.insert(rail) {
+            return Err(format!("{where_}: duplicate capture rail {rail:?}").into());
+        }
+    }
+    if rails.is_empty() {
+        return Err(format!("{where_}: capture_rails cannot be empty").into());
+    }
+    // The attachment resolves against the declaring case's own table: one of
+    // its declared views has to be the attachment, it has to be read-only (a
+    // compute pass that wrote the view the render pass stores would make the
+    // order inexpressible), and its byte range has to agree with the extent the
+    // attachment restates.
+    let declaring = suite
+        .cases
+        .iter()
+        .find(|declared| declared.id == case.declaring_case)
+        .ok_or(format!(
+            "{where_}: unknown declaring case {}",
+            case.declaring_case
+        ))?;
+    if dispatch_sequence(declaring).len() != 1
+        || declaring.command_buffers.is_some()
+        || declaring.programs.is_some()
+    {
+        return Err(format!(
+            "{where_}: the declaring case must be one pass over its whole view pool"
+        )
+        .into());
+    }
+    let matches = declaring
+        .buffers
+        .iter()
+        .filter(|buffer| {
+            buffer.allocation == attachment.allocation && buffer.view == attachment.view
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "{where_}: the declaring case has to declare exactly the attachment view"
+        )
+        .into());
+    }
+    let declared = matches[0];
+    if declared.access != "read" {
+        return Err(
+            format!("{where_}: the declaring pass must only read the attachment view").into(),
+        );
+    }
+    if declared.length != u64::try_from(texels.len())? {
+        return Err(
+            format!("{where_}: attachment extent disagrees with the declaring view").into(),
+        );
     }
     Ok(())
 }
@@ -1573,6 +1946,17 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [4, 4, 1],
             [1, 1, 1],
             &[(0, "write", 64)][..],
+        ),
+        // v13: the declaring pass of the render suite reads the attachment's
+        // own allocation (the whole 2x2x4 image) and copies its first word into
+        // a second allocation, so the render submission also proves the
+        // declaring pass really read the attachment view. The attachment
+        // allocation carries no guard bytes: it is the attachment.
+        "render_declaring_copy_word" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "write", 4)][..],
         ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds
@@ -1922,6 +2306,213 @@ fn case_trace(
         encoder_dispatch_type: DispatchType::Serial,
         passes: passes.into_iter().map(TracePass::Compute).collect(),
         completion_policy: CompletionPolicy::HostReadback,
+    })
+}
+
+/// Execute one render case on the Vulkan trace rail.
+///
+/// The trace is the declaring case's own pass followed by the render pass, i.e.
+/// the shape `research/docs/23` §3.6 admits: the attachment references a view
+/// the trace declares, the declaring pass only *reads* it, and the render rail
+/// executes after the compute sequence. The attachment's bytes leave through
+/// the existing writeback channel — the render rail pushes one
+/// `BufferWriteback` for the view the trace declares — so this reports the
+/// attachment's allocation image and that one writeback and nothing else. The
+/// declaring pass's own landing belongs to the declaring case, which is what
+/// keeps an attachment observation from being confusable with a buffer
+/// writeback.
+fn run_render_case(
+    provider: &dyn PipelineProvider,
+    programs: &[CompiledComputePipeline],
+    declaring: &Case,
+    case: &RenderCase,
+    render_pipeline: &CompiledComputePipeline,
+    operation: u64,
+    guard: u8,
+) -> Result<CaseResult> {
+    let attachment = &case.attachment;
+    // The declaring pass's own resource table: one backing image and one
+    // `AllocationRecord` per allocation (`docs/23` §4.1).
+    let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut recorded = BTreeSet::new();
+    let mut resources = ResourceTableSnapshot::new();
+    for buffer in &declaring.buffers {
+        let initial = unhex(&buffer.initial_hex)?;
+        let start = usize::try_from(buffer.offset)?;
+        let position = match allocations
+            .iter()
+            .position(|(allocation, _)| *allocation == buffer.allocation)
+        {
+            Some(position) => position,
+            None => {
+                allocations.push((
+                    buffer.allocation,
+                    vec![guard; usize::try_from(buffer.allocation_size)?],
+                ));
+                allocations.len() - 1
+            }
+        };
+        if recorded.insert(buffer.allocation) {
+            resources.insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(buffer.allocation),
+                owner_epoch: provider.device_epoch(),
+                size: buffer.allocation_size,
+            })?;
+        }
+        allocations[position].1[start..start + initial.len()].copy_from_slice(&initial);
+    }
+    let views = declaring
+        .buffers
+        .iter()
+        .map(|buffer| {
+            let access = match buffer.access.as_str() {
+                "read" => BufferAccess::Read,
+                "write" => BufferAccess::Write,
+                "read_write" => BufferAccess::ReadWrite,
+                _ => return Err("unsupported access".into()),
+            };
+            let (_, backing) = allocations
+                .iter()
+                .find(|(allocation, _)| *allocation == buffer.allocation)
+                .ok_or("unknown fixture allocation")?;
+            let start = usize::try_from(buffer.offset)?;
+            let end = start + usize::try_from(buffer.length)?;
+            Ok(BufferView {
+                view_id: ViewId::new(buffer.view),
+                metal_binding: buffer.binding,
+                allocation_id: AllocationId::new(buffer.allocation),
+                offset: buffer.offset,
+                length: buffer.length,
+                access,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(backing[start..end].to_vec()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let declared = views
+        .iter()
+        .find(|view| {
+            view.view_id == ViewId::new(attachment.view)
+                && view.allocation_id == AllocationId::new(attachment.allocation)
+        })
+        .ok_or("the declaring pass does not declare the attachment view")?
+        .clone();
+
+    let mut trace = case_trace(
+        provider.device_epoch(),
+        programs,
+        declaring,
+        operation,
+        &views,
+        &[],
+        &dispatch_sequence(declaring),
+    )?;
+    let clear = unhex(
+        attachment
+            .clear_hex
+            .as_deref()
+            .ok_or("a clear attachment needs clear_hex")?,
+    )?;
+    trace.pipelines.push(render_pipeline.clone());
+    trace.passes.push(TracePass::Render(RenderPassDescriptor {
+        pipeline: render_pipeline.pipeline_id,
+        color_attachments: vec![RenderAttachment {
+            view_id: ViewId::new(attachment.view),
+            allocation_id: AllocationId::new(attachment.allocation),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: attachment.width,
+            height: attachment.height,
+            load: LoadOp::Clear(ClearColor::new(
+                clear
+                    .try_into()
+                    .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+            )),
+            store: StoreOp::Store,
+        }],
+        viewport: [
+            u32::try_from(case.viewport[0])?,
+            u32::try_from(case.viewport[1])?,
+            u32::try_from(case.viewport[2])?,
+            u32::try_from(case.viewport[3])?,
+        ],
+        vertices: u32::try_from(case.vertices)?,
+    }));
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(|error| format!("admit {}: {error:?}", case.id))?;
+    let output = provider
+        .submit(admitted)
+        .map_err(|error| format!("submit {}: {error:?}", case.id))?;
+    output.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = output.completion else {
+        return Err("render capture requires completed visible results".into());
+    };
+    if provider
+        .wait(token, Duration::ZERO)
+        .map_err(|error| format!("wait: {error:?}"))?
+        != output.completion
+    {
+        return Err("provider completion observation changed".into());
+    }
+    let mut landed = None;
+    for write in output.writebacks {
+        let (_, backing) = allocations
+            .iter_mut()
+            .find(|(id, _)| *id == write.allocation_id.get())
+            .ok_or("unknown writeback allocation")?;
+        let start = usize::try_from(write.offset)?;
+        backing[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
+        if write.view_id == declared.view_id && write.allocation_id == declared.allocation_id {
+            landed = Some(write);
+        }
+    }
+    provider
+        .release_completion(token)
+        .map_err(|error| format!("release completion: {error:?}"))?;
+    let landed = landed.ok_or("the render rail landed no attachment writeback")?;
+    // The observation is the attachment's own range: a rail that landed a
+    // different range cannot be reported as this case's texels.
+    if landed.offset != declared.offset || landed.bytes.len() as u64 != declared.length {
+        return Err(format!(
+            "render case {}: the attachment writeback covers {}..{} instead of {}..{}",
+            case.id,
+            landed.offset,
+            landed.offset + landed.bytes.len() as u64,
+            declared.offset,
+            declared.offset + declared.length
+        )
+        .into());
+    }
+    let image = allocations
+        .iter()
+        .find(|(id, _)| *id == attachment.allocation)
+        .ok_or("the attachment allocation is missing")?
+        .1
+        .clone();
+    eprintln!(
+        "render case completed: {} attachment={} bytes={}",
+        case.id,
+        hex(&landed.bytes),
+        landed.bytes.len()
+    );
+    Ok(CaseResult {
+        id: case.id.clone(),
+        completion: "CompletedVisible",
+        writebacks: vec![Writeback {
+            allocation: attachment.allocation,
+            view: attachment.view,
+            offset: landed.offset,
+            bytes_hex: hex(&landed.bytes),
+        }],
+        allocations: vec![Allocation {
+            allocation: attachment.allocation,
+            bytes_hex: hex(&image),
+        }],
+        copy_in: None,
+        copy_out: None,
+        group_counts: None,
     })
 }
 

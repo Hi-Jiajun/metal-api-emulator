@@ -1,13 +1,15 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v12 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v13 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 //
-// The render path is present but no committed suite reaches it yet: no fixture
-// declares `render_cases`, because the observable a render case reports (an
-// attachment's texels) is not part of `conformance/compare.py`'s plan model
-// until the render milestone's fixture step lands. `--render-selftest` is the
-// one path that runs it on a device today, and `conformance/RENDER-CAPTURE.md`
-// lists what a suite has to change to switch it on.
+// `conformance/suite-v13.json` is the first committed suite that declares
+// `render_cases`, and `conformance/compare.py` now has the matching attachment
+// section, so a render case reports through the same writebacks/allocations
+// shape the compute cases use. The render path itself has still never run on
+// Apple hardware: it is exercised by CI only after v13 is named on the macOS
+// rails, which `conformance/RENDER-CAPTURE.md` §4 keeps as the pending step,
+// and `--render-selftest` remains the one command that reaches the reviewed
+// fixture on a device without a suite.
 import Foundation
 import Metal
 import CoreGraphics
@@ -725,8 +727,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["sampled_texture_first_texel"]
     case "compute-buffer-v12":
         expectedIDs = ["texture_cell_local_4x4", "texture_cell_local_1x1"]
+    case "compute-buffer-v13":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v12 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v13 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

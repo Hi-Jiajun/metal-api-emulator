@@ -2,10 +2,12 @@
 
 This file describes the render side of `NativeOracle.swift` and
 `crates/metal-api-native/src/render.rs`: what the reviewed fixture is, what a
-render case looks like, what a render capture reports, and what still has to
-change before a committed suite can run one. It is a **pending** path: no
-committed suite declares render cases, both providers still refuse render
-traces, and nothing here has run on an Apple GPU.
+render case looks like, what a render capture reports, and which rails report
+one today. `conformance/suite-v13.json` is the first committed suite that
+declares render cases, `conformance/compare.py` has the matching attachment
+section, and the Vulkan trace rail executes the case end to end. Two things are
+still **pending**: the two object-API rails have no render command encoder, and
+nothing on the Apple side has run on an Apple GPU.
 
 The design it implements is `research/docs/23` §1.2 (the milestone), §3 (the
 contract), §5.1 (what the oracle needs) and §6 Steps 6–7 (where it lands).
@@ -31,7 +33,7 @@ falsifiable:
   dzn (`research/docs/23` §3.5). The Rust rail's unit tests assert both rules,
   including that the fixture carries no `0.5` literal.
 
-The module's identity is pinned **in code** in three places, because a matching
+The module's identity is pinned **in code** in four places, because a matching
 file name or an updated hash must not be enough to admit different source for
 execution:
 
@@ -40,6 +42,13 @@ execution:
 * `NativeOracle.swift`: `reviewedRenderModule()`, whose `RenderSourcePin` path
   and SHA-256 are checked against the file before any capture;
 * `NativeOracle.swift`'s `--render-selftest` expectation `40 80 c0 ff` x4.
+* `examples/metal-smoke/src/bin/provider-capture.rs`: the Vulkan rail's half —
+  the two reviewed SPIR-V stage modules (`RENDER_VERTEX_SPV`,
+  `RENDER_FRAGMENT_SPV`) and their entry names (`vertex_main`,
+  `fragment_main`). The entries differ from the MSL ones because the reviewed
+  SPIR-V sources declare them that way and core refuses a render contract whose
+  two entries share a name; the suite still pins the MSL module, i.e. the
+  identity both canonical rails compile.
 
 ## 2. A render case
 
@@ -47,14 +56,25 @@ A suite may carry a top-level `render_cases` array next to `cases`. A render
 case is not a compute case: its resource shape is one colour attachment, not a
 buffer pool, and the compute case model (`buffers`, `expected_writebacks`,
 `dispatches`) is what `conformance/compare.py` builds its plan from. Keeping the
-render cases in their own array leaves that model untouched until the fixture
-step below extends it.
+render cases in their own array leaves that model untouched.
+
+A render attachment does not declare storage: it references an existing
+resource by identity and restates the shape the pass draws into, exactly as
+`metal_api_core::provider::RenderAttachment` does. The pass that declares that
+view is a compute case of the same suite, named by `declaring_case`; the
+structural rules (`validate_serial_buffer_reuse`) resolve the attachment
+against that case's own view declarations, so the attachment has to name one of
+its views, with the same allocation and a byte range agreeing with the restated
+extent, and the declaring pass has to be read-only for it — a compute pass that
+*wrote* the view the render pass stores would make the two writers' order
+inexpressible (`research/docs/23` §3.6).
 
 ```json
 {
   "render_cases": [
     {
-      "id": "offscreen_clear_triangle_2x2",
+      "id": "offscreen_triangle_clear_2x2",
+      "declaring_case": "render_declaring_copy_word",
       "vertex_entry": "render_fullscreen_triangle",
       "fragment_entry": "render_solid_rgba8",
       "metal": {
@@ -73,18 +93,34 @@ step below extends it.
         "store": "store",
         "clear_hex": "fefefefe"
       },
-      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff"
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
+      "capture_rails": ["vulkan"]
     }
   ]
 }
 ```
 
+Field by field, against the core values the rail builds:
+
+| Suite field | Core value | Rule |
+|---|---|---|
+| `attachment.allocation` / `.view` | `RenderAttachment::allocation_id` / `view_id` | nonzero; must be declared by `declaring_case` |
+| `attachment.format` | `RenderAttachment::format` | `rgba8_unorm` only |
+| `attachment.width` / `.height` | `RenderAttachment::width` / `height` | `2` x `2` only |
+| `attachment.load` + `clear_hex` | `LoadOp::Clear(ClearColor)` | four bytes in memory order, different from the expected texel; `load: "load"` with `initial_hex` covering the whole attachment is admitted by the schema but refused by the Vulkan rail, which has no upload path yet |
+| `attachment.store` | `StoreOp::Store` | `store` only; a discarded attachment could not be compared |
+| `vertices` / `viewport` | `RenderPassDescriptor::vertices` / `viewport` | three vertices and a viewport covering the attachment |
+| `expected_hex` | `RenderAttachment::expected_bytes` | every texel identical, and different from the value the pass started from |
+| `declaring_case` | — | a `cases` entry: one submission, one dispatch, declaring the attachment view read-only |
+| `capture_rails` | — | the capture backends required to report the case; see §4 |
+
 The oracle validates this shape as a whitelist, not as a per-case table: the
 first render increment has exactly one render shape (`research/docs/23` §1.2,
 §3), so the shape *is* the review, and a fixture cannot widen it by renaming a
-case. The admitted values are one `rgba8_unorm` `2x2` attachment, three drawn
-vertices, the reviewed entry pair and module, `store` (a discarded attachment
-could not be compared), and either
+case. `conformance/compare.py` repeats the same rules when it builds the render
+plan, so a suite the oracle would refuse cannot pass the comparator either. The
+admitted values are one `rgba8_unorm` `2x2` attachment, three drawn vertices,
+the reviewed entry pair and module, `store`, and either
 
 * `load: "clear"` with a four-byte `clear_hex`, or
 * `load: "load"` with `initial_hex` covering the whole attachment.
@@ -98,45 +134,75 @@ Two falsifiability rules are enforced at load time, before a device exists:
 
 ## 3. What a render capture reports
 
-The observable is the attachment's tightly packed texel bytes, reported in the
-same shape as every other case: one `writebacks` entry
-(`allocation`, `view`, `offset: 0`, `bytes_hex`) and one `allocations` entry
-(`allocation`, `bytes_hex`) with the observed bytes. A render case therefore
-needs no second observation channel (`research/docs/23` §1.1); the comparator's
-existing byte comparison is the whole assertion.
+The observable is the attachment's own allocation, reported in the same shape as
+every other case: one `writebacks` entry (`allocation`, `view`, the declaring
+view's `offset`, `bytes_hex`) and one `allocations` entry (`allocation`,
+`bytes_hex`) holding the observed image. A render case therefore needs no second
+observation channel (`research/docs/23` §1.1); the comparator's per-texel byte
+comparison is the whole assertion. The Swift oracle's `runRenderCase` already
+reports that shape, and the Vulkan trace rail reports it from the writeback the
+render rail pushes for the view the trace declares
+(`VulkanComputeProvider::execute_render_passes`).
 
-The Swift oracle is not a provider, so the `copy_in`/`copy_out` count contract
-does not apply to it (`conformance/compare.py`, `validate_capture`). A provider
-rail that reports a render case does have to decide those counters — the Vulkan
-rail's shape is one `vkCmdCopyImageToBuffer`, i.e. `copy_out = 1`
-(`research/docs/23` §3.5, §5.3).
+The suite's `cases` entry is the *declaring* pass, so one render submission
+carries two observations' worth of work: the declaring case reports its own
+buffer landing, and the render case reports the attachment and nothing else.
+`conformance/compare.py` asserts exactly that split — the attachment's writeback
+identity set has to be the attachment's own, and the declaring case's has to be
+its buffers — which is how an attachment and a buffer writeback are kept from
+standing in for each other.
 
-## 4. Why no committed suite reaches it yet
+The count contract is derived, not stored. The declaring pass copies its touched
+allocations in and its written ones out, and the attachment allocation is one of
+the written ones: its single `vkCmdCopyImageToBuffer` readback *is* that
+allocation's copy-out, replacing the device-buffer readback the compute pool
+would otherwise do (`research/docs/23` §3.5, §5.3). So a render case expects one
+`copy_in` per touched allocation and one `copy_out` per written allocation, the
+same rule a compute case follows; the Swift oracle reports bytes without
+counters, so the contract does not apply to `native-metal`
+(`conformance/compare.py`, `validate_capture`).
 
-`conformance/compare.py` has no attachment section in its plan model,
-`examples/metal-smoke/src/bin/provider-capture.rs` has no render execution
-shape, and both providers still declare `supports_render_passes = false`, so
-admission refuses a render-bearing trace with `render_passes_unsupported`
-before any execution code runs. Committing a suite that declares render cases
-now would therefore make the oracle, the Vulkan rails and the native-provider
-rails disagree about the same fixture.
+## 4. Which rails report a render case
 
-Switching a suite on is a coordinated change. The places that have to move
-together:
+The first render increment has exactly one executable rail: the Vulkan trace
+rail. The two object-API rails have no render command encoder
+(`crates/metal-api-core/src/provider_api.rs` exposes
+`compute_command_encoder` only) and the native provider still declares
+`supports_render_passes = false`, so a render-bearing trace is refused there
+with `render_passes_unsupported` or cannot be expressed at all.
 
-| # | Place | What changes |
-|---|---|---|
-| 1 | `crates/metal-api-*/src/provider.rs` | flip `supports_render_passes` (native: only after the check in §5 passes) |
-| 2 | provider trace path | dispatch a render pass to the offscreen rail instead of the compute path |
-| 3 | `examples/metal-smoke/src/bin/provider-capture.rs` | build the render trace, `validate_suite` case ids, `copy_in`/`copy_out` |
-| 4 | `conformance/compare.py` | the attachment section in `_suite_plan`, and the render case's expected allocation |
-| 5 | `conformance/suite-vN.json` | `cases` (the declaring pass) plus `render_cases` |
-| 6 | `NativeOracle.swift` | the `loadSuite` `expectedIDs` arm for the new suite |
-| 7 | `conformance/test_oracle_coverage.py` | extend the suite/case tables to cover `render_cases` |
-| 8 | `.github/workflows/ci.yml` | name the suite on every rail and in the four version loops |
-| 9 | `tools/lavapipe-smoke.sh` discovery | nothing to edit, but the suite must land only after 2–4 |
+A render case therefore declares the capture backends that owe the attachment
+in its `capture_rails` marker:
 
-Steps 5–7 are the ones a reader can check from Linux; 1–4 need a device.
+* a rail named by the marker has to report the case — `compare.py` refuses a
+  capture from it that omits the case;
+* a rail not named by it has to omit it — a capture that reports the case
+  anyway is refused, because that observation did not come from a rail that can
+  produce one.
+
+`suite-v13.json` marks `["vulkan"]`, so the local and CI Vulkan rails report the
+attachment while `--api objects`, `--api objects --async` and every macOS rail
+report the declaring case only. `conformance/test_oracle_coverage.py` checks the
+marker against `compare.py`'s backend vocabulary and keeps the marked suite out
+of the four CI rails and version loops until the macOS half exists.
+
+The macOS half is the pending step, and it is deliberately not wired:
+
+* `NativeOracle.swift` accepts `compute-buffer-v13` and its render capture path
+  reports the attachment in exactly this shape, but the path has never run on
+  Apple hardware — `--render-selftest` (§5) and, after that,
+  `run_native.py --suite conformance/suite-v13.json` are what would turn the
+  claim into evidence;
+* the Rust native provider needs its own `supports_render_passes` flip, whose
+  condition is the same §5 check (`crates/metal-api-native/src/native.rs`);
+* `.github/workflows/ci.yml` would then need `13` in the four version loops, the
+  explicit suite lines, the native status list and the parity lines.
+
+Until that lands, the suite is run by the three Vulkan rails locally
+(`tools/lavapipe-smoke.sh` discovers it from `conformance/suite*.json`), and
+`.github/workflows/ci.yml` does not name it: no CI job depends on the macOS
+half. The coverage check keeps that split explicit rather than silent, and
+`conformance/test_suite_v13.py` holds the schema, the plan and the refusals.
 
 ## 5. The one-device check
 
@@ -173,7 +239,16 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 * that the reviewed fixture still carries the expected byte/255 constants, no
   half-integer tie, and both entry names;
 * that the Swift oracle still accepts exactly the committed suites and pins
-  exactly the committed sources (`conformance/test_oracle_coverage.py`).
+  exactly the committed sources (`conformance/test_oracle_coverage.py`);
+* that `suite-v13.json`'s attachment section is the reviewed shape, that the
+  Vulkan capture pins the reviewed SPIR-V stage pair and entries, and that a
+  tampered attachment byte, a dropped texel, a buffer writeback standing in for
+  the attachment (in either direction) and a wrong copy count are all refused
+  (`conformance/test_suite_v13.py`, run by `python3 -m unittest discover -s
+  conformance`);
+* that the render case actually executes on Lavapipe: `provider-capture --suite
+  conformance/suite-v13.json` reports
+  `4080c0ff4080c0ff4080c0ff4080c0ff`, and `compare.py --check` accepts it.
 
 **Only an Apple GPU can confirm**, and none of it has been checked yet:
 

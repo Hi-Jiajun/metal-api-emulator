@@ -298,21 +298,33 @@ executable on Linux, so `test_oracle_coverage.py` compares the three tables with
   provider capture and the three-way parity comparison) names every suite, and
   the four object-API `for version in ...; do` loops pin every version;
 - the oracle's "v1 through vN" diagnostic names the last committed suite.
+- a suite whose render cases are marked for the Vulkan trace rail only is kept
+  out of the four CI rails and the version loops on purpose; every other suite
+  still has to be named on all of them, and the marker itself is checked to name
+  no rail that cannot report an attachment yet.
 
 This is metadata consistency, not evidence: it cannot compile Swift and says
 nothing about a case body, a shader hash, GPU execution or cross-backend
-agreement. There is currently no exemption list, so a new suite or case must be
-added to all three tables; a case intended for one rail only has to change them
-deliberately and update this note. If a table is reshaped so it can no longer be
-parsed, the check fails instead of silently comparing empty sets.
+agreement. The only exemption is the render marker described above, and it has
+to be a deliberate edit to both the suite and this section. If a table is
+reshaped so it can no longer be parsed, the check fails instead of silently
+comparing empty sets.
 
-## Offscreen render capture (pending)
+## Offscreen render capture
 
-The first render increment's capture path exists on the Apple side — the native
-rail in `crates/metal-api-native/src/render.rs`, the reviewed MSL fixture
-`shaders/render_offscreen_2x2.metal`, and the oracle's `render_cases` section
-plus `--render-selftest`. No committed suite reaches it: `compare.py`,
-`provider-capture` and the CI rails have no render model yet, and both providers
-still refuse render-bearing traces. [RENDER-CAPTURE.md](RENDER-CAPTURE.md)
-records the case schema, the report shape, the one-command device check and the
-places that have to move together before a suite can declare a render case.
+[suite-v13.json](suite-v13.json) is the first suite that declares `render_cases`:
+one compute case whose pass declares the attachment view, and one render case
+that draws the reviewed full-screen triangle into a 2x2 `rgba8_unorm`
+allocation. The attachment's texels are reported through the same
+writebacks/allocations shape every compute case uses, so the comparator's
+per-texel byte comparison is the whole assertion. See
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) for the case schema field by field, the
+report shape, the count contract and the one-command device check.
+
+The Vulkan trace rail executes the case — `provider-capture --suite
+conformance/suite-v13.json` — and the two object-API rails report the declaring
+case only: they carry no render command encoder in this increment, so the
+suite's `capture_rails` marker names `vulkan` and `compare.py` requires the
+attachment exactly from that rail. Wiring the case into the macOS rails (the
+Swift oracle and the Rust native provider) is the pending step §4 of
+RENDER-CAPTURE.md lists; the render path has never run on Apple hardware.

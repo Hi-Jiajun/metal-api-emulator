@@ -36,6 +36,16 @@ WORKFLOW_PATH = REPOSITORY / ".github" / "workflows" / "ci.yml"
 SUITE_FILES = "suite*.json"
 SUITE_IDENTITY = re.compile(r"compute-buffer-v([0-9]+)")
 
+# The one capture backend that reports an attachment observation in the first
+# render increment, and the ones that still cannot: the two object-API rails
+# carry no render command encoder and the macOS rails have not run the render
+# path on Apple hardware. A render case whose marker names only `vulkan` is
+# therefore deliberately outside the macOS CI rails until
+# `conformance/RENDER-CAPTURE.md` §4 lands.
+VULKAN_TRACE_RAIL = "vulkan"
+PENDING_RENDER_RAILS = ("native-metal", "native-metal-provider",
+                        "native-metal-provider-objects", "vulkan-objects")
+
 # Every command rail in the CI workflow that writes its suites out explicitly.
 # Order matters: a parity line also contains `compare.py --suite`, and the
 # object-API lines contain a `--bin provider-capture --` prefix, so the first
@@ -118,6 +128,35 @@ def suite_fixtures():
     if not fixtures:
         raise AssertionError("no suite JSON files found in " + str(CONFORMANCE))
     return fixtures
+
+
+def locally_reported_suites():
+    """Suites whose render cases are marked for rails this checkout can run.
+
+    A suite that declares render cases and marks every one of them for the
+    Vulkan trace rail only is reported by the local/lavapipe Vulkan rails; the
+    macOS capture rails stay pending (`conformance/RENDER-CAPTURE.md` §4). The
+    marker is read from the suite JSON rather than inferred, so a suite that
+    never declares a render case keeps the full four-rail coverage, and a suite
+    that widens the marker to a macOS rail starts failing the CI-coverage tests
+    instead of silently leaving that rail behind.
+    """
+    pending = set()
+    for path in sorted(CONFORMANCE.glob(SUITE_FILES)):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        rails = set()
+        for case in document.get("render_cases", []):
+            rails.update(case["capture_rails"])
+        if rails and rails <= {VULKAN_TRACE_RAIL}:
+            pending.add(document["suite"])
+        elif rails:
+            raise AssertionError(
+                "%s marks render cases for the still-pending capture rails %s; wire them "
+                "into every CI rail first" % (document["suite"],
+                                              ", ".join(sorted(rails))))
+    if not pending:
+        raise AssertionError("no committed suite declares a Vulkan-only render case")
+    return pending
 
 
 def suite_source_pins():
@@ -282,7 +321,11 @@ class SuiteCoverageTests(unittest.TestCase):
                                  "match the committed bytes")
 
     def test_ci_rails_each_run_every_committed_suite(self):
-        fixtures = set(suite_fixtures())
+        # A suite whose render cases are marked for the Vulkan trace rail only
+        # is reported by the local Vulkan rails and stays out of the CI rails
+        # until the macOS capture step lands (`conformance/RENDER-CAPTURE.md`
+        # §4); every other suite has to be named on all four.
+        fixtures = set(suite_fixtures()) - locally_reported_suites()
         found = {name: set() for name, _ in CI_RAILS}
         for line in _workflow_lines():
             for name, marker in CI_RAILS:
@@ -298,6 +341,8 @@ class SuiteCoverageTests(unittest.TestCase):
 
     def test_ci_version_loops_pin_every_committed_suite(self):
         fixtures = suite_fixtures()
+        locally = locally_reported_suites()
+        fixtures = {identity: ids for identity, ids in fixtures.items() if identity not in locally}
         expected = {"compute-buffer-v" + str(version)
                     for version in sorted(_version(identity) for identity in fixtures)}
         loops = []
@@ -312,6 +357,29 @@ class SuiteCoverageTests(unittest.TestCase):
             with self.subTest(loop=index):
                 self.assertEqual(loop, expected, "version loop %d coverage: " % index
                                  + _suite_difference(expected, loop))
+
+    def test_render_cases_name_only_the_rails_that_can_report_them(self):
+        # The first render increment has exactly one executable rail
+        # (`research/docs/23` §1.2). A suite may therefore mark its render cases
+        # for the Vulkan trace rail only; a marker that adds a pending rail would
+        # make a capture that cannot report the attachment look compliant, so it
+        # is refused here instead.
+        marked = {}
+        for path in sorted(CONFORMANCE.glob(SUITE_FILES)):
+            document = json.loads(path.read_text(encoding="utf-8"))
+            rails = set()
+            for case in document.get("render_cases", []):
+                rails.update(case["capture_rails"])
+            if rails:
+                marked[document["suite"]] = rails
+        self.assertTrue(marked, "no committed suite declares render_cases")
+        for identity, rails in sorted(marked.items()):
+            with self.subTest(suite=identity):
+                self.assertIn(VULKAN_TRACE_RAIL, rails,
+                              identity + " must be reportable by the Vulkan trace rail")
+                self.assertEqual(rails & set(PENDING_RENDER_RAILS), set(),
+                                 identity + " names a capture rail that cannot report an "
+                                 "attachment yet")
 
     def test_oracle_supported_version_range_names_the_last_suite(self):
         # The default arm is the diagnostic a real capture prints when it is
