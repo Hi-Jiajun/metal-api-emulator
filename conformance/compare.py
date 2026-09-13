@@ -6,6 +6,7 @@ It does not attest how a capture was produced or substitute for a native run.
 """
 
 import argparse
+from collections import namedtuple
 import hashlib
 import json
 from pathlib import Path
@@ -24,6 +25,17 @@ ALLOCATION_OBSERVATIONS = {
     "vulkan-objects": "host-writeback-landing",
     "native-metal-provider-objects": "host-writeback-landing",
 }
+
+# The attachment observation a render case has to land
+# (`research/docs/23` §1.1, §5.2). `writes` and `allocations` are the same
+# shapes the compute plan builds; `touched`/`written` are the declaring pass's
+# allocations, which the count contract is derived from; `rails` is the set of
+# capture backends a suite declares this case executable on; `attachment` is
+# the `(allocation, view, offset, length)` tuple the render result has to report
+# and nothing else, which is what keeps an attachment from passing as a buffer
+# writeback.
+RenderExpectation = namedtuple(
+    "RenderExpectation", "writes allocations touched written rails attachment")
 
 
 class CaptureError(ValueError):
@@ -71,6 +83,46 @@ def _same_bytes(actual, expected, where, offset=0):
                 f"{where}: first differing byte at offset {offset + index}: "
                 f"expected 0x{right:02x}, got 0x{left:02x}"
             )
+
+
+def _compare_observation(result, expected_writes, expected_allocations, where):
+    """Check one case's writebacks and allocation images against the plan.
+
+    Both the compute and the render case report the same two surfaces, so the
+    check is shared: the writeback identities are compared as a set *and* in
+    order (the suite fixes the landing order), each writeback's bytes are
+    compared byte for byte, and every declared allocation image has to be
+    reported exactly. A capture that lands the right bytes under the wrong view
+    identity, or that drops an allocation, is refused here.
+    """
+    actual_writes, identities = [], set()
+    for value in _list(result["writebacks"], f"{where}.writebacks"):
+        identity, data = _writeback(value, f"{where} writeback")
+        _require(identity not in identities, f"{where}: duplicate writeback {identity}")
+        identities.add(identity)
+        actual_writes.append((identity, data))
+    expected_identities = [identity for identity, _ in expected_writes]
+    _require(identities == set(expected_identities),
+             f"{where}: writable set mismatch: expected {expected_identities}, "
+             f"got {[key for key, _ in actual_writes]}")
+    _require([identity for identity, _ in actual_writes] == expected_identities,
+             f"{where}: writeback order differs from suite")
+    for (identity, actual), (_, expected) in zip(actual_writes, expected_writes):
+        allocation, view, offset = identity
+        _same_bytes(actual, expected, f"{where} writeback allocation {allocation}/view {view}",
+                    offset)
+
+    seen_allocations = set()
+    for value in _list(result["allocations"], f"{where}.allocations"):
+        _object(value, ("allocation", "bytes_hex"), f"{where} allocation")
+        allocation = _integer(value["allocation"], f"{where}.allocation")
+        _require(allocation not in seen_allocations, f"{where}: duplicate allocation {allocation}")
+        _require(allocation in expected_allocations, f"{where}: unknown allocation {allocation}")
+        seen_allocations.add(allocation)
+        actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
+        _same_bytes(actual, expected_allocations[allocation], f"{where} allocation {allocation}")
+    missing = set(expected_allocations) - seen_allocations
+    _require(not missing, f"{where}: missing allocations {sorted(missing)}")
 
 
 def _writeback(value, where):
@@ -306,9 +358,157 @@ def _suite_plan(suite):
     return plan
 
 
+def _render_plan(plan, suite):
+    """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
+
+    A render case is not a compute case: its observable is one colour
+    attachment's tightly packed texels, and the pass that draws into it does not
+    declare that storage itself. The declaring pass of every render case is
+    therefore also a compute case of the same suite, and the attachment resolves
+    against that case's own resource table exactly as
+    `ComputeTrace::validate_serial_buffer_reuse` resolves it at admission
+    (`research/docs/23` §3.6).
+
+    The shape is a whitelist and not a per-case table: the first render
+    increment has exactly one render shape, so the shape *is* the review and a
+    fixture cannot widen it by renaming a case. The rules mirror the Swift
+    oracle's `validateRenderCase`, including the two falsifiability rules — the
+    expectation has to cover every texel with the same bytes, and it has to
+    differ from the value the pass started from — so a suite that
+    `NativeOracle.swift` would refuse cannot pass here either.
+    """
+    by_id = {case["id"]: case for case in suite.get("cases", [])}
+    render_plan = {}
+    for case in _list(suite.get("render_cases", []), "suite.render_cases"):
+        _require(isinstance(case, dict), "render case: expected an object")
+        case_id = _string(case.get("id"), "render case.id")
+        where = f"render case {case_id}"
+        _object(case, ("id", "declaring_case", "vertex_entry", "fragment_entry", "metal",
+                       "vertices", "viewport", "attachment", "expected_hex", "capture_rails"),
+                where)
+        _require(case_id not in plan and case_id not in render_plan,
+                 f"{where}: duplicate case")
+        declaring = _string(case["declaring_case"], f"{where}.declaring_case")
+        _require(declaring in plan and declaring in by_id,
+                 f"{where}: unknown declaring case {declaring}")
+        # A render case replays its declaring case's passes before the render
+        # pass, so the declaring case has to be one submission with one
+        # dispatch.
+        declaring_writes, _, _, group_expectations = plan[declaring]
+        _require(group_expectations is None,
+                 f"{where}: the declaring case must be one submission")
+        _require(not any(key in by_id[declaring] for key in ("programs", "dispatches",
+                                                            "command_buffers")),
+                 f"{where}: the declaring case must be one pass over its whole view pool")
+
+        source = case["metal"]
+        _object(source, ("path", "sha256"), f"{where}.metal")
+        _string(source["path"], f"{where}.metal.path")
+        _require(isinstance(source["sha256"], str)
+                 and re.fullmatch(r"[0-9a-f]{64}", source["sha256"]),
+                 f"{where}: invalid source digest")
+        vertex_entry = _string(case["vertex_entry"], f"{where}.vertex_entry")
+        fragment_entry = _string(case["fragment_entry"], f"{where}.fragment_entry")
+        _require(vertex_entry != fragment_entry,
+                 f"{where}: the vertex and fragment entries have to differ")
+
+        attachment = case["attachment"]
+        _require(isinstance(attachment, dict), f"{where}.attachment: expected an object")
+        _require(set(attachment).issubset({"allocation", "view", "format", "width", "height",
+                                          "load", "store", "clear_hex", "initial_hex"}),
+                 f"{where}.attachment: unexpected fields")
+        allocation = _integer(attachment.get("allocation"), f"{where}.attachment.allocation")
+        view = _integer(attachment.get("view"), f"{where}.attachment.view")
+        _require(allocation > 0 and view > 0, f"{where}: zero attachment identity")
+        _require(attachment.get("format") == "rgba8_unorm",
+                 f"{where}: unsupported attachment format")
+        width = _integer(attachment.get("width"), f"{where}.attachment.width", 1)
+        height = _integer(attachment.get("height"), f"{where}.attachment.height", 1)
+        _require((width, height) == (2, 2),
+                 f"{where}: the first render increment renders into a 2x2 attachment")
+        _require(attachment.get("store") == "store",
+                 f"{where}: a discarded attachment cannot be compared")
+        _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
+        viewport = _list(case["viewport"], f"{where}.viewport")
+        _require(viewport == [0, 0, width, height],
+                 f"{where}: the viewport must cover the attachment")
+        expected = _hex(case["expected_hex"], f"{where}.expected_hex")
+        _require(len(expected) == width * height * 4,
+                 f"{where}: expected texel bytes do not match the attachment")
+        texel = expected[:4]
+        # Full coverage is the milestone's whole point (`research/docs/23` §1.3):
+        # an expectation that admits different texels could be satisfied by a
+        # partially covered attachment.
+        _require(all(expected[offset:offset + 4] == texel
+                     for offset in range(0, len(expected), 4)),
+                 f"{where}: every texel of the expectation has to be the fragment output")
+        load = attachment.get("load")
+        if load == "clear":
+            clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
+            _require(len(clear) == 4, f"{where}: a clear colour is four bytes")
+            _require("initial_hex" not in attachment,
+                     f"{where}: a cleared attachment carries no initial bytes")
+            _require(clear != texel, f"{where}: the clear colour equals the expected texel")
+        elif load == "load":
+            previous = _hex(attachment.get("initial_hex"), f"{where}.attachment.initial_hex")
+            _require(len(previous) == len(expected),
+                     f"{where}: initial texels do not match the attachment")
+            _require(previous != expected,
+                     f"{where}: the initial texels equal the expectation")
+            _require("clear_hex" not in attachment,
+                     f"{where}: a loaded attachment carries no clear colour")
+        else:
+            raise CaptureError(f"{where}: unknown attachment load op {load!r}")
+
+        rails = _list(case["capture_rails"], f"{where}.capture_rails")
+        _require(rails and len(set(rails)) == len(rails)
+                 and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
+                         for rail in rails),
+                 f"{where}: capture_rails has to name distinct known backends")
+
+        # The attachment resolves against the declaring case's own table: one of
+        # its declared views has to be the attachment, it has to be read-only
+        # (a compute pass that *wrote* the view the render pass stores would make
+        # the order inexpressible), and its byte range has to agree with the
+        # extent the attachment restates.
+        declaring_buffers = by_id[declaring]["buffers"]
+        declared = [buffer for buffer in declaring_buffers
+                    if buffer["allocation"] == allocation and buffer["view"] == view]
+        _require(len(declared) == 1,
+                 f"{where}: the declaring case has to declare exactly the attachment view")
+        declared = declared[0]
+        _require(declared["access"] == "read",
+                 f"{where}: the declaring pass must only read the attachment view")
+        _require(declared["length"] == len(expected),
+                 f"{where}: attachment extent disagrees with the declaring view")
+        offset = declared["offset"]
+        size = declared["allocation_size"]
+        _require(offset + len(expected) <= size,
+                 f"{where}: the declaring view is outside its allocation")
+
+        # The allocation image is the declaring case's own image with the
+        # attachment's landing overlaid: the render result observes the whole
+        # allocation, so a guard byte or an untouched neighbour that the render
+        # pass did not store into stays part of the comparison.
+        image = bytearray(plan[declaring][1][allocation])
+        _require(len(image) == size, f"{where}: inconsistent allocation size")
+        image[offset:offset + len(expected)] = expected
+        touched = set(plan[declaring][1])
+        written = {identity[0] for identity, _ in declaring_writes} | {allocation}
+        render_plan[case_id] = RenderExpectation(
+            writes=[((allocation, view, offset), expected)],
+            allocations={allocation: bytes(image)},
+            touched=touched,
+            written=written,
+            rails=frozenset(rails),
+            attachment=(allocation, view, offset, len(expected)))
+    return render_plan
+
+
 def validate_capture(suite, digest, report, required_backend=None):
     """Raise CaptureError for invalid captures; success alone does not claim parity."""
     plan = _suite_plan(suite)
+    render_plan = _render_plan(plan, suite)
     _require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
              "suite digest: expected lowercase SHA-256")
     _object(report, ("schema_version", "suite", "suite_sha256", "backend", "allocation_observation",
@@ -348,39 +548,55 @@ def validate_capture(suite, digest, report, required_backend=None):
                  "capture result: copy_in and copy_out are recorded together")
         case_id = _string(result["id"], "capture result.id")
         where = f"case {case_id}"
-        _require(case_id in plan, f"{where}: unknown case")
+        _require(case_id in plan or case_id in render_plan, f"{where}: unknown case")
         _require(case_id not in seen, f"{where}: duplicate case")
         seen.add(case_id)
         _require(result["completion"] == "CompletedVisible",
                  f"{where}: completion must be CompletedVisible, got {result['completion']!r}")
-        expected_writes, expected_allocations, texture_count, group_expectations = plan[case_id]
-        actual_writes, identities = [], set()
-        for value in _list(result["writebacks"], f"{where}.writebacks"):
-            identity, data = _writeback(value, f"{where} writeback")
-            _require(identity not in identities, f"{where}: duplicate writeback {identity}")
-            identities.add(identity)
-            actual_writes.append((identity, data))
-        expected_identities = [identity for identity, _ in expected_writes]
-        _require(identities == set(expected_identities),
-                 f"{where}: writable set mismatch: expected {expected_identities}, got {[key for key, _ in actual_writes]}")
-        _require([identity for identity, _ in actual_writes] == expected_identities,
-                 f"{where}: writeback order differs from suite")
-        for (identity, actual), (_, expected) in zip(actual_writes, expected_writes):
-            allocation, view, offset = identity
-            _same_bytes(actual, expected, f"{where} writeback allocation {allocation}/view {view}", offset)
+        if case_id in render_plan:
+            # A render case reports one observation and one only: the
+            # attachment's own allocation and its writeback. The identity check
+            # below is the attachment-versus-buffer rule — an attachment cannot
+            # be satisfied by a buffer writeback, and a buffer writeback cannot
+            # be reported where the attachment belongs.
+            expectation = render_plan[case_id]
+            _compare_observation(result, expectation.writes, expectation.allocations, where)
+            attachment_allocation, attachment_view, attachment_offset, attachment_length = \
+                expectation.attachment
+            _require({identity for identity, _ in expectation.writes}
+                     == {(attachment_allocation, attachment_view, attachment_offset)},
+                     f"{where}: the attachment plan has to be one writeback")
+            _require(len(expectation.allocations) == 1
+                     and next(iter(expectation.allocations)) == attachment_allocation,
+                     f"{where}: the attachment plan has to be its own allocation")
+            _require(attachment_length == len(expectation.writes[0][1]),
+                     f"{where}: the attachment plan has to cover its own texels")
+            if counts[0] is not None and provider_backend:
+                # One submission carries the declaring pass and the render pass.
+                # The declaring pass copies its own allocations in and the ones
+                # it writes out; the attachment allocation is one of the written
+                # ones, and its single `vkCmdCopyImageToBuffer` readback *is*
+                # that allocation's copy-out (it replaces the device-buffer
+                # readback the pool would otherwise do), so the counts stay one
+                # per touched and one per written allocation
+                # (`research/docs/23` §3.5, §5.3).
+                expected_in = len(expectation.touched)
+                expected_out = len(expectation.written)
+                _require(counts[0] == expected_in,
+                         f"{where}: copy_in {counts[0]} does not match {expected_in} "
+                         "touched allocations")
+                _require(counts[1] == expected_out,
+                         f"{where}: copy_out {counts[1]} does not match {expected_out} "
+                         "written allocations")
+        else:
+            expected_writes, expected_allocations, texture_count, group_expectations = plan[case_id]
+            _compare_observation(result, expected_writes, expected_allocations, where)
 
-        seen_allocations = set()
-        for value in _list(result["allocations"], f"{where}.allocations"):
-            _object(value, ("allocation", "bytes_hex"), f"{where} allocation")
-            allocation = _integer(value["allocation"], f"{where}.allocation")
-            _require(allocation not in seen_allocations, f"{where}: duplicate allocation {allocation}")
-            _require(allocation in expected_allocations, f"{where}: unknown allocation {allocation}")
-            seen_allocations.add(allocation)
-            actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
-            _same_bytes(actual, expected_allocations[allocation], f"{where} allocation {allocation}")
-        missing = set(expected_allocations) - seen_allocations
-        _require(not missing, f"{where}: missing allocations {sorted(missing)}")
-
+        if case_id in render_plan:
+            if counts[0] is not None:
+                _integer(counts[0], f"{where}.copy_in")
+                _integer(counts[1], f"{where}.copy_out")
+            continue
         if provider_backend and suite["suite"] in ("compute-buffer-v11", "compute-buffer-v12"):
             _require(counts[0] is not None,
                      f"{where}: the v11/v12 count contract requires copy_in and copy_out")
@@ -443,8 +659,19 @@ def validate_capture(suite, digest, report, required_backend=None):
             _require(counts[1] == expected_out,
                      f"{where}: copy_out {counts[1]} does not match {expected_out} "
                      "written allocations")
-    missing = set(plan) - seen
+    # Every compute case is required from every rail. A render case is required
+    # only from the rails its own `capture_rails` marker names: the object-API
+    # rails carry no render command encoder and the native provider declares no
+    # render support, so those captures have no attachment observation to
+    # report. A rail that is not named must not report the case either, which is
+    # the same exact-set rule the per-result check applies.
+    required = set(plan) | {case_id for case_id, expectation in render_plan.items()
+                            if report["backend"] in expectation.rails}
+    missing = required - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
+    for case_id in sorted(set(render_plan) - required):
+        _require(case_id not in seen,
+                 f"case {case_id}: {report['backend']} is not a rail this render case runs on")
 
 
 def _unique_object(pairs):
@@ -483,10 +710,13 @@ def main(argv=None):
     try:
         raw, suite = _read_json(args.suite)
         digest = hashlib.sha256(raw).hexdigest()
+        shape = (f"{len(suite['cases'])} cases"
+                 + (f"; {len(suite['render_cases'])} render cases"
+                    if suite.get("render_cases") else ""))
         if args.check is not None:
             _, report = _read_json(args.check)
             validate_capture(suite, digest, report)
-            print(f"PASS capture: {report['backend']}; {suite['suite']}; {len(suite['cases'])} cases; "
+            print(f"PASS capture: {report['backend']}; {suite['suite']}; {shape}; "
                   f"host-visible bytes agreement with suite; allocations={report['allocation_observation']}")
         else:
             _, native = _read_json(args.native)
@@ -503,14 +733,14 @@ def main(argv=None):
                     backends.append(backend)
             if args.vulkan_objects is not None or args.metal_objects is not None:
                 print(f"PASS parity: {' / '.join(backends)}; "
-                      f"{suite['suite']}; {len(suite['cases'])} cases; host-visible bytes agreement; "
+                      f"{suite['suite']}; {shape}; host-visible bytes agreement; "
                       "Swift native GPU buffer readback / trace and object API provider host writeback landing")
             elif args.metal_provider is not None:
                 print(f"PASS parity: native-metal / vulkan / native-metal-provider; "
-                      f"{suite['suite']}; {len(suite['cases'])} cases; host-visible bytes agreement; "
+                      f"{suite['suite']}; {shape}; host-visible bytes agreement; "
                       "Swift native GPU buffer readback / Vulkan and Rust Metal provider host writeback landing")
             else:
-                print(f"PASS parity: native-metal / vulkan; {suite['suite']}; {len(suite['cases'])} cases; "
+                print(f"PASS parity: native-metal / vulkan; {suite['suite']}; {shape}; "
                       "host-visible bytes agreement; native GPU buffer readback / Vulkan host writeback landing")
         return 0
     except (CaptureError, OSError, UnicodeError, json.JSONDecodeError) as error:
