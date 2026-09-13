@@ -55,11 +55,21 @@ impl ObservationDeadline {
     }
 
     pub fn expired(&self) -> bool {
+        // A zero limit is spent the moment it exists. Testing `remaining()`
+        // alone is not enough: `Instant::elapsed()` can still read zero on a
+        // coarse clock, which would grant an expired deadline a retry window
+        // (seen on the macOS CI runner).
+        if self.limit.is_zero() {
+            return true;
+        }
         self.remaining().is_none()
     }
 
     /// Bound a caller timeout by the remaining observation window.
     pub fn clamp(&self, requested: Duration) -> Duration {
+        if self.limit.is_zero() {
+            return Duration::ZERO;
+        }
         requested.min(self.remaining().unwrap_or(Duration::ZERO))
     }
 }
