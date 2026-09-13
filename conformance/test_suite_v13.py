@@ -33,10 +33,11 @@ TEXELS = "4080c0ff" * 4
 
 # The capture backends `suite-v13.json` marks this case executable on
 # (`conformance/RENDER-CAPTURE.md` §4): every rail that owns a render execution
-# path has to report the attachment, and the two object-API rails have to omit
-# it because they expose no render command encoder.
-REPORTING_RAILS = ("vulkan", "native-metal", "native-metal-provider")
-OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
+# path has to report the attachment. The Vulkan object rail now owns one
+# (its render command encoder runs the same reviewed pass), while the native
+# object rail still exposes no render command encoder and has to omit it.
+REPORTING_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider")
+OBJECT_RAILS = ("native-metal-provider-objects",)
 
 # Read by hand from suite-v13.json: the declaring pass copies the attachment
 # view's first word (`fe fe fe fe`, the clear sentinel) into the probe view, and
@@ -236,7 +237,7 @@ class RenderObservationTests(unittest.TestCase):
             compare.validate_capture(self.suite, self.digest, report)
 
     def test_v13_refuses_a_rail_the_marker_does_not_name(self):
-        report = synthetic_capture(self.suite, self.digest, "vulkan-objects")
+        report = synthetic_capture(self.suite, self.digest, OBJECT_RAILS[0])
         report["results"].append(render_result())
         with self.assertRaisesRegex(compare.CaptureError, "not a rail this render case runs on"):
             compare.validate_capture(self.suite, self.digest, report)

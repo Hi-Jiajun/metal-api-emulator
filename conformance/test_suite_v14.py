@@ -290,7 +290,7 @@ PINNED_V14_PLAN = {
         "allocations": [[900, TEXELS]],
         "touched": [900, 920],
         "written": [900, 920],
-        "rails": sorted(["vulkan", "native-metal-provider"]),
+        "rails": sorted(["vulkan", "vulkan-objects", "native-metal-provider"]),
         "attachment": list(ATTACHMENT),
         "present": {
             "mode": "fifo",

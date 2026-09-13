@@ -185,10 +185,13 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   texture generalisation beyond the sampled fixture, presentation beyond the
   surfaceless readable-target equivalent (real surfaces and swapchains,
   multi-buffering, present modes other than FIFO, vsync, suboptimal handling),
-  the object-API present action (`research/docs/24` §6 Step 5), heaps, ICBs,
-  general MTLB function-name resolution, Windows MSL compilation, arbitrary
-  AIR/MSL compilation and reflection, and production reims integration
-  (Gate 2/3). This is not a Metal.framework ABI implementation.
+  the native object-API render/present path (the Vulkan object rail executes
+  both; `research/docs/24` §6 Step 5), heap placement and ICB execution (the
+  core value types and default-off capability gates landed in `90771cc`;
+  `research/docs/25` is the eight-step design), general MTLB function-name
+  resolution, Windows MSL compilation, arbitrary AIR/MSL compilation and
+  reflection, and production reims integration (Gate 2/3). This is not a
+  Metal.framework ABI implementation.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
 shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift

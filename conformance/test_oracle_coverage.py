@@ -36,22 +36,21 @@ WORKFLOW_PATH = REPOSITORY / ".github" / "workflows" / "ci.yml"
 SUITE_FILES = "suite*.json"
 SUITE_IDENTITY = re.compile(r"compute-buffer-v([0-9]+)")
 
-# The one capture backend that reports an attachment observation in the first
+# The capture backends that report an attachment observation in the first
 # render increment. Every render-capable rail owns a render execution path
-# (`conformance/RENDER-CAPTURE.md` §4): the Vulkan trace rail, the native
-# provider's trace rail and the Swift oracle.
+# (`conformance/RENDER-CAPTURE.md` §4): the Vulkan trace rail, the Vulkan
+# object rail (its render command encoder runs the same reviewed pass), the
+# native provider's trace rail and the Swift oracle.
 VULKAN_TRACE_RAIL = "vulkan"
-RENDER_CAPABLE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+RENDER_CAPABLE_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider")
 
 # The capture backends that still cannot carry an attachment observation: the
-# object API exposes no render command encoder
-# (`metal_api_core::provider_api` offers `compute_command_encoder` only), so a
-# render case cannot be expressed there at all. Those rails run a render-bearing
-# suite and report its declaring pass, but a marker that names one of them is
-# refused here rather than reported as compliant. Wiring one in needs a render
-# command encoder in the object API first.
+# native object API exposes no render command encoder yet, so a render case
+# cannot be expressed there. That rail runs a render-bearing suite and reports
+# its declaring pass, but a marker that names it is refused here rather than
+# reported as compliant. Wiring it in needs a render command encoder in the
+# native provider's object surface first.
 RAILS_WITHOUT_ATTACHMENT_OBSERVATION = frozenset({
-    "vulkan-objects",
     "native-metal-provider-objects",
 })
 
