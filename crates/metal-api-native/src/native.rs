@@ -66,6 +66,16 @@ struct State {
     pipelines: BTreeMap<PipelineId, RegisteredPipeline>,
     next_pipeline: u64,
     next_submission: u64,
+    /// Present targets by (allocation, view). The texture is created on the
+    /// first present and reused across submissions until the allocation's
+    /// lease is released (`research/docs/24` §6 Step 7).
+    present_targets: BTreeMap<(AllocationId, ViewId), PresentTargetRef>,
+}
+
+/// One present target's device-side texture. Held for the life of the
+/// allocation's lease, not one submission.
+struct PresentTargetRef {
+    texture: Texture,
 }
 
 #[derive(Clone)]
@@ -106,6 +116,16 @@ struct CopyCounters {
     readbacks: AtomicUsize,
 }
 
+/// Cumulative acquire/present completions of the present rail
+/// (`research/docs/24` §1.4, §5.3). The accessor mirrors
+/// [`NativeMetalProvider::buffer_copy_counts`] so the capture harness can
+/// assert "one acquire, one present" without a second observation channel.
+#[derive(Default)]
+struct PresentCounters {
+    acquires: AtomicUsize,
+    presents: AtomicUsize,
+}
+
 pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
@@ -131,8 +151,13 @@ pub struct NativeMetalProvider {
     observation_deadline: Duration,
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
+    /// Lease id → allocation id, populated on import and consumed on release,
+    /// so releasing a lease can drop the present targets reserved for its
+    /// allocation (`research/docs/24` §6 Step 7).
+    lease_allocations: Mutex<BTreeMap<LeaseId, AllocationId>>,
     borrowed: Arc<BorrowedLeaseRegistry>,
     counters: Arc<CopyCounters>,
+    present_counters: Arc<PresentCounters>,
 }
 
 impl NativeMetalProvider {
@@ -233,15 +258,18 @@ impl NativeMetalProvider {
                     pipelines: BTreeMap::new(),
                     next_pipeline: 1,
                     next_submission: 1,
+                    present_targets: BTreeMap::new(),
                 }),
                 render_pipelines: Mutex::new(BTreeMap::new()),
                 completions: Mutex::new(BTreeMap::new()),
                 counters: Arc::new(CopyCounters::default()),
+                present_counters: Arc::new(PresentCounters::default()),
                 lifecycle: Arc::new(NativeLifecycle::new()),
                 async_execution: false,
                 observation_deadline: GPU_DEADLINE,
                 completion_outbox: None,
                 staging: LeaseRegistry::new(),
+                lease_allocations: Mutex::new(BTreeMap::new()),
                 borrowed: Arc::new(BorrowedLeaseRegistry::new()),
             })
         })
@@ -1199,8 +1227,7 @@ impl NativeMetalProvider {
         // lands its texels: the attachment's view is already a written view of
         // the compute pool, so its pre-render bytes are replaced rather than
         // reported alongside.
-        let render_writebacks =
-            self.execute_render_passes(&state.device, &state.queue, &render_plan)?;
+        let render_writebacks = self.execute_render_passes(state, &render_plan)?;
         let writebacks = render::merge_writebacks(
             collect_writebacks(&pool, &resources.buffers, &self.counters),
             render_writebacks,
@@ -1268,6 +1295,18 @@ impl NativeMetalProvider {
         )
     }
 
+    /// Cumulative acquire / present completions of the present rail. The
+    /// capture harness asserts the present milestone's one acquire and one
+    /// present from this pair, the same shape `buffer_copy_counts` gives the
+    /// copy path (`research/docs/24` §1.4, §5.3).
+    #[doc(hidden)]
+    pub fn present_counts(&self) -> (usize, usize) {
+        (
+            self.present_counters.acquires.load(Ordering::Relaxed),
+            self.present_counters.presents.load(Ordering::Relaxed),
+        )
+    }
+
     /// Staged lease registry owned by this provider.
     pub fn lease_registry(&self) -> &LeaseRegistry {
         &self.staging
@@ -1276,6 +1315,29 @@ impl NativeMetalProvider {
     /// No-copy lease registry owned by this provider.
     pub fn borrowed_registry(&self) -> &BorrowedLeaseRegistry {
         &self.borrowed
+    }
+
+    /// Drop any present target reserved for the allocation of a released
+    /// lease.
+    ///
+    /// A present target lives across submissions until its allocation's lease
+    /// is released, so releasing the lease has to retire the target too
+    /// (`research/docs/24` §6 Step 7). The lease→allocation mapping is removed
+    /// in the same call, so a double release cannot retire a sibling
+    /// allocation's targets.
+    fn drop_present_targets_for(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        let allocation_id = self
+            .lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&lease_id);
+        if let Some(allocation_id) = allocation_id {
+            let mut state = self.lock()?;
+            state
+                .present_targets
+                .retain(|(allocation, _), _| *allocation != allocation_id);
+        }
+        Ok(())
     }
 
     /// Register one render pipeline: the trace-table entry a render pass names
@@ -1420,16 +1482,70 @@ impl NativeMetalProvider {
     /// (`research/docs/23` §6 Step 7).
     fn execute_render_passes(
         &self,
-        device: &Device,
-        queue: &CommandQueue,
+        state: &mut State,
         plan: &[render::TraceRenderPlan<'_>],
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
-            let texels = render::encode_offscreen_render(device, queue, &planned.plan)?;
+            let texels = match &planned.present {
+                Some(present) => self.execute_present_render(state, planned, present)?,
+                None => {
+                    render::encode_offscreen_render(&state.device, &state.queue, &planned.plan)?
+                }
+            };
             writebacks.push(planned.writeback(texels));
         }
         Ok(writebacks)
+    }
+
+    /// Execute one present action: acquire the target, preset the sentinel if
+    /// the target declares one, render the pass's attachment into it, present
+    /// it, and read the target back (`research/docs/24` §6 Step 7). The target
+    /// texture is created once and reused across submissions until the
+    /// allocation's lease is released.
+    fn execute_present_render(
+        &self,
+        state: &mut State,
+        planned: &render::TraceRenderPlan<'_>,
+        present: &render::PresentPlan<'_>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let key = (
+            present.descriptor.target.allocation_id,
+            present.descriptor.target.view_id,
+        );
+        let texture = if let Some(entry) = state.present_targets.get(&key) {
+            entry.texture.clone()
+        } else {
+            let texture = render::present_target_texture(
+                &state.device,
+                planned.plan.format,
+                planned.plan.extent,
+            )?;
+            state.present_targets.insert(
+                key,
+                PresentTargetRef {
+                    texture: texture.clone(),
+                },
+            );
+            texture
+        };
+        // acquire: take the target's ownership before the pass writes it.
+        self.present_counters
+            .acquires
+            .fetch_add(1, Ordering::Relaxed);
+        // The sentinel makes "the present never happened" falsifiable: a
+        // present that claims success without running the render reads back the
+        // sentinel, not the fragment texel (`research/docs/24` §3.1).
+        if let Some(sentinel) = &present.sentinel {
+            render::upload_texels(&texture, &planned.plan, sentinel);
+        }
+        let texels =
+            render::encode_present_render(&state.device, &state.queue, &planned.plan, &texture)?;
+        // present: hand the target on after the pass completed.
+        self.present_counters
+            .presents
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(texels)
     }
 
     fn submit_async(
@@ -1557,11 +1673,19 @@ impl LeaseImporter for NativeMetalProvider {
                 FieldValue::Unsigned(staged.reservation.lease.owner_epoch.get()),
             ));
         }
-        self.staging.import(staged)
+        let lease_id = staged.lease_id();
+        let allocation_id = staged.reservation.lease.allocation_id;
+        self.staging.import(staged)?;
+        self.lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease_id, allocation_id);
+        Ok(())
     }
 
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
-        self.staging.release(lease_id)
+        self.staging.release(lease_id)?;
+        self.drop_present_targets_for(lease_id)
     }
 }
 
@@ -1606,11 +1730,19 @@ impl NoCopyLeaseImporter for NativeMetalProvider {
                 alignment as u64,
             ));
         }
-        self.borrowed.import(borrowed)
+        let lease_id = borrowed.lease_id();
+        let allocation_id = borrowed.reservation.lease.allocation_id;
+        self.borrowed.import(borrowed)?;
+        self.lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease_id, allocation_id);
+        Ok(())
     }
 
     fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
-        self.borrowed.release(lease_id)
+        self.borrowed.release(lease_id)?;
+        self.drop_present_targets_for(lease_id)
     }
 }
 

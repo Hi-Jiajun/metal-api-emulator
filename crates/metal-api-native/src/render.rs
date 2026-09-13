@@ -35,8 +35,9 @@
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferView, BufferWriteback, ClearColor, ComputeTrace, ContractError,
-    FieldValue, LoadOp, PipelineId, PresentMode, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, ViewId,
+    FieldValue, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, StoreOp,
+    TracePass, ViewId,
 };
 use std::collections::BTreeMap;
 
@@ -99,10 +100,24 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) supported_color_formats: Vec<AttachmentFormat>,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
-    /// They stay at "cannot present" because `research/docs/24` §6 leaves the
-    /// "readable swapchain equivalent" to Step 3, so core admission refuses a
-    /// present-bearing trace with `present_targets_unsupported` instead of
-    /// running the offscreen render and silently dropping the present.
+    /// The four fields come from [`present_capability_bits`], so their flip
+    /// condition is one observation (`research/docs/24` §6 Step 7) rather than
+    /// a second set of inline literals that could drift from the comment.
+    pub(crate) supports_presentation: bool,
+    pub(crate) max_present_targets: u32,
+    pub(crate) supported_present_modes: Vec<PresentMode>,
+    pub(crate) max_present_image_count: u32,
+}
+
+/// The present bits the provider declares, in one value so the macOS
+/// capability snapshot and the host-side unit tests cannot drift.
+///
+/// Split out from the render bits because the flip condition is a separate
+/// single-device observation: the Swift oracle's `--present-selftest` on an
+/// Apple GPU, exactly as the render bits rest on `--render-selftest`
+/// (`research/docs/24` §6 Step 7).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PresentCapabilityBits {
     pub(crate) supports_presentation: bool,
     pub(crate) max_present_targets: u32,
     pub(crate) supported_present_modes: Vec<PresentMode>,
@@ -119,11 +134,35 @@ pub(crate) struct RenderCapabilityBits {
 /// whose log said `SKIP` would not be that evidence, because it reports a runner
 /// without an eligible device rather than an executed reviewed path.
 pub(crate) fn capability_bits() -> RenderCapabilityBits {
+    let present = present_capability_bits();
     RenderCapabilityBits {
         supports_render_passes: true,
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+        supports_presentation: present.supports_presentation,
+        max_present_targets: present.max_present_targets,
+        supported_present_modes: present.supported_present_modes,
+        max_present_image_count: present.max_present_image_count,
+    }
+}
+
+/// The present bits this provider declares as of the Step 7 flip.
+///
+/// They stay at "cannot present" so core admission refuses a present-bearing
+/// trace with `present_targets_unsupported` instead of running the offscreen
+/// render and silently dropping the present (`research/docs/24` §4.2). The
+/// flip is one change here plus the comment below: set `supports_presentation:
+/// true`, `max_present_targets: MAX_PRESENT_TARGETS`,
+/// `supported_present_modes: PresentMode::ADMITTED.to_vec()` and
+/// `max_present_image_count: MAX_PRESENT_IMAGE_COUNT`, once the Swift oracle's
+/// `--present-selftest` runs on an Apple GPU in CI and reports
+/// `present_selftest: PASS` (the reviewed 2x2 target read back as `4080c0ff`
+/// four times, never the `fefefefe` sentinel). A green job whose log said
+/// `SKIP` is not that evidence: it reports a runner without an eligible
+/// device, not an executed reviewed present path.
+pub(crate) fn present_capability_bits() -> PresentCapabilityBits {
+    PresentCapabilityBits {
         supports_presentation: false,
         max_present_targets: 0,
         supported_present_modes: Vec::new(),
@@ -264,6 +303,11 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// Tightly packed texels the attachment already holds, for [`LoadOp::Load`].
     /// Required exactly then, refused for a clear.
     pub(crate) initial: Option<&'a [u8]>,
+    /// Whether the pass hands its attachment on through a present action.
+    /// A present pass's `Load` keeps the present target's initial state — the
+    /// sentinel preset by the present path, or undefined — so no `initial`
+    /// bytes are required here (`research/docs/24` §3.1).
+    pub(crate) present: bool,
 }
 
 /// Everything the encoder needs, decided before the first Metal object exists.
@@ -350,10 +394,10 @@ pub(crate) fn plan<'a>(
             .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
     let load = load_action(attachment.load, format)?;
     let store = store_action(attachment.store)?;
-    let initial = match (load, request.initial) {
-        (RenderLoadAction::Clear(_), None) => None,
-        (RenderLoadAction::Load, Some(bytes)) if bytes.len() == texel_bytes => Some(bytes),
-        (RenderLoadAction::Load, Some(bytes)) => {
+    let initial = match (load, request.initial, request.present) {
+        (RenderLoadAction::Clear(_), None, _) => None,
+        (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
+        (RenderLoadAction::Load, Some(bytes), _) => {
             return Err(
                 args_refusal("render_attachment_initial_mismatch").with_detail(format!(
                     "LoadOp::Load needs {texel_bytes} tightly packed bytes, got {}",
@@ -361,11 +405,12 @@ pub(crate) fn plan<'a>(
                 )),
             );
         }
-        (RenderLoadAction::Load, None) => {
+        (RenderLoadAction::Load, None, true) => None,
+        (RenderLoadAction::Load, None, false) => {
             return Err(args_refusal("render_attachment_initial_mismatch")
                 .with_detail("LoadOp::Load needs the attachment's previous texels"));
         }
-        (RenderLoadAction::Clear(_), Some(_)) => {
+        (RenderLoadAction::Clear(_), Some(_), _) => {
             return Err(args_refusal("render_attachment_initial_mismatch")
                 .with_detail("LoadOp::Clear writes every texel, so initial bytes are refused"));
         }
@@ -576,6 +621,24 @@ pub(crate) struct TraceRenderPlan<'a> {
     pub(crate) contract: &'a RenderPipelineContract,
     pub(crate) landing: &'a BufferView,
     pub(crate) plan: RenderPlan<'a>,
+    /// The present action hanging off this pass, if any, with its sentinel
+    /// already expanded to the target's whole texel extent so the macOS
+    /// present path only has to upload it (`research/docs/24` §3.1, §6 Step 7).
+    pub(crate) present: Option<PresentPlan<'a>>,
+}
+
+/// One present action, planned before the first Metal object exists.
+///
+/// The descriptor is borrowed from the pass it hands on, and the sentinel is
+/// the expanded byte string the present path presets into the target before
+/// the render runs. `None` means the target declares [`InitialState::Undefined`]
+/// and holds whatever the device gave it (`research/docs/24` §3.1).
+#[derive(Debug)]
+pub(crate) struct PresentPlan<'a> {
+    /// The present descriptor the pass carries.
+    pub(crate) descriptor: &'a PresentDescriptor,
+    /// The sentinel texel replicated across the whole target, or `None`.
+    pub(crate) sentinel: Option<Vec<u8>>,
 }
 
 impl TraceRenderPlan<'_> {
@@ -624,7 +687,13 @@ pub(crate) fn plan_trace<'a>(
         let Some(attachment) = pass.color_attachments.first() else {
             return Err(contract_refusal(ContractError::EmptyAttachmentList));
         };
-        admit_trace_load(attachment.load)?;
+        // An offscreen pass has no channel for previous contents, so a `Load`
+        // would silently become a clear. A present pass's `Load` keeps the
+        // target's initial state, which the present path supplies, so it is
+        // refused only when the pass does not present (`research/docs/24` §3.1).
+        if pass.present.is_none() {
+            admit_trace_load(attachment.load)?;
+        }
         // An attachment that no buffer view covers has no landing rail: the
         // texels would have nowhere to go, so the pass is refused instead of
         // being executed and dropped.
@@ -650,12 +719,28 @@ pub(crate) fn plan_trace<'a>(
             pipeline: contract,
             source: REVIEWED_SOURCE,
             initial: None,
+            present: pass.present.is_some(),
         })?;
+        let present = pass.present.as_ref().map(|descriptor| {
+            let sentinel = descriptor.target.initial.sentinel().map(|texel| {
+                let texels = usize::try_from(
+                    u64::from(plan_of_pass.extent[0])
+                        .saturating_mul(u64::from(plan_of_pass.extent[1])),
+                )
+                .unwrap_or(0);
+                texel.repeat(texels)
+            });
+            PresentPlan {
+                descriptor,
+                sentinel,
+            }
+        });
         planned.push(TraceRenderPlan {
             pass,
             contract,
             landing,
             plan: plan_of_pass,
+            present,
         });
     }
     Ok(planned)
@@ -703,7 +788,8 @@ pub(crate) fn execute_offscreen_render(
 /// Split from [`execute_offscreen_render`] so the trace path can plan once
 /// ([`plan_trace`], before the compute command buffer is committed) and then
 /// encode that same decision, instead of planning a second, possibly different,
-/// pass.
+/// pass. The attachment is fresh per pass: it is created here and dropped with
+/// the readback, which is the offscreen shape (`research/docs/23` §6 Step 7).
 #[cfg(target_os = "macos")]
 pub(crate) fn encode_offscreen_render(
     device: &Device,
@@ -712,60 +798,91 @@ pub(crate) fn encode_offscreen_render(
 ) -> Result<Vec<u8>, ProviderError> {
     objc::rc::autoreleasepool(|| {
         let attachment = attachment_texture(device, planned)?;
-        let pipeline = render_pipeline_state(device, planned)?;
-        // The pass descriptor is autoreleased; it only has to outlive the
-        // encoder creation below.
-        let pass = MetalRenderPassDescriptor::new();
-        let color = pass
-            .color_attachments()
-            .object_at(0)
-            .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))?;
-        color.set_texture(Some(attachment.as_ref()));
-        match planned.load {
-            RenderLoadAction::Clear(components) => {
-                color.set_load_action(MTLLoadAction::Clear);
-                color.set_clear_color(MTLClearColor::new(
-                    components[0],
-                    components[1],
-                    components[2],
-                    components[3],
-                ));
-            }
-            RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
-        }
-        color.set_store_action(MTLStoreAction::Store);
-        // The command buffer and the encoder are autoreleased and the rail is
-        // synchronous, so neither has to be retained: nothing here outlives this
-        // pool.
-        let command = queue.new_command_buffer();
-        let encoder = command.new_render_command_encoder(pass);
-        encoder.set_render_pipeline_state(&pipeline);
-        // The viewport is explicit because the contract carries it, even though
-        // the first increment only accepts the attachment-covering default.
-        encoder.set_viewport(MTLViewport {
-            originX: f64::from(planned.viewport[0]),
-            originY: f64::from(planned.viewport[1]),
-            width: f64::from(planned.viewport[2]),
-            height: f64::from(planned.viewport[3]),
-            znear: 0.0,
-            zfar: 1.0,
-        });
-        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices));
-        encoder.end_encoding();
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            // `MTLCommandBufferStatus` is a `#[repr(u32)]` enum, so the numeric
-            // status is the diagnostic a field-less error can carry.
-            let status = command.status() as u32;
-            return Err(resource_refusal("metal_render_command_failed")
-                .with_detail(format!("command buffer ended with status {status}")));
-        }
-        read_texels(&attachment, planned)
+        encode_into_and_readback(device, queue, planned, &attachment)
     })
 }
 
-/// The colour attachment this rail renders into.
+/// Encode, commit and read back one already planned present pass into the
+/// caller-held target texture.
+///
+/// The target is the present action's own texture, held by (allocation, view)
+/// across submissions (`research/docs/24` §6 Step 7); this function renders the
+/// pass's attachment into it and reads the target back after `wait`, but it
+/// neither creates nor destroys the texture. The acquire/present counts live in
+/// `native.rs`, which calls this between its two counter increments.
+#[cfg(target_os = "macos")]
+pub(crate) fn encode_present_render(
+    device: &Device,
+    queue: &CommandQueue,
+    planned: &RenderPlan<'_>,
+    target: &Texture,
+) -> Result<Vec<u8>, ProviderError> {
+    objc::rc::autoreleasepool(|| encode_into_and_readback(device, queue, planned, target))
+}
+
+/// The shared encoder body of the offscreen and present rails: build the
+/// reviewed pipeline, render the pass into `target`, wait for a terminal
+/// command-buffer status, and read the texels back.
+#[cfg(target_os = "macos")]
+fn encode_into_and_readback(
+    device: &Device,
+    queue: &CommandQueue,
+    planned: &RenderPlan<'_>,
+    target: &Texture,
+) -> Result<Vec<u8>, ProviderError> {
+    let pipeline = render_pipeline_state(device, planned)?;
+    // The pass descriptor is autoreleased; it only has to outlive the
+    // encoder creation below.
+    let pass = MetalRenderPassDescriptor::new();
+    let color = pass
+        .color_attachments()
+        .object_at(0)
+        .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))?;
+    color.set_texture(Some(target));
+    match planned.load {
+        RenderLoadAction::Clear(components) => {
+            color.set_load_action(MTLLoadAction::Clear);
+            color.set_clear_color(MTLClearColor::new(
+                components[0],
+                components[1],
+                components[2],
+                components[3],
+            ));
+        }
+        RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
+    }
+    color.set_store_action(MTLStoreAction::Store);
+    // The command buffer and the encoder are autoreleased and the rail is
+    // synchronous, so neither has to be retained: nothing here outlives this
+    // pool.
+    let command = queue.new_command_buffer();
+    let encoder = command.new_render_command_encoder(pass);
+    encoder.set_render_pipeline_state(&pipeline);
+    // The viewport is explicit because the contract carries it, even though
+    // the first increment only accepts the attachment-covering default.
+    encoder.set_viewport(MTLViewport {
+        originX: f64::from(planned.viewport[0]),
+        originY: f64::from(planned.viewport[1]),
+        width: f64::from(planned.viewport[2]),
+        height: f64::from(planned.viewport[3]),
+        znear: 0.0,
+        zfar: 1.0,
+    });
+    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices));
+    encoder.end_encoding();
+    command.commit();
+    command.wait_until_completed();
+    if command.status() != MTLCommandBufferStatus::Completed {
+        // `MTLCommandBufferStatus` is a `#[repr(u32)]` enum, so the numeric
+        // status is the diagnostic a field-less error can carry.
+        let status = command.status() as u32;
+        return Err(resource_refusal("metal_render_command_failed")
+            .with_detail(format!("command buffer ended with status {status}")));
+    }
+    read_texels(target, planned)
+}
+
+/// The colour attachment or present target this rail renders into.
 ///
 /// `usage = RenderTarget` states what the texture is for, and the shared storage
 /// mode is what makes the texels CPU-visible for the readback on the
@@ -773,11 +890,28 @@ pub(crate) fn encode_offscreen_render(
 /// texture rail uses shared storage (`research/docs/16` §4.8).
 #[cfg(target_os = "macos")]
 fn attachment_texture(device: &Device, planned: &RenderPlan<'_>) -> Result<Texture, ProviderError> {
+    let texture = present_target_texture(device, planned.format, planned.extent)?;
+    if let Some(bytes) = planned.initial {
+        upload_texels(&texture, planned, bytes);
+    }
+    Ok(texture)
+}
+
+/// One render target texture, built for an offscreen attachment or a present
+/// target. A present target is created once and then reused across submissions,
+/// which is why this creation is split from the initial upload
+/// (`research/docs/24` §6 Step 7).
+#[cfg(target_os = "macos")]
+pub(crate) fn present_target_texture(
+    device: &Device,
+    format: RenderPixelFormat,
+    extent: [u32; 2],
+) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(metal_pixel_format(planned.format));
-    descriptor.set_width(u64::from(planned.extent[0]));
-    descriptor.set_height(u64::from(planned.extent[1]));
+    descriptor.set_pixel_format(metal_pixel_format(format));
+    descriptor.set_width(u64::from(extent[0]));
+    descriptor.set_height(u64::from(extent[1]));
     descriptor.set_mipmap_level_count(1);
     descriptor.set_usage(MTLTextureUsage::RenderTarget);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
@@ -786,20 +920,25 @@ fn attachment_texture(device: &Device, planned: &RenderPlan<'_>) -> Result<Textu
     if pointer.is_null() {
         return Err(resource_refusal("metal_render_target_allocation_failed"));
     }
-    let texture = unsafe { Texture::from_ptr(pointer) };
-    if let Some(bytes) = planned.initial {
-        // `replace_region` takes the source stride and owns the texture-side
-        // layout, so this upload cannot repeat the Vulkan rail's defect: there
-        // the host had to guess the destination row pitch, while Metal keeps that
-        // distance inside the driver (`research/docs/16` §4.8).
-        texture.replace_region(
-            region(planned),
-            0,
-            bytes.as_ptr().cast(),
-            NSUInteger::try_from(planned.row_pitch).unwrap_or(NSUInteger::MAX),
-        );
-    }
-    Ok(texture)
+    Ok(unsafe { Texture::from_ptr(pointer) })
+}
+
+/// Upload tightly packed texels into a texture's whole extent.
+///
+/// `replace_region` takes the source stride and owns the texture-side layout,
+/// so this upload cannot repeat the Vulkan rail's defect: there the host had to
+/// guess the destination row pitch, while Metal keeps that distance inside the
+/// driver (`research/docs/16` §4.8). The present path uses this for the
+/// sentinel preset that makes "the present never happened" falsifiable
+/// (`research/docs/24` §3.1).
+#[cfg(target_os = "macos")]
+pub(crate) fn upload_texels(texture: &Texture, planned: &RenderPlan<'_>, bytes: &[u8]) {
+    texture.replace_region(
+        region(planned),
+        0,
+        bytes.as_ptr().cast(),
+        NSUInteger::try_from(planned.row_pitch).unwrap_or(NSUInteger::MAX),
+    );
 }
 
 /// The two-stage pipeline state of the reviewed module.
@@ -883,12 +1022,12 @@ fn resource_refusal(slug: &'static str) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AliasMode, AllocationId, AllocationRecord, BufferAccess, BufferBindingContract,
-        BufferSource, CompiledComputePipeline, CompletionPolicy, ComputePass, DeviceEpoch,
-        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
-        OperationId, PipelineContract, ProviderCapabilities, RenderAttachment,
-        ResourceTableSnapshot, SemanticDigest, StorageMode, VertexLayout, ViewId,
-        PROVIDER_SCHEMA_VERSION,
+        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BufferAccess,
+        BufferBindingContract, BufferSource, CompiledComputePipeline, CompletionPolicy,
+        ComputePass, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
+        FunctionIdentity, FunctionSource, InitialState, OperationId, PipelineContract,
+        PresentTarget, ProviderCapabilities, RenderAttachment, ResourceTableSnapshot,
+        SemanticDigest, StorageMode, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -940,6 +1079,7 @@ mod tests {
             pipeline,
             source: REVIEWED_SOURCE,
             initial,
+            present: false,
         }
     }
 
@@ -957,6 +1097,7 @@ mod tests {
             pipeline: &pipeline,
             source,
             initial: None,
+            present: false,
         };
         plan(&request).map(|_| ()).unwrap_err()
     }
@@ -1301,6 +1442,38 @@ mod tests {
         (trace, resources)
     }
 
+    /// The milestone's present pass: the same 2x2 attachment, but with a
+    /// `Load` that keeps the present target's sentinel and a present action
+    /// handing that target on (`research/docs/24` §3.1, §3.5 shape one).
+    fn milestone_present_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(LoadOp::Load);
+        pass.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(9),
+                view_id: ViewId::new(7),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Sentinel(vec![0xfe, 0xfe, 0xfe, 0xfe]),
+            },
+            source: ViewId::new(7),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        pass
+    }
+
+    /// The milestone's present-bearing trace and resource namespace.
+    fn milestone_present_trace() -> (ComputeTrace, ResourceTableSnapshot) {
+        let (mut trace, resources) = milestone_trace(LoadOp::Clear(sentinel()));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        *pass = milestone_present_pass();
+        (trace, resources)
+    }
+
     /// The capability snapshot the macOS provider builds, with the render bits
     /// taken from the value under test and the compute bits from `native.rs`.
     fn capabilities(bits: &RenderCapabilityBits) -> ProviderCapabilities {
@@ -1393,6 +1566,67 @@ mod tests {
         assert_eq!(refused.slug, "render_passes_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(refused.phase, ProviderPhase::Resolve);
+    }
+
+    /// The present bits stay at their defaults, so a present-bearing trace is
+    /// refused in the second admission gate (`present_targets_unsupported`)
+    /// before any resource action. Flipping them is a separate Apple-GPU
+    /// observation (`research/docs/24` §6 Step 7), not a silent side effect.
+    #[test]
+    fn the_current_snapshot_refuses_a_present_bearing_trace() {
+        let bits = capability_bits();
+        assert!(!bits.supports_presentation);
+        assert_eq!(bits.max_present_targets, 0);
+        assert!(bits.supported_present_modes.is_empty());
+        assert_eq!(bits.max_present_image_count, 0);
+
+        let (trace, resources) = milestone_present_trace();
+        let refused = capabilities(&bits).admit(&trace, &resources).unwrap_err();
+        assert_eq!(refused.slug, "present_targets_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        // The refusal names the number of present actions the snapshot would
+        // have to drop.
+        assert_eq!(
+            refused.fields.get("targets"),
+            Some(&FieldValue::Unsigned(1))
+        );
+    }
+
+    /// The host-side half of the present plan: the descriptor is borrowed from
+    /// the pass and the sentinel is expanded to the target's whole extent, so
+    /// the macOS present path only has to upload it.
+    #[test]
+    fn plan_trace_plans_the_present_action_and_expands_the_sentinel() {
+        let (trace, _) = milestone_present_trace();
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned =
+            plan_trace(&trace, &pool, &contracts).expect("the reviewed present pass plans");
+        assert_eq!(planned.len(), 1);
+        let [planned] = planned.as_slice() else {
+            panic!("the present trace carries one render pass");
+        };
+        let present = planned
+            .present
+            .as_ref()
+            .expect("the pass carries a present");
+        assert_eq!(present.descriptor.source, ViewId::new(7));
+        assert_eq!(
+            present.descriptor.target.allocation_id,
+            AllocationId::new(9)
+        );
+        assert_eq!(present.descriptor.target.view_id, ViewId::new(7));
+        assert_eq!(present.descriptor.mode, PresentMode::Fifo);
+        assert_eq!(present.descriptor.acquire, AcquirePolicy::Blocking);
+        // The one-texel sentinel is replicated across the 2x2 target.
+        assert_eq!(
+            present.sentinel.as_deref(),
+            Some([0xfe, 0xfe, 0xfe, 0xfe].repeat(4).as_slice())
+        );
+        // The present pass keeps the target's sentinel through a `Load`, which
+        // is the load op the present path can honour (`research/docs/24` §3.1).
+        assert!(matches!(planned.plan.load, RenderLoadAction::Load));
     }
 
     /// The host-side half of the trace path: the plan a device-free host can
