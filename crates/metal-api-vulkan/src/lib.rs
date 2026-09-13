@@ -3419,7 +3419,7 @@ mod tests {
             pipeline,
             buffers: vec![metal_api_core::BufferBinding {
                 index: 0,
-                bytes: vec![0_u8; 4],
+                bytes: vec![0_u8; 64],
             }],
             textures: vec![texture],
             threads_per_grid: metal_api_core::Size::new(1, 1, 1).unwrap(),
@@ -3427,7 +3427,10 @@ mod tests {
         };
         let updates = executor.execute(submission).expect("texture read executes");
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].bytes, 0_u32.to_le_bytes());
+        // The fixture declares a 64-byte output buffer; a 1x1 dispatch writes
+        // only its first word.
+        assert_eq!(updates[0].bytes.len(), 64);
+        assert_eq!(updates[0].bytes[..4], 0_u32.to_le_bytes());
     }
 
     fn serial_fixture() -> (
