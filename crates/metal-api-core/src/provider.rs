@@ -410,6 +410,102 @@ impl DirtySet {
     }
 }
 
+/// One owner-registered guest window: a lease reservation plus the state that
+/// decides when its host mapping may be reclaimed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestWindow {
+    pub lease: LeaseId,
+    pub allocation_id: AllocationId,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowState {
+    Active,
+    Retired,
+}
+
+/// Owner-side lifecycle for guest windows (`research/docs/19` step 4): a
+/// window is active while any in-flight submission may touch it, becomes
+/// retired when the lease observation says every reservation is known to be
+/// retired, and only then may its host mapping be reclaimed. Reclamation is
+/// explicit and returns the window, so the caller cannot silently drop the
+/// backing of an active window.
+#[derive(Debug, Default)]
+pub struct GuestWindows {
+    windows: BTreeMap<LeaseId, (GuestWindow, WindowState)>,
+}
+
+impl GuestWindows {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// Register one window before its lease is imported.
+    pub fn register(&mut self, window: GuestWindow) -> Result<(), ContractError> {
+        if window.lease.is_zero() {
+            return Err(ContractError::InvalidIdentity("guest window lease id"));
+        }
+        if window.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("guest window allocation id"));
+        }
+        if window.length == 0 {
+            return Err(ContractError::ZeroLength("guest window"));
+        }
+        if self
+            .windows
+            .insert(window.lease, (window, WindowState::Active))
+            .is_some()
+        {
+            return Err(ContractError::DuplicateLease(window.lease));
+        }
+        Ok(())
+    }
+
+    /// Record that the lease observation retired every reservation of this
+    /// window. Retirement is idempotent; unknown windows are refused so a
+    /// stray observation cannot mark another owner's window.
+    pub fn retire(&mut self, lease: LeaseId) -> Result<(), ContractError> {
+        let entry = self
+            .windows
+            .get_mut(&lease)
+            .ok_or(ContractError::UnknownLease(lease))?;
+        entry.1 = WindowState::Retired;
+        Ok(())
+    }
+
+    /// Whether the window may be reclaimed now.
+    pub fn is_reclaimable(&self, lease: LeaseId) -> bool {
+        matches!(self.windows.get(&lease), Some((_, WindowState::Retired)))
+    }
+
+    /// Remove and return a retired window's registration. An active window is
+    /// refused and left registered, which is the invariant that keeps a host
+    /// mapping alive while anything may still touch it.
+    pub fn reclaim(&mut self, lease: LeaseId) -> Result<GuestWindow, ContractError> {
+        if !self.is_reclaimable(lease) {
+            if self.windows.contains_key(&lease) {
+                return Err(ContractError::GuestWindowStillActive(lease));
+            }
+            return Err(ContractError::UnknownLease(lease));
+        }
+        Ok(self
+            .windows
+            .remove(&lease)
+            .expect("reclaimable window is registered")
+            .0)
+    }
+}
+
 /// How the caller supplies a buffer's initial contents.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BufferSource {
@@ -2973,6 +3069,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
         E::NullHostPointer(_) => (ProviderErrorClass::Args, "borrowed_host_pointer_null"),
+        E::GuestWindowStillActive(_) => (ProviderErrorClass::Resource, "guest_window_still_active"),
         E::InvalidHostRegionPageSize(_)
         | E::UnalignedHostRegion { .. }
         | E::HostRegionWindowOutOfBounds { .. } => {
@@ -3285,6 +3382,7 @@ pub enum ContractError {
         actual: u64,
     },
     NullHostPointer(LeaseId),
+    GuestWindowStillActive(LeaseId),
     InvalidHostRegionPageSize(u64),
     UnalignedHostRegion {
         field: &'static str,
@@ -3472,6 +3570,10 @@ impl fmt::Display for ContractError {
             Self::NullHostPointer(lease) => {
                 write!(formatter, "lease {lease:?} borrowed host pointer is null")
             }
+            Self::GuestWindowStillActive(lease) => write!(
+                formatter,
+                "guest window {lease:?} is still active and cannot be reclaimed"
+            ),
             Self::InvalidHostRegionPageSize(page_size) => write!(
                 formatter,
                 "host region page size {page_size} must be a nonzero power of two"
@@ -3911,6 +4013,75 @@ mod tests {
             shader_capabilities: Vec::new(),
             translator_revision: None,
         }
+    }
+
+    #[test]
+    fn guest_windows_refuse_reclaim_before_retirement() {
+        let mut windows = GuestWindows::new();
+        let window = GuestWindow {
+            lease: LeaseId::new(51),
+            allocation_id: AllocationId::new(61),
+            offset: 0,
+            length: 0x2000,
+        };
+        windows.register(window).expect("register");
+        assert_eq!(windows.len(), 1);
+        assert!(!windows.is_reclaimable(window.lease));
+        // Reclaiming an active window must fail and leave it registered.
+        assert!(matches!(
+            windows.reclaim(window.lease),
+            Err(ContractError::GuestWindowStillActive(LeaseId(51)))
+        ));
+        assert_eq!(windows.len(), 1);
+
+        windows.retire(window.lease).expect("retire");
+        assert!(windows.is_reclaimable(window.lease));
+        assert_eq!(windows.reclaim(window.lease).expect("reclaim"), window);
+        assert!(windows.is_empty());
+
+        // Unknown or malformed registrations are refused.
+        assert!(matches!(
+            windows.retire(LeaseId::new(99)),
+            Err(ContractError::UnknownLease(LeaseId(99)))
+        ));
+        assert!(matches!(
+            windows.register(GuestWindow {
+                lease: LeaseId::new(0),
+                allocation_id: AllocationId::new(61),
+                offset: 0,
+                length: 0x1000,
+            }),
+            Err(ContractError::InvalidIdentity("guest window lease id"))
+        ));
+        assert!(matches!(
+            windows.register(GuestWindow {
+                lease: LeaseId::new(52),
+                allocation_id: AllocationId::new(61),
+                offset: 0,
+                length: 0,
+            }),
+            Err(ContractError::ZeroLength("guest window"))
+        ));
+        windows
+            .register(GuestWindow {
+                lease: LeaseId::new(53),
+                allocation_id: AllocationId::new(61),
+                offset: 0,
+                length: 0x1000,
+            })
+            .expect("register");
+        assert!(matches!(
+            windows.register(GuestWindow {
+                lease: LeaseId::new(53),
+                allocation_id: AllocationId::new(62),
+                offset: 0,
+                length: 0x1000,
+            }),
+            Err(ContractError::DuplicateLease(LeaseId(53)))
+        ));
+        // Retirement is idempotent.
+        windows.retire(LeaseId::new(53)).expect("retire");
+        windows.retire(LeaseId::new(53)).expect("retire again");
     }
 
     #[test]
