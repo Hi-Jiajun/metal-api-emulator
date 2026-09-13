@@ -467,6 +467,19 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
+    case "render_declaring_copy_word":
+        // v13's declaring case: the same reviewed copy kernel, but its read
+        // view covers the 16 attachment bytes the render case stores into, so
+        // the attachment is reported through the existing writeback channel
+        // (`conformance/RENDER-CAPTURE.md` §3) rather than a new one.
+        try require(definition.entry == "copy_word"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "render_declaring_copy_word: unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 2,
+                    "render_declaring_copy_word: expected two buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 16 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
+                    "render_declaring_copy_word: expected a 16-byte read buffer at 0 and a 4-byte write buffer at 1")
     case "indexed_boundary", "indexed_tail", "indexed_full", "indexed_small_grid", "indexed_unit":
         let expectedLocal: [UInt64]
         switch definition.id {
