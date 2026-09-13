@@ -122,7 +122,10 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub extent: [u32; 2],
     /// The `LoadOp::Clear` value. Carried as bytes for the same reason the
     /// contract carries bytes: a float clear is not parity-stable
-    /// (`research/docs/23` §3.5).
+    /// (`research/docs/23` §3.5). The bytes are in the attachment format's
+    /// *memory* order; [`clear_value_for`] maps them onto Vulkan's component
+    /// order, which is not the same thing (`Bgra8Unorm` needs a swap, and
+    /// `R32Float` is one component, not four).
     pub clear: ClearColor,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
@@ -366,6 +369,47 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
     })
 }
 
+/// Map a contract [`ClearColor`] onto the `VkClearColorValue` components for an
+/// admitted attachment format.
+///
+/// The contract's bytes are in the format's **memory** order (that is what the
+/// readback compares against), while `VkClearColorValue` takes **component**
+/// values: `Bgra8Unorm` therefore needs its red and blue components swapped,
+/// and `R32Float` is a single component whose bits are the contract's four
+/// bytes reinterpreted, not four components. Getting this wrong is silent: a
+/// clear value is only observable where the fragment stage does not store, so
+/// a wrong conversion survives every full-coverage fixture. The `R32Uint` arm
+/// exists to keep the match exhaustive; the format is refused long before a
+/// clear value is built.
+pub(crate) fn clear_value_for(format: AttachmentFormat, clear: ClearColor) -> vk::ClearColorValue {
+    let bytes = clear.bytes;
+    let unorm = |byte: u8| f32::from(byte) / 255.0;
+    match format {
+        AttachmentFormat::Rgba8Unorm => vk::ClearColorValue {
+            float32: [
+                unorm(bytes[0]),
+                unorm(bytes[1]),
+                unorm(bytes[2]),
+                unorm(bytes[3]),
+            ],
+        },
+        AttachmentFormat::Bgra8Unorm => vk::ClearColorValue {
+            float32: [
+                unorm(bytes[2]),
+                unorm(bytes[1]),
+                unorm(bytes[0]),
+                unorm(bytes[3]),
+            ],
+        },
+        AttachmentFormat::R32Float => vk::ClearColorValue {
+            float32: [f32::from_le_bytes(bytes), 0.0, 0.0, 0.0],
+        },
+        AttachmentFormat::R32Uint => vk::ClearColorValue {
+            uint32: [u32::from_le_bytes(bytes), 0, 0, 0],
+        },
+    }
+}
+
 /// The `VkFormatFeatureFlags` the selected device reports for one format and
 /// tiling.
 pub(crate) fn format_features(
@@ -484,7 +528,7 @@ pub(crate) fn execute_offscreen_render(
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_command_pool(queue_index)?;
-    objects.record(request.clear, width, height)?;
+    objects.record(request.format, request.clear, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
     let texels = unsafe {
@@ -852,7 +896,17 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     /// Record clear → draw → copy-out on the one command buffer.
-    fn record(&mut self, clear: ClearColor, width: u32, height: u32) -> Result<(), ProviderError> {
+    ///
+    /// The clear value is a function of the attachment format: the contract's
+    /// bytes are in the format's memory order, while `VkClearColorValue`
+    /// components follow the format's *component* order.
+    fn record(
+        &mut self,
+        format: AttachmentFormat,
+        clear: ClearColor,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ProviderError> {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
@@ -863,9 +917,7 @@ impl<'a> OffscreenObjects<'a> {
         .map_err(|error| execution_refusal("begin command buffer", &error.to_string()))?;
 
         let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: clear.bytes.map(|byte| f32::from(byte) / 255.0),
-            },
+            color: clear_value_for(format, clear),
         };
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -1200,6 +1252,23 @@ mod tests {
     /// still holds it proves the draw did not cover that pixel.
     const CLEAR_SENTINEL: u8 = 0xfe;
 
+    /// Vertex stage that collapses the triangle onto `(-1,-1)`: in a 2×2
+    /// viewport it covers only the pixel at `(0,0)`, so the other three texels
+    /// keep the `LoadOp::Clear` bytes. `spirv-as` output of
+    /// `render_spv/single_pixel.vert.spvasm`.
+    const SINGLE_PIXEL_VERT_SPV: &[u8] = include_bytes!("render_spv/single_pixel.vert.spv");
+
+    /// The clear value a format test uses: four distinct bytes so a swapped or
+    /// reinterpreted component order cannot coincide with the expected bytes.
+    const DISTINCT_CLEAR: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+
+    fn single_pixel_vertex() -> OffscreenVertexStage<'static> {
+        OffscreenVertexStage {
+            entry: "single_pixel",
+            spirv: SINGLE_PIXEL_VERT_SPV,
+        }
+    }
+
     /// The reviewed vertex stage of the milestone, under the entry name its
     /// `.spvasm` source declares.
     fn milestone_vertex() -> OffscreenVertexStage<'static> {
@@ -1283,6 +1352,51 @@ mod tests {
             hex(&texels[..4])
         );
         texels
+    }
+
+    /// The contract's bytes are memory order; `VkClearColorValue` wants
+    /// components. The three admitted formats disagree about how those two
+    /// relate, and the disagreement is silent in every full-coverage fixture —
+    /// this test states the mapping without a device (the partial-coverage
+    /// tests below then prove it against a real attachment).
+    #[test]
+    fn clear_components_follow_the_format_not_the_byte_order() {
+        let clear = ClearColor::new(DISTINCT_CLEAR);
+
+        // SAFETY: `clear_value_for` initialises exactly one union field, and
+        // this test reads the same field it sets.
+        let rgba = unsafe { clear_value_for(AttachmentFormat::Rgba8Unorm, clear).float32 };
+        assert_eq!(
+            rgba,
+            [
+                0x11u8 as f32 / 255.0,
+                0x22u8 as f32 / 255.0,
+                0x33u8 as f32 / 255.0,
+                0x44u8 as f32 / 255.0,
+            ]
+        );
+
+        // B,G,R,A memory order: the stored blue is component 0 and the stored
+        // red is component 2, so the components are the bytes with 0 and 2
+        // exchanged.
+        let bgra = unsafe { clear_value_for(AttachmentFormat::Bgra8Unorm, clear).float32 };
+        assert_eq!(
+            bgra,
+            [
+                0x33u8 as f32 / 255.0,
+                0x22u8 as f32 / 255.0,
+                0x11u8 as f32 / 255.0,
+                0x44u8 as f32 / 255.0,
+            ]
+        );
+        assert_eq!(bgra[0], rgba[2], "the blue component is the same value");
+        assert_eq!(bgra[2], rgba[0], "the red component is the same value");
+
+        // One float, not four components: the four bytes reinterpreted.
+        let r32f = unsafe { clear_value_for(AttachmentFormat::R32Float, clear).float32 };
+        let expected = f32::from_le_bytes(DISTINCT_CLEAR);
+        assert_eq!(r32f[0].to_bits(), expected.to_bits());
+        assert_eq!(r32f[1..], [0.0, 0.0, 0.0]);
     }
 
     /// The rail's structural guarantee, stated without a device: `format` selects
@@ -1468,6 +1582,71 @@ mod tests {
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         // No copy in either direction: the refusal precedes vkCreateImage.
         assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
+    /// Partial coverage: one texel keeps the fragment output, the other three
+    /// keep the `LoadOp::Clear` bytes. A full-coverage triangle overwrites every
+    /// texel, which is why the clear conversion could be wrong without any
+    /// assertion noticing; this test makes it observable for every admitted
+    /// format (the single-point vertex covers only pixel (0,0) of the 2×2
+    /// viewport).
+    #[test]
+    fn a_partial_attachment_shows_the_clear_bytes_in_the_format_memory_order() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let clear = ClearColor::new(DISTINCT_CLEAR);
+        for (format, clear_texel, stored_texel) in [
+            (
+                AttachmentFormat::Rgba8Unorm,
+                DISTINCT_CLEAR,
+                EXPECTED_RGBA8_TEXELS,
+            ),
+            (
+                AttachmentFormat::Bgra8Unorm,
+                // The contract's bytes are memory order, so an uncovered texel
+                // reads back exactly those bytes in every format; only the
+                // *component* mapping inside the clear differs (`Bgra8Unorm`
+                // swaps red and blue, `R32Float` is one component). The
+                // unit test above states that mapping.
+                DISTINCT_CLEAR,
+                EXPECTED_BGRA8_TEXELS,
+            ),
+            (
+                AttachmentFormat::R32Float,
+                DISTINCT_CLEAR,
+                EXPECTED_R32F_TEXEL,
+            ),
+        ] {
+            let texels = execute_offscreen_render(
+                &context,
+                &OffscreenRenderRequest {
+                    format,
+                    extent: [2, 2],
+                    clear,
+                    vertex: single_pixel_vertex(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("the partial {format:?} pass executes: {error:?}"));
+            eprintln!(
+                "{format:?} partial readback: {} (clear {clear_texel:02x?}, stored {stored_texel:02x?})",
+                hex(&texels)
+            );
+            assert_eq!(texels.len(), 16);
+            assert_eq!(
+                texels[..4],
+                stored_texel,
+                "{format:?}: the covered texel holds the fragment output"
+            );
+            for (index, texel) in texels[4..].chunks(4).enumerate() {
+                assert_eq!(
+                    texel,
+                    clear_texel,
+                    "{format:?}: uncovered texel {} holds the clear bytes in memory order",
+                    index + 1
+                );
+            }
+        }
     }
 
     /// The 8-bit R,G,B,A layout of the milestone's colour.
