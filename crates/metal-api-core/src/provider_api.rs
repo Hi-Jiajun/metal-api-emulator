@@ -917,7 +917,10 @@ impl CommandBuffer {
             operation_id: OperationId::new(next_id()?),
             pipelines: pipelines.into_values().collect(),
             encoder_dispatch_type: DispatchType::Serial,
-            passes: trace_passes,
+            passes: trace_passes
+                .into_iter()
+                .map(contract::TracePass::Compute)
+                .collect(),
             completion_policy: CompletionPolicy::HostReadback,
         };
         let admitted = owner

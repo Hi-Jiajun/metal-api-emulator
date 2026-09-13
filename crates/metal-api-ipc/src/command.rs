@@ -1409,18 +1409,20 @@ mod tests {
         serve_provider, serve_provider_named, CommandRequest, CommandResponse, RemoteProvider,
     };
     use crate::codec::CodecError;
-    use crate::command_codec::{CommandCodec, MAX_QUEUE_PRIORITIES};
+    use crate::command_codec::{CommandCodec, MAX_QUEUE_PRIORITIES, MAX_TAGGED_TRACE_PASSES};
     use metal_api_core::provider::{
-        AllocationId, AllocationRecord, BufferAccess, BufferBindingContract, BufferLease,
-        BufferSource, BufferView, BufferWriteback, CompiledComputePipeline, CompletionDisposition,
-        CompletionReadback, CompletionToken, ComputePass, ComputeProvider, ComputeTrace,
-        DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity,
-        LeaseId, LeaseImporter, LeaseReservation, OperationId, PipelineCompileRequest,
-        PipelineContract, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-        ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
-        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-        ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
+        AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferBindingContract,
+        BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
+        CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
+        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch,
+        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, LeaseId, LeaseImporter,
+        LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
+        PipelineId, PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass,
+        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+        RenderPassDescriptor, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+        StagedLease, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
+        TextureType, TextureView, TracePass, ValidatedComputeTrace, ViewId,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1478,7 +1480,7 @@ mod tests {
             operation_id: OperationId::new(21),
             pipelines: vec![pipeline.clone()],
             encoder_dispatch_type: DispatchType::Serial,
-            passes: vec![ComputePass {
+            passes: vec![TracePass::Compute(ComputePass {
                 pipeline: pipeline.pipeline_id,
                 buffers: vec![BufferView {
                     view_id: ViewId::new(31),
@@ -1496,7 +1498,7 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
                 textures: Vec::new(),
-            }],
+            })],
             completion_policy: metal_api_core::provider::CompletionPolicy::HostReadback,
         }
     }
@@ -1511,6 +1513,233 @@ mod tests {
             })
             .unwrap();
         resources
+    }
+
+    /// The bytes a pre-render build put on the wire for the fixture trace
+    /// built by [`trace`]. Hand-copied from `encode_request` at commit
+    /// `8ec26a7`, before `TracePass` existed.
+    ///
+    /// A compute-only trace must keep producing exactly these bytes: the
+    /// render track is additive, so an owner that has nothing new to say must
+    /// stay byte-for-byte compatible with a provider that predates it.
+    const LEGACY_SUBMIT_FRAME: &[u8] = &[
+        77, 67, 67, 49, 1, 0, 0, 1, 104, 3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 21,
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0,
+        0, 10, 102, 105, 120, 116, 117, 114, 101, 45, 118, 49, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111,
+        112, 121, 95, 119, 111, 114, 100, 0, 0, 0, 0, 0, 0, 0, 9, 99, 111, 112, 121, 95, 119, 111,
+        114, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 12, 98, 117, 102, 102,
+        101, 114, 45, 119, 114, 105, 116, 101, 1, 0, 0, 0, 0, 0, 0, 0, 10, 116, 114, 97, 110, 115,
+        108, 97, 116, 111, 114, 0, 0, 0, 0, 0, 0, 0, 2, 118, 49, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        4, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
+        0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    fn render_attachment(width: u64, height: u64) -> RenderAttachment {
+        RenderAttachment {
+            view_id: ViewId::new(71),
+            allocation_id: AllocationId::new(41),
+            format: AttachmentFormat::Rgba8Unorm,
+            width,
+            height,
+            load: LoadOp::Clear(ClearColor::new([0xfe, 0xfe, 0xfe, 0xfe])),
+            store: StoreOp::Store,
+        }
+    }
+
+    fn render_pass_descriptor(
+        compiled: &CompiledComputePipeline,
+        width: u64,
+        height: u64,
+    ) -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            pipeline: compiled.pipeline_id,
+            color_attachments: vec![render_attachment(width, height)],
+            viewport: [0, 0, width as u32, height as u32],
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+        }
+    }
+
+    /// A trace whose only pass is a render pass.
+    fn render_only_trace() -> ComputeTrace {
+        let compiled = pipeline(&compile_request());
+        ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: compiled.device_epoch,
+            operation_id: OperationId::new(21),
+            pipelines: vec![compiled.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Render(render_pass_descriptor(&compiled, 2, 2))],
+            completion_policy: CompletionPolicy::HostReadback,
+        }
+    }
+
+    /// A trace that carries both shapes, in order.
+    fn mixed_trace() -> ComputeTrace {
+        let compiled = pipeline(&compile_request());
+        let mut value = trace(&compiled);
+        value
+            .passes
+            .push(TracePass::Render(render_pass_descriptor(&compiled, 2, 2)));
+        value
+    }
+
+    #[test]
+    fn compute_only_submit_keeps_its_pre_render_bytes() {
+        let compiled = pipeline(&compile_request());
+        let request = CommandRequest::Submit {
+            trace: trace(&compiled),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame, LEGACY_SUBMIT_FRAME);
+        // The pre-render payload tag is unchanged, so a decoder built before
+        // the render track reads this frame exactly as it always did.
+        assert_eq!(frame[9], 0x03);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+    }
+
+    #[test]
+    fn render_pass_frames_use_a_new_tag_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: mixed_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // A new payload tag, not the compute submit tag: an older decoder
+        // answers `UnknownCommandTag` instead of misreading the tagged list.
+        assert_eq!(frame[9], 0x0f);
+        assert_ne!(frame[9], 0x03);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+
+        // Both shapes travel as the same `CommandRequest::Submit`, so nothing
+        // downstream needs a second variant.
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        assert_eq!(trace.passes.len(), 2);
+        assert!(trace.passes[0].as_compute().is_some());
+        assert_eq!(
+            trace.passes[1]
+                .as_render()
+                .map(|pass| pass.color_attachments.len()),
+            Some(1)
+        );
+
+        // A render-only trace round-trips too.
+        let request = CommandRequest::Submit {
+            trace: render_only_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+    }
+
+    #[test]
+    fn capability_frames_declare_render_bits_under_their_own_tag() {
+        let legacy = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+        };
+        let frame = CommandCodec::encode_response(&legacy).unwrap();
+        assert_eq!(frame[9], 0x01);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), legacy);
+
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        let declaring = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(7),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&declaring).unwrap();
+        assert_eq!(frame[9], 0x0a);
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), declaring);
+    }
+
+    #[test]
+    fn render_trace_frames_refuse_truncation_oversize_and_unknown_kinds() {
+        let request = CommandRequest::Submit {
+            trace: render_only_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x0f);
+
+        // Locate the single colour attachment's view id: every other identity
+        // in this frame is a smaller number and the eight-byte big-endian 71
+        // is unique. The fixed layout before it is attachment count (8),
+        // pipeline id (8), pass kind (1) and pass count (8).
+        let view_id = ViewId::new(71).get().to_be_bytes();
+        let view_id_offset = frame
+            .windows(view_id.len())
+            .position(|window| window == view_id)
+            .expect("the fixture attachment view id is on the wire");
+        let attachment_count = view_id_offset - 8;
+        let pass_kind = view_id_offset - 17;
+        let pass_count = view_id_offset - 25;
+        assert_eq!(frame[pass_kind], 0x01, "render pass kind tag");
+
+        let mut unknown = frame.clone();
+        unknown[pass_kind] = 0x7e;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown).unwrap_err(),
+            CodecError::UnknownPassTag(0x7e)
+        ));
+
+        let mut oversize_attachments = frame.clone();
+        oversize_attachments[attachment_count..attachment_count + 8]
+            .copy_from_slice(&((MAX_COLOR_ATTACHMENTS + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            CommandCodec::decode_request(&oversize_attachments).unwrap_err(),
+            CodecError::ColorAttachmentCount { count, maximum }
+                if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
+
+        let mut oversize_passes = frame.clone();
+        oversize_passes[pass_count..pass_count + 8]
+            .copy_from_slice(&((MAX_TAGGED_TRACE_PASSES + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            CommandCodec::decode_request(&oversize_passes).unwrap_err(),
+            CodecError::TracePassCount { count, maximum }
+                if count == MAX_TAGGED_TRACE_PASSES + 1 && maximum == MAX_TAGGED_TRACE_PASSES
+        ));
+
+        // A frame that declares its own (short) length must fail inside the
+        // payload rather than decoding a partial trace.
+        let payload = &frame[9..];
+        let mut truncated = b"MCC1".to_vec();
+        truncated.push(0x01);
+        truncated.extend_from_slice(&((payload.len() - 8) as u32).to_be_bytes());
+        truncated.extend_from_slice(&payload[..payload.len() - 8]);
+        assert!(matches!(
+            CommandCodec::decode_request(&truncated).unwrap_err(),
+            CodecError::TruncatedPayload { .. }
+        ));
+
+        // The encoder refuses the same protocol bound instead of writing a
+        // frame the decoder would reject.
+        let mut trace = render_only_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("fixture trace carries a render pass");
+        };
+        pass.color_attachments.push(render_attachment(2, 2));
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap_err(),
+            CodecError::ColorAttachmentCount { count, maximum }
+                if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
     }
 
     #[test]
@@ -1586,7 +1815,11 @@ mod tests {
         // The wire format carries the field even though provider admission
         // refuses a non-None attribute stride.
         let mut strided = trace.clone();
-        strided.passes[0].buffers[0].attribute_stride = Some(16);
+        strided.passes[0]
+            .as_compute_mut()
+            .expect("compute trace entry")
+            .buffers[0]
+            .attribute_stride = Some(16);
         let request = CommandRequest::Submit {
             trace: strided,
             resources: resources(),
@@ -1598,20 +1831,24 @@ mod tests {
         // admission refuses them until a provider executes them
         // (research/docs/16 §4.2).
         let mut textured = trace.clone();
-        textured.passes[0].textures.push(TextureView {
-            view_id: ViewId::new(71),
-            metal_binding: 0,
-            allocation_id: AllocationId::new(41),
-            texture_type: TextureType::D2,
-            format: TextureFormat::R32Uint,
-            width: 4,
-            height: 4,
-            depth: 1,
-            array_length: 1,
-            sample_count: 1,
-            access: TextureAccess::Sampled,
-            source: TextureSource::OwnedBytes(vec![0x5a; 64]),
-        });
+        textured.passes[0]
+            .as_compute_mut()
+            .expect("compute trace entry")
+            .textures
+            .push(TextureView {
+                view_id: ViewId::new(71),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(41),
+                texture_type: TextureType::D2,
+                format: TextureFormat::R32Uint,
+                width: 4,
+                height: 4,
+                depth: 1,
+                array_length: 1,
+                sample_count: 1,
+                access: TextureAccess::Sampled,
+                source: TextureSource::OwnedBytes(vec![0x5a; 64]),
+            });
         let request = CommandRequest::Submit {
             trace: textured,
             resources: resources(),
@@ -1656,6 +1893,10 @@ mod tests {
                     storage_modes: vec![metal_api_core::provider::StorageMode::OwnedBytes],
                     host_readback: true,
                     submit_only: false,
+                    supports_render_passes: false,
+                    max_color_attachments: 0,
+                    max_attachment_dimension: [0, 0],
+                    supported_color_formats: Vec::new(),
                 },
             },
             CommandResponse::Compiled {
@@ -2001,6 +2242,10 @@ mod tests {
             storage_modes: vec![metal_api_core::provider::StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: false,
+            supports_render_passes: false,
+            max_color_attachments: 0,
+            max_attachment_dimension: [0, 0],
+            supported_color_formats: Vec::new(),
         }
     }
 

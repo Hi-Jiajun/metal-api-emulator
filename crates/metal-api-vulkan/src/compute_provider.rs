@@ -709,8 +709,7 @@ impl ComputeProvider for VulkanComputeProvider {
         let artifacts = {
             let registry = self.pipelines.lock().map_err(|_| registry_poisoned())?;
             trace
-                .passes
-                .iter()
+                .compute_passes()
                 .map(|pass| {
                     let requested = trace.pipeline(pass.pipeline).map_err(|error| {
                         refusal(
@@ -737,7 +736,7 @@ impl ComputeProvider for VulkanComputeProvider {
             .with_detail(error.to_string())
         })?;
         let mut dispatches = Vec::with_capacity(trace.passes.len());
-        for pass in &trace.passes {
+        for pass in trace.compute_passes() {
             let grid = narrow_dimensions(pass.dispatch.grid)?.dimensions();
             let local = narrow_dimensions(pass.dispatch.threads_per_threadgroup)?.dimensions();
             let mut bindings = pass

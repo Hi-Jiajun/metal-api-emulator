@@ -38,6 +38,12 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         storage_modes: vec![StorageMode::OwnedBytes],
         host_readback: true,
         submit_only: false,
+        // Compute-only snapshot: the render track is not wired into this
+        // provider, so admission refuses render-bearing traces.
+        supports_render_passes: false,
+        max_color_attachments: 0,
+        max_attachment_dimension: [0, 0],
+        supported_color_formats: Vec::new(),
     }
 }
 

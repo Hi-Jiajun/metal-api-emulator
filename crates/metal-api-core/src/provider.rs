@@ -1391,6 +1391,60 @@ pub enum CompletionPolicy {
     SubmitOnly,
 }
 
+/// One entry of a trace's ordered pass list.
+///
+/// `ComputeTrace` used to carry `Vec<ComputePass>` directly. The render track
+/// needs a second pass shape, so the entry became a tagged union: the
+/// discriminant is always present, and "no passes" is spelled by an empty
+/// list, never by a combination of absent optionals. The `Compute` arm keeps
+/// the exact value of the pre-render pass type, so every existing provider
+/// path only has to unwrap a variant it already understands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TracePass {
+    /// One dispatch over the compute pipeline named by `ComputePass::pipeline`.
+    Compute(ComputePass),
+    /// One offscreen colour render pass (`research/docs/23` §3).
+    Render(RenderPassDescriptor),
+}
+
+impl TracePass {
+    /// The compute payload, or `None` for a render entry.
+    pub fn as_compute(&self) -> Option<&ComputePass> {
+        match self {
+            Self::Compute(pass) => Some(pass),
+            Self::Render(_) => None,
+        }
+    }
+
+    /// Mutable access to the compute payload, or `None` for a render entry.
+    pub fn as_compute_mut(&mut self) -> Option<&mut ComputePass> {
+        match self {
+            Self::Compute(pass) => Some(pass),
+            Self::Render(_) => None,
+        }
+    }
+
+    /// The render payload, or `None` for a compute entry.
+    pub fn as_render(&self) -> Option<&RenderPassDescriptor> {
+        match self {
+            Self::Compute(_) => None,
+            Self::Render(pass) => Some(pass),
+        }
+    }
+}
+
+impl From<ComputePass> for TracePass {
+    fn from(pass: ComputePass) -> Self {
+        Self::Compute(pass)
+    }
+}
+
+impl From<RenderPassDescriptor> for TracePass {
+    fn from(pass: RenderPassDescriptor) -> Self {
+        Self::Render(pass)
+    }
+}
+
 /// The immutable value trace shared by both provider implementations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeTrace {
@@ -1401,7 +1455,10 @@ pub struct ComputeTrace {
     /// belongs to this trace's device epoch and must be used at least once.
     pub pipelines: Vec<CompiledComputePipeline>,
     pub encoder_dispatch_type: DispatchType,
-    pub passes: Vec<ComputePass>,
+    /// Ordered compute and render passes. `MCC1` keeps the pre-render byte
+    /// layout for a compute-only list and tags every entry in the extended
+    /// layout, so this field is the single source of pass order.
+    pub passes: Vec<TracePass>,
     pub completion_policy: CompletionPolicy,
 }
 
@@ -1548,6 +1605,11 @@ impl ResourceTableSnapshot {
             BTreeMap::<ViewId, (AllocationId, u64, u64, BufferSourceKind, Option<LeaseId>)>::new();
         let mut ranges = Vec::<(usize, AllocationId, ViewId, u64, u64, BufferAccess)>::new();
         for (pass_index, pass) in trace.passes.iter().enumerate() {
+            // Attachments are not `BufferView`s; their range admission joins
+            // the render execution step (`research/docs/23` §6 Step 4).
+            let Some(pass) = pass.as_compute() else {
+                continue;
+            };
             for view in &pass.buffers {
                 let end = view.validate_shape()?;
                 let allocation = self
@@ -2536,7 +2598,7 @@ pub fn trace_from_trusted_snapshot(
             contract: pipeline.pipeline_contract,
         }],
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![ComputePass {
+        passes: vec![TracePass::Compute(ComputePass {
             pipeline: pipeline.pipeline_id,
             buffers,
             dispatch: Dispatch {
@@ -2545,7 +2607,7 @@ pub fn trace_from_trusted_snapshot(
                 threads_per_threadgroup: local,
             },
             textures: Vec::new(),
-        }],
+        })],
         completion_policy: CompletionPolicy::HostReadback,
     };
     trace.validate()?;
@@ -2553,6 +2615,28 @@ pub fn trace_from_trusted_snapshot(
 }
 
 impl ComputeTrace {
+    /// The compute entries of `passes`, in trace order.
+    ///
+    /// Providers that cannot execute render passes refuse them during
+    /// admission, so an admitted trace reaches a compute execution path with
+    /// this iterator covering every entry.
+    pub fn compute_passes(&self) -> impl Iterator<Item = &ComputePass> {
+        self.passes.iter().filter_map(TracePass::as_compute)
+    }
+
+    /// The render entries of `passes`, in trace order.
+    pub fn render_passes(&self) -> impl Iterator<Item = &RenderPassDescriptor> {
+        self.passes.iter().filter_map(TracePass::as_render)
+    }
+
+    /// Whether this trace carries at least one render pass. This is the
+    /// discriminator the `MCC1` encoder and render admission both read.
+    pub fn has_render_passes(&self) -> bool {
+        self.passes
+            .iter()
+            .any(|pass| matches!(pass, TracePass::Render(_)))
+    }
+
     /// Look up metadata without recursively validating the trace. Providers
     /// must still check this caller-supplied metadata against their registry.
     pub fn pipeline(&self, id: PipelineId) -> Result<&CompiledComputePipeline, ContractError> {
@@ -2597,13 +2681,28 @@ impl ComputeTrace {
             pipeline.contract.validate()?;
         }
         for pass in &self.passes {
-            if pass.pipeline.is_zero() {
-                return Err(ContractError::InvalidIdentity("pipeline id"));
+            match pass {
+                TracePass::Compute(pass) => {
+                    if pass.pipeline.is_zero() {
+                        return Err(ContractError::InvalidIdentity("pipeline id"));
+                    }
+                    let pipeline = self.pipeline(pass.pipeline)?;
+                    pass.validate(&pipeline.contract)?;
+                }
+                TracePass::Render(pass) => {
+                    // `RenderPassDescriptor::validate` repeats the identity
+                    // check; the lookup additionally proves the referenced
+                    // pipeline is in this trace's table and epoch.
+                    pass.validate()?;
+                    self.pipeline(pass.pipeline)?;
+                }
             }
-            let pipeline = self.pipeline(pass.pipeline)?;
-            pass.validate(&pipeline.contract)?;
+            let pipeline = match pass {
+                TracePass::Compute(pass) => pass.pipeline,
+                TracePass::Render(pass) => pass.pipeline,
+            };
             *used
-                .get_mut(&pass.pipeline)
+                .get_mut(&pipeline)
                 .expect("pipeline lookup checked the metadata table") = true;
         }
         for (pipeline, was_used) in used {
@@ -2631,6 +2730,13 @@ impl ComputeTrace {
         }
         let mut initial_buffers = BTreeMap::<ViewId, &BufferView>::new();
         for (pass_index, pass) in self.passes.iter().enumerate() {
+            // Render entries name attachments by identity, not `BufferView`s,
+            // so they join the serial pool reset in the render execution step
+            // (`research/docs/23` §6 Step 4). Until then this subset is
+            // compute-only and the index still counts every trace entry.
+            let Some(pass) = pass.as_compute() else {
+                continue;
+            };
             for view in &pass.buffers {
                 if let Some(initial) = initial_buffers.get(&view.view_id) {
                     if view.allocation_id != initial.allocation_id
@@ -2664,7 +2770,7 @@ impl ComputeTrace {
         self.validate_serial_buffer_reuse()?;
         let mut resources = Vec::<BufferView>::new();
         let mut positions = BTreeMap::<ViewId, usize>::new();
-        for pass in &self.passes {
+        for pass in self.compute_passes() {
             for view in &pass.buffers {
                 if let Some(&position) = positions.get(&view.view_id) {
                     let resource = &mut resources[position];
@@ -2689,7 +2795,7 @@ impl ComputeTrace {
     pub fn serial_texture_resources(&self) -> Result<Vec<TextureView>, ContractError> {
         let mut resources = Vec::<TextureView>::new();
         let mut positions = BTreeMap::<ViewId, usize>::new();
-        for pass in &self.passes {
+        for pass in self.compute_passes() {
             for texture in &pass.textures {
                 if let Some(&position) = positions.get(&texture.view_id) {
                     let resource = &mut resources[position];
@@ -3141,9 +3247,37 @@ pub struct ProviderCapabilities {
     pub storage_modes: Vec<StorageMode>,
     pub host_readback: bool,
     pub submit_only: bool,
+    /// Whether this snapshot can execute the render pass shape of
+    /// `research/docs/23`. Defaults to `false` everywhere: neither the Vulkan
+    /// nor the native provider executes graphics work today, so a
+    /// render-bearing trace is refused during admission instead of being
+    /// silently downgraded.
+    pub supports_render_passes: bool,
+    /// Colour attachment slots the render track may address. `0` means the
+    /// snapshot cannot render at all; the first render increment caps this at
+    /// [`MAX_COLOR_ATTACHMENTS`].
+    pub max_color_attachments: u32,
+    /// Largest attachment extent `[width, height]` this snapshot admits.
+    /// `[0, 0]` means no attachment is admissible.
+    pub max_attachment_dimension: [u64; 2],
+    /// Colour attachment formats this snapshot admits. Empty means none.
+    /// Compared against [`AttachmentFormat`], which is the render contract's
+    /// own format family; its wire codes are the `MCC1` texture-format codes,
+    /// so no second mapping is needed (`docs/23` §3.1).
+    pub supported_color_formats: Vec<AttachmentFormat>,
 }
 
 impl ProviderCapabilities {
+    /// Whether any render bit differs from the pre-render defaults. `MCC1`
+    /// uses this to keep a compute-only provider's capability frame at its
+    /// exact legacy bytes and to carry the render bits only when they exist.
+    pub fn declares_render_support(&self) -> bool {
+        self.supports_render_passes
+            || self.max_color_attachments != 0
+            || self.max_attachment_dimension != [0, 0]
+            || !self.supported_color_formats.is_empty()
+    }
+
     /// Freeze a trace and its resource snapshot after admission. The returned
     /// value is the hand-off object a future provider trait should consume.
     pub fn validate_trace(
@@ -3169,6 +3303,12 @@ impl ProviderCapabilities {
         resources: &ResourceTableSnapshot,
     ) -> Result<(), ProviderError> {
         trace.validate().map_err(contract_error_refusal)?;
+
+        // Render admission is the first capability gate and precedes every
+        // reservation the caller performs after a successful `admit`: a
+        // provider that cannot render refuses the whole trace here, and a
+        // compute-only trace never enters the walk (`docs/23` §4.2).
+        self.admit_render_passes(trace)?;
 
         if trace.passes.len() > self.max_passes as usize {
             return Err(capability_error("pass_count_limit")
@@ -3196,7 +3336,7 @@ impl ProviderCapabilities {
         }
 
         let mut allocations = BTreeMap::<AllocationId, BTreeMap<ViewId, BufferRange>>::new();
-        for pass in &trace.passes {
+        for pass in trace.compute_passes() {
             let contract = &trace
                 .pipeline(pass.pipeline)
                 .map_err(contract_error_refusal)?
@@ -3377,6 +3517,62 @@ impl ProviderCapabilities {
         resources
             .validate_trace(trace)
             .map_err(contract_error_refusal)?;
+        Ok(())
+    }
+
+    /// Render-track admission, run before the compute walk and before any
+    /// resource reservation. A provider whose render bits stay at their
+    /// defaults refuses every render-bearing trace with
+    /// `render_passes_unsupported`; a compute-only trace never enters the loop
+    /// body. When a provider does declare render support, the same walk
+    /// enforces the attachment count, dimension and format bits.
+    fn admit_render_passes(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        let render_pass_count = trace.render_passes().count();
+        if render_pass_count == 0 {
+            return Ok(());
+        }
+        if !self.supports_render_passes {
+            return Err(capability_error("render_passes_unsupported")
+                .with_field("passes", FieldValue::Unsigned(render_pass_count as u64)));
+        }
+        for pass in trace.render_passes() {
+            if pass.color_attachments.len() > self.max_color_attachments as usize {
+                return Err(capability_error("color_attachment_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.color_attachments.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(self.max_color_attachments as u64),
+                    ));
+            }
+            for attachment in &pass.color_attachments {
+                if !self.supported_color_formats.contains(&attachment.format) {
+                    return Err(
+                        capability_error("attachment_format_unsupported").with_field(
+                            "format",
+                            FieldValue::Unsigned(u64::from(attachment.format.code())),
+                        ),
+                    );
+                }
+                if attachment.width > self.max_attachment_dimension[0]
+                    || attachment.height > self.max_attachment_dimension[1]
+                {
+                    return Err(capability_error("attachment_dimension_limit")
+                        .with_field("width", FieldValue::Unsigned(attachment.width))
+                        .with_field("height", FieldValue::Unsigned(attachment.height))
+                        .with_field(
+                            "maximum_width",
+                            FieldValue::Unsigned(self.max_attachment_dimension[0]),
+                        )
+                        .with_field(
+                            "maximum_height",
+                            FieldValue::Unsigned(self.max_attachment_dimension[1]),
+                        ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -5514,7 +5710,7 @@ mod tests {
                 },
             }],
             encoder_dispatch_type: DispatchType::Serial,
-            passes,
+            passes: passes.into_iter().map(TracePass::Compute).collect(),
             completion_policy: CompletionPolicy::HostReadback,
         }
     }
@@ -5530,6 +5726,97 @@ mod tests {
             },
             textures: Vec::new(),
         }
+    }
+
+    fn compute_pass(trace: &ComputeTrace, index: usize) -> &ComputePass {
+        trace.passes[index]
+            .as_compute()
+            .expect("test trace entry is a compute pass")
+    }
+
+    fn compute_pass_mut(trace: &mut ComputeTrace, index: usize) -> &mut ComputePass {
+        trace.passes[index]
+            .as_compute_mut()
+            .expect("test trace entry is a compute pass")
+    }
+
+    fn compute_passes_mut(trace: &mut ComputeTrace) -> impl Iterator<Item = &mut ComputePass> {
+        trace
+            .passes
+            .iter_mut()
+            .filter_map(TracePass::as_compute_mut)
+    }
+
+    fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
+        TracePass::Render(RenderPassDescriptor {
+            pipeline: PipelineId::new(pipeline),
+            color_attachments: vec![RenderAttachment {
+                view_id: ViewId::new(7),
+                allocation_id: AllocationId::new(9),
+                format: AttachmentFormat::Rgba8Unorm,
+                width,
+                height,
+                load: LoadOp::Clear(ClearColor::new([0xfe; 4])),
+                store: StoreOp::Store,
+            }],
+            viewport: [0, 0, width as u32, height as u32],
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+        })
+    }
+
+    /// A render-bearing trace must be refused by a snapshot that never
+    /// declared render support, before the pass-count or resource walks, while
+    /// the same compute-only trace keeps admitting. The second half proves the
+    /// gate is the capability bit and not the trace shape.
+    #[test]
+    fn render_passes_are_refused_without_the_capability_bit() {
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        let resources = resources();
+        assert!(capabilities().admit(&value, &resources).is_ok());
+
+        value.passes.push(render_trace_pass(4, 2, 2));
+        let refusal = capabilities().admit(&value, &resources).unwrap_err();
+        assert_eq!(refusal.slug, "render_passes_unsupported");
+        assert_eq!(refusal.phase, ProviderPhase::Resolve);
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.fields.get("passes"), Some(&FieldValue::Unsigned(1)));
+        // The freeze step refuses too: no `ValidatedComputeTrace` is produced
+        // for a shape this snapshot cannot execute.
+        assert_eq!(
+            capabilities()
+                .validate_trace(value.clone(), resources.clone())
+                .unwrap_err()
+                .slug,
+            "render_passes_unsupported"
+        );
+
+        // Turning the bit on moves the refusal from the shape to the declared
+        // attachment limits; the compute path is unchanged.
+        let mut render = capabilities();
+        render.max_passes = 8;
+        render.supports_render_passes = true;
+        render.max_color_attachments = 1;
+        render.max_attachment_dimension = [2, 2];
+        render.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        render.admit(&value, &resources).unwrap();
+
+        render.max_attachment_dimension = [1, 2];
+        assert_eq!(
+            render.admit(&value, &resources).unwrap_err().slug,
+            "attachment_dimension_limit"
+        );
+        render.max_attachment_dimension = [2, 2];
+        render.supported_color_formats = vec![AttachmentFormat::R32Float];
+        assert_eq!(
+            render.admit(&value, &resources).unwrap_err().slug,
+            "attachment_format_unsupported"
+        );
+        render.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        render.max_color_attachments = 0;
+        assert_eq!(
+            render.admit(&value, &resources).unwrap_err().slug,
+            "color_attachment_limit"
+        );
     }
 
     fn ping_pong_trace() -> ComputeTrace {
@@ -5583,6 +5870,10 @@ mod tests {
             storage_modes: vec![StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: true,
+            supports_render_passes: false,
+            max_color_attachments: 0,
+            max_attachment_dimension: [0, 0],
+            supported_color_formats: Vec::new(),
         }
     }
 
@@ -5654,7 +5945,7 @@ mod tests {
             },
         ] {
             let mut rebound = value.clone();
-            rebound.passes[1].buffers[0] = changed;
+            compute_pass_mut(&mut rebound, 1).buffers[0] = changed;
             assert_eq!(
                 rebound.validate_serial_buffer_reuse(),
                 Err(ContractError::SerialBufferRebinding { pass_index: 1 })
@@ -5662,14 +5953,14 @@ mod tests {
         }
 
         let mut changed_access = value.clone();
-        changed_access.passes[1].buffers[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut changed_access, 1).buffers[0].access = BufferAccess::Read;
         assert!(matches!(
             changed_access.validate_serial_buffer_reuse(),
             Err(ContractError::AccessMismatch { binding: 0, .. })
         ));
 
         let mut changed_pipeline = value;
-        changed_pipeline.passes[1].pipeline = PipelineId::new(5);
+        compute_pass_mut(&mut changed_pipeline, 1).pipeline = PipelineId::new(5);
         assert_eq!(
             changed_pipeline.validate_serial_buffer_reuse(),
             Err(ContractError::UnknownPipeline(PipelineId::new(5)))
@@ -5692,7 +5983,7 @@ mod tests {
         provider.max_passes = 8;
         provider.admit(&value, &pool).unwrap();
 
-        let expected = value.passes[0]
+        let expected = compute_pass(&value, 0)
             .buffers
             .iter()
             .cloned()
@@ -5705,7 +5996,7 @@ mod tests {
 
         // Permutation support does not relax the cross-view alias policy.
         let mut overlapping = value;
-        for pass in &mut overlapping.passes {
+        for pass in compute_passes_mut(&mut overlapping) {
             for view in &mut pass.buffers {
                 view.allocation_id = AllocationId::new(9);
             }
@@ -5746,7 +6037,7 @@ mod tests {
             let mut value = ping_pong_trace();
             value.pipelines[0].contract.buffer_bindings[0].access = first;
             value.pipelines[0].contract.buffer_bindings[1].access = second;
-            for pass in &mut value.passes {
+            for pass in compute_passes_mut(&mut value) {
                 pass.buffers[0].access = first;
                 pass.buffers[1].access = second;
             }
@@ -5760,19 +6051,19 @@ mod tests {
     fn serial_permutations_refuse_source_reuploads_and_missing_pipeline_bindings() {
         let value = ping_pong_trace();
         let mut reupload = value.clone();
-        reupload.passes[1].buffers[0].source = BufferSource::OwnedBytes(vec![7; 4]);
+        compute_pass_mut(&mut reupload, 1).buffers[0].source = BufferSource::OwnedBytes(vec![7; 4]);
         assert_eq!(
             reupload.serial_resources(),
             Err(ContractError::SerialBufferRebinding { pass_index: 1 })
         );
         let mut missing = value.clone();
-        missing.passes[1].buffers.pop();
+        compute_pass_mut(&mut missing, 1).buffers.pop();
         assert_eq!(
             missing.serial_resources(),
             Err(ContractError::MissingBinding(1))
         );
         let mut duplicate = value;
-        duplicate.passes[1].buffers[1].view_id = ViewId::new(1);
+        compute_pass_mut(&mut duplicate, 1).buffers[1].view_id = ViewId::new(1);
         assert_eq!(
             duplicate.serial_resources(),
             Err(ContractError::DuplicateView(ViewId::new(1)))
@@ -5781,7 +6072,7 @@ mod tests {
 
     fn subset_trace() -> ComputeTrace {
         let mut value = ping_pong_trace();
-        value.passes[1].buffers[1] = BufferView {
+        compute_pass_mut(&mut value, 1).buffers[1] = BufferView {
             allocation_id: AllocationId::new(11),
             source: BufferSource::OwnedBytes(vec![9; 4]),
             ..buffer(3, 1)
@@ -5812,9 +6103,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 1, 3]
         );
-        assert_eq!(pool[0], value.passes[0].buffers[0]);
+        assert_eq!(pool[0], compute_pass(&value, 0).buffers[0]);
         assert_eq!(pool[1].access, BufferAccess::ReadWrite);
-        assert_eq!(pool[2], value.passes[1].buffers[1]);
+        assert_eq!(pool[2], compute_pass(&value, 1).buffers[1]);
         assert_eq!(pool[2].source, BufferSource::OwnedBytes(vec![9; 4]));
         let mut provider = capabilities();
         provider.max_passes = 8;
@@ -5831,8 +6122,8 @@ mod tests {
         read_only.pipeline_id = PipelineId::new(5);
         read_only.contract.buffer_bindings.truncate(1);
         value.pipelines.push(read_only);
-        value.passes[1].pipeline = PipelineId::new(5);
-        value.passes[1].buffers.truncate(1);
+        compute_pass_mut(&mut value, 1).pipeline = PipelineId::new(5);
+        compute_pass_mut(&mut value, 1).buffers.truncate(1);
         let pool = value.serial_resources().unwrap();
         assert_eq!(pool.len(), 2);
         assert_eq!(pool[0].access, BufferAccess::Read);
@@ -5842,7 +6133,7 @@ mod tests {
         provider.admit(&value, &subset_resources()).unwrap();
 
         // Omitting A is legal for this pipeline; omitting its required B is not.
-        value.passes[1].buffers.clear();
+        compute_pass_mut(&mut value, 1).buffers.clear();
         assert_eq!(
             value.serial_resources(),
             Err(ContractError::MissingBinding(0))
@@ -5852,9 +6143,11 @@ mod tests {
     #[test]
     fn serial_subsets_refuse_changed_views_after_an_unbound_pass() {
         let mut value = subset_trace();
-        value.passes.push(value.passes[0].clone());
+        value
+            .passes
+            .push(TracePass::Compute(compute_pass(&value, 0).clone()));
         value.validate_serial_buffer_reuse().unwrap();
-        let initial = value.passes[2].buffers[0].clone();
+        let initial = compute_pass(&value, 2).buffers[0].clone();
         for changed in [
             BufferView {
                 source: BufferSource::OwnedBytes(vec![8; 4]),
@@ -5875,15 +6168,17 @@ mod tests {
             },
         ] {
             let mut invalid = value.clone();
-            invalid.passes[2].buffers[0] = changed;
+            compute_pass_mut(&mut invalid, 2).buffers[0] = changed;
             assert_eq!(
                 invalid.serial_resources(),
                 Err(ContractError::SerialBufferRebinding { pass_index: 2 })
             );
         }
         // A view first introduced in pass 2 is also frozen before submission.
-        value.passes.push(value.passes[1].clone());
-        value.passes[3].buffers[1].source = BufferSource::OwnedBytes(vec![10; 4]);
+        value
+            .passes
+            .push(TracePass::Compute(compute_pass(&value, 1).clone()));
+        compute_pass_mut(&mut value, 3).buffers[1].source = BufferSource::OwnedBytes(vec![10; 4]);
         assert_eq!(
             value.serial_resources(),
             Err(ContractError::SerialBufferRebinding { pass_index: 3 })
@@ -5899,7 +6194,7 @@ mod tests {
         subset_resources().validate_trace(&value).unwrap();
 
         // C may not overlap A's backing even though A is unbound in pass 2.
-        value.passes[1].buffers[1].allocation_id = AllocationId::new(10);
+        compute_pass_mut(&mut value, 1).buffers[1].allocation_id = AllocationId::new(10);
         assert_eq!(
             subset_resources().validate_trace(&value),
             Err(ContractError::OverlappingWritableViews {
@@ -5951,7 +6246,10 @@ mod tests {
                         buffers.push(view);
                         next_view += 1;
                     }
-                    value.passes.push(pass(pipeline.pipeline_id.get(), buffers));
+                    value.passes.push(TracePass::Compute(pass(
+                        pipeline.pipeline_id.get(),
+                        buffers,
+                    )));
                     value.pipelines.push(pipeline);
                 }
                 let mut provider = capabilities();
@@ -6094,7 +6392,7 @@ mod tests {
         second.pipeline_id = PipelineId::new(5);
         second.function.entry_name = "second_kernel".into();
         value.pipelines.push(second);
-        value.passes[1].pipeline = PipelineId::new(5);
+        compute_pass_mut(&mut value, 1).pipeline = PipelineId::new(5);
         value
     }
 
@@ -6107,10 +6405,12 @@ mod tests {
         value.pipelines[1].contract.required_local_size = Some([2, 1, 1]);
         value.pipelines[1].contract.buffer_bindings[0].metal_binding = 7;
         value.pipelines[1].contract.buffer_bindings[0].access = BufferAccess::Read;
-        value.passes[1].dispatch.grid = [3, 2, 1];
-        value.passes[1].dispatch.threads_per_threadgroup = [2, 1, 1];
-        value.passes[1].buffers[0].metal_binding = 7;
-        value.passes[1].buffers[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut value, 1).dispatch.grid = [3, 2, 1];
+        compute_pass_mut(&mut value, 1)
+            .dispatch
+            .threads_per_threadgroup = [2, 1, 1];
+        compute_pass_mut(&mut value, 1).buffers[0].metal_binding = 7;
+        compute_pass_mut(&mut value, 1).buffers[0].access = BufferAccess::Read;
         value.validate_serial_buffer_reuse().unwrap();
         assert_eq!(
             value.serial_resources().unwrap()[0].access,
@@ -6122,7 +6422,7 @@ mod tests {
         provider.admit(&value, &resources()).unwrap();
 
         let mut wrong_grid = value.clone();
-        wrong_grid.passes[1].dispatch.grid = value.passes[0].dispatch.grid;
+        compute_pass_mut(&mut wrong_grid, 1).dispatch.grid = compute_pass(&value, 0).dispatch.grid;
         assert!(matches!(
             wrong_grid.validate(),
             Err(ContractError::GridMismatch {
@@ -6131,8 +6431,9 @@ mod tests {
             })
         ));
         let mut wrong_local = value.clone();
-        wrong_local.passes[1].dispatch.threads_per_threadgroup =
-            value.passes[0].dispatch.threads_per_threadgroup;
+        compute_pass_mut(&mut wrong_local, 1)
+            .dispatch
+            .threads_per_threadgroup = compute_pass(&value, 0).dispatch.threads_per_threadgroup;
         assert!(matches!(
             wrong_local.validate(),
             Err(ContractError::LocalSizeMismatch {
@@ -6141,7 +6442,7 @@ mod tests {
             })
         ));
         let mut wrong_access = value.clone();
-        wrong_access.passes[1].buffers[0].access = BufferAccess::Write;
+        compute_pass_mut(&mut wrong_access, 1).buffers[0].access = BufferAccess::Write;
         assert!(matches!(
             wrong_access.validate(),
             Err(ContractError::AccessMismatch {
@@ -6166,7 +6467,7 @@ mod tests {
 
         let mut dispatch = value.clone();
         dispatch.pipelines[1].contract.dispatch_kind = DispatchKind::Threadgroups;
-        dispatch.passes[1].dispatch.kind = DispatchKind::Threadgroups;
+        compute_pass_mut(&mut dispatch, 1).dispatch.kind = DispatchKind::Threadgroups;
         assert_eq!(
             provider.admit(&dispatch, &resources()).unwrap_err().slug,
             "dispatch_kind_unsupported"
@@ -6208,7 +6509,7 @@ mod tests {
         assert_eq!(unknown.validate(), Err(ContractError::UnknownBinding(1)));
 
         let mut mismatched_trace = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        mismatched_trace.passes[0].buffers[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut mismatched_trace, 0).buffers[0].access = BufferAccess::Read;
         assert_eq!(
             mismatched_trace.validate(),
             Err(ContractError::AccessMismatch {
@@ -6234,7 +6535,7 @@ mod tests {
     #[test]
     fn resource_snapshot_checks_allocation_range_and_epoch() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.passes[0].buffers[0].offset = 2;
+        compute_pass_mut(&mut value, 0).buffers[0].offset = 2;
         let error = value.validate_with_resources(&resources()).unwrap_err();
         assert_eq!(
             error,
@@ -6253,7 +6554,7 @@ mod tests {
                 size: 4,
             })
             .unwrap();
-        value.passes[0].buffers[0].allocation_id = AllocationId::new(10);
+        compute_pass_mut(&mut value, 0).buffers[0].allocation_id = AllocationId::new(10);
         assert!(matches!(
             value.validate_with_resources(&wrong_epoch),
             Err(ContractError::AllocationEpochMismatch { .. })
@@ -6263,7 +6564,7 @@ mod tests {
     #[test]
     fn resource_snapshot_checks_lease_range_epoch_and_cross_pass_identity() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.passes[0].buffers[0] = BufferView {
+        compute_pass_mut(&mut value, 0).buffers[0] = BufferView {
             view_id: ViewId::new(1),
             metal_binding: 0,
             allocation_id: AllocationId::new(9),
@@ -6277,7 +6578,7 @@ mod tests {
         assert!(value.validate_with_resources(&leased_resources()).is_ok());
 
         let mut out_of_lease = value.clone();
-        out_of_lease.passes[0].buffers[0].offset = 0;
+        compute_pass_mut(&mut out_of_lease, 0).buffers[0].offset = 0;
         assert!(matches!(
             out_of_lease.validate_with_resources(&leased_resources()),
             Err(ContractError::LeaseRangeOutOfBounds { .. })
@@ -6285,7 +6586,11 @@ mod tests {
 
         let mut switched = value;
         let mut second = switched.passes[0].clone();
-        second.buffers[0].source = BufferSource::BorrowedNoCopy(LeaseId::new(12));
+        second
+            .as_compute_mut()
+            .expect("test trace entry is a compute pass")
+            .buffers[0]
+            .source = BufferSource::BorrowedNoCopy(LeaseId::new(12));
         switched.passes.push(second);
         let mut two_leases = leased_resources();
         two_leases
@@ -6322,15 +6627,15 @@ mod tests {
         ));
 
         value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
-        value.passes[0].buffers[0].access = BufferAccess::Read;
-        value.passes[1].buffers[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut value, 0).buffers[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut value, 1).buffers[0].access = BufferAccess::Read;
         assert!(value.validate_with_resources(&resources()).is_ok());
     }
 
     #[test]
     fn owned_snapshot_source_length_is_part_of_the_contract() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.passes[0].buffers[0].length = 3;
+        compute_pass_mut(&mut value, 0).buffers[0].length = 3;
         assert_eq!(
             value.validate(),
             Err(ContractError::SourceLengthMismatch {
@@ -6429,13 +6734,13 @@ mod tests {
         assert_eq!(value.pipelines[0].device_epoch, value.device_epoch);
         assert_eq!(value.pipelines[0].pipeline_id, PipelineId::new(5));
         assert_eq!(value.pipelines[0].function, snapshot_function());
-        assert_eq!(value.passes[0].pipeline, PipelineId::new(5));
+        assert_eq!(compute_pass(&value, 0).pipeline, PipelineId::new(5));
         assert_eq!(
-            value.passes[0].buffers[0].allocation_id,
+            compute_pass(&value, 0).buffers[0].allocation_id,
             AllocationId::new(6)
         );
-        assert_eq!(value.passes[0].buffers[0].view_id, ViewId::new(7));
-        assert_eq!(value.passes[0].dispatch.grid, [10, 3, 1]);
+        assert_eq!(compute_pass(&value, 0).buffers[0].view_id, ViewId::new(7));
+        assert_eq!(compute_pass(&value, 0).dispatch.grid, [10, 3, 1]);
     }
 
     #[test]
@@ -6573,8 +6878,10 @@ mod tests {
                 ([8, 2, 1], [129, 3, 1], "dispatch_group_count_limit"),
             ] {
                 let mut invalid = value.clone();
-                invalid.passes[pass_index].dispatch.threads_per_threadgroup = local;
-                invalid.passes[pass_index].dispatch.grid = grid;
+                compute_pass_mut(&mut invalid, pass_index)
+                    .dispatch
+                    .threads_per_threadgroup = local;
+                compute_pass_mut(&mut invalid, pass_index).dispatch.grid = grid;
                 assert_eq!(
                     multi_pass.admit(&invalid, &resources()).unwrap_err().slug,
                     expected_slug
@@ -6589,10 +6896,10 @@ mod tests {
                     terms: vec![AffineTerm { axis: 0, stride: 4 }],
                 }],
             };
-            for pass in &mut invalid.passes {
+            for pass in compute_passes_mut(&mut invalid) {
                 pass.dispatch.grid = [1, 1, 1];
             }
-            invalid.passes[pass_index].dispatch.grid = [2, 1, 1];
+            compute_pass_mut(&mut invalid, pass_index).dispatch.grid = [2, 1, 1];
             assert_eq!(
                 multi_pass.admit(&invalid, &resources()).unwrap_err().slug,
                 "buffer_footprint_exceeds_view"
@@ -6616,7 +6923,7 @@ mod tests {
             Some(ContractError::ConcurrentPassesUnsupported.to_string())
         );
         value.encoder_dispatch_type = DispatchType::Serial;
-        value.passes[1].buffers[0].source = BufferSource::OwnedBytes(vec![1; 4]);
+        compute_pass_mut(&mut value, 1).buffers[0].source = BufferSource::OwnedBytes(vec![1; 4]);
         let error = multi_pass
             .admit(&value, &ResourceTableSnapshot::new())
             .unwrap_err();
@@ -6630,7 +6937,9 @@ mod tests {
     #[test]
     fn capabilities_report_limits_and_aliases_structurally() {
         let mut too_wide = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        too_wide.passes[0].dispatch.threads_per_threadgroup = [9, 1, 1];
+        compute_pass_mut(&mut too_wide, 0)
+            .dispatch
+            .threads_per_threadgroup = [9, 1, 1];
         let error = capabilities().admit(&too_wide, &resources()).unwrap_err();
         assert_eq!(error.slug, "dispatch_local_size_limit");
         assert_eq!(
@@ -6665,7 +6974,7 @@ mod tests {
     #[test]
     fn attribute_stride_is_a_structured_capability_refusal() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.passes[0].buffers[0].attribute_stride = Some(16);
+        compute_pass_mut(&mut value, 0).buffers[0].attribute_stride = Some(16);
         let error = capabilities().admit(&value, &resources()).unwrap_err();
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.slug, "buffer_attribute_stride_unsupported");
@@ -6743,7 +7052,7 @@ mod tests {
     fn capabilities_refuse_a_future_dispatch_kind_without_guessing() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
         value.pipelines[0].contract.dispatch_kind = DispatchKind::Threadgroups;
-        value.passes[0].dispatch.kind = DispatchKind::Threadgroups;
+        compute_pass_mut(&mut value, 0).dispatch.kind = DispatchKind::Threadgroups;
         let error = capabilities().admit(&value, &resources()).unwrap_err();
         assert_eq!(error.slug, "dispatch_kind_unsupported");
     }
@@ -6767,7 +7076,7 @@ mod tests {
         let mut fixed = value.clone();
         fixed.pipelines[0].contract.fixed_grid = Some([10, 3, 1]);
         assert!(capabilities().admit(&fixed, &resources()).is_ok());
-        fixed.passes[0].dispatch.grid = [9, 3, 1];
+        compute_pass_mut(&mut fixed, 0).dispatch.grid = [9, 3, 1];
         let error = capabilities().admit(&fixed, &resources()).unwrap_err();
         assert_eq!(
             error.detail.as_deref(),
@@ -6778,8 +7087,8 @@ mod tests {
     #[test]
     fn capabilities_bound_affine_footprints_to_the_dispatch_grid() {
         let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
-        value.passes[0].buffers[0].length = 40;
-        value.passes[0].buffers[0].source = BufferSource::OwnedBytes(vec![0; 40]);
+        compute_pass_mut(&mut value, 0).buffers[0].length = 40;
+        compute_pass_mut(&mut value, 0).buffers[0].source = BufferSource::OwnedBytes(vec![0; 40]);
         let mut backing = resources();
         backing
             .insert_allocation(AllocationRecord {
@@ -6788,7 +7097,7 @@ mod tests {
                 size: 40,
             })
             .unwrap();
-        value.passes[0].buffers[0].allocation_id = AllocationId::new(10);
+        compute_pass_mut(&mut value, 0).buffers[0].allocation_id = AllocationId::new(10);
         value.pipelines[0].contract.buffer_bindings[0].footprint = FootprintProof::Affine {
             accesses: vec![AffineAccess {
                 base_offset: 0,
@@ -6797,8 +7106,8 @@ mod tests {
             }],
         };
         assert!(capabilities().admit(&value, &backing).is_ok());
-        value.passes[0].buffers[0].length = 36;
-        value.passes[0].buffers[0].source = BufferSource::OwnedBytes(vec![0; 36]);
+        compute_pass_mut(&mut value, 0).buffers[0].length = 36;
+        compute_pass_mut(&mut value, 0).buffers[0].source = BufferSource::OwnedBytes(vec![0; 36]);
         let error = capabilities().admit(&value, &backing).unwrap_err();
         assert_eq!(error.slug, "buffer_footprint_exceeds_view");
         assert_eq!(
@@ -7716,7 +8025,7 @@ mod tests {
     }
 
     fn completed_submission(trace: &ComputeTrace) -> ProviderSubmission {
-        let mut writebacks = trace.passes[0]
+        let mut writebacks = compute_pass(trace, 0)
             .buffers
             .iter()
             .filter(|view| view.access.is_writable())
@@ -7790,7 +8099,7 @@ mod tests {
         let final_result = completed_submission(&multi_pass);
         assert_eq!(final_result.writebacks.len(), 1);
         final_result.validate_for_trace(&multi_pass).unwrap();
-        multi_pass.passes[1].buffers[0].view_id = ViewId::new(8);
+        compute_pass_mut(&mut multi_pass, 1).buffers[0].view_id = ViewId::new(8);
         assert_eq!(
             final_result.validate_for_trace(&multi_pass),
             Err(ContractError::MissingWriteback {
@@ -7938,7 +8247,7 @@ mod tests {
         let submission = completed_submission(&trace);
         for access in [BufferAccess::Read, BufferAccess::Unused] {
             let mut read_only = trace.clone();
-            read_only.passes[0].buffers[0].access = access;
+            compute_pass_mut(&mut read_only, 0).buffers[0].access = access;
             read_only.pipelines[0].contract.buffer_bindings[0].access = access;
             assert_eq!(
                 submission.validate_for_trace(&read_only),
@@ -8162,12 +8471,12 @@ mod tests {
 
         // Overlapping ranges keep the alias refusal even for read-read pairs,
         // which stay refused conservatively in the first version.
-        value.passes[1].buffers[0] = ranged_buffer(2, 2, 4);
+        compute_pass_mut(&mut value, 1).buffers[0] = ranged_buffer(2, 2, 4);
         assert_eq!(
             distinct.admit(&value, &resources).unwrap_err().slug,
             "buffer_alias_unsupported"
         );
-        for pass in &mut value.passes {
+        for pass in compute_passes_mut(&mut value) {
             pass.buffers[0].access = BufferAccess::Read;
         }
         value.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
@@ -8177,8 +8486,8 @@ mod tests {
         );
 
         // The same logical view reused across passes is not an alias.
-        value.passes[1].buffers[0] = ranged_buffer(1, 0, 4);
-        for pass in &mut value.passes {
+        compute_pass_mut(&mut value, 1).buffers[0] = ranged_buffer(1, 0, 4);
+        for pass in compute_passes_mut(&mut value) {
             pass.buffers[0].access = BufferAccess::Read;
         }
         assert!(distinct.admit(&value, &resources).is_ok());

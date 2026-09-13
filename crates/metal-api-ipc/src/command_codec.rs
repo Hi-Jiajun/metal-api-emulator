@@ -10,16 +10,17 @@
 use crate::codec::CodecError;
 use crate::command::{CommandRequest, CommandResponse};
 use metal_api_core::provider::{
-    AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord, BufferAccess,
-    BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback,
-    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
-    CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
-    FieldValue, FootprintProof, FunctionIdentity, FunctionSource, LeaseId, LeaseReservation,
-    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, ProviderCapabilities,
-    ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
-    QueuePriority, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
-    StorageMode, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType,
-    TextureView, ViewId,
+    AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord, AttachmentFormat,
+    BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback,
+    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
+    DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
+    LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
+    PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
+    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+    TracePass, ViewId, MAX_COLOR_ATTACHMENTS,
 };
 use std::io::{Read, Write};
 
@@ -56,6 +57,14 @@ const RELEASE_BORROWED_LEASE_REQUEST: u8 = 0x0d;
 /// older owner sends still decodes here unchanged (and therefore keeps the
 /// provider's queues at `QueuePriority::Default`).
 const SET_QUEUE_PRIORITIES_REQUEST: u8 = 0x0e;
+/// Submit a trace whose pass list uses the tagged compute/render layout.
+///
+/// A compute-only trace keeps travelling under [`SUBMIT_REQUEST`] with the
+/// exact pre-render pass bytes, so this tag is only ever emitted when a render
+/// pass is present. An older decoder answers `UnknownCommandTag` for it
+/// instead of misreading the tagged pass list, which is the same additive
+/// policy the queue-priority tag uses.
+const SUBMIT_RENDER_REQUEST: u8 = 0x0f;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -67,7 +76,31 @@ const HEALTH_RESPONSE: u8 = 0x07;
 const IMPORTED_RESPONSE: u8 = 0x08;
 /// The device queue table an owner marking installed.
 const QUEUE_PRIORITIES_RESPONSE: u8 = 0x09;
+/// Capabilities including the render bits the pre-render payload cannot carry.
+///
+/// Only a snapshot that declares at least one non-default render bit uses this
+/// tag; every compute-only provider keeps sending the legacy
+/// [`CAPABILITIES_RESPONSE`] bytes.
+const RENDER_CAPABILITIES_RESPONSE: u8 = 0x0a;
 const ERROR_RESPONSE: u8 = 0x7f;
+
+/// Pass discriminator inside the tagged trace layout.
+const PASS_KIND_COMPUTE: u8 = 0x00;
+const PASS_KIND_RENDER: u8 = 0x01;
+
+/// Maximum number of passes one tagged trace frame may carry.
+///
+/// The legacy layout keeps its previous (payload-bounded) behaviour; this
+/// bound exists so a corrupt tagged count cannot make the decoder allocate
+/// before it has read a single pass.
+pub const MAX_TAGGED_TRACE_PASSES: usize = 4096;
+
+/// Maximum colour formats one capability snapshot may declare.
+///
+/// [`AttachmentFormat`] is a closed four-value family, so this bound can never
+/// refuse a well-formed snapshot; it only stops a corrupt count from driving
+/// the decoder.
+pub const MAX_SUPPORTED_COLOR_FORMATS: usize = 16;
 
 /// Maximum number of queue tiers one frame may carry.
 ///
@@ -130,8 +163,12 @@ impl CommandCodec {
                 put_queue_priorities(&mut encoder, tiers)?;
             }
             CommandRequest::Submit { trace, resources } => {
-                encoder.u8(SUBMIT_REQUEST);
-                put_trace(&mut encoder, trace);
+                encoder.u8(if trace.has_render_passes() {
+                    SUBMIT_RENDER_REQUEST
+                } else {
+                    SUBMIT_REQUEST
+                });
+                put_trace(&mut encoder, trace)?;
                 put_resources(&mut encoder, resources);
             }
             CommandRequest::Wait { token, timeout } => {
@@ -182,9 +219,15 @@ impl CommandCodec {
                 epoch,
                 capabilities,
             } => {
-                encoder.u8(CAPABILITIES_RESPONSE);
-                put_epoch(&mut encoder, *epoch);
-                put_capabilities(&mut encoder, capabilities);
+                if capabilities.declares_render_support() {
+                    encoder.u8(RENDER_CAPABILITIES_RESPONSE);
+                    put_epoch(&mut encoder, *epoch);
+                    put_capabilities(&mut encoder, capabilities)?;
+                } else {
+                    encoder.u8(CAPABILITIES_RESPONSE);
+                    put_epoch(&mut encoder, *epoch);
+                    put_capabilities_legacy(&mut encoder, capabilities);
+                }
             }
             CommandResponse::Health { health } => {
                 encoder.u8(HEALTH_RESPONSE);
@@ -363,6 +406,10 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
             trace: get_trace(&mut decoder)?,
             resources: get_resources(&mut decoder)?,
         },
+        SUBMIT_RENDER_REQUEST => CommandRequest::Submit {
+            trace: get_trace_tagged(&mut decoder)?,
+            resources: get_resources(&mut decoder)?,
+        },
         WAIT_REQUEST => CommandRequest::Wait {
             token: get_token(&mut decoder)?,
             timeout: std::time::Duration::from_millis(decoder.u64()?),
@@ -389,7 +436,14 @@ fn decode_response_payload(payload: &[u8]) -> Result<CommandResponse, CodecError
     let mut decoder = Decoder::new(payload);
     let tag = decoder.u8()?;
     let response = match tag {
-        CAPABILITIES_RESPONSE => CommandResponse::Capabilities {
+        CAPABILITIES_RESPONSE => {
+            let epoch = get_epoch(&mut decoder)?;
+            CommandResponse::Capabilities {
+                epoch,
+                capabilities: get_capabilities_legacy(&mut decoder)?,
+            }
+        }
+        RENDER_CAPABILITIES_RESPONSE => CommandResponse::Capabilities {
             epoch: get_epoch(&mut decoder)?,
             capabilities: get_capabilities(&mut decoder)?,
         },
@@ -1338,7 +1392,20 @@ fn get_completion_policy(decoder: &mut Decoder<'_>) -> Result<CompletionPolicy, 
     }
 }
 
-fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) {
+/// Encode one trace, choosing the pass layout from its own contents.
+///
+/// A compute-only trace writes the pre-render pass bytes; a render-bearing
+/// trace tags every pass. The caller writes the matching payload tag, so
+/// `SUBMIT_REQUEST` frames keep their exact legacy bytes and
+/// `SUBMIT_RENDER_REQUEST` frames are self-describing.
+fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
+    let tagged = trace.has_render_passes();
+    if tagged && trace.passes.len() > MAX_TAGGED_TRACE_PASSES {
+        return Err(CodecError::TracePassCount {
+            count: trace.passes.len(),
+            maximum: MAX_TAGGED_TRACE_PASSES,
+        });
+    }
     encoder.u16(trace.schema_version);
     put_epoch(encoder, trace.device_epoch);
     encoder.u64(trace.operation_id.get());
@@ -1349,18 +1416,88 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) {
     put_dispatch_type(encoder, trace.encoder_dispatch_type);
     encoder.u64(trace.passes.len() as u64);
     for pass in &trace.passes {
-        encoder.u64(pass.pipeline.get());
-        encoder.u64(pass.buffers.len() as u64);
-        for view in &pass.buffers {
-            put_view(encoder, view);
+        match pass {
+            TracePass::Compute(pass) => {
+                if tagged {
+                    encoder.u8(PASS_KIND_COMPUTE);
+                }
+                put_compute_pass(encoder, pass);
+            }
+            TracePass::Render(pass) => {
+                if pass.color_attachments.len() > MAX_COLOR_ATTACHMENTS {
+                    return Err(CodecError::ColorAttachmentCount {
+                        count: pass.color_attachments.len(),
+                        maximum: MAX_COLOR_ATTACHMENTS,
+                    });
+                }
+                // `tagged` is true whenever a render entry exists, so the tag
+                // below always belongs to the extended layout.
+                encoder.u8(PASS_KIND_RENDER);
+                put_render_pass(encoder, pass);
+            }
         }
-        encoder.u64(pass.textures.len() as u64);
-        for texture in &pass.textures {
-            put_texture(encoder, texture);
-        }
-        put_dispatch(encoder, &pass.dispatch);
     }
     put_completion_policy(encoder, trace.completion_policy);
+    Ok(())
+}
+
+fn put_compute_pass(encoder: &mut Encoder, pass: &ComputePass) {
+    encoder.u64(pass.pipeline.get());
+    encoder.u64(pass.buffers.len() as u64);
+    for view in &pass.buffers {
+        put_view(encoder, view);
+    }
+    encoder.u64(pass.textures.len() as u64);
+    for texture in &pass.textures {
+        put_texture(encoder, texture);
+    }
+    put_dispatch(encoder, &pass.dispatch);
+}
+
+fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) {
+    encoder.u64(pass.pipeline.get());
+    encoder.u64(pass.color_attachments.len() as u64);
+    for attachment in &pass.color_attachments {
+        put_render_attachment(encoder, attachment);
+    }
+    for dimension in pass.viewport {
+        encoder.u32(dimension);
+    }
+    encoder.u32(pass.vertices);
+}
+
+fn put_render_attachment(encoder: &mut Encoder, attachment: &RenderAttachment) {
+    encoder.u64(attachment.view_id.get());
+    encoder.u64(attachment.allocation_id.get());
+    put_attachment_format(encoder, attachment.format);
+    encoder.u64(attachment.width);
+    encoder.u64(attachment.height);
+    put_load_op(encoder, attachment.load);
+    put_store_op(encoder, attachment.store);
+}
+
+fn put_attachment_format(encoder: &mut Encoder, format: AttachmentFormat) {
+    encoder.u8(format.code());
+}
+
+fn put_load_op(encoder: &mut Encoder, load: LoadOp) {
+    match load {
+        LoadOp::Clear(color) => {
+            encoder.u8(0);
+            // Fixed four-byte payload: no length prefix, so the clear value
+            // cannot be separated from its tag by a malformed length.
+            encoder.bytes.extend_from_slice(&color.bytes);
+        }
+        LoadOp::Load => encoder.u8(1),
+        LoadOp::DontCare => encoder.u8(2),
+    }
+}
+
+fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
+    encoder.u8(match store {
+        StoreOp::Store => 0,
+        StoreOp::DontCare => 1,
+    });
 }
 
 fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
@@ -1383,30 +1520,52 @@ fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
     })?;
     let mut passes = Vec::with_capacity(pass_count.min(1024));
     for _ in 0..pass_count {
-        let pipeline = PipelineId::new(decoder.u64()?);
-        let view_count =
-            usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
-                needed: usize::MAX,
-                remaining: decoder.remaining(),
-            })?;
-        let mut buffers = Vec::with_capacity(view_count.min(1024));
-        for _ in 0..view_count {
-            buffers.push(get_view(decoder)?);
-        }
-        let texture_count =
-            usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
-                needed: usize::MAX,
-                remaining: decoder.remaining(),
-            })?;
-        let mut textures = Vec::with_capacity(texture_count.min(1024));
-        for _ in 0..texture_count {
-            textures.push(get_texture(decoder)?);
-        }
-        passes.push(ComputePass {
-            pipeline,
-            buffers,
-            dispatch: get_dispatch(decoder)?,
-            textures,
+        passes.push(TracePass::Compute(get_compute_pass(decoder)?));
+    }
+    Ok(ComputeTrace {
+        schema_version,
+        device_epoch,
+        operation_id,
+        pipelines,
+        encoder_dispatch_type,
+        passes,
+        completion_policy: get_completion_policy(decoder)?,
+    })
+}
+
+/// Decode a trace whose pass list is tagged. Only a `SUBMIT_RENDER_REQUEST`
+/// frame uses this layout; a `SUBMIT_REQUEST` frame keeps decoding through
+/// [`get_trace`] and stays compute-only.
+fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
+    let schema_version = decoder.u16()?;
+    let device_epoch = get_epoch(decoder)?;
+    let operation_id = OperationId::new(decoder.u64()?);
+    let pipeline_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    let mut pipelines = Vec::with_capacity(pipeline_count.min(1024));
+    for _ in 0..pipeline_count {
+        pipelines.push(get_pipeline(decoder)?);
+    }
+    let encoder_dispatch_type = get_dispatch_type(decoder)?;
+    let pass_count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+        needed: usize::MAX,
+        remaining: decoder.remaining(),
+    })?;
+    if pass_count > MAX_TAGGED_TRACE_PASSES {
+        return Err(CodecError::TracePassCount {
+            count: pass_count,
+            maximum: MAX_TAGGED_TRACE_PASSES,
+        });
+    }
+    let mut passes = Vec::with_capacity(pass_count.min(1024));
+    for _ in 0..pass_count {
+        passes.push(match decoder.u8()? {
+            PASS_KIND_COMPUTE => TracePass::Compute(get_compute_pass(decoder)?),
+            PASS_KIND_RENDER => TracePass::Render(get_render_pass(decoder)?),
+            tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
     Ok(ComputeTrace {
@@ -1418,6 +1577,117 @@ fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
         passes,
         completion_policy: get_completion_policy(decoder)?,
     })
+}
+
+fn get_compute_pass(decoder: &mut Decoder<'_>) -> Result<ComputePass, CodecError> {
+    let pipeline = PipelineId::new(decoder.u64()?);
+    let view_count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+        needed: usize::MAX,
+        remaining: decoder.remaining(),
+    })?;
+    let mut buffers = Vec::with_capacity(view_count.min(1024));
+    for _ in 0..view_count {
+        buffers.push(get_view(decoder)?);
+    }
+    let texture_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    let mut textures = Vec::with_capacity(texture_count.min(1024));
+    for _ in 0..texture_count {
+        textures.push(get_texture(decoder)?);
+    }
+    Ok(ComputePass {
+        pipeline,
+        buffers,
+        dispatch: get_dispatch(decoder)?,
+        textures,
+    })
+}
+
+fn get_render_pass(decoder: &mut Decoder<'_>) -> Result<RenderPassDescriptor, CodecError> {
+    let pipeline = PipelineId::new(decoder.u64()?);
+    let attachment_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    if attachment_count > MAX_COLOR_ATTACHMENTS {
+        return Err(CodecError::ColorAttachmentCount {
+            count: attachment_count,
+            maximum: MAX_COLOR_ATTACHMENTS,
+        });
+    }
+    let mut color_attachments = Vec::with_capacity(attachment_count);
+    for _ in 0..attachment_count {
+        color_attachments.push(get_render_attachment(decoder)?);
+    }
+    Ok(RenderPassDescriptor {
+        pipeline,
+        color_attachments,
+        viewport: [
+            decoder.u32()?,
+            decoder.u32()?,
+            decoder.u32()?,
+            decoder.u32()?,
+        ],
+        vertices: decoder.u32()?,
+    })
+}
+
+fn get_render_attachment(decoder: &mut Decoder<'_>) -> Result<RenderAttachment, CodecError> {
+    let view_id = ViewId::new(decoder.u64()?);
+    let allocation_id = AllocationId::new(decoder.u64()?);
+    let format = get_attachment_format(decoder)?;
+    let width = decoder.u64()?;
+    let height = decoder.u64()?;
+    let load = get_load_op(decoder)?;
+    let store = get_store_op(decoder)?;
+    Ok(RenderAttachment {
+        view_id,
+        allocation_id,
+        format,
+        width,
+        height,
+        load,
+        store,
+    })
+}
+
+fn get_attachment_format(decoder: &mut Decoder<'_>) -> Result<AttachmentFormat, CodecError> {
+    let code = decoder.u8()?;
+    AttachmentFormat::from_code(code).ok_or(CodecError::UnknownEnumValue {
+        field: "attachment format",
+        value: code,
+    })
+}
+
+fn get_load_op(decoder: &mut Decoder<'_>) -> Result<LoadOp, CodecError> {
+    match decoder.u8()? {
+        0 => {
+            let mut bytes = [0_u8; ClearColor::BYTES];
+            bytes.copy_from_slice(decoder.take(ClearColor::BYTES)?);
+            Ok(LoadOp::Clear(ClearColor::new(bytes)))
+        }
+        1 => Ok(LoadOp::Load),
+        2 => Ok(LoadOp::DontCare),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "attachment load op",
+            value,
+        }),
+    }
+}
+
+fn get_store_op(decoder: &mut Decoder<'_>) -> Result<StoreOp, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(StoreOp::Store),
+        1 => Ok(StoreOp::DontCare),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "attachment store op",
+            value,
+        }),
+    }
 }
 
 fn put_resources(encoder: &mut Encoder, resources: &ResourceTableSnapshot) {
@@ -1849,7 +2119,35 @@ fn get_storage_mode(decoder: &mut Decoder<'_>) -> Result<StorageMode, CodecError
     }
 }
 
-fn put_capabilities(encoder: &mut Encoder, capabilities: &ProviderCapabilities) {
+/// Encode a capability snapshot, including its render bits.
+///
+/// Only [`RENDER_CAPABILITIES_RESPONSE`] frames use this layout. A snapshot
+/// whose render bits are all at their defaults is written by
+/// [`put_capabilities_legacy`] under the legacy tag, which is what keeps both
+/// current providers byte-identical on the wire.
+fn put_capabilities(
+    encoder: &mut Encoder,
+    capabilities: &ProviderCapabilities,
+) -> Result<(), CodecError> {
+    put_capabilities_legacy(encoder, capabilities);
+    if capabilities.supported_color_formats.len() > MAX_SUPPORTED_COLOR_FORMATS {
+        return Err(CodecError::SupportedColorFormatCount {
+            count: capabilities.supported_color_formats.len(),
+            maximum: MAX_SUPPORTED_COLOR_FORMATS,
+        });
+    }
+    encoder.bool(capabilities.supports_render_passes);
+    encoder.u32(capabilities.max_color_attachments);
+    encoder.u64(capabilities.max_attachment_dimension[0]);
+    encoder.u64(capabilities.max_attachment_dimension[1]);
+    encoder.u64(capabilities.supported_color_formats.len() as u64);
+    for format in &capabilities.supported_color_formats {
+        put_attachment_format(encoder, *format);
+    }
+    Ok(())
+}
+
+fn put_capabilities_legacy(encoder: &mut Encoder, capabilities: &ProviderCapabilities) {
     encoder.u32(capabilities.max_passes);
     encoder.bool(capabilities.supports_threads_exact);
     encoder.bool(capabilities.supports_threadgroups);
@@ -1870,7 +2168,9 @@ fn put_capabilities(encoder: &mut Encoder, capabilities: &ProviderCapabilities) 
     encoder.bool(capabilities.submit_only);
 }
 
-fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, CodecError> {
+/// Decode the pre-render capability payload and fill the render bits with the
+/// defaults a provider that never declared them must be treated as having.
+fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, CodecError> {
     let max_passes = decoder.u32()?;
     let supports_threads_exact = decoder.bool()?;
     let supports_threadgroups = decoder.bool()?;
@@ -1907,5 +2207,33 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         storage_modes,
         host_readback: decoder.bool()?,
         submit_only: decoder.bool()?,
+        supports_render_passes: false,
+        max_color_attachments: 0,
+        max_attachment_dimension: [0, 0],
+        supported_color_formats: Vec::new(),
     })
+}
+
+fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, CodecError> {
+    let mut capabilities = get_capabilities_legacy(decoder)?;
+    capabilities.supports_render_passes = decoder.bool()?;
+    capabilities.max_color_attachments = decoder.u32()?;
+    capabilities.max_attachment_dimension = [decoder.u64()?, decoder.u64()?];
+    let format_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    if format_count > MAX_SUPPORTED_COLOR_FORMATS {
+        return Err(CodecError::SupportedColorFormatCount {
+            count: format_count,
+            maximum: MAX_SUPPORTED_COLOR_FORMATS,
+        });
+    }
+    let mut supported_color_formats = Vec::with_capacity(format_count);
+    for _ in 0..format_count {
+        supported_color_formats.push(get_attachment_format(decoder)?);
+    }
+    capabilities.supported_color_formats = supported_color_formats;
+    Ok(capabilities)
 }

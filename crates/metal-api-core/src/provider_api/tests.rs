@@ -114,6 +114,10 @@ impl ComputeProvider for FakeProvider {
             storage_modes: vec![StorageMode::OwnedBytes],
             host_readback: true,
             submit_only: false,
+            supports_render_passes: false,
+            max_color_attachments: 0,
+            max_attachment_dimension: [0, 0],
+            supported_color_formats: Vec::new(),
         }
     }
     fn health(&self) -> ProviderHealth {
@@ -184,7 +188,7 @@ impl ComputeProvider for FakeProvider {
                 (view.view_id, bytes.clone())
             })
             .collect::<BTreeMap<_, _>>();
-        for pass in &trace.passes {
+        for pass in trace.compute_passes() {
             let input = pass
                 .buffers
                 .iter()
@@ -442,14 +446,29 @@ fn one_submit_preserves_recorded_dispatches_late_views_and_commit_time_contents(
     assert_eq!(traces[0].passes.len(), 3);
     assert_eq!(traces[0].pipelines.len(), 3);
     assert_eq!(
-        traces[0].passes[0].buffers[0].source,
+        traces[0].passes[0]
+            .as_compute()
+            .expect("recorded pass is a compute pass")
+            .buffers[0]
+            .source,
         BufferSource::OwnedBytes(vec![3; 4])
     );
     assert_eq!(
-        traces[0].passes[1].buffers[0].source,
+        traces[0].passes[1]
+            .as_compute()
+            .expect("recorded pass is a compute pass")
+            .buffers[0]
+            .source,
         BufferSource::OwnedBytes(vec![3; 4])
     );
-    assert_eq!(traces[0].passes[0].buffers[0].view_id, av.view_id());
+    assert_eq!(
+        traces[0].passes[0]
+            .as_compute()
+            .expect("recorded pass is a compute pass")
+            .buffers[0]
+            .view_id,
+        av.view_id()
+    );
     assert_eq!(command.submission().unwrap().writebacks.len(), 2);
 }
 

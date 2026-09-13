@@ -68,6 +68,10 @@ pub enum CodecError {
     ChunkInterrupted { received: u64, declared: u64 },
     ChunkedPayloadTooLarge { total: u64, maximum: usize },
     QueuePriorityCount { count: usize, maximum: usize },
+    TracePassCount { count: usize, maximum: usize },
+    ColorAttachmentCount { count: usize, maximum: usize },
+    SupportedColorFormatCount { count: usize, maximum: usize },
+    UnknownPassTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
@@ -130,6 +134,21 @@ impl fmt::Display for CodecError {
                 formatter,
                 "queue priority table carries {count} tiers, maximum {maximum}"
             ),
+            Self::TracePassCount { count, maximum } => write!(
+                formatter,
+                "tagged trace carries {count} passes, maximum {maximum}"
+            ),
+            Self::ColorAttachmentCount { count, maximum } => write!(
+                formatter,
+                "render pass carries {count} colour attachments, maximum {maximum}"
+            ),
+            Self::SupportedColorFormatCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} colour formats, maximum {maximum}"
+            ),
+            Self::UnknownPassTag(tag) => {
+                write!(formatter, "unknown trace pass tag {tag:#04x}")
+            }
             Self::UnknownEnumValue { field, value } => {
                 write!(formatter, "unknown {field} value {value}")
             }

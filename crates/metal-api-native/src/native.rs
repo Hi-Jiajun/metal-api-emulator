@@ -49,7 +49,7 @@ struct CompletionSlot {
 }
 
 fn trace_owned_bytes(trace: &ComputeTrace) -> u64 {
-    trace.passes.iter().fold(0_u64, |total, pass| {
+    trace.compute_passes().fold(0_u64, |total, pass| {
         pass.buffers
             .iter()
             .fold(total, |total, view| total.saturating_add(view.length))
@@ -158,6 +158,12 @@ impl NativeMetalProvider {
                 ],
                 host_readback: true,
                 submit_only: false,
+                // Compute-only device snapshot: the native provider has no
+                // render execution path, so admission refuses render traces.
+                supports_render_passes: false,
+                max_color_attachments: 0,
+                max_attachment_dimension: [0, 0],
+                supported_color_formats: Vec::new(),
             };
             Ok(Self {
                 epoch: allocate_device_epoch()?,
@@ -475,7 +481,7 @@ impl ComputeProvider for NativeMetalProvider {
         // Resolve and retain every pass's pipeline under the same registry
         // lock, checking all metadata and local limits before GPU allocation.
         let mut pipelines = Vec::with_capacity(trace.passes.len());
-        for (pass_index, pass) in trace.passes.iter().enumerate() {
+        for (pass_index, pass) in trace.compute_passes().enumerate() {
             let metadata = trace.pipeline(pass.pipeline).map_err(|error| {
                 refusal(
                     ProviderPhase::Resolve,
@@ -536,8 +542,7 @@ impl ComputeProvider for NativeMetalProvider {
             submission_id: SubmissionId::new(next_id(&mut state.next_submission)?),
         };
         let borrowed_leases = trace
-            .passes
-            .iter()
+            .compute_passes()
             .flat_map(|pass| pass.buffers.iter())
             .filter_map(|view| match view.source {
                 BufferSource::BorrowedNoCopy(lease_id) => Some(lease_id),
@@ -1002,7 +1007,7 @@ fn encode(
     // resources on MTLCommandQueue carry writes across encoder boundaries:
     // https://developer.apple.com/documentation/metal/resource-synchronization
     // Each pass sees earlier writes; the initial bytes are uploaded only once.
-    for (pass_index, pass) in trace.passes.iter().enumerate() {
+    for (pass_index, pass) in trace.compute_passes().enumerate() {
         let encoder = unsafe {
             let pointer: *mut metal::MTLComputeCommandEncoder =
                 msg_send![resources.command.as_ref(), computeCommandEncoder];

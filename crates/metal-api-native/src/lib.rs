@@ -555,7 +555,7 @@ mod tests {
         use metal_api_core::provider::{
             AllocationId, AllocationRecord, BufferSource, BufferView, CompletionPolicy,
             ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType, OperationId,
-            PipelineProvider, ProviderHealth, ResourceTableSnapshot, ViewId,
+            PipelineProvider, ProviderHealth, ResourceTableSnapshot, TracePass, ViewId,
             PROVIDER_SCHEMA_VERSION,
         };
         use std::time::Duration;
@@ -580,7 +580,7 @@ mod tests {
             operation_id: OperationId::new(1),
             pipelines: vec![pipeline.clone()],
             encoder_dispatch_type: DispatchType::Serial,
-            passes: vec![ComputePass {
+            passes: vec![TracePass::Compute(ComputePass {
                 pipeline: pipeline.pipeline_id,
                 buffers: vec![
                     BufferView {
@@ -610,7 +610,7 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
                 textures: Vec::new(),
-            }],
+            })],
             completion_policy: CompletionPolicy::HostReadback,
         };
         let resources = || {
@@ -695,7 +695,7 @@ mod tests {
         use metal_api_core::provider::{
             AllocationId, AllocationRecord, BufferSource, BufferView, CompletionPolicy,
             ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType, OperationId,
-            PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+            PipelineProvider, ResourceTableSnapshot, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
         };
 
         let Ok(provider) = NativeMetalProvider::new() else {
@@ -713,7 +713,7 @@ mod tests {
             operation_id: OperationId::new(1),
             pipelines: vec![pipeline.clone()],
             encoder_dispatch_type: DispatchType::Serial,
-            passes: vec![ComputePass {
+            passes: vec![TracePass::Compute(ComputePass {
                 pipeline: pipeline.pipeline_id,
                 buffers: vec![
                     BufferView {
@@ -743,7 +743,7 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
                 textures: Vec::new(),
-            }],
+            })],
             completion_policy: CompletionPolicy::HostReadback,
         };
         let mut snapshot = ResourceTableSnapshot::new();
@@ -789,7 +789,7 @@ mod tests {
             operation_id: OperationId::new(2),
             pipelines: vec![pipeline.clone()],
             encoder_dispatch_type: DispatchType::Serial,
-            passes: vec![ComputePass {
+            passes: vec![TracePass::Compute(ComputePass {
                 pipeline: pipeline.pipeline_id,
                 buffers: vec![
                     BufferView {
@@ -819,7 +819,7 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
                 textures: Vec::new(),
-            }],
+            })],
             completion_policy: CompletionPolicy::HostReadback,
         };
         let mut split_snapshot = ResourceTableSnapshot::new();
@@ -855,7 +855,8 @@ mod tests {
             AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView,
             CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType,
             LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, OperationId,
-            PipelineProvider, ResourceTableSnapshot, StagedLease, ViewId, PROVIDER_SCHEMA_VERSION,
+            PipelineProvider, ResourceTableSnapshot, StagedLease, TracePass, ViewId,
+            PROVIDER_SCHEMA_VERSION,
         };
 
         let Ok(provider) = NativeMetalProvider::new() else {
@@ -887,7 +888,7 @@ mod tests {
             operation_id: OperationId::new(97),
             pipelines: vec![pipeline.clone()],
             encoder_dispatch_type: DispatchType::Serial,
-            passes: vec![ComputePass {
+            passes: vec![TracePass::Compute(ComputePass {
                 pipeline: pipeline.pipeline_id,
                 buffers: vec![
                     BufferView {
@@ -917,7 +918,7 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
                 textures: Vec::new(),
-            }],
+            })],
             completion_policy: CompletionPolicy::HostReadback,
         };
         let resources = || {
@@ -985,7 +986,8 @@ mod tests {
             AllocationId, AllocationRecord, BorrowedLease, BufferLease, BufferSource, BufferView,
             CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchType,
             LeaseId, LeaseLedger, LeaseObservation, LeaseReservation, NoCopyLeaseImporter,
-            OperationId, PipelineProvider, ResourceTableSnapshot, ViewId, PROVIDER_SCHEMA_VERSION,
+            OperationId, PipelineProvider, ResourceTableSnapshot, TracePass, ViewId,
+            PROVIDER_SCHEMA_VERSION,
         };
 
         let Ok(provider) = NativeMetalProvider::new() else {
@@ -1110,7 +1112,7 @@ mod tests {
                 operation_id: OperationId::new(view),
                 pipelines: vec![pipeline.clone()],
                 encoder_dispatch_type: DispatchType::Serial,
-                passes: vec![ComputePass {
+                passes: vec![TracePass::Compute(ComputePass {
                     pipeline: pipeline.pipeline_id,
                     buffers,
                     dispatch: Dispatch {
@@ -1119,7 +1121,7 @@ mod tests {
                         threads_per_threadgroup: [1, 1, 1],
                     },
                     textures: Vec::new(),
-                }],
+                })],
                 completion_policy: CompletionPolicy::HostReadback,
             }
         };

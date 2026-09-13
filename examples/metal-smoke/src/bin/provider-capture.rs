@@ -9,7 +9,7 @@ use metal_api_core::provider::{
     DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId,
     PipelineCompileRequest, PipelineProvider, QueuePriority, QueueSchedulingPolicy,
     ResourceTableSnapshot, SemanticDigest, ShaderSource, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, ViewId, PROVIDER_SCHEMA_VERSION,
+    TextureSource, TextureType, TextureView, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1920,7 +1920,7 @@ fn case_trace(
         operation_id: OperationId::new(operation),
         pipelines,
         encoder_dispatch_type: DispatchType::Serial,
-        passes,
+        passes: passes.into_iter().map(TracePass::Compute).collect(),
         completion_policy: CompletionPolicy::HostReadback,
     })
 }
@@ -2217,8 +2217,16 @@ fn run_case(
     )?;
     if case.entry == "transform_3d" {
         let mut short = guard_trace.clone();
-        let shortened = short.passes[0].buffers[0].view_id;
-        for pass in &mut short.passes {
+        let shortened = short.passes[0]
+            .as_compute()
+            .ok_or("guard trace pass is not a compute pass")?
+            .buffers[0]
+            .view_id;
+        for pass in short
+            .passes
+            .iter_mut()
+            .filter_map(TracePass::as_compute_mut)
+        {
             if let Some(view) = pass
                 .buffers
                 .iter_mut()
@@ -2255,7 +2263,11 @@ fn run_case(
         let original_id = unknown.pipelines[1].pipeline_id;
         let missing = metal_api_core::provider::PipelineId::new(u64::MAX);
         unknown.pipelines[1].pipeline_id = missing;
-        for pass in &mut unknown.passes {
+        for pass in unknown
+            .passes
+            .iter_mut()
+            .filter_map(TracePass::as_compute_mut)
+        {
             if pass.pipeline == original_id {
                 pass.pipeline = missing;
             }
@@ -2825,10 +2837,26 @@ mod tests {
             .unwrap();
             let resources = trace.serial_resources().unwrap();
             assert_eq!(resources.len(), case.buffers.len());
-            assert_eq!(trace.passes[0].buffers.len(), 3);
-            assert_eq!(trace.passes[1].buffers.len(), 2);
+            assert_eq!(
+                trace.passes[0]
+                    .as_compute()
+                    .expect("capture pass is a compute pass")
+                    .buffers
+                    .len(),
+                3
+            );
             assert_eq!(
                 trace.passes[1]
+                    .as_compute()
+                    .expect("capture pass is a compute pass")
+                    .buffers
+                    .len(),
+                2
+            );
+            assert_eq!(
+                trace.passes[1]
+                    .as_compute()
+                    .expect("capture pass is a compute pass")
                     .buffers
                     .iter()
                     .map(|view| (view.metal_binding, view.view_id.get()))
@@ -2836,6 +2864,8 @@ mod tests {
                 [(4, 400), (9, 430)]
             );
             assert!(!trace.passes[1]
+                .as_compute()
+                .expect("capture pass is a compute pass")
                 .buffers
                 .iter()
                 .any(|view| view.view_id.get() == 410));

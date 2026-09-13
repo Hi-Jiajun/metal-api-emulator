@@ -16,7 +16,7 @@ use metal_api_core::provider::{
     HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
     NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
     ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    StagedLease, StorageMode, SubmissionId, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
@@ -806,7 +806,11 @@ fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
         },
         vec![(0, 8, word.clone()), (1, 16, vec![0; 4])],
     )?;
-    trace.passes[0].buffers[0].source = BufferSource::StagedLease(lease_id);
+    trace.passes[0]
+        .as_compute_mut()
+        .expect("fixture pass is a compute pass")
+        .buffers[0]
+        .source = BufferSource::StagedLease(lease_id);
     let mut resources = resources_for_trace(&trace)?;
     resources.insert_lease(reservation)?;
     let admitted = remote
@@ -1614,7 +1618,7 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
         operation_id: OperationId::new(97),
         pipelines: vec![pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![ComputePass {
+        passes: vec![TracePass::Compute(ComputePass {
             pipeline: pipeline.pipeline_id,
             buffers: vec![
                 BufferView {
@@ -1644,7 +1648,7 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
                 threads_per_threadgroup: [1, 1, 1],
             },
             textures: Vec::new(),
-        }],
+        })],
         completion_policy: CompletionPolicy::HostReadback,
     };
     let mut resources = ResourceTableSnapshot::new();
@@ -3178,7 +3182,7 @@ fn borrowed_lease_trace_for(
         operation_id: OperationId::new(lease_view_id),
         pipelines: vec![pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![ComputePass {
+        passes: vec![TracePass::Compute(ComputePass {
             pipeline: pipeline.pipeline_id,
             buffers,
             dispatch: Dispatch {
@@ -3187,7 +3191,7 @@ fn borrowed_lease_trace_for(
                 threads_per_threadgroup: [1, 1, 1],
             },
             textures: Vec::new(),
-        }],
+        })],
         completion_policy: CompletionPolicy::HostReadback,
     }
 }
@@ -3389,19 +3393,23 @@ fn make_trace(
         operation_id: OperationId::new(operation),
         pipelines: vec![pipeline.clone()],
         encoder_dispatch_type: DispatchType::Serial,
-        passes: vec![ComputePass {
+        passes: vec![TracePass::Compute(ComputePass {
             pipeline: pipeline.pipeline_id,
             buffers,
             dispatch,
             textures: Vec::new(),
-        }],
+        })],
         completion_policy: CompletionPolicy::HostReadback,
     })
 }
 
 fn resources_for_trace(trace: &ComputeTrace) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
     let mut resources = ResourceTableSnapshot::new();
-    for view in &trace.passes[0].buffers {
+    for view in &trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+    {
         resources.insert_allocation(AllocationRecord {
             allocation_id: view.allocation_id,
             owner_epoch: trace.device_epoch,
@@ -3440,6 +3448,8 @@ fn check_writeback(
     expected: &[u8],
 ) -> Result<(), Box<dyn Error>> {
     let view = trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
         .buffers
         .iter()
         .find(|view| view.metal_binding == binding)
