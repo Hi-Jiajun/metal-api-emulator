@@ -817,12 +817,20 @@ impl PresentTargetImage {
         self.view
     }
 
-    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
-        *self.layout_lock()
-    }
-
-    pub(crate) fn mark_presented(&self) {
-        *self.layout_lock() = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+    /// Begin one present round trip on this target, holding its layout lock
+    /// until the returned guard is dropped.
+    ///
+    /// The guard is the target's serialization point: a present action must
+    /// read the layout it is about to submit against and publish the new
+    /// layout before another present on the same target can start. Without
+    /// it, two concurrent presents of one target could interleave so that the
+    /// second submits `initialLayout = COLOR_ATTACHMENT_OPTIMAL` after the
+    /// first has already moved the image to `TRANSFER_SRC_OPTIMAL`, which is a
+    /// layout mismatch the driver is entitled to reject (`research/docs/24`
+    /// §3.3 rule 1). The caller publishes the terminal layout by writing
+    /// through the guard; dropping it releases the next round trip.
+    pub(crate) fn begin_present(&self) -> std::sync::MutexGuard<'_, vk::ImageLayout> {
+        self.layout_lock()
     }
 
     fn layout_lock(&self) -> std::sync::MutexGuard<'_, vk::ImageLayout> {
@@ -846,6 +854,54 @@ impl Drop for PresentTargetImage {
             }
         }
     }
+}
+
+/// The present path chains the colour store out of the render pass and into
+/// the copy-out through one access class, `COLOR_ATTACHMENT_WRITE` at
+/// `COLOR_ATTACHMENT_OUTPUT`. The render pass's `0 → EXTERNAL` dependency and
+/// the explicit terminal transition below must both name it: a dependency
+/// whose second scope was `COLOR_ATTACHMENT_READ` would leave the barrier's
+/// `srcAccessMask` outside the availability chain, so the copy-out would not
+/// be synchronized with the colour store on a validation-layer-strict driver
+/// (`research/docs/24` §3.3 rule 1).
+const PRESENT_WRITE_STAGE: vk::PipelineStageFlags = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+
+/// The access class [`PRESENT_WRITE_STAGE`] hands from the pass to the present
+/// transition.
+const PRESENT_WRITE_ACCESS: vk::AccessFlags = vk::AccessFlags::COLOR_ATTACHMENT_WRITE;
+
+/// The render pass's `0 → EXTERNAL` dependency for a present pass: the stored
+/// colour write is made available to the explicit present transition that
+/// follows the pass.
+fn present_subpass_dependency() -> vk::SubpassDependency {
+    vk::SubpassDependency::default()
+        .src_subpass(0)
+        .dst_subpass(vk::SUBPASS_EXTERNAL)
+        .src_stage_mask(PRESENT_WRITE_STAGE)
+        .dst_stage_mask(PRESENT_WRITE_STAGE)
+        .src_access_mask(PRESENT_WRITE_ACCESS)
+        .dst_access_mask(PRESENT_WRITE_ACCESS)
+}
+
+/// The present action's terminal transition (`docs/24` §3.6): the rendered
+/// target moves from the colour-attachment state to the host-readable state
+/// the copy-out consumes.
+fn present_transition_barrier(image: vk::Image) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
+        .src_access_mask(PRESENT_WRITE_ACCESS)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
 }
 
 /// Execute one render pass whose attachment is a provider-owned present target,
@@ -884,9 +940,16 @@ pub(crate) fn execute_present_render(
     let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
     // One acquire per present action, before the pass runs (`docs/24` §3.6).
+    //
+    // The guard serializes the whole round trip on this target's layout: the
+    // submission below declares `*layout` as its `initialLayout`, and the
+    // terminal layout is published through the same guard before it drops, so
+    // a concurrent present of this target cannot read a layout that another
+    // submission has already changed.
+    let mut layout = target.begin_present();
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
-    objects.attach_present_target(target);
+    objects.attach_present_target(target, *layout);
     objects.create_render_pass(vk_format)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
@@ -908,7 +971,7 @@ pub(crate) fn execute_present_render(
     // One present per present action, after the terminal transition and
     // readback have landed (`docs/24` §3.6).
     context.record_present();
-    target.mark_presented();
+    *layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
     Ok(texels)
 }
 
@@ -1005,12 +1068,20 @@ impl<'a> OffscreenObjects<'a> {
     /// freshly created offscreen attachment. The target's image and view are
     /// borrowed for the pass's lifetime; its memory stays owned by the provider
     /// (`docs/24` §5.2).
-    fn attach_present_target(&mut self, target: &PresentTargetImage) {
+    ///
+    /// `initial_layout` is passed in rather than read from the target: the
+    /// caller holds the target's present round-trip guard, and the guard's
+    /// value *is* the layout this submission must declare.
+    fn attach_present_target(
+        &mut self,
+        target: &PresentTargetImage,
+        initial_layout: vk::ImageLayout,
+    ) {
         self.image = target.image();
         self.view = target.view();
         self.owns_attachment = false;
         self.present = true;
-        self.initial_layout = target.current_layout();
+        self.initial_layout = initial_layout;
     }
 
     /// The 2D single-sample optimal-tiling colour attachment.
@@ -1093,14 +1164,13 @@ impl<'a> OffscreenObjects<'a> {
             // The present path does its own `COLOR_ATTACHMENT_OPTIMAL →
             // TRANSFER_SRC_OPTIMAL` transition in `record`, so the render pass
             // only has to make the store available to the barrier that follows
-            // (`docs/24` §3.3 rule 1).
-            vk::SubpassDependency::default()
-                .src_subpass(0)
-                .dst_subpass(vk::SUBPASS_EXTERNAL)
-                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)
+            // (`docs/24` §3.3 rule 1). The dependency's second scope and the
+            // barrier's first scope are the *same* colour-write access class:
+            // a dependency that hands the store on as `COLOR_ATTACHMENT_READ`
+            // would leave the barrier's `srcAccessMask =
+            // COLOR_ATTACHMENT_WRITE` outside the availability chain, so the
+            // copy-out would not be synchronized with the colour store.
+            present_subpass_dependency()
         } else {
             vk::SubpassDependency::default()
                 .src_subpass(0)
@@ -1393,25 +1463,11 @@ impl<'a> OffscreenObjects<'a> {
             // (`docs/24` §3.3 rule 1). The equivalent terminal state is
             // `TRANSFER_SRC_OPTIMAL`, i.e. "readable by the host after `wait`"
             // (`docs/24` §3.6), not a real `VkQueuePresentKHR`.
-            let barrier = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
+            let barrier = present_transition_barrier(self.image);
             unsafe {
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    PRESENT_WRITE_STAGE,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &[],
@@ -1817,6 +1873,94 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// The render pass's `0 → EXTERNAL` dependency and the explicit present
+    /// transition have to agree about the access class that carries the colour
+    /// store out of the pass. They disagreed once (`dst_access =
+    /// COLOR_ATTACHMENT_READ` against the barrier's `src_access =
+    /// COLOR_ATTACHMENT_WRITE`), which Lavapipe tolerated but a validation
+    /// layer would not; this pins the agreement at the constructors both call
+    /// sites use.
+    #[test]
+    fn the_present_subpass_dependency_hands_the_colour_write_to_the_present_barrier() {
+        let dependency = present_subpass_dependency();
+        let barrier = present_transition_barrier(vk::Image::null());
+        assert_eq!(dependency.dst_subpass, vk::SUBPASS_EXTERNAL);
+        // The bits are compared through `as_raw`: ash's bitflags and layout
+        // newtypes do not implement `Debug` without the crate's `debug`
+        // feature, which `assert_eq!` would need. `VkImageMemoryBarrier`
+        // carries no stage mask — the stage is a parameter of
+        // `vkCmdPipelineBarrier` — so the command's source stage is pinned by
+        // both call sites naming [`PRESENT_WRITE_STAGE`].
+        assert_eq!(
+            dependency.dst_stage_mask.as_raw(),
+            PRESENT_WRITE_STAGE.as_raw()
+        );
+        assert_eq!(
+            dependency.dst_access_mask.as_raw(),
+            PRESENT_WRITE_ACCESS.as_raw()
+        );
+        assert_eq!(
+            barrier.src_access_mask.as_raw(),
+            PRESENT_WRITE_ACCESS.as_raw()
+        );
+        assert_eq!(
+            barrier.dst_access_mask.as_raw(),
+            vk::AccessFlags::TRANSFER_READ.as_raw()
+        );
+        assert_eq!(
+            barrier.old_layout.as_raw(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL.as_raw()
+        );
+        assert_eq!(
+            barrier.new_layout.as_raw(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL.as_raw()
+        );
+    }
+
+    /// One present round trip holds the target's layout lock until it has
+    /// published the terminal layout, so a second present of the same target
+    /// cannot submit against a layout the previous submission already left.
+    /// The guard's blocking behaviour is the invariant the fix relies on, so
+    /// the test observes it directly instead of hoping a race shows up.
+    #[test]
+    fn a_present_round_trip_excludes_a_second_present_on_the_same_target() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let context = std::sync::Arc::new(context);
+        let target = std::sync::Arc::new(
+            PresentTargetImage::create(
+                std::sync::Arc::clone(&context),
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+            )
+            .expect("the present target is created"),
+        );
+
+        let first = target.begin_present();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiting = std::sync::Arc::clone(&target);
+        let handle = std::thread::spawn(move || {
+            let _second = waiting.begin_present();
+            let _ = started_tx.send(());
+        });
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a second present round trip must wait for the first to publish its layout"
+        );
+        drop(first);
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "the second round trip starts once the first published its layout"
+        );
+        handle.join().expect("the waiting thread ends");
     }
 
     /// Execute the milestone's 2×2 offscreen pass against `format` and return the
