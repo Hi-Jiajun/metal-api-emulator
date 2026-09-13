@@ -133,10 +133,13 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `cd5bced`/`b14f496`, the
   Vulkan executor in `2e64eff`/`0319da1`, the observation in `e581562`, and
   `8430446` added the suite to CI on the trace rail and both Vulkan object-API
-  loops. Only that rail reports an attachment: the object API has no render
-  command encoder, and the native provider still declares
-  `supports_render_passes = false`. The macOS oracle's render capture path
-  exists but has not run on Apple hardware; see `conformance/RENDER-CAPTURE.md`.
+  loops. Only that rail reports the suite's attachment today: the object API has
+  no render command encoder, and no macOS rail has run `suite-v13` yet. The
+  native provider's own trace rail is wired to the same reviewed fixture and
+  flipped `supports_render_passes` after CI run `34774478149`'s
+  `native-oracle --render-selftest` read the 2x2 attachment back as `40 80 c0 ff`
+  four times on an Apple Paravirtual device, but its encoder body has not run on
+  Apple hardware itself; see `conformance/RENDER-CAPTURE.md`.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
@@ -157,8 +160,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   marking that carries them to a remote provider over the command channel now
   exist, while nothing maps an `MTLCommandQueue` to a tier yet). Resource
   snapshots do not hold live guest pages.
-- Not implemented: render passes beyond the Vulkan trace rail (no object-API
-  render command encoder and no native-provider render path), sampler and
+- Not implemented: render passes beyond the two trace rails (the object API has
+  no render command encoder, and the native provider's render path has not run
+  on Apple hardware yet), sampler and
   texture generalisation beyond the sampled fixture, presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
   compilation, arbitrary AIR/MSL compilation and reflection, and production

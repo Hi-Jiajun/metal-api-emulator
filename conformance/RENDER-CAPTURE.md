@@ -7,9 +7,12 @@ one today. `conformance/suite-v13.json` is the first committed suite that
 declares render cases, `conformance/compare.py` has the matching attachment
 section, and the Vulkan trace rail executes the case end to end. Two things are
 still **pending**: the two object-API rails have no render command encoder, and
-no run on an Apple GPU has been observed yet. The macOS job does run the
-one-device check itself — `--render-selftest` in §5 — but its result is still an
-outstanding observation, not a recorded one.
+no macOS rail has reported the case. The one-device check is no longer pending
+— `--render-selftest` in §5 ran on an Apple Paravirtual device in CI run
+`34774478149` and read the attachment back as `4080c0ff` four times — so the
+native provider declares render support and its trace rail executes the same
+reviewed fixture; what no Apple GPU has run yet is the Rust provider's own
+encoder path.
 
 The design it implements is `research/docs/23` §1.2 (the milestone), §3 (the
 contract), §5.1 (what the oracle needs) and §6 Steps 6–7 (where it lands).
@@ -166,12 +169,16 @@ counters, so the contract does not apply to `native-metal`
 
 ## 4. Which rails report a render case
 
-The first render increment has exactly one executable rail: the Vulkan trace
-rail. The two object-API rails have no render command encoder
-(`crates/metal-api-core/src/provider_api.rs` exposes
-`compute_command_encoder` only) and the native provider still declares
-`supports_render_passes = false`, so a render-bearing trace is refused there
-with `render_passes_unsupported` or cannot be expressed at all.
+The first render increment has two executable rails: the Vulkan trace rail and
+the native trace rail (`crates/metal-api-native/src/render.rs`, wired into
+`NativeMetalProvider::submit` in Step 7). The native provider declares
+`supports_render_passes = true` with the rail's own limits — one colour
+attachment, 2x2, the three admitted formats — because the flip condition below
+is met; before that flip it refused a render-bearing trace with
+`render_passes_unsupported`. The two object-API rails still have no render
+command encoder (`crates/metal-api-core/src/provider_api.rs` exposes
+`compute_command_encoder` only), so a render case cannot be expressed there at
+all.
 
 A render case therefore declares the capture backends that owe the attachment
 in its `capture_rails` marker:
@@ -199,8 +206,11 @@ the suite itself:
   the single-case shape is evidenced; the **suite** path
   (`run_native.py --suite conformance/suite-v13.json`) is what would put that
   byte comparison into the four-rail capture matrix;
-* the Rust native provider needs its own `supports_render_passes` flip, whose
-  condition is the same §5 check (`crates/metal-api-native/src/native.rs`);
+* the Rust native provider's `supports_render_passes` flip has landed on the
+  same §5 evidence (`crates/metal-api-native/src/native.rs`), and its trace rail
+  plans and encodes every render pass the suite declares; what it has not had is
+  an Apple GPU running its own encoder body, so the rail is admitted and
+  reviewed rather than observed;
 * `.github/workflows/ci.yml` would then need `13` in the four version loops, the
   explicit suite lines, the native status list and the parity lines.
 
@@ -246,13 +256,20 @@ allocation read `4080c0ff` four times; a successful log ends with
 `render_selftest: PASS`. The job's existing `native-evidence` artifact upload
 archives those files on every run, including a SKIP.
 
-The flip therefore needs one CI run whose log carries both `4080c0ff` four
+The flip therefore needed one CI run whose log carries both `4080c0ff` four
 times and `render_selftest: PASS`. A green job whose log says `SKIP` is not that
 evidence: it reports that the runner had no eligible device, not that the
 reviewed path ran.
 
-This is the check the native provider's `supports_render_passes` flip condition
-names (`crates/metal-api-native/src/native.rs`).
+That run is `34774478149` (`native-oracle-build`, commit `fb4f8da`): on an Apple
+Paravirtual device it reported `bytes_hex =
+4080c0ff4080c0ff4080c0ff4080c0ff` and `render_selftest: PASS`. It is the
+evidence the native provider's render bits point at
+(`crates/metal-api-native/src/render.rs::capability_bits`,
+`crates/metal-api-native/src/native.rs`), and it is what checks the Swift
+oracle's half of Step 6: the reviewed MSL pin matched, the oversize triangle
+covered every texel of the 2x2 attachment, and the readback was the fragment's
+texel rather than the clear sentinel.
 
 ## 6. What is verified where
 
@@ -264,7 +281,19 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   the `LoadOp::Load` agreement, the readback extent and row pitch;
 * the clear-value decoding per format, including the B/G/R/A memory order of
   `bgra8_unorm` and the single-channel float format;
-* that the rail's refusal slugs and classes are the ones core admission uses;
+* that the rail's refusal slugs and classes are the ones core admission uses,
+  including the trace path's own refusals (`attachment_load_op_unsupported` for
+  a `Load` the trace cannot carry, `render_attachment_landing_unsupported` for
+  an attachment no declared view covers, `render_pass_order_unsupported` for a
+  compute pass that would read after a render store);
+* the trace path's device-free plan (`render::plan_trace`) and writeback merge
+  (`render::merge_writebacks`): the planned extent and readback length, the
+  attachment's landing view, the canonical one-writeback-per-view order, and
+  that the render bytes replace the pre-render bytes of the attachment's own
+  view;
+* that the declared render bits are the rail's limits and that core admission
+  admits exactly the trace the rail plans, while the pre-flip snapshot refuses
+  it with `render_passes_unsupported`;
 * that the reviewed fixture still carries the expected byte/255 constants, no
   half-integer tie, and both entry names;
 * that the Swift oracle still accepts exactly the committed suites and pins
@@ -288,11 +317,20 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 * the readback bytes: that all four texels are `40 80 c0 ff`;
 * that `getBytes` on a `usage = .renderTarget`, `storageMode = .shared` 2x2
   texture returns the tightly packed rows this report assumes;
-* the oracle's `--render-selftest` output and, after the flip, a render case in
-  a committed suite;
-* the provider's render path end to end, including the writeback that would
-  land the attachment bytes on the trace's view.
+* a render case from the native rail in a committed suite: the oracle's
+  `--render-selftest` output exists (§5), but `run_native.py --suite
+  conformance/suite-v13.json` has not been run, and `suite-v13` still marks
+  `["vulkan"]` only;
+* the Rust provider's render path end to end — `render::plan_trace` plus the
+  encoder body, and the writeback that lands the attachment bytes on the
+  trace's view. Its refusal and planning halves are host-verified; the encoder
+  half has only the oracle's observation behind it, not its own.
 
-`native-oracle-build` now runs the first of those bullets on every eligible
-runner (§5). Until a run reports `render_selftest: PASS`, however, none of the
-six has an Apple observation behind it.
+`native-oracle-build` runs the `--render-selftest` half of those bullets on
+every eligible runner (§5). On the Paravirtual device of run `34774478149` that
+check built the reviewed two-stage pipeline state, cleared the 2x2 `rgba8Unorm`
+attachment and read it back through `getBytes` as `4080c0ff` four times — the
+bullets that name the pipeline state, `loadAction = .clear`, the texel bytes and
+the tightly packed readback, on the oracle's own path. It does not establish the
+`.load` branch, a suite-reported case, or the Rust provider's own encoder path;
+the last is what the flipped capability bit now lets an Apple runner exercise.

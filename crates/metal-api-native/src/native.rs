@@ -4,7 +4,7 @@
 
 use crate::{
     bounded_contract, classify_command_buffer_error, device_lost_refusal,
-    lifecycle::NativeLifecycle, refusal, unknown_completion, CommandBufferFailure,
+    lifecycle::NativeLifecycle, refusal, render, unknown_completion, CommandBufferFailure,
 };
 use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -31,6 +31,33 @@ const GPU_DEADLINE: Duration = Duration::from_secs(20);
 struct RegisteredPipeline {
     metadata: CompiledComputePipeline,
     pipeline: ComputePipelineState,
+}
+
+/// One host-registered render pipeline: the trace-table entry this context
+/// minted for it and the reviewed contract behind that identity.
+///
+/// The shape mirrors [`RegisteredPipeline`] on purpose. A trace's pipeline table
+/// is the only place a pass says which pipeline it runs, so both rails check the
+/// caller-supplied entry against what the owner registered before anything
+/// executes. The ids share one counter and one namespace: a compute pass naming
+/// a render registration is refused as an unknown pipeline, and a render pass
+/// naming a compute registration is refused as an unknown render pipeline.
+struct RegisteredRenderPipeline {
+    metadata: CompiledComputePipeline,
+    contract: RenderPipelineContract,
+}
+
+/// One render pipeline a host asks a native context to own.
+///
+/// The rail compiles one reviewed MSL module (`crate::render::REVIEWED_SOURCE`),
+/// so the request carries no source: `contract` names the two entries and the
+/// attachment format that module was reviewed for, and `logical_digest` is the
+/// caller-issued fixture identity [`PipelineProvider::compile`] also takes.
+/// Registering a contract the reviewed module does not carry is refused with
+/// `native_render_source_not_reviewed`, exactly as an unreviewed MSL fixture is.
+pub struct NativeRenderPipelineRequest {
+    pub contract: RenderPipelineContract,
+    pub logical_digest: SemanticDigest,
 }
 
 struct State {
@@ -84,6 +111,14 @@ pub struct NativeMetalProvider {
     name: String,
     capabilities: ProviderCapabilities,
     state: Mutex<State>,
+    /// Render registrations, keyed by pipeline id.
+    ///
+    /// A separate mutex from `state` because the trace path resolves a
+    /// registration while a submission holds the device lock. The lock order is
+    /// `state` then `render_pipelines` everywhere — registration mints its
+    /// pipeline id from `State::next_pipeline` before touching this map — so the
+    /// two locks cannot deadlock.
+    render_pipelines: Mutex<BTreeMap<PipelineId, RegisteredRenderPipeline>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     /// Admission, health and the abandonment counters of this instance.
     ///
@@ -134,6 +169,10 @@ impl NativeMetalProvider {
             };
             let dimensions = device.max_threads_per_threadgroup();
             let local = [dimensions.width, dimensions.height, dimensions.depth];
+            // The render bits come from the rail itself (`crate::render`) so the
+            // snapshot and the rail cannot disagree; the unit tests assert that
+            // agreement against core admission on a host without Metal.
+            let render_bits = render::capability_bits();
             let capabilities = ProviderCapabilities {
                 max_passes: 8,
                 supports_threads_exact: true,
@@ -158,30 +197,24 @@ impl NativeMetalProvider {
                 ],
                 host_readback: true,
                 submit_only: false,
-                // Compute-only device snapshot. The render rail (`crate::render`)
-                // exists, but it has never run on an Apple GPU, so every render
-                // bit stays at its default and admission refuses a render-bearing
-                // trace with `render_passes_unsupported`
-                // (`research/docs/23` §4.2, §6 Step 6).
+                // Render-bearing device snapshot, flipped in Step 7. The flip
+                // condition was the single-device check in
+                // `conformance/RENDER-CAPTURE.md` §5, and the observation behind
+                // it is CI run `34774478149` (`native-oracle-build`, commit
+                // `fb4f8da`): on an Apple Paravirtual device
+                // `native-oracle --render-selftest` ran the same reviewed module
+                // and the same `runRenderCase` a suite would, read the 2x2
+                // attachment back as `4080c0ff` four times, and printed
+                // `render_selftest: PASS`. A green job whose log said `SKIP`
+                // would not have been that evidence.
                 //
-                // Flip condition, deliberately conservative: the single-device
-                // check in `conformance/RENDER-CAPTURE.md` —
-                // `native-oracle --render-selftest` on Apple hardware — has to
-                // read the 2x2 attachment back as `40 80 c0 ff` four times,
-                // which is only possible if the full-screen triangle covered
-                // every texel and the reviewed MSL pin matched. Then:
-                //   supports_render_passes: true,
-                //   max_color_attachments: crate::render::MAX_COLOR_ATTACHMENTS,
-                //   max_attachment_dimension: crate::render::MAX_ATTACHMENT_DIMENSION,
-                //   supported_color_formats:
-                //       crate::render::SUPPORTED_COLOR_FORMATS.to_vec(),
-                // and connect the trace path to
-                // `render::execute_offscreen_render` (`research/docs/23` §6
-                // Step 7).
-                supports_render_passes: false,
-                max_color_attachments: 0,
-                max_attachment_dimension: [0, 0],
-                supported_color_formats: Vec::new(),
+                // The bits stay the rail's own limits, and the trace path below
+                // executes `render::plan_trace` + `render::encode_offscreen_render`
+                // (`research/docs/23` §4.2, §6 Steps 6-7).
+                supports_render_passes: render_bits.supports_render_passes,
+                max_color_attachments: render_bits.max_color_attachments,
+                max_attachment_dimension: render_bits.max_attachment_dimension,
+                supported_color_formats: render_bits.supported_color_formats,
             };
             Ok(Self {
                 epoch: allocate_device_epoch()?,
@@ -194,6 +227,7 @@ impl NativeMetalProvider {
                     next_pipeline: 1,
                     next_submission: 1,
                 }),
+                render_pipelines: Mutex::new(BTreeMap::new()),
                 completions: Mutex::new(BTreeMap::new()),
                 counters: Arc::new(CopyCounters::default()),
                 lifecycle: Arc::new(NativeLifecycle::new()),
@@ -617,6 +651,22 @@ impl ComputeProvider for NativeMetalProvider {
                 }
             }
         };
+        // The render rail completes inside `submit`: it needs the command
+        // buffer's terminal status before it can read the attachment back. The
+        // deferred path records now and reports at `wait`, so admitting render
+        // work there would report bytes no rail read
+        // (`crates/metal-api-vulkan` refuses the same shape).
+        if self.async_execution && trace.has_render_passes() {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "render_async_unsupported",
+            )
+            .with_detail(
+                "the render rail completes inside submit; the deferred submission path \
+                 executes no graphics work in this increment",
+            ));
+        }
         if self.async_execution {
             let result = self.submit_async(&mut state, trace, pipelines, token, &resolve, retains);
             self.publish_health(self.lifecycle.health());
@@ -1076,6 +1126,13 @@ impl NativeMetalProvider {
     ) -> Result<ProviderSubmission, ProviderError> {
         let EncodedSubmission { mut pending, pool } =
             encode(state, &self.counters, trace, pipelines, resolve, retains)?;
+        // Render work is planned after the compute objects exist but before the
+        // compute command buffer is committed: the ordering rule, the reviewed
+        // allowlist, the attachment landing and the load op are all decided
+        // from values, so a trace this provider cannot execute end to end is
+        // refused with nothing on the queue.
+        let render_contracts = self.render_contracts(trace)?;
+        let render_plan = render::plan_trace(trace, &pool, &render_contracts)?;
         pending.submitted = true;
         let resources = pending.resources.as_ref().expect("encoded resources");
         resources.command.commit();
@@ -1127,7 +1184,17 @@ impl NativeMetalProvider {
         // Shared memory on the admitted device is now CPU visible. Only a known
         // completed command permits the guard to release its backing resources.
         pending.submitted = false;
-        let writebacks = collect_writebacks(&pool, &resources.buffers, &self.counters);
+        // The render rail runs last, on the same queue and after the compute
+        // command buffer reached its terminal status, and the merge is what
+        // lands its texels: the attachment's view is already a written view of
+        // the compute pool, so its pre-render bytes are replaced rather than
+        // reported alongside.
+        let render_writebacks =
+            self.execute_render_passes(&state.device, &state.queue, &render_plan)?;
+        let writebacks = render::merge_writebacks(
+            collect_writebacks(&pool, &resources.buffers, &self.counters),
+            render_writebacks,
+        );
         let submission = ProviderSubmission {
             completion: CompletionDisposition::CompletedVisible { token },
             writebacks,
@@ -1199,6 +1266,156 @@ impl NativeMetalProvider {
     /// No-copy lease registry owned by this provider.
     pub fn borrowed_registry(&self) -> &BorrowedLeaseRegistry {
         &self.borrowed
+    }
+
+    /// Register one render pipeline: the trace-table entry a render pass names
+    /// and the reviewed contract the rail compiles.
+    ///
+    /// The render sibling of [`PipelineProvider::compile`]. It validates the
+    /// contract, refuses an entry pair the reviewed module does not carry
+    /// (`native_render_source_not_reviewed`), mints the pipeline identity from
+    /// the same counter compute pipelines use, and hands back the table entry a
+    /// trace has to carry. The module itself stays in the rail, which compiles
+    /// the reviewed bytes at execution.
+    pub fn register_render_pipeline(
+        &self,
+        request: NativeRenderPipelineRequest,
+    ) -> Result<CompiledComputePipeline, ProviderError> {
+        let mut state = self.lock()?;
+        self.lifecycle.admit()?;
+        request
+            .contract
+            .validate()
+            .map_err(|error| render_contract_error(error.to_string()))?;
+        render::review_contract(&request.contract)?;
+        let function = FunctionIdentity {
+            logical_digest: request.logical_digest,
+            entry_name: request.contract.vertex_entry.clone(),
+            // The rail hands Metal source, which is the representation this
+            // registration is compiled from, exactly as `compile` does for a
+            // reviewed compute fixture.
+            source: FunctionSource::MetalSource,
+        };
+        function
+            .validate()
+            .map_err(|error| render_contract_error(error.to_string()))?;
+        let metadata = CompiledComputePipeline {
+            device_epoch: self.epoch,
+            pipeline_id: PipelineId::new(next_id(&mut state.next_pipeline)?),
+            function,
+            contract: render_table_contract(),
+        };
+        self.render_pipelines()?.insert(
+            metadata.pipeline_id,
+            RegisteredRenderPipeline {
+                metadata: metadata.clone(),
+                contract: request.contract,
+            },
+        );
+        Ok(metadata)
+    }
+
+    /// Stop accepting new submissions that name this render registration.
+    ///
+    /// Symmetric with [`PipelineProvider::release_pipeline`]: the epoch and the
+    /// registered identity are verified before the entry is removed, so a stale
+    /// or foreign value cannot release another context's registration. A
+    /// submission that already resolved this id holds its own copy of the
+    /// contract, so releasing never pulls the reviewed contract out from under
+    /// work that is being planned or encoded.
+    pub fn release_render_pipeline(
+        &self,
+        metadata: &CompiledComputePipeline,
+    ) -> Result<(), ProviderError> {
+        self.check_epoch(metadata.device_epoch)?;
+        let mut registrations = self.render_pipelines()?;
+        let registered = registrations
+            .get(&metadata.pipeline_id)
+            .ok_or_else(|| unknown_render_pipeline(metadata.pipeline_id))?;
+        if registered.metadata != *metadata {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "render_pipeline_identity_mismatch",
+            ));
+        }
+        registrations.remove(&metadata.pipeline_id);
+        Ok(())
+    }
+
+    fn render_pipelines(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<PipelineId, RegisteredRenderPipeline>>, ProviderError> {
+        self.render_pipelines.lock().map_err(|_| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Internal,
+                "provider_registry_poisoned",
+            )
+        })
+    }
+
+    /// The reviewed contracts a trace's render passes name, keyed by pipeline id.
+    ///
+    /// A render pass's pipeline id is caller-supplied table data, so the entry
+    /// the trace carries is checked against the registration that owns the same
+    /// id before the contract is handed to the rail: a trace cannot name a
+    /// render pipeline this context never registered, and it cannot pass a table
+    /// entry that disagrees with one.
+    fn render_contracts(
+        &self,
+        trace: &ComputeTrace,
+    ) -> Result<BTreeMap<PipelineId, RenderPipelineContract>, ProviderError> {
+        let mut contracts = BTreeMap::new();
+        if !trace.has_render_passes() {
+            return Ok(contracts);
+        }
+        let registrations = self.render_pipelines()?;
+        for pass in trace.render_passes() {
+            let registered = registrations
+                .get(&pass.pipeline)
+                .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+            let requested = trace.pipeline(pass.pipeline).map_err(|error| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "render_pipeline_identity_mismatch",
+                )
+                .with_detail(error.to_string())
+            })?;
+            if requested != &registered.metadata {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "render_pipeline_identity_mismatch",
+                )
+                .with_field("pipeline", FieldValue::Unsigned(pass.pipeline.get())));
+            }
+            contracts.insert(pass.pipeline, registered.contract.clone());
+        }
+        Ok(contracts)
+    }
+
+    /// Execute the planned render passes in trace order, after the compute
+    /// sequence, and turn each attachment readback into a buffer writeback.
+    ///
+    /// The attachment's bytes leave the rail through the same channel a compute
+    /// pass uses — one [`BufferWriteback`] for the view and allocation the trace
+    /// declared, at the view's own offset inside the allocation — so resource
+    /// admission, lease bookkeeping and readback consumers need no second path
+    /// (`research/docs/23` §6 Step 7).
+    fn execute_render_passes(
+        &self,
+        device: &Device,
+        queue: &CommandQueue,
+        plan: &[render::TraceRenderPlan<'_>],
+    ) -> Result<Vec<BufferWriteback>, ProviderError> {
+        let mut writebacks = Vec::with_capacity(plan.len());
+        for planned in plan {
+            let texels = render::encode_offscreen_render(device, queue, &planned.plan)?;
+            writebacks.push(planned.writeback(texels));
+        }
+        Ok(writebacks)
     }
 
     fn submit_async(
@@ -1452,6 +1669,50 @@ fn unknown_pipeline(id: PipelineId) -> ProviderError {
         "unknown_pipeline",
     )
     .with_field("pipeline", FieldValue::Unsigned(id.get()))
+}
+
+/// The refusal a render pass gets when it names a pipeline this context never
+/// registered as a render pipeline. Mirror of [`unknown_pipeline`]: the two
+/// registries share one id namespace, so a render pass naming a compute
+/// registration and a compute pass naming a render registration are refused
+/// symmetrically.
+fn unknown_render_pipeline(id: PipelineId) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Resource,
+        "unknown_render_pipeline",
+    )
+    .with_field("pipeline", FieldValue::Unsigned(id.get()))
+}
+
+/// A render pipeline contract the context cannot register or execute.
+fn render_contract_error(detail: String) -> ProviderError {
+    refusal(
+        ProviderPhase::Compile,
+        ProviderErrorClass::Args,
+        "render_pipeline_contract_invalid",
+    )
+    .with_detail(detail)
+}
+
+/// The pipeline-table contract one render registration carries.
+///
+/// `ComputeTrace` has a single pipeline entry shape and core admission validates
+/// every entry's contract, so a render registration carries the most permissive
+/// exact-thread contract: no bindings, no push constants and no fixed grid.
+/// Nothing reads it as a compute contract — the compute rail resolves artifacts
+/// out of [`State::pipelines`], where a render registration does not exist.
+fn render_table_contract() -> PipelineContract {
+    PipelineContract {
+        dispatch_kind: DispatchKind::ThreadsExact,
+        required_local_size: None,
+        fixed_grid: None,
+        push_constant_offset: 0,
+        push_constant_bytes: 0,
+        buffer_bindings: Vec::new(),
+        shader_capabilities: Vec::new(),
+        translator_revision: None,
+    }
 }
 
 /// Called only inside an autorelease pool with nil or a live NSError pointer.

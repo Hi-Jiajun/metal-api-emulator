@@ -1,16 +1,25 @@
-//! Offscreen render rail for the native provider (`research/docs/23` §6 Step 6).
+//! Offscreen render rail for the native provider (`research/docs/23` §6 Steps 6
+//! and 7).
 //!
 //! The rail answers the one question Step 6 owns on the Apple side: can the
 //! native provider build a colour attachment, a render pass descriptor, a
 //! two-entry render pipeline state and a full-screen-triangle draw out of one
 //! reviewed MSL module, and read the attachment's texels back byte for byte.
+//! Step 7 is the trace path over it: [`plan_trace`] decides ordering, the
+//! reviewed allowlist, the attachment landing and the load op from values
+//! alone, [`TraceRenderPlan::writeback`] and [`merge_writebacks`] put the texels
+//! into the same writeback channel a compute pass uses, and `native.rs` calls
+//! both around `encode_offscreen_render`.
 //!
-//! **It has never run on an Apple GPU.** The provider's render bits stay at
-//! their defaults, so admission refuses a render-bearing trace with
-//! `render_passes_unsupported` before this code is reached (`native.rs`,
-//! `ProviderCapabilities`); that refusal is the honest state until the
-//! single-device check in `conformance/RENDER-CAPTURE.md` passes. The two rules
-//! this rail shares with its sibling on the Vulkan side
+//! **The encoder body has still never run on an Apple GPU.** What is
+//! different from the pre-flip state is the evidence: CI run `34774478149`
+//! (`native-oracle-build`, commit `fb4f8da`) ran the oracle's `--render-selftest`
+//! — the single-device check in `conformance/RENDER-CAPTURE.md` §5, over the
+//! same reviewed module and the same `runRenderCase` a suite would use — on an
+//! Apple Paravirtual device, read the 2x2 attachment back as `4080c0ff` four
+//! times and printed `render_selftest: PASS`. That is the flip condition the
+//! provider's render bits name (`native.rs`, `ProviderCapabilities`). The two
+//! rules this rail shares with its sibling on the Vulkan side
 //! (`crates/metal-api-vulkan/src/render.rs`, which does execute on Lavapipe and
 //! the RTX 5060) are the fixed 2x2 extent and the byte/255 fragment constants
 //! that keep 8-bit UNORM rounding away from a half-integer tie.
@@ -25,9 +34,11 @@
 
 use crate::refusal;
 use metal_api_core::provider::{
-    AttachmentFormat, ClearColor, ContractError, FieldValue, LoadOp, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, StoreOp,
+    AttachmentFormat, BufferView, BufferWriteback, ClearColor, ComputeTrace, ContractError,
+    FieldValue, LoadOp, PipelineId, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, ViewId,
 };
+use std::collections::BTreeMap;
 
 #[cfg(target_os = "macos")]
 use foreign_types::ForeignType;
@@ -72,6 +83,39 @@ pub(crate) const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [2, 2];
 /// — the core contract's admitted set, without `R32Uint` ([`pixel_format`]
 /// refuses that one).
 pub(crate) const SUPPORTED_COLOR_FORMATS: [AttachmentFormat; 3] = AttachmentFormat::ADMITTED;
+
+/// The render bits the provider declares, in one value so the macOS capability
+/// snapshot (`native.rs`) and the host-side unit tests cannot drift.
+///
+/// Every field is the rail's own limit, so capability admission and this rail
+/// agree by construction; the unit tests assert that agreement against core's
+/// [`metal_api_core::provider::ProviderCapabilities::admit`], which is the only
+/// place the two could otherwise diverge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenderCapabilityBits {
+    pub(crate) supports_render_passes: bool,
+    pub(crate) max_color_attachments: u32,
+    pub(crate) max_attachment_dimension: [u64; 2],
+    pub(crate) supported_color_formats: Vec<AttachmentFormat>,
+}
+
+/// The render bits this provider declares as of the Step 7 flip.
+///
+/// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
+/// `conformance/RENDER-CAPTURE.md` §5): CI run `34774478149` — job
+/// `native-oracle-build` at commit `fb4f8da` — ran `native-oracle
+/// --render-selftest` on an Apple Paravirtual device, whose report and log read
+/// `4080c0ff` four times and ended with `render_selftest: PASS`. A green run
+/// whose log said `SKIP` would not be that evidence, because it reports a runner
+/// without an eligible device rather than an executed reviewed path.
+pub(crate) fn capability_bits() -> RenderCapabilityBits {
+    RenderCapabilityBits {
+        supports_render_passes: true,
+        max_color_attachments: MAX_COLOR_ATTACHMENTS,
+        max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
+        supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+    }
+}
 
 /// The texel the reviewed fragment writes, as the UNORM8 bytes an admitted
 /// attachment stores. Both this rail and the Swift oracle's render self-test
@@ -237,12 +281,15 @@ pub(crate) fn plan<'a>(
     request: &OffscreenRenderRequest<'a>,
 ) -> Result<RenderPlan<'a>, ProviderError> {
     // The reviewed (source, entry pair) triple is the rail's whole allowlist.
-    if request.source != REVIEWED_SOURCE
-        || request.pipeline.vertex_entry != VERTEX_ENTRY
-        || request.pipeline.fragment_entry != FRAGMENT_ENTRY
-    {
-        return Err(allowlist_refusal("native_render_source_not_reviewed"));
+    if request.source != REVIEWED_SOURCE {
+        return Err(
+            allowlist_refusal("native_render_source_not_reviewed").with_detail(
+                "the rail compiles the bytes of \
+             `conformance/shaders/render_offscreen_2x2.metal` and nothing else",
+            ),
+        );
     }
+    review_contract(request.pipeline)?;
     // Core admission first: the pass's own shape rules and the
     // pipeline/attachment format agreement belong to the contract
     // (`research/docs/23` §3.1, §3.2), not to this rail.
@@ -324,6 +371,99 @@ pub(crate) fn plan<'a>(
     })
 }
 
+/// The rail's review gate for a render pipeline contract.
+///
+/// The reviewed module carries exactly one vertex entry and one fragment entry,
+/// so a contract naming anything else is refused with the same slug, class and
+/// phase the compute allowlist gives an unreviewed kernel
+/// (`lib.rs::bounded_contract`, `native_shader_not_allowlisted`): a matching
+/// file name, an edited module or a recompiled one must not be enough to run
+/// different source (`research/docs/23` §6 Step 7). Registration
+/// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
+/// so the refusal is reachable before a submission as well as inside one.
+pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
+    if contract.vertex_entry != VERTEX_ENTRY || contract.fragment_entry != FRAGMENT_ENTRY {
+        return Err(
+            allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+                "the reviewed module carries {VERTEX_ENTRY:?} and {FRAGMENT_ENTRY:?}"
+            )),
+        );
+    }
+    Ok(())
+}
+
+/// The load op the trace path can honour.
+///
+/// The rail itself executes `LoadOp::Load` when it is handed the attachment's
+/// previous texels, and the tests below exercise that. `ComputeTrace` has no
+/// channel that carries those bytes: [`metal_api_core::provider::RenderAttachment`]
+/// restates the attachment's shape and names no contents, so a trace asking for
+/// `Load` would have to be executed as a clear. The refusal reuses the slug,
+/// class and phase this rail and the Vulkan rail give an unexecutable load op.
+pub(crate) fn admit_trace_load(load: LoadOp) -> Result<(), ProviderError> {
+    match load {
+        LoadOp::Load => Err(capability_refusal("attachment_load_op_unsupported")
+            .with_field("load_op", FieldValue::Text("load".to_owned()))
+            .with_detail(
+                "the trace carries no attachment-initial-bytes channel, so an executed \
+                 `Load` would silently become a clear",
+            )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a trace whose compute passes would be reordered against a render
+/// pass's stores.
+///
+/// The trace path executes every compute pass before every render pass, in trace
+/// order within each group (see [`plan_trace`] and
+/// `NativeMetalProvider::execute_render_passes`). Compute passes that come
+/// before a render pass therefore run in the order the trace asked for, and so
+/// do render passes among themselves. The one shape that would silently change
+/// meaning is a compute pass that *follows* a render pass and binds a view that
+/// render pass stores: it would observe pre-render bytes where the trace's
+/// serial order defines post-render ones. Core admission already refuses the
+/// write/write half of the pair (`AttachmentComputeConflict`,
+/// `attachment_resource_conflict`); this is the read half, refused rather than
+/// executed in an order the bytes would not reflect.
+pub(crate) fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderError> {
+    let mut render_written = BTreeMap::<ViewId, usize>::new();
+    for (index, entry) in trace.passes.iter().enumerate() {
+        match entry {
+            TracePass::Render(pass) => {
+                for attachment in &pass.color_attachments {
+                    render_written.entry(attachment.view_id).or_insert(index);
+                }
+            }
+            TracePass::Compute(pass) => {
+                let bound = pass
+                    .buffers
+                    .iter()
+                    .map(|view| view.view_id)
+                    .chain(pass.textures.iter().map(|texture| texture.view_id));
+                for view in bound {
+                    if let Some(render_pass) = render_written.get(&view) {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "render_pass_order_unsupported",
+                        )
+                        .with_field("pass", FieldValue::Unsigned(index as u64))
+                        .with_field("render_pass", FieldValue::Unsigned(*render_pass as u64))
+                        .with_field("view", FieldValue::Unsigned(view.get()))
+                        .with_detail(
+                            "a compute pass that follows a render pass storing this view \
+                             would observe pre-render bytes, because this increment runs \
+                             every compute pass before every render pass",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn capability_refusal(slug: &'static str) -> ProviderError {
     refusal(ProviderPhase::Resolve, ProviderErrorClass::Capability, slug)
 }
@@ -386,11 +526,146 @@ fn contract_refusal(error: ContractError) -> ProviderError {
     refusal(ProviderPhase::Resolve, class, slug).with_detail(error.to_string())
 }
 
+/// The refusal a render pass gets when it names a pipeline this context never
+/// registered as a render pipeline.
+///
+/// One counter and one id namespace serve both rails, so the wording is the
+/// mirror of [`crate::native`]'s `unknown_pipeline`: a compute pass naming a
+/// render registration and a render pass naming a compute registration are both
+/// resource refusals, with the rail that refused them as the slug.
+fn unknown_render_pipeline(id: PipelineId) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Resource,
+        "unknown_render_pipeline",
+    )
+    .with_field("pipeline", FieldValue::Unsigned(id.get()))
+}
+
+/// One render pass of a trace, planned before any device object exists.
+///
+/// The pass and the contract are borrowed from values that outlive execution —
+/// the trace itself and the provider's render registrations — while the landing
+/// view points into the serial view pool the encoder is built from. The planned
+/// [`RenderPlan`] is the same value the encoder body consumes, so planning once
+/// and encoding later cannot disagree.
+#[derive(Debug)]
+pub(crate) struct TraceRenderPlan<'a> {
+    pub(crate) pass: &'a RenderPassDescriptor,
+    pub(crate) contract: &'a RenderPipelineContract,
+    pub(crate) landing: &'a BufferView,
+    pub(crate) plan: RenderPlan<'a>,
+}
+
+impl TraceRenderPlan<'_> {
+    /// The writeback this pass's texels become.
+    ///
+    /// The view identity, allocation and offset are the landing view's own, so
+    /// resource admission, lease bookkeeping and readback consumers need no
+    /// second path: the attachment lands exactly where a compute pass writing
+    /// the same view would (`research/docs/23` §6 Step 7).
+    pub(crate) fn writeback(&self, texels: Vec<u8>) -> BufferWriteback {
+        BufferWriteback {
+            view_id: self.landing.view_id,
+            allocation_id: self.landing.allocation_id,
+            offset: self.landing.offset,
+            bytes: texels,
+        }
+    }
+}
+
+/// Plan every render pass of a trace, without a device.
+///
+/// Four decisions have to be made before the first Metal object exists, and all
+/// four are answerable from values: the order the rails run in
+/// ([`refuse_reordered_render_reads`]), the reviewed allowlist, the attachment's
+/// landing view, and the load op the trace can carry
+/// ([`admit_trace_load`]). `pool` is [`ComputeTrace::serial_resources`], the same
+/// pool the encoder binds, and `contracts` holds the render contracts the
+/// provider registered for the pipeline ids this trace names — a caller-supplied
+/// table entry is checked against those registrations in `native.rs`, where the
+/// registry lives.
+pub(crate) fn plan_trace<'a>(
+    trace: &'a ComputeTrace,
+    pool: &'a [BufferView],
+    contracts: &'a BTreeMap<PipelineId, RenderPipelineContract>,
+) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
+    if !trace.has_render_passes() {
+        return Ok(Vec::new());
+    }
+    refuse_reordered_render_reads(trace)?;
+    let mut planned = Vec::with_capacity(trace.render_passes().count());
+    for pass in trace.render_passes() {
+        let contract = contracts
+            .get(&pass.pipeline)
+            .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+        let Some(attachment) = pass.color_attachments.first() else {
+            return Err(contract_refusal(ContractError::EmptyAttachmentList));
+        };
+        admit_trace_load(attachment.load)?;
+        // An attachment that no buffer view covers has no landing rail: the
+        // texels would have nowhere to go, so the pass is refused instead of
+        // being executed and dropped.
+        let landing = pool
+            .iter()
+            .find(|view| {
+                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
+            })
+            .ok_or_else(|| {
+                capability_refusal("render_attachment_landing_unsupported")
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "attachment bytes land through the buffer writeback channel, \
+                         and this trace declares no buffer view covering the attachment",
+                    )
+            })?;
+        let plan_of_pass = plan(&OffscreenRenderRequest {
+            pass,
+            pipeline: contract,
+            source: REVIEWED_SOURCE,
+            initial: None,
+        })?;
+        planned.push(TraceRenderPlan {
+            pass,
+            contract,
+            landing,
+            plan: plan_of_pass,
+        });
+    }
+    Ok(planned)
+}
+
+/// Fold compute and render writebacks into the one canonical list a submission
+/// returns.
+///
+/// Compute and render writebacks share one channel and one rule: one complete
+/// writeback per written view, keyed by identity. A view both rails could have
+/// written is refused by core admission (`AttachmentComputeConflict`), and the
+/// render rail runs last, so a repeated key keeps the bytes the render pass
+/// ended with. The attachment's own view is in the serial pool as a written view
+/// (`ComputeTrace::serial_resources`), which is exactly why the merge — and not
+/// the compute readback — is what lands its texels.
+pub(crate) fn merge_writebacks(
+    compute: Vec<BufferWriteback>,
+    render: Vec<BufferWriteback>,
+) -> Vec<BufferWriteback> {
+    let mut merged = BTreeMap::new();
+    for writeback in compute.into_iter().chain(render) {
+        merged.insert((writeback.allocation_id, writeback.view_id), writeback);
+    }
+    merged.into_values().collect()
+}
+
 /// Execute one offscreen render pass and return its tightly packed texel bytes.
 ///
-/// Not verified on an Apple GPU. The check that would verify it is the one
-/// `conformance/RENDER-CAPTURE.md` records, and it is the condition for flipping
-/// `ProviderCapabilities::supports_render_passes`.
+/// Not verified on an Apple GPU: the check that would verify this encoder body
+/// is the Rust provider's own render path in a committed suite, and the macOS
+/// oracle's `--render-selftest` run `34774478149` is the observation behind the
+/// capability flip (`conformance/RENDER-CAPTURE.md` §5, §6).
 #[cfg(target_os = "macos")]
 pub(crate) fn execute_offscreen_render(
     device: &Device,
@@ -398,9 +673,24 @@ pub(crate) fn execute_offscreen_render(
     request: &OffscreenRenderRequest<'_>,
 ) -> Result<Vec<u8>, ProviderError> {
     let planned = plan(request)?;
+    encode_offscreen_render(device, queue, &planned)
+}
+
+/// Encode, commit and read back one already planned pass.
+///
+/// Split from [`execute_offscreen_render`] so the trace path can plan once
+/// ([`plan_trace`], before the compute command buffer is committed) and then
+/// encode that same decision, instead of planning a second, possibly different,
+/// pass.
+#[cfg(target_os = "macos")]
+pub(crate) fn encode_offscreen_render(
+    device: &Device,
+    queue: &CommandQueue,
+    planned: &RenderPlan<'_>,
+) -> Result<Vec<u8>, ProviderError> {
     objc::rc::autoreleasepool(|| {
-        let attachment = attachment_texture(device, &planned)?;
-        let pipeline = render_pipeline_state(device, &planned)?;
+        let attachment = attachment_texture(device, planned)?;
+        let pipeline = render_pipeline_state(device, planned)?;
         // The pass descriptor is autoreleased; it only has to outlive the
         // encoder creation below.
         let pass = MetalRenderPassDescriptor::new();
@@ -449,7 +739,7 @@ pub(crate) fn execute_offscreen_render(
             return Err(resource_refusal("metal_render_command_failed")
                 .with_detail(format!("command buffer ended with status {status}")));
         }
-        read_texels(&attachment, &planned)
+        read_texels(&attachment, planned)
     })
 }
 
@@ -571,7 +861,12 @@ fn resource_refusal(slug: &'static str) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AllocationId, PipelineId, RenderAttachment, VertexLayout, ViewId,
+        AliasMode, AllocationId, AllocationRecord, BufferAccess, BufferBindingContract,
+        BufferSource, CompiledComputePipeline, CompletionPolicy, ComputePass, DeviceEpoch,
+        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
+        OperationId, PipelineContract, ProviderCapabilities, RenderAttachment,
+        ResourceTableSnapshot, SemanticDigest, StorageMode, VertexLayout, ViewId,
+        PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -861,5 +1156,333 @@ mod tests {
                 "clear channel {channel} must differ from the fragment output"
             );
         }
+    }
+
+    /// The one compute pass of the trace-path fixture: a read-only declaration
+    /// of the attachment's own view.
+    ///
+    /// Core admission resolves every render attachment against the views the
+    /// trace declares, so a render-bearing trace always carries one of these,
+    /// and it is what makes the attachment's landing rail exist (see
+    /// `ComputeTrace::serial_resources`).
+    fn declaration_pass() -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(11),
+            buffers: vec![BufferView {
+                view_id: ViewId::new(7),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(9),
+                offset: 0,
+                length: 16,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0xfe; 16]),
+            }],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The compute registration `declaration_pass` names. Its contract reflects
+    /// a read-only 16-byte binding, i.e. exactly the extent the 2x2 attachment
+    /// restates, and the footprint proof is static so admission can compare it
+    /// with the view.
+    fn declaration_pipeline() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(11),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-wiring-fixture", vec![7]).unwrap(),
+                entry_name: "declares_the_attachment_view".to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: PipelineContract {
+                dispatch_kind: DispatchKind::ThreadsExact,
+                required_local_size: None,
+                fixed_grid: None,
+                push_constant_offset: 0,
+                push_constant_bytes: 0,
+                buffer_bindings: vec![BufferBindingContract {
+                    metal_binding: 0,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                }],
+                shader_capabilities: Vec::new(),
+                translator_revision: None,
+            },
+        }
+    }
+
+    /// The trace-table entry a render registration hands back, minted the way
+    /// `NativeMetalProvider::register_render_pipeline` mints it: the id the
+    /// render pass names, the reviewed vertex entry, and the most permissive
+    /// exact-thread contract, because nothing reads a render entry as a compute
+    /// contract.
+    fn render_table_entry() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(3),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-wiring-fixture", vec![3]).unwrap(),
+                entry_name: VERTEX_ENTRY.to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: PipelineContract {
+                dispatch_kind: DispatchKind::ThreadsExact,
+                required_local_size: None,
+                fixed_grid: None,
+                push_constant_offset: 0,
+                push_constant_bytes: 0,
+                buffer_bindings: Vec::new(),
+                shader_capabilities: Vec::new(),
+                translator_revision: None,
+            },
+        }
+    }
+
+    /// The milestone's trace and the resource namespace it needs: the
+    /// declaration pass, then the render pass under test.
+    fn milestone_trace(load: LoadOp) -> (ComputeTrace, ResourceTableSnapshot) {
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(1),
+            pipelines: vec![declaration_pipeline(), render_table_entry()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(declaration_pass()),
+                TracePass::Render(milestone_pass(load)),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(9),
+                owner_epoch: DeviceEpoch::new(3),
+                size: 16,
+            })
+            .unwrap();
+        (trace, resources)
+    }
+
+    /// The capability snapshot the macOS provider builds, with the render bits
+    /// taken from the value under test and the compute bits from `native.rs`.
+    fn capabilities(bits: &RenderCapabilityBits) -> ProviderCapabilities {
+        ProviderCapabilities {
+            max_passes: 8,
+            supports_threads_exact: true,
+            supports_threadgroups: false,
+            supports_serial: true,
+            supports_concurrent: false,
+            max_local_size: [1024, 1024, 1024],
+            max_invocations: 1024,
+            max_group_count: [1024, 1024, 1024],
+            max_storage_buffer_descriptors: 31,
+            max_buffer_range: 1024,
+            max_push_constant_bytes: 0,
+            alias_mode: AliasMode::DistinctViews,
+            storage_modes: vec![StorageMode::OwnedBytes],
+            host_readback: true,
+            submit_only: false,
+            supports_render_passes: bits.supports_render_passes,
+            max_color_attachments: bits.max_color_attachments,
+            max_attachment_dimension: bits.max_attachment_dimension,
+            supported_color_formats: bits.supported_color_formats.clone(),
+        }
+    }
+
+    /// The registrations `plan_trace` resolves the trace's pipeline ids against.
+    fn milestone_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
+        BTreeMap::from([(PipelineId::new(3), milestone_pipeline())])
+    }
+
+    /// The step that flips the capability bit needs the declared bits and core
+    /// admission to agree: what the snapshot says it renders and what core
+    /// admits have to be the same set, or one of the two is lying.
+    #[test]
+    fn declared_render_capabilities_admit_what_the_rail_plans() {
+        let bits = capability_bits();
+        assert!(bits.supports_render_passes);
+        assert_eq!(bits.max_color_attachments, MAX_COLOR_ATTACHMENTS);
+        assert_eq!(bits.max_attachment_dimension, MAX_ATTACHMENT_DIMENSION);
+        assert_eq!(
+            bits.supported_color_formats,
+            SUPPORTED_COLOR_FORMATS.to_vec()
+        );
+        // The rail's limits are core's own values, not a second spelling that
+        // could drift from the contract's.
+        assert_eq!(
+            bits.max_color_attachments,
+            u32::try_from(metal_api_core::provider::MAX_COLOR_ATTACHMENTS).unwrap()
+        );
+        assert_eq!(
+            bits.supported_color_formats,
+            AttachmentFormat::ADMITTED.to_vec()
+        );
+
+        let (trace, resources) = milestone_trace(LoadOp::Clear(sentinel()));
+        capabilities(&bits)
+            .admit(&trace, &resources)
+            .expect("the declared bits admit the milestone trace");
+
+        // The pre-flip snapshot refuses the same trace in render admission,
+        // before any compute reservation — that refusal is what the flip
+        // removes.
+        let mut before_the_flip = bits.clone();
+        before_the_flip.supports_render_passes = false;
+        let refused = capabilities(&before_the_flip)
+            .admit(&trace, &resources)
+            .unwrap_err();
+        assert_eq!(refused.slug, "render_passes_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+    }
+
+    /// The host-side half of the trace path: the plan a device-free host can
+    /// check, which is the same decision the macOS encoder body then executes.
+    #[test]
+    fn plan_trace_plans_the_milestone_pass_and_its_landing_view() {
+        let (trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed pass plans");
+        assert_eq!(planned.len(), 1);
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        assert_eq!(planned.pass.color_attachments[0].view_id, ViewId::new(7));
+        assert_eq!(planned.contract, &milestone_pipeline());
+        assert_eq!(planned.plan.extent, [2, 2]);
+        assert_eq!(planned.plan.texel_bytes, 16);
+        assert_eq!(planned.plan.row_pitch, 8);
+        assert_eq!(planned.plan.format, RenderPixelFormat::Rgba8Unorm);
+        assert_eq!(planned.plan.vertices, 3);
+        assert_eq!(planned.plan.initial, None);
+        // The landing view is the declaration's own identity and range, so the
+        // writeback is the one the trace asked for and no second channel is
+        // invented.
+        assert_eq!(planned.landing.view_id, ViewId::new(7));
+        assert_eq!(planned.landing.allocation_id, AllocationId::new(9));
+        let writeback = planned.writeback(EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(writeback.view_id, ViewId::new(7));
+        assert_eq!(writeback.allocation_id, AllocationId::new(9));
+        assert_eq!(writeback.offset, 0);
+        assert_eq!(writeback.bytes, [0x40, 0x80, 0xc0, 0xff].repeat(4));
+
+        // A compute-only trace keeps the pre-render path: nothing to plan, no
+        // new refusal and no attachment readback.
+        let mut compute_only = trace.clone();
+        compute_only
+            .passes
+            .retain(|pass| pass.as_compute().is_some());
+        assert!(plan_trace(&compute_only, &pool, &contracts)
+            .expect("a compute-only trace plans nothing")
+            .is_empty());
+    }
+
+    /// `LoadOp::Load` is the one load op the trace cannot carry, and it is
+    /// refused before the pass is planned rather than executed as a clear.
+    #[test]
+    fn plan_trace_refuses_a_load_op_the_trace_cannot_carry() {
+        let (trace, _) = milestone_trace(LoadOp::Load);
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "attachment_load_op_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+    }
+
+    /// The landing rail is the writeback channel: an attachment no declared view
+    /// covers has nowhere to land, so it is refused instead of executed and
+    /// dropped.
+    #[test]
+    fn plan_trace_refuses_an_attachment_without_a_landing_view() {
+        let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.color_attachments[0].view_id = ViewId::new(8);
+        let pool = vec![declaration_pass().buffers[0].clone()];
+        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(8)),
+            "the refusal names the attachment that has no landing rail"
+        );
+    }
+
+    /// The ordering rule the trace path shares with the Vulkan rail: every
+    /// compute pass runs before every render pass, so a compute pass that
+    /// follows a render store of a view it binds would read pre-render bytes.
+    #[test]
+    fn plan_trace_refuses_a_compute_pass_that_reads_after_a_render_store() {
+        let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        trace.passes.push(TracePass::Compute(declaration_pass()));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_pass_order_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+
+        // The same rule in its legal direction: a declaration that comes before
+        // the store is planned, not refused.
+        let (legal, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        let pool = legal.serial_resources().expect("admitted serial pool");
+        assert_eq!(
+            plan_trace(&legal, &pool, &milestone_contracts())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A render registration is a review gate: an entry pair the reviewed module
+    /// does not carry cannot be registered, the same way an unreviewed MSL
+    /// fixture cannot be compiled.
+    #[test]
+    fn a_render_contract_has_to_name_the_reviewed_entries() {
+        assert_eq!(review_contract(&milestone_pipeline()), Ok(()));
+        let mut edited = milestone_pipeline();
+        edited.fragment_entry = "render_solid_rgba8_v2".to_owned();
+        let error = review_contract(&edited).unwrap_err();
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Compile);
+    }
+
+    /// The merge that puts the two rails' bytes in one channel: one writeback
+    /// per written view, in the canonical order the submission protocol
+    /// requires, with the render bytes winning because the render rail runs
+    /// last.
+    #[test]
+    fn render_writebacks_replace_the_compute_bytes_of_the_same_view() {
+        let later_view = BufferWriteback {
+            view_id: ViewId::new(2),
+            allocation_id: AllocationId::new(1),
+            offset: 16,
+            bytes: vec![0x11; 4],
+        };
+        let attachment = BufferWriteback {
+            view_id: ViewId::new(1),
+            allocation_id: AllocationId::new(1),
+            offset: 0,
+            bytes: vec![0xfe; 16],
+        };
+        let rendered = BufferWriteback {
+            view_id: ViewId::new(1),
+            allocation_id: AllocationId::new(1),
+            offset: 0,
+            bytes: [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        };
+        let merged = merge_writebacks(vec![later_view.clone(), attachment], vec![rendered.clone()]);
+        assert_eq!(merged, vec![rendered, later_view]);
     }
 }

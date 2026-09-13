@@ -16,7 +16,7 @@ use metal_api_core::provider::{ProviderError, ProviderErrorClass, ProviderPhase,
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
-pub use native::NativeMetalProvider;
+pub use native::{NativeMetalProvider, NativeRenderPipelineRequest};
 
 // The admission and terminal-state wiring is provider logic, not platform
 // logic, so it is compiled for the macOS provider and for the unit tests that
