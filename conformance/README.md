@@ -254,10 +254,24 @@ initialization ranges, and refuses shared allocations outside this suite. See
 
 ## Provider object entry point
 
-`provider-capture --api objects` runs the same v1-v10 fixtures through the new
+`provider-capture --api objects` runs the same v1-v12 fixtures through the new
 shared object API. Its reports identify `vulkan-objects` or
 `native-metal-provider-objects`; both report actual host-buffer landing.
 The direct trace captures remain separate, and the Swift oracle is unchanged.
+
+## Sampled textures
+
+[suite-v11.json](suite-v11.json) adds the first sampled-texture case: one
+invocation reading texel (0, 0) of a 4x4 `R32Uint` image, which is why it cannot
+see a wrong row stride. v11 provider captures also carry the copy-in/copy-out
+counters for the texture upload (`research/docs/18` step 3).
+
+[suite-v12.json](suite-v12.json) reads **every** cell of that image under two
+dispatch shapes (one 4x4 group and sixteen 1x1 groups) and expects `[100..115]`
+for a textured image holding 0..15. This is the case that fails when a host
+linear-image upload assumes tightly packed rows instead of the driver's
+`VkSubresourceLayout.rowPitch`. See [SUITE-V12.md](SUITE-V12.md) for the raw
+before/after captures, the count contract and the limits.
 Compare all five paths with the additional `--vulkan-objects` and
 `--metal-objects` arguments. See [PROVIDER-OBJECTS.md](../docs/PROVIDER-OBJECTS.md)
 for object lifetimes, result validation and the current verification boundary.

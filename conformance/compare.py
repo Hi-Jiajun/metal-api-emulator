@@ -381,9 +381,9 @@ def validate_capture(suite, digest, report, required_backend=None):
         missing = set(expected_allocations) - seen_allocations
         _require(not missing, f"{where}: missing allocations {sorted(missing)}")
 
-        if provider_backend and suite["suite"] == "compute-buffer-v11":
+        if provider_backend and suite["suite"] in ("compute-buffer-v11", "compute-buffer-v12"):
             _require(counts[0] is not None,
-                     f"{where}: the v11 count contract requires copy_in and copy_out")
+                     f"{where}: the v11/v12 count contract requires copy_in and copy_out")
         if counts[0] is not None:
             _integer(counts[0], f"{where}.copy_in")
             _integer(counts[1], f"{where}.copy_out")

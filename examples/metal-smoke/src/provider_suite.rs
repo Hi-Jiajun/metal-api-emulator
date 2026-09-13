@@ -129,6 +129,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_object_queue_ordering()?;
     run_object_disjoint_views()?;
     run_sampled_texture_read(Arc::clone(&executor))?;
+    run_multi_invocation_texture_read(Arc::clone(&executor))?;
     run_object_sampled_texture()?;
     run_object_parallel_commands()?;
     run_object_same_allocation_parallel()?;
@@ -2117,9 +2118,9 @@ fn run_object_sampled_texture() -> Result<(), Box<dyn Error>> {
 }
 
 /// Read one R32Uint texel through the sampled-texture path. This is the first
-/// provider-level texture case that runs on both Lavapipe and the RTX 5060;
-/// the multi-invocation variant is blocked by the translator defect recorded
-/// in `research/docs/16` §4.5, so this case stays single invocation.
+/// provider-level texture case that runs on both Lavapipe and the RTX 5060.
+/// It reads only texel (0, 0), so it cannot see a row stride at all; the
+/// multi-invocation companion below is the case that can.
 fn run_sampled_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
     use metal_api_core::provider::{
         AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
@@ -2178,6 +2179,91 @@ fn run_sampled_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn
     println!(
         "PASS provider_sampled_texture_read texture=4x4-r32uint texel=(0,0) value=0 copy_in=1"
     );
+    Ok(())
+}
+
+/// Read every cell of a 4x4 R32Uint texture holding 0..15, once as a single
+/// 4x4 group and once as sixteen 1x1 groups. Both forms must land [100..115].
+///
+/// A host-side upload that assumes tightly packed linear rows puts every row
+/// after the first in bytes the driver never reads, so both forms then return
+/// [100, 101, 102, 103, 100, ...]: only the V = 0 row survives. That is a
+/// provider defect, not a translated-coordinate one — a single invocation with
+/// constant coordinates reproduced it before the fix
+/// (`evidence/upstream-issue-metal2vulkan-2026-09-14/`).
+fn run_multi_invocation_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let expected = (100_u32..116).collect::<Vec<_>>();
+    for (form, threadgroup) in [
+        ("local_4x4", (4_u32, 4_u32, 1_u32)),
+        ("local_1x1", (1, 1, 1)),
+    ] {
+        let library = device.new_library_with_air(
+            include_str!("../shaders/kernel_read_texture_2d_cell.ll").to_owned(),
+        )?;
+        let function = library.function("read_texture_2d_cell")?;
+        let pipeline = executor.new_compute_pipeline(&function)?;
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = TextureView {
+            view_id: ViewId::new(910),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(911),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(texels),
+        };
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 64],
+            }],
+            textures: vec![texture],
+            threads_per_grid: metal_api_core::Size::new(4, 4, 1)?,
+            threads_per_threadgroup: metal_api_core::Size::new(
+                threadgroup.0,
+                threadgroup.1,
+                threadgroup.2,
+            )?,
+        };
+        let updates = executor.execute(submission).map_err(|error| {
+            format!(
+                "multi invocation texture read ({form}) failed: {}",
+                error.message()
+            )
+        })?;
+        let update = updates
+            .iter()
+            .find(|update| update.index == 0)
+            .ok_or("multi invocation texture read returned no writeback")?;
+        let observed = update
+            .bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("chunk is four bytes")))
+            .collect::<Vec<_>>();
+        if observed != expected {
+            return Err(format!(
+                "multi invocation texture read ({form}) landed {observed:?}, expected {expected:?}"
+            )
+            .into());
+        }
+        println!(
+            "PASS provider_multi_invocation_texture_read form={form} grid=4x4x1 threadgroup={}x{}x{} cells=100..115",
+            threadgroup.0, threadgroup.1, threadgroup.2
+        );
+    }
     Ok(())
 }
 

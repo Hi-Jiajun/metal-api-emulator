@@ -435,6 +435,22 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
                     && definition.textures?[0].height == 4
                     && definition.textures?[0].access == "sampled",
                     "\(definition.id): expected one 4x4 sampled texture")
+    case "texture_cell_local_4x4", "texture_cell_local_1x1":
+        let expectedLocal: [UInt64] = definition.id == "texture_cell_local_4x4" ? [4, 4, 1] : [1, 1, 1]
+        try require(suite == "compute-buffer-v12" && definition.entry == "read_texture_2d_cell"
+                    && definition.grid == [4, 4, 1] && definition.local == expectedLocal,
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 1
+                    && definition.buffers[0].binding == 0
+                    && definition.buffers[0].access == "write"
+                    && definition.buffers[0].length == 64,
+                    "\(definition.id): expected one 64-byte write-only output buffer")
+        try require(definition.textures?.count == 1
+                    && definition.textures?[0].binding == 0
+                    && definition.textures?[0].width == 4
+                    && definition.textures?[0].height == 4
+                    && definition.textures?[0].access == "sampled",
+                    "\(definition.id): expected one 4x4 sampled texture")
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
@@ -621,8 +637,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["alias_disjoint_pair", "alias_disjoint_pair_reversed"]
     case "compute-buffer-v11":
         expectedIDs = ["sampled_texture_first_texel"]
+    case "compute-buffer-v12":
+        expectedIDs = ["texture_cell_local_4x4", "texture_cell_local_1x1"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v11 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v12 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -674,6 +692,12 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
             sha256: "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb")
         metal = SourceDefinition(path: "shaders/read_texture_2d.metal",
             sha256: "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee")
+        slots = [BufferSlotDefinition(binding: 0, access: "write", length: 64)]
+    case "read_texture_2d_cell":
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_read_texture_2d_cell.ll",
+            sha256: "80fe6866bac049de9c1c2b33d9f15a3a133b68c321dfdb16721c991f8dfc23c9")
+        metal = SourceDefinition(path: "shaders/read_texture_2d_cell.metal",
+            sha256: "6517da4354381bb46706ec3395d3e449ff08499df37c0c1f2a620a0c04161237")
         slots = [BufferSlotDefinition(binding: 0, access: "write", length: 64)]
     case "copy_word":
         air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",

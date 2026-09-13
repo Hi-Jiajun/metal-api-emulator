@@ -881,6 +881,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         ],
         (1, "compute-buffer-v10") => &["alias_disjoint_pair", "alias_disjoint_pair_reversed"],
         (1, "compute-buffer-v11") => &["sampled_texture_first_texel"],
+        (1, "compute-buffer-v12") => &["texture_cell_local_4x4", "texture_cell_local_1x1"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -1131,6 +1132,12 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/read_texture_2d.metal",
             "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee",
         ),
+        "read_texture_2d_cell" => (
+            "../examples/metal-smoke/shaders/kernel_read_texture_2d_cell.ll",
+            "80fe6866bac049de9c1c2b33d9f15a3a133b68c321dfdb16721c991f8dfc23c9",
+            "shaders/read_texture_2d_cell.metal",
+            "6517da4354381bb46706ec3395d3e449ff08499df37c0c1f2a620a0c04161237",
+        ),
         "copy_word" => (
             "../examples/metal-smoke/shaders/kernel_copy_word.ll",
             "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99",
@@ -1278,6 +1285,21 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         "sampled_texture_first_texel" => (
             "read_texture_2d",
             [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "write", 64)][..],
+        ),
+        // v12: the same 4x4 grid runs once as a single 4x4 group and once as
+        // sixteen 1x1 groups. Both forms read texel(x, y), so the two shapes
+        // must agree on [100..115] for a 4x4 R32Uint image holding 0..15.
+        "texture_cell_local_4x4" => (
+            "read_texture_2d_cell",
+            [4, 4, 1],
+            [4, 4, 1],
+            &[(0, "write", 64)][..],
+        ),
+        "texture_cell_local_1x1" => (
+            "read_texture_2d_cell",
+            [4, 4, 1],
             [1, 1, 1],
             &[(0, "write", 64)][..],
         ),
