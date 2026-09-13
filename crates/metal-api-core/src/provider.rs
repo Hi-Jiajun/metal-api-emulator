@@ -3785,6 +3785,35 @@ impl ProviderLifecycle {
         self.state = TerminalState::DeviceLost;
     }
 
+    /// Fail the instance closed for one submission whose completion can no
+    /// longer be observed, without charging the abandonment ledger.
+    ///
+    /// [`ProviderLifecycle::record_abandonment`] is the entry point for a
+    /// submission that is given up on: it counts the submission and its bytes
+    /// before the budget decides. This is the entry point for transitions that
+    /// only *classify* a submission the instance already gave up on — a queue
+    /// that refused the submission, or a device-loss-class error observed
+    /// after the work retired. Nothing is added to
+    /// [`ProviderLifecycle::abandonment`], so the counters keep reporting real
+    /// abandoned work, but the instance leaves `Usable` all the same: it stays
+    /// terminal until it is recreated.
+    ///
+    /// The instance ends in [`TerminalState::Exhausted`], not `DeviceLost`,
+    /// because no device loss was observed; admission therefore keeps
+    /// answering with the `abandonment_budget` refusal. `DeviceLost` is
+    /// terminal-ordered above `Exhausted`, so a state that already observed a
+    /// device loss is never relabelled or downgraded.
+    pub fn mark_unobservable_submission(&mut self) {
+        if matches!(self.state, TerminalState::DeviceLost) {
+            return;
+        }
+        self.poisoned = true;
+        self.state = TerminalState::Exhausted {
+            submissions: self.ledger.submissions(),
+            bytes: self.ledger.bytes(),
+        };
+    }
+
     /// Whether the instance has been poisoned by exhaustion or device loss.
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -6694,6 +6723,57 @@ mod tests {
         assert_eq!(
             error.fields.get("terminal"),
             Some(&FieldValue::Text("device_lost".into()))
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_seals_an_unobservable_submission_without_charging_it() {
+        let mut lifecycle = ProviderLifecycle::new(4, 4096);
+        lifecycle.mark_unobservable_submission();
+        assert!(lifecycle.is_poisoned());
+        assert!(lifecycle.ended_by_abandonment_budget());
+        assert_eq!(lifecycle.health(), ProviderHealth::Exhausted);
+        // The ledger stays honest: no submission was recorded as abandoned.
+        assert_eq!(lifecycle.abandonment(), (0, 0));
+
+        let refusal = lifecycle
+            .admit()
+            .expect_err("a sealed instance refuses work");
+        assert_eq!(refusal.reason(), TerminalRefusalReason::AbandonmentBudget);
+        assert!(refusal.requires_recreate());
+        assert_eq!(
+            refusal.error().fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_eq!(
+            refusal.error().fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // Sealing is idempotent, recording afterwards stays a no-op, and a
+        // later observed device loss still wins over the abandonment cause.
+        lifecycle.mark_unobservable_submission();
+        assert_eq!(
+            lifecycle.state(),
+            TerminalState::Exhausted {
+                submissions: 0,
+                bytes: 0
+            }
+        );
+        assert_eq!(
+            lifecycle.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(lifecycle.abandonment(), (0, 0));
+        lifecycle.mark_device_lost();
+        assert_eq!(lifecycle.state(), TerminalState::DeviceLost);
+        assert_eq!(lifecycle.abandonment(), (0, 0));
+        assert_eq!(
+            lifecycle
+                .admit()
+                .expect_err("device loss refuses work")
+                .reason(),
+            TerminalRefusalReason::DeviceLost
         );
     }
 
