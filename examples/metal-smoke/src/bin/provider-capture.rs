@@ -778,7 +778,7 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
             "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb",
             "shaders/read_texture_2d.metal",
-            "06b69d02aa0b70a6a326c2df966cc4466bf2fc4c2ed045adc15e4e9719a451ac",
+            "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee",
         ),
         "copy_word" => (
             "../examples/metal-smoke/shaders/kernel_copy_word.ll",

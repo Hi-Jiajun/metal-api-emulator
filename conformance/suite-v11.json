@@ -22,7 +22,7 @@
       },
       "metal": {
         "path": "shaders/read_texture_2d.metal",
-        "sha256": "06b69d02aa0b70a6a326c2df966cc4466bf2fc4c2ed045adc15e4e9719a451ac"
+        "sha256": "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee"
       },
       "textures": [
         {

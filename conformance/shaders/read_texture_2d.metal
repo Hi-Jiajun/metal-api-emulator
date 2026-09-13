@@ -8,6 +8,8 @@ kernel void read_texture_2d(texture2d<uint, access::read> texture [[texture(0)]]
                             device uint *output [[buffer(0)]],
                             uint3 gid [[thread_position_in_grid]]) {
     const uint2 coord = uint2(gid.x, gid.y);
-    const uint cell = (gid.y << 2) + gid.x;
+    // Keep the arithmetic identical to the AIR fixture's `4*y + x` so both
+    // rails land the same cell for every invocation.
+    const uint cell = (gid.y * 4) + gid.x;
     output[cell] = texture.read(coord).x;
 }

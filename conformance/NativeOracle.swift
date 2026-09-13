@@ -75,7 +75,19 @@ private struct CaseDefinition: Decodable {
     let air: SourceDefinition
     let metal: SourceDefinition
     let buffers: [BufferDefinition]
+    let textures: [TextureDefinition]?
     let expected_writebacks: [Writeback]
+}
+
+private struct TextureDefinition: Decodable {
+    let binding: Int
+    let allocation: UInt64
+    let view: UInt64
+    let width: Int
+    let height: Int
+    let format: String
+    let access: String
+    let initial_hex: String
 }
 
 private struct SuiteDefinition: Decodable {
@@ -96,6 +108,12 @@ private struct ValidatedCase {
     let commandBuffers: [[Int]]
     let programs: [(definition: ProgramDefinition, source: String)]
     let buffers: [ValidatedBuffer]
+    let textures: [ValidatedTexture]
+}
+
+private struct ValidatedTexture {
+    let definition: TextureDefinition
+    let backing: Data
 }
 
 private struct ValidatedSuite {
@@ -458,6 +476,29 @@ private func writableViews(_ definition: CaseDefinition) -> Set<UInt64> {
     return result
 }
 
+/// The v11 texture section: one 4x4 R32Uint sampled texture per case, whose
+/// tightly packed initial bytes become an MTLTexture before execution.
+private func validateTextures(_ definition: CaseDefinition) throws -> [ValidatedTexture] {
+    let textures = definition.textures ?? []
+    var views = Set<UInt64>()
+    var bindings = Set<Int>()
+    var valid = [ValidatedTexture]()
+    for texture in textures {
+        try require(texture.format == "r32_uint", "\(definition.id): unsupported texture format")
+        try require(texture.access == "sampled", "\(definition.id): unsupported texture access")
+        try require(texture.width > 0 && texture.height > 0,
+                    "\(definition.id): texture dimensions must be nonzero")
+        try require(bindings.insert(texture.binding).inserted && views.insert(texture.view).inserted,
+                    "\(definition.id): duplicate texture view or binding")
+        let backing = try decodeHex(texture.initial_hex,
+                                    context: "\(definition.id) texture \(texture.view)")
+        try require(backing.count == texture.width * texture.height * 4,
+                    "\(definition.id): texture bytes do not match the declared extent")
+        valid.append(ValidatedTexture(definition: texture, backing: backing))
+    }
+    return valid
+}
+
 private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) throws -> [ValidatedBuffer] {
     var bindings = Set<UInt64>()
     var views = Set<UInt64>()
@@ -563,8 +604,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["subset_chain_two", "subset_chain_four", "subset_chain_eight"]
     case "compute-buffer-v10":
         expectedIDs = ["alias_disjoint_pair", "alias_disjoint_pair_reversed"]
+    case "compute-buffer-v11":
+        expectedIDs = ["sampled_texture_first_texel"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v10 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v11 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -594,12 +637,14 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         }
         try require(usedViews == Set(definition.buffers.map { $0.view }), "Unused declared resource")
         let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
+        let textures = try validateTextures(definition)
         let loaded = try programs.map { program in
             (definition: program, source: try loadProgram(program, root: root))
         }
         cases.append(ValidatedCase(definition: definition, dispatches: dispatches,
                                    commandBuffers: commandBuffers,
-                                   programs: loaded, buffers: buffers))
+                                   programs: loaded, buffers: buffers,
+                                   textures: textures))
     }
     return ValidatedSuite(name: suite.suite, sha256: sha256(raw), cases: cases)
 }
@@ -609,6 +654,12 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
     let metal: SourceDefinition
     let slots: [BufferSlotDefinition]
     switch entry {
+    case "read_texture_2d":
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
+            sha256: "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb")
+        metal = SourceDefinition(path: "shaders/read_texture_2d.metal",
+            sha256: "da21ca69d76018f2911aaf6867f517fca8e41b20d531b6b43df30931563499ee")
+        slots = [BufferSlotDefinition(binding: 0, access: "write", length: 64)]
     case "copy_word":
         air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_copy_word.ll",
             sha256: "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99")
@@ -734,6 +785,32 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
         }
         resources.append(resource)
     }
+    // v11: sampled textures are their own allocations. The AIR fixture reads
+    // one R32Uint texel per thread, so the MTLTexture is filled once from the
+    // case's tightly packed initial bytes.
+    var textures = [MTLTexture]()
+    for texture in fixture.textures {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Uint,
+            width: texture.definition.width,
+            height: texture.definition.height,
+            mipmapped: false)
+        descriptor.usage = .shaderRead
+        descriptor.storageMode = .shared
+        guard let resource = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the sampled texture")
+        }
+        texture.backing.withUnsafeBytes { bytes in
+            if let source = bytes.baseAddress {
+                resource.replace(region: MTLRegionMake2D(0, 0, texture.definition.width,
+                                                         texture.definition.height),
+                                 mipmapLevel: 0,
+                                 withBytes: source,
+                                 bytesPerRow: texture.definition.width * 4)
+            }
+        }
+        textures.append(resource)
+    }
     // makeCommandBuffer() retains referenced resources until GPU completion.
     // In particular, a CPU timeout below must not release submitted buffers.
     // One command buffer commits and completes before the next group is
@@ -761,6 +838,9 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
                 }
                 let resource = fixture.buffers[poolIndex]
                 encoder.setBuffer(resources[poolIndex], offset: Int(resource.definition.offset), index: Int(slot.binding))
+            }
+            for (index, texture) in fixture.textures.enumerated() {
+                encoder.setTexture(textures[index], index: texture.definition.binding)
             }
             encoder.dispatchThreads(metalSize(dispatch.grid), threadsPerThreadgroup: metalSize(dispatch.local))
             encoder.endEncoding()

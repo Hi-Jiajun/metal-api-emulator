@@ -11,7 +11,8 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef,
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
-    MTLResourceOptions, MTLSize,
+    MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLTextureType, MTLTextureUsage, NSUInteger, Texture, TextureDescriptor,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{
@@ -714,6 +715,8 @@ struct SubmissionResources {
     pipelines: Vec<ComputePipelineState>,
     command: CommandBuffer,
     buffers: Vec<BoundBuffer>,
+    /// Sampled textures by their contract view id (`research/docs/16` §4.8).
+    textures: BTreeMap<ViewId, TextureRef>,
     // Keep owner mappings imported and retained until Metal retires the work.
     _borrowed: BorrowedRetains,
 }
@@ -726,6 +729,11 @@ struct SubmissionResources {
 struct BoundBuffer {
     buffer: Buffer,
     offset: u64,
+}
+
+/// One owned MTLTexture created from a sampled view's initial bytes.
+struct TextureRef {
+    texture: Texture,
 }
 
 /// Retains no-copy leases for one submission until its Metal resources own
@@ -941,6 +949,68 @@ fn encode(
         }
         buffers.push(BoundBuffer { buffer, offset });
     }
+    // Sampled textures (`research/docs/16` §4.8): the first increment accepts
+    // D2, single-sample R32Uint owned bytes, uploaded once per submission.
+    let mut bound_textures = BTreeMap::<ViewId, TextureRef>::new();
+    for texture in trace.serial_texture_resources().map_err(|error| {
+        refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Resource,
+            "texture_contract_invalid",
+        )
+        .with_detail(error.to_string())
+    })? {
+        texture.validate_shape().map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "texture_shape_invalid",
+            )
+            .with_detail(error.to_string())
+        })?;
+        if texture.texture_type != TextureType::D2
+            || texture.format != TextureFormat::R32Uint
+            || texture.sample_count != 1
+            || texture.depth != 1
+            || texture.array_length != 1
+            || texture.access != TextureAccess::Sampled
+        {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "texture_shape_unsupported",
+            ));
+        }
+        let TextureSource::OwnedBytes(bytes) = &texture.source else {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "texture_source_unsupported",
+            ));
+        };
+        let width = texture.width;
+        let height = texture.height;
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(MTLPixelFormat::R32Uint);
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor.set_mipmap_level_count(1);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        let created = state.device.new_texture(descriptor.as_ref());
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        let stride = NSUInteger::try_from(width.saturating_mul(4)).unwrap_or(NSUInteger::MAX);
+        created.replace_region(region, 0, bytes.as_ptr().cast(), stride);
+        bound_textures.insert(texture.view_id, TextureRef { texture: created });
+    }
     let command = unsafe {
         let pointer: *mut metal::MTLCommandBuffer = msg_send![state.queue.as_ref(), commandBuffer];
         if pointer.is_null() {
@@ -956,6 +1026,7 @@ fn encode(
             pipelines,
             command,
             buffers,
+            textures: bound_textures,
             _borrowed: retains,
         }),
         submitted: false,
@@ -983,6 +1054,13 @@ fn encode(
                 Some(&bound.buffer),
                 bound.offset,
             );
+        }
+        for texture in &pass.textures {
+            let bound = resources
+                .textures
+                .get(&texture.view_id)
+                .ok_or_else(|| resource_error("metal_texture_not_uploaded"))?;
+            encoder.set_texture(u64::from(texture.metal_binding), Some(&bound.texture));
         }
         let [gx, gy, gz] = pass.dispatch.grid;
         let [lx, ly, lz] = pass.dispatch.threads_per_threadgroup;
@@ -1133,6 +1211,7 @@ impl NativeMetalProvider {
             pipelines: retained_pipelines,
             command,
             buffers,
+            textures: _textures,
             _borrowed,
         } = pending.resources.take().expect("encoded resources");
         pending.submitted = true;
