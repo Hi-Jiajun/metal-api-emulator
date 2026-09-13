@@ -660,8 +660,22 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
         try require(buffer.offset % 4 == 0, "\(context): uint binding offset needs 4-byte alignment")
         // Each owned view must have a canary prefix and suffix to make an
         // offset/extent mismatch observable. Bounds above make addition safe.
+        //
+        // v13's declaring case is the one exception: its read view *is* the
+        // whole attachment allocation (`offset == 0`,
+        // `allocation_size == length`), because the render case stores into
+        // exactly those bytes and the comparison is against that view. There is
+        // no neighbouring byte to guard with, and the render path's own
+        // sentinel-versus-fragment check is what keeps an extent mistake
+        // observable there (`conformance/RENDER-CAPTURE.md` §3). The exception
+        // is written down here rather than loosening the rule for every case.
+        let wholeAllocationDeclaringView =
+            definition.id == "render_declaring_copy_word"
+            && buffer.access == "read" && buffer.offset == 0
+            && buffer.allocation_size == buffer.length
         let end = buffer.offset + buffer.length
-        try require(buffer.offset >= 4 && buffer.allocation_size - end >= 4,
+        try require(wholeAllocationDeclaringView
+                    || (buffer.offset >= 4 && buffer.allocation_size - end >= 4),
                     "\(context): expected at least four guard bytes before and after the view")
         let initial = try decodeHex(buffer.initial_hex, context: context)
         try require(UInt64(initial.count) == buffer.length, "\(context): initial data length mismatch")
