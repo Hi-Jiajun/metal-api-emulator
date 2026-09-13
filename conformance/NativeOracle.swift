@@ -420,6 +420,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
             try require(resource.access == access && resource.length == length,
                         "\(definition.id): unsupported resource pool shape")
         }
+    case "sampled_texture_first_texel":
+        try require(suite == "compute-buffer-v11" && definition.entry == "read_texture_2d"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 1
+                    && definition.buffers[0].binding == 0
+                    && definition.buffers[0].access == "write"
+                    && definition.buffers[0].length == 64,
+                    "\(definition.id): expected one 64-byte write-only output buffer")
+        try require(definition.textures?.count == 1
+                    && definition.textures?[0].binding == 0
+                    && definition.textures?[0].width == 4
+                    && definition.textures?[0].height == 4
+                    && definition.textures?[0].access == "sampled",
+                    "\(definition.id): expected one 4x4 sampled texture")
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
