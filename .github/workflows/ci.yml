@@ -155,6 +155,8 @@ jobs:
           python3 conformance/compare.py --suite conformance/suite-v8.json --check /tmp/native-evidence/rust-provider-v8.json
           target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v9.json --output /tmp/native-evidence/rust-provider-v9.json
           python3 conformance/compare.py --suite conformance/suite-v9.json --check /tmp/native-evidence/rust-provider-v9.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v10.json --output /tmp/native-evidence/rust-provider-v10.json
+          python3 conformance/compare.py --suite conformance/suite-v10.json --check /tmp/native-evidence/rust-provider-v10.json
       - name: Capture Rust Metal through shared object API
         if: steps.capture.outputs.capture_status == 'captured'
         run: |
