@@ -139,10 +139,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   publisher and mirror now exist), provider-side lease import (the core
   `LeaseLedger` release contract now exists), general native shader admission
   and CPU uploads during command-buffer execution, guest-memory lifecycle
-  wiring beyond the owner-side contract, and carrying the priority/fairness
-  queue policy across the trace/wire boundary (the core contract, algorithm and
-  live queue attributes exist, while the tiers stay process-local host
-  scheduling attributes). Resource snapshots do not hold live guest pages.
+  wiring beyond the owner-side contract, and deriving a scheduling tier from
+  the guest (the priority policy, the per-queue tiers, and the owner marking
+  that carries them to a remote provider over the command channel now exist,
+  while nothing maps an `MTLCommandQueue` to a tier yet). Resource snapshots do
+  not hold live guest pages.
 - Not implemented: rendering (render pipelines, render passes, sampler and
   texture generalisation beyond the sampled fixture), presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL

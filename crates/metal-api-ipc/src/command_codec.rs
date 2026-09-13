@@ -17,8 +17,9 @@ use metal_api_core::provider::{
     FieldValue, FootprintProof, FunctionIdentity, FunctionSource, LeaseId, LeaseReservation,
     OperationId, PipelineCompileRequest, PipelineContract, PipelineId, ProviderCapabilities,
     ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
-    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
-    SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    QueuePriority, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
+    StorageMode, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType,
+    TextureView, ViewId,
 };
 use std::io::{Read, Write};
 
@@ -47,6 +48,14 @@ const IMPORT_STAGED_LEASE_REQUEST: u8 = 0x0a;
 const RELEASE_STAGED_LEASE_REQUEST: u8 = 0x0b;
 const IMPORT_BORROWED_LEASE_REQUEST: u8 = 0x0c;
 const RELEASE_BORROWED_LEASE_REQUEST: u8 = 0x0d;
+/// Owner queue-priority marking.
+///
+/// This tag is the reason the channel needed no version bump: it is additive,
+/// so a decoder that predates it answers
+/// [`CodecError::UnknownCommandTag`] for a marked frame while every frame an
+/// older owner sends still decodes here unchanged (and therefore keeps the
+/// provider's queues at `QueuePriority::Default`).
+const SET_QUEUE_PRIORITIES_REQUEST: u8 = 0x0e;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -56,7 +65,18 @@ const READBACK_RESPONSE: u8 = 0x05;
 const RELEASED_RESPONSE: u8 = 0x06;
 const HEALTH_RESPONSE: u8 = 0x07;
 const IMPORTED_RESPONSE: u8 = 0x08;
+/// The device queue table an owner marking installed.
+const QUEUE_PRIORITIES_RESPONSE: u8 = 0x09;
 const ERROR_RESPONSE: u8 = 0x7f;
+
+/// Maximum number of queue tiers one frame may carry.
+///
+/// The bound is a protocol limit, not a device limit: a marking describes the
+/// owner's view of a device queue table, and the Vulkan provider caps a device
+/// at eight queues. Refusing a longer frame keeps a corrupt length from making
+/// the decoder allocate; a provider may still read a short marking, because the
+/// expansion pads it (`metal_api_core::provider::queue_priorities_for_device`).
+pub const MAX_QUEUE_PRIORITIES: usize = 64;
 
 /// Stateless encoder/decoder for command frames.
 pub struct CommandCodec;
@@ -104,6 +124,10 @@ impl CommandCodec {
             CommandRequest::ReleaseBorrowedLease { lease_id } => {
                 encoder.u8(RELEASE_BORROWED_LEASE_REQUEST);
                 encoder.u64(lease_id.get());
+            }
+            CommandRequest::SetQueuePriorities { tiers } => {
+                encoder.u8(SET_QUEUE_PRIORITIES_REQUEST);
+                put_queue_priorities(&mut encoder, tiers)?;
             }
             CommandRequest::Submit { trace, resources } => {
                 encoder.u8(SUBMIT_REQUEST);
@@ -182,6 +206,10 @@ impl CommandCodec {
             CommandResponse::Readback { readback } => {
                 encoder.u8(READBACK_RESPONSE);
                 put_readback(&mut encoder, readback);
+            }
+            CommandResponse::QueuePriorities { installed } => {
+                encoder.u8(QUEUE_PRIORITIES_RESPONSE);
+                put_queue_priorities(&mut encoder, installed)?;
             }
             CommandResponse::Released => encoder.u8(RELEASED_RESPONSE),
             CommandResponse::Error { error } => {
@@ -328,6 +356,9 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
         RELEASE_BORROWED_LEASE_REQUEST => CommandRequest::ReleaseBorrowedLease {
             lease_id: LeaseId::new(decoder.u64()?),
         },
+        SET_QUEUE_PRIORITIES_REQUEST => CommandRequest::SetQueuePriorities {
+            tiers: get_queue_priorities(&mut decoder)?,
+        },
         SUBMIT_REQUEST => CommandRequest::Submit {
             trace: get_trace(&mut decoder)?,
             resources: get_resources(&mut decoder)?,
@@ -377,6 +408,9 @@ fn decode_response_payload(payload: &[u8]) -> Result<CommandResponse, CodecError
         },
         READBACK_RESPONSE => CommandResponse::Readback {
             readback: get_readback(&mut decoder)?,
+        },
+        QUEUE_PRIORITIES_RESPONSE => CommandResponse::QueuePriorities {
+            installed: get_queue_priorities(&mut decoder)?,
         },
         RELEASED_RESPONSE => CommandResponse::Released,
         ERROR_RESPONSE => CommandResponse::Error {
@@ -736,6 +770,51 @@ fn get_token(decoder: &mut Decoder<'_>) -> Result<CompletionToken, CodecError> {
         device_epoch: get_epoch(decoder)?,
         submission_id: SubmissionId::new(decoder.u64()?),
     })
+}
+
+/// One queue-priority table: a bounded count followed by one rank per tier.
+///
+/// The count is explicit so the decoder can refuse an oversized table before
+/// reading it, and each tier travels as its scheduler rank
+/// ([`QueuePriority::rank`]) rather than as a dense enum byte, so the wire value
+/// is the same number the policy compares.
+fn put_queue_priorities(encoder: &mut Encoder, tiers: &[QueuePriority]) -> Result<(), CodecError> {
+    if tiers.len() > MAX_QUEUE_PRIORITIES {
+        return Err(CodecError::QueuePriorityCount {
+            count: tiers.len(),
+            maximum: MAX_QUEUE_PRIORITIES,
+        });
+    }
+    encoder.u64(tiers.len() as u64);
+    for tier in tiers {
+        encoder.u8(tier.rank());
+    }
+    Ok(())
+}
+
+fn get_queue_priorities(decoder: &mut Decoder<'_>) -> Result<Vec<QueuePriority>, CodecError> {
+    let count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::QueuePriorityCount {
+        count: usize::MAX,
+        maximum: MAX_QUEUE_PRIORITIES,
+    })?;
+    if count > MAX_QUEUE_PRIORITIES {
+        return Err(CodecError::QueuePriorityCount {
+            count,
+            maximum: MAX_QUEUE_PRIORITIES,
+        });
+    }
+    let mut tiers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let rank = decoder.u8()?;
+        // A rank this build does not know is refused, never folded to
+        // `Default`: the frame carries a tier the decoder cannot honour.
+        let tier = QueuePriority::from_rank(rank).ok_or(CodecError::UnknownEnumValue {
+            field: "queue priority",
+            value: rank,
+        })?;
+        tiers.push(tier);
+    }
+    Ok(tiers)
 }
 
 fn put_digest(encoder: &mut Encoder, digest: &SemanticDigest) {

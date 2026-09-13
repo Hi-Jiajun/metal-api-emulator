@@ -14,10 +14,13 @@ use metal_api_core::provider::{
     CompletionDisposition, CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch,
     FieldValue, FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, ValidatedComputeTrace,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId,
+    ValidatedComputeTrace,
 };
-use metal_api_core::provider::{BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter};
+use metal_api_core::provider::{
+    queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
+};
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -670,6 +673,33 @@ impl ComputeProvider for VulkanComputeProvider {
         VulkanComputeProvider::health(self)
     }
 
+    /// Install an owner queue-priority marking on the device queues.
+    ///
+    /// The marking is expanded to one tier per device queue
+    /// ([`queue_priorities_for_device`]) and the installed table is returned, so
+    /// an owner that sent the marking over the command channel gets the same
+    /// view a process-local caller reads from
+    /// [`VulkanExecutor::queue_priorities`]. Nothing else about submission
+    /// changes: the tier table is read by every queue selection and by nothing
+    /// else.
+    fn set_queue_priorities(
+        &self,
+        tiers: &[QueuePriority],
+    ) -> Result<Vec<QueuePriority>, ProviderError> {
+        let installed = queue_priorities_for_device(self.executor.queue_count(), tiers);
+        self.executor
+            .set_queue_priorities(&installed)
+            .map_err(|error| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Internal,
+                    "queue_priorities_refused",
+                )
+                .with_detail(error.to_string())
+            })?;
+        Ok(installed)
+    }
+
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let trace = admitted.trace();
         check_epoch(self.epoch, trace.device_epoch)?;
@@ -1122,9 +1152,9 @@ fn map_writebacks(
     Ok(writebacks)
 }
 
-/// Serialize queue-0 device work with the standalone executor, then run the
-/// prepared sequence. The worker path calls this directly; the synchronous
-/// path calls it on the submitting thread.
+/// Serialize device work on the selected queue with the standalone executor,
+/// then run the prepared sequence. The worker path calls this directly; the
+/// synchronous path calls it on the submitting thread.
 fn execute_on_context(
     executor: &Arc<VulkanExecutor>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
@@ -1133,9 +1163,13 @@ fn execute_on_context(
     retains: &mut BorrowedRetains,
     textures: &[metal_api_core::provider::TextureView],
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
+    // The synchronous path goes through the same queue policy as the deferred
+    // object path (`research/docs/21` §4): the tier table decides which idle
+    // queue receives the work, and a one-queue device keeps answering zero.
+    let queue_index = executor.context.pick_queue();
     let _execution = executor
         .context
-        .lock_queue(0)
+        .lock_queue(queue_index)
         .map_err(|_| registry_poisoned())?;
     ensure_executor_usable(executor)?;
     execute_pool_sequence_with_status(
@@ -1145,6 +1179,7 @@ fn execute_on_context(
         dispatches,
         retains.take(),
         textures,
+        queue_index,
     )
 }
 

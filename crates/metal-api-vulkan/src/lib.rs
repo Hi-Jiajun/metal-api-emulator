@@ -328,12 +328,17 @@ impl ComputeExecutor for VulkanExecutor {
                 "pipeline artifact belongs to another Vulkan device",
             ));
         }
+        // The synchronous path selects through the same priority/fairness
+        // policy as the deferred object path (`research/docs/21` §4). A
+        // single-queue device still answers zero, so this changes nothing on a
+        // one-queue family like Lavapipe.
+        let queue_index = self.context.pick_queue();
         let _execution = self
             .context
-            .lock_queue(0)
+            .lock_queue(queue_index)
             .map_err(|_| failure("Vulkan queue lock is poisoned"))?;
         self.context.ensure_usable()?;
-        execute_submission(&self.context, artifact, submission)
+        execute_submission(&self.context, artifact, submission, queue_index)
     }
 }
 
@@ -685,6 +690,23 @@ impl VulkanContext {
             .clone()
     }
 
+    /// Report one enqueue on the selected device queue to the installed probe.
+    ///
+    /// Every submit path calls this while it holds that queue's host enqueue
+    /// lock, so the probe observes the same sequence the device does, whichever
+    /// path (synchronous or deferred) enqueued the command buffer. Production
+    /// callers leave the probe unset and this is a lock-and-drop of an `Option`.
+    pub(crate) fn notify_enqueue(&self, index: usize) {
+        if let Some(probe) = self
+            .enqueue_probe
+            .lock()
+            .ok()
+            .and_then(|probe| probe.clone())
+        {
+            probe(index);
+        }
+    }
+
     /// Lock the host-side enqueue section of one device queue.
     ///
     /// Vulkan requires host access to a `VkQueue` to be externally
@@ -957,23 +979,28 @@ fn execute_submission(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ExecutorError> {
-    execute_submission_with_status(context, artifact, submission)
+    execute_submission_with_status(context, artifact, submission, queue_index)
         .map_err(|error| failure(error.detail.unwrap_or(error.slug)))
 }
 
 /// Execute while preserving the phase and queue disposition for provider callers.
-/// The caller owns serialization and supplies its token after observing the result.
+/// The caller owns serialization: it holds the host enqueue lock of the queue
+/// it selected with `VulkanContext::pick_queue` and passes that index, so the
+/// device enqueue and the lock always describe the same queue. It supplies its
+/// token after observing the result.
 pub(crate) fn execute_submission_with_status(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let dispatch = (
         submission.threads_per_grid.dimensions(),
         submission.threads_per_threadgroup.dimensions(),
     );
-    execute_serial_submission_with_status(context, artifact, submission, &[dispatch])
+    execute_serial_submission_with_status(context, artifact, submission, &[dispatch], queue_index)
 }
 
 /// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
@@ -1021,11 +1048,13 @@ pub(crate) struct BoundDispatch {
 
 /// Execute one to eight ordered dispatches with one pipeline and buffer set.
 /// Tuples contain (grid, local size); the first must match the submission sizes.
+/// `queue_index` is the queue the caller selected and locked.
 pub(crate) fn execute_serial_submission_with_status(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
     dispatches: &[([u32; 3], [u32; 3])],
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     validate_serial_dispatches(
         (
@@ -1036,7 +1065,14 @@ pub(crate) fn execute_serial_submission_with_status(
     )?;
     let textures = submission.textures.clone();
     let bound = identity_dispatches(&submission.buffers, &textures, dispatches);
-    execute_rebound_submission_with_status(context, artifact, submission.buffers, &bound, &textures)
+    execute_rebound_submission_with_status(
+        context,
+        artifact,
+        submission.buffers,
+        &bound,
+        &textures,
+        queue_index,
+    )
 }
 
 /// Execute one pipeline against a selected subset of uploaded buffers per pass.
@@ -1049,9 +1085,17 @@ pub(crate) fn execute_rebound_submission_with_status(
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
     textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let artifacts = vec![artifact; dispatches.len()];
-    execute_pipeline_sequence_with_status(context, &artifacts, buffers, dispatches, textures)
+    execute_pipeline_sequence_with_status(
+        context,
+        &artifacts,
+        buffers,
+        dispatches,
+        textures,
+        queue_index,
+    )
 }
 
 /// Execute one to eight ordered pipeline dispatches over one uploaded pool.
@@ -1063,17 +1107,29 @@ pub(crate) fn execute_pipeline_sequence_with_status(
     buffers: Vec<BufferBinding>,
     dispatches: &[BoundDispatch],
     textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let buffers = buffers
         .into_iter()
         .map(PoolBinding::Owned)
         .collect::<Vec<_>>();
-    execute_pool_sequence_with_status(context, artifacts, &buffers, dispatches, None, textures)
+    execute_pool_sequence_with_status(
+        context,
+        artifacts,
+        &buffers,
+        dispatches,
+        None,
+        textures,
+        queue_index,
+    )
 }
 
 /// Execute a pool whose bindings are either provider-owned copies or owner
 /// host mappings imported without copying. `borrowed` carries the registry and
 /// the leases retained for this submission; their Drop retires every retain.
+/// `queue_index` is the queue the caller selected with
+/// `VulkanContext::pick_queue` and locked; the device enqueue uses that index,
+/// so the lock and the enqueue can never describe different queues.
 pub(crate) fn execute_pool_sequence_with_status(
     context: &Arc<VulkanContext>,
     artifacts: &[Arc<VulkanPipelineArtifact>],
@@ -1081,6 +1137,7 @@ pub(crate) fn execute_pool_sequence_with_status(
     dispatches: &[BoundDispatch],
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
     textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     for artifact in artifacts {
         if !Arc::ptr_eq(context, &artifact.context) {
@@ -1089,8 +1146,15 @@ pub(crate) fn execute_pool_sequence_with_status(
             )));
         }
     }
-    let result =
-        execute_submission_stages(context, artifacts, buffers, dispatches, borrowed, textures);
+    let result = execute_submission_stages(
+        context,
+        artifacts,
+        buffers,
+        dispatches,
+        borrowed,
+        textures,
+        queue_index,
+    );
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -1110,9 +1174,16 @@ fn execute_submission_stages(
     dispatches: &[BoundDispatch],
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
     textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     let mut pending = PendingExecution::submit(
-        context, 0, artifacts, buffers, dispatches, borrowed, textures,
+        context,
+        queue_index,
+        artifacts,
+        buffers,
+        dispatches,
+        borrowed,
+        textures,
     )?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
         context.mark_unobservable_submission();
@@ -3328,15 +3399,7 @@ impl ExecutionResources {
 
     fn submit(&mut self, queue_index: usize) -> Result<(), SubmissionFailure> {
         self.queue_index = queue_index;
-        if let Some(probe) = self
-            .context
-            .enqueue_probe
-            .lock()
-            .ok()
-            .and_then(|probe| probe.clone())
-        {
-            probe(queue_index);
-        }
+        self.context.notify_enqueue(queue_index);
         self.fence = unsafe {
             self.context
                 .device
@@ -5316,8 +5379,10 @@ mod tests {
             }
         }));
 
-        // Only the asynchronous object path selects a queue; the synchronous
-        // path stays pinned to queue 0, so the table has to be observed here.
+        // The asynchronous object path commits one command buffer per probe
+        // call, so its sequence is the observation surface for the window
+        // contract below. The synchronous paths select through the same policy
+        // (`synchronous_paths_select_queues_through_the_priority_policy`).
         let provider = crate::VulkanComputeProvider::with_executor(Arc::clone(&executor))
             .expect("provider")
             .with_async_execution(true);
@@ -5398,5 +5463,201 @@ mod tests {
         let tiers_seen: Vec<QueuePriority> =
             sequence.iter().map(|index| installed[*index]).collect();
         assert_queue_priority_window(&tiers_seen);
+    }
+
+    #[test]
+    fn provider_queue_priority_marking_installs_on_the_device_table() {
+        use metal_api_core::provider::ComputeProvider;
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        assert!(queues >= 1, "a selected device exposes at least one queue");
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+
+        // A marking longer than the device is truncated and a shorter one is
+        // padded, so the owner never has to know the queue count.
+        let marking = rtx_5060_queue_tiers();
+        let installed = provider
+            .set_queue_priorities(&marking)
+            .expect("a marking expands to the device table");
+        let expected: Vec<QueuePriority> = marking.into_iter().take(queues).collect();
+        assert_eq!(installed, expected);
+        assert_eq!(installed.len(), queues);
+        // The response is the table the scheduler actually reads.
+        assert_eq!(executor.queue_priorities(), installed);
+
+        // The empty marking is the all-`Default` table, i.e. exactly the
+        // scheduling a connection that never sends the request keeps.
+        let cleared = provider
+            .set_queue_priorities(&[])
+            .expect("an empty marking clears the table");
+        assert_eq!(cleared, vec![QueuePriority::Default; queues]);
+        assert_eq!(executor.queue_priorities(), cleared);
+    }
+
+    #[test]
+    fn synchronous_paths_select_queues_through_the_priority_policy() {
+        use metal_api_core::provider::{ComputeProvider, PipelineCompileRequest, ShaderSource};
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        // The §6 marking, truncated to the device: Lavapipe exposes one queue
+        // and therefore keeps the degenerate one-tier table.
+        let installed: Vec<QueuePriority> =
+            rtx_5060_queue_tiers().into_iter().take(queues).collect();
+        executor
+            .set_queue_priorities(&installed)
+            .expect("a table with one entry per queue is accepted");
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+            if let Ok(mut sequence) = sink.lock() {
+                sequence.push(queue);
+            }
+        }));
+
+        // Path one: the standalone `ComputeExecutor` entry point, which used to
+        // be pinned to queue 0.
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 64],
+            }],
+            textures: vec![metal_api_core::provider::TextureView {
+                view_id: metal_api_core::provider::ViewId::new(910),
+                metal_binding: 0,
+                allocation_id: metal_api_core::provider::AllocationId::new(911),
+                texture_type: metal_api_core::provider::TextureType::D2,
+                format: metal_api_core::provider::TextureFormat::R32Uint,
+                width: 4,
+                height: 4,
+                depth: 1,
+                array_length: 1,
+                sample_count: 1,
+                access: metal_api_core::provider::TextureAccess::Sampled,
+                source: metal_api_core::provider::TextureSource::OwnedBytes(texels),
+            }],
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).unwrap(),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).unwrap(),
+        };
+        let updates = executor.execute(submission).expect("texture read executes");
+        assert_eq!(updates[0].bytes[..4], 0_u32.to_le_bytes());
+
+        // Path two: the synchronous provider, which used to call
+        // `execute_on_context` on queue 0.
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+        assert_eq!(
+            provider
+                .set_queue_priorities(&installed)
+                .expect("the device-sized marking installs unchanged"),
+            installed
+        );
+        let objects = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = objects
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"synchronous_queue_selection".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = objects
+            .new_texture_with_bytes(
+                metal_api_core::provider::TextureFormat::R32Uint,
+                4,
+                4,
+                texels,
+            )
+            .expect("texture object");
+        let output = objects
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = objects.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("encoder");
+            encoder
+                .set_compute_pipeline_state(&pipeline)
+                .expect("pipeline state");
+            encoder.set_texture(0, &texture).expect("texture binding");
+            encoder
+                .set_buffer(0, &output.view(0, 64).unwrap())
+                .expect("buffer binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end encoding");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        assert_eq!(output.read().expect("readback")[..4], 0_u32.to_le_bytes());
+        executor.clear_enqueue_probe_for_test();
+
+        // Both paths reported exactly one selection, and each one is the answer
+        // the core policy gives for that cursor with every queue idle.
+        let loads = vec![0_usize; queues];
+        let sequence = observed.lock().expect("probe sequence").clone();
+        assert_eq!(
+            sequence.len(),
+            2,
+            "one probe call per synchronous submit: {sequence:?}"
+        );
+        for (cursor, picked) in sequence.iter().enumerate() {
+            assert_eq!(
+                *picked,
+                select_queue_for_submission(&loads, &installed, cursor),
+                "synchronous selection {cursor} did not go through the queue policy"
+            );
+        }
+        // The marking is scheduler state: two submissions neither consume it
+        // nor end the context that admits them.
+        assert_eq!(executor.queue_priorities(), installed);
     }
 }

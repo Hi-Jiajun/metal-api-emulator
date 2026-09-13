@@ -2682,6 +2682,39 @@ fn validate_writebacks_for_trace(
 pub trait ComputeProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Install a host-side scheduling tier per device queue and report the
+    /// table the provider actually installed.
+    ///
+    /// The argument is a marking, not a device table: an owner does not
+    /// necessarily know how many queues the provider created (the command
+    /// channel carries capabilities, not the queue count), so the provider
+    /// expands it with [`queue_priorities_for_device`] — extra entries are
+    /// ignored and missing ones stay [`QueuePriority::Default`]. The returned
+    /// table therefore has exactly one entry per device queue, which is what an
+    /// owner compares against to confirm the marking it sent.
+    ///
+    /// A tier only steers which device queue a submission is enqueued on. It
+    /// never changes dependency order, lease reservation semantics or writeback
+    /// contents, and a provider that received no marking keeps every queue at
+    /// [`QueuePriority::Default`] — the pre-priority scheduling.
+    /// A marking is scheduling state rather than device work: it neither
+    /// admits a submission nor revives a provider that stopped admitting work.
+    ///
+    /// Providers without queue scheduling keep this refusal: a marking that
+    /// cannot reach a scheduler is a capability question, not a protocol error.
+    fn set_queue_priorities(
+        &self,
+        tiers: &[QueuePriority],
+    ) -> Result<Vec<QueuePriority>, ProviderError> {
+        let _ = tiers;
+        Err(ProviderError::new(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "queue_priorities_unsupported",
+        )
+        .expect("non-empty provider error slug"))
+    }
+
     /// Current provider health. Providers that can lose a device or exhaust a
     /// bounded abandonment budget must override this; callers must recreate a
     /// provider whose health is not [`ProviderHealth::Usable`].
@@ -3309,6 +3342,21 @@ impl QueuePriority {
             Self::High => 2,
         }
     }
+
+    /// Inverse of [`Self::rank`] for tier tables and wire carriers.
+    ///
+    /// A carrier that reads a rank this build does not know must refuse the
+    /// value instead of falling back to a tier, otherwise a rank written by a
+    /// newer peer would silently become `Default` and change the scheduling
+    /// of a queue nobody asked to mark.
+    pub const fn from_rank(rank: u8) -> Option<Self> {
+        match rank {
+            0 => Some(Self::Low),
+            1 => Some(Self::Default),
+            2 => Some(Self::High),
+            _ => None,
+        }
+    }
 }
 
 /// Weighted, starvation-free scheduling policy for one provider's device
@@ -3431,6 +3479,31 @@ fn tier_distance(tier: QueuePriority, nominated: QueuePriority) -> (u8, u8) {
     } else {
         (2, tier.rank() - nominated.rank())
     }
+}
+
+/// Expand an owner queue-priority marking into one tier per device queue.
+///
+/// The marking is a hint, not a device table: an owner does not necessarily
+/// know how many queues a provider created, and a marking that crossed a
+/// process boundary carries the owner's view rather than the provider's. Extra
+/// entries are ignored and missing entries stay [`QueuePriority::Default`],
+/// which is exactly how [`select_queue_with_priority`] reads a short table. An
+/// empty marking therefore produces the all-`Default` table a provider has
+/// without any marking at all, so the default path keeps the pre-priority
+/// scheduling byte for byte.
+///
+/// This is the one place a marking ages into a device table, so a
+/// process-local marking and a marking that arrived over the command channel
+/// cannot drift apart.
+pub fn queue_priorities_for_device(
+    queue_count: usize,
+    marking: &[QueuePriority],
+) -> Vec<QueuePriority> {
+    let mut tiers = vec![QueuePriority::Default; queue_count];
+    for (slot, tier) in tiers.iter_mut().zip(marking) {
+        *slot = *tier;
+    }
+    tiers
 }
 
 /// Pick the device queue that should receive the next submission.
@@ -7714,6 +7787,60 @@ mod tests {
         assert_eq!(QueuePriority::Low.rank(), 0);
         assert_eq!(QueuePriority::Default.rank(), 1);
         assert_eq!(QueuePriority::High.rank(), 2);
+    }
+
+    #[test]
+    fn queue_priority_ranks_round_trip_and_refuse_unknown_values() {
+        for tier in [
+            QueuePriority::Low,
+            QueuePriority::Default,
+            QueuePriority::High,
+        ] {
+            assert_eq!(QueuePriority::from_rank(tier.rank()), Some(tier));
+        }
+        // A rank from a newer peer is refused instead of aging into `Default`:
+        // guessing a tier would change a queue nobody marked.
+        assert_eq!(QueuePriority::from_rank(3), None);
+        assert_eq!(QueuePriority::from_rank(u8::MAX), None);
+    }
+
+    #[test]
+    fn a_queue_priority_marking_ages_into_a_device_table() {
+        // No marking: the provider keeps the all-`Default` table, i.e. the
+        // scheduling behaviour that predates the tier table.
+        assert_eq!(
+            queue_priorities_for_device(3, &[]),
+            vec![QueuePriority::Default; 3]
+        );
+        // A shorter marking is padded, a longer one is truncated, so the
+        // expansion never depends on the owner knowing the queue count.
+        assert_eq!(
+            queue_priorities_for_device(3, &[QueuePriority::High]),
+            vec![
+                QueuePriority::High,
+                QueuePriority::Default,
+                QueuePriority::Default
+            ]
+        );
+        assert_eq!(
+            queue_priorities_for_device(
+                2,
+                &[QueuePriority::High, QueuePriority::Low, QueuePriority::High]
+            ),
+            vec![QueuePriority::High, QueuePriority::Low]
+        );
+        // The expansion is also the table `select_queue_with_priority` reads,
+        // so a marking changes which queue a submit picks and nothing else:
+        // both queues stay idle in every case below.
+        let policy = QueueSchedulingPolicy::default();
+        let marked = queue_priorities_for_device(2, &[QueuePriority::Low, QueuePriority::High]);
+        let unmarked = queue_priorities_for_device(2, &[]);
+        // Slot 0 of the window nominates `High`, so the marked queue wins where
+        // the unmarked table would have kept its rotation on queue 0...
+        assert_eq!(select_queue_with_priority(&[0, 0], &marked, 0, policy), 1);
+        assert_eq!(select_queue_with_priority(&[0, 0], &unmarked, 0, policy), 0);
+        // ...and slot 6 nominates `Low`, which only the unmarked queue matches.
+        assert_eq!(select_queue_with_priority(&[0, 0], &marked, 6, policy), 0);
     }
 
     #[test]

@@ -34,8 +34,8 @@ use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionReadback, CompletionToken,
     ComputeProvider, ComputeTrace, DeviceEpoch, LeaseId, LeaseImporter, LeaseReservation,
     PipelineCompileRequest, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, ResourceTableSnapshot,
-    Retryability, StagedLease, ValidatedComputeTrace,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+    ResourceTableSnapshot, Retryability, StagedLease, ValidatedComputeTrace,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,6 +67,20 @@ pub enum CommandRequest {
     ImportBorrowedLease { reservation: LeaseReservation },
     /// Drop a descriptor-backed no-copy lease import.
     ReleaseBorrowedLease { lease_id: LeaseId },
+    /// Install an owner queue-priority marking on the provider's device
+    /// queues.
+    ///
+    /// The frame carries the owner's marking, not a device table: the provider
+    /// expands it to one tier per device queue (padding with
+    /// `QueuePriority::Default`, truncating the rest) and answers with the
+    /// table it installed. A connection that never sends this request leaves
+    /// every queue at `QueuePriority::Default`, which is the scheduling
+    /// behaviour the channel had before the tier table existed.
+    ///
+    /// One connection carries one exchange at a time, so a marking is ordered
+    /// against the submits on the same connection: it steers every submission
+    /// sent after its response, and nothing about a trace changes.
+    SetQueuePriorities { tiers: Vec<QueuePriority> },
     /// Admit and submit one trace with its resource snapshot.
     Submit {
         trace: ComputeTrace,
@@ -98,6 +112,7 @@ impl CommandRequest {
             Self::ReleaseStagedLease { .. } => "release_staged_lease",
             Self::ImportBorrowedLease { .. } => "import_borrowed_lease",
             Self::ReleaseBorrowedLease { .. } => "release_borrowed_lease",
+            Self::SetQueuePriorities { .. } => "set_queue_priorities",
             Self::Submit { .. } => "submit",
             Self::Wait { .. } => "wait",
             Self::Readback { .. } => "readback",
@@ -134,6 +149,11 @@ pub enum CommandResponse {
     Readback {
         readback: CompletionReadback,
     },
+    /// The device queue table a [`CommandRequest::SetQueuePriorities`] marking
+    /// installed, one entry per device queue.
+    QueuePriorities {
+        installed: Vec<QueuePriority>,
+    },
     Released,
     Error {
         error: ProviderError,
@@ -151,6 +171,7 @@ impl CommandResponse {
             Self::Submitted { .. } => "submitted",
             Self::Observed { .. } => "observed",
             Self::Readback { .. } => "readback",
+            Self::QueuePriorities { .. } => "queue_priorities",
             Self::Released => "released",
             Self::Error { .. } => "error",
         }
@@ -603,6 +624,34 @@ impl<R: Read + Send, W: Write + Send> ComputeProvider for RemoteProvider<R, W> {
         }
     }
 
+    /// Send the owner marking over the channel and return the provider's
+    /// installed table.
+    ///
+    /// The owner cannot expand the marking itself: the queue count is a
+    /// provider device property and the channel carries capabilities, not the
+    /// queue table. The response is the only view of what the provider
+    /// installed, so it is also the owner-side evidence that the marking
+    /// reached the scheduler.
+    fn set_queue_priorities(
+        &self,
+        tiers: &[QueuePriority],
+    ) -> Result<Vec<QueuePriority>, ProviderError> {
+        match self.exchange(
+            CommandRequest::SetQueuePriorities {
+                tiers: tiers.to_vec(),
+            },
+            ProviderPhase::Resolve,
+        )? {
+            CommandResponse::QueuePriorities { installed } => Ok(installed),
+            CommandResponse::Error { error } => Err(error),
+            other => Err(unexpected_response(
+                ProviderPhase::Resolve,
+                "queue_priorities",
+                &other,
+            )),
+        }
+    }
+
     fn submit(&self, trace: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let (trace, resources) = trace.into_parts();
         match self.exchange(
@@ -915,6 +964,12 @@ where
             Ok(()) => CommandResponse::Released,
             Err(error) => CommandResponse::Error { error },
         },
+        CommandRequest::SetQueuePriorities { tiers } => {
+            match provider.set_queue_priorities(&tiers) {
+                Ok(installed) => CommandResponse::QueuePriorities { installed },
+                Err(error) => CommandResponse::Error { error },
+            }
+        }
     }
 }
 
@@ -1353,9 +1408,8 @@ mod tests {
     use super::{
         serve_provider, serve_provider_named, CommandRequest, CommandResponse, RemoteProvider,
     };
-    #[cfg(unix)]
     use crate::codec::CodecError;
-    use crate::command_codec::CommandCodec;
+    use crate::command_codec::{CommandCodec, MAX_QUEUE_PRIORITIES};
     use metal_api_core::provider::{
         AllocationId, AllocationRecord, BufferAccess, BufferBindingContract, BufferLease,
         BufferSource, BufferView, BufferWriteback, CompiledComputePipeline, CompletionDisposition,
@@ -1363,13 +1417,13 @@ mod tests {
         DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity,
         LeaseId, LeaseImporter, LeaseReservation, OperationId, PipelineCompileRequest,
         PipelineContract, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
+        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
         ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
         SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
         ValidatedComputeTrace, ViewId, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use metal_api_core::provider::{BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter};
@@ -1502,6 +1556,13 @@ mod tests {
             CommandRequest::ReleaseBorrowedLease {
                 lease_id: LeaseId::new(52),
             },
+            CommandRequest::SetQueuePriorities {
+                tiers: vec![
+                    QueuePriority::High,
+                    QueuePriority::Default,
+                    QueuePriority::Low,
+                ],
+            },
             CommandRequest::Submit {
                 trace: trace.clone(),
                 resources: resources(),
@@ -1619,6 +1680,9 @@ mod tests {
                     writebacks: vec![writeback],
                 },
             },
+            CommandResponse::QueuePriorities {
+                installed: vec![QueuePriority::High, QueuePriority::Low],
+            },
             CommandResponse::Released,
             CommandResponse::Error { error },
         ];
@@ -1626,6 +1690,116 @@ mod tests {
             let frame = CommandCodec::encode_response(&response).unwrap();
             assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
         }
+    }
+
+    /// The frames a pre-priority owner sends keep decoding — and keep their
+    /// exact bytes — while a marking travels under a tag no older decoder knew.
+    ///
+    /// `MCC1` is length-delimited value by value, so the carrier for a queue
+    /// marking is a new request/response tag instead of a new field inside an
+    /// existing frame: an unmarked connection stays byte for byte the
+    /// connection this channel had before the tier table, and a decoder that
+    /// predates the tag answers `UnknownCommandTag` for a marked frame rather
+    /// than misreading it. That is the whole version policy — no new magic, and
+    /// no change to `PROVIDER_SCHEMA_VERSION`, because no trace value moved.
+    #[test]
+    fn legacy_frames_still_decode_byte_for_byte() {
+        // Hand-written rather than produced by the encoder below: these are the
+        // bytes an older build puts on the wire.
+        let legacy_health = [b'M', b'C', b'C', b'1', 0x01, 0, 0, 0, 1, 0x09];
+        let legacy_capabilities = [b'M', b'C', b'C', b'1', 0x01, 0, 0, 0, 1, 0x01];
+        assert_eq!(
+            CommandCodec::decode_request(&legacy_health).unwrap(),
+            CommandRequest::Health
+        );
+        assert_eq!(
+            CommandCodec::decode_request(&legacy_capabilities).unwrap(),
+            CommandRequest::Capabilities
+        );
+        // The encoder still emits exactly those bytes, so a mixed-version pair
+        // cannot disagree about a frame neither side changed.
+        assert_eq!(
+            CommandCodec::encode_request(&CommandRequest::Health).unwrap(),
+            legacy_health
+        );
+        assert_eq!(
+            CommandCodec::encode_request(&CommandRequest::Capabilities).unwrap(),
+            legacy_capabilities
+        );
+
+        // The marking is a new payload tag in both directions: the request
+        // extends the request range, the response uses the value after
+        // `IMPORTED_RESPONSE`.
+        let marking =
+            CommandCodec::encode_request(&CommandRequest::SetQueuePriorities { tiers: Vec::new() })
+                .unwrap();
+        assert_eq!(marking[9], 0x0e);
+        let installed = CommandCodec::encode_response(&CommandResponse::QueuePriorities {
+            installed: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(installed[9], 0x09);
+
+        // An unknown request tag is refused loudly, which is the answer an
+        // older decoder gives for the two new tags above.
+        let unknown = [b'M', b'C', b'C', b'1', 0x01, 0, 0, 0, 1, 0x7e];
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown).unwrap_err(),
+            CodecError::UnknownCommandTag(0x7e)
+        ));
+    }
+
+    #[test]
+    fn queue_priority_frames_round_trip_and_refuse_unknown_input() {
+        let request = CommandRequest::SetQueuePriorities {
+            tiers: vec![
+                QueuePriority::Low,
+                QueuePriority::Default,
+                QueuePriority::High,
+            ],
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let response = CommandResponse::QueuePriorities {
+            installed: vec![QueuePriority::High, QueuePriority::Low],
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+
+        // A rank this build does not know is refused instead of aging into a
+        // tier the owner never asked for.
+        let mut corrupted = CommandCodec::encode_request(&request).unwrap();
+        *corrupted.last_mut().unwrap() = 3;
+        assert!(matches!(
+            CommandCodec::decode_request(&corrupted).unwrap_err(),
+            CodecError::UnknownEnumValue {
+                field: "queue priority",
+                value: 3
+            }
+        ));
+
+        // The protocol bound is enforced on both sides, so a corrupt count
+        // cannot make the decoder allocate.
+        let oversized = vec![QueuePriority::Default; MAX_QUEUE_PRIORITIES + 1];
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::SetQueuePriorities {
+                tiers: oversized
+            })
+            .unwrap_err(),
+            CodecError::QueuePriorityCount { count, maximum }
+                if count == MAX_QUEUE_PRIORITIES + 1 && maximum == MAX_QUEUE_PRIORITIES
+        ));
+        let mut payload = vec![0x0e];
+        payload.extend_from_slice(&((MAX_QUEUE_PRIORITIES + 1) as u64).to_be_bytes());
+        let mut frame = b"MCC1".to_vec();
+        frame.push(0x01);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(matches!(
+            CommandCodec::decode_request(&frame).unwrap_err(),
+            CodecError::QueuePriorityCount { count, maximum }
+                if count == MAX_QUEUE_PRIORITIES + 1 && maximum == MAX_QUEUE_PRIORITIES
+        ));
     }
 
     struct FakeProvider {
@@ -1729,6 +1903,87 @@ mod tests {
         }
     }
 
+    /// `FakeProvider` plus the one behaviour the marking carrier needs: it
+    /// remembers the queue table an owner installed. Everything else is
+    /// forwarded, so the channel test above still pins the rest of the
+    /// protocol.
+    struct TierRecorderProvider {
+        inner: FakeProvider,
+        installed: Arc<Mutex<Vec<QueuePriority>>>,
+    }
+
+    impl ComputeProvider for TierRecorderProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn set_queue_priorities(
+            &self,
+            tiers: &[QueuePriority],
+        ) -> Result<Vec<QueuePriority>, ProviderError> {
+            // A device expands the marking with the core policy
+            // (`queue_priorities_for_device`); this recorder only has to be
+            // honest about what reached it and what it answers.
+            let mut installed = self.installed.lock().expect("tier recorder table");
+            installed.clear();
+            installed.extend_from_slice(tiers);
+            Ok(installed.clone())
+        }
+
+        fn submit(
+            &self,
+            trace: ValidatedComputeTrace,
+        ) -> Result<ProviderSubmission, ProviderError> {
+            self.inner.submit(trace)
+        }
+
+        fn wait(
+            &self,
+            token: CompletionToken,
+            timeout: Duration,
+        ) -> Result<CompletionDisposition, ProviderError> {
+            self.inner.wait(token, timeout)
+        }
+
+        fn readback(&self, token: CompletionToken) -> Result<CompletionReadback, ProviderError> {
+            self.inner.readback(token)
+        }
+    }
+
+    impl PipelineProvider for TierRecorderProvider {
+        fn device_epoch(&self) -> DeviceEpoch {
+            self.inner.device_epoch()
+        }
+
+        fn compile(
+            &self,
+            request: PipelineCompileRequest,
+        ) -> Result<CompiledComputePipeline, ProviderError> {
+            self.inner.compile(request)
+        }
+
+        fn release_pipeline(
+            &self,
+            pipeline: &CompiledComputePipeline,
+        ) -> Result<(), ProviderError> {
+            self.inner.release_pipeline(pipeline)
+        }
+
+        fn release_completion(&self, token: CompletionToken) -> Result<(), ProviderError> {
+            self.inner.release_completion(token)
+        }
+    }
+
+    impl LeaseImporter for TierRecorderProvider {
+        fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError> {
+            self.inner.import_staged_lease(staged)
+        }
+
+        fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+            self.inner.release_staged_lease(lease_id)
+        }
+    }
+
     fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             max_passes: 1,
@@ -1747,6 +2002,88 @@ mod tests {
             host_readback: true,
             submit_only: false,
         }
+    }
+
+    /// An owner marking crosses the channel, and an owner that never sends one
+    /// leaves the provider without a table — i.e. every queue at
+    /// `QueuePriority::Default`, the scheduling this channel had before the
+    /// tier table existed.
+    #[cfg(unix)]
+    #[test]
+    fn remote_provider_carries_a_queue_priority_marking() {
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        let provider = TierRecorderProvider {
+            inner: FakeProvider {
+                epoch: DeviceEpoch::new(7),
+                capabilities: fake_capabilities(),
+                submissions: Arc::new(AtomicU64::new(0)),
+                imports: Arc::new(AtomicU64::new(0)),
+                borrowed: Arc::new(BorrowedLeaseRegistry::new()),
+            },
+            installed: Arc::clone(&installed),
+        };
+        let (client, mut server) = super::unix::pair().unwrap();
+        let server_thread = std::thread::spawn(move || serve_provider(&provider, &mut server));
+
+        let remote = RemoteProvider::connect(client).unwrap();
+        assert!(installed.lock().unwrap().is_empty());
+
+        // The response is the table the provider read, which is what an owner
+        // compares against to confirm the marking reached the scheduler.
+        let marking = vec![
+            QueuePriority::High,
+            QueuePriority::Default,
+            QueuePriority::Low,
+        ];
+        assert_eq!(remote.set_queue_priorities(&marking).unwrap(), marking);
+        assert_eq!(installed.lock().unwrap().as_slice(), marking.as_slice());
+
+        // A later marking replaces the table instead of stacking on it, and the
+        // empty marking returns the device to the all-`Default` table.
+        let cleared = remote
+            .set_queue_priorities(&[])
+            .expect("an empty marking is installed");
+        assert!(cleared.is_empty());
+        assert!(installed.lock().unwrap().is_empty());
+
+        // Priority traffic leaves the rest of the channel framed and usable.
+        assert_eq!(remote.health(), ProviderHealth::Usable);
+        drop(remote);
+        server_thread.join().unwrap().unwrap();
+    }
+
+    /// A provider without a scheduler refuses a marking, both through the trait
+    /// default and over the wire, and the refusal is an answer rather than a
+    /// framing error.
+    #[cfg(unix)]
+    #[test]
+    fn a_provider_without_queue_scheduling_refuses_a_marking() {
+        let provider = FakeProvider {
+            epoch: DeviceEpoch::new(7),
+            capabilities: fake_capabilities(),
+            submissions: Arc::new(AtomicU64::new(0)),
+            imports: Arc::new(AtomicU64::new(0)),
+            borrowed: Arc::new(BorrowedLeaseRegistry::new()),
+        };
+        // `FakeProvider` never overrides the method, so this is the core
+        // default: a capability question, not a protocol error.
+        let direct = ComputeProvider::set_queue_priorities(&provider, &[QueuePriority::High])
+            .expect_err("a provider without a scheduler refuses a marking");
+        assert_eq!(direct.phase, ProviderPhase::Resolve);
+        assert_eq!(direct.class, ProviderErrorClass::Capability);
+        assert_eq!(direct.slug, "queue_priorities_unsupported");
+
+        let (client, mut server) = super::unix::pair().unwrap();
+        let server_thread = std::thread::spawn(move || serve_provider(&provider, &mut server));
+        let remote = RemoteProvider::connect(client).unwrap();
+        let refused = remote
+            .set_queue_priorities(&[QueuePriority::High])
+            .expect_err("the refusal travels as an error response");
+        assert_eq!(refused.slug, "queue_priorities_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(remote.health(), ProviderHealth::Usable);
+        drop(remote);
+        server_thread.join().unwrap().unwrap();
     }
 
     #[cfg(unix)]
