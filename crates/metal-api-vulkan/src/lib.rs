@@ -308,6 +308,29 @@ fn select_queue(in_flight: &[usize], round_robin_start: usize) -> usize {
     best
 }
 
+/// Priority-aware form of [`select_queue`], used only by the tests below.
+///
+/// Every queue a provider creates today shares one tier, and the live choice
+/// still goes through [`select_queue`]; wiring the core policy into the device
+/// path needs per-queue priorities on the trace/wire boundary, which is left to
+/// a later round (`research/docs/21-队列优先级与公平性设计.md` §6). This wrapper
+/// exists so the equivalence test can pin the stronger contract: with equal
+/// tiers the new policy must reproduce [`select_queue`] for every load vector.
+#[cfg(test)]
+fn select_queue_with_priority_policy(
+    in_flight: &[usize],
+    priorities: &[metal_api_core::provider::QueuePriority],
+    round_robin_start: usize,
+    policy: metal_api_core::provider::QueueSchedulingPolicy,
+) -> usize {
+    metal_api_core::provider::select_queue_with_priority(
+        in_flight,
+        priorities,
+        round_robin_start,
+        policy,
+    )
+}
+
 pub(crate) struct VulkanContext {
     entry: ManuallyDrop<Entry>,
     instance: Instance,
@@ -4711,5 +4734,53 @@ mod tests {
         assert_eq!(select_queue(&[2, 2, 2, 1], 3), 3);
         assert_eq!(select_queue(&[7], 5), 0);
         assert_eq!(select_queue(&[], 0), 0);
+    }
+
+    #[test]
+    fn queue_priority_policy_reduces_to_select_queue_on_one_tier() {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let policy = QueueSchedulingPolicy::default();
+        let probes = 3_usize;
+        for len in 0..=3_usize {
+            for encoded in 0..probes.pow(len as u32) {
+                let mut loads = vec![0_usize; len];
+                let mut rest = encoded;
+                for load in &mut loads {
+                    *load = rest % probes;
+                    rest /= probes;
+                }
+                let priorities = vec![QueuePriority::Default; len];
+                for cursor in 0..6_usize {
+                    assert_eq!(
+                        select_queue_with_priority_policy(&loads, &priorities, cursor, policy),
+                        select_queue(&loads, cursor),
+                        "loads {loads:?} cursor {cursor} must keep the least-loaded rule"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_priority_policy_separates_tiers_when_loads_tie() {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let policy = QueueSchedulingPolicy::default();
+        let loads = [0_usize, 0];
+        let priorities = [QueuePriority::Low, QueuePriority::High];
+        // Window slot 0 nominates the high tier, so the high queue wins even
+        // though both queues are idle.
+        assert_eq!(
+            select_queue_with_priority_policy(&loads, &priorities, 0, policy),
+            1
+        );
+        // The last slot of the window belongs to the low tier, so the idle high
+        // queue yields instead of running again.
+        let low_slot = (policy.window() - 1) as usize;
+        assert_eq!(
+            select_queue_with_priority_policy(&loads, &priorities, low_slot, policy),
+            0
+        );
     }
 }
