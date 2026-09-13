@@ -332,6 +332,84 @@ impl HostRegion {
     }
 }
 
+/// Page-aligned dirty ranges one allocation accumulated from device
+/// writebacks. The owner consumes this to flush guest pages; the type is pure,
+/// so it can be produced from a submission's writebacks without a provider
+/// callback (`research/docs/19` step 3).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirtySet {
+    page_size: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl DirtySet {
+    /// A set over one page size; refuses zero and non-power-of-two sizes.
+    pub fn new(page_size: u64) -> Result<Self, ContractError> {
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(ContractError::InvalidHostRegionPageSize(page_size));
+        }
+        Ok(Self {
+            page_size,
+            ranges: Vec::new(),
+        })
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Mark the pages covering one byte range. Adjacent or overlapping ranges
+    /// coalesce, so the result is the canonical minimal cover.
+    pub fn mark(&mut self, offset: u64, length: u64) -> Result<(), ContractError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(ContractError::ArithmeticOverflow("dirty range"))?;
+        let start_page = offset / self.page_size * self.page_size;
+        let end_page = end
+            .checked_add(self.page_size - 1)
+            .ok_or(ContractError::ArithmeticOverflow("dirty range"))?
+            / self.page_size
+            * self.page_size;
+        self.ranges.push((start_page, end_page));
+        self.ranges.sort_unstable();
+        let mut merged = Vec::with_capacity(self.ranges.len());
+        for (start, end) in self.ranges.drain(..) {
+            match merged.last_mut() {
+                Some((_, last_end)) if start <= *last_end => {
+                    if end > *last_end {
+                        *last_end = end;
+                    }
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        self.ranges = merged;
+        Ok(())
+    }
+
+    /// The canonical page-aligned ranges, ascending and disjoint.
+    pub fn ranges(&self) -> &[(u64, u64)] {
+        &self.ranges
+    }
+
+    /// Every writeback's written range, applied in order.
+    pub fn mark_writebacks(&mut self, writebacks: &[BufferWriteback]) -> Result<(), ContractError> {
+        for writeback in writebacks {
+            let length = u64::try_from(writeback.bytes.len())
+                .map_err(|_| ContractError::ArithmeticOverflow("writeback length"))?;
+            self.mark(writeback.offset, length)?;
+        }
+        Ok(())
+    }
+}
+
 /// How the caller supplies a buffer's initial contents.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BufferSource {
@@ -3833,6 +3911,52 @@ mod tests {
             shader_capabilities: Vec::new(),
             translator_revision: None,
         }
+    }
+
+    #[test]
+    fn dirty_set_marks_pages_and_coalesces_adjacent_ranges() {
+        let mut dirty = DirtySet::new(0x1000).expect("page size");
+        assert!(dirty.is_empty());
+        dirty.mark(0x40, 4).expect("mark inside the first page");
+        assert_eq!(dirty.ranges(), [(0, 0x1000)]);
+        // A write at the start of the next page coalesces with the first.
+        dirty.mark(0x1000, 8).expect("mark the second page");
+        assert_eq!(dirty.ranges(), [(0, 0x2000)]);
+        // A distant write stays separate.
+        dirty.mark(0x4000, 0x1000).expect("mark a far page");
+        assert_eq!(dirty.ranges(), [(0, 0x2000), (0x4000, 0x5000)]);
+        // A bridging write merges both neighbours into one extent.
+        dirty.mark(0x1800, 0x2800).expect("bridge the gap");
+        assert_eq!(dirty.ranges(), [(0, 0x5000)]);
+        // Zero-length marks are no-ops; a page size of zero is refused.
+        let before = dirty.ranges().to_vec();
+        dirty.mark(0x9000, 0).expect("zero length");
+        assert_eq!(dirty.ranges(), before.as_slice());
+        assert!(matches!(
+            DirtySet::new(0x3000),
+            Err(ContractError::InvalidHostRegionPageSize(0x3000))
+        ));
+    }
+
+    #[test]
+    fn dirty_set_derives_from_writebacks_in_order() {
+        let mut dirty = DirtySet::new(0x1000).expect("page size");
+        let writebacks = vec![
+            BufferWriteback {
+                view_id: ViewId::new(1),
+                allocation_id: AllocationId::new(9),
+                offset: 0x10,
+                bytes: vec![1; 4],
+            },
+            BufferWriteback {
+                view_id: ViewId::new(2),
+                allocation_id: AllocationId::new(9),
+                offset: 0x1010,
+                bytes: vec![2; 4],
+            },
+        ];
+        dirty.mark_writebacks(&writebacks).expect("mark");
+        assert_eq!(dirty.ranges(), [(0, 0x2000)]);
     }
 
     fn host_region(pointer: usize, length: u64, page_size: u64) -> HostRegion {
