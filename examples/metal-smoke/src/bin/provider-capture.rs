@@ -5,7 +5,8 @@ use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
     DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, OperationId,
     PipelineCompileRequest, PipelineProvider, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    ViewId, PROVIDER_SCHEMA_VERSION,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(target_os = "macos")]
@@ -130,10 +131,27 @@ struct Case {
     air: Source,
     metal: Source,
     buffers: Vec<Buffer>,
+    /// Sampled textures bound by every pass of the case (v11 and later).
+    /// `research/docs/18` step 1.
+    #[serde(default)]
+    textures: Vec<Texture>,
     expected_writebacks: Vec<Writeback>,
     dispatches: Option<Vec<CaseDispatch>>,
     programs: Option<Vec<CaseProgram>>,
     command_buffers: Option<Vec<Vec<usize>>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Texture {
+    binding: u32,
+    allocation: u64,
+    view: u64,
+    width: u64,
+    height: u64,
+    format: String,
+    access: String,
+    initial_hex: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -511,6 +529,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "subset_chain_eight",
         ],
         (1, "compute-buffer-v10") => &["alias_disjoint_pair", "alias_disjoint_pair_reversed"],
+        (1, "compute-buffer-v11") => &["sampled_texture_first_texel"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -612,6 +631,31 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 || unhex(&expected.bytes_hex)?.len() as u64 != buffer.length
             {
                 return Err("expected result identity/range mismatch".into());
+            }
+        }
+        // v11 texture section: every texture carries its full tightly packed
+        // image, and each one names a distinct allocation the provider can
+        // resolve.
+        let mut texture_bindings = BTreeSet::new();
+        let mut texture_allocations = BTreeSet::new();
+        for texture in &case.textures {
+            if !texture_bindings.insert(texture.binding) {
+                return Err(format!("duplicate texture binding in {}", case.id).into());
+            }
+            if !texture_allocations.insert(texture.allocation) {
+                return Err(format!("duplicate texture allocation in {}", case.id).into());
+            }
+            let expected = texture
+                .width
+                .checked_mul(texture.height)
+                .and_then(|extent| extent.checked_mul(4))
+                .ok_or("texture extent overflows")?;
+            if unhex(&texture.initial_hex)?.len() as u64 != expected {
+                return Err(format!(
+                    "texture initial data length differs from declared extent in {}",
+                    case.id
+                )
+                .into());
             }
         }
     }
@@ -730,6 +774,12 @@ fn merge_writebacks(
 
 fn validate_program(program: &CaseProgram) -> Result<()> {
     let (air_path, air_hash, metal_path, metal_hash) = match program.entry.as_str() {
+        "read_texture_2d" => (
+            "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
+            "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb",
+            "shaders/read_texture_2d.metal",
+            "06b69d02aa0b70a6a326c2df966cc4466bf2fc4c2ed045adc15e4e9719a451ac",
+        ),
         "copy_word" => (
             "../examples/metal-smoke/shaders/kernel_copy_word.ll",
             "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99",
@@ -872,6 +922,14 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         )
     };
     Ok(match id {
+        // v11: the texture case binds a sampled texture plus one write-only
+        // output buffer; textures are validated by the texture section.
+        "sampled_texture_first_texel" => (
+            "read_texture_2d",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "write", 64)][..],
+        ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds
         // the source above the destination so an offset mix-up cannot pass.
@@ -1140,6 +1198,7 @@ fn case_trace(
     case: &Case,
     operation: u64,
     views: &[BufferView],
+    textures: &[TextureView],
     dispatches: &[CaseDispatch],
 ) -> Result<ComputeTrace> {
     let passes = dispatches
@@ -1191,7 +1250,7 @@ fn case_trace(
                     grid: dispatch.grid,
                     threads_per_threadgroup: dispatch.local,
                 },
-                textures: Vec::new(),
+                textures: textures.to_vec(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1281,6 +1340,19 @@ fn run_object_case(
             u32::try_from(dimensions[2])?,
         )?)
     };
+    // v11: sampled textures become object-API Texture handles, bound by the
+    // same Metal argument index as the AIR fixture declares.
+    let mut object_textures = BTreeMap::new();
+    for texture in &case.textures {
+        let initial = unhex(&texture.initial_hex)?;
+        let created = device.new_texture_with_bytes(
+            TextureFormat::R32Uint,
+            texture.width,
+            texture.height,
+            initial,
+        )?;
+        object_textures.insert(texture.binding, created);
+    }
     let mut reported = Vec::new();
     // Each command buffer commits and completes before the next one records,
     // which matches Metal's serial queue boundary and re-snapshots the landed
@@ -1295,7 +1367,11 @@ fn run_object_case(
                 .get(*index)
                 .ok_or("command buffer dispatch index out of range")?;
             encoder.clear_buffers()?;
+            encoder.clear_textures()?;
             encoder.set_compute_pipeline_state(&programs[dispatch.program.unwrap_or(0)])?;
+            for (binding, texture) in &object_textures {
+                encoder.set_texture(*binding, texture)?;
+            }
             let slots = selected_slots(case, dispatch);
             let views = dispatch
                 .bindings
@@ -1405,6 +1481,42 @@ fn run_case(
         }
         allocations[position].1[start..start + initial.len()].copy_from_slice(&initial);
     }
+    // v11: sampled textures are their own allocations; the provider uploads
+    // them once per submission (`research/docs/18` step 1).
+    let mut case_textures = Vec::with_capacity(case.textures.len());
+    for texture in &case.textures {
+        let initial = unhex(&texture.initial_hex)?;
+        if recorded.insert(texture.allocation) {
+            resources.insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(texture.allocation),
+                owner_epoch: provider.device_epoch(),
+                size: u64::try_from(initial.len())?,
+            })?;
+        }
+        let access = match texture.access.as_str() {
+            "sampled" => TextureAccess::Sampled,
+            "storage" => TextureAccess::Storage,
+            _ => return Err("unsupported texture access".into()),
+        };
+        let format = match texture.format.as_str() {
+            "r32_uint" => TextureFormat::R32Uint,
+            _ => return Err("unsupported texture format".into()),
+        };
+        case_textures.push(TextureView {
+            view_id: ViewId::new(texture.view),
+            metal_binding: texture.binding,
+            allocation_id: AllocationId::new(texture.allocation),
+            texture_type: TextureType::D2,
+            format,
+            width: texture.width,
+            height: texture.height,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access,
+            source: TextureSource::OwnedBytes(initial),
+        });
+    }
     // Every command buffer snapshots the bytes landed so far, so a later
     // command reads what an earlier command wrote.
     let case_views = |allocations: &[(u64, Vec<u8>)]| -> Result<Vec<BufferView>> {
@@ -1446,6 +1558,7 @@ fn run_case(
         case,
         operation,
         &initial_views,
+        &case_textures,
         &dispatches,
     )?;
     if case.entry == "transform_3d" {
@@ -1531,6 +1644,7 @@ fn run_case(
             case,
             trace_operation,
             &views,
+            &case_textures,
             &selected,
         )?;
         let admitted = provider
@@ -2043,6 +2157,7 @@ mod tests {
                 case,
                 1,
                 &views,
+                &[],
                 &dispatch_sequence(case),
             )
             .unwrap();
@@ -2082,6 +2197,7 @@ mod tests {
                 case,
                 1,
                 &views,
+                &[],
                 &dispatch_sequence(case)
             )
             .is_err());

@@ -2903,8 +2903,13 @@ impl ExecutionResources {
                             candidate.metal_index == binding.metal_index
                                 && candidate.key.kind == PoolKind::Texture
                         })
-                        .expect("validated pass binding")
-                        .key;
+                        .map(|candidate| candidate.key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "pass binds no texture at Metal index {}; bindings={:?}",
+                                binding.metal_index, dispatch.bindings
+                            ))
+                        })?;
                     let texture = self
                         .textures
                         .iter()

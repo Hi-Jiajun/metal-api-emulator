@@ -100,6 +100,31 @@ def _suite_plan(suite):
         _require(air_encoding in ("text", "raw", "wrapped"),
                  f"{where}: unknown air_encoding")
         allocations, views, initial_ranges, bindings = {}, {}, {}, set()
+        # v11 adds a sampled-texture section: textures are their own
+        # allocations and the provider uploads each one once, so the count
+        # contract has to account for them (`research/docs/18` step 3).
+        textures = _list(case.get("textures", []), f"{where}.textures")
+        texture_allocations = set()
+        for texture in textures:
+            _require(isinstance(texture, dict), f"{where}: texture must be an object")
+            allocation = _integer(texture.get("allocation"), f"{where}.texture.allocation")
+            view = _integer(texture.get("view"), f"{where}.texture.view")
+            binding = _integer(texture.get("binding"), f"{where}.texture.binding")
+            width = _integer(texture.get("width"), f"{where}.texture.width", 1)
+            height = _integer(texture.get("height"), f"{where}.texture.height", 1)
+            _require(texture.get("format") == "r32_uint",
+                     f"{where}: unknown texture format")
+            _require(texture.get("access") in ("sampled", "storage"),
+                     f"{where}: unknown texture access")
+            _require(allocation not in texture_allocations,
+                     f"{where}: duplicate texture allocation {allocation}")
+            _require(view not in views and binding not in bindings,
+                     f"{where}: duplicate view or binding")
+            initial = _hex(texture.get("initial_hex"),
+                           f"{where} texture {allocation}.initial_hex")
+            _require(len(initial) == width * height * 4,
+                     f"{where}: texture initial length does not match its extent")
+            texture_allocations.add(allocation)
         buffers = _list(case.get("buffers"), f"{where}.buffers")
         _require(buffers, f"{where}: no buffers")
         _require(len(buffers) <= MAX_SERIAL_RESOURCES,
@@ -255,7 +280,7 @@ def _suite_plan(suite):
             written_views.add(view)
             writes.append((identity, data))
         _require(written_views == writable_views, f"{where}: expected writebacks do not cover writable views")
-        plan[case_id] = (writes, allocations)
+        plan[case_id] = (writes, allocations, len(texture_allocations))
     return plan
 
 
@@ -305,7 +330,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         seen.add(case_id)
         _require(result["completion"] == "CompletedVisible",
                  f"{where}: completion must be CompletedVisible, got {result['completion']!r}")
-        expected_writes, expected_allocations = plan[case_id]
+        expected_writes, expected_allocations, texture_count = plan[case_id]
         actual_writes, identities = [], set()
         for value in _list(result["writebacks"], f"{where}.writebacks"):
             identity, data = _writeback(value, f"{where} writeback")
@@ -344,7 +369,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         # with a single submission (research/docs/15 §5).
         single_submission = "command_buffers" not in cases.get(case_id, {})
         if provider_backend and single_submission and counts[0] is not None:
-            expected_in = len(expected_allocations)
+            expected_in = len(expected_allocations) + texture_count
             expected_out = len({identity[0] for identity, _ in expected_writes})
             _require(counts[0] == expected_in,
                      f"{where}: copy_in {counts[0]} does not match {expected_in} "

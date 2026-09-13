@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v11",
+  "guard_byte": 0,
+  "cases": [
+    {
+      "id": "sampled_texture_first_texel",
+      "entry": "read_texture_2d",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_read_texture_2d.ll",
+        "sha256": "f730b65c08538d14f902e8a51eb6c99154013584a6b45a74d1a8dd3bedfbdceb"
+      },
+      "metal": {
+        "path": "shaders/read_texture_2d.metal",
+        "sha256": "06b69d02aa0b70a6a326c2df966cc4466bf2fc4c2ed045adc15e4e9719a451ac"
+      },
+      "textures": [
+        {
+          "binding": 0,
+          "allocation": 700,
+          "view": 710,
+          "width": 4,
+          "height": 4,
+          "format": "r32_uint",
+          "access": "sampled",
+          "initial_hex": "000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000"
+        }
+      ],
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "length": 64,
+          "allocation_size": 72,
+          "access": "write",
+          "initial_hex": "ffffffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "bytes_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ]
+}
