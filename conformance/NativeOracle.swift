@@ -251,6 +251,7 @@ private struct Options {
     let validateOnly: Bool
     let probe: Bool
     let renderSelfTest: Bool
+    let presentSelfTest: Bool
 }
 
 private let usage = """
@@ -258,6 +259,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --suite PATH --validate-suite
        native-metal-oracle --probe
        native-metal-oracle --render-selftest
+       native-metal-oracle --present-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -272,6 +274,12 @@ fixture, resolved relative to the current working directory, and prints the
 observed attachment bytes as JSON. It fails unless all four texels read back as
 the reviewed fragment output rather than the clear sentinel, and it cannot be
 combined with other options.
+--present-selftest needs no suite: it captures the reviewed 2x2 present
+equivalent, resolving the same module relative to the current working
+directory. The present target is preset with the fefefefe sentinel, the
+reviewed fragment draws over it, and the report fails unless all four texels
+read back as the fragment output rather than the sentinel. It cannot be
+combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -281,6 +289,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var validateOnly = false
     var probe = false
     var renderSelfTest = false
+    var presentSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -310,19 +319,31 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!renderSelfTest, "Duplicate --render-selftest option")
             renderSelfTest = true
             index += 1
+        case "--present-selftest":
+            try require(!presentSelfTest, "Duplicate --present-selftest option")
+            presentSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, or --render-selftest")
-        return Options(suite: nil, output: nil, validateOnly: false, probe: true, renderSelfTest: false)
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, or --present-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: true,
+                       renderSelfTest: false, presentSelfTest: false)
     }
     if renderSelfTest {
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, or --present-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: true, presentSelfTest: false)
+    }
+    if presentSelfTest {
         try require(suite == nil && output == nil && !validateOnly,
-                    "--render-selftest cannot be combined with --suite, --output, or --validate-suite")
-        return Options(suite: nil, output: nil, validateOnly: false, probe: false, renderSelfTest: true)
+                    "--present-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -331,7 +352,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
                     "Output already exists: \(outputURL.path)")
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
-                   renderSelfTest: false)
+                   renderSelfTest: false, presentSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -1353,6 +1374,50 @@ private func renderSelfTest() throws -> CaseResult {
     return try runRenderCase(fixture, device: device, queue: queue)
 }
 
+/// The present milestone's own fixture, constructed in code.
+///
+/// This is the byte-level present equivalent the Swift oracle can express
+/// (`research/docs/24` §5.1, §6 Step 7): the present target is a 2x2
+/// `rgba8Unorm` texture preset with the `fefefefe` sentinel, the reviewed
+/// fragment draws over it through a `Load` (keeping the sentinel as the
+/// previous contents), and the readback has to be the fragment's
+/// `40 80 c0 ff` texel rather than the sentinel. The acquire/present counts
+/// are provider-only observations (§5.1, §5.3), so the oracle reports the same
+/// `writebacks`/`allocations` shape the render self-test does and leaves the
+/// count assertion to the provider backend.
+@available(macOS 11.0, *)
+private func presentSelfTest() throws -> CaseResult {
+    let reviewed = reviewedRenderModule()
+    // The sentinel is one texel replicated across the 2x2 target, exactly as
+    // `InitialState::Sentinel` presets the whole present target.
+    let sentinel = Data(repeating: 0xfe, count: 16)
+    let definition = RenderCaseDefinition(
+        id: "present_offscreen_2x2",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        vertices: 3,
+        viewport: [0, 0, 2, 2],
+        attachment: RenderAttachmentDefinition(
+            allocation: 900, view: 910, format: "rgba8_unorm",
+            width: 2, height: 2, load: "load", store: "store",
+            clear_hex: nil, initial_hex: hex(sentinel)),
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff")
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fixture = try validateRenderCase(definition, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the present self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native present self-test: device=\(device.name) platform=\(eligibility.platform)")
+    return try runRenderCase(fixture, device: device, queue: queue)
+}
+
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -1448,6 +1513,14 @@ do {
         // reported bytes are the evidence: four `40 80 c0 ff` texels, never the
         // `fe` clear sentinel the pass started from.
         let result = try renderSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.presentSelfTest {
+        // The present equivalent's one-device check: the reported bytes are the
+        // evidence, four `40 80 c0 ff` texels, never the `fe` sentinel the
+        // target was preset with (`research/docs/24` §6 Step 7).
+        let result = try presentSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

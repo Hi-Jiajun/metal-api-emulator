@@ -119,5 +119,60 @@ class NativeCaptureFlowTests(unittest.TestCase):
         self.assertEqual((self.output / "prior.json").read_text(), "keep")
 
 
+class PresentSelftestValidationTests(unittest.TestCase):
+    """The CI step's present-selftest byte comparison, exercised without Metal.
+
+    `run_native.validate_present_selftest` is the function the workflow reuses,
+    so the sentinel rule is pinned here rather than only in the inline heredoc.
+    """
+
+    TARGET = "4080c0ff" * 4
+    SENTINEL = "fefefefe" * 4
+
+    def reviewed_report(self, writeback_bytes=None, allocation_bytes=None, completion="CompletedVisible"):
+        return {
+            "completion": completion,
+            "writebacks": [{"bytes_hex": writeback_bytes}],
+            "allocations": [{"bytes_hex": allocation_bytes}],
+        }
+
+    def test_accepts_the_reviewed_present_target(self):
+        report = self.reviewed_report(self.TARGET, self.TARGET)
+        self.assertEqual(run_native.validate_present_selftest(report), [self.TARGET, self.TARGET])
+
+    def test_rejects_the_sentinel_in_either_channel(self):
+        for writeback, allocation in (
+            (self.SENTINEL, self.TARGET),
+            (self.TARGET, self.SENTINEL),
+            (self.SENTINEL, self.SENTINEL),
+        ):
+            with self.subTest(writeback=writeback, allocation=allocation):
+                report = self.reviewed_report(writeback, allocation)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_present_selftest(report)
+
+    def test_rejects_a_missing_or_extra_observation(self):
+        for writebacks, allocations in (
+            ([], []),
+            ([{"bytes_hex": self.TARGET}], []),
+            ([], [{"bytes_hex": self.TARGET}]),
+            ([{"bytes_hex": self.TARGET}] * 2, [{"bytes_hex": self.TARGET}]),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=allocations):
+                report = {"completion": "CompletedVisible",
+                          "writebacks": writebacks, "allocations": allocations}
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_present_selftest(report)
+
+    def test_rejects_a_non_visible_completion(self):
+        report = self.reviewed_report(self.TARGET, self.TARGET, completion="Submitted")
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_present_selftest(report)
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_present_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()
