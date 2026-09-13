@@ -1,4 +1,4 @@
-// Capture native Metal observations for the bounded compute-buffer-v1 through v9 suites.
+// Capture native Metal observations for the bounded compute-buffer-v1 through v10 suites.
 // Build on macOS with Swift 5 language mode and link Foundation, Metal,
 // CoreGraphics, and CryptoKit. This file does not implement ComputeProvider.
 import Foundation
@@ -351,7 +351,8 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     }
     switch definition.id {
-    case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong":
+    case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
+         "alias_disjoint_pair", "alias_disjoint_pair_reversed":
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "copy_word: unsupported entry or dispatch shape")
