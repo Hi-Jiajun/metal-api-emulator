@@ -1,0 +1,34 @@
+; 本文件是 solid_rgba8.frag.spv 的可读源，由渲染轨道 include_bytes! 内嵌
+; （crates/metal-api-vulkan/src/render.rs）。复现命令：
+;   spirv-as --target-env vulkan1.0 solid_rgba8.frag.spvasm -o solid_rgba8.frag.spv
+; 来源：/var/tmp/render-probe/shaders/solid_rgba8.frag.spvasm（linear/optimal 附件探针）。
+; 片元着色器：写固定颜色 (64/255, 128/255, 192/255, 1.0)
+; 取"字节值本身 / 255"而不是 0.25/0.5/0.75，是为了避开 f*255 落在半整数上的 tie
+; （0.5*255 = 127.5 的 tie-break 实现相关，见 --tie-probe）。
+; 8-bit UNORM 附件上的期望字节 = 40 80 c0 ff（round(f*255)，f 离整数 ≥3.7e-6）
+; 16-bit 半浮点附着上的期望字节 = 04 34 04 38 06 3a 00 3c
+               OpCapability Shader
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %outColor
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "main"
+               OpName %outColor "outColor"
+               OpDecorate %outColor Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+   %outColor = OpVariable %_ptr_Output_v4float Output
+  %byte_64 = OpConstant %float 0.250980407
+  %byte_128 = OpConstant %float 0.501960814
+  %byte_192 = OpConstant %float 0.752941191
+    %float_1 = OpConstant %float 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+        %col = OpCompositeConstruct %v4float %byte_64 %byte_128 %byte_192 %float_1
+               OpStore %outColor %col
+               OpReturn
+               OpFunctionEnd

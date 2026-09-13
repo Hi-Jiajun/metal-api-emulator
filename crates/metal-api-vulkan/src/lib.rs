@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 mod compute_provider;
 mod provider;
+mod render;
 
 pub use compute_provider::{CompiledComputePipeline, VulkanComputeProvider};
 
@@ -390,6 +391,10 @@ fn select_queue_for_submission(
 pub(crate) struct VulkanContext {
     entry: ManuallyDrop<Entry>,
     instance: Instance,
+    /// The physical device `device` was created from. Kept so the render rail
+    /// can query format and queue-family properties without a second
+    /// enumeration (`research/docs/23` §6 Step 3b).
+    physical: vk::PhysicalDevice,
     device: AshDevice,
     external_memory_host: Option<ExternalMemoryHost>,
     queue_families: Vec<u32>,
@@ -563,6 +568,7 @@ impl VulkanContext {
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
+            physical,
             device,
             external_memory_host,
             queue_families,
@@ -1732,6 +1738,86 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
     Ok(())
 }
 
+/// Create a `VkImage` and bind allocated memory of a requested property class.
+///
+/// The sampled-texture rail and the render-attachment rail need the same four
+/// steps (create image, read its memory requirements, pick a satisfying type,
+/// allocate and bind); only the `VkImageCreateInfo` and the property class
+/// differ. Keeping the sequence in one place means a new image-backed resource
+/// cannot forget the memory-type check or leave a half-created image behind on
+/// failure (`research/docs/23` §6 Step 3b).
+///
+/// On failure the image and memory created so far are destroyed here, so a
+/// caller only has to clean up what it created before this call.
+fn allocate_image_backing(
+    context: &VulkanContext,
+    info: &vk::ImageCreateInfo,
+    properties: vk::MemoryPropertyFlags,
+    what: &str,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::MemoryRequirements), ExecutionFailure> {
+    let image = unsafe { context.device.create_image(info, None) }.map_err(|error| {
+        ExecutionFailure::vulkan(error, format!("create {what} image: {error}"))
+    })?;
+    let requirements = unsafe { context.device.get_image_memory_requirements(image) };
+    let memory_type = match context.memory_type(requirements.memory_type_bits, properties) {
+        Ok(index) => index,
+        Err(error) => {
+            unsafe { context.device.destroy_image(image, None) };
+            return Err(error.into());
+        }
+    };
+    let allocation = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { context.device.destroy_image(image, None) };
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("allocate {what} memory: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = unsafe { context.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            context.device.destroy_image(image, None);
+            context.device.free_memory(memory, None);
+        }
+        return Err(ExecutionFailure::vulkan(
+            error,
+            format!("bind {what} memory: {error}"),
+        ));
+    }
+    Ok((image, memory, requirements))
+}
+
+/// Create the single-mip, single-layer 2D colour view over `image`.
+///
+/// Shared by the sampled-texture rail and the render-attachment rail; the
+/// aspect mask is `COLOR` for both because neither admits a depth/stencil or
+/// plane-disjoint format (`research/docs/23` §3.3).
+fn create_color_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { context.device.create_image_view(&info, None) }
+        .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
+}
+
 fn validate_pipeline_reflection(
     requested_entry: &str,
     reflection: &ShaderReflection,
@@ -2656,46 +2742,12 @@ impl ExecutionResources {
                 .usage(vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::PREINITIALIZED);
-            let image = unsafe { self.context.device.create_image(&image_info, None) }.map_err(
-                |error| ExecutionFailure::vulkan(error, format!("create texture image: {error}")),
-            )?;
-            let destroy_image = |resources: &Self| unsafe {
-                resources.context.device.destroy_image(image, None);
-            };
-            let requirements = unsafe { self.context.device.get_image_memory_requirements(image) };
-            let memory_type = match self.context.memory_type(
-                requirements.memory_type_bits,
+            let (image, memory, requirements) = allocate_image_backing(
+                &self.context,
+                &image_info,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            ) {
-                Ok(index) => index,
-                Err(error) => {
-                    destroy_image(self);
-                    return Err(error.into());
-                }
-            };
-            let allocation = vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type);
-            let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-                Ok(memory) => memory,
-                Err(error) => {
-                    destroy_image(self);
-                    return Err(ExecutionFailure::vulkan(
-                        error,
-                        format!("allocate texture memory: {error}"),
-                    ));
-                }
-            };
-            if let Err(error) = unsafe { self.context.device.bind_image_memory(image, memory, 0) } {
-                unsafe {
-                    destroy_image(self);
-                    self.context.device.free_memory(memory, None);
-                }
-                return Err(ExecutionFailure::vulkan(
-                    error,
-                    format!("bind texture memory: {error}"),
-                ));
-            }
+                "texture",
+            )?;
             let mapped = match unsafe {
                 self.context.device.map_memory(
                     memory,
@@ -2707,7 +2759,7 @@ impl ExecutionResources {
                 Ok(mapped) => mapped,
                 Err(error) => {
                     unsafe {
-                        destroy_image(self);
+                        self.context.device.destroy_image(image, None);
                         self.context.device.free_memory(memory, None);
                     }
                     return Err(ExecutionFailure::vulkan(
@@ -2773,28 +2825,19 @@ impl ExecutionResources {
                 }
             }
             unsafe { self.context.device.unmap_memory(memory) };
-            let view_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(vk::Format::R32_UINT)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            let view = match unsafe { self.context.device.create_image_view(&view_info, None) } {
+            let view = match create_color_image_view(
+                &self.context,
+                image,
+                vk::Format::R32_UINT,
+                "texture",
+            ) {
                 Ok(view) => view,
                 Err(error) => {
                     unsafe {
-                        destroy_image(self);
+                        self.context.device.destroy_image(image, None);
                         self.context.device.free_memory(memory, None);
                     }
-                    return Err(ExecutionFailure::vulkan(
-                        error,
-                        format!("create texture view: {error}"),
-                    ));
+                    return Err(error);
                 }
             };
             let sampler_info = vk::SamplerCreateInfo::default()
@@ -2809,7 +2852,7 @@ impl ExecutionResources {
                 Err(error) => {
                     unsafe {
                         self.context.device.destroy_image_view(view, None);
-                        destroy_image(self);
+                        self.context.device.destroy_image(image, None);
                         self.context.device.free_memory(memory, None);
                     }
                     return Err(ExecutionFailure::vulkan(
