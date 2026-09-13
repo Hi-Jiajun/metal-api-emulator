@@ -3472,6 +3472,10 @@ mod tests {
                     shader_capabilities: Vec::new(),
                     translator_revision: None,
                 },
+                // A fixture compute pipeline carries the compute half only; a
+                // render pass's entry is the one `register_render_pipeline`
+                // hands back, and that one carries the render half.
+                render: None,
             })
             .collect()
     }

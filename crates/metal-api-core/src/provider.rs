@@ -927,7 +927,24 @@ pub struct CompiledComputePipeline {
     pub device_epoch: DeviceEpoch,
     pub pipeline_id: PipelineId,
     pub function: FunctionIdentity,
+    /// The compute half of the registration, as before.
     pub contract: PipelineContract,
+    /// The render half, when this registration compiles the two stages a
+    /// [`RenderPassDescriptor`] names.
+    ///
+    /// Carrying it in the table entry is what lets core admission compare an
+    /// attachment with the pipeline the pass names (review item I3,
+    /// 2026-09-14). Before this field existed the trace could not say what a
+    /// render pass would render with, so the `color_format` agreement was
+    /// checked by each provider against its own registry — a lookup core cannot
+    /// perform for a caller-supplied table.
+    ///
+    /// `None` means "this entry carries the compute half only", which is the
+    /// pre-render entry every compute registration mints and the only shape the
+    /// `SUBMIT_REQUEST` (`0x03`) wire layout can express. Both halves stay
+    /// independent: a compute pass naming an entry that also renders is that
+    /// provider's registry question, not a core rule (`docs/23` §4.1).
+    pub render: Option<RenderPipelineContract>,
 }
 
 impl PipelineContract {
@@ -2732,6 +2749,9 @@ pub fn trace_from_trusted_snapshot(
             pipeline_id: pipeline.pipeline_id,
             function: pipeline.function,
             contract: pipeline.pipeline_contract,
+            // One owner-side submission carries a compute pipeline, and the
+            // pre-render entry shape is the compute half only.
+            render: None,
         }],
         encoder_dispatch_type: DispatchType::Serial,
         passes: vec![TracePass::Compute(ComputePass {
@@ -2966,6 +2986,12 @@ impl ComputeTrace {
             }
             pipeline.function.validate()?;
             pipeline.contract.validate()?;
+            // The render half is validated wherever it is carried. Its
+            // agreement with a render pass stays admission's job: a table entry
+            // may carry one that only a compute pass names.
+            if let Some(render) = &pipeline.render {
+                render.validate()?;
+            }
         }
         for pass in &self.passes {
             match pass {
@@ -3917,7 +3943,16 @@ impl ProviderCapabilities {
     /// defaults refuses every render-bearing trace with
     /// `render_passes_unsupported`; a compute-only trace never enters the loop
     /// body. When a provider does declare render support, the same walk
-    /// enforces the attachment count, dimension and format bits.
+    /// enforces the attachment count, dimension and format bits and then the
+    /// agreement between the pass and the pipeline it names.
+    ///
+    /// The order is deliberate (review items I3/I4, 2026-09-14): the
+    /// capability bits a snapshot can answer on its own come first, so a
+    /// provider that cannot render at all never reports a contract detail about
+    /// work it would not execute. Only then is the named table entry read, and
+    /// only then is its render half compared with the pass. That is the first
+    /// gate that can check "this attachment format is the pipeline's own"
+    /// without a provider registry.
     fn admit_render_passes(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
         let render_pass_count = trace.render_passes().count();
         if render_pass_count == 0 {
@@ -3927,7 +3962,10 @@ impl ProviderCapabilities {
             return Err(capability_error("render_passes_unsupported")
                 .with_field("passes", FieldValue::Unsigned(render_pass_count as u64)));
         }
-        for pass in trace.render_passes() {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(pass) = entry.as_render() else {
+                continue;
+            };
             if pass.color_attachments.len() > self.max_color_attachments as usize {
                 return Err(capability_error("color_attachment_limit")
                     .with_field(
@@ -3964,6 +4002,25 @@ impl ProviderCapabilities {
                         ));
                 }
             }
+            // The pass's own shape rules are already `trace.validate()`'s job,
+            // which ran before this gate. What is added here is the agreement
+            // only the table entry can answer: the pass names a
+            // `PipelineId`, so an entry without a render half leaves the
+            // comparison without a format, and an entry whose render half
+            // disagrees with the attachment is refused as a caller-fixable
+            // trace shape rather than left to a provider registry.
+            let pipeline = trace
+                .pipeline(pass.pipeline)
+                .map_err(contract_error_refusal)?;
+            let render = pipeline.render.as_ref().ok_or_else(|| {
+                contract_error_refusal(ContractError::MissingRenderPipelineContract {
+                    pass_index,
+                    pipeline: pass.pipeline,
+                })
+            })?;
+            render
+                .validate_against(pass)
+                .map_err(contract_error_refusal)?;
         }
         Ok(())
     }
@@ -4165,6 +4222,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::EmptyRenderPipelineEntry(_)
         | E::DuplicateRenderPipelineEntry(_)
         | E::RenderPipelineFormatMismatch { .. }
+        | E::MissingRenderPipelineContract { .. }
         | E::DispatchKindMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
@@ -4994,6 +5052,17 @@ pub enum ContractError {
         pipeline: AttachmentFormat,
         attachment: AttachmentFormat,
     },
+    /// A render pass names a table entry that carries no render half, so the
+    /// trace cannot say what the pass would render with.
+    ///
+    /// Kept distinct from [`Self::UnknownPipeline`]: the id exists and the
+    /// entry is well formed, it simply has no `color_format` to agree with, and
+    /// reusing the unknown-id variant would name a pipeline the trace does
+    /// carry.
+    MissingRenderPipelineContract {
+        pass_index: usize,
+        pipeline: PipelineId,
+    },
     // Render contract, Step 3c (`research/docs/23` §3.6): an attachment is
     // resolved against the trace's own resource table, so these refusals name
     // both the attachment's trace entry and the declaration it disagreed with.
@@ -5252,6 +5321,13 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "render pipeline colour format {pipeline:?} does not match attachment format {attachment:?}"
+            ),
+            Self::MissingRenderPipelineContract {
+                pass_index,
+                pipeline,
+            } => write!(
+                formatter,
+                "render pass {pass_index} names pipeline {pipeline:?}, but that entry carries no render contract to render with"
             ),
             Self::AttachmentViewUnknown {
                 pass_index,
@@ -6095,6 +6171,7 @@ mod tests {
                     source: request.source.kind(),
                 },
                 contract: trace(Vec::new()).pipelines[0].contract.clone(),
+                render: None,
             };
             *self.registered.lock().unwrap() = Some(metadata.clone());
             Ok(metadata)
@@ -6212,6 +6289,9 @@ mod tests {
                     shader_capabilities: Vec::new(),
                     translator_revision: None,
                 },
+                // A compute registration has no render half; a render-bearing
+                // fixture declares one on the entry its render pass names.
+                render: None,
             }],
             encoder_dispatch_type: DispatchType::Serial,
             passes: passes.into_iter().map(TracePass::Compute).collect(),
@@ -6326,6 +6406,122 @@ mod tests {
             render.admit(&value, &resources).unwrap_err().slug,
             "color_attachment_limit"
         );
+    }
+
+    // Render contract, review item I3 (2026-09-14). The render half of a
+    // registration travels in the trace's pipeline table, so core admission
+    // compares an attachment with the pipeline the pass names instead of
+    // leaving that agreement to each provider's own registry lookup.
+
+    /// Give the trace's table entry the render half the render pass names.
+    fn declare_render_contract(value: &mut ComputeTrace) {
+        value.pipelines[0].render = Some(render_pipeline_contract());
+    }
+
+    fn render_entry(value: &mut ComputeTrace) -> &mut RenderPassDescriptor {
+        value
+            .passes
+            .iter_mut()
+            .find_map(|pass| match pass {
+                TracePass::Render(pass) => Some(pass),
+                TracePass::Compute(_) => None,
+            })
+            .expect("the fixture carries a render pass")
+    }
+
+    #[test]
+    fn render_admission_compares_the_attachment_with_the_named_pipeline() {
+        // The control: the attachment carries the colour format the named
+        // pipeline was compiled for, so core admission admits the trace.
+        let mut agreeing = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        declare_render_contract(&mut agreeing);
+        render_capabilities()
+            .admit(&agreeing, &landing_resources())
+            .expect("an attachment in the pipeline's own format is admitted");
+
+        // The counterpart: another admitted colour format is still not the
+        // format this pipeline's stages were compiled against, and the refusal
+        // now comes from core admission rather than from a provider registry.
+        let mut mismatched = agreeing.clone();
+        render_entry(&mut mismatched).color_attachments[0].format = AttachmentFormat::Bgra8Unorm;
+        let mut render = render_capabilities();
+        render.supported_color_formats =
+            vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm];
+        let refusal = render
+            .admit(&mismatched, &landing_resources())
+            .expect_err("a pipeline cannot render into a format it was not compiled for");
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.phase, ProviderPhase::Resolve);
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("does not match attachment format")),
+            "the refusal has to name both formats, got {:?}",
+            refusal.detail
+        );
+    }
+
+    #[test]
+    fn render_admission_refuses_an_entry_that_carries_no_render_contract() {
+        // A render pass names an id whose table entry only carries the compute
+        // half: nothing in the trace says what the pass would render with, so
+        // the trace is refused instead of falling back to a provider registry.
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        // The fixture builder declares the half; this case drops it again.
+        value.pipelines[0].render = None;
+        let expected = ContractError::MissingRenderPipelineContract {
+            pass_index: 1,
+            pipeline: PipelineId::new(4),
+        };
+        let refusal = render_capabilities()
+            .admit(&value, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        let detail = expected.to_string();
+        assert_eq!(refusal.detail.as_deref(), Some(detail.as_str()));
+    }
+
+    #[test]
+    fn render_admission_keeps_the_unknown_pipeline_refusal() {
+        // An id no table entry declares keeps its existing semantics: the
+        // structural lookup refuses it before any render agreement is asked.
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        declare_render_contract(&mut value);
+        render_entry(&mut value).pipeline = PipelineId::new(5);
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::UnknownPipeline(PipelineId::new(5)))
+        );
+        let refusal = render_capabilities()
+            .admit(&value, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("unknown pipeline")),
+            "the refusal has to keep the unknown-pipeline detail, got {:?}",
+            refusal.detail
+        );
+    }
+
+    #[test]
+    fn the_render_capability_gate_precedes_the_pipeline_agreement() {
+        // This snapshot declares no render support at all, so a render-bearing
+        // trace is refused by the capability bit even though its attachment
+        // format also disagrees with the pipeline: the gate a provider can
+        // answer without reading a pipeline has to stay first.
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        declare_render_contract(&mut value);
+        render_entry(&mut value).color_attachments[0].format = AttachmentFormat::Bgra8Unorm;
+        let refusal = capabilities().admit(&value, &resources()).unwrap_err();
+        assert_eq!(refusal.slug, "render_passes_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
     }
 
     fn ping_pong_trace() -> ComputeTrace {
@@ -9701,6 +9897,9 @@ mod tests {
         // `ComputePass::validate` compares each binding against its reflection,
         // so the pipeline contract carries the landing view's access.
         value.pipelines[0].contract.buffer_bindings[0].access = access;
+        // The render pass names entry 4, so the fixture carries that entry's
+        // render half the way a registered render pipeline's metadata does.
+        declare_render_contract(&mut value);
         value.passes.push(render_pass_into(attachment));
         value
     }
@@ -9723,6 +9922,7 @@ mod tests {
                 threads_per_threadgroup: [1, 1, 1],
             },
         }));
+        declare_render_contract(&mut value);
         value.passes.push(render_pass_into(attachment));
         value
     }
@@ -9763,6 +9963,11 @@ mod tests {
                     threads_per_threadgroup: [1, 1, 1],
                 },
             }));
+            if attach {
+                // The render entry names this pass's own pipeline, so the entry
+                // has to carry the render half the render pass resolves with.
+                pipeline.render = Some(render_pipeline_contract());
+            }
             value.pipelines.push(pipeline);
             if attach {
                 // The attachment's render entry names a registered pipeline too.

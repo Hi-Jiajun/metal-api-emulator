@@ -1214,14 +1214,16 @@ mod tests {
                 shader_capabilities: Vec::new(),
                 translator_revision: None,
             },
+            render: None,
         }
     }
 
     /// The trace-table entry a render registration hands back, minted the way
     /// `NativeMetalProvider::register_render_pipeline` mints it: the id the
-    /// render pass names, the reviewed vertex entry, and the most permissive
-    /// exact-thread contract, because nothing reads a render entry as a compute
-    /// contract.
+    /// render pass names, the reviewed vertex entry, the most permissive
+    /// exact-thread contract (nothing reads a render entry as a compute
+    /// contract) and the reviewed render contract in the `render` half core
+    /// admission compares the attachment against.
     fn render_table_entry() -> CompiledComputePipeline {
         CompiledComputePipeline {
             device_epoch: DeviceEpoch::new(3),
@@ -1241,6 +1243,12 @@ mod tests {
                 shader_capabilities: Vec::new(),
                 translator_revision: None,
             },
+            render: Some(RenderPipelineContract {
+                vertex_entry: VERTEX_ENTRY.to_owned(),
+                fragment_entry: FRAGMENT_ENTRY.to_owned(),
+                color_format: AttachmentFormat::Rgba8Unorm,
+                vertex_layout: VertexLayout::None,
+            }),
         }
     }
 
@@ -1299,6 +1307,23 @@ mod tests {
     /// The registrations `plan_trace` resolves the trace's pipeline ids against.
     fn milestone_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
         BTreeMap::from([(PipelineId::new(3), milestone_pipeline())])
+    }
+
+    /// The trace's table entry and the registry have to carry the same render
+    /// contract.
+    ///
+    /// The entry's `render` half is what core admission compares a pass against
+    /// (review item I3, 2026-09-14) and the registry is what the rail executes,
+    /// so a fixture where the two disagree would let a value-level test pass on
+    /// an agreement the provider would refuse at submit.
+    #[test]
+    fn the_render_table_entry_carries_the_registered_contract() {
+        let entry = render_table_entry();
+        let registered = milestone_contracts();
+        let contract = registered
+            .get(&entry.pipeline_id)
+            .expect("the registry holds the entry the render pass names");
+        assert_eq!(entry.render.as_ref(), Some(contract));
     }
 
     /// The step that flips the capability bit needs the declared bits and core

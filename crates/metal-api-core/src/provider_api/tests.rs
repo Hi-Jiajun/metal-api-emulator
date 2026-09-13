@@ -351,6 +351,7 @@ impl PipelineProvider for FakeProvider {
                 shader_capabilities: vec![],
                 translator_revision: None,
             },
+            render: None,
         };
         if self.mode.load(Ordering::SeqCst) == BAD_METADATA {
             metadata.function.entry_name = "wrong".into();

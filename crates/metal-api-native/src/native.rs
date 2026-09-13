@@ -472,6 +472,9 @@ impl PipelineProvider for NativeMetalProvider {
                     source: FunctionSource::MetalSource,
                 },
                 contract,
+                // A compute registration has no render half; a render pass
+                // naming this id is refused by core admission.
+                render: None,
             };
             state.pipelines.insert(
                 metadata.pipeline_id,
@@ -1304,6 +1307,10 @@ impl NativeMetalProvider {
             pipeline_id: PipelineId::new(next_id(&mut state.next_pipeline)?),
             function,
             contract: render_table_contract(),
+            // The half that makes this a render registration: core admission
+            // compares a render pass's attachment with this contract, and the
+            // render rail re-checks it against the registration below.
+            render: Some(request.contract.clone()),
         };
         self.render_pipelines()?.insert(
             metadata.pipeline_id,
@@ -1695,13 +1702,15 @@ fn render_contract_error(detail: String) -> ProviderError {
     .with_detail(detail)
 }
 
-/// The pipeline-table contract one render registration carries.
+/// The compute half of the pipeline-table entry one render registration carries.
 ///
 /// `ComputeTrace` has a single pipeline entry shape and core admission validates
 /// every entry's contract, so a render registration carries the most permissive
 /// exact-thread contract: no bindings, no push constants and no fixed grid.
 /// Nothing reads it as a compute contract — the compute rail resolves artifacts
-/// out of [`State::pipelines`], where a render registration does not exist.
+/// out of [`State::pipelines`], where a render registration does not exist. The
+/// entry's render half, which is what core admission compares a render pass
+/// against, is set by [`NativeMetalProvider::register_render_pipeline`].
 fn render_table_contract() -> PipelineContract {
     PipelineContract {
         dispatch_kind: DispatchKind::ThreadsExact,

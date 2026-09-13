@@ -504,6 +504,90 @@ fn the_same_trace_is_refused_when_the_provider_declares_no_render_support() {
     assert_eq!(refused.slug, "attachment_dimension_limit");
 }
 
+/// The registered entry is what core admission reads (review item I3,
+/// 2026-09-14).
+///
+/// The registration hands the owner the render half beside the compute half, so
+/// a trace's own table carries the colour format the stages were compiled for.
+/// The two halves of this test are the two ways a trace can get that wrong: an
+/// entry with no render half at all, and an entry whose render half names
+/// another admitted format. Both are refused by admission — before the provider
+/// reserves anything — and the third shape, the registered entry itself, keeps
+/// executing.
+#[test]
+fn admission_reads_the_render_contract_from_the_registered_entry() {
+    for format in ADMITTED_FORMATS {
+        let Some(fixture) = fixture(format) else {
+            return;
+        };
+        // The clone below keeps the table order, so one index serves both.
+        let render_entry = fixture
+            .trace
+            .pipelines
+            .iter()
+            .position(|pipeline| pipeline.pipeline_id == fixture.render_pipeline)
+            .expect("the fixture carries the registered render entry");
+        let registered = &fixture.trace.pipelines[render_entry];
+        assert_eq!(
+            registered
+                .render
+                .as_ref()
+                .map(|contract| contract.color_format),
+            Some(format),
+            "the registration hands the owner the half admission reads"
+        );
+
+        let mut dropped = fixture.trace.clone();
+        dropped.pipelines[render_entry].render = None;
+        let refused = admit_error(
+            &fixture.provider.capabilities(),
+            &dropped,
+            &fixture.resources,
+        );
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no render contract")),
+            "the refusal has to name the missing half, got {:?}",
+            refused.detail
+        );
+
+        let mut retargeted = fixture.trace.clone();
+        let other = ADMITTED_FORMATS
+            .into_iter()
+            .find(|candidate| *candidate != format)
+            .expect("the admitted set has more than one format");
+        retargeted.pipelines[render_entry]
+            .render
+            .as_mut()
+            .expect("the fixture entry carries the half")
+            .color_format = other;
+        let refused = admit_error(
+            &fixture.provider.capabilities(),
+            &retargeted,
+            &fixture.resources,
+        );
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("does not match attachment format")),
+            "the refusal has to name both formats, got {:?}",
+            refused.detail
+        );
+
+        // The registered entry as it was handed out still admits and runs.
+        assert_eq!(
+            attachment_readback(&fixture, &submit_fixture(&fixture)),
+            expected_texels(format).repeat(4)
+        );
+    }
+}
+
 fn without_render_bits(declared: &ProviderCapabilities) -> ProviderCapabilities {
     let mut capabilities = declared.clone();
     capabilities.supports_render_passes = false;

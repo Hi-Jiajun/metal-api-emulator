@@ -1419,10 +1419,11 @@ mod tests {
         LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
         PipelineId, PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass,
         ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-        RenderPassDescriptor, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-        StagedLease, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
-        TextureType, TextureView, TracePass, ValidatedComputeTrace, ViewId,
-        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, PROVIDER_SCHEMA_VERSION,
+        RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
+        SemanticDigest, ShaderSource, StagedLease, StoreOp, SubmissionId, TextureAccess,
+        TextureFormat, TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace,
+        VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
+        PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1470,6 +1471,9 @@ mod tests {
                     SemanticDigest::new("translator", b"v1".to_vec()).unwrap(),
                 ),
             },
+            // A compiled compute pipeline carries the compute half only; the
+            // render half belongs to a render registration's entry.
+            render: None,
         }
     }
 
@@ -1551,6 +1555,18 @@ mod tests {
         }
     }
 
+    /// The render half a render registration hands the owner: the entry pair
+    /// the render pass resolves against and the colour format both stages were
+    /// compiled for.
+    fn render_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: "full_screen_vertex".into(),
+            fragment_entry: "solid_color_fragment".into(),
+            color_format: AttachmentFormat::Rgba8Unorm,
+            vertex_layout: VertexLayout::None,
+        }
+    }
+
     fn render_pass_descriptor(
         compiled: &CompiledComputePipeline,
         width: u64,
@@ -1566,7 +1582,8 @@ mod tests {
 
     /// A trace whose only pass is a render pass.
     fn render_only_trace() -> ComputeTrace {
-        let compiled = pipeline(&compile_request());
+        let mut compiled = pipeline(&compile_request());
+        compiled.render = Some(render_contract());
         ComputeTrace {
             schema_version: PROVIDER_SCHEMA_VERSION,
             device_epoch: compiled.device_epoch,
@@ -1580,7 +1597,10 @@ mod tests {
 
     /// A trace that carries both shapes, in order.
     fn mixed_trace() -> ComputeTrace {
-        let compiled = pipeline(&compile_request());
+        let mut compiled = pipeline(&compile_request());
+        // The render entry names this very id, so the table entry has to carry
+        // the render half the pass resolves against.
+        compiled.render = Some(render_contract());
         let mut value = trace(&compiled);
         value
             .passes
@@ -1641,6 +1661,57 @@ mod tests {
     }
 
     #[test]
+    fn render_frames_carry_the_pipeline_render_contract() {
+        // The tagged layout carries the table entry's render half, so the trace
+        // an owner sends and the trace a provider decodes describe the same
+        // pipeline. Core admission on the provider side reads exactly this
+        // field to compare the attachment with the pipeline the pass names.
+        let request = CommandRequest::Submit {
+            trace: mixed_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x0f);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, request);
+        let CommandRequest::Submit {
+            trace: decoded_trace,
+            ..
+        } = &decoded
+        else {
+            panic!("a render submit decodes as a submit");
+        };
+        assert_eq!(
+            decoded_trace.pipelines[0].render.as_ref(),
+            Some(&render_contract()),
+            "the render half has to survive the round trip"
+        );
+
+        // The pre-render layout has no room for the render half, so a
+        // compute-only frame keeps producing the old bytes and decodes with
+        // `None`: an owner with nothing to render sends no render metadata.
+        let compute_only = CommandRequest::Submit {
+            trace: trace(&pipeline(&compile_request())),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&compute_only).unwrap();
+        assert_eq!(frame, LEGACY_SUBMIT_FRAME);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, compute_only);
+        let CommandRequest::Submit {
+            trace: legacy_trace,
+            ..
+        } = &decoded
+        else {
+            panic!("a compute submit decodes as a submit");
+        };
+        assert!(
+            legacy_trace.pipelines[0].render.is_none(),
+            "a pre-render frame carries no render half"
+        );
+    }
+
+    #[test]
     fn capability_frames_declare_render_bits_under_their_own_tag() {
         let legacy = CommandResponse::Capabilities {
             epoch: DeviceEpoch::new(7),
@@ -1692,6 +1763,18 @@ mod tests {
         assert!(matches!(
             CommandCodec::decode_request(&unknown).unwrap_err(),
             CodecError::UnknownPassTag(0x7e)
+        ));
+
+        // The pipeline table is a tagged list too: its entry kind sits right
+        // after the frame kind, the request tag, the schema version, the epoch,
+        // the operation id and the entry count.
+        let entry_kind = 4 + 1 + 4 + 1 + 2 + 8 + 8 + 8;
+        assert_eq!(frame[entry_kind], 0x01, "render pipeline entry tag");
+        let mut unknown_entry = frame.clone();
+        unknown_entry[entry_kind] = 0x7e;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown_entry).unwrap_err(),
+            CodecError::UnknownPipelineTag(0x7e)
         ));
 
         let mut oversize_attachments = frame.clone();

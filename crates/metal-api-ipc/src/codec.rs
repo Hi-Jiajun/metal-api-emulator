@@ -72,6 +72,7 @@ pub enum CodecError {
     ColorAttachmentCount { count: usize, maximum: usize },
     SupportedColorFormatCount { count: usize, maximum: usize },
     UnknownPassTag(u8),
+    UnknownPipelineTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
@@ -148,6 +149,9 @@ impl fmt::Display for CodecError {
             ),
             Self::UnknownPassTag(tag) => {
                 write!(formatter, "unknown trace pass tag {tag:#04x}")
+            }
+            Self::UnknownPipelineTag(tag) => {
+                write!(formatter, "unknown pipeline table entry tag {tag:#04x}")
             }
             Self::UnknownEnumValue { field, value } => {
                 write!(formatter, "unknown {field} value {value}")

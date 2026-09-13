@@ -321,6 +321,10 @@ impl VulkanComputeProvider {
                 },
             },
             contract,
+            // A compute registration has no render half: a render pass naming
+            // this id finds no render contract here and is refused by core
+            // admission.
+            render: None,
         };
         let registered = RegisteredPipeline {
             metadata: metadata.clone(),
@@ -347,10 +351,11 @@ impl VulkanComputeProvider {
     /// The table entry is a [`CompiledComputePipeline`] because that is the one
     /// entry shape `ComputeTrace` has today (`research/docs/23` §6 Step 4 grows
     /// it). It carries the registration's vertex entry as the function entry
-    /// name and an exact-thread contract that binds nothing, and it is
-    /// deliberately unreachable from the compute rail: a compute pass naming
-    /// this id finds no artifact in the compute registry and is refused as
-    /// `unknown_pipeline`.
+    /// name, an exact-thread contract that binds nothing, and the reviewed
+    /// contract in the entry's `render` half, which is what core admission
+    /// compares the pass's attachment against. It is deliberately unreachable
+    /// from the compute rail: a compute pass naming this id finds no artifact in
+    /// the compute registry and is refused as `unknown_pipeline`.
     pub fn register_render_pipeline(
         &self,
         request: RenderPipelineRequest,
@@ -387,6 +392,7 @@ impl VulkanComputeProvider {
             )?),
             function,
             contract: render_pipeline_table_contract(),
+            render: Some(stages.contract.clone()),
         };
         self.ensure_usable()?;
         let registered = Arc::new(RegisteredRenderPipeline {
@@ -1382,6 +1388,19 @@ fn validate_pipeline_identity(
             ProviderPhase::Resolve,
             ProviderErrorClass::Resource,
             "pipeline_contract_mismatch",
+        ));
+    }
+    // The render half is part of the registration too: a trace that carries a
+    // different (or absent) render contract would be admitted against a format
+    // this context did not compile the stages for, so it is refused here even
+    // though core admission already compares the pass with the entry
+    // (review item I3, 2026-09-14: core is the first gate, this is the
+    // registry's own).
+    if requested.render != metadata.render {
+        return Err(refusal(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Resource,
+            "render_pipeline_contract_mismatch",
         ));
     }
     Ok(())

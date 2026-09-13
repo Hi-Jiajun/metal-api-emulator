@@ -18,9 +18,9 @@ use metal_api_core::provider::{
     LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
     PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
     ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
-    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
-    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-    TracePass, ViewId, MAX_COLOR_ATTACHMENTS,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexLayout, ViewId, MAX_COLOR_ATTACHMENTS,
 };
 use std::io::{Read, Write};
 
@@ -87,6 +87,19 @@ const ERROR_RESPONSE: u8 = 0x7f;
 /// Pass discriminator inside the tagged trace layout.
 const PASS_KIND_COMPUTE: u8 = 0x00;
 const PASS_KIND_RENDER: u8 = 0x01;
+
+/// Pipeline-table discriminator inside the tagged trace layout.
+///
+/// The pipeline table carries one entry per registration, and the render half
+/// of an entry is what lets core admission compare an attachment with the
+/// pipeline the render pass names (review item I3, 2026-09-14). The
+/// discriminator is a value rather than an optional length prefix so an
+/// unknown tag is refused instead of being read as "no render half", exactly
+/// like [`PASS_KIND_COMPUTE`]. Only the tagged layout writes it: a
+/// compute-only trace keeps the pre-render pipeline bytes, so
+/// `PIPELINE_KIND_COMPUTE` is what an entry in that layout decodes to.
+const PIPELINE_KIND_COMPUTE: u8 = 0x00;
+const PIPELINE_KIND_RENDER: u8 = 0x01;
 
 /// Maximum number of passes one tagged trace frame may carry.
 ///
@@ -1065,6 +1078,11 @@ fn get_footprint(decoder: &mut Decoder<'_>) -> Result<FootprintProof, CodecError
     }
 }
 
+/// Encode the compute half of one pipeline-table entry.
+///
+/// The pre-render layout carries exactly these bytes, so this function stays
+/// the legacy encoder for `Compiled`, `ReleasePipeline` and any compute-only
+/// trace; the render half travels through [`put_pipeline_tagged`] only.
 fn put_pipeline(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
     put_epoch(encoder, pipeline.device_epoch);
     encoder.u64(pipeline.pipeline_id.get());
@@ -1072,13 +1090,76 @@ fn put_pipeline(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
     put_contract(encoder, &pipeline.contract);
 }
 
+/// Encode one pipeline-table entry of the tagged layout: the entry kind, then
+/// the compute half, then the render half when the entry carries one.
+fn put_pipeline_tagged(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
+    match &pipeline.render {
+        Some(contract) => {
+            encoder.u8(PIPELINE_KIND_RENDER);
+            put_pipeline(encoder, pipeline);
+            put_render_pipeline_contract(encoder, contract);
+        }
+        None => {
+            encoder.u8(PIPELINE_KIND_COMPUTE);
+            put_pipeline(encoder, pipeline);
+        }
+    }
+}
+
+fn put_render_pipeline_contract(encoder: &mut Encoder, contract: &RenderPipelineContract) {
+    encoder.text(&contract.vertex_entry);
+    encoder.text(&contract.fragment_entry);
+    put_attachment_format(encoder, contract.color_format);
+    encoder.u8(match contract.vertex_layout {
+        VertexLayout::None => 0,
+    });
+}
+
+/// Decode the compute half of one pipeline-table entry.
+///
+/// `render` is always `None`: the pre-render entry has no render half, and
+/// [`get_pipeline_tagged`] fills it in for the layout that carries one.
 fn get_pipeline(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipeline, CodecError> {
     Ok(CompiledComputePipeline {
         device_epoch: get_epoch(decoder)?,
         pipeline_id: PipelineId::new(decoder.u64()?),
         function: get_function_identity(decoder)?,
         contract: get_contract(decoder)?,
+        render: None,
     })
+}
+
+/// Decode one pipeline-table entry of the tagged layout.
+fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipeline, CodecError> {
+    let kind = decoder.u8()?;
+    let mut pipeline = get_pipeline(decoder)?;
+    pipeline.render = match kind {
+        PIPELINE_KIND_COMPUTE => None,
+        PIPELINE_KIND_RENDER => Some(get_render_pipeline_contract(decoder)?),
+        tag => return Err(CodecError::UnknownPipelineTag(tag)),
+    };
+    Ok(pipeline)
+}
+
+fn get_render_pipeline_contract(
+    decoder: &mut Decoder<'_>,
+) -> Result<RenderPipelineContract, CodecError> {
+    Ok(RenderPipelineContract {
+        vertex_entry: decoder.text()?,
+        fragment_entry: decoder.text()?,
+        color_format: get_attachment_format(decoder)?,
+        vertex_layout: get_vertex_layout(decoder)?,
+    })
+}
+
+fn get_vertex_layout(decoder: &mut Decoder<'_>) -> Result<VertexLayout, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(VertexLayout::None),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "vertex layout",
+            value,
+        }),
+    }
 }
 
 fn put_contract(encoder: &mut Encoder, contract: &PipelineContract) {
@@ -1411,7 +1492,11 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
     encoder.u64(trace.operation_id.get());
     encoder.u64(trace.pipelines.len() as u64);
     for pipeline in &trace.pipelines {
-        put_pipeline(encoder, pipeline);
+        if tagged {
+            put_pipeline_tagged(encoder, pipeline);
+        } else {
+            put_pipeline(encoder, pipeline);
+        }
     }
     put_dispatch_type(encoder, trace.encoder_dispatch_type);
     encoder.u64(trace.passes.len() as u64);
@@ -1547,7 +1632,7 @@ fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecErro
         })?;
     let mut pipelines = Vec::with_capacity(pipeline_count.min(1024));
     for _ in 0..pipeline_count {
-        pipelines.push(get_pipeline(decoder)?);
+        pipelines.push(get_pipeline_tagged(decoder)?);
     }
     let encoder_dispatch_type = get_dispatch_type(decoder)?;
     let pass_count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
