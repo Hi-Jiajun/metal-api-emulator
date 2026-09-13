@@ -193,19 +193,22 @@ one-device check runs in CI (§5). What is deliberately still **not** wired is
 the suite itself:
 
 * `NativeOracle.swift` accepts `compute-buffer-v13` and its render capture path
-  reports the attachment in exactly this shape, but the path has never run on
-  Apple hardware — the CI self-test (§5) and, after it,
-  `run_native.py --suite conformance/suite-v13.json` are what would turn the
-  claim into evidence;
+  reports the attachment in exactly this shape. The self-test (§5) has since run
+  on the CI runner's Apple Paravirtual device and passed
+  (`render_selftest: PASS (4080c0ff4080c0ff4080c0ff4080c0ff)`, run 34774478149), so
+  the single-case shape is evidenced; the **suite** path
+  (`run_native.py --suite conformance/suite-v13.json`) is what would put that
+  byte comparison into the four-rail capture matrix;
 * the Rust native provider needs its own `supports_render_passes` flip, whose
   condition is the same §5 check (`crates/metal-api-native/src/native.rs`);
 * `.github/workflows/ci.yml` would then need `13` in the four version loops, the
   explicit suite lines, the native status list and the parity lines.
 
-Until that lands, the suite is run by the three Vulkan rails locally
-(`tools/lavapipe-smoke.sh` discovers it from `conformance/suite*.json`), and
-`.github/workflows/ci.yml` does not name its suite file: no CI job reports the
-macOS attachment yet. The coverage check keeps that split explicit rather than
+Until that lands, the suite is run by the Vulkan rails locally
+(`tools/lavapipe-smoke.sh` discovers it from `conformance/suite*.json`) and by
+the trace and object-API rails in CI, which do name its suite file; the macOS
+and Rust-native rails deliberately do not, because neither reports an
+attachment yet. The coverage check keeps that split explicit rather than
 silent, and `conformance/test_suite_v13.py` holds the schema, the plan and the
 refusals.
 
