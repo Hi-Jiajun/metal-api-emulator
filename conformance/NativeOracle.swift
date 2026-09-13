@@ -1366,7 +1366,10 @@ private func renderSelfTest() throws -> CaseResult {
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
             clear_hex: "fefefefe", initial_hex: nil),
-        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff")
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        // The self-test runs on this rail by construction; the marker is the
+        // same one suite-v13 names for it.
+        capture_rails: ["native-metal"])
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     let fixture = try validateRenderCase(definition, root: root)
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -1410,7 +1413,10 @@ private func presentSelfTest() throws -> CaseResult {
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "load", store: "store",
             clear_hex: nil, initial_hex: hex(sentinel)),
-        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff")
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        // The self-test is this rail's own check; it runs directly rather than
+        // through a suite marker, so the marker only has to name this rail.
+        capture_rails: ["native-metal"])
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     let fixture = try validateRenderCase(definition, root: root)
     guard let device = MTLCreateSystemDefaultDevice() else {
