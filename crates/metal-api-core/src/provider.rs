@@ -214,6 +214,124 @@ pub struct BufferLease {
     pub owner_epoch: DeviceEpoch,
 }
 
+/// One owner-registered host address range a provider may import without
+/// copying — for the VM line this is a guest RAM region whose host mapping is
+/// stable for the registration's lifetime (`research/docs/19`). The type is
+/// deliberately narrow: it proves the range's shape and identity so a lease can
+/// be derived from it, and it does not claim anything about guest pages,
+/// dirty tracking or invalidation, which stay owner-side.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostRegion {
+    pub lease_id: LeaseId,
+    pub owner_epoch: DeviceEpoch,
+    pub host_pointer: usize,
+    pub length: u64,
+    /// Page size the owner registered the region with. Lease reservations cut
+    /// from the region must be aligned to it.
+    pub page_size: u64,
+}
+
+impl HostRegion {
+    /// Validate the region's identity, pointer, alignment and extent. Refuses
+    /// zero identities, null or unaligned pointers, zero or unaligned lengths,
+    /// a page size that is not a power of two, and ranges that overflow.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.lease_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("host region lease id"));
+        }
+        if self.owner_epoch.is_zero() {
+            return Err(ContractError::InvalidIdentity("host region owner epoch"));
+        }
+        if self.host_pointer == 0 {
+            return Err(ContractError::NullHostPointer(self.lease_id));
+        }
+        if self.page_size == 0 || !self.page_size.is_power_of_two() {
+            return Err(ContractError::InvalidHostRegionPageSize(self.page_size));
+        }
+        if self.length == 0 {
+            return Err(ContractError::ZeroLength("host region"));
+        }
+        if !self.length.is_multiple_of(self.page_size) {
+            return Err(ContractError::UnalignedHostRegion {
+                field: "length",
+                value: self.length,
+                page_size: self.page_size,
+            });
+        }
+        if !u64::try_from(self.host_pointer)
+            .map(|pointer| pointer.is_multiple_of(self.page_size))
+            .unwrap_or(false)
+        {
+            return Err(ContractError::UnalignedHostRegion {
+                field: "pointer",
+                value: u64::try_from(self.host_pointer).unwrap_or(u64::MAX),
+                page_size: self.page_size,
+            });
+        }
+        u64::try_from(self.host_pointer)
+            .ok()
+            .and_then(|pointer| pointer.checked_add(self.length))
+            .ok_or(ContractError::ArithmeticOverflow("host region range"))?;
+        Ok(())
+    }
+
+    /// Derive the borrowed backing for one page-aligned window of the region.
+    /// The window is validated against the region before a lease is produced,
+    /// so a provider never receives a pointer outside the registration.
+    pub fn borrowed_window(
+        &self,
+        allocation_id: AllocationId,
+        offset: u64,
+        length: u64,
+    ) -> Result<BorrowedLease, ContractError> {
+        self.validate()?;
+        if allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("allocation id"));
+        }
+        if length == 0 {
+            return Err(ContractError::ZeroLength("host region window"));
+        }
+        for (field, value) in [("offset", offset), ("length", length)] {
+            if !value.is_multiple_of(self.page_size) {
+                return Err(ContractError::UnalignedHostRegion {
+                    field,
+                    value,
+                    page_size: self.page_size,
+                });
+            }
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(ContractError::ArithmeticOverflow("host region window"))?;
+        if end > self.length {
+            return Err(ContractError::HostRegionWindowOutOfBounds {
+                end,
+                region_length: self.length,
+            });
+        }
+        let pointer = u64::try_from(self.host_pointer)
+            .map_err(|_| ContractError::ArithmeticOverflow("host region pointer"))?
+            .checked_add(offset)
+            .ok_or(ContractError::ArithmeticOverflow(
+                "host region window pointer",
+            ))?;
+        let pointer = usize::try_from(pointer)
+            .map_err(|_| ContractError::ArithmeticOverflow("host region window pointer"))?;
+        BorrowedLease::new(
+            LeaseReservation {
+                lease: BufferLease {
+                    lease_id: self.lease_id,
+                    allocation_id,
+                    owner_epoch: self.owner_epoch,
+                },
+                offset,
+                length,
+            },
+            pointer,
+        )
+    }
+}
+
 /// How the caller supplies a buffer's initial contents.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BufferSource {
@@ -2777,6 +2895,11 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
         E::NullHostPointer(_) => (ProviderErrorClass::Args, "borrowed_host_pointer_null"),
+        E::InvalidHostRegionPageSize(_)
+        | E::UnalignedHostRegion { .. }
+        | E::HostRegionWindowOutOfBounds { .. } => {
+            (ProviderErrorClass::Args, "host_region_invalid")
+        }
         // Well-formed input asking for a feature outside the B0 subset.
         E::UnsupportedAttributeStride => (
             ProviderErrorClass::Capability,
@@ -3084,6 +3207,16 @@ pub enum ContractError {
         actual: u64,
     },
     NullHostPointer(LeaseId),
+    InvalidHostRegionPageSize(u64),
+    UnalignedHostRegion {
+        field: &'static str,
+        value: u64,
+        page_size: u64,
+    },
+    HostRegionWindowOutOfBounds {
+        end: u64,
+        region_length: u64,
+    },
     DuplicateAllocation(AllocationId),
     UnknownAllocation(AllocationId),
     AllocationEpochMismatch {
@@ -3261,6 +3394,25 @@ impl fmt::Display for ContractError {
             Self::NullHostPointer(lease) => {
                 write!(formatter, "lease {lease:?} borrowed host pointer is null")
             }
+            Self::InvalidHostRegionPageSize(page_size) => write!(
+                formatter,
+                "host region page size {page_size} must be a nonzero power of two"
+            ),
+            Self::UnalignedHostRegion {
+                field,
+                value,
+                page_size,
+            } => write!(
+                formatter,
+                "host region {field} {value} is not aligned to {page_size}"
+            ),
+            Self::HostRegionWindowOutOfBounds {
+                end,
+                region_length,
+            } => write!(
+                formatter,
+                "host region window ends at {end}, beyond region length {region_length}"
+            ),
             Self::DuplicateAllocation(allocation) => {
                 write!(formatter, "duplicate allocation {:?}", allocation)
             }
@@ -3681,6 +3833,85 @@ mod tests {
             shader_capabilities: Vec::new(),
             translator_revision: None,
         }
+    }
+
+    fn host_region(pointer: usize, length: u64, page_size: u64) -> HostRegion {
+        HostRegion {
+            lease_id: LeaseId::new(41),
+            owner_epoch: DeviceEpoch::new(7),
+            host_pointer: pointer,
+            length,
+            page_size,
+        }
+    }
+
+    #[test]
+    fn host_region_validates_shape_and_derives_aligned_windows() {
+        let region = host_region(0x1000, 0x4000, 0x1000);
+        region.validate().expect("aligned registration is valid");
+
+        let borrowed = region
+            .borrowed_window(AllocationId::new(11), 0x1000, 0x2000)
+            .expect("an aligned window inside the region derives a lease");
+        assert_eq!(borrowed.host_pointer, 0x2000);
+        assert_eq!(borrowed.reservation.offset, 0x1000);
+        assert_eq!(borrowed.reservation.length, 0x2000);
+        assert_eq!(borrowed.reservation.lease.lease_id, LeaseId::new(41));
+        assert_eq!(
+            borrowed.reservation.lease.allocation_id,
+            AllocationId::new(11)
+        );
+
+        let page = region
+            .borrowed_window(AllocationId::new(11), 0, 0x1000)
+            .expect("the first page derives a lease");
+        assert_eq!(page.host_pointer, 0x1000);
+    }
+
+    #[test]
+    fn host_region_refuses_bad_shape_and_out_of_bounds_windows() {
+        assert!(matches!(
+            host_region(0x1800, 0x1000, 0x1000).validate(),
+            Err(ContractError::UnalignedHostRegion {
+                field: "pointer",
+                ..
+            })
+        ));
+        assert!(matches!(
+            host_region(0x1000, 0x1500, 0x1000).validate(),
+            Err(ContractError::UnalignedHostRegion {
+                field: "length",
+                ..
+            })
+        ));
+        assert!(matches!(
+            host_region(0x1000, 0x1000, 0x3000).validate(),
+            Err(ContractError::InvalidHostRegionPageSize(0x3000))
+        ));
+        assert!(matches!(
+            host_region(0, 0x1000, 0x1000).validate(),
+            Err(ContractError::NullHostPointer(LeaseId(41)))
+        ));
+
+        let region = host_region(0x1000, 0x2000, 0x1000);
+        assert!(matches!(
+            region.borrowed_window(AllocationId::new(11), 0x1000, 0x2000),
+            Err(ContractError::HostRegionWindowOutOfBounds {
+                end: 0x3000,
+                region_length: 0x2000
+            })
+        ));
+        assert!(matches!(
+            region.borrowed_window(AllocationId::new(11), 0x800, 0x1000),
+            Err(ContractError::UnalignedHostRegion {
+                field: "offset",
+                ..
+            })
+        ));
+        assert!(matches!(
+            region.borrowed_window(AllocationId::new(0), 0, 0x1000),
+            Err(ContractError::InvalidIdentity("allocation id"))
+        ));
     }
 
     #[test]
