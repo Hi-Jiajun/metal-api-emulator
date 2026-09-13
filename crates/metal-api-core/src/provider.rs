@@ -250,6 +250,187 @@ pub enum BufferSourceKind {
     BorrowedNoCopy,
 }
 
+/// Texture formats admitted by the first texture increment
+/// (`research/docs/16` §4.1). The list is deliberately closed: a provider must
+/// refuse an unlisted format instead of guessing a mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureFormat {
+    R32Uint,
+    R32Float,
+    Rgba8Unorm,
+    Bgra8Unorm,
+}
+
+impl TextureFormat {
+    /// Tightly packed bytes one texel occupies in this format. Sampling and
+    /// row padding are provider concerns; this is the byte extent the contract
+    /// validates a source against.
+    pub const fn bytes_per_texel(self) -> u64 {
+        match self {
+            Self::R32Uint | Self::R32Float => 4,
+            Self::Rgba8Unorm | Self::Bgra8Unorm => 4,
+        }
+    }
+}
+
+/// Texture dimensionality admitted by the first texture increment. Array and
+/// multisample variants carry their extra dimension explicitly so validation
+/// can reject inconsistent combinations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureType {
+    D1,
+    D1Array,
+    D2,
+    D2Array,
+    D2Multisample,
+    D2MultisampleArray,
+    D3,
+}
+
+impl TextureType {
+    pub const fn is_array(self) -> bool {
+        matches!(
+            self,
+            Self::D1Array | Self::D2Array | Self::D2MultisampleArray
+        )
+    }
+
+    pub const fn is_multisample(self) -> bool {
+        matches!(self, Self::D2Multisample | Self::D2MultisampleArray)
+    }
+}
+
+/// How a shader uses one texture binding. The first increment admits read-only
+/// sampling and refuses storage writeback (`research/docs/16` §4.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureAccess {
+    Sampled,
+    Storage,
+    Unused,
+}
+
+impl TextureAccess {
+    pub const fn is_writable(self) -> bool {
+        matches!(self, Self::Storage)
+    }
+}
+
+/// How the caller supplies a texture's initial contents. Mirrors
+/// [`BufferSource`]; a lease covers the whole texture in the first increment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextureSource {
+    /// Offline/test input owned by the trace. The provider may copy it.
+    OwnedBytes(Vec<u8>),
+    /// Contents and lifetime are supplied by an owner-issued staged lease.
+    StagedLease(LeaseId),
+    /// Provider may use the owner's backing without copying.
+    BorrowedNoCopy(LeaseId),
+}
+
+impl TextureSource {
+    pub const fn lease_id(&self) -> Option<LeaseId> {
+        match self {
+            Self::OwnedBytes(_) => None,
+            Self::StagedLease(lease_id) | Self::BorrowedNoCopy(lease_id) => Some(*lease_id),
+        }
+    }
+}
+
+/// A logical Metal texture view. Dimensions are texels; the source length is
+/// bytes and is validated against a tightly packed layout of
+/// `width * height * depth * array_length * sample_count` texels.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextureView {
+    pub view_id: ViewId,
+    pub metal_binding: u32,
+    pub allocation_id: AllocationId,
+    pub texture_type: TextureType,
+    pub format: TextureFormat,
+    pub width: u64,
+    pub height: u64,
+    pub depth: u64,
+    pub array_length: u64,
+    pub sample_count: u64,
+    pub access: TextureAccess,
+    pub source: TextureSource,
+}
+
+impl TextureView {
+    /// Total tightly packed byte extent of one texture view.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        let texels = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|extent| extent.checked_mul(self.depth))
+            .and_then(|extent| extent.checked_mul(self.array_length))
+            .and_then(|extent| extent.checked_mul(self.sample_count))
+            .ok_or(ContractError::ArithmeticOverflow("texture extent"))?;
+        texels
+            .checked_mul(self.format.bytes_per_texel())
+            .ok_or(ContractError::ArithmeticOverflow("texture bytes"))
+    }
+
+    /// Structural validation only. It does not decide whether a provider
+    /// supports the format or access; that is a capability refusal.
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("texture view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("allocation id"));
+        }
+        for (axis, dimension) in [self.width, self.height, self.depth]
+            .into_iter()
+            .enumerate()
+        {
+            if dimension == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "texture",
+                    axis,
+                });
+            }
+        }
+        if self.array_length == 0 {
+            return Err(ContractError::ZeroLength("texture array"));
+        }
+        if self.sample_count == 0 {
+            return Err(ContractError::ZeroLength("texture sample count"));
+        }
+        if self.texture_type.is_multisample() {
+            if self.sample_count < 2 {
+                return Err(ContractError::TextureSampleCountMismatch {
+                    texture_type: self.texture_type,
+                    sample_count: self.sample_count,
+                });
+            }
+        } else if self.sample_count != 1 {
+            return Err(ContractError::TextureSampleCountMismatch {
+                texture_type: self.texture_type,
+                sample_count: self.sample_count,
+            });
+        }
+        if !self.texture_type.is_array() && self.array_length != 1 {
+            return Err(ContractError::TextureArrayLengthMismatch {
+                texture_type: self.texture_type,
+                array_length: self.array_length,
+            });
+        }
+        let expected = self.expected_bytes()?;
+        if let TextureSource::OwnedBytes(bytes) = &self.source {
+            let actual = u64::try_from(bytes.len())
+                .map_err(|_| ContractError::ArithmeticOverflow("owned texture length"))?;
+            if actual != expected {
+                return Err(ContractError::SourceLengthMismatch {
+                    view: self.view_id,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A logical Metal buffer view. Offsets, lengths, and writeback ranges are
 /// always bytes, and use the wire's wide integer width until a provider does a
 /// checked narrowing conversion.
@@ -2542,6 +2723,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::SourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "buffer_source_length_mismatch")
         }
+        E::TextureSampleCountMismatch { .. } | E::TextureArrayLengthMismatch { .. } => {
+            (ProviderErrorClass::Args, "texture_shape_mismatch")
+        }
         E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
@@ -2838,6 +3022,14 @@ pub enum ContractError {
         expected: u64,
         actual: u64,
     },
+    TextureSampleCountMismatch {
+        texture_type: TextureType,
+        sample_count: u64,
+    },
+    TextureArrayLengthMismatch {
+        texture_type: TextureType,
+        array_length: u64,
+    },
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -2991,6 +3183,20 @@ impl fmt::Display for ContractError {
                 formatter,
                 "view {:?} source length {actual} does not match declared length {expected}",
                 view
+            ),
+            Self::TextureSampleCountMismatch {
+                texture_type,
+                sample_count,
+            } => write!(
+                formatter,
+                "texture type {texture_type:?} does not admit sample count {sample_count}"
+            ),
+            Self::TextureArrayLengthMismatch {
+                texture_type,
+                array_length,
+            } => write!(
+                formatter,
+                "texture type {texture_type:?} does not admit array length {array_length}"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -3239,6 +3445,177 @@ mod tests {
 
     fn digest() -> SemanticDigest {
         SemanticDigest::new("test-v1", [7, 3, 1]).expect("non-empty digest")
+    }
+
+    struct TextureCase {
+        texture_type: TextureType,
+        format: TextureFormat,
+        width: u64,
+        height: u64,
+        depth: u64,
+        array_length: u64,
+        sample_count: u64,
+        bytes: Vec<u8>,
+    }
+
+    fn texture_view(case: TextureCase) -> TextureView {
+        TextureView {
+            view_id: ViewId::new(7),
+            metal_binding: 3,
+            allocation_id: AllocationId::new(11),
+            texture_type: case.texture_type,
+            format: case.format,
+            width: case.width,
+            height: case.height,
+            depth: case.depth,
+            array_length: case.array_length,
+            sample_count: case.sample_count,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(case.bytes),
+        }
+    }
+
+    #[test]
+    fn texture_extent_is_the_tightly_packed_texel_count() {
+        let view = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: vec![0; 64],
+        });
+        assert_eq!(view.expected_bytes().expect("bounded extent"), 64);
+        view.validate_shape().expect("4x4 R32Uint is valid");
+
+        let array = texture_view(TextureCase {
+            texture_type: TextureType::D2Array,
+            format: TextureFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 3,
+            sample_count: 1,
+            bytes: vec![0; 48],
+        });
+        assert_eq!(array.expected_bytes().expect("bounded extent"), 48);
+        array.validate_shape().expect("2x2x3 RGBA8 array is valid");
+    }
+
+    #[test]
+    fn texture_source_length_must_match_the_declared_extent() {
+        let short = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: vec![0; 60],
+        });
+        assert!(matches!(
+            short.validate_shape(),
+            Err(ContractError::SourceLengthMismatch {
+                expected: 64,
+                actual: 60,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn texture_zero_dimensions_are_refused() {
+        let empty = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 0,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: Vec::new(),
+        });
+        assert!(matches!(
+            empty.validate_shape(),
+            Err(ContractError::ZeroDimension { axis: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn texture_sample_count_must_match_the_texture_type() {
+        let mismatched = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 1,
+            sample_count: 4,
+            bytes: vec![0; 64],
+        });
+        assert!(matches!(
+            mismatched.validate_shape(),
+            Err(ContractError::TextureSampleCountMismatch {
+                sample_count: 4,
+                ..
+            })
+        ));
+
+        let multisample = texture_view(TextureCase {
+            texture_type: TextureType::D2Multisample,
+            format: TextureFormat::R32Uint,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 1,
+            sample_count: 4,
+            bytes: vec![0; 64],
+        });
+        multisample
+            .validate_shape()
+            .expect("4x multisample R32Uint is valid");
+    }
+
+    #[test]
+    fn texture_array_length_must_match_the_texture_type() {
+        let mismatched = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 4,
+            sample_count: 1,
+            bytes: vec![0; 64],
+        });
+        assert!(matches!(
+            mismatched.validate_shape(),
+            Err(ContractError::TextureArrayLengthMismatch {
+                array_length: 4,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn texture_extent_overflow_is_refused_not_wrapped() {
+        let huge = texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: u64::MAX,
+            height: u64::MAX,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: Vec::new(),
+        });
+        assert!(matches!(
+            huge.expected_bytes(),
+            Err(ContractError::ArithmeticOverflow("texture extent"))
+        ));
     }
 
     fn compile_request(source: ShaderSource) -> PipelineCompileRequest {
