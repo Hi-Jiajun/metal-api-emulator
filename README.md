@@ -112,15 +112,33 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   operation and byte counts, and the comparator enforces the allocation-level
   copy contract on every suite. See `research/docs/15` for the design and
   `conformance/SUITE-V10.md` for the disjoint-view suite.
+- Sampled textures execute on both providers: the reviewed
+  `read_texture_2d` fixture is a copy of one R32Uint texel, and suite-v11
+  runs it through all five rails (Swift native, Vulkan direct, Rust Metal
+  provider, Vulkan objects, Rust Metal objects) in CI. The object API
+  declares textures with `new_texture_with_bytes` and binds them with
+  `set_texture`; see `conformance/SUITE-V10.md`'s successor state in
+  `research/docs/18`. Multi-invocation texture reads are blocked by a
+  translator defect recorded in `research/docs/17`.
+- Guest memory has its owner-side contract: `HostRegion` registers a host
+  address range and derives page-aligned borrowed windows,
+  `provider-smoke` imports such a window without copying and observes the
+  device write in place on both drivers, `DirtySet` accumulates the pages a
+  submission wrote, and `GuestWindows` refuses to reclaim a window until its
+  lease is retired. See `research/docs/19`.
 - Open design work: device-loss reclamation beyond the bounded abandonment
   budget, the cross-process completion transport and provider wiring (the
   core wire publisher and mirror now exist), provider-side lease import (the
   core `LeaseLedger` release contract now exists), general native shader
-  admission and CPU uploads during command-buffer execution. Resource
-  snapshots do not hold live guest pages.
-- Not implemented: general MTLB function-name resolution, Windows MSL compilation,
-  textures, rendering, presentation, heaps, ICBs or production
-  reims integration. This is not a Metal.framework ABI implementation.
+  admission and CPU uploads during command-buffer execution, guest-memory
+  lifecycle wiring beyond the owner-side contract, and priority/fairness in
+  queue scheduling. Resource snapshots do not hold live guest pages.
+- Not implemented: rendering (render pipelines, render passes, sampler and
+  texture generalisation beyond the sampled fixture), presentation and
+  swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
+  compilation, arbitrary AIR/MSL compilation and reflection, and production
+  reims integration (Gate 2/3). This is not a Metal.framework ABI
+  implementation.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
 shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift
