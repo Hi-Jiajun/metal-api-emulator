@@ -4225,6 +4225,279 @@ mod tests {
         assert_eq!(observed[..4], 0_u32.to_le_bytes());
     }
 
+    /// The object API now owns a render command encoder, so one command buffer
+    /// can run the declaring compute pass and then render (and present) into
+    /// the attachment buffer the compute pass declared. This is the object-rail
+    /// sibling of the trace rail's render+present round trip.
+    #[test]
+    fn object_api_executes_render_and_present_on_the_selected_device() {
+        use metal_api_core::provider::{
+            AttachmentFormat, PipelineCompileRequest, RenderPipelineContract, SemanticDigest,
+            ShaderSource, VertexLayout,
+        };
+        use metal_api_core::provider_api as objects;
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider = Arc::new(
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider"),
+        );
+        let device = objects::Device::new(
+            Arc::clone(&provider) as Arc<dyn metal_api_core::provider::PipelineProvider>
+        );
+
+        let copy = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "copy_word".to_owned(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_declaring".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("compute pipeline");
+        let render_metadata = provider
+            .register_render_pipeline(RenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: "vertex_main".to_owned(),
+                    fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
+                    color_format: AttachmentFormat::Rgba8Unorm,
+                    vertex_layout: VertexLayout::None,
+                },
+                vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(AttachmentFormat::Rgba8Unorm)
+                    .expect("reviewed fragment stage")
+                    .to_vec(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_pipeline".to_vec(),
+                )
+                .expect("digest"),
+            })
+            .expect("render pipeline registration");
+        let render = device
+            .render_pipeline(&render_metadata)
+            .expect("render handle");
+
+        let attachment = device
+            .new_buffer_with_bytes(vec![0xfe; 16])
+            .expect("attachment buffer");
+        let attachment_view = attachment.view(0, 16).expect("attachment view");
+        let output = device
+            .new_buffer_with_bytes(vec![0xff; 4])
+            .expect("output buffer");
+        let output_view = output.view(0, 4).expect("output view");
+
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("compute encoder");
+            encoder
+                .set_compute_pipeline_state(&copy)
+                .expect("compute pipeline");
+            encoder
+                .set_buffer(0, &attachment_view)
+                .expect("attachment binding");
+            encoder.set_buffer(1, &output_view).expect("output binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end compute");
+        }
+        {
+            let mut encoder = command.render_command_encoder().expect("render encoder");
+            encoder
+                .set_render_pipeline_state(&render)
+                .expect("render pipeline");
+            encoder
+                .draw_render_pass(
+                    &attachment_view,
+                    AttachmentFormat::Rgba8Unorm,
+                    2,
+                    2,
+                    [0xfe; 4],
+                    Some(objects::PresentInitial::Sentinel([0xef; 4])),
+                )
+                .expect("render pass");
+            encoder.end_encoding().expect("end render");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        assert_eq!(
+            attachment.read().expect("attachment readback"),
+            [0x40, 0x80, 0xc0, 0xff].repeat(4),
+            "the rendered attachment reads back the solid unorm8 colour"
+        );
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "one present target is acquired and presented once"
+        );
+    }
+
+    /// In deferred mode the present tail executes during `submit`, so a
+    /// cancelled present-bearing command abandons the writeback landing but
+    /// keeps the submit-time present action (counters and target layout).
+    #[test]
+    fn cancelling_an_async_present_command_keeps_the_submit_time_present() {
+        use metal_api_core::provider::{
+            AttachmentFormat, CompletionDisposition, PipelineCompileRequest,
+            RenderPipelineContract, SemanticDigest, ShaderSource, VertexLayout,
+        };
+        use metal_api_core::provider_api as objects;
+        use metal_api_core::CommandBufferStatus;
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider = Arc::new(
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor))
+                .expect("provider")
+                .with_async_execution(true),
+        );
+        let device = objects::Device::new(provider.clone());
+
+        let copy = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "copy_word".to_owned(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_cancel_declaring".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("compute pipeline");
+        let render_metadata = provider
+            .register_render_pipeline(RenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: "vertex_main".to_owned(),
+                    fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
+                    color_format: AttachmentFormat::Rgba8Unorm,
+                    vertex_layout: VertexLayout::None,
+                },
+                vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(AttachmentFormat::Rgba8Unorm)
+                    .expect("reviewed fragment stage")
+                    .to_vec(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_cancel_pipeline".to_vec(),
+                )
+                .expect("digest"),
+            })
+            .expect("render pipeline registration");
+        let render = device
+            .render_pipeline(&render_metadata)
+            .expect("render handle");
+
+        let attachment = device
+            .new_buffer_with_bytes(vec![0xfe; 16])
+            .expect("attachment buffer");
+        let attachment_view = attachment.view(0, 16).expect("attachment view");
+        let output = device
+            .new_buffer_with_bytes(vec![0xff; 4])
+            .expect("output buffer");
+        let output_view = output.view(0, 4).expect("output view");
+
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("compute encoder");
+            encoder
+                .set_compute_pipeline_state(&copy)
+                .expect("compute pipeline");
+            encoder
+                .set_buffer(0, &attachment_view)
+                .expect("attachment binding");
+            encoder.set_buffer(1, &output_view).expect("output binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end compute");
+        }
+        {
+            let mut encoder = command.render_command_encoder().expect("render encoder");
+            encoder
+                .set_render_pipeline_state(&render)
+                .expect("render pipeline");
+            encoder
+                .draw_render_pass(
+                    &attachment_view,
+                    AttachmentFormat::Rgba8Unorm,
+                    2,
+                    2,
+                    [0xfe; 4],
+                    Some(objects::PresentInitial::Sentinel([0xef; 4])),
+                )
+                .expect("render pass");
+            encoder.end_encoding().expect("end render");
+        }
+        command.commit().expect("commit");
+        assert_eq!(
+            command.status().unwrap(),
+            CommandBufferStatus::Committed,
+            "the deferred command stays Committed until its results land"
+        );
+        // The present action ran during `submit`, before any observation.
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "the present tail advances its counters at submit time"
+        );
+        command.cancel().expect("cancel");
+        assert_eq!(
+            command.status().unwrap(),
+            CommandBufferStatus::Failed,
+            "cancel turns the command Failed"
+        );
+        assert!(matches!(
+            command.wait_until_completed(),
+            Err(objects::Error::CompletionUnavailable(
+                CompletionDisposition::Cancelled { .. }
+            ))
+        ));
+        // Cancel does not roll the present action back, and neither the render
+        // writeback nor the compute writeback landed.
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "cancel abandons observation without rolling the present back"
+        );
+        assert_eq!(
+            attachment.read().expect("attachment readback"),
+            vec![0xfe; 16],
+            "the render writeback is not landed by a cancelled command"
+        );
+        assert_eq!(
+            output.read().expect("output readback"),
+            vec![0xff; 4],
+            "the compute writeback is not landed by a cancelled command"
+        );
+    }
+
     #[test]
     fn texture_fixture_executes_a_texel_read_on_the_selected_device() {
         use metal_api_core::provider::{
