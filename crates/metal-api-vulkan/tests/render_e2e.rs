@@ -1,13 +1,22 @@
 //! End-to-end render rail: one trace that carries a render pass, submitted
 //! through the provider's own admission and submit path.
 //!
-//! The case is the milestone of `research/docs/23`: a 2×2 `Rgba8Unorm`
-//! attachment cleared to a sentinel and then covered by the full-screen
-//! triangle, whose fragment stage stores `40 80 c0 ff` per texel. What this
-//! test measures is the whole chain rather than the rail alone — a
-//! `ComputeTrace` with a render entry → `ProviderCapabilities::validate_trace`
-//! → `ComputeProvider::submit` → the attachment's bytes in the returned
-//! writebacks — so a rail that runs but lands nothing cannot pass.
+//! The case is the milestone of `research/docs/23`: a 2×2 attachment cleared to
+//! a sentinel and then covered by the full-screen triangle, whose fragment stage
+//! stores `(64/255, 128/255, 192/255, 1)`. What this test measures is the whole
+//! chain rather than the rail alone — a `ComputeTrace` with a render entry →
+//! `ProviderCapabilities::validate_trace` → `ComputeProvider::submit` → the
+//! attachment's bytes in the returned writebacks — so a rail that runs but lands
+//! nothing cannot pass.
+//!
+//! The rail builds the fragment stage from the attachment format, so the same
+//! trace shape is measured once per admitted format: `Rgba8Unorm`
+//! (`40 80 c0 ff` per texel), `Bgra8Unorm` (the same colour in a B,G,R,A layout,
+//! `c0 80 40 ff`) and `R32Float` (one `float`, `64/255`, `81 80 80 3e`). A host
+//! hands the rail compiled stages, so a registration is also where the pairing is
+//! checked: a format registered with another format's fragment stage is refused
+//! (`render_fragment_stage_mismatch`) instead of being run and read back as bytes
+//! the format claim does not cover.
 //!
 //! The attachment view is declared by the trace's compute pass because that is
 //! what the render contract requires: `validate_serial_buffer_reuse` resolves
@@ -19,11 +28,11 @@
 
 use metal_api_core::provider::{
     AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
-    ClearColor, CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider,
-    ComputeTrace, Dispatch, DispatchKind, DispatchType, LoadOp, OperationId, PipelineId,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
-    TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
+    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue, LoadOp,
+    OperationId, PipelineId, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+    SemanticDigest, StoreOp, TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
@@ -34,21 +43,23 @@ use std::sync::Arc;
 const FULL_SCREEN_TRIANGLE_VERT_SPV: &[u8] =
     include_bytes!("../src/render_spv/fullscreen_triangle.vert.spv");
 
-/// Fragment stage of the milestone: `spirv-as` output of the reviewed
-/// `render_spv/solid_rgba8.frag.spvasm` (entry `fragment_main`).
-const SOLID_RGBA8_FRAG_SPV: &[u8] = include_bytes!("../src/render_spv/solid_rgba8.frag.spv");
+/// The reviewed 8-bit UNORM fragment stage: `spirv-as` output of
+/// `render_spv/solid_unorm8.frag.spvasm` (entry `fragment_main`). One module
+/// serves both UNORM layouts, because the channel order is the image format's
+/// decision rather than the shader's.
+const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("../src/render_spv/solid_unorm8.frag.spv");
+
+/// The reviewed single-channel float fragment stage: `spirv-as` output of
+/// `render_spv/solid_r32f.frag.spvasm` (entry `fragment_main`).
+const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("../src/render_spv/solid_r32f.frag.spv");
 
 /// The reviewed compute fixture the declaring pass runs.
 const COPY_WORD_AIR: &str =
     include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll");
 
-/// What the fragment stage stores, read back one texel at a time: a 2×2
-/// `R8G8B8A8_UNORM` attachment holds `40 80 c0 ff` four times.
-const EXPECTED_TEXELS: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
-
-/// The `LoadOp::Clear` sentinel (`research/docs/23` §1.3). A texel still
-/// holding it proves the draw did not cover that pixel, so "the pass ran" is
-/// falsifiable rather than assumed.
+/// The `LoadOp::Clear` sentinel (`research/docs/23` §1.3). A texel still holding
+/// it proves the draw did not cover that pixel, so "the pass ran" is falsifiable
+/// rather than assumed.
 const CLEAR_SENTINEL: [u8; 4] = [0xfe; 4];
 
 /// The word `copy_word` reads out of the attachment view's first four bytes.
@@ -59,12 +70,59 @@ const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(801);
 const SCRATCH_VIEW: ViewId = ViewId::new(702);
 const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(802);
 
+/// The colour formats this file measures: the contract's admitted set.
+const ADMITTED_FORMATS: [AttachmentFormat; 3] = AttachmentFormat::ADMITTED;
+
 fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The fragment stage a host registers for `format`.
+///
+/// The test names these modules itself because a registration is exactly where a
+/// host hands the rail compiled stages. The rail then checks the pairing against
+/// its own per-format map, which
+/// `registering_a_format_with_another_formats_fragment_stage_is_refused` observes
+/// from the outside.
+fn reviewed_fragment_spirv(format: AttachmentFormat) -> &'static [u8] {
+    match format {
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
+        AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
+        AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
+    }
+}
+
+/// The bytes one texel holds when the fragment stage stores
+/// `(64/255, 128/255, 192/255, 1)` into an attachment of `format`.
+fn expected_texels(format: AttachmentFormat) -> [u8; 4] {
+    match format {
+        // The stage's components in the order it writes them.
+        AttachmentFormat::Rgba8Unorm => [0x40, 0x80, 0xc0, 0xff],
+        // The same colour with that layout's blue/red exchange applied: the
+        // stored red `0x40` lands third, behind the stored blue `0xc0`.
+        AttachmentFormat::Bgra8Unorm => [0xc0, 0x80, 0x40, 0xff],
+        // A float attachment quantises nothing, so the texel is the stage's
+        // `float 64/255` (`0x3e808081`) in little-endian byte order.
+        AttachmentFormat::R32Float => [0x81, 0x80, 0x80, 0x3e],
+        AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
+    }
+}
+
+/// The bytes a *surviving clear* leaves in an attachment of `format`.
+///
+/// The rail's clear components are `byte/255` as floats at every format, so the
+/// single-channel float attachment's sentinel is the float `254/255` rather than
+/// the four sentinel bytes themselves.
+fn clear_bytes(format: AttachmentFormat) -> [u8; 4] {
+    match format {
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => CLEAR_SENTINEL,
+        AttachmentFormat::R32Float => (f32::from(CLEAR_SENTINEL[0]) / 255.0).to_le_bytes(),
+        AttachmentFormat::R32Uint => panic!("R32Uint is outside the first render increment"),
+    }
 }
 
 /// One provider context with both pipelines registered and one render-bearing
@@ -74,15 +132,21 @@ struct Fixture {
     trace: ComputeTrace,
     resources: ResourceTableSnapshot,
     render_pipeline: PipelineId,
+    format: AttachmentFormat,
 }
 
-fn render_pass(pipeline: PipelineId, width: u64, height: u64) -> RenderPassDescriptor {
+fn render_pass(
+    pipeline: PipelineId,
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+) -> RenderPassDescriptor {
     RenderPassDescriptor {
         pipeline,
         color_attachments: vec![RenderAttachment {
             view_id: ATTACHMENT_VIEW,
             allocation_id: ATTACHMENT_ALLOCATION,
-            format: AttachmentFormat::Rgba8Unorm,
+            format,
             width,
             height,
             load: LoadOp::Clear(ClearColor::new(CLEAR_SENTINEL)),
@@ -93,14 +157,41 @@ fn render_pass(pipeline: PipelineId, width: u64, height: u64) -> RenderPassDescr
     }
 }
 
-fn fixture() -> Option<Fixture> {
-    let executor = match VulkanExecutor::new() {
-        Ok(executor) => executor,
+fn executor() -> Option<Arc<VulkanExecutor>> {
+    match VulkanExecutor::new() {
+        Ok(executor) => Some(executor),
         Err(error) => {
             eprintln!("SKIP: no Vulkan device: {error}");
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Register one render pipeline for `format` and return its id.
+///
+/// `fragment_spirv` is the caller's choice, which is what makes the mismatch case
+/// observable: the rail answers whether that choice is the format's own stage.
+fn register_render(
+    provider: &VulkanComputeProvider,
+    format: AttachmentFormat,
+    fragment_spirv: &[u8],
+    digest: SemanticDigest,
+) -> Result<CompiledComputePipeline, ProviderError> {
+    provider.register_render_pipeline(RenderPipelineRequest {
+        contract: RenderPipelineContract {
+            vertex_entry: "vertex_main".to_owned(),
+            fragment_entry: "fragment_main".to_owned(),
+            color_format: format,
+            vertex_layout: VertexLayout::None,
+        },
+        vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+        fragment_spirv: fragment_spirv.to_vec(),
+        logical_digest: digest,
+    })
+}
+
+fn fixture_with_stage(format: AttachmentFormat, fragment_spirv: &[u8]) -> Option<Fixture> {
+    let executor = executor()?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
     let provider =
         VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
@@ -117,19 +208,13 @@ fn fixture() -> Option<Fixture> {
     let compute = provider
         .compile_pipeline(&function, fixture_digest(b"render_e2e_compute"))
         .expect("the compute pipeline registers");
-    let render = provider
-        .register_render_pipeline(RenderPipelineRequest {
-            contract: RenderPipelineContract {
-                vertex_entry: "vertex_main".to_owned(),
-                fragment_entry: "fragment_main".to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
-                vertex_layout: VertexLayout::None,
-            },
-            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV.to_vec(),
-            logical_digest: fixture_digest(b"render_e2e_stages"),
-        })
-        .expect("the render pipeline registers");
+    let render = register_render(
+        &provider,
+        format,
+        fragment_spirv,
+        fixture_digest(b"render_e2e_stages"),
+    )
+    .expect("the render pipeline registers");
 
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
@@ -172,7 +257,7 @@ fn fixture() -> Option<Fixture> {
                     threads_per_threadgroup: [1, 1, 1],
                 },
             }),
-            TracePass::Render(render_pass(render.pipeline_id, 2, 2)),
+            TracePass::Render(render_pass(render.pipeline_id, format, 2, 2)),
         ],
         completion_policy: CompletionPolicy::HostReadback,
     };
@@ -198,7 +283,12 @@ fn fixture() -> Option<Fixture> {
         trace,
         resources,
         render_pipeline: render.pipeline_id,
+        format,
     })
+}
+
+fn fixture(format: AttachmentFormat) -> Option<Fixture> {
+    fixture_with_stage(format, reviewed_fragment_spirv(format))
 }
 
 fn submit_fixture(fixture: &Fixture) -> Vec<(ViewId, Vec<u8>)> {
@@ -233,37 +323,50 @@ fn readback(writebacks: &[(ViewId, Vec<u8>)], view: ViewId) -> Vec<u8> {
         .unwrap_or_else(|| panic!("view {view:?} has no writeback"))
 }
 
+/// The attachment's readback for one submitted fixture, with the raw bytes
+/// printed so the run's log carries the evidence the assertions are about.
+fn attachment_readback(fixture: &Fixture, writebacks: &[(ViewId, Vec<u8>)]) -> Vec<u8> {
+    let attachment = readback(writebacks, ATTACHMENT_VIEW);
+    eprintln!(
+        "{:?} attachment readback: {} ({} bytes, first texel: {})",
+        fixture.format,
+        hex(&attachment),
+        attachment.len(),
+        hex(&attachment[..4])
+    );
+    eprintln!(
+        "{:?} expected: [{}] x4, clear sentinel: [{}]",
+        fixture.format,
+        hex(&expected_texels(fixture.format)),
+        hex(&clear_bytes(fixture.format))
+    );
+    attachment
+}
+
+/// The whole chain for the milestone's original case, plus the registration's
+/// lifecycle.
 #[test]
 fn render_pass_trace_executes_and_lands_attachment_bytes_through_writeback() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
         return;
     };
     let writebacks = submit_fixture(&fixture);
+    let attachment = attachment_readback(&fixture, &writebacks);
 
-    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
-    eprintln!(
-        "attachment readback: {} ({} bytes)",
-        hex(&attachment),
-        attachment.len()
-    );
-    eprintln!("expected: [{}] x4", hex(&EXPECTED_TEXELS));
     assert_eq!(attachment.len(), 16);
-    assert_eq!(attachment, EXPECTED_TEXELS.repeat(4));
+    assert_eq!(attachment, expected_texels(fixture.format).repeat(4));
     // The attachment is cleared to `fe fe fe fe` and the draw then covers every
     // texel of the 2×2 viewport, so the clear's own bytes are observable only
-    // where the draw did *not* land. Asserting that no texel still holds the
-    // sentinel is what keeps "the readback is the draw's bytes" falsifiable:
-    // a surviving sentinel would mean the coverage claim is false, and the
-    // readback a clear value rather than the fragment stage's output.
+    // here: "the readback is the draw's bytes" rather than the clear value.
     assert!(
         !attachment
             .chunks_exact(4)
-            .any(|texel| texel == CLEAR_SENTINEL),
+            .any(|texel| texel == clear_bytes(fixture.format).as_slice()),
         "a surviving clear sentinel means the triangle did not cover every texel, so the \
          readback would be the ClearColor rather than the fragment stage's bytes: {}",
         hex(&attachment)
     );
-    assert_ne!(CLEAR_SENTINEL, EXPECTED_TEXELS);
+    assert_ne!(clear_bytes(fixture.format), expected_texels(fixture.format));
 
     // The compute rail's own writeback rides the same submission, so the render
     // pass was not traded for the compute result.
@@ -289,9 +392,94 @@ fn render_pass_trace_executes_and_lands_attachment_bytes_through_writeback() {
     assert_eq!(refused.slug, "unknown_render_pipeline");
 }
 
+/// The same trace shape through every admitted colour format: the format selects
+/// the fragment stage, and the attachment lands the bytes that stage's colour
+/// has in that format's layout.
+#[test]
+fn every_admitted_colour_format_lands_its_own_attachment_bytes() {
+    for format in ADMITTED_FORMATS {
+        let Some(fixture) = fixture(format) else {
+            return;
+        };
+        let writebacks = submit_fixture(&fixture);
+        let attachment = attachment_readback(&fixture, &writebacks);
+
+        assert_eq!(attachment.len(), 16);
+        assert_eq!(attachment, expected_texels(format).repeat(4));
+        assert!(
+            !attachment
+                .chunks_exact(4)
+                .any(|texel| texel == clear_bytes(format).as_slice()),
+            "a surviving clear sentinel means the triangle did not cover every texel, so the \
+             {format:?} readback would be the ClearColor: {}",
+            hex(&attachment)
+        );
+        assert_ne!(clear_bytes(format), expected_texels(format));
+        // The two UNORM layouts must not land the same bytes: a rail that wrote
+        // the same byte order at both formats would pass an R,G,B,A-only check
+        // and still be wrong about one of them.
+        if format == AttachmentFormat::Bgra8Unorm {
+            assert_ne!(
+                attachment,
+                expected_texels(AttachmentFormat::Rgba8Unorm).repeat(4),
+                "a B,G,R,A attachment cannot read back the R,G,B,A bytes"
+            );
+        }
+
+        let scratch = readback(&writebacks, SCRATCH_VIEW);
+        assert_eq!(scratch, ATTACHMENT_WORD.to_vec());
+    }
+}
+
+/// A registration pairs a compiled fragment stage with a format, and the rail
+/// refuses a pairing that is not the format's own stage. This is the end-to-end
+/// witness that the fragment stage really is a function of the format: the
+/// caller cannot choose one the format was not built for.
+#[test]
+fn registering_a_format_with_another_formats_fragment_stage_is_refused() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+
+    // The pairings the review filed as I2: the 8-bit module's `vec4` store on the
+    // one-component float attachment, and the float module on each 8-bit layout.
+    for (format, wrong_stage) in [
+        (AttachmentFormat::R32Float, SOLID_UNORM8_FRAG_SPV),
+        (AttachmentFormat::Rgba8Unorm, SOLID_R32F_FRAG_SPV),
+        (AttachmentFormat::Bgra8Unorm, SOLID_R32F_FRAG_SPV),
+    ] {
+        let refused = register_render(&provider, format, wrong_stage, digest(b"mismatch"))
+            .expect_err("another format's fragment stage is refused");
+        eprintln!("{format:?} with another format's stage: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("format_code"),
+            Some(&FieldValue::Unsigned(u64::from(format.code())))
+        );
+    }
+
+    // Every format's own stage registers, so the refusal above is about the
+    // pairing rather than about render registration itself.
+    for (index, format) in ADMITTED_FORMATS.into_iter().enumerate() {
+        let case = format!("render_e2e_reviewed_{index}");
+        register_render(
+            &provider,
+            format,
+            reviewed_fragment_spirv(format),
+            digest(case.as_bytes()),
+        )
+        .unwrap_or_else(|error| panic!("{format:?} registers with its own stage: {error:?}"));
+    }
+}
+
 #[test]
 fn the_same_trace_is_refused_when_the_provider_declares_no_render_support() {
-    let Some(fixture) = fixture() else {
+    let Some(fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
         return;
     };
     let declared = fixture.provider.capabilities();
@@ -327,7 +515,7 @@ fn without_render_bits(declared: &ProviderCapabilities) -> ProviderCapabilities 
 
 fn oversized_trace(fixture: &Fixture) -> ComputeTrace {
     let mut trace = fixture.trace.clone();
-    trace.passes[1] = TracePass::Render(render_pass(fixture.render_pipeline, 3, 3));
+    trace.passes[1] = TracePass::Render(render_pass(fixture.render_pipeline, fixture.format, 3, 3));
     trace
 }
 

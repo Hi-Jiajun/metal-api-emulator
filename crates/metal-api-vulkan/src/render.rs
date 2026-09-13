@@ -44,9 +44,66 @@ const BYTES_PER_TEXEL: u64 = 4;
 const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 
 // The reviewed stage modules of the milestone live in `render_spv/`: a
-// full-screen triangle vertex stage and a solid `40 80 c0 ff` fragment stage.
-// The rail itself takes the modules from a host registration, so only the
-// tests below (and the end-to-end crate test) name them directly.
+// full-screen triangle vertex stage plus one solid fragment stage per admitted
+// colour-attachment format. The vertex stage stays a host registration's value,
+// while the fragment stage is *not*: it is a function of the attachment format
+// (`solid_fragment_spirv`), because a fragment stage built for one format does
+// not describe another one. Pairing the fixed `vec4` store with every format is
+// exactly the "admitted, then read back the wrong bytes" path the 2026-09-14
+// review filed as I2.
+
+/// Entry point every reviewed solid fragment module declares.
+///
+/// One name for the whole set keeps the registration check and the execution
+/// check in terms of the same binding: `VkPipelineShaderStageCreateInfo::pName`
+/// names this entry, and a module that does not declare it would build a
+/// pipeline the trace did not describe.
+pub(crate) const SOLID_FRAGMENT_ENTRY: &str = "fragment_main";
+
+/// The reviewed solid fragment module for an 8-bit UNORM attachment.
+///
+/// One module serves both `VK_FORMAT_R8G8B8A8_UNORM` and
+/// `VK_FORMAT_B8G8R8A8_UNORM`, because which channel lands in which byte is the
+/// *image format's* decision rather than the shader's: the stage stores
+/// `(64/255, 128/255, 192/255, 1)` either way, so an R,G,B,A layout reads back
+/// `40 80 c0 ff` per texel and a B,G,R,A layout reads back `c0 80 40 ff`.
+/// Swizzling the store as well would undo the format's own reordering twice and
+/// land the other colour in those same bytes.
+const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8.frag.spv");
+
+/// The reviewed solid fragment module for a single-channel float attachment
+/// (`VK_FORMAT_R32_SFLOAT`).
+///
+/// A one-component attachment takes a one-component store: the same colour's
+/// red component, `64/255`, written as one `float`. The `vec4` store of the
+/// 8-bit module would not match this attachment's component shape, which is the
+/// half of I2 that is a genuine mismatch rather than a byte-order expectation.
+const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_r32f.frag.spv");
+
+/// The solid fragment module the offscreen rail builds for `format`.
+///
+/// The match is exhaustive over [`AttachmentFormat`] and has no default arm: a
+/// contract format that gains no arm here is a compile error, which is what
+/// makes "admitted but executed with another format's fragment stage"
+/// unrepresentable instead of merely tested. `R32Uint` is refused with the slug
+/// the contract and the format rail already use for it, so an integer
+/// attachment cannot reach a colour store.
+pub(crate) fn solid_fragment_spirv(
+    format: AttachmentFormat,
+) -> Result<&'static [u8], ProviderError> {
+    Ok(match format {
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
+        AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
+        AttachmentFormat::R32Uint => {
+            return Err(attachment_format_refusal()
+                .with_field(
+                    "format_code",
+                    FieldValue::Unsigned(u64::from(format.code())),
+                )
+                .with_detail("this rail has no colour fragment stage for the format"));
+        }
+    })
+}
 
 /// One offscreen render pass to execute.
 ///
@@ -54,7 +111,9 @@ const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 /// fields this rail consumes: the core type carries wiring identities
 /// (pipeline/view/allocation ids and a resolved byte source) that Step 3c maps,
 /// while Step 3b fixes the Vulkan-side execution against an already-chosen
-/// format, extent, clear value and shader pair.
+/// format, extent and clear value. The shader *pair* is not a field: the
+/// fragment half is chosen from the format by [`solid_fragment_spirv`], so a
+/// request cannot name a fragment stage the format was not compiled for.
 pub(crate) struct OffscreenRenderRequest<'a> {
     /// Colour attachment format, in render-contract terms.
     pub format: AttachmentFormat,
@@ -65,42 +124,24 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// contract carries bytes: a float clear is not parity-stable
     /// (`research/docs/23` §3.5).
     pub clear: ClearColor,
-    /// The two compiled stages the graphics pipeline is built from.
-    pub stages: RenderStageModules<'a>,
+    /// The vertex stage the graphics pipeline is built from.
+    pub vertex: OffscreenVertexStage<'a>,
 }
 
-/// The two compiled stage entries one offscreen render pipeline pairs.
+/// The vertex stage entry one offscreen render pipeline pairs with the rail's
+/// own fragment stage.
 ///
-/// The entry names travel with the modules because they are what the pipeline
+/// The entry name travels with the module because it is what the pipeline
 /// actually binds: `VkPipelineShaderStageCreateInfo::pName` names the SPIR-V
-/// entry point, so a contract whose two entries are not the modules' entries
-/// would build a pipeline the trace did not describe. Host-side registrations
-/// own the modules; this rail only reads them.
-pub(crate) struct RenderStageModules<'a> {
+/// entry point, so an entry the module does not declare would build a pipeline
+/// the trace did not describe. Host-side registrations own this module; this
+/// rail only reads it. The fragment half is deliberately absent — it belongs to
+/// the rail, because it is a function of the attachment format.
+pub(crate) struct OffscreenVertexStage<'a> {
     /// Entry point of the vertex-stage module.
-    pub vertex_entry: &'a str,
-    /// Entry point of the fragment-stage module.
-    pub fragment_entry: &'a str,
+    pub entry: &'a str,
     /// Vertex-stage SPIR-V module.
-    pub vertex_spirv: &'a [u8],
-    /// Fragment-stage SPIR-V module.
-    pub fragment_spirv: &'a [u8],
-}
-
-impl<'a> RenderStageModules<'a> {
-    pub(crate) const fn new(
-        vertex_entry: &'a str,
-        fragment_entry: &'a str,
-        vertex_spirv: &'a [u8],
-        fragment_spirv: &'a [u8],
-    ) -> Self {
-        Self {
-            vertex_entry,
-            fragment_entry,
-            vertex_spirv,
-            fragment_spirv,
-        }
-    }
+    pub spirv: &'a [u8],
 }
 
 /// One host-registered render pipeline: the two compiled stage modules and the
@@ -109,7 +150,9 @@ impl<'a> RenderStageModules<'a> {
 /// The compute rail keeps one translated artifact per `PipelineId` in the
 /// provider registry; this is the render sibling of that value, stored in the
 /// same registry namespace so a trace's pipeline table stays the single source
-/// of which pipeline a pass names.
+/// of which pipeline a pass names. The fragment module is not free-form: it is
+/// the reviewed module of the contract's colour format, which is what
+/// [`fragment_stage_is_reviewed`] binds.
 pub(crate) struct RenderStages {
     pub contract: RenderPipelineContract,
     pub vertex_spirv: Vec<u8>,
@@ -123,7 +166,9 @@ impl RenderStages {
     /// per-registration facts: an empty entry name, a name carrying an interior
     /// NUL and a module that is not a whole number of SPIR-V words are refused
     /// once, at registration, instead of on every submission that names the
-    /// pipeline.
+    /// pipeline. The same place binds the fragment stage to the contract's
+    /// colour format, for the same reason: the registration is where the pairing
+    /// is settled, so a trace never sees a pairing this rail cannot execute.
     pub(crate) fn validate(&self) -> Result<(), ProviderError> {
         self.contract
             .validate()
@@ -150,17 +195,58 @@ impl RenderStages {
                 );
             }
         }
+        // The fragment stage has to be the reviewed module for the format this
+        // contract declares. The rail cannot read a module's semantics, so
+        // binding the registration to the reviewed set is what refuses "this
+        // format, that format's fragment stage" *before* a submission can read
+        // back bytes the format claim does not cover (review item I2,
+        // 2026-09-14): an `R32Float` pipeline handed the 8-bit module's `vec4`
+        // store is a component-shape mismatch, not a byte-order preference.
+        if !fragment_stage_is_reviewed(self) {
+            return Err(fragment_stage_mismatch_refusal(
+                self.contract.color_format,
+                &self.contract.fragment_entry,
+            ));
+        }
         Ok(())
     }
+}
 
-    fn modules(&self) -> RenderStageModules<'_> {
-        RenderStageModules::new(
-            &self.contract.vertex_entry,
-            &self.contract.fragment_entry,
-            &self.vertex_spirv,
-            &self.fragment_spirv,
+/// Whether a registration's fragment stage is exactly the module this rail
+/// builds for the contract's colour format, under the entry that module
+/// declares.
+///
+/// Both ends of the rail ask this question — registration refuses a pairing
+/// once, and execution re-asks it of the value it was handed, so a
+/// directly-constructed [`RenderStages`] cannot skip the registration gate.
+fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
+    stages.contract.fragment_entry == SOLID_FRAGMENT_ENTRY
+        && solid_fragment_spirv(stages.contract.color_format)
+            .is_ok_and(|module| module == stages.fragment_spirv.as_slice())
+}
+
+/// The refusal for a fragment stage that is not the reviewed module of the
+/// pipeline's colour format.
+///
+/// A capability fact, like the other stage-module refusals: the rail has one
+/// reviewed fragment stage per admitted format and no second translation path,
+/// so it refuses the pairing instead of executing a module whose semantics it
+/// cannot check.
+fn fragment_stage_mismatch_refusal(format: AttachmentFormat, entry: &str) -> ProviderError {
+    capability_refusal("render_fragment_stage_mismatch")
+        .with_field(
+            "format_code",
+            FieldValue::Unsigned(u64::from(format.code())),
         )
-    }
+        .with_field("fragment_entry", FieldValue::Text(entry.to_owned()))
+        .with_field(
+            "reviewed_entry",
+            FieldValue::Text(SOLID_FRAGMENT_ENTRY.to_owned()),
+        )
+        .with_detail(
+            "the fragment stage is not the module this rail builds for the colour format, so \
+             running it would land bytes the format claim does not cover",
+        )
 }
 
 /// Execute one admitted render pass and return the attachment's tightly packed
@@ -174,7 +260,9 @@ impl RenderStages {
 /// attachment's previous bytes into the image, and a pass whose attachment
 /// list is not the single target the registered pipeline was built for. Both
 /// are refused as capability facts before any Vulkan object exists, never
-/// downgraded to a clear.
+/// downgraded to a clear. The registered fragment stage is re-checked against
+/// the pipeline's declared format in the same place, for the same reason: the
+/// pass is about to be executed with it.
 pub(crate) fn execute_render_pass(
     context: &VulkanContext,
     stages: &RenderStages,
@@ -184,6 +272,12 @@ pub(crate) fn execute_render_pass(
         .contract
         .validate_against(pass)
         .map_err(|error| contract_refusal(&error.to_string()))?;
+    if !fragment_stage_is_reviewed(stages) {
+        return Err(fragment_stage_mismatch_refusal(
+            stages.contract.color_format,
+            &stages.contract.fragment_entry,
+        ));
+    }
     let [attachment] = pass.color_attachments.as_slice() else {
         return Err(capability_refusal("color_attachment_limit")
             .with_field(
@@ -226,7 +320,10 @@ pub(crate) fn execute_render_pass(
         format: attachment.format,
         extent: [width, height],
         clear,
-        stages: stages.modules(),
+        vertex: OffscreenVertexStage {
+            entry: &stages.contract.vertex_entry,
+            spirv: &stages.vertex_spirv,
+        },
     };
     execute_offscreen_render(context, &request)
 }
@@ -328,7 +425,8 @@ pub(crate) fn admit_color_attachment(
 /// Execute one offscreen render pass and return the attachment's tightly packed
 /// texel bytes (`width * height * 4`).
 ///
-/// Contract format admission, the device's `COLOR_ATTACHMENT` bit and the
+/// Contract format admission, the fragment stage the format selects
+/// ([`solid_fragment_spirv`]), the device's `COLOR_ATTACHMENT` bit and the
 /// `TRANSFER_SRC` bit the readback needs all run before the first
 /// `vkCreateImage`, so an unsupported request is refused instead of being
 /// handed to the driver.
@@ -337,6 +435,10 @@ pub(crate) fn execute_offscreen_render(
     request: &OffscreenRenderRequest<'_>,
 ) -> Result<Vec<u8>, ProviderError> {
     let format = attachment_vk_format(request.format)?;
+    // The fragment stage is the format's, not the caller's: `request` carries no
+    // fragment module, so this is the only place one is named and there is no
+    // pairing left to get wrong.
+    let fragment_spirv = solid_fragment_spirv(request.format)?;
     let tiling = vk::ImageTiling::OPTIMAL;
     admit_color_attachment(context, format, tiling)?;
     if !format_features(context, format, tiling).contains(vk::FormatFeatureFlags::TRANSFER_SRC) {
@@ -363,12 +465,12 @@ pub(crate) fn execute_offscreen_render(
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
-    let vertex_words = spirv_words(request.stages.vertex_spirv)
+    let vertex_words = spirv_words(request.vertex.spirv)
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
-    let fragment_words = spirv_words(request.stages.fragment_spirv)
+    let fragment_words = spirv_words(fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
-    let vertex_entry = stage_entry_cstring("vertex", request.stages.vertex_entry)?;
-    let fragment_entry = stage_entry_cstring("fragment", request.stages.fragment_entry)?;
+    let vertex_entry = stage_entry_cstring("vertex", request.vertex.entry)?;
+    let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
     let mut objects = OffscreenObjects::new(context);
     objects.create_attachment(format, width, height)?;
@@ -1065,34 +1167,82 @@ mod tests {
         include_bytes!("render_spv/fullscreen_triangle.vert.spv");
 
     /// Fragment stage: writes `(64/255, 128/255, 192/255, 1)`, which an 8-bit UNORM
-    /// attachment stores as `40 80 c0 ff`.
+    /// attachment stores as `40 80 c0 ff` (R,G,B,A) or `c0 80 40 ff` (B,G,R,A).
     ///
     /// The constants are byte/255 rather than the round decimals `0.25/0.5/0.75`
     /// on purpose: `0.5 * 255 = 127.5` is a half-integer tie, and the probe read
     /// `0x80` back on Lavapipe but `0x7f` on both the NVIDIA driver and dzn
     /// (`research/docs/23` §3.5). Byte/255 values sit at least 3.7e-6 away from a
     /// tie on every driver, so they are the parity-stable discipline the fixture
-    /// has to follow.
-    const SOLID_RGBA8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_rgba8.frag.spv");
+    /// has to follow. The same discipline is what the float stage's `64/255`
+    /// follows, so the three formats write the same nominal colour.
+    const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8.frag.spv");
+
+    /// Fragment stage of the `R32_SFLOAT` attachment: the same colour's red
+    /// component, `64/255`, as one `float`.
+    const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_r32f.frag.spv");
 
     /// The readback a 2×2 `R8G8B8A8_UNORM` attachment must hold when the
     /// fragment shader stores `64/255, 128/255, 192/255, 1`.
-    const EXPECTED_TEXELS: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
+    const EXPECTED_RGBA8_TEXELS: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
+
+    /// The same colour in a `B8G8R8A8_UNORM` attachment: the *bytes* carry the
+    /// B,G,R,A order the image format asks for, so the first byte is the stored
+    /// blue (`0xc0` = 192) and the third is the stored red (`0x40` = 64).
+    const EXPECTED_BGRA8_TEXELS: [u8; 4] = [0xc0, 0x80, 0x40, 0xff];
+
+    /// One texel of an `R32_SFLOAT` attachment: the little-endian bytes of the
+    /// `float` `64/255` (`0x3e808081`) the float stage stores. Every texel is the
+    /// same four bytes, because a float attachment quantises nothing.
+    const EXPECTED_R32F_TEXEL: [u8; 4] = [0x81, 0x80, 0x80, 0x3e];
 
     /// The `LoadOp::Clear` sentinel (`research/docs/23` §1.3): a texel that
     /// still holds it proves the draw did not cover that pixel.
     const CLEAR_SENTINEL: u8 = 0xfe;
 
-    /// The two reviewed stage modules of the milestone, under the entry names
-    /// their `.spvasm` sources declare. The names have to differ: core refuses a
-    /// contract whose vertex and fragment entries are the same name.
-    fn milestone_stages() -> RenderStageModules<'static> {
-        RenderStageModules::new(
-            "vertex_main",
-            "fragment_main",
-            FULL_SCREEN_TRIANGLE_VERT_SPV,
-            SOLID_RGBA8_FRAG_SPV,
-        )
+    /// The reviewed vertex stage of the milestone, under the entry name its
+    /// `.spvasm` source declares.
+    fn milestone_vertex() -> OffscreenVertexStage<'static> {
+        OffscreenVertexStage {
+            entry: "vertex_main",
+            spirv: FULL_SCREEN_TRIANGLE_VERT_SPV,
+        }
+    }
+
+    /// One registration for `format` whose fragment stage is the reviewed module
+    /// for that format.
+    fn reviewed_stages(format: AttachmentFormat) -> RenderStages {
+        RenderStages {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
+                color_format: format,
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: solid_fragment_spirv(format)
+                .expect("every admitted format has a reviewed stage")
+                .to_vec(),
+        }
+    }
+
+    /// One 2×2 render pass naming an attachment of `format`, holding the clear
+    /// sentinel the coverage assertions look for.
+    fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            pipeline: PipelineId::new(11),
+            color_attachments: vec![RenderAttachment {
+                view_id: ViewId::new(21),
+                allocation_id: AllocationId::new(31),
+                format,
+                width: 2,
+                height: 2,
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+                store: StoreOp::Store,
+            }],
+            viewport: [0, 0, 2, 2],
+            vertices: 3,
+        }
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -1111,6 +1261,122 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// Execute the milestone's 2×2 offscreen pass against `format` and return the
+    /// readback, printing the raw bytes so the run's log carries the evidence the
+    /// assertions below are about.
+    fn offscreen_readback(context: &VulkanContext, format: AttachmentFormat) -> Vec<u8> {
+        let texels = execute_offscreen_render(
+            context,
+            &OffscreenRenderRequest {
+                format,
+                extent: [2, 2],
+                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                vertex: milestone_vertex(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("the 2x2 {format:?} render pass executes: {error:?}"));
+        eprintln!(
+            "{format:?} readback: {} (first texel: {})",
+            hex(&texels),
+            hex(&texels[..4])
+        );
+        texels
+    }
+
+    /// The rail's structural guarantee, stated without a device: `format` selects
+    /// the fragment stage, the map is total over the admitted formats, and the one
+    /// format outside the increment has no stage at all.
+    #[test]
+    fn every_admitted_format_selects_a_reviewed_fragment_stage() {
+        // `solid_fragment_spirv` matches every `AttachmentFormat` variant with no
+        // default arm, so "the map covers the contract" is a compile-time fact;
+        // what is checked here is the content of each arm.
+        for format in AttachmentFormat::ADMITTED {
+            let module = solid_fragment_spirv(format).expect("an admitted format has a stage");
+            assert!(
+                spirv_words(module).is_some(),
+                "{format:?} must name a whole number of SPIR-V words: {} bytes",
+                module.len()
+            );
+        }
+        assert_eq!(
+            solid_fragment_spirv(AttachmentFormat::Rgba8Unorm).expect("admitted"),
+            SOLID_UNORM8_FRAG_SPV
+        );
+        // The B,G,R,A layout shares the 8-bit module on purpose: the channel order
+        // lives in the image format, so the bytes differ while the stage does not.
+        assert_eq!(
+            solid_fragment_spirv(AttachmentFormat::Bgra8Unorm).expect("admitted"),
+            SOLID_UNORM8_FRAG_SPV
+        );
+        assert_eq!(
+            solid_fragment_spirv(AttachmentFormat::R32Float).expect("admitted"),
+            SOLID_R32F_FRAG_SPV
+        );
+        // ... and the float stage is a different module: a one-component
+        // attachment cannot take the 8-bit module's `vec4` store.
+        assert_ne!(SOLID_UNORM8_FRAG_SPV, SOLID_R32F_FRAG_SPV);
+        // `R32Uint` is the contract format outside the increment, refused with the
+        // slug the contract and the format rail already use for it.
+        let refused =
+            solid_fragment_spirv(AttachmentFormat::R32Uint).expect_err("R32Uint has no stage");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "attachment_format_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("format_code"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// The registration gate: a colour format cannot be paired with another
+    /// format's fragment stage, and the pairing that used to be the I2 path (the
+    /// 8-bit module's `vec4` store on an `R32Float` attachment) is refused
+    /// instead of executed.
+    #[test]
+    fn a_registration_refuses_a_format_with_another_formats_fragment_stage() {
+        for format in AttachmentFormat::ADMITTED {
+            reviewed_stages(format)
+                .validate()
+                .unwrap_or_else(|error| panic!("{format:?} is a reviewed pairing: {error:?}"));
+        }
+
+        // The pre-fix pairing: a `vec4` store on the one-component float
+        // attachment.
+        let mut stages = reviewed_stages(AttachmentFormat::R32Float);
+        stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
+        let refused = stages
+            .validate()
+            .expect_err("a vec4 store cannot describe an R32Float attachment");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("format_code"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::R32Float.code()
+            )))
+        );
+
+        // The same module under the other UNORM layout stays accepted: one module,
+        // two layouts. The gate refuses formats' shapes, not the fixture's hash.
+        let mut stages = reviewed_stages(AttachmentFormat::Bgra8Unorm);
+        stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
+        stages
+            .validate()
+            .expect("the 8-bit module is reviewed for both UNORM layouts");
+
+        // An entry name that is not the module's own entry cannot be bound, so it
+        // is refused with the same slug.
+        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        stages.contract.fragment_entry = "frag_other".to_owned();
+        let refused = stages
+            .validate()
+            .expect_err("the reviewed module declares fragment_main");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
     }
 
     #[test]
@@ -1193,7 +1459,7 @@ mod tests {
             format: AttachmentFormat::R32Uint,
             extent: [2, 2],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            stages: milestone_stages(),
+            vertex: milestone_vertex(),
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("R32Uint is refused before any Vulkan object exists");
@@ -1204,25 +1470,18 @@ mod tests {
         assert_eq!(context.buffer_copy_counts(), (0, 0));
     }
 
+    /// The 8-bit R,G,B,A layout of the milestone's colour.
     #[test]
-    fn offscreen_full_screen_triangle_reads_back_the_expected_texels() {
+    fn offscreen_rgba8_attachment_reads_back_the_stored_colour_bytes() {
         let Some(context) = device_context() else {
             return;
         };
-        let request = OffscreenRenderRequest {
-            format: AttachmentFormat::Rgba8Unorm,
-            extent: [2, 2],
-            clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            stages: milestone_stages(),
-        };
         let (uploads_before, readbacks_before) = context.buffer_copy_counts();
-        let texels =
-            execute_offscreen_render(&context, &request).expect("the 2x2 render pass executes");
+        let texels = offscreen_readback(&context, AttachmentFormat::Rgba8Unorm);
         let (uploads_after, readbacks_after) = context.buffer_copy_counts();
 
-        eprintln!("readback texels: {}", hex(&texels));
         assert_eq!(texels.len(), 16);
-        assert_eq!(texels, EXPECTED_TEXELS.repeat(4));
+        assert_eq!(texels, EXPECTED_RGBA8_TEXELS.repeat(4));
         assert!(
             !texels.contains(&CLEAR_SENTINEL),
             "a surviving clear sentinel means the triangle did not cover every texel: {}",
@@ -1234,6 +1493,76 @@ mod tests {
         assert_eq!(readbacks_after, readbacks_before + 1);
     }
 
+    /// The same colour through the same module, read back in the B,G,R,A byte
+    /// order the image format asks for.
+    #[test]
+    fn offscreen_bgra8_attachment_reads_back_the_same_colour_in_bgra_order() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let texels = offscreen_readback(&context, AttachmentFormat::Bgra8Unorm);
+
+        assert_eq!(texels.len(), 16);
+        assert_eq!(texels, EXPECTED_BGRA8_TEXELS.repeat(4));
+        // The channel order is asserted, not just the byte count: the stage's
+        // first component is the stored red `0x40`, and a B,G,R,A texel puts it
+        // third, behind the stored blue `0xc0` and green `0x80`.
+        assert_eq!(texels[0], 0xc0, "byte 0 is the stored blue (192/255)");
+        assert_eq!(texels[1], 0x80, "byte 1 is the stored green (128/255)");
+        assert_eq!(texels[2], 0x40, "byte 2 is the stored red (64/255)");
+        assert_eq!(texels[3], 0xff, "byte 3 is the stored alpha");
+        // Same colour, different layout: the R,G,B,A expectation is this
+        // readback with the red and blue bytes exchanged.
+        assert_eq!(
+            EXPECTED_RGBA8_TEXELS,
+            [texels[2], texels[1], texels[0], texels[3]]
+        );
+        assert_ne!(
+            texels,
+            EXPECTED_RGBA8_TEXELS.repeat(4),
+            "a B,G,R,A attachment cannot read back the R,G,B,A bytes"
+        );
+        assert!(
+            !texels.contains(&CLEAR_SENTINEL),
+            "a surviving clear sentinel means the triangle did not cover every texel: {}",
+            hex(&texels)
+        );
+    }
+
+    /// The single-channel float attachment: one `float` per texel and no UNORM
+    /// quantisation, so the four bytes are the stored float's own bytes.
+    #[test]
+    fn offscreen_r32float_attachment_reads_back_one_float_per_texel() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let texels = offscreen_readback(&context, AttachmentFormat::R32Float);
+
+        assert_eq!(texels.len(), 16);
+        assert_eq!(texels, EXPECTED_R32F_TEXEL.repeat(4));
+        let stored = f32::from_le_bytes(texels[..4].try_into().expect("four bytes per texel"));
+        // The readback is the float the stage stored, bit for bit, and that float
+        // is the same `64/255` the 8-bit module's red channel carries.
+        assert_eq!(stored.to_bits(), 0x3e80_8081);
+        assert_eq!(stored, 64.0_f32 / 255.0);
+        assert_eq!(
+            (64.0_f32 / 255.0).to_le_bytes(),
+            EXPECTED_R32F_TEXEL,
+            "the frozen expectation is the f32 form of the 8-bit path's red channel"
+        );
+        // A float attachment's clear is `byte/255` as a float, exactly as
+        // `OffscreenObjects::record` builds it, so the sentinel is those four
+        // bytes rather than the 8-bit sentinel itself.
+        let clear_bytes = (f32::from(CLEAR_SENTINEL) / 255.0).to_le_bytes();
+        assert!(
+            !texels
+                .chunks_exact(4)
+                .any(|texel| texel == clear_bytes.as_slice()),
+            "a surviving clear sentinel means the triangle did not cover every texel: {}",
+            hex(&texels)
+        );
+    }
+
     #[test]
     fn offscreen_render_refuses_a_zero_extent() {
         let Some(context) = device_context() else {
@@ -1243,7 +1572,7 @@ mod tests {
             format: AttachmentFormat::Rgba8Unorm,
             extent: [2, 0],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            stages: milestone_stages(),
+            vertex: milestone_vertex(),
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("a zero-dimension attachment is a contract refusal");
@@ -1258,12 +1587,12 @@ mod tests {
         let stages = |vertex_entry: &str, vertex_spirv: Vec<u8>| RenderStages {
             contract: RenderPipelineContract {
                 vertex_entry: vertex_entry.to_owned(),
-                fragment_entry: "fragment_main".to_owned(),
+                fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
                 color_format: AttachmentFormat::Rgba8Unorm,
                 vertex_layout: VertexLayout::None,
             },
             vertex_spirv,
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
         };
         assert!(
             stages("vertex_main", FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec())
@@ -1300,6 +1629,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execute_render_pass_refuses_a_mismatched_fragment_stage_before_the_device() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        // A `RenderStages` built by hand, i.e. one that never passed the
+        // registration gate: the execution side re-asks the same question, so the
+        // pairing is still refused rather than executed.
+        let mut stages = reviewed_stages(AttachmentFormat::R32Float);
+        stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
+        let pass = milestone_pass(AttachmentFormat::R32Float);
+        pass.validate().expect("the fixture pass is a legal shape");
+        let refused = execute_render_pass(&context, &stages, &pass)
+            .expect_err("the mismatched pairing is refused before any Vulkan object exists");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        // No upload and no readback: the refusal precedes vkCreateImage.
+        assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
     /// `LoadOp::Load` has no rail that carries an attachment's previous bytes
     /// into the image, so the first increment refuses it instead of storing a
     /// clear under a name the trace did not ask for.
@@ -1308,30 +1658,8 @@ mod tests {
         let Some(context) = device_context() else {
             return;
         };
-        let stages = RenderStages {
-            contract: RenderPipelineContract {
-                vertex_entry: "vertex_main".to_owned(),
-                fragment_entry: "fragment_main".to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
-                vertex_layout: VertexLayout::None,
-            },
-            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV.to_vec(),
-        };
-        let mut pass = RenderPassDescriptor {
-            pipeline: PipelineId::new(11),
-            color_attachments: vec![RenderAttachment {
-                view_id: ViewId::new(21),
-                allocation_id: AllocationId::new(31),
-                format: AttachmentFormat::Rgba8Unorm,
-                width: 2,
-                height: 2,
-                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
-                store: StoreOp::Store,
-            }],
-            viewport: [0, 0, 2, 2],
-            vertices: 3,
-        };
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
         let refused = execute_render_pass(&context, &stages, &pass)

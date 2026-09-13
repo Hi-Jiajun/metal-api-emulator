@@ -1,15 +1,24 @@
-; 本文件是 solid_rgba8.frag.spv 的可读源，由渲染轨道的测试 include_bytes! 内嵌
+; 本文件是 solid_unorm8.frag.spv 的可读源，由渲染轨道的 include_bytes! 内嵌
 ; （crates/metal-api-vulkan/src/render.rs、crates/metal-api-vulkan/tests/render_e2e.rs）。复现命令：
-;   spirv-as --target-env vulkan1.0 solid_rgba8.frag.spvasm -o solid_rgba8.frag.spv
+;   spirv-as --target-env vulkan1.0 solid_unorm8.frag.spvasm -o solid_unorm8.frag.spv
 ; 来源：/var/tmp/render-probe/shaders/solid_rgba8.frag.spvasm（linear/optimal 附件探针）。
 ; 入口名 fragment_main：core 的 RenderPipelineContract 拒绝 vertex/fragment 同名入口
 ; （两段名必须区分），所以本文件的入口名从探针的 "main" 改为 "fragment_main"，
 ; 着色器行为与探针一致（探针本身不依赖入口名）。
+;
+; 本模块服务两个 8-bit UNORM 准入格式：VK_FORMAT_R8G8B8A8_UNORM 与
+; VK_FORMAT_B8G8R8A8_UNORM。"哪个通道落进哪个字节"是 VkFormat 决定的，不是着色器
+; 决定的，所以两个布局共用这一个 vec4 store 才是语义正确的：着色器无论哪种布局都写
+; 同一个颜色，读回字节随布局不同——
+;   R8G8B8A8_UNORM 布局 -> 40 80 c0 ff（R,G,B,A）
+;   B8G8R8A8_UNORM 布局 -> c0 80 40 ff（B,G,R,A）
+; 若再做一次通道交换（把 store 写成 b,g,r），就是替驱动重复了一次重排，
+; 同一批字节里落的会是另一个颜色。文件名从 solid_rgba8 改为 solid_unorm8 就是这个原因。
+;
 ; 片元着色器：写固定颜色 (64/255, 128/255, 192/255, 1.0)
 ; 取"字节值本身 / 255"而不是 0.25/0.5/0.75，是为了避开 f*255 落在半整数上的 tie
 ; （0.5*255 = 127.5 的 tie-break 实现相关，见 --tie-probe）。
-; 8-bit UNORM 附件上的期望字节 = 40 80 c0 ff（round(f*255)，f 离整数 ≥3.7e-6）
-; 16-bit 半浮点附着上的期望字节 = 04 34 04 38 06 3a 00 3c
+; 8-bit UNORM 附件上的期望字节 = round(f*255)，f 离整数 ≥3.7e-6
                OpCapability Shader
           %glsl = OpExtInstImport "GLSL.std.450"
                OpMemoryModel Logical GLSL450
