@@ -12,10 +12,10 @@ use metal_api_core::provider::{
     AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease, BufferSource,
     BufferView, CompletionDisposition, CompletionPolicy, CompletionToken, ComputePass,
     ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
-    FootprintProof, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
-    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
+    FootprintProof, HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation,
+    LeaseReservation, NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider,
+    ProviderError, ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest,
+    ShaderSource, StagedLease, StorageMode, SubmissionId, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
@@ -125,6 +125,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     println!("SKIP provider_ipc_process cases transport=unix reason=platform");
     run_staged_lease(Arc::clone(&executor))?;
     run_borrowed_lease(Arc::clone(&executor))?;
+    run_host_region_window(Arc::clone(&executor))?;
     run_object_queue_ordering()?;
     run_object_disjoint_views()?;
     run_sampled_texture_read(Arc::clone(&executor))?;
@@ -1710,6 +1711,111 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
 /// provider reads and writes the live mapping: one mutates owner memory after
 /// import and observes the new value on the GPU, and one writes through the
 /// GPU directly into owner memory.
+/// Guest memory step 2 (`research/docs/19`): the owner registers one host
+/// address range, derives a page-aligned window from it, imports the window
+/// without copying, writes through it on the device and observes the change in
+/// place before releasing the lease. This is the owner-side lifecycle the VM
+/// line will use for guest RAM.
+fn run_host_region_window(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err("provider does not advertise VK_EXT_external_memory_host".into());
+    }
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"host_region_window".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    // The "guest RAM" registration: 8 KiB of page-aligned host memory.
+    let page = alignment.max(4096);
+    let mut owner = AlignedBuffer::new(2 * usize::try_from(page)?, usize::try_from(page)?)?;
+    owner.as_mut_slice().fill(0);
+    let region = HostRegion {
+        lease_id: LeaseId::new(120),
+        owner_epoch: provider.device_epoch(),
+        host_pointer: owner.as_ptr() as usize,
+        length: 2 * page,
+        page_size: page,
+    };
+    region.validate()?;
+    // A window outside the registration must be refused by the owner type
+    // before any provider sees a pointer.
+    let refused = region
+        .borrowed_window(AllocationId::new(320), 0, 3 * page)
+        .expect_err("an out-of-bounds window must be refused");
+    if !matches!(
+        refused,
+        metal_api_core::provider::ContractError::HostRegionWindowOutOfBounds { .. }
+    ) {
+        return Err(format!("out-of-bounds window refused with {refused:?}").into());
+    }
+
+    let word = 0xfeed_face_u32;
+    let second_page = usize::try_from(page)?;
+    owner.as_mut_slice()[second_page..second_page + 4].copy_from_slice(&word.to_le_bytes());
+    // The lease window names the whole registered range (a provider slices one
+    // backing per allocation), and the payload lives in the second page.
+    let borrowed = region.borrowed_window(AllocationId::new(320), 0, 2 * page)?;
+    if borrowed.host_pointer != owner.as_ptr() as usize {
+        return Err("window pointer does not name the registration base".into());
+    }
+    // SAFETY: `owner` outlives the import and the submission below, and the
+    // window was validated against the registration above.
+    unsafe {
+        provider
+            .import_borrowed_lease(borrowed)
+            .map_err(provider_error)?;
+    }
+
+    let trace = borrowed_lease_trace_for(
+        provider.device_epoch(),
+        &pipeline,
+        region.lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(word.to_le_bytes().to_vec()),
+        401,
+        402,
+        320,
+    );
+    let resources =
+        borrowed_lease_resources_for(provider.device_epoch(), borrowed.reservation, 320, 2 * page)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    if !matches!(
+        result.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ) {
+        return Err(format!(
+            "host region window submission did not complete: {:?}",
+            result.completion
+        )
+        .into());
+    }
+    let observed = &owner.as_slice()[second_page..second_page + 4];
+    if observed != word.to_le_bytes() {
+        return Err(format!("guest window was not written in place: {observed:02x?}").into());
+    }
+    provider
+        .release_borrowed_lease(region.lease_id)
+        .map_err(provider_error)?;
+
+    println!(
+        "PASS provider_host_region_window page={page} window=1 import=no-copy write=in-place release=ok"
+    );
+    Ok(())
+}
+
 fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
     let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
     let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
@@ -2736,6 +2842,29 @@ fn borrowed_lease_trace(
     lease_view_id: u64,
     owned_view_id: u64,
 ) -> ComputeTrace {
+    borrowed_lease_trace_for(
+        epoch,
+        pipeline,
+        lease_id,
+        lease_access,
+        owned,
+        lease_view_id,
+        owned_view_id,
+        298,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_lease_trace_for(
+    epoch: DeviceEpoch,
+    pipeline: &CompiledComputePipeline,
+    lease_id: LeaseId,
+    lease_access: BufferAccess,
+    owned: BufferSource,
+    lease_view_id: u64,
+    owned_view_id: u64,
+    lease_allocation: u64,
+) -> ComputeTrace {
     let owned_access = match lease_access {
         BufferAccess::Read => BufferAccess::Write,
         BufferAccess::Write => BufferAccess::Read,
@@ -2744,7 +2873,7 @@ fn borrowed_lease_trace(
     let lease_view = |metal_binding| BufferView {
         view_id: ViewId::new(lease_view_id),
         metal_binding,
-        allocation_id: AllocationId::new(298),
+        allocation_id: AllocationId::new(lease_allocation),
         offset: 0,
         length: 4,
         access: lease_access,
@@ -2790,11 +2919,20 @@ fn borrowed_lease_resources(
     epoch: DeviceEpoch,
     reservation: LeaseReservation,
 ) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    borrowed_lease_resources_for(epoch, reservation, 298, 64)
+}
+
+fn borrowed_lease_resources_for(
+    epoch: DeviceEpoch,
+    reservation: LeaseReservation,
+    lease_allocation: u64,
+    lease_size: u64,
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
     let mut resources = ResourceTableSnapshot::new();
     resources.insert_allocation(AllocationRecord {
-        allocation_id: AllocationId::new(298),
+        allocation_id: AllocationId::new(lease_allocation),
         owner_epoch: epoch,
-        size: 64,
+        size: lease_size,
     })?;
     resources.insert_allocation(AllocationRecord {
         allocation_id: AllocationId::new(299),
