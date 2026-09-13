@@ -224,6 +224,16 @@ struct Allocation {
     bytes_hex: String,
 }
 
+/// Device-buffer copy counters for one command buffer. A case that splits its
+/// dispatch sequence across several command buffers submits once per group, so
+/// the accumulated case counters cannot show which boundary copied what
+/// (`research/docs/15` §5b).
+#[derive(Serialize)]
+struct GroupCounts {
+    copy_in: u32,
+    copy_out: u32,
+}
+
 #[derive(Serialize)]
 struct CaseResult {
     id: String,
@@ -236,6 +246,12 @@ struct CaseResult {
     /// which is not a provider.
     copy_in: Option<u32>,
     copy_out: Option<u32>,
+    /// Per-command-buffer counters, one entry per committed command buffer and
+    /// in commit order. Recorded only for cases that split their sequence, so
+    /// the flat totals above stay the sum of the groups
+    /// (`research/docs/15` §5b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_counts: Option<Vec<GroupCounts>>,
 }
 
 #[derive(Serialize)]
@@ -432,7 +448,14 @@ fn main() -> Result<()> {
                     object_pipelines[&(program.entry.clone(), case.air_encoding)].clone()
                 })
                 .collect::<Vec<_>>();
-            run_object_case(device, &programs, case, suite.guard_byte, async_execution)?
+            run_object_case(
+                device,
+                &programs,
+                case,
+                suite.guard_byte,
+                async_execution,
+                &mut || counters.read(),
+            )?
         } else {
             run_case(
                 provider.as_ref(),
@@ -440,6 +463,7 @@ fn main() -> Result<()> {
                 case,
                 index as u64 + 1,
                 suite.guard_byte,
+                &mut || counters.read(),
             )?
         };
         let after = counters.read();
@@ -1287,6 +1311,7 @@ fn run_object_case(
     case: &Case,
     guard: u8,
     async_execution: bool,
+    counters: &mut dyn FnMut() -> (usize, usize),
 ) -> Result<CaseResult> {
     // Fixture IDs are report labels only. The object API creates and validates
     // its own allocation/view identities before they are mapped back here.
@@ -1354,10 +1379,12 @@ fn run_object_case(
         object_textures.insert(texture.binding, created);
     }
     let mut reported = Vec::new();
+    let mut group_counts = Vec::with_capacity(groups.len());
     // Each command buffer commits and completes before the next one records,
     // which matches Metal's serial queue boundary and re-snapshots the landed
     // bytes for the following command.
     for group in &groups {
+        let before = counters();
         let command = queue.command_buffer();
         // Several dispatches on one encoder exercise snapshot-at-dispatch behavior,
         // including changed pipelines, binding tables and later first use.
@@ -1413,6 +1440,11 @@ fn run_object_case(
                 .ok_or("unknown object writeback identity")?;
             reported.push((allocation, view, write.offset, write.bytes));
         }
+        let after = counters();
+        group_counts.push(GroupCounts {
+            copy_in: u32::try_from(after.0 - before.0)?,
+            copy_out: u32::try_from(after.1 - before.1)?,
+        });
     }
     let writebacks = merge_writebacks(case, reported)?;
     let mut allocations = Vec::new();
@@ -1439,6 +1471,7 @@ fn run_object_case(
         allocations,
         copy_in: None,
         copy_out: None,
+        group_counts: case.command_buffers.as_ref().map(|_| group_counts),
     })
 }
 
@@ -1448,6 +1481,7 @@ fn run_case(
     case: &Case,
     operation: u64,
     guard: u8,
+    counters: &mut dyn FnMut() -> (usize, usize),
 ) -> Result<CaseResult> {
     let mut resources = ResourceTableSnapshot::new();
     // One backing image and one AllocationRecord per allocation. A v10 fixture
@@ -1620,7 +1654,9 @@ fn run_case(
         eprintln!("Checked second-pipeline refusal guards: {}", case.id);
     }
     let mut reported = Vec::new();
+    let mut group_counts = Vec::with_capacity(groups.len());
     for (index, group) in groups.iter().enumerate() {
+        let before = counters();
         let views = case_views(&allocations)?;
         let selected = group
             .iter()
@@ -1682,6 +1718,11 @@ fn run_case(
         provider
             .release_completion(token)
             .map_err(|error| format!("release completion: {error:?}"))?;
+        let after = counters();
+        group_counts.push(GroupCounts {
+            copy_in: u32::try_from(after.0 - before.0)?,
+            copy_out: u32::try_from(after.1 - before.1)?,
+        });
     }
     let writebacks = merge_writebacks(case, reported)?;
     allocations.sort_by_key(|(id, _)| *id);
@@ -1698,6 +1739,7 @@ fn run_case(
             .collect(),
         copy_in: None,
         copy_out: None,
+        group_counts: case.command_buffers.as_ref().map(|_| group_counts),
     })
 }
 

@@ -211,6 +211,10 @@ def _suite_plan(suite):
                      f"{where}: first program buffer_slots must match initial buffer metadata")
         used_programs = set()
         used_views = set()
+        # Per-dispatch allocation touches and writes. A v9 case commits one
+        # command buffer per group, so these become the per-group count
+        # expectations (`research/docs/15` §5b).
+        dispatch_touches = []
         for dispatch in dispatches:
             selection = dispatch.get("program") if isinstance(dispatch, dict) else None
             if programs is not None:
@@ -235,11 +239,15 @@ def _suite_plan(suite):
                          f"{where}: binding map must cover every resource selected by program "
                          "slots and permute every resource in that selection exactly once")
             used_views.update(mapping)
+            touched, written = set(), set()
             for slot, view in zip(slots, mapping):
                 _require(views[view][2] == slot["length"],
                          f"{where}: rebound view does not fit the binding extent")
+                touched.add(views[view][0])
                 if slot["access"] != "read":
                     writable_views.add(view)
+                    written.add(views[view][0])
+            dispatch_touches.append((touched, written))
 
         if programs is not None:
             _require(used_programs == set(range(len(programs))), f"{where}: unused program entries")
@@ -247,6 +255,7 @@ def _suite_plan(suite):
                      f"{where}: unused buffer pool resources; every view must appear in a dispatch")
 
         command_buffers = case.get("command_buffers")
+        group_expectations = None
         if command_buffers is None:
             _require(suite["suite"] != "compute-buffer-v9",
                      f"{where}: v9 fixture requires command buffer groups")
@@ -265,6 +274,19 @@ def _suite_plan(suite):
                     expected += 1
             _require(expected == len(dispatches),
                      f"{where}: command buffer groups must partition the dispatch order")
+            # One submission per group: the provider copies in every
+            # allocation that group's own dispatches touch and copies out
+            # every allocation they write, so groups cannot be checked with
+            # the case-level totals (`research/docs/15` §5b).
+            group_expectations = []
+            for group in command_buffers:
+                touched, written = set(), set()
+                for index in group:
+                    touched.update(dispatch_touches[index][0])
+                    written.update(dispatch_touches[index][1])
+                group_expectations.append(
+                    (len(touched) + len(texture_allocations), len(written))
+                )
 
         writes, written_views = [], set()
         for value in _list(case.get("expected_writebacks"), f"{where}.expected_writebacks"):
@@ -280,7 +302,7 @@ def _suite_plan(suite):
             written_views.add(view)
             writes.append((identity, data))
         _require(written_views == writable_views, f"{where}: expected writebacks do not cover writable views")
-        plan[case_id] = (writes, allocations, len(texture_allocations))
+        plan[case_id] = (writes, allocations, len(texture_allocations), group_expectations)
     return plan
 
 
@@ -307,7 +329,6 @@ def validate_capture(suite, digest, report, required_backend=None):
     _string(report["platform"], "capture.platform")
     results = _list(report["results"], "capture.results")
     seen = set()
-    cases = {case.get("id"): case for case in suite["cases"] if isinstance(case, dict)}
     # The Swift reference oracle reports bytes but not device-buffer copy
     # counters: it is not a provider. The count contract therefore applies to
     # every other backend (research/docs/15 §5).
@@ -317,9 +338,11 @@ def validate_capture(suite, digest, report, required_backend=None):
                  "capture result: expected an object with an id")
         base = {"id", "completion", "writebacks", "allocations"}
         counted = base | {"copy_in", "copy_out"}
-        _require(set(result) in (base, counted),
+        grouped = counted | {"group_counts"}
+        _require(set(result) in (base, counted, grouped),
                  "capture result: expected fields "
-                 + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out")
+                 + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
+                 " plus the per-command-buffer group_counts")
         counts = (result.get("copy_in"), result.get("copy_out"))
         _require((counts[0] is None) == (counts[1] is None),
                  "capture result: copy_in and copy_out are recorded together")
@@ -330,7 +353,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         seen.add(case_id)
         _require(result["completion"] == "CompletedVisible",
                  f"{where}: completion must be CompletedVisible, got {result['completion']!r}")
-        expected_writes, expected_allocations, texture_count = plan[case_id]
+        expected_writes, expected_allocations, texture_count, group_expectations = plan[case_id]
         actual_writes, identities = [], set()
         for value in _list(result["writebacks"], f"{where}.writebacks"):
             identity, data = _writeback(value, f"{where} writeback")
@@ -364,11 +387,54 @@ def validate_capture(suite, digest, report, required_backend=None):
         if counts[0] is not None:
             _integer(counts[0], f"{where}.copy_in")
             _integer(counts[1], f"{where}.copy_out")
-        # A case split across command buffers submits once per group and the
-        # counters accumulate, so the derived expectation only applies to cases
-        # with a single submission (research/docs/15 §5).
-        single_submission = "command_buffers" not in cases.get(case_id, {})
-        if provider_backend and single_submission and counts[0] is not None:
+        groups = result.get("group_counts")
+        if groups is not None:
+            _list(groups, f"{where}.group_counts")
+            _require(counts[0] is not None,
+                     f"{where}: group_counts require the summed copy_in and copy_out")
+            _require(group_expectations is not None,
+                     f"{where}: group_counts are only recorded for cases split "
+                     "across command buffers")
+        elif provider_backend and counts[0] is not None and group_expectations is not None:
+            # The v9 count contract is per submission, so a provider capture of
+            # a split case that only reports the accumulated totals stays
+            # unverifiable and is refused (`research/docs/15` §5b).
+            raise CaptureError(
+                f"{where}: a case split across command buffers must report "
+                "per-command-buffer group_counts when it reports counters")
+        if groups is not None and provider_backend:
+            # One submission per command buffer: the expectation is that
+            # group's own touched and written allocations, and the flat
+            # counters are their sums (research/docs/15 §5b).
+            _require(len(groups) == len(group_expectations),
+                     f"{where}: expected {len(group_expectations)} command buffer "
+                     f"groups, got {len(groups)}")
+            total_in = total_out = 0
+            for position, (group, (expected_in, expected_out)) in enumerate(
+                    zip(groups, group_expectations)):
+                _object(group, ("copy_in", "copy_out"),
+                        f"{where} command buffer {position}")
+                group_in = _integer(group["copy_in"],
+                                    f"{where} command buffer {position}.copy_in")
+                group_out = _integer(group["copy_out"],
+                                     f"{where} command buffer {position}.copy_out")
+                _require(group_in == expected_in,
+                         f"{where}: command buffer {position} copy_in {group_in} does "
+                         f"not match {expected_in} touched allocations")
+                _require(group_out == expected_out,
+                         f"{where}: command buffer {position} copy_out {group_out} does "
+                         f"not match {expected_out} written allocations")
+                total_in += group_in
+                total_out += group_out
+            _require(counts[0] == total_in,
+                     f"{where}: copy_in {counts[0]} does not match the {total_in} "
+                     f"summed over {len(groups)} command buffers")
+            _require(counts[1] == total_out,
+                     f"{where}: copy_out {counts[1]} does not match the {total_out} "
+                     f"summed over {len(groups)} command buffers")
+        # A case with a single submission submits its whole sequence once, so
+        # the derived expectation is the case-level one (research/docs/15 §5).
+        if provider_backend and group_expectations is None and counts[0] is not None:
             expected_in = len(expected_allocations) + texture_count
             expected_out = len({identity[0] for identity, _ in expected_writes})
             _require(counts[0] == expected_in,

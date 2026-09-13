@@ -233,6 +233,15 @@ the reviewed MSL fixture. Native v8 passed
 and complete in order, and the capture merges the per-view final landed bytes.
 See [SUITE-V9.md](SUITE-V9.md).
 
+Because every command buffer is its own submission, provider reports for these
+cases carry `group_counts`: one `copy_in`/`copy_out` pair per committed command
+buffer, each counting one device-buffer operation per allocation that group's
+own dispatches touch or write. The flat `copy_in`/`copy_out` of the case remain
+the sum over the groups. `compare.py` refuses a provider capture whose group
+number, per-group counters or summed totals disagree with the fixture, instead
+of skipping split cases; single-submission cases keep the case-level contract,
+and the Swift oracle stays outside both (research/docs/15 §5b).
+
 ## Ranged aliasing
 
 [suite-v10.json](suite-v10.json) binds two **disjoint views of one allocation**
