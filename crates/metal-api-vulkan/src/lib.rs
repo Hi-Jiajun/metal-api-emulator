@@ -824,12 +824,46 @@ pub(crate) fn execute_submission_with_status(
 }
 
 /// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
-/// Pool keys identify backing buffers; they are not Vulkan descriptor indices.
+/// A Metal argument index is not unique across resource kinds: the translator
+/// reports a sampled texture and a buffer under the same index, so the pool key
+/// carries the kind as well (`research/docs/16` §4.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum PoolKind {
+    Buffer,
+    Texture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PoolKey {
+    pub kind: PoolKind,
+    pub index: u32,
+}
+
+impl PoolKey {
+    pub(crate) const fn buffer(index: u32) -> Self {
+        Self {
+            kind: PoolKind::Buffer,
+            index,
+        }
+    }
+}
+
+/// One Metal binding: the argument index plus the pool resource it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Binding {
+    pub metal_index: u32,
+    pub key: PoolKey,
+    /// The binding width the planner validates: the pool window in bytes for a
+    /// buffer, the tightly packed extent for a texture.
+    pub width: usize,
+}
+
+/// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
 #[derive(Clone, Debug)]
 pub(crate) struct BoundDispatch {
     pub grid: [u32; 3],
     pub local: [u32; 3],
-    pub bindings: Vec<(u32, u32)>,
+    pub bindings: Vec<Binding>,
 }
 
 /// Execute one to eight ordered dispatches with one pipeline and buffer set.
@@ -1093,8 +1127,8 @@ fn identity_dispatches<T: PoolWidth>(
 ) -> Vec<BoundDispatch> {
     // Textures share the Metal argument index space with buffers (a fixture
     // reports texture 0 and buffer 0), so their pool keys are offset into a
-    // separate range.
-    const TEXTURE_POOL_KEY_BASE: u32 = 1 << 20;
+    // separate range and the kind is carried explicitly.
+    let texture_base = u32::try_from(buffers.len()).unwrap_or(u32::MAX);
     dispatches
         .iter()
         .map(|&(grid, local)| BoundDispatch {
@@ -1102,12 +1136,18 @@ fn identity_dispatches<T: PoolWidth>(
             local,
             bindings: buffers
                 .iter()
-                .map(|buffer| (buffer.pool_index(), buffer.pool_index()))
-                .chain(textures.iter().map(|texture| {
-                    (
-                        texture.metal_binding,
-                        TEXTURE_POOL_KEY_BASE + texture.metal_binding,
-                    )
+                .map(|buffer| Binding {
+                    metal_index: buffer.pool_index(),
+                    key: PoolKey::buffer(buffer.pool_index()),
+                    width: buffer.pool_len(),
+                })
+                .chain(textures.iter().map(|texture| Binding {
+                    metal_index: texture.metal_binding,
+                    key: PoolKey {
+                        kind: PoolKind::Texture,
+                        index: texture_base + texture.metal_binding,
+                    },
+                    width: usize::try_from(texture.expected_bytes().unwrap_or(0)).unwrap_or(0),
                 }))
                 .collect(),
         })
@@ -1197,33 +1237,43 @@ fn plan_pipeline_sequence<T: PoolWidth>(
         }
         let mut pass_pool_keys = BTreeSet::new();
         let mut widths = Vec::with_capacity(dispatch.bindings.len());
-        for &(metal_index, pool_key) in &dispatch.bindings {
-            let buffer = pool.get(&pool_key).ok_or_else(|| {
-                dispatch_args_error(failure(format!("unknown buffer pool key {pool_key}")))
-            })?;
-            if !pass_pool_keys.insert(pool_key) {
+        for binding in &dispatch.bindings {
+            if binding.key.kind == PoolKind::Buffer && !pool.contains_key(&binding.key.index) {
                 return Err(dispatch_args_error(failure(format!(
-                    "buffer pool key {pool_key} is bound more than once in one pass",
+                    "unknown buffer pool key {}",
+                    binding.key.index
                 ))));
             }
-            widths.push((metal_index, buffer.pool_len()));
+            if !pass_pool_keys.insert(binding.key) {
+                return Err(dispatch_args_error(failure(format!(
+                    "pool key {binding:?} is bound more than once in one pass",
+                ))));
+            }
+            // Buffer width validation speaks about buffer bindings only; a
+            // texture binding shares the Metal index space and is checked by
+            // `create_textures` instead.
+            if binding.key.kind == PoolKind::Buffer {
+                widths.push((binding.metal_index, binding.width));
+            }
         }
         validate_local_size(limits, dispatch.local).map_err(resolve_capability)?;
         translated
             .validate_binding_widths(&widths, dispatch.grid)
             .map_err(dispatch_args_error)?;
         used_pool_keys.extend(pass_pool_keys);
-        for &(metal_index, pool_key) in &dispatch.bindings {
+        for binding in &dispatch.bindings {
             let reflected = reflection
                 .bindings
                 .iter()
-                .find(|binding| binding.metal_index == metal_index)
+                .find(|reflected| reflected.metal_index == binding.metal_index)
                 .expect("validated reflected binding");
-            if !matches!(
-                reflected.access,
-                Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
-            ) {
-                writable_pool_keys.insert(pool_key);
+            if binding.key.kind == PoolKind::Buffer
+                && !matches!(
+                    reflected.access,
+                    Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
+                )
+            {
+                writable_pool_keys.insert(binding.key.index);
             }
         }
         translated
@@ -1243,7 +1293,11 @@ fn plan_pipeline_sequence<T: PoolWidth>(
             .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
         plans.push(plan);
     }
-    if used_pool_keys.len() != pool.len() {
+    let used_buffers = used_pool_keys
+        .iter()
+        .filter(|key| key.kind == PoolKind::Buffer)
+        .count();
+    if used_buffers != pool.len() {
         return Err(dispatch_args_error(failure(
             "every uploaded buffer pool resource must be bound in at least one pass",
         )));
@@ -1796,7 +1850,7 @@ struct GpuTexture {
     index: u64,
     /// The descriptor writer resolves the texture through the pass binding
     /// map, so the pool key is stored with the image.
-    pool_key: u32,
+    pool_key: PoolKey,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -1830,7 +1884,8 @@ struct ExecutionResources {
     /// Sampled textures addressed by their Metal argument index.
     textures: Vec<GpuTexture>,
     /// Pool key to its window in `buffers`. `research/docs/15` §3.
-    view_windows: BTreeMap<u32, ViewWindow>,
+    /// Pool key (kind plus index) to its window in `buffers` or `textures`.
+    view_windows: BTreeMap<PoolKey, ViewWindow>,
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 }
 
@@ -2223,7 +2278,7 @@ impl ExecutionResources {
                     let index = binding.index;
                     let length = binding.bytes.len();
                     self.create_owned_buffer(binding)?;
-                    self.register_view(index, u64::from(index), 0, length)?;
+                    self.register_view(PoolKey::buffer(index), u64::from(index), 0, length)?;
                 }
                 PoolBinding::SharedOwned {
                     index,
@@ -2287,7 +2342,7 @@ impl ExecutionResources {
                         gpu.uploaded_ranges.insert(*offset, upload.len());
                         self.context.record_buffer_upload_bytes(upload.len());
                     }
-                    self.register_view(*index, *allocation, *offset, *length)?;
+                    self.register_view(PoolKey::buffer(*index), *allocation, *offset, *length)?;
                 }
                 PoolBinding::Imported {
                     index,
@@ -2297,7 +2352,7 @@ impl ExecutionResources {
                 } => {
                     let length = *len;
                     self.import_host_buffer(*index, *pointer, *len, *capacity)?;
-                    self.register_view(*index, u64::from(*index), 0, length)?;
+                    self.register_view(PoolKey::buffer(*index), u64::from(*index), 0, length)?;
                 }
             }
         }
@@ -2497,8 +2552,11 @@ impl ExecutionResources {
             let pool_key = dispatches
                 .iter()
                 .flat_map(|dispatch| dispatch.bindings.iter())
-                .find(|(metal_index, _)| *metal_index == texture.metal_binding)
-                .map(|(_, pool_key)| *pool_key)
+                .find(|binding| {
+                    binding.metal_index == texture.metal_binding
+                        && binding.key.kind == PoolKind::Texture
+                })
+                .map(|binding| binding.key)
                 .ok_or_else(|| {
                     failure(format!(
                         "Metal texture {} is not bound in any dispatch",
@@ -2531,7 +2589,7 @@ impl ExecutionResources {
     /// Record where one pool key lives inside a device buffer.
     fn register_view(
         &mut self,
-        pool_key: u32,
+        pool_key: PoolKey,
         buffer_key: u64,
         offset: usize,
         length: usize,
@@ -2548,9 +2606,7 @@ impl ExecutionResources {
             )
             .is_some()
         {
-            return Err(
-                failure(format!("buffer pool key {pool_key} occurs more than once")).into(),
-            );
+            return Err(failure(format!("pool key {pool_key:?} occurs more than once")).into());
         }
         Ok(())
     }
@@ -2564,7 +2620,7 @@ impl ExecutionResources {
     }
 
     /// The window of one pool key.
-    fn view_window(&self, pool_key: u32) -> &ViewWindow {
+    fn view_window(&self, pool_key: PoolKey) -> &ViewWindow {
         self.view_windows
             .get(&pool_key)
             .expect("validated GPU buffer view window")
@@ -2835,11 +2891,15 @@ impl ExecutionResources {
             let mut image_infos = Vec::with_capacity(reflection.bindings.len());
             for binding in &reflection.bindings {
                 if binding.kind == ResourceKind::Texture {
-                    let &(_, pool_key) = dispatch
+                    let pool_key = dispatch
                         .bindings
                         .iter()
-                        .find(|&&(metal_index, _)| metal_index == binding.metal_index)
-                        .expect("validated pass binding");
+                        .find(|candidate| {
+                            candidate.metal_index == binding.metal_index
+                                && candidate.key.kind == PoolKind::Texture
+                        })
+                        .expect("validated pass binding")
+                        .key;
                     let texture = self
                         .textures
                         .iter()
@@ -2858,11 +2918,15 @@ impl ExecutionResources {
                     writes.push(vk::WriteDescriptorSet::default());
                     continue;
                 }
-                let &(_, pool_key) = dispatch
+                let pool_key = dispatch
                     .bindings
                     .iter()
-                    .find(|&&(metal_index, _)| metal_index == binding.metal_index)
-                    .expect("validated pass binding");
+                    .find(|candidate| {
+                        candidate.metal_index == binding.metal_index
+                            && candidate.key.kind == PoolKind::Buffer
+                    })
+                    .expect("validated pass binding")
+                    .key;
                 let window = self.view_window(pool_key);
                 let gpu = self.gpu_buffer(window.buffer_key);
                 let info = vk::DescriptorBufferInfo::default()
@@ -3127,7 +3191,7 @@ impl ExecutionResources {
         // views are writable.
         let mut read_buffers = BTreeSet::<u64>::new();
         for &pool_key in writable_pool_keys {
-            let window = self.view_window(pool_key);
+            let window = self.view_window(PoolKey::buffer(pool_key));
             let gpu = self.gpu_buffer(window.buffer_key);
             // Owned backings were mapped once at creation and are unmapped only
             // when the execution resources are destroyed; imported backings are
@@ -3225,6 +3289,30 @@ impl Drop for ExecutionResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Test-only helper: turn (metal_index, pool index) pairs into bindings,
+    /// taking each binding's width from the pool it names.
+    fn test_bindings(pairs: &[(u32, u32)], pool: &[BufferBinding]) -> Vec<Binding> {
+        pairs
+            .iter()
+            .map(|&(metal_index, index)| Binding {
+                metal_index,
+                key: PoolKey::buffer(index),
+                width: pool
+                    .iter()
+                    .find(|buffer| buffer.index == index)
+                    .map(|buffer| buffer.bytes.len())
+                    .unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn test_pool_width(pool: &[BufferBinding], index: u32) -> usize {
+        pool.iter()
+            .find(|buffer| buffer.index == index)
+            .map(|buffer| buffer.bytes.len())
+            .unwrap_or(0)
+    }
+
     use metal2vulkan::meta::{KernMeta, KernRole};
     use metal2vulkan::reflect::{BufferStrideTerm, BufferStridedAccess};
 
@@ -3279,6 +3367,67 @@ mod tests {
         device
             .new_compute_pipeline_state(&function)
             .expect("a texture-reading pipeline creates its descriptor layout");
+    }
+
+    #[test]
+    fn texture_fixture_executes_a_texel_read_on_the_selected_device() {
+        use metal_api_core::provider::{
+            AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+            ViewId,
+        };
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        // 4x4 R32Uint texels 0..15; thread 0 reads texel (0, 0).
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = TextureView {
+            view_id: ViewId::new(900),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(901),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(texels),
+        };
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 4],
+            }],
+            textures: vec![texture],
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).unwrap(),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).unwrap(),
+        };
+        let updates = executor.execute(submission).expect("texture read executes");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].bytes, 0_u32.to_le_bytes());
     }
 
     fn serial_fixture() -> (
@@ -3359,17 +3508,39 @@ mod tests {
         (translated, buffers, limits)
     }
 
-    fn ping_pong_dispatches() -> Vec<BoundDispatch> {
+    fn ping_pong_dispatches(pool: &[BufferBinding]) -> Vec<BoundDispatch> {
         vec![
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 0), (1, 1)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [7, 2, 1],
                 local: [4, 1, 1],
-                bindings: vec![(1, 0), (0, 1)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
             },
         ]
     }
@@ -3400,17 +3571,39 @@ mod tests {
         }
     }
 
-    fn mixed_pipeline_dispatches() -> Vec<BoundDispatch> {
+    fn mixed_pipeline_dispatches(pool: &[BufferBinding]) -> Vec<BoundDispatch> {
         vec![
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 0), (1, 1)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [7, 2, 1],
                 local: [4, 1, 1],
-                bindings: vec![(3, 0), (7, 1)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 3,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 7,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
             },
         ]
     }
@@ -3423,7 +3616,7 @@ mod tests {
             first.reflection.bindings[0].descriptor,
             second.reflection.bindings[0].descriptor
         );
-        let dispatches = mixed_pipeline_dispatches();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
         let planned =
             plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap();
         assert_eq!(planned.writable_pool_keys, BTreeSet::from([0, 1]));
@@ -3463,17 +3656,84 @@ mod tests {
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 11), (1, 19), (9, 23)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 9,
+                        key: PoolKey::buffer(23),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 23)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [7, 2, 1],
                 local: [4, 1, 1],
-                bindings: vec![(3, 19), (7, 29)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 3,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 7,
+                        key: PoolKey::buffer(29),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 29)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 19), (1, 29), (9, 23)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(29),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 29)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 9,
+                        key: PoolKey::buffer(23),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 23)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
         ];
         (
@@ -3516,11 +3776,26 @@ mod tests {
         buffers.pop();
 
         for (bindings, detail) in [
-            (vec![(3, 19), (7, 31)], "unknown buffer pool key 31"),
-            (vec![(3, 19), (7, 19)], "bound more than once in one pass"),
-            (vec![(3, 19)], "do not match reflection"),
-            (vec![(3, 19), (3, 29)], "buffer 3 is bound more than once"),
-            (vec![(3, 19), (7, 29), (9, 11)], "buffer 9 is not reflected"),
+            (
+                test_bindings(&[(3, 19), (7, 31)], &buffers),
+                "unknown buffer pool key 31",
+            ),
+            (
+                test_bindings(&[(3, 19), (7, 19)], &buffers),
+                "bound more than once in one pass",
+            ),
+            (
+                test_bindings(&[(3, 19)], &buffers),
+                "do not match reflection",
+            ),
+            (
+                test_bindings(&[(3, 19), (3, 29)], &buffers),
+                "buffer 3 is bound more than once",
+            ),
+            (
+                test_bindings(&[(3, 19), (7, 29), (9, 11)], &buffers),
+                "buffer 9 is not reflected",
+            ),
         ] {
             let mut invalid_dispatches = dispatches.clone();
             invalid_dispatches[1].bindings = bindings;
@@ -3544,7 +3819,14 @@ mod tests {
         // The first pipeline reads pool 23 as a scalar, but the next pipeline
         // reads its input as an array. The later pass must reject that mapping.
         plan_pipeline_sequence(&[&first], &buffers[..3], &limits, &dispatches[..1]).unwrap();
-        dispatches[1].bindings[1] = (7, 23);
+        dispatches[1].bindings[1] = Binding {
+            metal_index: 7,
+            key: PoolKey::buffer(23),
+            width: buffers[..]
+                .iter()
+                .find(|buffer| buffer.index == 23)
+                .map_or(0, |buffer| buffer.bytes.len()),
+        };
         let error =
             plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
                 .unwrap_err();
@@ -3578,7 +3860,13 @@ mod tests {
             .map(|pass| BoundDispatch {
                 grid: [1; 3],
                 local: [1; 3],
-                bindings: (0..8).map(|index| (index, pass * 8 + index)).collect(),
+                bindings: (0..8)
+                    .map(|index| Binding {
+                        metal_index: index,
+                        key: PoolKey::buffer(pass * 8 + index),
+                        width: test_pool_width(&buffers, pass * 8 + index),
+                    })
+                    .collect(),
             })
             .collect::<Vec<_>>();
         let translated = vec![&translated; 8];
@@ -3604,7 +3892,7 @@ mod tests {
     fn mixed_preflight_rejects_missing_or_extra_pipeline_artifacts() {
         let (first, buffers, limits) = rebound_fixture();
         let second = alternate_pipeline_fixture();
-        let dispatches = mixed_pipeline_dispatches();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
         for translated in [vec![], vec![&first], vec![&first, &second, &first]] {
             let error =
                 plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches).unwrap_err();
@@ -3625,7 +3913,7 @@ mod tests {
             .unwrap()
             .strided_accesses[0]
             .base_offset = 240;
-        let dispatches = mixed_pipeline_dispatches();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
         plan_pipeline_sequence(&[&first], &buffers, &limits, &dispatches[..1]).unwrap();
         let error =
             plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap_err();
@@ -3638,7 +3926,7 @@ mod tests {
     fn mixed_preflight_checks_later_shader_push_range_and_air_threadgroup_limit() {
         let (first, buffers, limits) = rebound_fixture();
         let second = alternate_pipeline_fixture();
-        let dispatches = mixed_pipeline_dispatches();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
         let small_push_limits = vk::PhysicalDeviceLimits {
             max_push_constants_size: 48,
             ..limits
@@ -3667,7 +3955,7 @@ mod tests {
     #[test]
     fn rebound_preflight_accepts_ping_pong_and_collects_all_written_pool_keys() {
         let (translated, buffers, limits) = rebound_fixture();
-        let dispatches = ping_pong_dispatches();
+        let dispatches = ping_pong_dispatches(&buffers);
         let first =
             plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
         assert_eq!(first.writable_pool_keys, BTreeSet::from([1]));
@@ -3690,12 +3978,46 @@ mod tests {
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 11), (1, 19)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [10, 3, 2],
                 local: [8, 2, 1],
-                bindings: vec![(0, 19), (1, 11)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
         ];
         let planned = plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap();
@@ -3706,13 +4028,18 @@ mod tests {
     fn rebound_preflight_rejects_ambiguous_or_incomplete_resource_maps() {
         let (translated, buffers, limits) = rebound_fixture();
         for bindings in [
-            vec![(0, 0), (1, 0)], // Duplicate pool use.
-            vec![(0, 0), (1, 2)], // Unknown pool key.
-            vec![(0, 0)],         // Missing pool resource and Metal slot.
-            vec![(0, 0), (0, 1)], // Duplicate Metal slot.
-            vec![(0, 0), (2, 1)], // Unknown Metal slot.
+            // Duplicate pool use.
+            test_bindings(&[(0, 0), (1, 0)], &buffers),
+            // Unknown pool key.
+            test_bindings(&[(0, 0), (1, 2)], &buffers),
+            // Missing pool resource and Metal slot.
+            test_bindings(&[(0, 0)], &buffers),
+            // Duplicate Metal slot.
+            test_bindings(&[(0, 0), (0, 1)], &buffers),
+            // Unknown Metal slot.
+            test_bindings(&[(0, 0), (2, 1)], &buffers),
         ] {
-            let mut dispatches = ping_pong_dispatches();
+            let mut dispatches = ping_pong_dispatches(&buffers);
             dispatches[1].bindings = bindings;
             let error =
                 plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
@@ -3725,7 +4052,7 @@ mod tests {
             &translated,
             &duplicate_pool,
             &limits,
-            &ping_pong_dispatches(),
+            &ping_pong_dispatches(&buffers),
         )
         .unwrap_err();
         assert!(error
@@ -3733,9 +4060,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("pool key 0 occurs more than once"));
-        let error =
-            plan_rebound_submission(&translated, &buffers[..1], &limits, &ping_pong_dispatches())
-                .unwrap_err();
+        let error = plan_rebound_submission(
+            &translated,
+            &buffers[..1],
+            &limits,
+            &ping_pong_dispatches(&buffers),
+        )
+        .unwrap_err();
         assert!(error
             .detail
             .as_deref()
@@ -3758,12 +4089,46 @@ mod tests {
             BoundDispatch {
                 grid: [1; 3],
                 local: [1; 3],
-                bindings: vec![(0, 0), (1, 1)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 0)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 1)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
             BoundDispatch {
                 grid: [1; 3],
                 local: [1; 3],
-                bindings: vec![(0, 1), (1, 0)],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(1),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 1)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(0),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 0)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
             },
         ];
         plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
@@ -3779,7 +4144,7 @@ mod tests {
         assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
 
         let (translated, buffers, limits) = rebound_fixture();
-        let mut dispatches = ping_pong_dispatches();
+        let mut dispatches = ping_pong_dispatches(&buffers);
         dispatches[1].grid = [11, 3, 2];
         let error =
             plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();

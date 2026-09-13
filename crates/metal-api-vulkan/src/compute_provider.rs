@@ -2,8 +2,9 @@
 //! lease copies and host-memory no-copy imports.
 
 use crate::{
-    execute_pool_sequence_with_status, BoundDispatch, ContextHealth, PendingExecution, PoolBinding,
-    TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
+    execute_pool_sequence_with_status, Binding, BoundDispatch, ContextHealth, PendingExecution,
+    PoolBinding, PoolKey, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -718,7 +719,11 @@ impl ComputeProvider for VulkanComputeProvider {
                         .iter()
                         .position(|resource| resource.view_id == view.view_id)
                         .expect("validated resource pool");
-                    (view.metal_binding, position as u32)
+                    Binding {
+                        metal_index: view.metal_binding,
+                        key: PoolKey::buffer(position as u32),
+                        width: usize::try_from(view.length).unwrap_or(usize::MAX),
+                    }
                 })
                 .collect();
             dispatches.push(BoundDispatch {
