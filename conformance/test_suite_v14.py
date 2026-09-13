@@ -279,23 +279,54 @@ class PresentObservationTests(unittest.TestCase):
         self.reject(report, "optionally with copy_in and copy_out")
 
 
+# The committed v14 suite's render plan (`research/docs/24` §6 Step 8): the
+# same 2x2 attachment as v13, plus the present section the provider rails
+# report. It is pinned here for the same reason the v13 plan is: a change to
+# the shipped fixture has to be a deliberate edit to this table, not a side
+# effect of touching the comparator.
+PINNED_V14_PLAN = {
+    "present_triangle_clear_2x2": {
+        "writes": [[[900, 910, 0], TEXELS]],
+        "allocations": [[900, TEXELS]],
+        "touched": [900, 920],
+        "written": [900, 920],
+        "rails": sorted(["vulkan", "native-metal-provider"]),
+        "attachment": list(ATTACHMENT),
+        "present": {
+            "mode": "fifo",
+            "image_count": 1,
+            "acquire": 1,
+            "present": 1,
+            "sentinel": "efefefef",
+        },
+    },
+}
+
+
 class ShippedSuitePlanTests(unittest.TestCase):
-    """v1-v13 keep the plan they had before the present section existed."""
+    """v1-v13 keep their plan; v14 is pinned with its present section."""
 
     def test_shipped_plans_are_pinned(self):
         paths = sorted(CONFORMANCE.glob("suite*.json"))
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 12)
+        # One suite with a render plan (v13), the committed v14 fixture, and
+        # the twelve suites that carry no render case at all.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 13)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
             signature = plan_signature(compare._render_plan(compare._suite_plan(suite), suite))
-            self.assertEqual(signature, PINNED_PLANS.get(suite["suite"], {}),
-                             path.name + ": the render plan drifted")
+            expected = PINNED_PLANS.get(suite["suite"], PINNED_V14_PLAN if suite["suite"]
+                                        == "compute-buffer-v14" else {})
+            self.assertEqual(signature, expected, path.name + ": the render plan drifted")
             observed[suite["suite"]] = signature
         for identity, signature in observed.items():
             for case_id, expectation in signature.items():
-                self.assertIsNone(expectation["present"],
-                                  identity + "/" + case_id + ": v1-v13 declare no present")
+                if identity == "compute-buffer-v14":
+                    self.assertIsNotNone(expectation["present"],
+                                         identity + "/" + case_id + ": v14 declares present")
+                else:
+                    self.assertIsNone(expectation["present"],
+                                      identity + "/" + case_id + ": v1-v13 declare no present")
 
 
 if __name__ == "__main__":

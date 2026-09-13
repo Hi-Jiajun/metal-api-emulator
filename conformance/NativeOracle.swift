@@ -139,6 +139,12 @@ private struct RenderCaseDefinition: Decodable {
     let viewport: [UInt64]
     let attachment: RenderAttachmentDefinition
     let expected_hex: String
+    /// Which capture rails the suite marks this render case executable on. The
+    /// oracle validates every render case's metadata, but it only *runs* the
+    /// ones its marker names (`conformance/compare.py` refuses a rail that
+    /// reports a case its marker does not name). v14's present case is marked
+    /// for the provider rails; its Apple evidence is `--present-selftest`.
+    let capture_rails: [String]
 }
 
 /// A render case whose shape, source identity and expectation are reviewed.
@@ -778,8 +784,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["texture_cell_local_4x4", "texture_cell_local_1x1"]
     case "compute-buffer-v13":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v14":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v13 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v14 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1470,7 +1478,10 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     }
     // Render cases run last: they compile the reviewed render module instead of
     // the compute fixtures, and their observable is the attachment's texels.
-    for fixture in suite.renderCases {
+    // Only the cases this rail's marker names are reported: an unnamed rail
+    // that reported a case would present a comparison the suite did not ask
+    // for, which `conformance/compare.py` refuses.
+    for fixture in suite.renderCases where fixture.definition.capture_rails.contains("native-metal") {
         results.append(try runRenderCase(fixture, device: device, queue: queue))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,

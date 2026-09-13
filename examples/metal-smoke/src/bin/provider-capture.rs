@@ -152,13 +152,15 @@ impl CopyCounters {
     }
 
     /// Cumulative present acquire / present completions of the presentation
-    /// rail. The native rail has no present execution in this increment
-    /// (`research/docs/24` §6 Step 7), so it reports nothing to count.
+    /// rail. Both trace rails now execute present actions
+    /// (`research/docs/24` §6 Steps 3 and 7); the Swift oracle is not a
+    /// provider and reports no counters, which is why this surface only exists
+    /// on the provider backends (`compare.py` keys the rule on `backend`).
     fn present_counts(&self) -> (usize, usize) {
         match self {
             Self::Vulkan(executor) => executor.present_counts(),
             #[cfg(target_os = "macos")]
-            Self::Native(_) => (0, 0),
+            Self::Native(provider) => provider.present_counts(),
         }
     }
 }
@@ -1496,6 +1498,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v11") => &["sampled_texture_first_texel"],
         (1, "compute-buffer-v12") => &["texture_cell_local_4x4", "texture_cell_local_1x1"],
         (1, "compute-buffer-v13") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v14") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
