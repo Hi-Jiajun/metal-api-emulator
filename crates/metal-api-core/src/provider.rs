@@ -7,9 +7,11 @@
 //! compatibility with the first offline harness.
 //!
 //! The render contract family ([`AttachmentFormat`], [`RenderAttachment`],
-//! [`RenderPassDescriptor`]) is `research/docs/23-render-pipeline启动设计.md`
-//! Step 1: types and validation only. Execution (admission, `MCC1` payload,
-//! Vulkan render pass, native `MTLRenderCommandEncoder`) is Step 2+.
+//! [`RenderPassDescriptor`]) is `research/docs/23-render-pipeline启动设计.md`.
+//! Step 1 landed the types, Step 2 the trace carrier, the `MCC1` payload and
+//! the capability bits, and Step 3c resolves a render attachment against the
+//! trace's own resource table and the serial pool; executing a render pass
+//! (Vulkan render pass, native `MTLRenderCommandEncoder`) is still open.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -2614,6 +2616,137 @@ pub fn trace_from_trusted_snapshot(
     Ok(trace)
 }
 
+/// One view a trace declares in its own passes, reduced to the facts a render
+/// attachment is admitted against.
+///
+/// A render attachment does not declare storage: it references an existing
+/// resource by identity and restates the shape the first render increment draws
+/// into (`RenderAttachment`'s documentation, `research/docs/23` §3.6).
+/// Admission therefore resolves each attachment against the trace's own
+/// resource table — the buffer and texture bindings of its compute passes — and
+/// refuses an attachment that names a view the trace never declared, one whose
+/// declaration covers a different allocation, or one whose declaration
+/// describes a different extent. Resolving against that table is also what
+/// keeps the first increment from opening a second resource-declaration
+/// channel: allocation, epoch, lease and range admission stay the ones the
+/// declaring pass already passed (`docs/23` §4.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredView {
+    Buffer {
+        pass_index: usize,
+        allocation_id: AllocationId,
+        length: u64,
+        access: BufferAccess,
+    },
+    /// A 2D, single-sample, non-array view is the only texture shape the first
+    /// increment can render into. Any other shape fails [`Self::covers`]
+    /// instead of being reinterpreted as a flat extent.
+    Texture {
+        pass_index: usize,
+        allocation_id: AllocationId,
+        texture_type: TextureType,
+        format: TextureFormat,
+        width: u64,
+        height: u64,
+        depth: u64,
+        array_length: u64,
+        sample_count: u64,
+        access: TextureAccess,
+    },
+}
+
+impl DeclaredView {
+    /// The trace entry that declared this view, so a refusal can point at it.
+    const fn pass_index(self) -> usize {
+        match self {
+            Self::Buffer { pass_index, .. } | Self::Texture { pass_index, .. } => pass_index,
+        }
+    }
+
+    const fn allocation_id(self) -> AllocationId {
+        match self {
+            Self::Buffer { allocation_id, .. } | Self::Texture { allocation_id, .. } => {
+                allocation_id
+            }
+        }
+    }
+
+    /// Whether a compute pass writes this view.
+    ///
+    /// This is the first increment's whole hazard criterion for compute and
+    /// render sharing bytes: a render pass stores its attachment into the
+    /// referenced view, and a compute pass writing the same view leaves the two
+    /// writers' order inexpressible in the trace, so the trace is refused
+    /// rather than executed in an arbitrary order. A compute pass that only
+    /// *reads* the view stays admissible: serial order gives it the bytes as
+    /// they were before the render pass stored
+    /// (`research/docs/23` §3.6).
+    const fn is_writable(self) -> bool {
+        match self {
+            Self::Buffer { access, .. } => access.is_writable(),
+            Self::Texture { access, .. } => access.is_writable(),
+        }
+    }
+
+    /// Tightly packed byte extent this declaration covers, in the same
+    /// texel-level unit [`RenderAttachment::expected_bytes`] uses.
+    ///
+    /// Every factor is bounded by the declaration's own `validate_shape`, so
+    /// the saturated arithmetic below cannot be reached with an overflow; it
+    /// only exists to keep this helper free of a second error path.
+    const fn extent_bytes(self) -> u64 {
+        match self {
+            Self::Buffer { length, .. } => length,
+            Self::Texture {
+                format,
+                width,
+                height,
+                depth,
+                array_length,
+                sample_count,
+                ..
+            } => width
+                .saturating_mul(height)
+                .saturating_mul(depth)
+                .saturating_mul(array_length)
+                .saturating_mul(sample_count)
+                .saturating_mul(format.bytes_per_texel()),
+        }
+    }
+
+    /// Whether this declaration describes the extent the attachment restates.
+    ///
+    /// A buffer declaration is compared by byte length, which is the unit the
+    /// readback compares. A texture declaration is compared by texel shape and
+    /// format as well, because two byte-equal extents such as 4×1 and 2×2 are
+    /// different render targets even though a flat byte count agrees.
+    fn covers(self, attachment: &RenderAttachment) -> bool {
+        match self {
+            Self::Buffer { length, .. } => attachment
+                .expected_bytes()
+                .is_ok_and(|bytes| bytes == length),
+            Self::Texture {
+                texture_type,
+                format,
+                width,
+                height,
+                depth,
+                array_length,
+                sample_count,
+                ..
+            } => {
+                texture_type == TextureType::D2
+                    && depth == 1
+                    && array_length == 1
+                    && sample_count == 1
+                    && width == attachment.width
+                    && height == attachment.height
+                    && format == attachment.format.as_texture_format()
+            }
+        }
+    }
+}
+
 impl ComputeTrace {
     /// The compute entries of `passes`, in trace order.
     ///
@@ -2627,6 +2760,26 @@ impl ComputeTrace {
     /// The render entries of `passes`, in trace order.
     pub fn render_passes(&self) -> impl Iterator<Item = &RenderPassDescriptor> {
         self.passes.iter().filter_map(TracePass::as_render)
+    }
+
+    /// Every colour attachment in pass order, tagged with the index of the
+    /// trace entry that carries it.
+    ///
+    /// Render admission and the serial pool both walk this list. A trace with
+    /// no render entry yields nothing, so a compute-only trace keeps the
+    /// pre-render pool and budget exactly (`research/docs/23` §3.6).
+    pub fn attachments(&self) -> impl Iterator<Item = (usize, &RenderAttachment)> {
+        self.passes
+            .iter()
+            .enumerate()
+            .flat_map(|(pass_index, pass)| {
+                pass.as_render().into_iter().flat_map(move |render| {
+                    render
+                        .color_attachments
+                        .iter()
+                        .map(move |attachment| (pass_index, attachment))
+                })
+            })
     }
 
     /// Whether this trace carries at least one render pass. This is the
@@ -2723,21 +2876,59 @@ impl ComputeTrace {
     /// they do not introduce CPU uploads during execution. Writes from earlier
     /// passes remain visible to later passes, and readback happens after the
     /// final pass. General aliasing remains subject to resource admission.
+    ///
+    /// Render entries join the same walk (`research/docs/23` §3.6). Each
+    /// attachment is resolved against the views the trace declares, its
+    /// restated extent has to agree with the declaration it resolves to, and it
+    /// must not race a compute pass that writes the same view. Attachments are
+    /// pooled by view identity, so the budget that bounds one serial submission
+    /// covers them; a compute-only trace takes the pre-render path unchanged.
     pub fn validate_serial_buffer_reuse(&self) -> Result<(), ContractError> {
         self.validate()?;
         if self.passes.len() > 1 && self.encoder_dispatch_type != DispatchType::Serial {
             return Err(ContractError::ConcurrentPassesUnsupported);
         }
         let mut initial_buffers = BTreeMap::<ViewId, &BufferView>::new();
+        // The views this trace declares, in first-use order. Buffer and texture
+        // bindings share the view-id namespace, so one identity can hold
+        // several declarations (a later pass may rebind the view as a texture,
+        // for instance) and each of them has to agree with an attachment that
+        // references it.
+        let mut declared = BTreeMap::<ViewId, Vec<DeclaredView>>::new();
         for (pass_index, pass) in self.passes.iter().enumerate() {
-            // Render entries name attachments by identity, not `BufferView`s,
-            // so they join the serial pool reset in the render execution step
-            // (`research/docs/23` §6 Step 4). Until then this subset is
-            // compute-only and the index still counts every trace entry.
+            // Render entries name attachments by identity, not `BufferView`s;
+            // they are resolved after the compute declarations below are known,
+            // while the index still counts every trace entry.
             let Some(pass) = pass.as_compute() else {
                 continue;
             };
+            for texture in &pass.textures {
+                declared
+                    .entry(texture.view_id)
+                    .or_default()
+                    .push(DeclaredView::Texture {
+                        pass_index,
+                        allocation_id: texture.allocation_id,
+                        texture_type: texture.texture_type,
+                        format: texture.format,
+                        width: texture.width,
+                        height: texture.height,
+                        depth: texture.depth,
+                        array_length: texture.array_length,
+                        sample_count: texture.sample_count,
+                        access: texture.access,
+                    });
+            }
             for view in &pass.buffers {
+                declared
+                    .entry(view.view_id)
+                    .or_default()
+                    .push(DeclaredView::Buffer {
+                        pass_index,
+                        allocation_id: view.allocation_id,
+                        length: view.length,
+                        access: view.access,
+                    });
                 if let Some(initial) = initial_buffers.get(&view.view_id) {
                     if view.allocation_id != initial.allocation_id
                         || view.offset != initial.offset
@@ -2757,6 +2948,54 @@ impl ComputeTrace {
                 }
             }
         }
+        // Render attachments spend the same budget as the declared views. A
+        // buffer-declared target is counted by the loop above; a texture-declared
+        // one is counted here, which is the only place a render pass can add a
+        // pool key without a compute binding.
+        let mut pool = initial_buffers
+            .keys()
+            .copied()
+            .collect::<BTreeSet<ViewId>>();
+        for (pass_index, attachment) in self.attachments() {
+            let Some(declarations) = declared.get(&attachment.view_id) else {
+                return Err(ContractError::AttachmentViewUnknown {
+                    pass_index,
+                    view: attachment.view_id,
+                    allocation: attachment.allocation_id,
+                });
+            };
+            for declaration in declarations {
+                if declaration.allocation_id() != attachment.allocation_id {
+                    return Err(ContractError::AttachmentViewAllocationMismatch {
+                        pass_index,
+                        view: attachment.view_id,
+                        declared: declaration.allocation_id(),
+                        referenced: attachment.allocation_id,
+                    });
+                }
+                if !declaration.covers(attachment) {
+                    return Err(ContractError::AttachmentExtentMismatch {
+                        pass_index,
+                        view: attachment.view_id,
+                        expected: attachment.expected_bytes()?,
+                        declared: declaration.extent_bytes(),
+                    });
+                }
+                if declaration.is_writable() {
+                    return Err(ContractError::AttachmentComputeConflict {
+                        pass_index,
+                        view: attachment.view_id,
+                        compute_pass: declaration.pass_index(),
+                    });
+                }
+            }
+            if pool.insert(attachment.view_id) && pool.len() > MAX_SERIAL_RESOURCES {
+                return Err(ContractError::SerialResourceLimit {
+                    requested: pool.len(),
+                    maximum: MAX_SERIAL_RESOURCES,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2766,6 +3005,14 @@ impl ComputeTrace {
     /// `metal_binding` retains the first-use label, which may duplicate another
     /// resource's label and must never be used as a pool key. Providers identify
     /// resources by view identity and use each pass's bindings when encoding.
+    ///
+    /// A render pass stores its attachment into the referenced view, which is a
+    /// write of that pooled view for this submission: the readback path matches
+    /// writebacks against the pool, so an attachment landing in a buffer view
+    /// makes that view writable even when no compute pass writes it
+    /// (`research/docs/23` §3.6). Texture-backed targets add no buffer entry —
+    /// the sampled-texture pool stays read-only and its attachment byte landing
+    /// belongs to the render execution step.
     pub fn serial_resources(&self) -> Result<Vec<BufferView>, ContractError> {
         self.validate_serial_buffer_reuse()?;
         let mut resources = Vec::<BufferView>::new();
@@ -2784,6 +3031,17 @@ impl ComputeTrace {
                     resources.push(view.clone());
                 }
             }
+        }
+        for (_, attachment) in self.attachments() {
+            let Some(&position) = positions.get(&attachment.view_id) else {
+                continue;
+            };
+            let resource = &mut resources[position];
+            resource.access = match resource.access {
+                BufferAccess::Unused => BufferAccess::Write,
+                BufferAccess::Read => BufferAccess::ReadWrite,
+                BufferAccess::Write | BufferAccess::ReadWrite => resource.access,
+            };
         }
         Ok(resources)
     }
@@ -3678,6 +3936,22 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             (ProviderErrorClass::Capability, "draw_shape_unsupported")
         }
         E::ViewportExtentMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
+        // Render contract, Step 3c: an attachment that cannot be resolved in
+        // the trace's own resource table names a resource the submission does
+        // not have, which is the same class as an unknown allocation. A
+        // resolvable attachment whose restated extent disagrees with its
+        // declaration, or that races a compute writer, is a repairable trace
+        // shape instead.
+        E::AttachmentViewUnknown { .. } | E::AttachmentViewAllocationMismatch { .. } => (
+            ProviderErrorClass::Resource,
+            "attachment_allocation_unknown",
+        ),
+        E::AttachmentExtentMismatch { .. } => {
+            (ProviderErrorClass::Args, "attachment_extent_mismatch")
+        }
+        E::AttachmentComputeConflict { .. } => {
+            (ProviderErrorClass::Args, "attachment_resource_conflict")
+        }
         E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
@@ -4566,6 +4840,31 @@ pub enum ContractError {
         expected: u32,
         actual: u32,
     },
+    // Render contract, Step 3c (`research/docs/23` §3.6): an attachment is
+    // resolved against the trace's own resource table, so these refusals name
+    // both the attachment's trace entry and the declaration it disagreed with.
+    AttachmentViewUnknown {
+        pass_index: usize,
+        view: ViewId,
+        allocation: AllocationId,
+    },
+    AttachmentViewAllocationMismatch {
+        pass_index: usize,
+        view: ViewId,
+        declared: AllocationId,
+        referenced: AllocationId,
+    },
+    AttachmentExtentMismatch {
+        pass_index: usize,
+        view: ViewId,
+        expected: u64,
+        declared: u64,
+    },
+    AttachmentComputeConflict {
+        pass_index: usize,
+        view: ViewId,
+        compute_pass: usize,
+    },
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -4782,6 +5081,40 @@ impl fmt::Display for ContractError {
             Self::DrawVertexCountMismatch { expected, actual } => write!(
                 formatter,
                 "draw vertex count mismatch: expected {expected}, received {actual}"
+            ),
+            Self::AttachmentViewUnknown {
+                pass_index,
+                view,
+                allocation,
+            } => write!(
+                formatter,
+                "render pass {pass_index} attachment view {view:?} (allocation {allocation:?}) is not declared by this trace"
+            ),
+            Self::AttachmentViewAllocationMismatch {
+                pass_index,
+                view,
+                declared,
+                referenced,
+            } => write!(
+                formatter,
+                "render pass {pass_index} attachment view {view:?} references allocation {referenced:?}, but the trace declares it as {declared:?}"
+            ),
+            Self::AttachmentExtentMismatch {
+                pass_index,
+                view,
+                expected,
+                declared,
+            } => write!(
+                formatter,
+                "render pass {pass_index} attachment view {view:?} covers {expected} bytes, but the trace declares {declared}"
+            ),
+            Self::AttachmentComputeConflict {
+                pass_index,
+                view,
+                compute_pass,
+            } => write!(
+                formatter,
+                "render pass {pass_index} attachment view {view:?} is written by compute pass {compute_pass}"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -5798,7 +6131,12 @@ mod tests {
         render.max_color_attachments = 1;
         render.max_attachment_dimension = [2, 2];
         render.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
-        render.admit(&value, &resources).unwrap();
+        // The gate is the capability bit and not the trace shape: a
+        // render-bearing trace whose attachment resolves against a declared
+        // landing view is admitted, while `value` keeps failing the attachment
+        // limits below.
+        let landing = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render.admit(&landing, &landing_resources()).unwrap();
 
         render.max_attachment_dimension = [1, 2];
         assert_eq!(
@@ -9098,6 +9436,421 @@ mod tests {
         assert_eq!(
             attachment.validate_shape(),
             Err(ContractError::ArithmeticOverflow("attachment bytes"))
+        );
+    }
+
+    // Render contract, Step 3c (`research/docs/23` §3.6): attachment resource
+    // admission and the serial pool. An attachment references a view the trace
+    // declares, so these tests resolve identities and extents; they cannot pin
+    // execution, because neither provider renders yet.
+
+    /// A render attachment that lands in `view_id`/`allocation_id`. The 2×2
+    /// `Rgba8Unorm` shape is 16 tightly packed bytes, which is the extent the
+    /// landing views below declare.
+    fn attachment_into(view_id: u64, allocation_id: u64) -> RenderAttachment {
+        RenderAttachment {
+            view_id: ViewId::new(view_id),
+            allocation_id: AllocationId::new(allocation_id),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            load: LoadOp::Clear(ClearColor::new([0xfe, 0xfe, 0xfe, 0xfe])),
+            store: StoreOp::Store,
+        }
+    }
+
+    fn render_pass_into(attachment: RenderAttachment) -> TracePass {
+        TracePass::Render(RenderPassDescriptor {
+            pipeline: PipelineId::new(4),
+            viewport: [0, 0, attachment.width as u32, attachment.height as u32],
+            color_attachments: vec![attachment],
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+        })
+    }
+
+    /// The buffer-shaped landing view a render pass stores 16 attachment bytes
+    /// into, read-only from the compute side.
+    fn landing_view(view_id: u64, allocation_id: u64) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(view_id),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(allocation_id),
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        }
+    }
+
+    /// A compute pass declaring one buffer view plus a render pass whose
+    /// attachment references the same view identity and allocation.
+    fn attachment_trace(view: BufferView, attachment: RenderAttachment) -> ComputeTrace {
+        let access = view.access;
+        let mut value = trace(vec![pass(4, vec![view])]);
+        // `ComputePass::validate` compares each binding against its reflection,
+        // so the pipeline contract carries the landing view's access.
+        value.pipelines[0].contract.buffer_bindings[0].access = access;
+        value.passes.push(render_pass_into(attachment));
+        value
+    }
+
+    /// A compute pass declaring one sampled texture view plus a render pass
+    /// whose attachment lands in it.
+    fn texture_attachment_trace(
+        texture: TextureView,
+        attachment: RenderAttachment,
+    ) -> ComputeTrace {
+        let mut value = trace(Vec::new());
+        value.pipelines[0].contract.buffer_bindings.clear();
+        value.passes.push(TracePass::Compute(ComputePass {
+            pipeline: PipelineId::new(4),
+            buffers: Vec::new(),
+            textures: vec![texture],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        }));
+        value.passes.push(render_pass_into(attachment));
+        value
+    }
+
+    fn two_by_two_texture(format: TextureFormat) -> TextureView {
+        texture_view(TextureCase {
+            texture_type: TextureType::D2,
+            format,
+            width: 2,
+            height: 2,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            bytes: vec![0; 4 * format.bytes_per_texel() as usize],
+        })
+    }
+
+    /// `count` compute passes, each declaring one distinct 2×2 view. With
+    /// `attach`, every declaration is also the target of a render pass.
+    fn many_attachment_targets(count: usize, attach: bool) -> ComputeTrace {
+        let mut value = trace(Vec::new());
+        let template = value.pipelines.pop().expect("template pipeline");
+        for index in 1..=count as u64 {
+            let mut pipeline = template.clone();
+            pipeline.pipeline_id = PipelineId::new(100 + index);
+            pipeline.contract.buffer_bindings.clear();
+            let pipeline_id = pipeline.pipeline_id;
+            let mut texture = two_by_two_texture(TextureFormat::Rgba8Unorm);
+            texture.view_id = ViewId::new(index);
+            texture.allocation_id = AllocationId::new(index);
+            value.passes.push(TracePass::Compute(ComputePass {
+                pipeline: pipeline_id,
+                buffers: Vec::new(),
+                textures: vec![texture],
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }));
+            value.pipelines.push(pipeline);
+            if attach {
+                // The attachment's render entry names a registered pipeline too.
+                let mut entry = render_pass_into(attachment_into(index, index));
+                match &mut entry {
+                    TracePass::Render(descriptor) => descriptor.pipeline = pipeline_id,
+                    TracePass::Compute(_) => unreachable!("built as a render entry"),
+                }
+                value.passes.push(entry);
+            }
+        }
+        value
+    }
+
+    /// The snapshot that backs a 16-byte landing view in allocation 9.
+    fn landing_resources() -> ResourceTableSnapshot {
+        let mut pool = ResourceTableSnapshot::new();
+        pool.insert_allocation(AllocationRecord {
+            allocation_id: AllocationId::new(9),
+            owner_epoch: DeviceEpoch::new(1),
+            size: 16,
+        })
+        .unwrap();
+        pool
+    }
+
+    fn render_capabilities() -> ProviderCapabilities {
+        let mut provider = capabilities();
+        provider.max_passes = 8;
+        provider.supports_render_passes = true;
+        provider.max_color_attachments = 1;
+        provider.max_attachment_dimension = [2, 2];
+        provider.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        provider
+    }
+
+    fn admitted_completion() -> CompletionDisposition {
+        CompletionDisposition::CompletedVisible {
+            token: CompletionToken {
+                device_epoch: DeviceEpoch::new(1),
+                submission_id: SubmissionId::new(3),
+            },
+        }
+    }
+
+    #[test]
+    fn attachment_views_resolve_against_the_trace_resource_table() {
+        let value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        value.validate_serial_buffer_reuse().unwrap();
+        assert_eq!(
+            value
+                .attachments()
+                .map(|(pass_index, attachment)| (pass_index, attachment.view_id))
+                .collect::<Vec<_>>(),
+            vec![(1, ViewId::new(7))]
+        );
+        render_capabilities()
+            .admit(&value, &landing_resources())
+            .unwrap();
+
+        // The pool records the attachment's store as well: the landing view is
+        // read by the compute pass and written by the render pass.
+        let pool = value.serial_resources().unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].view_id, ViewId::new(7));
+        assert_eq!(pool[0].access, BufferAccess::ReadWrite);
+
+        // A texture-declared target resolves on the same terms when it is the
+        // 2D, single-sample, non-array shape that carries the attachment's
+        // format.
+        let mut texture = two_by_two_texture(TextureFormat::Rgba8Unorm);
+        texture.allocation_id = AllocationId::new(11);
+        let target = texture_attachment_trace(texture, attachment_into(7, 11));
+        target.validate_serial_buffer_reuse().unwrap();
+
+        // A compute-only trace has no attachment to resolve, so it reaches its
+        // pre-render pool unchanged.
+        let compute_only = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        assert_eq!(compute_only.attachments().count(), 0);
+        assert_eq!(
+            compute_only.serial_resources().unwrap()[0].access,
+            BufferAccess::Write
+        );
+    }
+
+    #[test]
+    fn attachment_views_must_be_declared_by_the_trace() {
+        // Nothing declares view 7: the attachment names a resource this
+        // submission does not have.
+        let mut value = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        value.passes.push(render_trace_pass(4, 2, 2));
+        let expected = ContractError::AttachmentViewUnknown {
+            pass_index: 1,
+            view: ViewId::new(7),
+            allocation: AllocationId::new(9),
+        };
+        assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected.clone());
+        assert_eq!(refusal.class, ProviderErrorClass::Resource);
+        assert_eq!(refusal.slug, "attachment_allocation_unknown");
+        assert_eq!(refusal.detail, Some(expected.to_string()));
+
+        // A render-only trace declares no view at all, so the first increment
+        // refuses it instead of opening a second resource-declaration channel.
+        let mut render_only = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        render_only.passes.clear();
+        render_only.passes.push(render_trace_pass(4, 2, 2));
+        assert_eq!(
+            render_only.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentViewUnknown {
+                pass_index: 0,
+                view: ViewId::new(7),
+                allocation: AllocationId::new(9),
+            })
+        );
+
+        // A declared view whose allocation is not the one the attachment names
+        // is the same class of refusal: the (view, allocation) pair has to
+        // exist, and only the identity pair does.
+        let mismatched = attachment_trace(landing_view(7, 9), attachment_into(7, 10));
+        let expected = ContractError::AttachmentViewAllocationMismatch {
+            pass_index: 1,
+            view: ViewId::new(7),
+            declared: AllocationId::new(9),
+            referenced: AllocationId::new(10),
+        };
+        assert_eq!(
+            mismatched.validate_serial_buffer_reuse(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            contract_error_refusal(expected).slug,
+            "attachment_allocation_unknown"
+        );
+    }
+
+    #[test]
+    fn attachment_extent_must_match_the_declared_view() {
+        // A buffer declaration is compared by byte length: 2×2 `Rgba8Unorm`
+        // issues 16 bytes, the declaration holds 8.
+        let mut short = landing_view(7, 9);
+        short.length = 8;
+        short.source = BufferSource::OwnedBytes(vec![0; 8]);
+        let value = attachment_trace(short, attachment_into(7, 9));
+        let expected = ContractError::AttachmentExtentMismatch {
+            pass_index: 1,
+            view: ViewId::new(7),
+            expected: 16,
+            declared: 8,
+        };
+        assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "attachment_extent_mismatch");
+
+        // A texture declaration is compared by texel shape and format as well.
+        // 4×1 is the same byte count as 2×2 and still a different target.
+        let mut wide = two_by_two_texture(TextureFormat::Rgba8Unorm);
+        wide.width = 4;
+        wide.height = 1;
+        wide.allocation_id = AllocationId::new(11);
+        assert_eq!(wide.expected_bytes().unwrap(), 16);
+        let shape = texture_attachment_trace(wide, attachment_into(7, 11));
+        assert_eq!(
+            shape.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentExtentMismatch {
+                pass_index: 1,
+                view: ViewId::new(7),
+                expected: 16,
+                declared: 16,
+            })
+        );
+
+        // A format mismatch lands on the same rule, even when the byte extents
+        // agree: `R32Float` and `Rgba8Unorm` both occupy 4 bytes per texel, so
+        // only the format comparison catches this one.
+        let mut float = two_by_two_texture(TextureFormat::R32Float);
+        float.allocation_id = AllocationId::new(11);
+        let format = texture_attachment_trace(float, attachment_into(7, 11));
+        assert_eq!(
+            format.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentExtentMismatch {
+                pass_index: 1,
+                view: ViewId::new(7),
+                expected: 16,
+                declared: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn attachment_targets_must_not_race_a_compute_writer() {
+        // A compute pass that writes the target and a render pass that stores
+        // into it leave the two writers' order inexpressible.
+        let mut writing = landing_view(7, 9);
+        writing.access = BufferAccess::Write;
+        let value = attachment_trace(writing, attachment_into(7, 9));
+        let expected = ContractError::AttachmentComputeConflict {
+            pass_index: 1,
+            view: ViewId::new(7),
+            compute_pass: 0,
+        };
+        assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "attachment_resource_conflict");
+
+        // A storage texture binding is the texture-side spelling of the same
+        // hazard.
+        let mut storage = two_by_two_texture(TextureFormat::Rgba8Unorm);
+        storage.access = TextureAccess::Storage;
+        storage.allocation_id = AllocationId::new(11);
+        assert_eq!(
+            texture_attachment_trace(storage, attachment_into(7, 11))
+                .validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentComputeConflict {
+                pass_index: 1,
+                view: ViewId::new(7),
+                compute_pass: 0,
+            })
+        );
+
+        // Two render passes storing the same target in order are admitted: the
+        // second pass's load/store sees the first pass's bytes, so serial order
+        // is the whole ordering statement the trace needs.
+        let mut ordered = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        ordered.passes.push(render_pass_into(attachment_into(7, 9)));
+        ordered.validate_serial_buffer_reuse().unwrap();
+        assert_eq!(
+            ordered.serial_resources().unwrap()[0].access,
+            BufferAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn attachment_targets_share_the_serial_resource_budget() {
+        // 64 texture-backed targets resolve and stay inside the pre-render
+        // budget; the 65th is refused with the existing bounded-resource
+        // refusal, because the pool keeps every attachment target live for the
+        // whole serial submission.
+        let value = many_attachment_targets(MAX_SERIAL_RESOURCES, true);
+        value.validate_serial_buffer_reuse().unwrap();
+        assert!(value.serial_resources().unwrap().is_empty());
+
+        let over = many_attachment_targets(MAX_SERIAL_RESOURCES + 1, true);
+        let expected = ContractError::SerialResourceLimit {
+            requested: MAX_SERIAL_RESOURCES + 1,
+            maximum: MAX_SERIAL_RESOURCES,
+        };
+        assert_eq!(over.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        // The budget keeps the refusal identity it already had for buffers; an
+        // attachment target spends that budget, it does not introduce a second.
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // Control: texture views were never part of the pre-render buffer
+        // budget, so the same 65 declarations without attachments still
+        // validate. Attachments are what bring them into the budget.
+        many_attachment_targets(MAX_SERIAL_RESOURCES + 1, false)
+            .validate_serial_buffer_reuse()
+            .unwrap();
+    }
+
+    #[test]
+    fn attachment_stores_make_the_target_a_writeback_subject() {
+        let value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        let admitted = render_capabilities()
+            .validate_trace(value, landing_resources())
+            .unwrap();
+        let admitted_trace = admitted.trace();
+
+        // The pool reports the landing view as writable, so a visible
+        // completion owes a writeback for it: the render track's bytes land
+        // through the readback the compute path already uses.
+        assert_eq!(
+            validate_writebacks_for_trace(admitted_completion(), &[], admitted_trace),
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(7),
+            })
+        );
+        let landed = BufferWriteback {
+            view_id: ViewId::new(7),
+            allocation_id: AllocationId::new(9),
+            offset: 0,
+            bytes: [0x40, 0x80, 0xc0, 0xff].repeat(4),
+        };
+        validate_writebacks_for_trace(admitted_completion(), &[landed], admitted_trace).unwrap();
+
+        // Control: a compute-only trace whose view stays read-only keeps the
+        // pre-render pool access, so nothing about its readback changed.
+        let mut read_only = trace(vec![pass(4, vec![buffer(1, 0)])]);
+        read_only.pipelines[0].contract.buffer_bindings[0].access = BufferAccess::Read;
+        compute_pass_mut(&mut read_only, 0).buffers[0].access = BufferAccess::Read;
+        assert_eq!(
+            read_only.serial_resources().unwrap()[0].access,
+            BufferAccess::Read
         );
     }
 }
