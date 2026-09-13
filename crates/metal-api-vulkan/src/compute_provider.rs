@@ -9,7 +9,7 @@ use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
-    allocate_device_epoch, AliasMode, BufferSource, BufferView, BufferWriteback,
+    allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
     CompletionDisposition, CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch,
     FieldValue, FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
     PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
@@ -18,7 +18,7 @@ use metal_api_core::provider::{
 };
 use metal_api_core::provider::{BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter};
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -735,7 +735,72 @@ impl ComputeProvider for VulkanComputeProvider {
             device_epoch: self.epoch,
         };
         let alignment = self.no_copy_alignment();
+        // Owned views of one allocation share a single device buffer, so the
+        // image is uploaded once and the readback is sliced per view
+        // (`research/docs/15` §3). Only allocations with more than one owned
+        // view are shared; a lone owned view keeps its exact-length buffer, and
+        // staged or borrowed views keep their own binding because their backing
+        // is owned elsewhere. The shared image spans every owned view of the
+        // allocation and is zero-filled between views: nothing reads or writes
+        // there, because each view's footprint proof bounds its own accesses.
+        let overflow = || {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "buffer_range_overflow",
+            )
+        };
+        let mut owned_per_allocation = BTreeMap::<AllocationId, usize>::new();
+        for resource in pool.iter() {
+            if matches!(resource.source, BufferSource::OwnedBytes(_)) {
+                *owned_per_allocation
+                    .entry(resource.allocation_id)
+                    .or_default() += 1;
+            }
+        }
+        let mut shared_images = BTreeMap::<AllocationId, Vec<u8>>::new();
+        for resource in pool.iter() {
+            if !matches!(resource.source, BufferSource::OwnedBytes(_))
+                || owned_per_allocation
+                    .get(&resource.allocation_id)
+                    .copied()
+                    .unwrap_or(0)
+                    < 2
+            {
+                continue;
+            }
+            let end = resource
+                .offset
+                .checked_add(resource.length)
+                .ok_or_else(overflow)?;
+            let size = usize::try_from(end).map_err(|_| overflow())?;
+            // The image spans every view of the allocation, so it takes the
+            // largest end offset, not the first one seen.
+            shared_images
+                .entry(resource.allocation_id)
+                .and_modify(|image| {
+                    if image.len() < size {
+                        image.resize(size, 0);
+                    }
+                })
+                .or_insert_with(|| vec![0_u8; size]);
+        }
+        for resource in pool.iter() {
+            let BufferSource::OwnedBytes(bytes) = &resource.source else {
+                continue;
+            };
+            let Some(image) = shared_images.get_mut(&resource.allocation_id) else {
+                continue;
+            };
+            let start = usize::try_from(resource.offset).map_err(|_| overflow())?;
+            let end = start.checked_add(bytes.len()).ok_or_else(overflow)?;
+            if end > image.len() {
+                return Err(overflow());
+            }
+            image[start..end].copy_from_slice(bytes);
+        }
         let mut buffers = Vec::with_capacity(pool.len());
+        let mut emitted_shared = BTreeSet::<AllocationId>::new();
         let mut borrowed_leases = Vec::new();
         for (position, resource) in pool.iter().enumerate() {
             // The validated pool has at most 64 resources. First-use Metal
@@ -743,10 +808,23 @@ impl ComputeProvider for VulkanComputeProvider {
             let index = position as u32;
             match &resource.source {
                 BufferSource::OwnedBytes(bytes) => {
-                    buffers.push(PoolBinding::Owned(BufferBinding {
+                    let Some(image) = shared_images.get(&resource.allocation_id) else {
+                        buffers.push(PoolBinding::Owned(BufferBinding {
+                            index,
+                            bytes: bytes.clone(),
+                        }));
+                        continue;
+                    };
+                    // Only the first entry of an allocation carries the image.
+                    let first = emitted_shared.insert(resource.allocation_id);
+                    buffers.push(PoolBinding::SharedOwned {
                         index,
-                        bytes: bytes.clone(),
-                    }))
+                        allocation: resource.allocation_id.get(),
+                        size: image.len(),
+                        offset: usize::try_from(resource.offset).map_err(|_| overflow())?,
+                        length: usize::try_from(resource.length).map_err(|_| overflow())?,
+                        bytes: if first { image.clone() } else { Vec::new() },
+                    });
                 }
                 BufferSource::StagedLease(lease_id) => {
                     let bytes = self.staging.view_bytes(

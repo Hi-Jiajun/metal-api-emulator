@@ -1997,8 +1997,20 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
         )?;
         encoder.end_encoding()?;
     }
+    // The judge for a shared device buffer (research/docs/15 §3.3): two views
+    // of one allocation must cost one copy in and one copy out, not two.
+    let (uploads_before, readbacks_before) = executor.buffer_copy_counts();
     command.commit()?;
     command.wait_until_completed()?;
+    let (uploads, readbacks) = executor.buffer_copy_counts();
+    let uploads = uploads - uploads_before;
+    let readbacks = readbacks - readbacks_before;
+    if uploads != 1 || readbacks != 1 {
+        return Err(format!(
+            "two views of one allocation copied in {uploads} and out {readbacks} times, expected 1 and 1"
+        )
+        .into());
+    }
     let observed = shared.read()?;
     if observed[..4] != word {
         return Err("disjoint views: the source range was not preserved".into());
@@ -2031,7 +2043,7 @@ fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
         Ok(()) => return Err("overlapping views of one allocation were admitted".into()),
     }
     println!(
-        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused"
+        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused copy_in={uploads} copy_out={readbacks}"
     );
     Ok(())
 }

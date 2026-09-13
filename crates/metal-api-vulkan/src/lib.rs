@@ -105,6 +105,13 @@ impl VulkanExecutor {
         self.context.queue_family_count()
     }
 
+    /// Cumulative device-buffer copy-in / copy-out operations. Smoke tests use
+    /// it to prove that several views of one allocation share one copy.
+    #[doc(hidden)]
+    pub fn buffer_copy_counts(&self) -> (usize, usize) {
+        self.context.buffer_copy_counts()
+    }
+
     /// Successful submissions recorded per device queue.
     #[doc(hidden)]
     pub fn queue_submission_counts(&self) -> Vec<usize> {
@@ -311,6 +318,11 @@ pub(crate) struct VulkanContext {
     poisoned: AtomicBool,
     abandoned: AtomicBool,
     device_lost: AtomicBool,
+    /// Device-buffer copy-in and copy-out operations. One of each per touched
+    /// allocation, not per view: several views of one allocation share one
+    /// device buffer (`research/docs/15` §3.3).
+    buffer_uploads: AtomicUsize,
+    buffer_readbacks: AtomicUsize,
     abandonment_budget: AbandonmentBudget,
     abandonment: Mutex<AbandonmentLedger>,
 }
@@ -460,6 +472,8 @@ impl VulkanContext {
             queues,
             next_queue: AtomicUsize::new(0),
             queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
+            buffer_uploads: AtomicUsize::new(0),
+            buffer_readbacks: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
@@ -538,6 +552,21 @@ impl VulkanContext {
         families.sort_unstable();
         families.dedup();
         families.len()
+    }
+
+    pub(crate) fn record_buffer_upload(&self) {
+        self.buffer_uploads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffer_readback(&self) {
+        self.buffer_readbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn buffer_copy_counts(&self) -> (usize, usize) {
+        (
+            self.buffer_uploads.load(Ordering::Relaxed),
+            self.buffer_readbacks.load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn queue_submission_counts(&self) -> Vec<usize> {
@@ -1526,6 +1555,21 @@ fn strided_footprint_reach(
 #[derive(Debug)]
 pub(crate) enum PoolBinding {
     Owned(BufferBinding),
+    /// One device buffer per allocation, shared by every owned view of it.
+    ///
+    /// `index` stays the pool key (the view), so the pool key space, the
+    /// planner, the writable-key set and the writeback mapping are unchanged.
+    /// `allocation` identifies the shared device buffer, and the view is its
+    /// `[offset, offset + length)` window. Only the first entry of an allocation
+    /// carries `bytes`; the image is uploaded once. `research/docs/15` §3.
+    SharedOwned {
+        index: u32,
+        allocation: u64,
+        size: usize,
+        offset: usize,
+        length: usize,
+        bytes: Vec<u8>,
+    },
     Imported {
         index: u32,
         pointer: usize,
@@ -1538,16 +1582,27 @@ impl PoolBinding {
     pub(crate) fn index(&self) -> u32 {
         match self {
             Self::Owned(binding) => binding.index,
-            Self::Imported { index, .. } => *index,
+            Self::SharedOwned { index, .. } | Self::Imported { index, .. } => *index,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Owned(binding) => binding.bytes.len(),
+            // The reflected binding width is the view, not the shared backing.
+            Self::SharedOwned { length, .. } => *length,
             Self::Imported { len, .. } => *len,
         }
     }
+}
+
+/// Where one pool key lives inside a device buffer: the shared backing plus the
+/// view's window inside it. A per-view binding is the same shape with offset
+/// zero and the whole buffer as its window.
+struct ViewWindow {
+    buffer_key: u64,
+    offset: usize,
+    length: usize,
 }
 
 /// Width view shared by owned bindings and no-copy pool bindings.
@@ -1577,7 +1632,7 @@ impl PoolWidth for PoolBinding {
 }
 
 struct GpuBuffer {
-    index: u32,
+    index: u64,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     len: usize,
@@ -1608,6 +1663,8 @@ struct ExecutionResources {
     device_lost: bool,
     leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+    /// Pool key to its window in `buffers`. `research/docs/15` §3.
+    view_windows: BTreeMap<u32, ViewWindow>,
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 }
 
@@ -1924,6 +1981,7 @@ impl ExecutionResources {
             device_lost: false,
             leak_is_budgeted: false,
             buffers: Vec::new(),
+            view_windows: BTreeMap::new(),
             borrowed: None,
         }
     }
@@ -1972,32 +2030,118 @@ impl ExecutionResources {
     fn create_buffers(&mut self, bindings: &[PoolBinding]) -> Result<(), ExecutionFailure> {
         for supplied in bindings {
             match supplied {
-                PoolBinding::Owned(binding) => self.create_owned_buffer(binding)?,
+                PoolBinding::Owned(binding) => {
+                    let index = binding.index;
+                    let length = binding.bytes.len();
+                    self.create_owned_buffer(binding)?;
+                    self.register_view(index, u64::from(index), 0, length)?;
+                }
+                PoolBinding::SharedOwned {
+                    index,
+                    allocation,
+                    size,
+                    offset,
+                    length,
+                    bytes,
+                } => {
+                    // The first view of an allocation carries the image and
+                    // uploads it; every later view reuses that backing by
+                    // allocation identity and must not send a second image.
+                    if self
+                        .buffers
+                        .iter()
+                        .all(|buffer| buffer.index != *allocation)
+                    {
+                        if bytes.len() != *size {
+                            return Err(failure(format!(
+                                "shared buffer {allocation} image has {} bytes, expected {size}",
+                                bytes.len()
+                            ))
+                            .into());
+                        }
+                        self.create_owned_backing(*allocation, bytes)?;
+                    } else if !bytes.is_empty() {
+                        return Err(failure(format!(
+                            "shared buffer {allocation} image was supplied twice"
+                        ))
+                        .into());
+                    }
+                    self.register_view(*index, *allocation, *offset, *length)?;
+                }
                 PoolBinding::Imported {
                     index,
                     pointer,
                     len,
                     capacity,
-                } => self.import_host_buffer(*index, *pointer, *len, *capacity)?,
+                } => {
+                    let length = *len;
+                    self.import_host_buffer(*index, *pointer, *len, *capacity)?;
+                    self.register_view(*index, u64::from(*index), 0, length)?;
+                }
             }
         }
         self.buffers.sort_by_key(|buffer| buffer.index);
         Ok(())
     }
 
+    /// Record where one pool key lives inside a device buffer.
+    fn register_view(
+        &mut self,
+        pool_key: u32,
+        buffer_key: u64,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), ExecutionFailure> {
+        if self
+            .view_windows
+            .insert(
+                pool_key,
+                ViewWindow {
+                    buffer_key,
+                    offset,
+                    length,
+                },
+            )
+            .is_some()
+        {
+            return Err(
+                failure(format!("buffer pool key {pool_key} occurs more than once")).into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The device buffer a window names.
+    fn gpu_buffer(&self, key: u64) -> &GpuBuffer {
+        self.buffers
+            .iter()
+            .find(|buffer| buffer.index == key)
+            .expect("validated GPU buffer pool key")
+    }
+
+    /// The window of one pool key.
+    fn view_window(&self, pool_key: u32) -> &ViewWindow {
+        self.view_windows
+            .get(&pool_key)
+            .expect("validated GPU buffer view window")
+    }
+
     fn create_owned_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
-        let size = u64::try_from(supplied.bytes.len())
-            .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
+        self.create_owned_backing(u64::from(supplied.index), &supplied.bytes)
+    }
+
+    /// One host-visible device buffer, uploaded once from `bytes`. A shared view
+    /// names it by its allocation identity instead of by its pool key.
+    fn create_owned_backing(&mut self, index: u64, bytes: &[u8]) -> Result<(), ExecutionFailure> {
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer =
             unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
-                ExecutionFailure::vulkan(
-                    error,
-                    format!("create buffer {}: {error}", supplied.index),
-                )
+                ExecutionFailure::vulkan(error, format!("create buffer {}: {error}", index))
             })?;
         let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
         let memory_type = match self.context.memory_type(
@@ -2019,7 +2163,7 @@ impl ExecutionResources {
                 unsafe { self.context.device.destroy_buffer(buffer, None) };
                 return Err(ExecutionFailure::vulkan(
                     error,
-                    format!("allocate buffer {} memory: {error}", supplied.index),
+                    format!("allocate buffer {} memory: {error}", index),
                 ));
             }
         };
@@ -2030,7 +2174,7 @@ impl ExecutionResources {
             }
             return Err(ExecutionFailure::vulkan(
                 error,
-                format!("bind buffer {} memory: {error}", supplied.index),
+                format!("bind buffer {} memory: {error}", index),
             ));
         }
         let mapped = match unsafe {
@@ -2046,23 +2190,20 @@ impl ExecutionResources {
                 }
                 return Err(ExecutionFailure::vulkan(
                     error,
-                    format!("map buffer {}: {error}", supplied.index),
+                    format!("map buffer {}: {error}", index),
                 ));
             }
         };
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                supplied.bytes.as_ptr(),
-                mapped.cast::<u8>(),
-                supplied.bytes.len(),
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
             self.context.device.unmap_memory(memory);
         }
+        self.context.record_buffer_upload();
         self.buffers.push(GpuBuffer {
-            index: supplied.index,
+            index,
             buffer,
             memory,
-            len: supplied.bytes.len(),
+            len: bytes.len(),
             host_pointer: None,
         });
         Ok(())
@@ -2159,7 +2300,7 @@ impl ExecutionResources {
             ));
         }
         self.buffers.push(GpuBuffer {
-            index,
+            index: u64::from(index),
             buffer,
             memory,
             len,
@@ -2220,15 +2361,12 @@ impl ExecutionResources {
                         .iter()
                         .find(|&&(metal_index, _)| metal_index == binding.metal_index)
                         .expect("validated pass binding");
-                    let gpu = self
-                        .buffers
-                        .iter()
-                        .find(|buffer| buffer.index == pool_key)
-                        .expect("validated GPU buffer pool key");
+                    let window = self.view_window(pool_key);
+                    let gpu = self.gpu_buffer(window.buffer_key);
                     vk::DescriptorBufferInfo::default()
                         .buffer(gpu.buffer)
-                        .offset(0)
-                        .range(gpu.len as u64)
+                        .offset(window.offset as u64)
+                        .range(window.length as u64)
                 })
                 .collect::<Vec<_>>();
             let writes = reflection
@@ -2440,12 +2578,12 @@ impl ExecutionResources {
         writable_pool_keys: &BTreeSet<u32>,
     ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
         let mut updates = Vec::new();
+        // One read per device buffer, then one slice per view: a shared backing
+        // is copied out once even when several of its views are writable.
+        let mut images = BTreeMap::<u64, Vec<u8>>::new();
         for &pool_key in writable_pool_keys {
-            let gpu = self
-                .buffers
-                .iter()
-                .find(|buffer| buffer.index == pool_key)
-                .expect("validated GPU buffer");
+            let window = self.view_window(pool_key);
+            let gpu = self.gpu_buffer(window.buffer_key);
             let bytes = match gpu.host_pointer {
                 // Imported memory is the owner's mapping; read it directly.
                 Some(pointer) => unsafe {
@@ -2473,8 +2611,23 @@ impl ExecutionResources {
                     bytes
                 }
             };
+            // One read per device buffer, however many of its views are
+            // writable in this submission.
+            let image = images.entry(window.buffer_key).or_insert_with(|| {
+                self.context.record_buffer_readback();
+                bytes
+            });
+            let end = window.offset + window.length;
+            let bytes = image
+                .get(window.offset..end)
+                .ok_or_else(|| {
+                    ExecutionFailure::from(failure(format!(
+                        "buffer pool key {pool_key} window ends at {end}, beyond its backing"
+                    )))
+                })?
+                .to_vec();
             updates.push(BufferUpdate {
-                index: gpu.index,
+                index: pool_key,
                 offset: 0,
                 bytes,
             });
