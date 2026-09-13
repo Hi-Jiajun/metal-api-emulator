@@ -5,6 +5,11 @@
 //! native Metal implementation and a Vulkan implementation. The older
 //! [`crate::ComputeExecutor`] snapshot API remains separate and is kept for
 //! compatibility with the first offline harness.
+//!
+//! The render contract family ([`AttachmentFormat`], [`RenderAttachment`],
+//! [`RenderPassDescriptor`]) is `research/docs/23-render-pipeline启动设计.md`
+//! Step 1: types and validation only. Execution (admission, `MCC1` payload,
+//! Vulkan render pass, native `MTLRenderCommandEncoder`) is Step 2+.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -1060,6 +1065,320 @@ impl ComputePass {
             {
                 return Err(ContractError::UnknownBinding(actual.metal_binding));
             }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render contract, Step 1: value types and validation only.
+//
+// This block is `research/docs/23-render-pipeline启动设计.md` §3, Step 1. It
+// adds the value types and their validation and nothing else: no execution, no
+// wire-format change, no `ComputeTrace` wiring and no provider call site. The
+// first increment is deliberately minimal — one colour attachment, one
+// non-indexed draw, no dynamic state — and "not supported yet" is expressed by
+// a missing field or by a validator refusal rather than by a default value, so
+// a trace cannot imply state the execution step does not set (`docs/23` §3.2).
+//
+// Step 2 owns the execution wiring: admission and capability bits, the `MCC1`
+// payload for a tagged pass union, the Vulkan `COLOR_ATTACHMENT_OPTIMAL` path
+// with `vkCmdCopyImageToBuffer`, and the native `MTLRenderCommandEncoder`
+// (`docs/23` §4.1, §6, §7.1). When that lands, keep this header pointing at the
+// design doc rather than restating it.
+// ---------------------------------------------------------------------------
+
+/// Colour attachment formats expressible by the render contract.
+///
+/// The code values are deliberately the same as the existing `MCC1`
+/// texture-format codes of `crates/metal-api-ipc/src/command_codec.rs`
+/// (`R32Uint = 0`, `R32Float = 1`, `Rgba8Unorm = 2`, `Bgra8Unorm = 3`), so
+/// Step 2 reuses that codec instead of maintaining a second mapping.
+///
+/// The list is closed and **contains no sRGB variant**: `docs/23` §7.4 defers
+/// sRGB to the presentation track, and an sRGB attachment would silently
+/// change the bytes the byte parity compares.
+///
+/// `Bgra8Unorm` and `R32Float` are admitted alongside the mandatory
+/// `Rgba8Unorm` because `docs/23` §3.1 names both as first-increment
+/// candidates and both already exist in [`TextureFormat`], so admitting them
+/// costs no new format mapping. The first milestone only uses `Rgba8Unorm`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentFormat {
+    /// `VK_FORMAT_R8G8B8A8_UNORM` / `MTLPixelFormat::RGBA8Unorm`.
+    Rgba8Unorm,
+    /// `VK_FORMAT_B8G8R8A8_UNORM` / `MTLPixelFormat::BGRA8Unorm`.
+    Bgra8Unorm,
+    /// `VK_FORMAT_R32_SFLOAT` / `MTLPixelFormat::R32Float`.
+    R32Float,
+    /// `VK_FORMAT_R32_UINT` / `MTLPixelFormat::R32Uint`.
+    ///
+    /// Expressible for trace symmetry with [`TextureFormat`] and with the v11
+    /// sampled-texture rail, but **refused** by the first render increment: its
+    /// texels are integers, while [`LoadOp::Clear`] and the fragment output
+    /// both carry colour bytes (`docs/23` §3.2, §7.4), so an integer
+    /// attachment needs a value domain the first increment does not model. The
+    /// code stays stable so Step 2 can enable it deliberately.
+    R32Uint,
+}
+
+impl AttachmentFormat {
+    /// Formats the first render increment admits as colour attachments. All
+    /// three are 4-byte texel formats, which is what makes the fixed 4-byte
+    /// [`ClearColor`] well formed.
+    pub const ADMITTED: [Self; 3] = [Self::Rgba8Unorm, Self::Bgra8Unorm, Self::R32Float];
+
+    /// Tightly packed bytes one texel occupies in this format. `rowPitch` and
+    /// readback alignment stay provider concerns, exactly as they are for
+    /// [`TextureFormat`].
+    pub const fn bytes_per_texel(self) -> u64 {
+        match self {
+            Self::Rgba8Unorm | Self::Bgra8Unorm | Self::R32Float | Self::R32Uint => 4,
+        }
+    }
+
+    /// Stable wire code, identical to the `MCC1` texture-format codes.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::R32Uint => 0,
+            Self::R32Float => 1,
+            Self::Rgba8Unorm => 2,
+            Self::Bgra8Unorm => 3,
+        }
+    }
+
+    /// Inverse of [`AttachmentFormat::code`]. An unknown code is a decoder
+    /// error, not a silent default.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::R32Uint),
+            1 => Some(Self::R32Float),
+            2 => Some(Self::Rgba8Unorm),
+            3 => Some(Self::Bgra8Unorm),
+            _ => None,
+        }
+    }
+
+    /// The matching [`TextureFormat`], so Step 2 can reuse the existing
+    /// texture upload/readback plumbing instead of a parallel format path.
+    pub const fn as_texture_format(self) -> TextureFormat {
+        match self {
+            Self::Rgba8Unorm => TextureFormat::Rgba8Unorm,
+            Self::Bgra8Unorm => TextureFormat::Bgra8Unorm,
+            Self::R32Float => TextureFormat::R32Float,
+            Self::R32Uint => TextureFormat::R32Uint,
+        }
+    }
+
+    /// Whether the first render increment admits this format as a colour
+    /// attachment. See [`AttachmentFormat::R32Uint`] for the one refusal.
+    pub const fn is_admitted_for_color_attachment(self) -> bool {
+        matches!(self, Self::Rgba8Unorm | Self::Bgra8Unorm | Self::R32Float)
+    }
+}
+
+/// The four tightly packed texel bytes a [`LoadOp::Clear`] writes into a colour
+/// attachment.
+///
+/// The value is carried as bytes rather than as a `u32` or a float: `docs/23`
+/// §3.5 fixes the byte-parity granularity at texel bytes and records that a
+/// float clear such as `0.5` converts to `0x80` on Lavapipe but `0x7f` on
+/// NVIDIA and dzn, so a float clear is not parity-stable. Bytes in memory order
+/// also remove any endianness question from the contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClearColor {
+    pub bytes: [u8; 4],
+}
+
+impl ClearColor {
+    /// Bytes per clear value. Every admitted attachment format is exactly four
+    /// bytes per texel ([`AttachmentFormat::bytes_per_texel`]); admitting a
+    /// wider format requires widening this payload first.
+    pub const BYTES: usize = 4;
+
+    pub const fn new(bytes: [u8; 4]) -> Self {
+        Self { bytes }
+    }
+}
+
+/// How a colour attachment's contents are established when a render pass
+/// begins (`research/docs/23` §3.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadOp {
+    /// Fill every texel with this colour before drawing. `docs/23` §1.3 uses a
+    /// preset sentinel here so "the pass never ran" cannot pass the parity.
+    Clear(ClearColor),
+    /// Keep the attachment's previous contents.
+    Load,
+    /// Leave the previous contents undefined. Carried so the wire format has a
+    /// fixed field set, but refused by the first render increment: the compared
+    /// bytes would depend on state no earlier pass defined.
+    DontCare,
+}
+
+/// How a colour attachment's contents are handed on after a render pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreOp {
+    /// Store the pass's writes. This is what makes the attachment comparable.
+    Store,
+    /// Discard the pass's writes. Carried for the wire format's completeness
+    /// and refused by the first render increment (`docs/23` §3.6): a discarded
+    /// attachment must not be able to pass as "landed correctly".
+    DontCare,
+}
+
+/// The colour attachments the first render increment admits. One, because
+/// `docs/23` §3.3 defers multi-target rendering until `render_targets`
+/// locations are mapped; the cap also stops a trace from smuggling an
+/// attachment list past the wire format before that mapping exists. Step 2
+/// grows the matching `ProviderCapabilities::max_color_attachments` field with
+/// this value (`docs/23` §4.2).
+pub const MAX_COLOR_ATTACHMENTS: usize = 1;
+
+/// Vertices in the first milestone's single non-indexed draw: the full-screen
+/// triangle generated from `vertex_id` (`research/docs/23` §1.2).
+pub const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
+
+/// One colour attachment of a render pass.
+///
+/// It references an existing resource by identity instead of embedding a
+/// [`TextureView`]: `TextureView` carries a [`TextureAccess`] whose current
+/// values are `Sampled`/`Storage`/`Unused` and whose codes are already pinned
+/// by the `MCC1` codec, so adding a colour-attachment value there would change
+/// the wire format (`docs/23` §2.1, §4.1). The attachment restates the shape
+/// fields the first render increment needs instead.
+///
+/// Single-sample only: MSAA (`sample_count > 1`), depth/stencil and
+/// array/cube attachments are all outside the first increment (`docs/23` §3.3)
+/// and are expressed here by the absence of those fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderAttachment {
+    pub view_id: ViewId,
+    pub allocation_id: AllocationId,
+    pub format: AttachmentFormat,
+    pub width: u64,
+    pub height: u64,
+    pub load: LoadOp,
+    pub store: StoreOp,
+}
+
+impl RenderAttachment {
+    /// Tightly packed byte extent of the attachment, in the same texel-level
+    /// unit the byte parity compares (`docs/23` §3.5). Provider row pitches and
+    /// allocations are not part of the contract.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|texels| texels.checked_mul(self.format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("attachment bytes"))
+    }
+
+    /// Structural validation only. Capability refusals (whether a device can
+    /// render to this format at all) belong to admission in Step 2.
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("attachment view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("attachment allocation id"));
+        }
+        for (axis, dimension) in [self.width, self.height].into_iter().enumerate() {
+            if dimension == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "attachment",
+                    axis,
+                });
+            }
+        }
+        self.expected_bytes()?;
+        if !self.format.is_admitted_for_color_attachment() {
+            return Err(ContractError::UnsupportedAttachmentFormat(self.format));
+        }
+        if matches!(self.load, LoadOp::DontCare) {
+            return Err(ContractError::UnsupportedAttachmentLoadOp(self.load));
+        }
+        if matches!(self.store, StoreOp::DontCare) {
+            return Err(ContractError::UnsupportedAttachmentStoreOp(self.store));
+        }
+        Ok(())
+    }
+}
+
+/// The first increment's render pass: one colour attachment, one non-indexed
+/// draw, no dynamic state (`research/docs/23` §3.1).
+///
+/// Deliberately absent fields, i.e. the features `docs/23` §3.3 schedules
+/// later: MSAA (no `sample_count`), depth/stencil attachments, MRT (the
+/// attachment list is capped at [`MAX_COLOR_ATTACHMENTS`] until
+/// `render_targets` locations are mapped), indexed and instanced draws (no
+/// index or instance field) and dynamic state beyond the explicit viewport (no
+/// scissor, blend, cull or winding).
+///
+/// This type is not referenced by [`ComputeTrace`] yet: Step 1 fixes the shape,
+/// Step 2 makes `passes` a tagged union, extends the `MCC1` payload and teaches
+/// the providers to execute it (`docs/23` §4.1, §6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderPassDescriptor {
+    /// The registered pipeline that supplies the vertex and fragment entries.
+    pub pipeline: PipelineId,
+    /// Colour attachments. The first increment admits exactly one.
+    pub color_attachments: Vec<RenderAttachment>,
+    /// `[origin_x, origin_y, width, height]`. The first increment accepts only
+    /// the attachment-covering default `(0, 0, width, height)`: the viewport is
+    /// explicit so a trace cannot imply viewport state the execution step does
+    /// not set, and so a later dynamic-viewport extension is a deliberate
+    /// change (`docs/23` §3.1).
+    pub viewport: [u32; 4],
+    /// Vertices of the single non-indexed draw. The first milestone draws
+    /// [`FULL_SCREEN_TRIANGLE_VERTICES`].
+    pub vertices: u32,
+}
+
+impl RenderPassDescriptor {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.pipeline.is_zero() {
+            return Err(ContractError::InvalidIdentity("render pipeline id"));
+        }
+        if self.color_attachments.is_empty() {
+            return Err(ContractError::EmptyAttachmentList);
+        }
+        if self.color_attachments.len() > MAX_COLOR_ATTACHMENTS {
+            return Err(ContractError::AttachmentLimitExceeded {
+                requested: self.color_attachments.len(),
+                maximum: MAX_COLOR_ATTACHMENTS,
+            });
+        }
+        for attachment in &self.color_attachments {
+            attachment.validate_shape()?;
+        }
+        if self.vertices != FULL_SCREEN_TRIANGLE_VERTICES {
+            return Err(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: self.vertices,
+            });
+        }
+        let [origin_x, origin_y, width, height] = self.viewport;
+        for (axis, dimension) in [width, height].into_iter().enumerate() {
+            if dimension == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "viewport",
+                    axis: axis + 2,
+                });
+            }
+        }
+        if origin_x != 0 || origin_y != 0 {
+            return Err(ContractError::ViewportOriginUnsupported {
+                origin: [origin_x, origin_y],
+            });
+        }
+        // The list is non-empty and capped at one, so the first attachment is
+        // the only one to compare the viewport against.
+        let attachment = &self.color_attachments[0];
+        if u64::from(width) != attachment.width || u64::from(height) != attachment.height {
+            return Err(ContractError::ViewportExtentMismatch {
+                viewport: [width, height],
+                attachment: [attachment.width, attachment.height],
+            });
         }
         Ok(())
     }
@@ -3135,6 +3454,34 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "texture_binding_unsupported",
         ),
+        // Render contract, Step 1: the format, load/store, viewport-origin and
+        // draw-shape rules are first-increment narrowings, so a well-formed
+        // request for something wider is a capability refusal. A viewport that
+        // disagrees with its own attachment is structural instead.
+        E::UnsupportedAttachmentFormat(_) => (
+            ProviderErrorClass::Capability,
+            "attachment_format_unsupported",
+        ),
+        E::UnsupportedAttachmentLoadOp(_) => (
+            ProviderErrorClass::Capability,
+            "attachment_load_op_unsupported",
+        ),
+        E::UnsupportedAttachmentStoreOp(_) => (
+            ProviderErrorClass::Capability,
+            "attachment_store_op_unsupported",
+        ),
+        E::AttachmentLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "attachment_count_unsupported",
+        ),
+        E::ViewportOriginUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "viewport_origin_unsupported",
+        ),
+        E::DrawVertexCountMismatch { .. } => {
+            (ProviderErrorClass::Capability, "draw_shape_unsupported")
+        }
+        E::ViewportExtentMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
         E::LeaseSourceLengthMismatch { .. } => {
             (ProviderErrorClass::Args, "lease_source_length_mismatch")
         }
@@ -3206,6 +3553,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::UnusedPipeline(_)
         | E::MissingSnapshotIdentity(_)
         | E::UnknownSnapshotIdentity(_)
+        | E::EmptyAttachmentList
         | E::DispatchKindMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
@@ -4001,6 +4349,27 @@ pub enum ContractError {
     /// providers execute them, so the variant currently has **no construction
     /// point** — only the error-class/slug mapping and its `Display` arm remain.
     TextureBindingUnsupported(u32),
+    // Render contract, Step 1 (`research/docs/23` §3.1). Structural refusals
+    // come first, then the first-increment capability narrowings.
+    EmptyAttachmentList,
+    AttachmentLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    UnsupportedAttachmentFormat(AttachmentFormat),
+    UnsupportedAttachmentLoadOp(LoadOp),
+    UnsupportedAttachmentStoreOp(StoreOp),
+    ViewportOriginUnsupported {
+        origin: [u32; 2],
+    },
+    ViewportExtentMismatch {
+        viewport: [u32; 2],
+        attachment: [u64; 2],
+    },
+    DrawVertexCountMismatch {
+        expected: u32,
+        actual: u32,
+    },
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -4183,6 +4552,40 @@ impl fmt::Display for ContractError {
             Self::TextureBindingUnsupported(binding) => write!(
                 formatter,
                 "texture binding {binding} is carried by the trace but not yet executed"
+            ),
+            Self::EmptyAttachmentList => {
+                formatter.write_str("render pass needs at least one colour attachment")
+            }
+            Self::AttachmentLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "render pass declares {requested} colour attachments, exceeding {maximum}"
+            ),
+            Self::UnsupportedAttachmentFormat(format) => write!(
+                formatter,
+                "attachment format {format:?} is outside the first render increment"
+            ),
+            Self::UnsupportedAttachmentLoadOp(load) => write!(
+                formatter,
+                "attachment load operation {load:?} is outside the first render increment"
+            ),
+            Self::UnsupportedAttachmentStoreOp(store) => write!(
+                formatter,
+                "attachment store operation {store:?} is outside the first render increment"
+            ),
+            Self::ViewportOriginUnsupported { origin } => write!(
+                formatter,
+                "viewport origin {origin:?} is outside the first render increment's (0, 0)"
+            ),
+            Self::ViewportExtentMismatch {
+                viewport,
+                attachment,
+            } => write!(
+                formatter,
+                "viewport extent {viewport:?} does not cover attachment extent {attachment:?}"
+            ),
+            Self::DrawVertexCountMismatch { expected, actual } => write!(
+                formatter,
+                "draw vertex count mismatch: expected {expected}, received {actual}"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -8070,6 +8473,322 @@ mod tests {
         assert_eq!(
             select_queue_with_priority(&[0, 0], &[QueuePriority::Low], 0, policy),
             1
+        );
+    }
+
+    // Render contract, Step 1 (`research/docs/23` §3.1). These tests pin the
+    // value shape and the first-increment narrowings; they cannot pin
+    // execution, because nothing executes a render pass yet.
+
+    fn render_attachment(format: AttachmentFormat) -> RenderAttachment {
+        RenderAttachment {
+            view_id: ViewId::new(21),
+            allocation_id: AllocationId::new(22),
+            format,
+            width: 2,
+            height: 2,
+            load: LoadOp::Clear(ClearColor::new([0x40, 0x80, 0xc0, 0xff])),
+            store: StoreOp::Store,
+        }
+    }
+
+    fn render_pass() -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            pipeline: PipelineId::new(5),
+            color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
+            viewport: [0, 0, 2, 2],
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+        }
+    }
+
+    #[test]
+    fn render_pass_accepts_the_first_increment_shape() {
+        let pass = render_pass();
+        pass.validate()
+            .expect("the first-increment render pass is well formed");
+        assert_eq!(
+            pass.color_attachments[0]
+                .expected_bytes()
+                .expect("bounded extent"),
+            16
+        );
+        assert_eq!(MAX_COLOR_ATTACHMENTS, 1);
+        assert_eq!(FULL_SCREEN_TRIANGLE_VERTICES, 3);
+
+        // Every admitted format carries one 4-byte texel, which is what makes
+        // the fixed 4-byte clear payload well formed.
+        for format in AttachmentFormat::ADMITTED {
+            assert!(format.is_admitted_for_color_attachment());
+            assert_eq!(format.bytes_per_texel(), ClearColor::BYTES as u64);
+            let mut adopted = pass.clone();
+            adopted.color_attachments[0].format = format;
+            adopted.validate().expect("an admitted format renders");
+        }
+    }
+
+    #[test]
+    fn render_pass_refuses_an_empty_attachment_list() {
+        let mut pass = render_pass();
+        pass.color_attachments.clear();
+        assert_eq!(pass.validate(), Err(ContractError::EmptyAttachmentList));
+        assert_eq!(
+            contract_error_refusal(ContractError::EmptyAttachmentList).slug,
+            "trace_contract_invalid"
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_a_zero_sized_viewport_or_attachment() {
+        let mut pass = render_pass();
+        pass.viewport = [0, 0, 0, 2];
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::ZeroDimension {
+                field: "viewport",
+                axis: 2,
+            })
+        );
+        pass.viewport = [0, 0, 2, 0];
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::ZeroDimension {
+                field: "viewport",
+                axis: 3,
+            })
+        );
+
+        let mut attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
+        attachment.width = 0;
+        assert_eq!(
+            attachment.validate_shape(),
+            Err(ContractError::ZeroDimension {
+                field: "attachment",
+                axis: 0,
+            })
+        );
+        attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
+        attachment.height = 0;
+        assert_eq!(
+            attachment.validate_shape(),
+            Err(ContractError::ZeroDimension {
+                field: "attachment",
+                axis: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_an_unsupported_attachment_format() {
+        // R32Uint is expressible but outside the first render increment.
+        assert!(!AttachmentFormat::R32Uint.is_admitted_for_color_attachment());
+        let mut pass = render_pass();
+        pass.color_attachments[0].format = AttachmentFormat::R32Uint;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::UnsupportedAttachmentFormat(
+                AttachmentFormat::R32Uint
+            ))
+        );
+        let refusal = contract_error_refusal(ContractError::UnsupportedAttachmentFormat(
+            AttachmentFormat::R32Uint,
+        ));
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "attachment_format_unsupported");
+    }
+
+    #[test]
+    fn render_pass_refuses_more_attachments_than_the_device_admits() {
+        let mut pass = render_pass();
+        pass.color_attachments
+            .push(render_attachment(AttachmentFormat::Bgra8Unorm));
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::AttachmentLimitExceeded {
+                requested: 2,
+                maximum: MAX_COLOR_ATTACHMENTS,
+            })
+        );
+        let refusal = contract_error_refusal(ContractError::AttachmentLimitExceeded {
+            requested: 2,
+            maximum: MAX_COLOR_ATTACHMENTS,
+        });
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "attachment_count_unsupported");
+    }
+
+    #[test]
+    fn attachment_format_codes_round_trip_like_the_mcc1_texture_codes() {
+        let cases = [
+            (
+                AttachmentFormat::R32Uint,
+                0_u8,
+                TextureFormat::R32Uint,
+                false,
+            ),
+            (AttachmentFormat::R32Float, 1, TextureFormat::R32Float, true),
+            (
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                TextureFormat::Rgba8Unorm,
+                true,
+            ),
+            (
+                AttachmentFormat::Bgra8Unorm,
+                3,
+                TextureFormat::Bgra8Unorm,
+                true,
+            ),
+        ];
+        for (format, code, texture_format, admitted) in cases {
+            assert_eq!(format.code(), code);
+            assert_eq!(AttachmentFormat::from_code(code), Some(format));
+            assert_eq!(format.as_texture_format(), texture_format);
+            assert_eq!(
+                format.bytes_per_texel(),
+                texture_format.bytes_per_texel(),
+                "the attachment bridge must not change a texel's size"
+            );
+            assert_eq!(format.is_admitted_for_color_attachment(), admitted);
+        }
+        assert_eq!(AttachmentFormat::from_code(4), None);
+        assert_eq!(AttachmentFormat::ADMITTED.len(), 3);
+    }
+
+    #[test]
+    fn render_pass_refuses_undefined_load_and_store_operations() {
+        let mut pass = render_pass();
+        pass.color_attachments[0].load = LoadOp::DontCare;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
+        );
+        pass.color_attachments[0].load = LoadOp::Clear(ClearColor::new([0, 0, 0, 0]));
+        pass.color_attachments[0].store = StoreOp::DontCare;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::UnsupportedAttachmentStoreOp(
+                StoreOp::DontCare
+            ))
+        );
+
+        // `Load` is admitted: the compared bytes then depend only on earlier
+        // passes, which the hazard rules already order.
+        pass.color_attachments[0].store = StoreOp::Store;
+        pass.color_attachments[0].load = LoadOp::Load;
+        pass.validate().expect("Load + Store is admitted");
+        assert_eq!(
+            contract_error_refusal(ContractError::UnsupportedAttachmentStoreOp(
+                StoreOp::DontCare
+            ))
+            .slug,
+            "attachment_store_op_unsupported"
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
+                .slug,
+            "attachment_load_op_unsupported"
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_a_viewport_that_is_not_the_attachment_extent() {
+        let mut pass = render_pass();
+        pass.viewport = [1, 0, 2, 2];
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::ViewportOriginUnsupported { origin: [1, 0] })
+        );
+        pass.viewport = [0, 0, 4, 2];
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::ViewportExtentMismatch {
+                viewport: [4, 2],
+                attachment: [2, 2],
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::ViewportOriginUnsupported { origin: [1, 0] })
+                .slug,
+            "viewport_origin_unsupported"
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::ViewportExtentMismatch {
+                viewport: [4, 2],
+                attachment: [2, 2],
+            })
+            .slug,
+            "trace_contract_invalid"
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_a_draw_that_is_not_the_full_screen_triangle() {
+        let mut pass = render_pass();
+        pass.vertices = 6;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: 6,
+            })
+        );
+        pass.vertices = 0;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::DrawVertexCountMismatch {
+                expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: 6,
+            })
+            .slug,
+            "draw_shape_unsupported"
+        );
+    }
+
+    #[test]
+    fn render_attachment_refuses_zero_identities_before_any_format() {
+        let attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
+
+        let mut zero_view = attachment;
+        zero_view.view_id = ViewId::new(0);
+        assert_eq!(
+            zero_view.validate_shape(),
+            Err(ContractError::InvalidIdentity("attachment view id"))
+        );
+
+        let mut zero_allocation = attachment;
+        zero_allocation.allocation_id = AllocationId::new(0);
+        assert_eq!(
+            zero_allocation.validate_shape(),
+            Err(ContractError::InvalidIdentity("attachment allocation id"))
+        );
+
+        // A zero pipeline identity is refused before any attachment is read.
+        let mut pass = render_pass();
+        pass.pipeline = PipelineId::new(0);
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::InvalidIdentity("render pipeline id"))
+        );
+    }
+
+    #[test]
+    fn render_attachment_extent_overflow_is_refused_not_wrapped() {
+        let mut attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
+        attachment.width = u64::MAX;
+        attachment.height = u64::MAX;
+        assert_eq!(
+            attachment.expected_bytes(),
+            Err(ContractError::ArithmeticOverflow("attachment bytes"))
+        );
+        assert_eq!(
+            attachment.validate_shape(),
+            Err(ContractError::ArithmeticOverflow("attachment bytes"))
         );
     }
 }
