@@ -33,9 +33,18 @@ ALLOCATION_OBSERVATIONS = {
 # capture backends a suite declares this case executable on; `attachment` is
 # the `(allocation, view, offset, length)` tuple the render result has to report
 # and nothing else, which is what keeps an attachment from passing as a buffer
-# writeback.
+# writeback; and `present` is the case's optional present section, the
+# acquire/present counts every rail its marker names has to report
+# (`research/docs/24` §5.3), or `None` when the suite declares none.
 RenderExpectation = namedtuple(
-    "RenderExpectation", "writes allocations touched written rails attachment")
+    "RenderExpectation", "writes allocations touched written rails attachment present",
+    defaults=(None,))
+
+# One render case's present section: the target mode and image count the first
+# increment fixes, the counts a capture has to report, and the sentinel the
+# provider pre-seeds the target with (`research/docs/24` §1.4, §5.3).
+PresentExpectation = namedtuple(
+    "PresentExpectation", "mode image_count acquire present sentinel")
 
 
 class CaptureError(ValueError):
@@ -131,6 +140,24 @@ def _writeback(value, where):
     data = _hex(value["bytes_hex"], f"{where}.bytes_hex")
     _require(data, f"{where}: empty writeback")
     return identity, data
+
+
+def _present_observation(value, expectation, where):
+    """Check one case's present counts against the section its suite declares.
+
+    The two counts are the whole observation: the first increment presents one
+    target image once, so a capture that acquired or presented a different
+    number of times is not the run the suite asked for (`research/docs/24` §5.3).
+    """
+    _object(value, ("acquire", "present"), f"{where}.present")
+    acquire = _integer(value["acquire"], f"{where}.present.acquire", 0, U32_MAX)
+    present = _integer(value["present"], f"{where}.present.present", 0, U32_MAX)
+    _require(acquire == expectation.acquire,
+             f"{where}: acquire {acquire} does not match the {expectation.acquire} "
+             "the suite declares")
+    _require(present == expectation.present,
+             f"{where}: the present count {present} does not match the {expectation.present} "
+             "the suite declares")
 
 
 def _suite_plan(suite):
@@ -358,6 +385,41 @@ def _suite_plan(suite):
     return plan
 
 
+def _present_declaration(value, texel, where):
+    """Parse one render case's optional present section (`research/docs/24` §5.3).
+
+    The section is the suite's own falsifiability statement rather than a
+    fixture knob: the first present increment presents one target image once,
+    and the sentinel the provider pre-seeds the target with has to differ from
+    the texel the render pass is expected to leave there, so "the present never
+    happened" cannot read as a pass. A missing `initial_hex` is Undefined, which
+    pre-seeds nothing.
+    """
+    _require(isinstance(value, dict), f"{where}.present: expected an object")
+    required = ("mode", "image_count", "acquire", "present")
+    missing = [field for field in required if field not in value]
+    _require(not missing, f"{where}.present: missing fields {', '.join(missing)}")
+    _require(set(value).issubset(set(required) | {"initial_hex"}),
+             f"{where}.present: unexpected fields "
+             + ", ".join(sorted(set(value) - set(required))))
+    mode = value["mode"]
+    _require(mode == "fifo", f"{where}.present: the first present increment is fifo")
+    image_count = _integer(value["image_count"], f"{where}.present.image_count", 1)
+    _require(image_count == 1,
+             f"{where}.present: image_count has to be 1, got {image_count}")
+    acquire = _integer(value["acquire"], f"{where}.present.acquire", 0, U32_MAX)
+    presented = _integer(value["present"], f"{where}.present.present", 0, U32_MAX)
+    _require((acquire, presented) == (1, 1),
+             f"{where}.present: the first increment acquires and presents exactly once")
+    sentinel = None
+    if "initial_hex" in value:
+        sentinel = _hex(value["initial_hex"], f"{where}.present.initial_hex")
+        _require(len(sentinel) == 4, f"{where}.present: a sentinel is one texel")
+        _require(sentinel != texel, f"{where}.present: the sentinel equals the expected texel")
+    return PresentExpectation(mode=mode, image_count=image_count, acquire=acquire,
+                              present=presented, sentinel=sentinel)
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -383,9 +445,15 @@ def _render_plan(plan, suite):
         _require(isinstance(case, dict), "render case: expected an object")
         case_id = _string(case.get("id"), "render case.id")
         where = f"render case {case_id}"
-        _object(case, ("id", "declaring_case", "vertex_entry", "fragment_entry", "metal",
-                       "vertices", "viewport", "attachment", "expected_hex", "capture_rails"),
-                where)
+        # The shape is a whitelist and not a per-case table: `present` is the one
+        # field the first present increment adds, and it arrives on the same
+        # reviewed shape rather than widening it (`research/docs/24` §5.3).
+        required = ("id", "declaring_case", "vertex_entry", "fragment_entry", "metal",
+                    "vertices", "viewport", "attachment", "expected_hex", "capture_rails")
+        missing = [field for field in required if field not in case]
+        _require(not missing, f"{where}: missing fields {', '.join(missing)}")
+        unexpected = sorted(set(case) - set(required) - {"present"})
+        _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
         declaring = _string(case["declaring_case"], f"{where}.declaring_case")
@@ -460,6 +528,13 @@ def _render_plan(plan, suite):
         else:
             raise CaptureError(f"{where}: unknown attachment load op {load!r}")
 
+        # The present section is optional: a case without it is the v13 case and
+        # must not grow a present observation in a capture (the exact-set rule
+        # `validate_capture` applies to every result).
+        present = None
+        if "present" in case:
+            present = _present_declaration(case["present"], texel, where)
+
         rails = _list(case["capture_rails"], f"{where}.capture_rails")
         _require(rails and len(set(rails)) == len(rails)
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
@@ -501,7 +576,8 @@ def _render_plan(plan, suite):
             touched=touched,
             written=written,
             rails=frozenset(rails),
-            attachment=(allocation, view, offset, len(expected)))
+            attachment=(allocation, view, offset, len(expected)),
+            present=present)
     return render_plan
 
 
@@ -539,7 +615,10 @@ def validate_capture(suite, digest, report, required_backend=None):
         base = {"id", "completion", "writebacks", "allocations"}
         counted = base | {"copy_in", "copy_out"}
         grouped = counted | {"group_counts"}
-        _require(set(result) in (base, counted, grouped),
+        # The present observation is the one key a suite may declare on top of
+        # an otherwise unchanged result shape: it replaces no existing field and
+        # it does not relax the counter-pair rule below.
+        _require(set(result) - {"present"} in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
                  " plus the per-command-buffer group_counts")
@@ -588,9 +667,28 @@ def validate_capture(suite, digest, report, required_backend=None):
                 _require(counts[1] == expected_out,
                          f"{where}: copy_out {counts[1]} does not match {expected_out} "
                          "written allocations")
+            # The present observation follows the same marker rule the bytes do:
+            # a rail the case's `capture_rails` names has to report the counts
+            # the suite declares, and a rail the marker does not name has to
+            # leave the observation out rather than report a run it does not
+            # own (`research/docs/24` §5.3, §5.5).
+            if expectation.present is None:
+                _require("present" not in result,
+                         f"{where}: the suite declares no present observation for this case")
+            elif report["backend"] in expectation.rails:
+                _require("present" in result,
+                         f"{where}: {report['backend']} has to report the present observation "
+                         "the suite declares")
+                _present_observation(result["present"], expectation.present, where)
+            else:
+                _require("present" not in result,
+                         f"{where}: {report['backend']} must not report the present observation "
+                         "of a case its marker does not name")
         else:
             expected_writes, expected_allocations, texture_count, group_expectations = plan[case_id]
             _compare_observation(result, expected_writes, expected_allocations, where)
+            _require("present" not in result,
+                     f"{where}: the suite declares no present observation for this case")
 
         if case_id in render_plan:
             if counts[0] is not None:
