@@ -247,6 +247,13 @@ impl NativeMetalProvider {
                 max_present_targets: render_bits.max_present_targets,
                 supported_present_modes: render_bits.supported_present_modes,
                 max_present_image_count: render_bits.max_present_image_count,
+                supports_heaps: false,
+                max_heap_bytes: 0,
+                supported_heap_storage_modes: Vec::new(),
+                supports_heap_aliasing: false,
+                supports_indirect_command_buffers: false,
+                max_indirect_commands: 0,
+                supported_indirect_commands: Vec::new(),
             };
             Ok(Self {
                 epoch: allocate_device_epoch()?,

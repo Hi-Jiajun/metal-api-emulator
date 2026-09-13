@@ -63,6 +63,8 @@ id_type!(ViewId);
 id_type!(LeaseId);
 id_type!(PipelineId);
 id_type!(SubmissionId);
+id_type!(HeapId);
+id_type!(IndirectCommandBufferId);
 
 static NEXT_DEVICE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -4275,6 +4277,26 @@ pub struct ProviderCapabilities {
     /// multi-buffering needs the in-flight state machine `docs/24` §3.4
     /// schedules after this increment.
     pub max_present_image_count: u32,
+    /// Whether this snapshot can back the first heap shape of
+    /// `research/docs/25`. Defaults to `false`: no provider executes heap
+    /// placement today, so a heap-bearing trace is refused during admission
+    /// instead of being silently downgraded (`docs/25` §4.1, §4.2).
+    pub supports_heaps: bool,
+    /// Largest heap this snapshot can back. `0` means no heap.
+    pub max_heap_bytes: u64,
+    /// Heap storage modes this snapshot admits. Empty means none.
+    pub supported_heap_storage_modes: Vec<StorageMode>,
+    /// Whether this snapshot can execute aliasing across heap placements. The
+    /// first increment stays `false` (`docs/25` §7.1).
+    pub supports_heap_aliasing: bool,
+    /// Whether this snapshot can encode and replay an indirect command buffer
+    /// (`research/docs/25` §4.3). Defaults to `false`; execution is Step 4.
+    pub supports_indirect_command_buffers: bool,
+    /// Largest fixed command count this snapshot admits in one ICB. `0` means
+    /// no ICB.
+    pub max_indirect_commands: u32,
+    /// Indirect command kinds this snapshot admits. Empty means none.
+    pub supported_indirect_commands: Vec<IndirectCommandKind>,
 }
 
 impl ProviderCapabilities {
@@ -4306,6 +4328,29 @@ impl ProviderCapabilities {
             || self.max_present_targets != 0
             || !self.supported_present_modes.is_empty()
             || self.max_present_image_count != 0
+    }
+
+    /// Whether any heap bit differs from its default.
+    ///
+    /// A snapshot with all four heap bits at their defaults is treated as
+    /// unable to place resources in a heap: admission refuses any heap-bearing
+    /// request it sees, and Step 2's `MCC1` never has to carry the bits.
+    pub fn declares_heap_support(&self) -> bool {
+        self.supports_heaps
+            || self.max_heap_bytes != 0
+            || !self.supported_heap_storage_modes.is_empty()
+            || self.supports_heap_aliasing
+    }
+
+    /// Whether any indirect-command bit differs from its default.
+    ///
+    /// A snapshot with all three ICB bits at their defaults is treated as
+    /// unable to encode or replay an ICB: admission refuses any ICB-bearing
+    /// request it sees, and Step 2's `MCC1` never has to carry the bits.
+    pub fn declares_icb_support(&self) -> bool {
+        self.supports_indirect_command_buffers
+            || self.max_indirect_commands != 0
+            || !self.supported_indirect_commands.is_empty()
     }
 
     /// Freeze a trace and its resource snapshot after admission. The returned
@@ -4696,6 +4741,95 @@ impl ProviderCapabilities {
         }
         Ok(())
     }
+
+    /// Heap admission gate (`research/docs/25` §4.5).
+    ///
+    /// `Step 1` publishes the gate while `ComputeTrace` still carries no heap
+    /// payload, so callers exercise it directly and Step 2 wires it into
+    /// [`ProviderCapabilities::admit`] once a trace can describe placements.
+    /// An empty placement list is a no-op, which keeps the pre-heap admission
+    /// path unchanged; a non-empty list is refused with `heap_unsupported`
+    /// before any resource action when the snapshot has no heap bits.
+    pub fn admit_heap_placements(
+        &self,
+        heap: &HeapDescriptor,
+        placements: &[HeapPlacement],
+        alignment: u64,
+    ) -> Result<(), ProviderError> {
+        if placements.is_empty() {
+            return Ok(());
+        }
+        if !self.supports_heaps {
+            return Err(capability_error("heap_unsupported")
+                .with_field("placements", FieldValue::Unsigned(placements.len() as u64)));
+        }
+        if heap.size > self.max_heap_bytes {
+            return Err(capability_error("heap_unsupported")
+                .with_field("heap_size", FieldValue::Unsigned(heap.size))
+                .with_field("maximum", FieldValue::Unsigned(self.max_heap_bytes)));
+        }
+        if !self
+            .supported_heap_storage_modes
+            .contains(&heap.storage_mode)
+        {
+            return Err(capability_error("heap_unsupported").with_field(
+                "storage_mode",
+                FieldValue::Text(format!("{:?}", heap.storage_mode)),
+            ));
+        }
+        validate_heap_placements(heap, placements).map_err(contract_error_refusal)?;
+        for placement in placements {
+            placement
+                .validate_alignment(alignment)
+                .map_err(contract_error_refusal)?;
+        }
+        Ok(())
+    }
+
+    /// ICB admission gate (`research/docs/25` §4.5).
+    ///
+    /// Like the heap gate, this is exercised directly in Step 1 and wired into
+    /// [`ProviderCapabilities::admit`] in Step 2, when the trace can carry an
+    /// indirect command. A snapshot without the ICB bit refuses every command
+    /// before touching provider resources.
+    pub fn admit_indirect_command(
+        &self,
+        buffer: &IndirectCommandBufferDescriptor,
+        command: &IndirectCommandDescriptor,
+        range: &IndirectCommandRange,
+        pipeline_bound: bool,
+    ) -> Result<(), ProviderError> {
+        if !self.supports_indirect_command_buffers {
+            return Err(capability_error("icb_unsupported"));
+        }
+        if buffer.max_commands > self.max_indirect_commands {
+            return Err(capability_error("icb_unsupported")
+                .with_field(
+                    "requested",
+                    FieldValue::Unsigned(u64::from(buffer.max_commands)),
+                )
+                .with_field(
+                    "maximum",
+                    FieldValue::Unsigned(u64::from(self.max_indirect_commands)),
+                ));
+        }
+        for kind in &buffer.kinds {
+            if !self.supported_indirect_commands.contains(kind) {
+                return Err(capability_error("icb_command_unsupported")
+                    .with_field("kind", FieldValue::Text(format!("{kind:?}"))));
+            }
+        }
+        command
+            .validate_against(buffer)
+            .map_err(contract_error_refusal)?;
+        buffer
+            .validate_range(range)
+            .map_err(contract_error_refusal)?;
+        command
+            .validate_inheritance(pipeline_bound)
+            .map_err(contract_error_refusal)?;
+        Ok(())
+    }
 }
 
 fn ceil_div(value: u64, divisor: u64) -> Option<u64> {
@@ -4831,6 +4965,34 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         ),
         E::PresentFormatMismatch { .. } => (ProviderErrorClass::Args, "present_format_mismatch"),
         E::PresentExtentMismatch { .. } => (ProviderErrorClass::Args, "present_extent_mismatch"),
+        // Heap / ICB contract, Step 1. Aliasing and command kinds are the same
+        // "well-formed but wider than this increment" capability refusals as
+        // the render/present narrowings; overflow, alignment, range and
+        // inheritance are caller-fixable trace shape.
+        E::HeapAliasingUnsupported | E::HeapPlacementOverlap { .. } => (
+            ProviderErrorClass::Capability,
+            "heap_alias_unsupported",
+        ),
+        E::HeapPlacementOverflow { .. } => (
+            ProviderErrorClass::Args,
+            "heap_placement_overflow",
+        ),
+        E::HeapPlacementMisaligned { .. } => (
+            ProviderErrorClass::Args,
+            "heap_placement_misaligned",
+        ),
+        E::IcbCommandKindUnsupported(_) => (
+            ProviderErrorClass::Capability,
+            "icb_command_unsupported",
+        ),
+        E::IcbRangeOutOfBounds { .. } => (
+            ProviderErrorClass::Args,
+            "icb_range_out_of_bounds",
+        ),
+        E::IcbInheritanceMissing(_) => (
+            ProviderErrorClass::Args,
+            "icb_inheritance_missing",
+        ),
         // Render contract, Step 3c: an attachment that cannot be resolved in
         // the trace's own resource table names a resource the submission does
         // not have, which is the same class as an unknown allocation. A
@@ -5042,6 +5204,384 @@ pub enum StorageMode {
     OwnedBytes,
     StagedLease,
     BorrowedNoCopy,
+}
+
+// ---------------------------------------------------------------------------
+// Heap / ICB contract, Step 1: value types and validation only.
+//
+// This block is `research/docs/25-heaps与ICB设计.md` §4, Step 1. It adds the
+// heap and indirect-command-buffer value types and their structural validation
+// and nothing else: no line-format field, no provider call site and no
+// `ComputeTrace` wiring. Step 2 owns the tagged `MCC1` payload (`docs/25`
+// §4.5); the capability bits and admission gates that reference these types
+// land later in this module (`ProviderCapabilities`).
+//
+// `docs/25` leaves several points open in §9. The Step 1 choices here are the
+// minimal, conservative reading: no aliasing in the first increment,
+// fixed-size heaps, no execution, and byte extent carried as the only resource
+// property needed to prove placement bounds.
+// ---------------------------------------------------------------------------
+
+/// The resource a [`HeapPlacement`] puts at an offset inside one heap.
+///
+/// `docs/25` §4.2 sketches this as "buffer size or texture description". Step 1
+/// carries only the byte extent, because that is the only property placement
+/// bounds need; the full texture descriptor is a Step 2/3 concern when a
+/// provider binds a concrete image into a `VkDeviceMemory` slab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapResource {
+    /// A buffer of `byte_size` bytes.
+    Buffer { byte_size: u64 },
+    /// A tightly packed texture of `byte_size` bytes.
+    Texture { byte_size: u64 },
+}
+
+impl HeapResource {
+    /// Tightly packed byte extent this resource occupies in a heap.
+    pub const fn byte_size(self) -> u64 {
+        match self {
+            Self::Buffer { byte_size } | Self::Texture { byte_size } => byte_size,
+        }
+    }
+
+    /// Structural validation. Provider alignment is not part of this value.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.byte_size() == 0 {
+            return Err(ContractError::ZeroLength("heap resource size"));
+        }
+        Ok(())
+    }
+}
+
+/// A first-increment heap descriptor (`research/docs/25` §4.2).
+///
+/// The first increment is fixed-size and refuses aliasing: those are the
+/// `docs/25` §9 item 2 and §7.1 choices, expressed here as "the field exists
+/// but the value is refused" rather than by a missing field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapDescriptor {
+    /// Total byte size of the heap. Zero means "no heap".
+    pub size: u64,
+    /// Storage mode the heap's backing memory uses. The first increment reuses
+    /// the existing three-value [`StorageMode`] closure.
+    pub storage_mode: StorageMode,
+    /// Whether resources placed in this heap may alias overlapping byte
+    /// ranges. The first increment refuses `true` (`docs/25` §7.1).
+    pub allows_aliasing: bool,
+}
+
+impl HeapDescriptor {
+    /// Structural validation. Whether a provider can back this heap at all is
+    /// admission's question; this only refuses shapes the first increment does
+    /// not define.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.size == 0 {
+            return Err(ContractError::ZeroLength("heap size"));
+        }
+        if self.allows_aliasing {
+            return Err(ContractError::HeapAliasingUnsupported);
+        }
+        Ok(())
+    }
+}
+
+/// One resource placed at an offset inside one heap (`research/docs/25` §4.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapPlacement {
+    /// The heap this placement belongs to.
+    pub heap_id: HeapId,
+    /// Byte offset from the start of the heap. Non-negative by type.
+    pub offset: u64,
+    /// The resource placed at `offset`.
+    pub resource: HeapResource,
+}
+
+impl HeapPlacement {
+    /// Structural validation of the placement alone.
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.heap_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("heap placement id"));
+        }
+        self.resource.validate()
+    }
+
+    /// Exclusive end offset, or an overflow refusal.
+    pub fn end(&self) -> Result<u64, ContractError> {
+        self.offset
+            .checked_add(self.resource.byte_size())
+            .ok_or(ContractError::ArithmeticOverflow("heap placement"))
+    }
+
+    /// Validate the placement against the heap it claims to live in. It checks
+    /// the heap's own shape, then bounds (`offset + size <= heap.size`).
+    pub fn validate_against(&self, heap: &HeapDescriptor) -> Result<(), ContractError> {
+        heap.validate()?;
+        self.validate_shape()?;
+        let end = self.end()?;
+        if end > heap.size {
+            return Err(ContractError::HeapPlacementOverflow {
+                heap: self.heap_id,
+                offset: self.offset,
+                size: self.resource.byte_size(),
+                heap_size: heap.size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a provider-supplied alignment. Alignment is not stored on the
+    /// neutral placement because the provider owns the device's
+    /// `VkMemoryRequirements.alignment`; core only checks the offset once that
+    /// value is supplied (`docs/25` §4.2).
+    pub fn validate_alignment(&self, alignment: u64) -> Result<(), ContractError> {
+        if alignment == 0 {
+            return Err(ContractError::ZeroLength("heap placement alignment"));
+        }
+        if !self.offset.is_multiple_of(alignment) {
+            return Err(ContractError::HeapPlacementMisaligned {
+                heap: self.heap_id,
+                offset: self.offset,
+                alignment,
+            });
+        }
+        Ok(())
+    }
+
+    /// True when two placements of the same heap share bytes. Zero-size
+    /// resources are invalid before this is called and therefore never overlap.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        if self.heap_id != other.heap_id {
+            return false;
+        }
+        match (self.end(), other.end()) {
+            (Ok(left), Ok(right)) => self.offset < right && other.offset < left,
+            _ => true,
+        }
+    }
+}
+
+/// Validate a complete set of placements for one heap.
+///
+/// The first increment refuses aliasing, so any two overlapping placements are
+/// rejected. Placement order and alignment are provider concerns.
+pub fn validate_heap_placements(
+    heap: &HeapDescriptor,
+    placements: &[HeapPlacement],
+) -> Result<(), ContractError> {
+    heap.validate()?;
+    for placement in placements {
+        placement.validate_against(heap)?;
+    }
+    for (index, first) in placements.iter().enumerate() {
+        for second in &placements[index + 1..] {
+            if first.overlaps(second) {
+                return Err(ContractError::HeapPlacementOverlap {
+                    heap: heap_id_of(first, second),
+                    first_offset: first.offset,
+                    first_size: first.resource.byte_size(),
+                    second_offset: second.offset,
+                    second_size: second.resource.byte_size(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn heap_id_of(first: &HeapPlacement, second: &HeapPlacement) -> HeapId {
+    debug_assert_eq!(first.heap_id, second.heap_id);
+    first.heap_id
+}
+
+/// Command kinds an indirect command buffer may encode or replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndirectCommandKind {
+    /// A non-indexed draw.
+    Draw,
+    /// An indexed draw.
+    DrawIndexed,
+    /// A compute dispatch.
+    Dispatch,
+}
+
+impl IndirectCommandKind {
+    /// Stable wire code for Step 2. `Draw` stays `0` so the first increment's
+    /// least-surprising kind reads as the default.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Draw => 0,
+            Self::DrawIndexed => 1,
+            Self::Dispatch => 2,
+        }
+    }
+
+    /// Inverse of [`IndirectCommandKind::code`]. An unknown code is a decoder
+    /// error, not a silent default.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Draw),
+            1 => Some(Self::DrawIndexed),
+            2 => Some(Self::Dispatch),
+            _ => None,
+        }
+    }
+}
+
+/// One indirect command, expressed as a closed variant rather than a struct
+/// whose unused fields depend on `kind` (`research/docs/25` §4.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndirectCommandDescriptor {
+    /// Draw `vertex_count` vertices with `instance_count` instances.
+    Draw {
+        vertex_count: u32,
+        instance_count: u32,
+    },
+    /// Draw `index_count` indices with `instance_count` instances.
+    DrawIndexed {
+        index_count: u32,
+        instance_count: u32,
+    },
+    /// Dispatch `threadgroups` workgroups.
+    Dispatch { threadgroups: [u32; 3] },
+}
+
+impl IndirectCommandDescriptor {
+    /// The kind this command encodes.
+    pub const fn kind(&self) -> IndirectCommandKind {
+        match self {
+            Self::Draw { .. } => IndirectCommandKind::Draw,
+            Self::DrawIndexed { .. } => IndirectCommandKind::DrawIndexed,
+            Self::Dispatch { .. } => IndirectCommandKind::Dispatch,
+        }
+    }
+
+    /// Structural validation of the command's own counts.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        match *self {
+            Self::Draw {
+                vertex_count,
+                instance_count,
+            } => {
+                if vertex_count == 0 {
+                    return Err(ContractError::ZeroLength("indirect draw vertex count"));
+                }
+                if instance_count == 0 {
+                    return Err(ContractError::ZeroLength("indirect draw instance count"));
+                }
+            }
+            Self::DrawIndexed {
+                index_count,
+                instance_count,
+            } => {
+                if index_count == 0 {
+                    return Err(ContractError::ZeroLength("indirect draw index count"));
+                }
+                if instance_count == 0 {
+                    return Err(ContractError::ZeroLength("indirect draw instance count"));
+                }
+            }
+            Self::Dispatch { threadgroups } => {
+                if threadgroups.contains(&0) {
+                    return Err(ContractError::ZeroLength("indirect dispatch threadgroups"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the command against the buffer that is asked to hold it: the
+    /// buffer's whitelist must contain the command kind.
+    pub fn validate_against(
+        &self,
+        buffer: &IndirectCommandBufferDescriptor,
+    ) -> Result<(), ContractError> {
+        buffer.validate()?;
+        self.validate()?;
+        if !buffer.kinds.contains(&self.kind()) {
+            return Err(ContractError::IcbCommandKindUnsupported(self.kind()));
+        }
+        Ok(())
+    }
+
+    /// Whether the inherited pipeline/binding this command replays is present.
+    /// The first increment has no execution yet, but the refusal is published
+    /// here so Step 2 can wire the same rule into the `MCC1` command payload.
+    pub fn validate_inheritance(&self, pipeline_bound: bool) -> Result<(), ContractError> {
+        if !pipeline_bound {
+            return Err(ContractError::IcbInheritanceMissing(self.kind()));
+        }
+        Ok(())
+    }
+}
+
+/// A half-open command range replayed from one ICB.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndirectCommandRange {
+    /// First command index, inclusive.
+    pub start: u32,
+    /// Number of commands to replay. Zero is invalid: "execute nothing" is
+    /// spelled by not issuing the execute action.
+    pub count: u32,
+}
+
+impl IndirectCommandRange {
+    /// Structural validation of the range alone.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.count == 0 {
+            return Err(ContractError::ZeroLength("indirect command range count"));
+        }
+        Ok(())
+    }
+}
+
+/// The first-increment descriptor of one indirect command buffer.
+///
+/// `max_commands` is fixed for the lifetime of the buffer (`docs/25` §4.6
+/// defers variable size), and `kinds` is the whitelist a replayed command must
+/// match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndirectCommandBufferDescriptor {
+    /// Number of command slots. Zero means "no ICB".
+    pub max_commands: u32,
+    /// Command kinds this buffer may encode/replay. Empty means none.
+    pub kinds: Vec<IndirectCommandKind>,
+}
+
+impl IndirectCommandBufferDescriptor {
+    /// Structural validation of the descriptor alone.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.max_commands == 0 {
+            return Err(ContractError::ZeroLength(
+                "indirect command buffer max commands",
+            ));
+        }
+        if self.kinds.is_empty() {
+            return Err(ContractError::EmptyField("indirect command buffer kinds"));
+        }
+        Ok(())
+    }
+
+    /// Whether this buffer admits `kind`.
+    pub fn admits(&self, kind: IndirectCommandKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    /// Validate a replay range against this buffer's fixed command count.
+    pub fn validate_range(&self, range: &IndirectCommandRange) -> Result<(), ContractError> {
+        range.validate()?;
+        let end = range
+            .start
+            .checked_add(range.count)
+            .ok_or(ContractError::ArithmeticOverflow("indirect command range"))?;
+        if end > self.max_commands {
+            return Err(ContractError::IcbRangeOutOfBounds {
+                start: range.start,
+                count: range.count,
+                max_commands: self.max_commands,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Priority tier of one device queue as seen by the host scheduling policy.
@@ -5808,6 +6348,36 @@ pub enum ContractError {
     },
     PresentModeUnsupported(PresentMode),
     PresentAcquirePolicyUnsupported(AcquirePolicy),
+    // Heap / ICB contract, Step 1 (`research/docs/25` §4). The placement and
+    // range refusals are caller-fixable structure; the aliasing and command-kind
+    // refusals are first-increment capability narrowings on a well-formed
+    // request, the same split the render and present tracks use.
+    HeapAliasingUnsupported,
+    HeapPlacementOverflow {
+        heap: HeapId,
+        offset: u64,
+        size: u64,
+        heap_size: u64,
+    },
+    HeapPlacementMisaligned {
+        heap: HeapId,
+        offset: u64,
+        alignment: u64,
+    },
+    HeapPlacementOverlap {
+        heap: HeapId,
+        first_offset: u64,
+        first_size: u64,
+        second_offset: u64,
+        second_size: u64,
+    },
+    IcbCommandKindUnsupported(IndirectCommandKind),
+    IcbRangeOutOfBounds {
+        start: u32,
+        count: u32,
+        max_commands: u32,
+    },
+    IcbInheritanceMissing(IndirectCommandKind),
     // Render pipeline contract, Step 3a (`research/docs/23` §3.4). The entry
     // shape and the pipeline/attachment agreement are caller-fixable structure,
     // like the pass rules above; the colour format reuses
@@ -6174,6 +6744,53 @@ impl fmt::Display for ContractError {
             Self::PresentAcquirePolicyUnsupported(policy) => write!(
                 formatter,
                 "present acquire policy {policy:?} is outside the first presentation increment"
+            ),
+            Self::HeapAliasingUnsupported => {
+                formatter.write_str("heap aliasing is outside the first heap increment")
+            }
+            Self::HeapPlacementOverflow {
+                heap,
+                offset,
+                size,
+                heap_size,
+            } => write!(
+                formatter,
+                "heap {heap:?} placement at offset {offset} with size {size} ends beyond heap size {heap_size}"
+            ),
+            Self::HeapPlacementMisaligned {
+                heap,
+                offset,
+                alignment,
+            } => write!(
+                formatter,
+                "heap {heap:?} placement offset {offset} is not aligned to {alignment}"
+            ),
+            Self::HeapPlacementOverlap {
+                heap,
+                first_offset,
+                first_size,
+                second_offset,
+                second_size,
+            } => write!(
+                formatter,
+                "heap {heap:?} placements overlap: offset {first_offset} size {first_size} and offset {second_offset} size {second_size}"
+            ),
+            Self::IcbCommandKindUnsupported(kind) => write!(
+                formatter,
+                "indirect command kind {kind:?} is not in the ICB's allowed-kind whitelist"
+            ),
+            Self::IcbRangeOutOfBounds {
+                start,
+                count,
+                max_commands,
+            } => write!(
+                formatter,
+                "indirect command range {start}..{} exceeds ICB command count {max_commands}",
+                start.saturating_add(*count)
+            ),
+            Self::IcbInheritanceMissing(kind) => write!(
+                formatter,
+                "indirect command kind {kind:?} has no inherited pipeline or binding"
             ),
             Self::EmptyRenderPipelineEntry(stage) => write!(
                 formatter,
@@ -7488,6 +8105,13 @@ mod tests {
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
             max_present_image_count: 0,
+            supports_heaps: false,
+            max_heap_bytes: 0,
+            supported_heap_storage_modes: Vec::new(),
+            supports_heap_aliasing: false,
+            supports_indirect_command_buffers: false,
+            max_indirect_commands: 0,
+            supported_indirect_commands: Vec::new(),
         }
     }
 
@@ -12124,5 +12748,292 @@ mod tests {
         assert!(!offscreen.has_present_actions());
         assert_eq!(offscreen.present_actions().count(), 0);
         offscreen.validate().unwrap();
+    }
+
+    fn heap_capabilities() -> ProviderCapabilities {
+        let mut provider = capabilities();
+        provider.supports_heaps = true;
+        provider.max_heap_bytes = 64;
+        provider.supported_heap_storage_modes = vec![StorageMode::OwnedBytes];
+        provider.supports_heap_aliasing = false;
+        provider
+    }
+
+    fn icb_capabilities() -> ProviderCapabilities {
+        let mut provider = capabilities();
+        provider.supports_indirect_command_buffers = true;
+        provider.max_indirect_commands = 4;
+        provider.supported_indirect_commands = vec![IndirectCommandKind::Draw];
+        provider
+    }
+
+    fn heap(size: u64) -> HeapDescriptor {
+        HeapDescriptor {
+            size,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: false,
+        }
+    }
+
+    fn placement(heap_id: u64, offset: u64, byte_size: u64) -> HeapPlacement {
+        HeapPlacement {
+            heap_id: HeapId::new(heap_id),
+            offset,
+            resource: HeapResource::Buffer { byte_size },
+        }
+    }
+
+    #[test]
+    fn heap_and_icb_capability_bits_default_to_unsupported() {
+        let default = capabilities();
+        assert!(!default.supports_heaps);
+        assert_eq!(default.max_heap_bytes, 0);
+        assert!(default.supported_heap_storage_modes.is_empty());
+        assert!(!default.supports_heap_aliasing);
+        assert!(!default.supports_indirect_command_buffers);
+        assert_eq!(default.max_indirect_commands, 0);
+        assert!(default.supported_indirect_commands.is_empty());
+        assert!(!default.declares_heap_support());
+        assert!(!default.declares_icb_support());
+
+        let heaps = heap_capabilities();
+        assert!(heaps.declares_heap_support());
+        assert!(!heaps.declares_icb_support());
+
+        let icbs = icb_capabilities();
+        assert!(icbs.declares_icb_support());
+        assert!(!icbs.declares_heap_support());
+    }
+
+    #[test]
+    fn heap_value_validation_round_trips_and_refuses_each_branch() {
+        let heap_desc = heap(16);
+        heap_desc.validate().unwrap();
+        HeapResource::Buffer { byte_size: 4 }.validate().unwrap();
+        placement(1, 0, 4).validate_against(&heap_desc).unwrap();
+        validate_heap_placements(&heap_desc, &[placement(1, 0, 4), placement(1, 8, 4)]).unwrap();
+
+        assert_eq!(
+            HeapDescriptor {
+                size: 16,
+                storage_mode: StorageMode::OwnedBytes,
+                allows_aliasing: true,
+            }
+            .validate(),
+            Err(ContractError::HeapAliasingUnsupported)
+        );
+        assert_eq!(
+            heap(0).validate(),
+            Err(ContractError::ZeroLength("heap size"))
+        );
+        assert_eq!(
+            placement(1, 12, 8).validate_against(&heap_desc),
+            Err(ContractError::HeapPlacementOverflow {
+                heap: HeapId::new(1),
+                offset: 12,
+                size: 8,
+                heap_size: 16,
+            })
+        );
+        assert_eq!(
+            validate_heap_placements(&heap_desc, &[placement(1, 0, 8), placement(1, 4, 8)]),
+            Err(ContractError::HeapPlacementOverlap {
+                heap: HeapId::new(1),
+                first_offset: 0,
+                first_size: 8,
+                second_offset: 4,
+                second_size: 8,
+            })
+        );
+        assert_eq!(
+            placement(1, 3, 4).validate_alignment(4),
+            Err(ContractError::HeapPlacementMisaligned {
+                heap: HeapId::new(1),
+                offset: 3,
+                alignment: 4,
+            })
+        );
+        assert_eq!(
+            HeapResource::Buffer { byte_size: 0 }.validate(),
+            Err(ContractError::ZeroLength("heap resource size"))
+        );
+        assert_eq!(
+            placement(0, 0, 4).validate_shape(),
+            Err(ContractError::InvalidIdentity("heap placement id"))
+        );
+    }
+
+    #[test]
+    fn heap_admission_refuses_by_default_and_narrows_each_refusal() {
+        let heap = heap(16);
+        let valid = [placement(1, 0, 4), placement(1, 8, 4)];
+
+        assert!(capabilities().admit_heap_placements(&heap, &[], 4).is_ok());
+        let refusal = capabilities()
+            .admit_heap_placements(&heap, &valid, 4)
+            .unwrap_err();
+        assert_eq!(refusal.slug, "heap_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refusal.fields.get("placements"),
+            Some(&FieldValue::Unsigned(2))
+        );
+
+        assert!(heap_capabilities()
+            .admit_heap_placements(&heap, &valid, 4)
+            .is_ok());
+        assert_eq!(
+            heap_capabilities()
+                .admit_heap_placements(&heap, &[placement(1, 0, 8), placement(1, 4, 8)], 4)
+                .unwrap_err()
+                .slug,
+            "heap_alias_unsupported"
+        );
+        assert_eq!(
+            heap_capabilities()
+                .admit_heap_placements(&heap, &[placement(1, 12, 8)], 4)
+                .unwrap_err()
+                .slug,
+            "heap_placement_overflow"
+        );
+        assert_eq!(
+            heap_capabilities()
+                .admit_heap_placements(&heap, &[placement(1, 3, 4)], 4)
+                .unwrap_err()
+                .slug,
+            "heap_placement_misaligned"
+        );
+    }
+
+    #[test]
+    fn icb_value_validation_round_trips_and_refuses_each_branch() {
+        let buffer = IndirectCommandBufferDescriptor {
+            max_commands: 4,
+            kinds: vec![IndirectCommandKind::Draw],
+        };
+        let command = IndirectCommandDescriptor::Draw {
+            vertex_count: 3,
+            instance_count: 1,
+        };
+        let range = IndirectCommandRange { start: 0, count: 1 };
+        buffer.validate().unwrap();
+        command.validate().unwrap();
+        command.validate_against(&buffer).unwrap();
+        buffer.validate_range(&range).unwrap();
+        command.validate_inheritance(true).unwrap();
+
+        assert_eq!(
+            IndirectCommandBufferDescriptor {
+                max_commands: 0,
+                kinds: vec![IndirectCommandKind::Draw],
+            }
+            .validate(),
+            Err(ContractError::ZeroLength(
+                "indirect command buffer max commands"
+            ))
+        );
+        assert_eq!(
+            IndirectCommandBufferDescriptor {
+                max_commands: 4,
+                kinds: Vec::new(),
+            }
+            .validate(),
+            Err(ContractError::EmptyField("indirect command buffer kinds"))
+        );
+        assert_eq!(
+            IndirectCommandDescriptor::Draw {
+                vertex_count: 0,
+                instance_count: 1,
+            }
+            .validate(),
+            Err(ContractError::ZeroLength("indirect draw vertex count"))
+        );
+        assert_eq!(
+            IndirectCommandDescriptor::DrawIndexed {
+                index_count: 3,
+                instance_count: 1,
+            }
+            .validate_against(&buffer),
+            Err(ContractError::IcbCommandKindUnsupported(
+                IndirectCommandKind::DrawIndexed
+            ))
+        );
+        assert_eq!(
+            buffer.validate_range(&IndirectCommandRange { start: 2, count: 3 }),
+            Err(ContractError::IcbRangeOutOfBounds {
+                start: 2,
+                count: 3,
+                max_commands: 4,
+            })
+        );
+        assert_eq!(
+            command.validate_inheritance(false),
+            Err(ContractError::IcbInheritanceMissing(
+                IndirectCommandKind::Draw
+            ))
+        );
+    }
+
+    #[test]
+    fn icb_admission_refuses_by_default_and_narrows_each_refusal() {
+        let buffer = IndirectCommandBufferDescriptor {
+            max_commands: 4,
+            kinds: vec![IndirectCommandKind::Draw],
+        };
+        let command = IndirectCommandDescriptor::Draw {
+            vertex_count: 3,
+            instance_count: 1,
+        };
+        let range = IndirectCommandRange { start: 0, count: 1 };
+
+        let refusal = capabilities()
+            .admit_indirect_command(&buffer, &command, &range, true)
+            .unwrap_err();
+        assert_eq!(refusal.slug, "icb_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        assert!(icb_capabilities()
+            .admit_indirect_command(&buffer, &command, &range, true)
+            .is_ok());
+
+        let mut missing_kind = icb_capabilities();
+        missing_kind.supported_indirect_commands.clear();
+        assert_eq!(
+            missing_kind
+                .admit_indirect_command(&buffer, &command, &range, true)
+                .unwrap_err()
+                .slug,
+            "icb_command_unsupported"
+        );
+
+        let mut disallowed = buffer.clone();
+        disallowed.kinds = vec![IndirectCommandKind::Dispatch];
+        assert_eq!(
+            icb_capabilities()
+                .admit_indirect_command(&disallowed, &command, &range, true)
+                .unwrap_err()
+                .slug,
+            "icb_command_unsupported"
+        );
+
+        assert_eq!(
+            icb_capabilities()
+                .admit_indirect_command(
+                    &buffer,
+                    &command,
+                    &IndirectCommandRange { start: 2, count: 3 },
+                    true
+                )
+                .unwrap_err()
+                .slug,
+            "icb_range_out_of_bounds"
+        );
+        assert_eq!(
+            icb_capabilities()
+                .admit_indirect_command(&buffer, &command, &range, false)
+                .unwrap_err()
+                .slug,
+            "icb_inheritance_missing"
+        );
     }
 }
