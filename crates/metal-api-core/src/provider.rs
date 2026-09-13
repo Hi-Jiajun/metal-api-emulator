@@ -3589,7 +3589,9 @@ pub enum TerminalRefusalReason {
 pub struct TerminalRefusal {
     reason: TerminalRefusalReason,
     state: TerminalState,
-    error: ProviderError,
+    /// Boxed so an `Err` from admission stays small; clippy's
+    /// `result_large_err` lint flags the inline variant.
+    error: Box<ProviderError>,
 }
 
 impl TerminalRefusal {
@@ -3617,7 +3619,7 @@ impl TerminalRefusal {
 
     /// Consume the refusal and return the structured provider error.
     pub fn into_error(self) -> ProviderError {
-        self.error
+        *self.error
     }
 
     fn abandonment_budget(state: TerminalState) -> Self {
@@ -3638,7 +3640,7 @@ impl TerminalRefusal {
         Self {
             reason: TerminalRefusalReason::AbandonmentBudget,
             state,
-            error,
+            error: Box::new(error),
         }
     }
 
@@ -3655,7 +3657,7 @@ impl TerminalRefusal {
         Self {
             reason: TerminalRefusalReason::DeviceLost,
             state,
-            error,
+            error: Box::new(error),
         }
     }
 }
