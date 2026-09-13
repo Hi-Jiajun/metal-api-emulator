@@ -2789,6 +2789,11 @@ enum DeclaredView {
     Buffer {
         pass_index: usize,
         allocation_id: AllocationId,
+        /// Offset of the view inside its allocation. The attachment's own byte
+        /// range is this one, so two sibling views of one allocation can be
+        /// compared without either of them naming the other
+        /// (review item M3, 2026-09-14).
+        offset: u64,
         length: u64,
         access: BufferAccess,
     },
@@ -2822,6 +2827,35 @@ impl DeclaredView {
             Self::Buffer { allocation_id, .. } | Self::Texture { allocation_id, .. } => {
                 allocation_id
             }
+        }
+    }
+
+    /// The bytes this declaration occupies in its allocation.
+    ///
+    /// A buffer declaration states its own offset and length. A texture
+    /// declaration states no offset ([`TextureView`] has none), so its packed
+    /// extent is taken from the allocation's start — the same extent
+    /// [`Self::extent_bytes`] reports. Both are compared with
+    /// [`BufferRange::overlaps`], the comparator the in-flight hazard admission
+    /// already uses (`research/docs/14` §3.2), so the render track does not
+    /// grow a second notion of "these two uses share bytes".
+    fn byte_range(self) -> BufferRange {
+        match self {
+            Self::Buffer {
+                allocation_id,
+                offset,
+                length,
+                ..
+            } => BufferRange {
+                allocation_id,
+                offset,
+                length,
+            },
+            Self::Texture { allocation_id, .. } => BufferRange {
+                allocation_id,
+                offset: 0,
+                length: self.extent_bytes(),
+            },
         }
     }
 
@@ -2868,17 +2902,35 @@ impl DeclaredView {
         }
     }
 
-    /// Whether this declaration describes the extent the attachment restates.
+    /// Whether this declaration describes the shape the attachment restates, or
+    /// the refusal that names the disagreement.
     ///
     /// A buffer declaration is compared by byte length, which is the unit the
-    /// readback compares. A texture declaration is compared by texel shape and
-    /// format as well, because two byte-equal extents such as 4×1 and 2×2 are
-    /// different render targets even though a flat byte count agrees.
-    fn covers(self, attachment: &RenderAttachment) -> bool {
+    /// readback compares, so a refusal can name the two numbers. A texture
+    /// declaration is compared by texel shape and format instead, because two
+    /// byte-equal extents such as 4×1 and 2×2 are different render targets even
+    /// though a flat byte count agrees: that refusal carries both shapes and
+    /// both byte counts, so an operator can locate the field to fix
+    /// (review item M4, 2026-09-14).
+    fn admit_extent(
+        self,
+        pass_index: usize,
+        attachment: &RenderAttachment,
+    ) -> Result<(), ContractError> {
         match self {
-            Self::Buffer { length, .. } => attachment
-                .expected_bytes()
-                .is_ok_and(|bytes| bytes == length),
+            Self::Buffer { length, .. } => {
+                let expected = attachment.expected_bytes()?;
+                if expected == length {
+                    Ok(())
+                } else {
+                    Err(ContractError::AttachmentExtentMismatch {
+                        pass_index,
+                        view: attachment.view_id,
+                        expected,
+                        declared: length,
+                    })
+                }
+            }
             Self::Texture {
                 texture_type,
                 format,
@@ -2889,13 +2941,30 @@ impl DeclaredView {
                 sample_count,
                 ..
             } => {
-                texture_type == TextureType::D2
+                let shape_agrees = texture_type == TextureType::D2
                     && depth == 1
                     && array_length == 1
                     && sample_count == 1
                     && width == attachment.width
                     && height == attachment.height
-                    && format == attachment.format.as_texture_format()
+                    && format == attachment.format.as_texture_format();
+                if shape_agrees {
+                    return Ok(());
+                }
+                Err(ContractError::AttachmentTextureShapeMismatch {
+                    pass_index,
+                    view: attachment.view_id,
+                    attachment_extent: [attachment.width, attachment.height],
+                    attachment_format: attachment.format,
+                    attachment_bytes: attachment.expected_bytes()?,
+                    declared_type: texture_type,
+                    declared_extent: [width, height],
+                    declared_depth: depth,
+                    declared_array_length: array_length,
+                    declared_sample_count: sample_count,
+                    declared_format: format,
+                    declared_bytes: self.extent_bytes(),
+                })
             }
         }
     }
@@ -3086,6 +3155,7 @@ impl ComputeTrace {
                     .push(DeclaredView::Buffer {
                         pass_index,
                         allocation_id: view.allocation_id,
+                        offset: view.offset,
                         length: view.length,
                         access: view.access,
                     });
@@ -3133,20 +3203,35 @@ impl ComputeTrace {
                         referenced: attachment.allocation_id,
                     });
                 }
-                if !declaration.covers(attachment) {
-                    return Err(ContractError::AttachmentExtentMismatch {
-                        pass_index,
-                        view: attachment.view_id,
-                        expected: attachment.expected_bytes()?,
-                        declared: declaration.extent_bytes(),
-                    });
-                }
-                if declaration.is_writable() {
-                    return Err(ContractError::AttachmentComputeConflict {
-                        pass_index,
-                        view: attachment.view_id,
-                        compute_pass: declaration.pass_index(),
-                    });
+                declaration.admit_extent(pass_index, attachment)?;
+            }
+            // The attachment's own byte range is the one its declaration
+            // describes, and the hazard is any compute write of the same
+            // allocation that overlaps it — whichever view that write goes
+            // through. Identity equality would miss a sibling view and would
+            // have to be re-derived for every shape, so the comparison reuses
+            // the range comparator (`research/docs/14` §3.2, review item M3,
+            // 2026-09-14).
+            let ranges = declarations
+                .iter()
+                .map(|declaration| declaration.byte_range())
+                .collect::<Vec<_>>();
+            for (compute_view, others) in &declared {
+                for other in others {
+                    if !other.is_writable() {
+                        continue;
+                    }
+                    if ranges
+                        .iter()
+                        .any(|range| range.overlaps(&other.byte_range()))
+                    {
+                        return Err(ContractError::AttachmentComputeConflict {
+                            pass_index,
+                            view: attachment.view_id,
+                            compute_view: *compute_view,
+                            compute_pass: other.pass_index(),
+                        });
+                    }
                 }
             }
             if pool.insert(attachment.view_id) && pool.len() > MAX_SERIAL_RESOURCES {
@@ -4137,7 +4222,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Resource,
             "attachment_allocation_unknown",
         ),
-        E::AttachmentExtentMismatch { .. } => {
+        // A byte-count disagreement and a texel-shape disagreement are the same
+        // caller-fixable resource shape, so they keep one slug; the detail is
+        // where the shape is spelled out (review item M4, 2026-09-14).
+        E::AttachmentExtentMismatch { .. } | E::AttachmentTextureShapeMismatch { .. } => {
             (ProviderErrorClass::Args, "attachment_extent_mismatch")
         }
         E::AttachmentComputeConflict { .. } => {
@@ -5083,9 +5171,39 @@ pub enum ContractError {
         expected: u64,
         declared: u64,
     },
-    AttachmentComputeConflict {
+    /// A texture declaration does not describe the attachment's shape.
+    ///
+    /// Kept beside [`Self::AttachmentExtentMismatch`] rather than folded into
+    /// it: a buffer declaration can only disagree about a byte count, while a
+    /// texture can disagree about the texel shape or the format and still hold
+    /// the same number of bytes. Reporting only the two byte counts there left
+    /// `expected: 16, declared: 16` in the message, which names no field to fix
+    /// (review item M4, 2026-09-14).
+    AttachmentTextureShapeMismatch {
         pass_index: usize,
         view: ViewId,
+        /// The attachment's own shape: `[width, height]` texels of
+        /// `attachment_format`, i.e. `attachment_bytes` tightly packed bytes.
+        attachment_extent: [u64; 2],
+        attachment_format: AttachmentFormat,
+        attachment_bytes: u64,
+        /// The shape the trace's own declaration states.
+        declared_type: TextureType,
+        declared_extent: [u64; 2],
+        declared_depth: u64,
+        declared_array_length: u64,
+        declared_sample_count: u64,
+        declared_format: TextureFormat,
+        declared_bytes: u64,
+    },
+    AttachmentComputeConflict {
+        pass_index: usize,
+        /// The attachment the render pass stores into.
+        view: ViewId,
+        /// The view the conflicting compute pass writes. It is `view` itself
+        /// when the same identity is declared writable, and a sibling view of
+        /// the same allocation when only the byte ranges overlap.
+        compute_view: ViewId,
         compute_pass: usize,
     },
     LeaseSourceLengthMismatch {
@@ -5355,13 +5473,38 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render pass {pass_index} attachment view {view:?} covers {expected} bytes, but the trace declares {declared}"
             ),
+            Self::AttachmentTextureShapeMismatch {
+                pass_index,
+                view,
+                attachment_extent,
+                attachment_format,
+                attachment_bytes,
+                declared_type,
+                declared_extent,
+                declared_depth,
+                declared_array_length,
+                declared_sample_count,
+                declared_format,
+                declared_bytes,
+            } => write!(
+                formatter,
+                "render pass {pass_index} attachment view {view:?} is {width}×{height} {attachment_format:?} \
+                 ({attachment_bytes} bytes), but the trace declares texture {declared_type:?} \
+                 {declared_width}×{declared_height}×{declared_depth}, array {declared_array_length}, \
+                 samples {declared_sample_count}, {declared_format:?} ({declared_bytes} bytes)",
+                width = attachment_extent[0],
+                height = attachment_extent[1],
+                declared_width = declared_extent[0],
+                declared_height = declared_extent[1],
+            ),
             Self::AttachmentComputeConflict {
                 pass_index,
                 view,
+                compute_view,
                 compute_pass,
             } => write!(
                 formatter,
-                "render pass {pass_index} attachment view {view:?} is written by compute pass {compute_pass}"
+                "render pass {pass_index} attachment view {view:?} shares bytes with compute pass {compute_pass}, which writes view {compute_view:?}"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -10219,22 +10362,45 @@ mod tests {
         assert_eq!(refusal.slug, "attachment_extent_mismatch");
 
         // A texture declaration is compared by texel shape and format as well.
-        // 4×1 is the same byte count as 2×2 and still a different target.
+        // 4×1 is the same byte count as 2×2 and still a different target, so the
+        // refusal has to name both shapes: two equal byte counts cannot locate
+        // the mistake (review item M4, 2026-09-14).
         let mut wide = two_by_two_texture(TextureFormat::Rgba8Unorm);
         wide.width = 4;
         wide.height = 1;
         wide.allocation_id = AllocationId::new(11);
         assert_eq!(wide.expected_bytes().unwrap(), 16);
         let shape = texture_attachment_trace(wide, attachment_into(7, 11));
-        assert_eq!(
-            shape.validate_serial_buffer_reuse(),
-            Err(ContractError::AttachmentExtentMismatch {
-                pass_index: 1,
-                view: ViewId::new(7),
-                expected: 16,
-                declared: 16,
-            })
-        );
+        let expected = ContractError::AttachmentTextureShapeMismatch {
+            pass_index: 1,
+            view: ViewId::new(7),
+            attachment_extent: [2, 2],
+            attachment_format: AttachmentFormat::Rgba8Unorm,
+            attachment_bytes: 16,
+            declared_type: TextureType::D2,
+            declared_extent: [4, 1],
+            declared_depth: 1,
+            declared_array_length: 1,
+            declared_sample_count: 1,
+            declared_format: TextureFormat::Rgba8Unorm,
+            declared_bytes: 16,
+        };
+        assert_eq!(shape.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected.clone());
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "attachment_extent_mismatch");
+        let detail = refusal
+            .detail
+            .clone()
+            .expect("the refusal carries its detail");
+        for fragment in ["2×2", "4×1", "Rgba8Unorm", "16 bytes"] {
+            assert!(
+                detail.contains(fragment),
+                "the refusal has to name {fragment:?} to be locatable, got {detail:?}"
+            );
+        }
+        let expected_detail = expected.to_string();
+        assert_eq!(refusal.detail.as_deref(), Some(expected_detail.as_str()));
 
         // A format mismatch lands on the same rule, even when the byte extents
         // agree: `R32Float` and `Rgba8Unorm` both occupy 4 bytes per texel, so
@@ -10242,15 +10408,18 @@ mod tests {
         let mut float = two_by_two_texture(TextureFormat::R32Float);
         float.allocation_id = AllocationId::new(11);
         let format = texture_attachment_trace(float, attachment_into(7, 11));
-        assert_eq!(
-            format.validate_serial_buffer_reuse(),
-            Err(ContractError::AttachmentExtentMismatch {
-                pass_index: 1,
-                view: ViewId::new(7),
-                expected: 16,
-                declared: 16,
-            })
-        );
+        let mut expected_format = expected;
+        let ContractError::AttachmentTextureShapeMismatch {
+            declared_extent,
+            declared_format,
+            ..
+        } = &mut expected_format
+        else {
+            panic!("the fixture expects the texture shape refusal");
+        };
+        *declared_extent = [2, 2];
+        *declared_format = TextureFormat::R32Float;
+        assert_eq!(format.validate_serial_buffer_reuse(), Err(expected_format));
     }
 
     #[test]
@@ -10292,6 +10461,7 @@ mod tests {
         let expected = ContractError::AttachmentComputeConflict {
             pass_index: 1,
             view: ViewId::new(7),
+            compute_view: ViewId::new(7),
             compute_pass: 0,
         };
         assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
@@ -10310,6 +10480,7 @@ mod tests {
             Err(ContractError::AttachmentComputeConflict {
                 pass_index: 1,
                 view: ViewId::new(7),
+                compute_view: ViewId::new(7),
                 compute_pass: 0,
             })
         );
@@ -10324,6 +10495,92 @@ mod tests {
             ordered.serial_resources().unwrap()[0].access,
             BufferAccess::ReadWrite
         );
+    }
+
+    // Review item M3 (2026-09-14): whether an attachment races a compute writer
+    // is a byte-range question inside one allocation, not a view-identity
+    // question. Two sibling views of one allocation can overlap without sharing
+    // an identity, and the same allocation can carry neighbouring views that
+    // never meet.
+
+    /// A trace whose render attachment lands in `landing` while one compute pass
+    /// writes `writer`; both views name the same allocation.
+    fn sibling_writer_trace(
+        landing: BufferView,
+        writer: BufferView,
+        attachment: RenderAttachment,
+    ) -> ComputeTrace {
+        let mut landing = landing;
+        landing.metal_binding = 0;
+        let mut writer = writer;
+        writer.metal_binding = 1;
+        let accesses = [landing.access, writer.access];
+        let mut value = trace(vec![pass(4, vec![landing, writer])]);
+        // `ComputePass::validate` compares each binding against its reflection,
+        // so the pipeline contract carries both views' accesses.
+        value.pipelines[0].contract.buffer_bindings = accesses
+            .into_iter()
+            .enumerate()
+            .map(|(index, access)| BufferBindingContract {
+                metal_binding: index as u32,
+                access,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            })
+            .collect();
+        declare_render_contract(&mut value);
+        value.passes.push(render_pass_into(attachment));
+        value
+    }
+
+    #[test]
+    fn attachment_conflicts_follow_the_allocation_byte_range() {
+        // Views 7 and 8 are siblings of allocation 9: 7 is the attachment's own
+        // landing view at [0, 16), 8 is written by compute at [8, 24). They
+        // share bytes without sharing an identity, so this is exactly the
+        // write/write hazard the same-view rule catches.
+        let mut overlapping = landing_view(8, 9);
+        overlapping.offset = 8;
+        overlapping.access = BufferAccess::Write;
+        let value = sibling_writer_trace(landing_view(7, 9), overlapping, attachment_into(7, 9));
+        let expected = ContractError::AttachmentComputeConflict {
+            pass_index: 1,
+            view: ViewId::new(7),
+            compute_view: ViewId::new(8),
+            compute_pass: 0,
+        };
+        assert_eq!(value.validate_serial_buffer_reuse(), Err(expected.clone()));
+        let refusal = contract_error_refusal(expected);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "attachment_resource_conflict");
+
+        // The control: a sibling view of the same allocation that shares no byte
+        // with the attachment is admitted. View identity is not what makes the
+        // hazard, so an identity-only rule is wrong in both directions.
+        let mut disjoint = landing_view(8, 9);
+        disjoint.offset = 16;
+        disjoint.length = 8;
+        disjoint.access = BufferAccess::Write;
+        disjoint.source = BufferSource::OwnedBytes(vec![0; 8]);
+        let allowed = sibling_writer_trace(landing_view(7, 9), disjoint, attachment_into(7, 9));
+        allowed.validate_serial_buffer_reuse().unwrap();
+
+        // The neighbours are admitted end to end as well, on a snapshot whose
+        // allocation holds both byte ranges.
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(9),
+                owner_epoch: DeviceEpoch::new(1),
+                size: 24,
+            })
+            .unwrap();
+        let mut render = render_capabilities();
+        // Two sibling views of one allocation need the alias mode that admits
+        // them; what this assertion is about is the byte ranges, not aliasing.
+        render.alias_mode = AliasMode::DistinctViews;
+        render.admit(&allowed, &resources).unwrap();
     }
 
     #[test]
