@@ -371,7 +371,7 @@ impl VulkanContext {
             .map_err(|error| failure(format!("create Vulkan instance: {error}")))?;
 
         let selection = select_physical_device(&instance);
-        let (physical, queue_family) = match selection {
+        let (physical, queue_family, shader_int8) = match selection {
             Ok(selection) => selection,
             Err(error) => {
                 unsafe { instance.destroy_instance(None) };
@@ -440,10 +440,14 @@ impl VulkanContext {
             Vec::new()
         };
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
+        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().shader_int8(shader_int8);
+        let physical_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enabled_extensions)
-            .push_next(&mut vulkan13);
+            .enabled_features(&physical_features)
+            .push_next(&mut vulkan13)
+            .push_next(&mut vulkan12);
         let device = match unsafe { instance.create_device(physical, &device_info, None) } {
             Ok(device) => device,
             Err(error) => {
@@ -700,7 +704,9 @@ impl Drop for VulkanContext {
     }
 }
 
-fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u32), ExecutorError> {
+fn select_physical_device(
+    instance: &Instance,
+) -> Result<(vk::PhysicalDevice, u32, bool), ExecutorError> {
     let physicals = unsafe { instance.enumerate_physical_devices() }
         .map_err(|error| failure(format!("enumerate Vulkan physical devices: {error}")))?;
     physicals
@@ -713,7 +719,21 @@ fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u3
             let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan13);
             unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            let shader_int64 = features.features.shader_int64 == vk::TRUE;
+            let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features12 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12);
+            unsafe { instance.get_physical_device_features2(physical, &mut features12) };
             if vulkan13.maintenance4 != vk::TRUE {
+                return None;
+            }
+            // The reviewed texture fixtures return an i8 status beside the
+            // texel, so the shader declares Int8. Vulkan exposes that through
+            // the shaderInt8 feature; a device without it cannot execute the
+            // same SPIR-V.
+            if vulkan12.shader_int8 != vk::TRUE {
+                return None;
+            }
+            if !shader_int64 {
                 return None;
             }
             let queues = unsafe { instance.get_physical_device_queue_family_properties(physical) };
@@ -738,9 +758,11 @@ fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u3
                 .max_by_key(|(score, _, _)| *score)
         })
         .max_by_key(|(score, _, _)| *score)
-        .map(|(_, physical, family)| (physical, family))
+        .map(|(_, physical, family)| (physical, family, true))
         .ok_or_else(|| {
-            failure("no Vulkan 1.3 physical device with maintenance4 exposes a compute queue")
+            failure(
+                "no Vulkan 1.3 physical device with maintenance4, shaderInt8 and a compute queue",
+            )
         })
 }
 
@@ -1341,7 +1363,24 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
                 return Err(failure("SPIR-V OpCapability has invalid length"));
             }
             let capability = words[cursor + 1];
-            if capability != Capability::Shader as u32 {
+            // Vulkan 1.0 core capabilities: Shader is required by every
+            // module, ImageQuery by texture size/level queries, and
+            // Sampled1D/SampledBuffer cover the linear and buffer texture
+            // shapes the reviewed fixtures use. Everything else stays
+            // refused until a capability gate admits a provider feature.
+            if !matches!(
+                capability,
+                value if value == Capability::Shader as u32
+                    || value == Capability::ImageQuery as u32
+                    // The reviewed texture fixtures return an i8 status
+                    // beside the texel; the device enables shaderInt8.
+                    || value == Capability::Int8 as u32
+                    // Index arithmetic in the reviewed fixtures widens to
+                    // i64; the device enables shaderInt64.
+                    || value == Capability::Int64 as u32
+                    || value == Capability::Sampled1D as u32
+                    || value == Capability::SampledBuffer as u32
+            ) {
                 return Err(failure(format!(
                     "SPIR-V capability {capability} requires a Vulkan feature outside the Phase 1 subset"
                 )));
@@ -2788,6 +2827,56 @@ mod tests {
     use metal2vulkan::meta::{KernMeta, KernRole};
     use metal2vulkan::reflect::{BufferStrideTerm, BufferStridedAccess};
 
+    #[test]
+    fn texture_fixture_translates_and_reflects_a_sampled_binding() {
+        let source =
+            include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll");
+        let options = TransformOptions {
+            kernel_local_size: [1, 1, 1],
+            kernel_dispatch: Some(KernelDispatch::safe_default()),
+            ..TransformOptions::default()
+        };
+        let scratch = ScratchDir::new().expect("scratch directory");
+        let (spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            source,
+            Stage::Kernel,
+            &scratch.path,
+            options,
+        )
+        .expect("the texture fixture translates");
+        assert!(!spirv.is_empty());
+        let texture = reflection
+            .bindings
+            .iter()
+            .find(|binding| binding.texture_shape.is_some())
+            .expect("the fixture reflects a texture binding");
+        assert_eq!(texture.access, Some(ResourceAccess::Sampled));
+    }
+
+    #[test]
+    fn texture_fixture_reaches_pipeline_creation_on_the_selected_device() {
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let device = metal_api_core::Device::new(executor);
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        match device.new_compute_pipeline_state(&function) {
+            Ok(_) => eprintln!("pipeline created for a texture-reading kernel"),
+            Err(error) => eprintln!("pipeline creation stopped at: {error}"),
+        }
+    }
+
     fn serial_fixture() -> (
         TranslatedComputePipeline,
         Vec<BufferBinding>,
@@ -3594,18 +3683,36 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_spirv_feature_gate_accepts_shader_and_rejects_optional_capabilities() {
+    fn phase_one_spirv_feature_gate_accepts_reviewed_capabilities_and_rejects_optional_ones() {
         let shader = [
             (2_u32 << 16) | Op::Capability as u32,
             Capability::Shader as u32,
         ];
         assert!(validate_spirv_capabilities(&spirv_bytes(&[&shader])).is_ok());
 
-        let int64 = [
+        // The reviewed texture fixtures need these core capabilities, and the
+        // device enables the matching shaderInt8/shaderInt64 features.
+        for capability in [
+            Capability::Int8,
+            Capability::Int64,
+            Capability::ImageQuery,
+            Capability::Sampled1D,
+            Capability::SampledBuffer,
+        ] {
+            let instruction = [(2_u32 << 16) | Op::Capability as u32, capability as u32];
+            assert!(
+                validate_spirv_capabilities(&spirv_bytes(&[&shader, &instruction])).is_ok(),
+                "{capability:?} is inside the reviewed subset"
+            );
+        }
+
+        // A capability outside the reviewed subset (Float64 has no matching
+        // enabled feature) stays refused.
+        let float64 = [
             (2_u32 << 16) | Op::Capability as u32,
-            Capability::Int64 as u32,
+            Capability::Float64 as u32,
         ];
-        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &int64])).unwrap_err();
+        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64])).unwrap_err();
         assert!(error.message().contains("outside the Phase 1 subset"));
 
         let extension = [(2_u32 << 16) | Op::Extension as u32, 0];
