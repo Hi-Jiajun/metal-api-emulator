@@ -1,7 +1,10 @@
-; 本文件是 solid_rgba8.frag.spv 的可读源，由渲染轨道 include_bytes! 内嵌
-; （crates/metal-api-vulkan/src/render.rs）。复现命令：
+; 本文件是 solid_rgba8.frag.spv 的可读源，由渲染轨道的测试 include_bytes! 内嵌
+; （crates/metal-api-vulkan/src/render.rs、crates/metal-api-vulkan/tests/render_e2e.rs）。复现命令：
 ;   spirv-as --target-env vulkan1.0 solid_rgba8.frag.spvasm -o solid_rgba8.frag.spv
 ; 来源：/var/tmp/render-probe/shaders/solid_rgba8.frag.spvasm（linear/optimal 附件探针）。
+; 入口名 fragment_main：core 的 RenderPipelineContract 拒绝 vertex/fragment 同名入口
+; （两段名必须区分），所以本文件的入口名从探针的 "main" 改为 "fragment_main"，
+; 着色器行为与探针一致（探针本身不依赖入口名）。
 ; 片元着色器：写固定颜色 (64/255, 128/255, 192/255, 1.0)
 ; 取"字节值本身 / 255"而不是 0.25/0.5/0.75，是为了避开 f*255 落在半整数上的 tie
 ; （0.5*255 = 127.5 的 tie-break 实现相关，见 --tie-probe）。
@@ -10,10 +13,10 @@
                OpCapability Shader
           %glsl = OpExtInstImport "GLSL.std.450"
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Fragment %main "main" %outColor
+               OpEntryPoint Fragment %main "fragment_main" %outColor
                OpExecutionMode %main OriginUpperLeft
                OpSource GLSL 450
-               OpName %main "main"
+               OpName %main "fragment_main"
                OpName %outColor "outColor"
                OpDecorate %outColor Location 0
        %void = OpTypeVoid

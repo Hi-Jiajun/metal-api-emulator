@@ -9,10 +9,20 @@ use metal2vulkan::reflect::{
     BufferFootprint, KernelDispatch, ResourceAccess, ResourceKind, ShaderReflection,
 };
 use metal_api_core::provider::{
-    AffineAccess, AffineTerm, AliasMode, BufferAccess, BufferBindingContract, DispatchKind,
-    FootprintProof, PipelineContract, ProviderCapabilities, SemanticDigest, StorageMode,
+    AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
+    DispatchKind, FootprintProof, PipelineContract, ProviderCapabilities, SemanticDigest,
+    StorageMode, MAX_COLOR_ATTACHMENTS,
 };
 use metal_api_core::ExecutorError;
+
+/// The largest attachment extent the first render increment executes.
+///
+/// The milestone is 2×2 (`research/docs/23` §1.3): every texel has to be
+/// distinguishable from a single stored one, and the capability bit is what
+/// keeps a larger attachment out of the rail instead of letting the driver
+/// answer a size the fixture never proved. Widening it is a deliberate change
+/// to the rail's window and to the conformance case that measures it.
+const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [2, 2];
 
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
@@ -38,12 +48,17 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         storage_modes: vec![StorageMode::OwnedBytes],
         host_readback: true,
         submit_only: false,
-        // Compute-only snapshot: the render track is not wired into this
-        // provider, so admission refuses render-bearing traces.
-        supports_render_passes: false,
-        max_color_attachments: 0,
-        max_attachment_dimension: [0, 0],
-        supported_color_formats: Vec::new(),
+        // The offscreen render rail is admitted: `render.rs` executes one
+        // colour attachment end to end, so the capability bits name exactly
+        // what that rail covers — one 2×2 attachment in a contract format.
+        // Formats the device itself refuses are still refused before
+        // `vkCreateImage` by the rail's `COLOR_ATTACHMENT` probe; the
+        // capability snapshot answers which shapes the provider can express,
+        // and the device answers which of those it can run.
+        supports_render_passes: true,
+        max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
+        max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
+        supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
     }
 }
 
@@ -337,5 +352,15 @@ mod tests {
         assert_eq!(capabilities.storage_modes, vec![StorageMode::OwnedBytes]);
         assert!(!capabilities.supports_threadgroups);
         assert!(!capabilities.submit_only);
+        // The render bits are the rail's own window, not a device limit: one
+        // 2×2 attachment in every format the render contract admits.
+        assert!(capabilities.supports_render_passes);
+        assert_eq!(capabilities.max_color_attachments, 1);
+        assert_eq!(capabilities.max_attachment_dimension, [2, 2]);
+        assert_eq!(
+            capabilities.supported_color_formats,
+            AttachmentFormat::ADMITTED.to_vec()
+        );
+        assert!(capabilities.declares_render_support());
     }
 }

@@ -17,16 +17,18 @@
 //!
 //! Step 3c owns the rest: tagging the trace's pass list with the render arm
 //! (the core value types already exist), the `MCC1` payload for that arm and
-//! flipping `ProviderCapabilities::supports_render_passes`. Nothing on the trace
-//! path calls this rail yet, so the non-test build allows `dead_code` here
-//! instead of carrying a `pub(crate)` surface that no production path reaches.
-#![cfg_attr(not(test), allow(dead_code))]
+//! flipping `ProviderCapabilities::supports_render_passes`. Step 4 hands the
+//! rail to the trace path: [`execute_render_pass`] translates one admitted
+//! `RenderPassDescriptor` into a rail request, and the compute provider's
+//! submit path calls it for every render entry and publishes the readback
+//! through the existing buffer-writeback channel.
 
 use ash::vk;
 use metal_api_core::provider::{
-    AttachmentFormat, ClearColor, FieldValue, ProviderError, ProviderErrorClass, ProviderPhase,
-    Retryability,
+    AttachmentFormat, ClearColor, FieldValue, LoadOp, ProviderError, ProviderErrorClass,
+    ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp,
 };
+use std::ffi::{CStr, CString};
 
 use crate::VulkanContext;
 
@@ -41,24 +43,10 @@ const BYTES_PER_TEXEL: u64 = 4;
 /// (`research/docs/23` §1.2).
 const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 
-/// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
-/// varyings. `spirv-as` output of `render_spv/fullscreen_triangle.vert.spvasm`,
-/// which selects `(-1,-1) (3,-1) (-1,3)` — the oversize triangle covers every
-/// pixel centre of a 2×2 viewport, so "the draw really ran" stays falsifiable
-/// (`research/docs/23` §1.3).
-const FULL_SCREEN_TRIANGLE_VERT_SPV: &[u8] =
-    include_bytes!("render_spv/fullscreen_triangle.vert.spv");
-
-/// Fragment stage: writes `(64/255, 128/255, 192/255, 1)`, which an 8-bit UNORM
-/// attachment stores as `40 80 c0 ff`.
-///
-/// The constants are byte/255 rather than the round decimals `0.25/0.5/0.75`
-/// on purpose: `0.5 * 255 = 127.5` is a half-integer tie, and the probe read
-/// `0x80` back on Lavapipe but `0x7f` on both the NVIDIA driver and dzn
-/// (`research/docs/23` §3.5). Byte/255 values sit at least 3.7e-6 away from a
-/// tie on every driver, so they are the parity-stable discipline the fixture
-/// has to follow.
-const SOLID_RGBA8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_rgba8.frag.spv");
+// The reviewed stage modules of the milestone live in `render_spv/`: a
+// full-screen triangle vertex stage and a solid `40 80 c0 ff` fragment stage.
+// The rail itself takes the modules from a host registration, so only the
+// tests below (and the end-to-end crate test) name them directly.
 
 /// One offscreen render pass to execute.
 ///
@@ -77,10 +65,183 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// contract carries bytes: a float clear is not parity-stable
     /// (`research/docs/23` §3.5).
     pub clear: ClearColor,
+    /// The two compiled stages the graphics pipeline is built from.
+    pub stages: RenderStageModules<'a>,
+}
+
+/// The two compiled stage entries one offscreen render pipeline pairs.
+///
+/// The entry names travel with the modules because they are what the pipeline
+/// actually binds: `VkPipelineShaderStageCreateInfo::pName` names the SPIR-V
+/// entry point, so a contract whose two entries are not the modules' entries
+/// would build a pipeline the trace did not describe. Host-side registrations
+/// own the modules; this rail only reads them.
+pub(crate) struct RenderStageModules<'a> {
+    /// Entry point of the vertex-stage module.
+    pub vertex_entry: &'a str,
+    /// Entry point of the fragment-stage module.
+    pub fragment_entry: &'a str,
     /// Vertex-stage SPIR-V module.
     pub vertex_spirv: &'a [u8],
     /// Fragment-stage SPIR-V module.
     pub fragment_spirv: &'a [u8],
+}
+
+impl<'a> RenderStageModules<'a> {
+    pub(crate) const fn new(
+        vertex_entry: &'a str,
+        fragment_entry: &'a str,
+        vertex_spirv: &'a [u8],
+        fragment_spirv: &'a [u8],
+    ) -> Self {
+        Self {
+            vertex_entry,
+            fragment_entry,
+            vertex_spirv,
+            fragment_spirv,
+        }
+    }
+}
+
+/// One host-registered render pipeline: the two compiled stage modules and the
+/// contract they were built against.
+///
+/// The compute rail keeps one translated artifact per `PipelineId` in the
+/// provider registry; this is the render sibling of that value, stored in the
+/// same registry namespace so a trace's pipeline table stays the single source
+/// of which pipeline a pass names.
+pub(crate) struct RenderStages {
+    pub contract: RenderPipelineContract,
+    pub vertex_spirv: Vec<u8>,
+    pub fragment_spirv: Vec<u8>,
+}
+
+impl RenderStages {
+    /// Structural validation of one registration, before any trace can name it.
+    ///
+    /// The entry names and the module bytes are checked here because both are
+    /// per-registration facts: an empty entry name, a name carrying an interior
+    /// NUL and a module that is not a whole number of SPIR-V words are refused
+    /// once, at registration, instead of on every submission that names the
+    /// pipeline.
+    pub(crate) fn validate(&self) -> Result<(), ProviderError> {
+        self.contract
+            .validate()
+            .map_err(|error| render_pipeline_contract_refusal(&error.to_string()))?;
+        for (stage, entry) in [
+            ("vertex", self.contract.vertex_entry.as_str()),
+            ("fragment", self.contract.fragment_entry.as_str()),
+        ] {
+            if CString::new(entry).is_err() {
+                return Err(stage_entry_refusal(
+                    stage,
+                    "the entry name carries an interior NUL",
+                ));
+            }
+        }
+        for (stage, module) in [
+            ("vertex", self.vertex_spirv.as_slice()),
+            ("fragment", self.fragment_spirv.as_slice()),
+        ] {
+            if spirv_words(module).is_none() {
+                return Err(
+                    spirv_refusal("the module is empty or not a multiple of four bytes")
+                        .with_field("stage", FieldValue::Text(stage.to_owned())),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn modules(&self) -> RenderStageModules<'_> {
+        RenderStageModules::new(
+            &self.contract.vertex_entry,
+            &self.contract.fragment_entry,
+            &self.vertex_spirv,
+            &self.fragment_spirv,
+        )
+    }
+}
+
+/// Execute one admitted render pass and return the attachment's tightly packed
+/// texel bytes.
+///
+/// This is the trace-side entry point of the rail: the pass's shape rules were
+/// already checked by core admission, so what is left here is the agreement
+/// between the pass and the registered pipeline it names
+/// ([`RenderPipelineContract::validate_against`]) and the two shapes the first
+/// increment cannot execute — a `Load` that would have to carry the
+/// attachment's previous bytes into the image, and a pass whose attachment
+/// list is not the single target the registered pipeline was built for. Both
+/// are refused as capability facts before any Vulkan object exists, never
+/// downgraded to a clear.
+pub(crate) fn execute_render_pass(
+    context: &VulkanContext,
+    stages: &RenderStages,
+    pass: &RenderPassDescriptor,
+) -> Result<Vec<u8>, ProviderError> {
+    stages
+        .contract
+        .validate_against(pass)
+        .map_err(|error| contract_refusal(&error.to_string()))?;
+    let [attachment] = pass.color_attachments.as_slice() else {
+        return Err(capability_refusal("color_attachment_limit")
+            .with_field(
+                "requested",
+                FieldValue::Unsigned(pass.color_attachments.len() as u64),
+            )
+            .with_field(
+                "maximum",
+                FieldValue::Unsigned(metal_api_core::provider::MAX_COLOR_ATTACHMENTS as u64),
+            )
+            .with_detail("this rail executes exactly one colour attachment"));
+    };
+    let clear = match attachment.load {
+        LoadOp::Clear(clear) => clear,
+        LoadOp::Load => {
+            return Err(capability_refusal("attachment_load_op_unsupported")
+                .with_field("load_op", FieldValue::Text("load".to_owned()))
+                .with_detail(
+                    "the first render increment has no rail that uploads an attachment's \
+                     previous bytes into the image, so `Load` would silently become a clear",
+                ))
+        }
+        LoadOp::DontCare => {
+            return Err(capability_refusal("attachment_load_op_unsupported")
+                .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
+                .with_detail("core admission refuses `LoadOp::DontCare` for this increment"));
+        }
+    };
+    match attachment.store {
+        StoreOp::Store => {}
+        StoreOp::DontCare => {
+            return Err(capability_refusal("attachment_store_op_unsupported")
+                .with_field("store_op", FieldValue::Text("dont_care".to_owned()))
+                .with_detail("core admission refuses `StoreOp::DontCare` for this increment"));
+        }
+    }
+    let width = narrow_dimension(attachment.width)?;
+    let height = narrow_dimension(attachment.height)?;
+    let request = OffscreenRenderRequest {
+        format: attachment.format,
+        extent: [width, height],
+        clear,
+        stages: stages.modules(),
+    };
+    execute_offscreen_render(context, &request)
+}
+
+/// Narrow one attachment dimension to the `u32` the Vulkan image extent uses.
+///
+/// The capability bits already bound every admitted attachment, so this is the
+/// second line of defence the capability snapshot is not: it keeps the widening
+/// explicit instead of letting a cast truncate an extent the caller asked for.
+fn narrow_dimension(dimension: u64) -> Result<u32, ProviderError> {
+    u32::try_from(dimension).map_err(|_| {
+        capability_refusal("attachment_dimension_limit")
+            .with_field("requested", FieldValue::Unsigned(dimension))
+            .with_field("maximum", FieldValue::Unsigned(u64::from(u32::MAX)))
+    })
 }
 
 /// The `VkFormat` a render-contract attachment format names.
@@ -202,16 +363,23 @@ pub(crate) fn execute_offscreen_render(
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
-    let vertex_words = spirv_words(request.vertex_spirv)
+    let vertex_words = spirv_words(request.stages.vertex_spirv)
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
-    let fragment_words = spirv_words(request.fragment_spirv)
+    let fragment_words = spirv_words(request.stages.fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
+    let vertex_entry = stage_entry_cstring("vertex", request.stages.vertex_entry)?;
+    let fragment_entry = stage_entry_cstring("fragment", request.stages.fragment_entry)?;
 
     let mut objects = OffscreenObjects::new(context);
     objects.create_attachment(format, width, height)?;
     objects.create_render_pass(format)?;
     objects.create_framebuffer(width, height)?;
-    objects.create_pipeline(&vertex_words, &fragment_words)?;
+    objects.create_pipeline(
+        &vertex_words,
+        &fragment_words,
+        &vertex_entry,
+        &fragment_entry,
+    )?;
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_command_pool(queue_index)?;
     objects.record(request.clear, width, height)?;
@@ -403,6 +571,8 @@ impl<'a> OffscreenObjects<'a> {
         &mut self,
         vertex_words: &[u32],
         fragment_words: &[u32],
+        vertex_entry: &CStr,
+        fragment_entry: &CStr,
     ) -> Result<(), ProviderError> {
         self.vertex_module = unsafe {
             self.context.device.create_shader_module(
@@ -423,11 +593,11 @@ impl<'a> OffscreenObjects<'a> {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(self.vertex_module)
-                .name(c"main"),
+                .name(vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.fragment_module)
-                .name(c"main"),
+                .name(fragment_entry),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -781,6 +951,15 @@ fn spirv_words(bytes: &[u8]) -> Option<Vec<u32>> {
     )
 }
 
+/// The `CStr` a graphics-pipeline stage binds for one entry name.
+fn stage_entry_cstring(stage: &'static str, entry: &str) -> Result<CString, ProviderError> {
+    if entry.is_empty() {
+        return Err(stage_entry_refusal(stage, "the entry name is empty"));
+    }
+    CString::new(entry)
+        .map_err(|_| stage_entry_refusal(stage, "the entry name carries an interior NUL"))
+}
+
 fn tiling_name(tiling: vk::ImageTiling) -> &'static str {
     match tiling {
         vk::ImageTiling::LINEAR => "linear",
@@ -825,6 +1004,29 @@ fn spirv_refusal(detail: &str) -> ProviderError {
     error.with_detail(detail.to_owned())
 }
 
+/// A registered render pipeline that cannot be built at all.
+///
+/// Registration is where a render pipeline's own shape is settled, so this is
+/// deliberately not the trace-level `trace_contract_invalid` the execution path
+/// uses when a pass disagrees with the pipeline it names: no trace exists yet.
+fn render_pipeline_contract_refusal(detail: &str) -> ProviderError {
+    let mut error = ProviderError::new(
+        ProviderPhase::Compile,
+        ProviderErrorClass::Args,
+        "render_pipeline_contract_invalid",
+    )
+    .expect("static provider refusal slug");
+    error.retryability = Retryability::Never;
+    error.with_detail(detail.to_owned())
+}
+
+/// A stage entry name the graphics pipeline cannot bind.
+fn stage_entry_refusal(stage: &'static str, detail: &str) -> ProviderError {
+    capability_refusal("render_stage_entry_invalid")
+        .with_field("stage", FieldValue::Text(stage.to_owned()))
+        .with_detail(detail.to_owned())
+}
+
 fn execution_refusal(step: &str, detail: &str) -> ProviderError {
     let mut error = ProviderError::new(
         ProviderPhase::Encode,
@@ -850,6 +1052,28 @@ fn submission_refusal(step: &str, detail: &str) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal_api_core::provider::{
+        AllocationId, PipelineId, RenderAttachment, VertexLayout, ViewId,
+    };
+
+    /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
+    /// varyings. `spirv-as` output of `render_spv/fullscreen_triangle.vert.spvasm`,
+    /// which selects `(-1,-1) (3,-1) (-1,3)` — the oversize triangle covers every
+    /// pixel centre of a 2×2 viewport, so "the draw really ran" stays falsifiable
+    /// (`research/docs/23` §1.3).
+    const FULL_SCREEN_TRIANGLE_VERT_SPV: &[u8] =
+        include_bytes!("render_spv/fullscreen_triangle.vert.spv");
+
+    /// Fragment stage: writes `(64/255, 128/255, 192/255, 1)`, which an 8-bit UNORM
+    /// attachment stores as `40 80 c0 ff`.
+    ///
+    /// The constants are byte/255 rather than the round decimals `0.25/0.5/0.75`
+    /// on purpose: `0.5 * 255 = 127.5` is a half-integer tie, and the probe read
+    /// `0x80` back on Lavapipe but `0x7f` on both the NVIDIA driver and dzn
+    /// (`research/docs/23` §3.5). Byte/255 values sit at least 3.7e-6 away from a
+    /// tie on every driver, so they are the parity-stable discipline the fixture
+    /// has to follow.
+    const SOLID_RGBA8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_rgba8.frag.spv");
 
     /// The readback a 2×2 `R8G8B8A8_UNORM` attachment must hold when the
     /// fragment shader stores `64/255, 128/255, 192/255, 1`.
@@ -858,6 +1082,18 @@ mod tests {
     /// The `LoadOp::Clear` sentinel (`research/docs/23` §1.3): a texel that
     /// still holds it proves the draw did not cover that pixel.
     const CLEAR_SENTINEL: u8 = 0xfe;
+
+    /// The two reviewed stage modules of the milestone, under the entry names
+    /// their `.spvasm` sources declare. The names have to differ: core refuses a
+    /// contract whose vertex and fragment entries are the same name.
+    fn milestone_stages() -> RenderStageModules<'static> {
+        RenderStageModules::new(
+            "vertex_main",
+            "fragment_main",
+            FULL_SCREEN_TRIANGLE_VERT_SPV,
+            SOLID_RGBA8_FRAG_SPV,
+        )
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes
@@ -957,8 +1193,7 @@ mod tests {
             format: AttachmentFormat::R32Uint,
             extent: [2, 2],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV,
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV,
+            stages: milestone_stages(),
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("R32Uint is refused before any Vulkan object exists");
@@ -978,8 +1213,7 @@ mod tests {
             format: AttachmentFormat::Rgba8Unorm,
             extent: [2, 2],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV,
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV,
+            stages: milestone_stages(),
         };
         let (uploads_before, readbacks_before) = context.buffer_copy_counts();
         let texels =
@@ -1009,12 +1243,102 @@ mod tests {
             format: AttachmentFormat::Rgba8Unorm,
             extent: [2, 0],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
-            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV,
-            fragment_spirv: SOLID_RGBA8_FRAG_SPV,
+            stages: milestone_stages(),
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("a zero-dimension attachment is a contract refusal");
         assert_eq!(refused.slug, "trace_contract_invalid");
         assert_eq!(refused.class, ProviderErrorClass::Args);
+    }
+
+    /// A registration whose contract is well formed but whose modules are not
+    /// is refused once, at registration, instead of on every submission.
+    #[test]
+    fn render_stage_registration_refuses_an_empty_module_and_a_nul_entry() {
+        let stages = |vertex_entry: &str, vertex_spirv: Vec<u8>| RenderStages {
+            contract: RenderPipelineContract {
+                vertex_entry: vertex_entry.to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_format: AttachmentFormat::Rgba8Unorm,
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv,
+            fragment_spirv: SOLID_RGBA8_FRAG_SPV.to_vec(),
+        };
+        assert!(
+            stages("vertex_main", FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec())
+                .validate()
+                .is_ok()
+        );
+
+        let empty = stages("vertex_main", Vec::new())
+            .validate()
+            .expect_err("an empty module cannot be a SPIR-V entry point");
+        eprintln!("refused: {empty:?}");
+        assert_eq!(empty.slug, "spirv_module_invalid");
+        assert_eq!(empty.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            empty.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+
+        // A module that is not a whole number of SPIR-V words is refused by the
+        // same predicate, so an odd tail cannot reach `vkCreateShaderModule`.
+        let truncated = stages("vertex_main", vec![0; 6])
+            .validate()
+            .expect_err("a truncated module is refused");
+        assert_eq!(truncated.slug, "spirv_module_invalid");
+
+        let nul_entry = stages("ver\0tex", FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec())
+            .validate()
+            .expect_err("an entry name with an interior NUL cannot be bound");
+        eprintln!("refused: {nul_entry:?}");
+        assert_eq!(nul_entry.slug, "render_stage_entry_invalid");
+        assert_eq!(
+            nul_entry.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+    }
+
+    /// `LoadOp::Load` has no rail that carries an attachment's previous bytes
+    /// into the image, so the first increment refuses it instead of storing a
+    /// clear under a name the trace did not ask for.
+    #[test]
+    fn execute_render_pass_refuses_load_before_touching_the_device() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let stages = RenderStages {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_format: AttachmentFormat::Rgba8Unorm,
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_RGBA8_FRAG_SPV.to_vec(),
+        };
+        let mut pass = RenderPassDescriptor {
+            pipeline: PipelineId::new(11),
+            color_attachments: vec![RenderAttachment {
+                view_id: ViewId::new(21),
+                allocation_id: AllocationId::new(31),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+                store: StoreOp::Store,
+            }],
+            viewport: [0, 0, 2, 2],
+            vertices: 3,
+        };
+        pass.validate().expect("the fixture pass is a legal shape");
+        pass.color_attachments[0].load = LoadOp::Load;
+        let refused = execute_render_pass(&context, &stages, &pass)
+            .expect_err("`Load` needs an upload rail this increment does not have");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "attachment_load_op_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(context.buffer_copy_counts(), (0, 0));
     }
 }

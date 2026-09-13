@@ -2,8 +2,8 @@
 //! lease copies and host-memory no-copy imports.
 
 use crate::{
-    execute_pool_sequence_with_status, Binding, BoundDispatch, PendingExecution, PoolBinding,
-    PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    execute_pool_sequence_with_status, render, Binding, BoundDispatch, PendingExecution,
+    PoolBinding, PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
     VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
@@ -11,12 +11,13 @@ use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, Observati
 pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
-    CompletionDisposition, CompletionReadback, CompletionToken, ComputeProvider, DeviceEpoch,
-    FieldValue, FunctionIdentity, FunctionSource, LeaseId, LeaseImporter, LeaseRegistry,
-    PipelineCompileRequest, PipelineId, PipelineProvider, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId,
-    ValidatedComputeTrace,
+    CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
+    ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, LeaseId,
+    LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
+    PipelineProvider, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderPassDescriptor, RenderPipelineContract,
+    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TracePass,
+    ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -34,6 +35,45 @@ const GPU_DEADLINE: Duration = Duration::from_secs(20);
 struct RegisteredPipeline {
     metadata: CompiledComputePipeline,
     artifact: Arc<VulkanPipelineArtifact>,
+}
+
+/// One host-registered render pipeline: the trace-table entry the provider
+/// minted for it and the two compiled stage modules behind that identity.
+///
+/// The shape mirrors [`RegisteredPipeline`] on purpose. A trace's pipeline
+/// table is the only place a pass says which pipeline it runs, so both rails
+/// check the caller-supplied table entry against what the owner registered
+/// before anything executes (`validate_pipeline_identity`). The ids share one
+/// counter and one namespace: a compute pass naming a render registration is
+/// refused as an unknown pipeline, and a render pass naming a compute
+/// registration is refused as an unknown render pipeline.
+struct RegisteredRenderPipeline {
+    metadata: CompiledComputePipeline,
+    stages: Arc<render::RenderStages>,
+}
+
+/// One render pipeline a host asks a provider context to own.
+///
+/// `vertex_spirv`/`fragment_spirv` are the two compiled stage modules the
+/// graphics pipeline is built from; `contract` is the render contract that
+/// names their entries and the attachment format they were compiled against, so
+/// the value a trace carries and the value the provider builds are checked
+/// against each other rather than trusted. The `logical_digest` is a
+/// caller-issued fixture/parity identity, exactly as it is for
+/// [`VulkanComputeProvider::compile_pipeline`]: it identifies the case, it does
+/// not prove that two modules are equal.
+pub struct RenderPipelineRequest {
+    pub contract: RenderPipelineContract,
+    pub vertex_spirv: Vec<u8>,
+    pub fragment_spirv: Vec<u8>,
+    pub logical_digest: SemanticDigest,
+}
+
+/// One planned render pass: the descriptor a trace carries and the stage
+/// modules the provider registered for the pipeline it names.
+struct PlannedRenderPass {
+    pass: RenderPassDescriptor,
+    stages: Arc<render::RenderStages>,
 }
 
 struct CompletionSlot {
@@ -108,6 +148,7 @@ pub struct VulkanComputeProvider {
     next_pipeline: AtomicU64,
     next_submission: AtomicU64,
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
+    render_pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredRenderPipeline>>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
     observation_deadline: Duration,
@@ -160,6 +201,7 @@ impl VulkanComputeProvider {
             next_pipeline: AtomicU64::new(1),
             next_submission: AtomicU64::new(1),
             pipelines: Mutex::new(BTreeMap::new()),
+            render_pipelines: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             retire_tx: Mutex::new(None),
             observation_deadline: GPU_DEADLINE,
@@ -294,6 +336,100 @@ impl VulkanComputeProvider {
         Ok(metadata)
     }
 
+    /// Register one offscreen render pipeline from its two compiled stages.
+    ///
+    /// The returned metadata is the entry the trace's pipeline table carries,
+    /// the same hand-off [`Self::compile_pipeline`] gives the compute rail. The
+    /// stage modules stay in this provider context; a trace names the pipeline
+    /// by id and the provider refuses a table entry that does not match the
+    /// registration.
+    ///
+    /// The table entry is a [`CompiledComputePipeline`] because that is the one
+    /// entry shape `ComputeTrace` has today (`research/docs/23` §6 Step 4 grows
+    /// it). It carries the registration's vertex entry as the function entry
+    /// name and an exact-thread contract that binds nothing, and it is
+    /// deliberately unreachable from the compute rail: a compute pass naming
+    /// this id finds no artifact in the compute registry and is refused as
+    /// `unknown_pipeline`.
+    pub fn register_render_pipeline(
+        &self,
+        request: RenderPipelineRequest,
+    ) -> Result<CompiledComputePipeline, ProviderError> {
+        self.ensure_usable()?;
+        let stages = render::RenderStages {
+            contract: request.contract,
+            vertex_spirv: request.vertex_spirv,
+            fragment_spirv: request.fragment_spirv,
+        };
+        stages.validate()?;
+        let function = FunctionIdentity {
+            logical_digest: request.logical_digest,
+            entry_name: stages.contract.vertex_entry.clone(),
+            // The registration hands the rail compiled stage modules, i.e. a
+            // Metal-side binary rather than source text. The field is table
+            // metadata the render rail never reads; the modules themselves are
+            // what the pipeline is built from.
+            source: FunctionSource::Metallib,
+        };
+        function.validate().map_err(|error| {
+            refusal(
+                ProviderPhase::Compile,
+                ProviderErrorClass::Args,
+                "render_pipeline_contract_invalid",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let metadata = CompiledComputePipeline {
+            device_epoch: self.epoch,
+            pipeline_id: PipelineId::new(next_identity(
+                &self.next_pipeline,
+                "pipeline_identity_exhausted",
+            )?),
+            function,
+            contract: render_pipeline_table_contract(),
+        };
+        self.ensure_usable()?;
+        let registered = Arc::new(RegisteredRenderPipeline {
+            metadata: metadata.clone(),
+            stages: Arc::new(stages),
+        });
+        self.render_pipelines
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .insert(metadata.pipeline_id, registered);
+        Ok(metadata)
+    }
+
+    /// Stop accepting new submissions using this render pipeline.
+    ///
+    /// Symmetric with [`PipelineProvider::release_pipeline`]: the epoch and the
+    /// registered identity are verified before the entry is removed, so a stale
+    /// or foreign value cannot release another context's registration. A
+    /// submission that is already encoding holds its own `Arc`, so releasing
+    /// never pulls the stage modules out from under running work.
+    pub fn release_render_pipeline(
+        &self,
+        metadata: &CompiledComputePipeline,
+    ) -> Result<(), ProviderError> {
+        check_epoch(self.epoch, metadata.device_epoch)?;
+        let mut registrations = self
+            .render_pipelines
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let registered = registrations
+            .get(&metadata.pipeline_id)
+            .ok_or_else(|| unknown_render_pipeline(metadata.pipeline_id))?;
+        if registered.metadata != *metadata {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "render_pipeline_identity_mismatch",
+            ));
+        }
+        registrations.remove(&metadata.pipeline_id);
+        Ok(())
+    }
+
     /// Stop accepting new submissions using this pipeline. An in-flight submit
     /// retains its own Arc until completion, independent of registry removal.
     pub fn release_pipeline(
@@ -321,6 +457,135 @@ impl VulkanComputeProvider {
             self.retire(pending);
         }
         Ok(())
+    }
+
+    /// Plan the render passes of one admitted trace, before any device work.
+    ///
+    /// Planning is where a render-bearing trace meets the provider's own
+    /// registry and the rail's pass order: a pipeline the context never
+    /// registered, a table entry that disagrees with the registration, or an
+    /// order the rail cannot honour is refused here, so a submission that
+    /// cannot run end to end executes nothing at all. The deferral path is
+    /// refused outright — the render rail completes inside `submit` while the
+    /// deferred path records now and reports at `wait`, so admitting render
+    /// work there would report bytes no rail read
+    /// (`research/docs/23` §6 Step 5 owns that shape).
+    fn plan_render_passes(
+        &self,
+        trace: &ComputeTrace,
+    ) -> Result<Vec<PlannedRenderPass>, ProviderError> {
+        if !trace.has_render_passes() {
+            return Ok(Vec::new());
+        }
+        if self.async_execution {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "render_async_unsupported",
+            )
+            .with_detail(
+                "the render rail completes inside submit; the deferred submission path \
+                 executes no graphics work in this increment",
+            ));
+        }
+        refuse_reordered_render_reads(trace)?;
+        let registrations = self
+            .render_pipelines
+            .lock()
+            .map_err(|_| registry_poisoned())?;
+        let mut plan = Vec::with_capacity(trace.render_passes().count());
+        for pass in trace.render_passes() {
+            let registered = registrations
+                .get(&pass.pipeline)
+                .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+            let requested = trace.pipeline(pass.pipeline).map_err(|error| {
+                refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "render_pipeline_identity_mismatch",
+                )
+                .with_detail(error.to_string())
+            })?;
+            validate_pipeline_identity(requested, &registered.metadata)?;
+            plan.push(PlannedRenderPass {
+                pass: pass.clone(),
+                stages: Arc::clone(&registered.stages),
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Execute the planned render passes in trace order, after the compute
+    /// sequence, and turn each attachment readback into a buffer writeback.
+    ///
+    /// The attachment's bytes leave the rail through the same channel a compute
+    /// pass uses: one [`BufferWriteback`] for the view and allocation the trace
+    /// declared, at the view's own offset inside the allocation, so resource
+    /// admission, lease bookkeeping and readback consumers need no second path.
+    /// An attachment that no buffer view covers has no such landing rail and is
+    /// refused instead of being executed and dropped.
+    fn execute_render_passes(
+        &self,
+        trace: &ComputeTrace,
+        pool: &[BufferView],
+        plan: &[PlannedRenderPass],
+    ) -> Result<Vec<BufferWriteback>, ProviderError> {
+        if plan.is_empty() {
+            return Ok(Vec::new());
+        }
+        let host_readback = trace.completion_policy == CompletionPolicy::HostReadback;
+        let mut writebacks = Vec::with_capacity(plan.len());
+        for planned in plan {
+            let [attachment] = planned.pass.color_attachments.as_slice() else {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Args,
+                    "trace_contract_invalid",
+                )
+                .with_detail("the render rail executes exactly one colour attachment"));
+            };
+            let view = if host_readback {
+                Some(
+                    pool.iter()
+                        .find(|view| {
+                            view.view_id == attachment.view_id
+                                && view.allocation_id == attachment.allocation_id
+                        })
+                        .ok_or_else(|| {
+                            refusal(
+                                ProviderPhase::Resolve,
+                                ProviderErrorClass::Capability,
+                                "render_attachment_landing_unsupported",
+                            )
+                            .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                            .with_field(
+                                "allocation",
+                                FieldValue::Unsigned(attachment.allocation_id.get()),
+                            )
+                            .with_detail(
+                                "attachment bytes land through the buffer writeback channel, \
+                                 and this trace declares no buffer view covering the attachment",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let texels = render::execute_render_pass(
+                &self.executor.context,
+                &planned.stages,
+                &planned.pass,
+            )?;
+            if let Some(view) = view {
+                writebacks.push(BufferWriteback {
+                    view_id: view.view_id,
+                    allocation_id: view.allocation_id,
+                    offset: view.offset,
+                    bytes: texels,
+                });
+            }
+        }
+        Ok(writebacks)
     }
 
     fn retire(&self, pending: PendingExecution) {
@@ -706,6 +971,10 @@ impl ComputeProvider for VulkanComputeProvider {
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
         self.capabilities.admit(trace, admitted.resources())?;
+        // Render work is planned before the compute sequence runs, so a trace
+        // this provider cannot execute end to end is refused with no execution
+        // at all rather than after its compute passes already wrote bytes.
+        let render_plan = self.plan_render_passes(trace)?;
         let artifacts = {
             let registry = self.pipelines.lock().map_err(|_| registry_poisoned())?;
             trace
@@ -913,7 +1182,19 @@ impl ComputeProvider for VulkanComputeProvider {
             &textures,
         )
         .and_then(|updates| {
-            let writebacks = map_writebacks(&pool, updates, token)?;
+            // Compute and render writebacks share one channel and one rule: one
+            // complete writeback per written view, keyed by identity. A view
+            // both rails could have written is refused by core admission
+            // (`AttachmentComputeConflict`), and the render rail runs last, so
+            // the map keeps the bytes a repeated attachment write ends with.
+            let mut merged = BTreeMap::new();
+            for writeback in map_writebacks(&pool, updates, token)?
+                .into_iter()
+                .chain(self.execute_render_passes(trace, &pool, &render_plan)?)
+            {
+                merged.insert((writeback.allocation_id, writeback.view_id), writeback);
+            }
+            let writebacks: Vec<BufferWriteback> = merged.into_values().collect();
             let output = ProviderSubmission {
                 completion: CompletionDisposition::CompletedVisible { token },
                 writebacks,
@@ -1101,6 +1382,58 @@ fn validate_pipeline_identity(
     Ok(())
 }
 
+/// Refuse a trace whose compute passes would be reordered against a render
+/// pass's stores.
+///
+/// This increment executes every compute pass first and every render pass
+/// afterwards, in trace order within each group (see
+/// [`VulkanComputeProvider::execute_render_passes`]). Compute passes that come
+/// before a render pass therefore run in the order the trace asked for, and so
+/// do render passes among themselves. The one shape that would silently change
+/// meaning is a compute pass that *follows* a render pass and binds a view that
+/// render pass stores: it would observe pre-render bytes where the trace's
+/// serial order defines post-render ones. That shape is refused rather than
+/// executed in an order the bytes would not reflect — core admission already
+/// refuses the write/write half of the pair with
+/// `AttachmentComputeConflict`.
+fn refuse_reordered_render_reads(trace: &ComputeTrace) -> Result<(), ProviderError> {
+    let mut render_written = BTreeMap::<ViewId, usize>::new();
+    for (index, entry) in trace.passes.iter().enumerate() {
+        match entry {
+            TracePass::Render(pass) => {
+                for attachment in &pass.color_attachments {
+                    render_written.entry(attachment.view_id).or_insert(index);
+                }
+            }
+            TracePass::Compute(pass) => {
+                let bound = pass
+                    .buffers
+                    .iter()
+                    .map(|view| view.view_id)
+                    .chain(pass.textures.iter().map(|texture| texture.view_id));
+                for view in bound {
+                    if let Some(render_pass) = render_written.get(&view) {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "render_pass_order_unsupported",
+                        )
+                        .with_field("pass", FieldValue::Unsigned(index as u64))
+                        .with_field("render_pass", FieldValue::Unsigned(*render_pass as u64))
+                        .with_field("view", FieldValue::Unsigned(view.get()))
+                        .with_detail(
+                            "a compute pass that follows a render pass storing this view \
+                             would observe pre-render bytes, because this increment runs \
+                             every compute pass before every render pass",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn narrow_dimensions(wide: [u64; 3]) -> Result<Size, ProviderError> {
     let mut values = [0; 3];
     for (axis, value) in wide.into_iter().enumerate() {
@@ -1249,6 +1582,36 @@ fn unknown_pipeline(id: PipelineId) -> ProviderError {
     .with_field("pipeline", FieldValue::Unsigned(id.get()))
 }
 
+fn unknown_render_pipeline(id: PipelineId) -> ProviderError {
+    refusal(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Resource,
+        "unknown_render_pipeline",
+    )
+    .with_field("pipeline", FieldValue::Unsigned(id.get()))
+}
+
+/// The pipeline-table contract one render registration carries.
+///
+/// `ComputeTrace` has a single pipeline entry shape and core admission
+/// validates every entry's contract, so a render registration carries the
+/// most permissive exact-thread contract: no bindings, no push constants and no
+/// fixed grid. Nothing reads it as a compute contract — the compute rail
+/// resolves artifacts out of its own registry, where a render registration does
+/// not exist.
+fn render_pipeline_table_contract() -> PipelineContract {
+    PipelineContract {
+        dispatch_kind: DispatchKind::ThreadsExact,
+        required_local_size: None,
+        fixed_grid: None,
+        push_constant_offset: 0,
+        push_constant_bytes: 0,
+        buffer_bindings: Vec::new(),
+        shader_capabilities: Vec::new(),
+        translator_revision: None,
+    }
+}
+
 fn unknown_completion(token: CompletionToken) -> ProviderError {
     refusal(
         ProviderPhase::Wait,
@@ -1272,7 +1635,106 @@ fn borrowed_alignment_error(lease_id: LeaseId, pointer: usize, alignment: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metal_api_core::provider::{AllocationId, BufferAccess, ProviderLifecycle, ViewId};
+    use metal_api_core::provider::ComputePass;
+    use metal_api_core::provider::{
+        AllocationId, AttachmentFormat, BufferAccess, ClearColor, Dispatch, DispatchKind,
+        DispatchType, LoadOp, OperationId, ProviderLifecycle, RenderAttachment, StoreOp, ViewId,
+        PROVIDER_SCHEMA_VERSION,
+    };
+
+    /// An admitted-shaped trace whose pass list is the only thing under test.
+    ///
+    /// `refuse_reordered_render_reads` walks the pass list, so this fixture
+    /// deliberately carries no pipeline table and no resources: the values are
+    /// the ones the ordering rule reads and nothing else.
+    fn ordering_trace(passes: Vec<TracePass>) -> ComputeTrace {
+        ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(5),
+            pipelines: Vec::new(),
+            encoder_dispatch_type: DispatchType::Serial,
+            passes,
+            completion_policy: CompletionPolicy::HostReadback,
+        }
+    }
+
+    fn ordering_render_pass(view: u64) -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            pipeline: PipelineId::new(1),
+            color_attachments: vec![RenderAttachment {
+                view_id: ViewId::new(view),
+                allocation_id: AllocationId::new(2),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                load: LoadOp::Clear(ClearColor::new([0xfe; 4])),
+                store: StoreOp::Store,
+            }],
+            viewport: [0, 0, 2, 2],
+            vertices: 3,
+        }
+    }
+
+    fn ordering_compute_pass(binding_view: u64) -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(2),
+            buffers: vec![BufferView {
+                view_id: ViewId::new(binding_view),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(2),
+                offset: 0,
+                length: 16,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0; 16]),
+            }],
+            textures: Vec::new(),
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        }
+    }
+
+    /// A compute pass that *follows* a render pass storing the view it binds
+    /// would silently observe pre-render bytes, because this increment runs
+    /// every compute pass before every render pass. The trace is refused
+    /// instead; the other three orders stay admissible.
+    #[test]
+    fn a_compute_pass_after_a_render_pass_may_not_observe_its_attachment() {
+        let refused = refuse_reordered_render_reads(&ordering_trace(vec![
+            TracePass::Render(ordering_render_pass(9)),
+            TracePass::Compute(ordering_compute_pass(9)),
+        ]))
+        .expect_err("a compute pass observing a stored attachment is refused");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_pass_order_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("pass"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(
+            refused.fields.get("render_pass"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert_eq!(refused.fields.get("view"), Some(&FieldValue::Unsigned(9)));
+
+        // The same two passes in trace order: the compute pass reads the bytes
+        // the trace says it reads.
+        refuse_reordered_render_reads(&ordering_trace(vec![
+            TracePass::Compute(ordering_compute_pass(9)),
+            TracePass::Render(ordering_render_pass(9)),
+        ]))
+        .expect("a compute pass before the store keeps its own bytes");
+
+        // A compute pass after the store that binds a different view does not
+        // observe the attachment at all.
+        refuse_reordered_render_reads(&ordering_trace(vec![
+            TracePass::Render(ordering_render_pass(9)),
+            TracePass::Compute(ordering_compute_pass(11)),
+        ]))
+        .expect("an unrelated view carries no hazard");
+    }
 
     /// The provider no longer spells its own terminal refusals: the core
     /// lifecycle owns the terminal state and its refusal, and the Vulkan side
