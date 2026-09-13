@@ -5,11 +5,12 @@
 // `conformance/suite-v13.json` is the first committed suite that declares
 // `render_cases`, and `conformance/compare.py` now has the matching attachment
 // section, so a render case reports through the same writebacks/allocations
-// shape the compute cases use. The render path itself has still never run on
-// Apple hardware: it is exercised by CI only after v13 is named on the macOS
-// rails, which `conformance/RENDER-CAPTURE.md` §4 keeps as the pending step,
-// and `--render-selftest` remains the one command that reaches the reviewed
-// fixture on a device without a suite.
+// shape the compute cases use. `capture` runs a suite's render cases after its
+// compute cases, so `--suite conformance/suite-v13.json` is the path that puts
+// the attachment comparison into the capture matrix; `--render-selftest`
+// remains the suite-free path to the same reviewed fixture, and it is the one
+// observation an Apple GPU has produced so far (`conformance/RENDER-CAPTURE.md`
+// §5).
 import Foundation
 import Metal
 import CoreGraphics
@@ -1287,13 +1288,14 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
 
 /// The milestone's own render fixture, constructed in code.
 ///
-/// No committed suite declares `render_cases` yet, so this is the one path that
-/// reaches `runRenderCase` on a device today — and the one command the provider's
-/// render-bit flip condition refers to (`conformance/RENDER-CAPTURE.md`). It
-/// reads the reviewed module relative to the current working directory, so it is
-/// meant to run from the repository root, and it fails unless all four
-/// attachment texels read back as the fragment's `40 80 c0 ff` instead of the
-/// `fe` clear sentinel.
+/// `--suite conformance/suite-v13.json` reaches `runRenderCase` through
+/// `capture`; this is the same fixture without a suite, and it is the one
+/// command the provider's render-bit flip condition refers to
+/// (`conformance/RENDER-CAPTURE.md` §5). It resolves the reviewed pin
+/// (`shaders/render_offscreen_2x2.metal`) against the working directory, so it
+/// runs from `conformance/` exactly like that section's command does, and it
+/// fails unless all four attachment texels read back as the fragment's
+/// `40 80 c0 ff` instead of the `fe` clear sentinel.
 @available(macOS 11.0, *)
 private func renderSelfTest() throws -> CaseResult {
     let reviewed = reviewedRenderModule()

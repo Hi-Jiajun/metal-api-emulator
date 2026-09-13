@@ -133,13 +133,15 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `cd5bced`/`b14f496`, the
   Vulkan executor in `2e64eff`/`0319da1`, the observation in `e581562`, and
   `8430446` added the suite to CI on the trace rail and both Vulkan object-API
-  loops. Only that rail reports the suite's attachment today: the object API has
-  no render command encoder, and no macOS rail has run `suite-v13` yet. The
-  native provider's own trace rail is wired to the same reviewed fixture and
-  flipped `supports_render_passes` after CI run `34774478149`'s
-  `native-oracle --render-selftest` read the 2x2 attachment back as `40 80 c0 ff`
-  four times on an Apple Paravirtual device, but its encoder body has not run on
-  Apple hardware itself; see `conformance/RENDER-CAPTURE.md`.
+  loops. Three rails report the suite's attachment: the Vulkan trace rail, the
+  native provider's trace rail and the Swift oracle's suite path, which
+  `run_native.py --suite conformance/suite-v13.json` now asks for. The two
+  object-API rails report the declaring case only — the object API has no render
+  command encoder — and the native provider's encoder body has not run on Apple
+  hardware itself yet; the reviewed fixture it compiles is the one CI run
+  `34774478149`'s `native-oracle --render-selftest` read back as `40 80 c0 ff`
+  four times on an Apple Paravirtual device, which is what flipped
+  `supports_render_passes`. See `conformance/RENDER-CAPTURE.md`.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
@@ -160,9 +162,10 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   marking that carries them to a remote provider over the command channel now
   exist, while nothing maps an `MTLCommandQueue` to a tier yet). Resource
   snapshots do not hold live guest pages.
-- Not implemented: render passes beyond the two trace rails (the object API has
-  no render command encoder, and the native provider's render path has not run
-  on Apple hardware yet), sampler and
+- Not implemented: render passes beyond the three rails that report the v13
+  attachment (the Vulkan trace rail, the native provider's trace rail and the
+  Swift oracle's suite path; the object API has no render command encoder, and
+  the native provider's render path has not run on Apple hardware yet), sampler and
   texture generalisation beyond the sampled fixture, presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
   compilation, arbitrary AIR/MSL compilation and reflection, and production

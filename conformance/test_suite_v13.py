@@ -31,6 +31,13 @@ ATTACHMENT = (900, 910, 0, 16)
 PROBE = (920, 930, 4, 4)
 TEXELS = "4080c0ff" * 4
 
+# The capture backends `suite-v13.json` marks this case executable on
+# (`conformance/RENDER-CAPTURE.md` §4): every rail that owns a render execution
+# path has to report the attachment, and the two object-API rails have to omit
+# it because they expose no render command encoder.
+REPORTING_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
+
 # Read by hand from suite-v13.json: the declaring pass copies the attachment
 # view's first word (`fe fe fe fe`, the clear sentinel) into the probe view, and
 # the render pass then stores the reviewed fragment output into all four texels.
@@ -39,25 +46,32 @@ DECLARING_WRITEBACK = {"allocation": 920, "view": 930, "offset": 4,
 RENDER_WRITEBACK = {"allocation": 900, "view": 910, "offset": 0, "bytes_hex": TEXELS}
 
 
-def render_result():
-    """The attachment observation a Vulkan capture of this suite has to report."""
-    return {
+def render_result(provider_backend=True):
+    """The attachment observation a reporting rail of this suite has to emit.
+
+    The Swift oracle reports bytes without device-buffer copy counters, so the
+    two surfaces a provider rail also carries stay absent for `native-metal`
+    exactly as they do on every compute case.
+    """
+    result = {
         "id": RENDER_ID,
         "completion": "CompletedVisible",
         "writebacks": [copy.deepcopy(RENDER_WRITEBACK)],
         "allocations": [{"allocation": 900, "bytes_hex": TEXELS}],
-        "copy_in": 2,
-        "copy_out": 2,
     }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = 2, 2
+    return result
 
 
 def synthetic_capture(suite, digest, backend="vulkan"):
     """A capture with the hand-written attachment observation attached."""
     report = synthetic_report(suite, digest, backend)
-    for result in report["results"]:
-        result["copy_in"], result["copy_out"] = 2, 1
-    if backend == "vulkan":
-        report["results"].append(render_result())
+    if backend != "native-metal":
+        for result in report["results"]:
+            result["copy_in"], result["copy_out"] = 2, 1
+    if backend in REPORTING_RAILS:
+        report["results"].append(render_result(backend != "native-metal"))
     return report
 
 
@@ -73,7 +87,7 @@ class RenderObservationTests(unittest.TestCase):
         self.assertEqual([case["id"] for case in self.suite["render_cases"]], [RENDER_ID])
         case = self.suite["render_cases"][0]
         self.assertEqual(case["declaring_case"], DECLARING_ID)
-        self.assertEqual(case["capture_rails"], ["vulkan"])
+        self.assertEqual(case["capture_rails"], list(REPORTING_RAILS))
         self.assertEqual(case["vertices"], 3)
         self.assertEqual(case["viewport"], [0, 0, 2, 2])
         self.assertEqual((case["vertex_entry"], case["fragment_entry"]),
@@ -161,13 +175,17 @@ class RenderObservationTests(unittest.TestCase):
         # the submission: the declaring pass uploads both.
         self.assertEqual(expectation.touched, {ATTACHMENT[0], PROBE[0]})
         self.assertEqual(expectation.written, {ATTACHMENT[0], PROBE[0]})
-        self.assertEqual(expectation.rails, {"vulkan"})
+        self.assertEqual(expectation.rails, set(REPORTING_RAILS))
 
-    def test_v13_capture_validates_on_the_trace_rail_and_skips_the_others(self):
-        compare.validate_capture(self.suite, self.digest,
-                                 synthetic_capture(self.suite, self.digest, "vulkan"), "vulkan")
-        for backend in ("vulkan-objects", "native-metal-provider",
-                        "native-metal-provider-objects", "native-metal"):
+    def test_v13_every_rail_that_reports_the_attachment_validates(self):
+        for backend in REPORTING_RAILS:
+            with self.subTest(backend=backend):
+                compare.validate_capture(self.suite, self.digest,
+                                         synthetic_capture(self.suite, self.digest, backend),
+                                         backend)
+        # A rail the marker does not name still has to validate its own capture:
+        # it reports the declaring pass and omits the attachment.
+        for backend in OBJECT_RAILS:
             with self.subTest(backend=backend):
                 compare.validate_capture(self.suite, self.digest,
                                          synthetic_capture(self.suite, self.digest, backend),

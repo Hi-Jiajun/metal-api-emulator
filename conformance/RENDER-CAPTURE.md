@@ -5,14 +5,16 @@ This file describes the render side of `NativeOracle.swift` and
 render case looks like, what a render capture reports, and which rails report
 one today. `conformance/suite-v13.json` is the first committed suite that
 declares render cases, `conformance/compare.py` has the matching attachment
-section, and the Vulkan trace rail executes the case end to end. Two things are
-still **pending**: the two object-API rails have no render command encoder, and
-no macOS rail has reported the case. The one-device check is no longer pending
-— `--render-selftest` in §5 ran on an Apple Paravirtual device in CI run
-`34774478149` and read the attachment back as `4080c0ff` four times — so the
-native provider declares render support and its trace rail executes the same
-reviewed fixture; what no Apple GPU has run yet is the Rust provider's own
-encoder path.
+section, and the case is named by every rail that owns a render execution path:
+the Vulkan trace rail, the native provider's trace rail and the Swift oracle's
+suite path. One thing is still **pending**: the two object-API rails have no
+render command encoder, so they run a render-bearing suite and report its
+declaring pass only. The one-device check is no longer pending — `--render-selftest`
+in §5 ran on an Apple Paravirtual device in CI run `34774478149` and read the
+attachment back as `4080c0ff` four times — so the native provider declares
+render support and its trace rail plans, encodes and reports the same reviewed
+fixture. What no Apple GPU has run yet is the Rust provider's own encoder path
+and the oracle's suite path; CI now asks both for it (§6).
 
 The design it implements is `research/docs/23` §1.2 (the milestone), §3 (the
 contract), §5.1 (what the oracle needs) and §6 Steps 6–7 (where it lands).
@@ -47,13 +49,15 @@ execution:
 * `NativeOracle.swift`: `reviewedRenderModule()`, whose `RenderSourcePin` path
   and SHA-256 are checked against the file before any capture;
 * `NativeOracle.swift`'s `--render-selftest` expectation `40 80 c0 ff` x4.
-* `examples/metal-smoke/src/bin/provider-capture.rs`: the Vulkan rail's half —
-  the two reviewed SPIR-V stage modules (`RENDER_VERTEX_SPV`,
-  `RENDER_FRAGMENT_SPV`) and their entry names (`vertex_main`,
-  `fragment_main`). The entries differ from the MSL ones because the reviewed
-  SPIR-V sources declare them that way and core refuses a render contract whose
-  two entries share a name; the suite still pins the MSL module, i.e. the
-  identity both canonical rails compile.
+* `examples/metal-smoke/src/bin/provider-capture.rs`: each trace rail's half.
+  The Vulkan rail pins the two reviewed SPIR-V stage modules
+  (`RENDER_VERTEX_SPV`, `RENDER_FRAGMENT_SPV`) and their entry names
+  (`vertex_main`, `fragment_main`); the native rail pins the reviewed MSL entry
+  pair (`RENDER_MSL_VERTEX_ENTRY`, `RENDER_MSL_FRAGMENT_ENTRY`), which the
+  rail's registration re-checks. The entries differ from the MSL ones because
+  the reviewed SPIR-V sources declare them that way and core refuses a render
+  contract whose two entries share a name; the suite still pins the MSL module,
+  i.e. the identity both canonical rails compile.
 
 ## 2. A render case
 
@@ -169,16 +173,23 @@ counters, so the contract does not apply to `native-metal`
 
 ## 4. Which rails report a render case
 
-The first render increment has two executable rails: the Vulkan trace rail and
+The first render increment has three executable rails: the Vulkan trace rail,
 the native trace rail (`crates/metal-api-native/src/render.rs`, wired into
-`NativeMetalProvider::submit` in Step 7). The native provider declares
-`supports_render_passes = true` with the rail's own limits — one colour
-attachment, 2x2, the three admitted formats — because the flip condition below
-is met; before that flip it refused a render-bearing trace with
-`render_passes_unsupported`. The two object-API rails still have no render
-command encoder (`crates/metal-api-core/src/provider_api.rs` exposes
-`compute_command_encoder` only), so a render case cannot be expressed there at
-all.
+`NativeMetalProvider::submit` in Step 7) and the Swift oracle's suite path
+(`NativeOracle.swift::capture`, which runs `suite.renderCases` after the compute
+cases exactly as it runs them for its own `--render-selftest`). The native
+provider declares `supports_render_passes = true` with the rail's own limits —
+one colour attachment, 2x2, the three admitted formats — because the flip
+condition below is met; before that flip it refused a render-bearing trace with
+`render_passes_unsupported`. On the Rust side both trace rails reach the case
+through the same `provider-capture` code path, and each registers the reviewed
+pipeline on its own concrete context: the Vulkan rail's SPIR-V pair
+(`VulkanComputeProvider::register_render_pipeline`) and the native rail's
+reviewed MSL module (`NativeMetalProvider::register_render_pipeline`). The two
+object-API rails still have no render command encoder
+(`crates/metal-api-core/src/provider_api.rs` exposes `compute_command_encoder`
+only), so a render case cannot be expressed there at all; they run the suite and
+report its declaring pass, and the marker does not name them.
 
 A render case therefore declares the capture backends that owe the attachment
 in its `capture_rails` marker:
@@ -189,38 +200,41 @@ in its `capture_rails` marker:
   anyway is refused, because that observation did not come from a rail that can
   produce one.
 
-`suite-v13.json` marks `["vulkan"]`, so the local and CI Vulkan rails report the
-attachment while `--api objects`, `--api objects --async` and every macOS rail
-report the declaring case only. `conformance/test_oracle_coverage.py` checks the
-marker against `compare.py`'s backend vocabulary and keeps the marked suite out
-of the four CI rails and version loops until the macOS half exists.
+`suite-v13.json` marks `["vulkan", "native-metal", "native-metal-provider"]`, so
+the attachment is reported by the Vulkan trace rail, the native provider's trace
+rail and the Swift oracle, while `--api objects` and `--api objects --async`
+report the declaring case only. `conformance/test_oracle_coverage.py` checks the marker
+against `compare.py`'s backend vocabulary, refuses a marker that names an
+object-API rail (they cannot report the attachment yet), and requires every
+committed suite to be named on every CI rail and in every object-API version
+loop.
 
-The macOS half is still the pending step, but its first part is now wired: the
-one-device check runs in CI (§5). What is deliberately still **not** wired is
-the suite itself:
+The one-device check (§5) and the suite path are both wired now:
 
-* `NativeOracle.swift` accepts `compute-buffer-v13` and its render capture path
-  reports the attachment in exactly this shape. The self-test (§5) has since run
-  on the CI runner's Apple Paravirtual device and passed
-  (`render_selftest: PASS (4080c0ff4080c0ff4080c0ff4080c0ff)`, run 34774478149), so
-  the single-case shape is evidenced; the **suite** path
-  (`run_native.py --suite conformance/suite-v13.json`) is what would put that
-  byte comparison into the four-rail capture matrix;
+* `NativeOracle.swift` accepts `compute-buffer-v13`, and its render capture path
+  reports the attachment in exactly this shape. The self-test (§5) ran on CI's
+  Apple Paravirtual device and passed
+  (`render_selftest: PASS (4080c0ff4080c0ff4080c0ff4080c0ff)`, run 34774478149);
+  the suite path is now named on the macOS rail
+  (`run_native.py --suite conformance/suite-v13.json`), so the same byte
+  comparison is asked for as part of the capture matrix rather than beside it;
 * the Rust native provider's `supports_render_passes` flip has landed on the
   same §5 evidence (`crates/metal-api-native/src/native.rs`), and its trace rail
-  plans and encodes every render pass the suite declares; what it has not had is
-  an Apple GPU running its own encoder body, so the rail is admitted and
-  reviewed rather than observed;
-* `.github/workflows/ci.yml` would then need `13` in the four version loops, the
+  plans, encodes and reports every render pass the suite declares. The capture
+  tool registers the reviewed MSL pipeline on the provider and runs the render
+  case through the same trace path as the Vulkan rail, so the rail is admitted
+  *and* asked for the observation;
+* `.github/workflows/ci.yml` carries `13` in the four version loops, the
   explicit suite lines, the native status list and the parity lines.
 
-Until that lands, the suite is run by the Vulkan rails locally
-(`tools/lavapipe-smoke.sh` discovers it from `conformance/suite*.json`) and by
-the trace and object-API rails in CI, which do name its suite file; the macOS
-and Rust-native rails deliberately do not, because neither reports an
-attachment yet. The coverage check keeps that split explicit rather than
-silent, and `conformance/test_suite_v13.py` holds the schema, the plan and the
-refusals.
+What is still pending is the Apple-side execution itself, not the wiring: the
+same CI job's `native-oracle-build` now runs the oracle's v13 suite capture and
+the Rust provider's v13 capture, and either has to report
+`4080c0ff4080c0ff4080c0ff4080c0ff` or fail the job. Local evidence for the
+Vulkan rail stays with `tools/lavapipe-smoke.sh`, which discovers every suite
+from `conformance/suite*.json`. `conformance/test_suite_v13.py` holds the
+schema, the plan and the refusals; `conformance/test_oracle_coverage.py` holds
+the marker, the case-id tables and the CI wiring.
 
 ## 5. The one-device check
 
@@ -296,14 +310,24 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   it with `render_passes_unsupported`;
 * that the reviewed fixture still carries the expected byte/255 constants, no
   half-integer tie, and both entry names;
+* that both trace rails register the reviewed pipeline they own and refuse the
+  other rail's identity: the native registration re-runs the reviewed MSL entry
+  pair and returns the trace-table entry the render pass names, so
+  `provider-capture` can put the same case through either rail without letting
+  a caller-supplied entry widen the allowlist;
 * that the Swift oracle still accepts exactly the committed suites and pins
   exactly the committed sources (`conformance/test_oracle_coverage.py`);
+* that the marker, the two case-id tables and the CI wiring agree:
+  `conformance/test_oracle_coverage.py` requires every committed suite on all
+  four named CI rails and in all four object-API version loops, and refuses a
+  marker that names an object-API rail, which has no render command encoder;
 * that `suite-v13.json`'s attachment section is the reviewed shape, that the
-  Vulkan capture pins the reviewed SPIR-V stage pair and entries, and that a
-  tampered attachment byte, a dropped texel, a buffer writeback standing in for
-  the attachment (in either direction) and a wrong copy count are all refused
-  (`conformance/test_suite_v13.py`, run by `python3 -m unittest discover -s
-  conformance`);
+  capture pins the reviewed SPIR-V stage pair and entries, that every rail the
+  marker names reports the attachment while the object-API rails omit it, and
+  that a tampered attachment byte, a dropped texel, a buffer writeback standing
+  in for the attachment (in either direction) and a wrong copy count are all
+  refused (`conformance/test_suite_v13.py`, run by `python3 -m unittest
+  discover -s conformance`);
 * that the render case actually executes on Lavapipe: `provider-capture --suite
   conformance/suite-v13.json` reports
   `4080c0ff4080c0ff4080c0ff4080c0ff`, and `compare.py --check` accepts it.
@@ -318,9 +342,9 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 * that `getBytes` on a `usage = .renderTarget`, `storageMode = .shared` 2x2
   texture returns the tightly packed rows this report assumes;
 * a render case from the native rail in a committed suite: the oracle's
-  `--render-selftest` output exists (§5), but `run_native.py --suite
-  conformance/suite-v13.json` has not been run, and `suite-v13` still marks
-  `["vulkan"]` only;
+  `--render-selftest` output exists (§5), and CI now asks for the suite capture
+  (`run_native.py --suite conformance/suite-v13.json`) and for the Rust
+  provider's v13 capture, but neither has produced a report yet;
 * the Rust provider's render path end to end — `render::plan_trace` plus the
   encoder body, and the writeback that lands the attachment bytes on the
   trace's view. Its refusal and planning halves are host-verified; the encoder
@@ -332,5 +356,6 @@ check built the reviewed two-stage pipeline state, cleared the 2x2 `rgba8Unorm`
 attachment and read it back through `getBytes` as `4080c0ff` four times — the
 bullets that name the pipeline state, `loadAction = .clear`, the texel bytes and
 the tightly packed readback, on the oracle's own path. It does not establish the
-`.load` branch, a suite-reported case, or the Rust provider's own encoder path;
-the last is what the flipped capability bit now lets an Apple runner exercise.
+`.load` branch or the Rust provider's own encoder path. The suite capture this
+job also runs is what asks for the first suite-reported case, and the flipped
+capability bit is what lets the same runner exercise the provider's encoder.

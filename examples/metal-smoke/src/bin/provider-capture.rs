@@ -16,7 +16,7 @@ use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
 #[cfg(target_os = "macos")]
-use metal_api_native::NativeMetalProvider;
+use metal_api_native::{NativeMetalProvider, NativeRenderPipelineRequest};
 use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,16 @@ const RENDER_FRAGMENT_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/solid_unorm8.frag.spv");
 const RENDER_VERTEX_ENTRY: &str = "vertex_main";
 const RENDER_FRAGMENT_ENTRY: &str = "fragment_main";
+
+/// The native rail's half of the same fixture: the reviewed MSL module's own
+/// stage entries (`conformance/shaders/render_offscreen_2x2.metal`), which
+/// `crates/metal-api-native/src/render.rs` compiles and refuses to substitute.
+/// The native `register_render_pipeline` re-runs that review gate, so the
+/// contract this rail registers names the pair here exactly as the Vulkan rail
+/// names its SPIR-V entries above. A render case declares the same two names
+/// and [`validate_render_case`] pins them.
+const RENDER_MSL_VERTEX_ENTRY: &str = "render_fullscreen_triangle";
+const RENDER_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
 
 /// The capture backends a suite may declare a render case executable on. The
 /// vocabulary is `conformance/compare.py`'s `ALLOCATION_OBSERVATIONS`, i.e. the
@@ -106,15 +116,28 @@ enum CopyCounters {
     Native(Arc<NativeMetalProvider>),
 }
 
+/// The concrete context a render pipeline is registered on.
+///
+/// `register_render_pipeline` is not part of `PipelineProvider`: it is a
+/// concrete-context entry point that names the reviewed source pair the rail
+/// compiles, so the handle is kept beside the trait object. Both trace rails own
+/// one (`conformance/RENDER-CAPTURE.md` §4) and each admits only its own
+/// reviewed module — the Vulkan rail's SPIR-V stages and the native rail's MSL
+/// module.
+enum RenderRegistrar {
+    Vulkan(Arc<VulkanComputeProvider>),
+    #[cfg(target_os = "macos")]
+    Native(Arc<NativeMetalProvider>),
+}
+
 /// What one capture run keeps hold of: the trait object every rail shares, the
-/// device name, the copy counters, and the concrete Vulkan context the render
-/// rail's `register_render_pipeline` entry point lives on (it is not part of
-/// `PipelineProvider`).
+/// device name, the copy counters, and the concrete context the render rail's
+/// `register_render_pipeline` entry point lives on.
 type ProviderHandles = (
     Arc<dyn PipelineProvider>,
     String,
     CopyCounters,
-    Option<Arc<VulkanComputeProvider>>,
+    RenderRegistrar,
 );
 
 impl CopyCounters {
@@ -654,7 +677,7 @@ fn create_provider(
                 Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                 name,
                 CopyCounters::Vulkan(executor),
-                Some(provider),
+                RenderRegistrar::Vulkan(provider),
             ))
         }
         Backend::NativeMetalProvider => {
@@ -669,12 +692,87 @@ fn create_provider(
                 Ok((
                     Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                     name,
-                    CopyCounters::Native(provider),
-                    None,
+                    CopyCounters::Native(Arc::clone(&provider)),
+                    RenderRegistrar::Native(provider),
                 ))
             }
             #[cfg(not(target_os = "macos"))]
             Err("native-metal-provider requires macOS".into())
+        }
+    }
+}
+
+/// Register the reviewed render pipeline on one trace rail's concrete context.
+///
+/// The render rail is a concrete-context entry point (`register_render_pipeline`
+/// is not part of `PipelineProvider`), and each rail is the only owner of its
+/// reviewed source pair: the Vulkan rail takes the SPIR-V stages pinned above,
+/// the native rail the reviewed MSL module
+/// (`crates/metal-api-native/src/render.rs::REVIEWED_SOURCE`). Both hand back
+/// the trace-table entry a render pass has to name, under the same
+/// caller-issued fixture identity both rails' `compile` siblings take, so the
+/// digest names the suite and the pipeline rather than a rail.
+fn register_render_pipeline(
+    registrar: &RenderRegistrar,
+    identity: &str,
+) -> Result<CompiledComputePipeline> {
+    let logical_digest = SemanticDigest::new(
+        "suite-sha256-entry-v1",
+        format!("{identity}:offscreen_render_pipeline").into_bytes(),
+    )?;
+    let registered = match registrar {
+        RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: RENDER_VERTEX_ENTRY.to_owned(),
+                fragment_entry: RENDER_FRAGMENT_ENTRY.to_owned(),
+                color_format: AttachmentFormat::Rgba8Unorm,
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: RENDER_VERTEX_SPV.to_vec(),
+            fragment_spirv: RENDER_FRAGMENT_SPV.to_vec(),
+            logical_digest,
+        }),
+        #[cfg(target_os = "macos")]
+        RenderRegistrar::Native(native) => {
+            // The native rail compiles the MSL module itself, so its contract
+            // names that module's own stage entries. The registration re-runs
+            // the review gate and refuses any other pair with
+            // `native_render_source_not_reviewed`, exactly as an unreviewed MSL
+            // fixture is refused.
+            native.register_render_pipeline(NativeRenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: RENDER_MSL_VERTEX_ENTRY.to_owned(),
+                    fragment_entry: RENDER_MSL_FRAGMENT_ENTRY.to_owned(),
+                    color_format: AttachmentFormat::Rgba8Unorm,
+                    vertex_layout: VertexLayout::None,
+                },
+                logical_digest,
+            })
+        }
+    }
+    .map_err(|error| format!("register render pipeline: {error:?}"))?;
+    Ok(registered)
+}
+
+/// Retire the registration [`register_render_pipeline`] minted, on the context
+/// that owns it.
+fn release_render_pipeline(
+    registrar: &RenderRegistrar,
+    pipeline: &CompiledComputePipeline,
+) -> Result<()> {
+    match registrar {
+        RenderRegistrar::Vulkan(vulkan) => {
+            vulkan
+                .release_render_pipeline(pipeline)
+                .map_err(|error| format!("release render pipeline: {error:?}"))?;
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        RenderRegistrar::Native(native) => {
+            native
+                .release_render_pipeline(pipeline)
+                .map_err(|error| format!("release render pipeline: {error:?}"))?;
+            Ok(())
         }
     }
 }
@@ -1052,18 +1150,20 @@ fn main() -> Result<()> {
             sources.insert((program.entry, case.air_encoding), source);
         }
     }
-    // A render case pins the one reviewed MSL module; the Vulkan rail executes
-    // the matching SPIR-V pair pinned in code above, so only the module's
-    // declared identity is verified here.
+    // A render case pins the one reviewed MSL module; each trace rail executes
+    // its own reviewed source pair — the Vulkan rail the matching SPIR-V stages
+    // pinned in code above, the native rail the MSL module itself — so only the
+    // module's declared identity is verified here.
     for case in &suite.render_cases {
         verified_source(directory, &case.metal)?;
     }
     // Every rail has to agree about which cases it owns. A rail a render case's
-    // marker names has to be able to report the case; the object-API rails carry
-    // no render command encoder in this increment, so a suite that asks them for
-    // one is refused instead of silently reporting fewer cases than the marker
-    // requires.
-    let render_rail = backend == Backend::Vulkan && api == EntryApi::Trace;
+    // marker names has to be able to report the case; both trace rails own a
+    // render execution path (`conformance/RENDER-CAPTURE.md` §4), and the
+    // object-API rails carry no render command encoder in this increment, so a
+    // suite that asks them for one is refused instead of silently reporting
+    // fewer cases than the marker requires.
+    let render_rail = api == EntryApi::Trace;
     for case in &suite.render_cases {
         if !render_rail
             && case
@@ -1081,7 +1181,7 @@ fn main() -> Result<()> {
         }
     }
     let identity = hex(&Sha256::digest(&raw));
-    let (provider, device_name, counters, vulkan) =
+    let (provider, device_name, counters, render_registrar) =
         create_provider(backend, async_execution, queue_priorities.as_deref())?;
     let object_device =
         (api == EntryApi::Objects).then(|| objects::Device::new(Arc::clone(&provider)));
@@ -1201,17 +1301,16 @@ fn main() -> Result<()> {
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
         results.push(result);
     }
-    // Render cases run after the compute cases, on the one rail that owns a
-    // render execution path (`research/docs/23` §6 Step 7). Every other rail
-    // omits them, which is what the suite's `capture_rails` marker declares.
+    // Render cases run after the compute cases, on the rails that own a render
+    // execution path (`research/docs/23` §6 Step 7): the Vulkan trace rail and
+    // the native provider's trace rail (`conformance/RENDER-CAPTURE.md` §4).
+    // Every other rail omits them, which is what the suite's `capture_rails`
+    // marker declares.
     let mut render_pipeline: Option<CompiledComputePipeline> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
         if !render_rail {
             continue;
         }
-        let vulkan = vulkan
-            .as_ref()
-            .ok_or("render cases require the Vulkan trace rail")?;
         let declaring = suite
             .cases
             .iter()
@@ -1224,22 +1323,7 @@ fn main() -> Result<()> {
         let pipeline = match &render_pipeline {
             Some(pipeline) => pipeline.clone(),
             None => {
-                let registered = vulkan
-                    .register_render_pipeline(RenderPipelineRequest {
-                        contract: RenderPipelineContract {
-                            vertex_entry: RENDER_VERTEX_ENTRY.to_owned(),
-                            fragment_entry: RENDER_FRAGMENT_ENTRY.to_owned(),
-                            color_format: AttachmentFormat::Rgba8Unorm,
-                            vertex_layout: VertexLayout::None,
-                        },
-                        vertex_spirv: RENDER_VERTEX_SPV.to_vec(),
-                        fragment_spirv: RENDER_FRAGMENT_SPV.to_vec(),
-                        logical_digest: SemanticDigest::new(
-                            "suite-sha256-entry-v1",
-                            format!("{identity}:offscreen_render_pipeline").into_bytes(),
-                        )?,
-                    })
-                    .map_err(|error| format!("register render pipeline: {error:?}"))?;
+                let registered = register_render_pipeline(&render_registrar, &identity)?;
                 render_pipeline = Some(registered.clone());
                 registered
             }
@@ -1267,11 +1351,7 @@ fn main() -> Result<()> {
         }
     }
     if let Some(pipeline) = render_pipeline.as_ref() {
-        vulkan
-            .as_ref()
-            .expect("only the Vulkan trace rail registers a render pipeline")
-            .release_render_pipeline(pipeline)
-            .map_err(|error| format!("release render pipeline: {error:?}"))?;
+        release_render_pipeline(&render_registrar, pipeline)?;
     }
     let capture = Capture {
         schema_version: 1,
@@ -1529,8 +1609,8 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     if case.viewport != [0, 0, attachment.width, attachment.height] {
         return Err(format!("{where_}: the viewport must cover the attachment").into());
     }
-    if case.vertex_entry != "render_fullscreen_triangle"
-        || case.fragment_entry != "render_solid_rgba8"
+    if case.vertex_entry != RENDER_MSL_VERTEX_ENTRY
+        || case.fragment_entry != RENDER_MSL_FRAGMENT_ENTRY
     {
         return Err(format!("{where_}: unreviewed render pipeline identity").into());
     }

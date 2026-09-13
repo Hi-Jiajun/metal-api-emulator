@@ -305,17 +305,18 @@ executable on Linux, so `test_oracle_coverage.py` compares the three tables with
   provider capture and the three-way parity comparison) names every suite, and
   the four object-API `for version in ...; do` loops pin every version;
 - the oracle's "v1 through vN" diagnostic names the last committed suite.
-- a suite whose render cases are marked for the Vulkan trace rail only is kept
-  out of the four CI rails and the version loops on purpose; every other suite
-  still has to be named on all of them, and the marker itself is checked to name
-  no rail that cannot report an attachment yet.
+- a render case's `capture_rails` marker is checked against the backends that
+  own a render execution path, so a marker cannot name an object-API rail,
+  which has no render command encoder and therefore cannot report an
+  attachment.
 
 This is metadata consistency, not evidence: it cannot compile Swift and says
 nothing about a case body, a shader hash, GPU execution or cross-backend
-agreement. The only exemption is the render marker described above, and it has
-to be a deliberate edit to both the suite and this section. If a table is
-reshaped so it can no longer be parsed, the check fails instead of silently
-comparing empty sets.
+agreement. A render-bearing suite needs no exemption any more: every committed
+suite is named on all four CI rails and in all four object-API version loops,
+and the object-API captures report the declaring pass of a render-bearing
+suite because the marker does not name them. If a table is reshaped so it can
+no longer be parsed, the check fails instead of silently comparing empty sets.
 
 ## Offscreen render capture
 
@@ -328,12 +329,14 @@ per-texel byte comparison is the whole assertion. See
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) for the case schema field by field, the
 report shape, the count contract and the one-command device check.
 
-The Vulkan trace rail executes the case — `provider-capture --suite
-conformance/suite-v13.json` — and the two object-API rails report the declaring
-case only: they carry no render command encoder in this increment, so the
-suite's `capture_rails` marker names `vulkan` and `compare.py` requires the
-attachment exactly from that rail. Wiring the case into the macOS rails (the
-Swift oracle and the Rust native provider) is the pending step §4 of
-RENDER-CAPTURE.md lists; no render run on Apple hardware has been observed yet,
-and the macOS job's `--render-selftest` step is what would produce the first
-one.
+Three rails execute and report the case: the Vulkan trace rail
+(`provider-capture --suite conformance/suite-v13.json`), the native provider's
+trace rail (`--backend native-metal-provider`, which registers the reviewed MSL
+pipeline on the native context) and the Swift oracle's suite path
+(`run_native.py --suite conformance/suite-v13.json`). The two object-API rails
+report the declaring case only: they carry no render command encoder in this
+increment, so the suite's `capture_rails` marker names the three rails above
+and `compare.py` requires the attachment exactly from them. §4 of
+RENDER-CAPTURE.md lists what that wiring covers and what only an Apple GPU can
+still confirm; the macOS job's `--render-selftest` step is the one Apple-side
+render run observed so far.
