@@ -73,6 +73,9 @@ pub enum CodecError {
     SupportedColorFormatCount { count: usize, maximum: usize },
     PresentModeCount { count: usize, maximum: usize },
     PresentSentinelLength { length: usize, maximum: usize },
+    HeapPlacementCount { count: usize, maximum: usize },
+    HeapStorageModeCount { count: usize, maximum: usize },
+    IndirectCommandKindCount { count: usize, maximum: usize },
     UnknownPassTag(u8),
     UnknownPipelineTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
@@ -152,6 +155,18 @@ impl fmt::Display for CodecError {
             Self::PresentSentinelLength { length, maximum } => write!(
                 formatter,
                 "present target sentinel carries {length} bytes, maximum {maximum}"
+            ),
+            Self::HeapPlacementCount { count, maximum } => write!(
+                formatter,
+                "heap payload carries {count} placements, maximum {maximum}"
+            ),
+            Self::HeapStorageModeCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} heap storage modes, maximum {maximum}"
+            ),
+            Self::IndirectCommandKindCount { count, maximum } => write!(
+                formatter,
+                "indirect command payload names {count} command kinds, maximum {maximum}"
             ),
             Self::PresentModeCount { count, maximum } => write!(
                 formatter,

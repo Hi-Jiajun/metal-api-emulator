@@ -1764,6 +1764,8 @@ mod tests {
             encoder_dispatch_type: DispatchType::Serial,
             passes,
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         }
     }
 

@@ -1439,6 +1439,8 @@ mod tests {
                 TracePass::Render(milestone_pass(load)),
             ],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let mut resources = ResourceTableSnapshot::new();
         resources

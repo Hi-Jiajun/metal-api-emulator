@@ -15,13 +15,16 @@ use metal_api_core::provider::{
     BufferWriteback, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
-    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
-    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexLayout, ViewId, MAX_COLOR_ATTACHMENTS,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
+    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
+    SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexLayout, ViewId,
+    MAX_COLOR_ATTACHMENTS,
 };
 use std::io::{Read, Write};
 
@@ -66,6 +69,15 @@ const SET_QUEUE_PRIORITIES_REQUEST: u8 = 0x0e;
 /// instead of misreading the tagged pass list, which is the same additive
 /// policy the queue-priority tag uses.
 const SUBMIT_RENDER_REQUEST: u8 = 0x0f;
+/// Submit a trace that carries a heap or an indirect-command payload.
+///
+/// A compute-only or render-only trace keeps travelling under
+/// [`SUBMIT_REQUEST`] / [`SUBMIT_RENDER_REQUEST`] with the exact pre-heap/ICB
+/// bytes, so this tag is only ever emitted when a heap or ICB payload exists.
+/// An older decoder answers `UnknownCommandTag` for it instead of misreading
+/// the tagged heap/ICB tail, the same additive policy the render and present
+/// tags used (`research/docs/25-heaps与ICB设计.md` §4.5).
+const SUBMIT_HEAP_ICB_REQUEST: u8 = 0x10;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -150,6 +162,29 @@ pub const MAX_SUPPORTED_PRESENT_MODES: usize = 8;
 /// size for its format.
 pub const MAX_PRESENT_SENTINEL_BYTES: usize = 64;
 
+/// Maximum heap placements one trace payload may carry.
+///
+/// The contract's own rule is stronger — a first-increment heap refuses
+/// aliasing, so placements are pairwise disjoint — but that rule needs the
+/// whole list decoded. This bound is the protocol's guard instead: it stops a
+/// corrupt count from making the decoder allocate before it has read a single
+/// placement.
+pub const MAX_HEAP_PLACEMENTS: usize = 4096;
+
+/// Maximum heap storage modes one capability snapshot may declare.
+///
+/// [`StorageMode`] is a closed three-value family, so this bound can never
+/// refuse a well-formed snapshot; it only stops a corrupt count from driving
+/// the decoder (`docs/25-heaps与ICB设计.md` §4.1).
+pub const MAX_SUPPORTED_HEAP_STORAGE_MODES: usize = 8;
+
+/// Maximum indirect-command kinds one ICB or capability snapshot may declare.
+///
+/// [`IndirectCommandKind`] is a closed three-value family, so this bound can
+/// never refuse a well-formed value; it only stops a corrupt count from
+/// driving the decoder (`docs/25-heaps与ICB设计.md` §4.1, §4.3).
+pub const MAX_SUPPORTED_INDIRECT_COMMANDS: usize = 8;
+
 /// Maximum number of queue tiers one frame may carry.
 ///
 /// The bound is a protocol limit, not a device limit: a marking describes the
@@ -211,7 +246,9 @@ impl CommandCodec {
                 put_queue_priorities(&mut encoder, tiers)?;
             }
             CommandRequest::Submit { trace, resources } => {
-                encoder.u8(if trace.has_render_passes() {
+                encoder.u8(if trace.has_heap_or_icb() {
+                    SUBMIT_HEAP_ICB_REQUEST
+                } else if trace.has_render_passes() {
                     SUBMIT_RENDER_REQUEST
                 } else {
                     SUBMIT_REQUEST
@@ -455,7 +492,11 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
             resources: get_resources(&mut decoder)?,
         },
         SUBMIT_RENDER_REQUEST => CommandRequest::Submit {
-            trace: get_trace_tagged(&mut decoder)?,
+            trace: get_trace_tagged(&mut decoder, false)?,
+            resources: get_resources(&mut decoder)?,
+        },
+        SUBMIT_HEAP_ICB_REQUEST => CommandRequest::Submit {
+            trace: get_trace_tagged(&mut decoder, true)?,
             resources: get_resources(&mut decoder)?,
         },
         WAIT_REQUEST => CommandRequest::Wait {
@@ -1515,7 +1556,7 @@ fn get_completion_policy(decoder: &mut Decoder<'_>) -> Result<CompletionPolicy, 
 /// `SUBMIT_REQUEST` frames keep their exact legacy bytes and
 /// `SUBMIT_RENDER_REQUEST` frames are self-describing.
 fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
-    let tagged = trace.has_render_passes();
+    let tagged = trace.has_render_passes() || trace.has_heap_or_icb();
     if tagged && trace.passes.len() > MAX_TAGGED_TRACE_PASSES {
         return Err(CodecError::TracePassCount {
             count: trace.passes.len(),
@@ -1566,6 +1607,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
         }
     }
     put_completion_policy(encoder, trace.completion_policy);
+    if trace.has_heap_or_icb() {
+        put_heap_icb_tail(encoder, trace)?;
+    }
     Ok(())
 }
 
@@ -1676,6 +1720,119 @@ fn put_store_op(encoder: &mut Encoder, store: StoreOp) {
     });
 }
 
+/// Encode the heap/ICB tail that follows the completion policy of a
+/// [`SUBMIT_HEAP_ICB_REQUEST`] frame.
+///
+/// Each optional payload is spelled as an explicit presence byte rather than a
+/// length-prefixed block, so a frame cannot claim a heap section it did not
+/// write and an older decoder that somehow reaches the tail refuses the
+/// unknown presence byte instead of reading garbage as the completion policy
+/// (`research/docs/25-heaps与ICB设计.md` §4.5).
+fn put_heap_icb_tail(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
+    encoder.bool(trace.heap.is_some());
+    if let Some(heap) = &trace.heap {
+        put_heap_payload(encoder, heap)?;
+    }
+    encoder.bool(trace.indirect.is_some());
+    if let Some(indirect) = &trace.indirect {
+        put_indirect_payload(encoder, indirect)?;
+    }
+    Ok(())
+}
+
+/// Encode one heap payload: the descriptor followed by its placements.
+fn put_heap_payload(encoder: &mut Encoder, heap: &HeapPayload) -> Result<(), CodecError> {
+    encoder.u64(heap.descriptor.size);
+    put_storage_mode(encoder, heap.descriptor.storage_mode);
+    encoder.bool(heap.descriptor.allows_aliasing);
+    if heap.placements.len() > MAX_HEAP_PLACEMENTS {
+        return Err(CodecError::HeapPlacementCount {
+            count: heap.placements.len(),
+            maximum: MAX_HEAP_PLACEMENTS,
+        });
+    }
+    encoder.u64(heap.placements.len() as u64);
+    for placement in &heap.placements {
+        put_heap_placement(encoder, placement);
+    }
+    Ok(())
+}
+
+/// Encode one heap placement: its heap identity, offset and resource.
+fn put_heap_placement(encoder: &mut Encoder, placement: &HeapPlacement) {
+    encoder.u64(placement.heap_id.get());
+    encoder.u64(placement.offset);
+    put_heap_resource(encoder, placement.resource);
+}
+
+/// Encode the resource a heap placement puts at an offset. The kind is written
+/// before the byte extent so an unknown kind is a decoder refusal rather than a
+/// silent default.
+fn put_heap_resource(encoder: &mut Encoder, resource: HeapResource) {
+    match resource {
+        HeapResource::Buffer { byte_size } => {
+            encoder.u8(0);
+            encoder.u64(byte_size);
+        }
+        HeapResource::Texture { byte_size } => {
+            encoder.u8(1);
+            encoder.u64(byte_size);
+        }
+    }
+}
+
+/// Encode one indirect-command payload: the buffer descriptor, one command and
+/// the replay range.
+fn put_indirect_payload(
+    encoder: &mut Encoder,
+    indirect: &IndirectCommandPayload,
+) -> Result<(), CodecError> {
+    encoder.u32(indirect.buffer.max_commands);
+    if indirect.buffer.kinds.len() > MAX_SUPPORTED_INDIRECT_COMMANDS {
+        return Err(CodecError::IndirectCommandKindCount {
+            count: indirect.buffer.kinds.len(),
+            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+        });
+    }
+    encoder.u64(indirect.buffer.kinds.len() as u64);
+    for kind in &indirect.buffer.kinds {
+        encoder.u8(kind.code());
+    }
+    put_indirect_command(encoder, &indirect.command);
+    encoder.u32(indirect.range.start);
+    encoder.u32(indirect.range.count);
+    Ok(())
+}
+
+/// Encode one indirect command as its kind followed by the closed variant's
+/// fields.
+fn put_indirect_command(encoder: &mut Encoder, command: &IndirectCommandDescriptor) {
+    match *command {
+        IndirectCommandDescriptor::Draw {
+            vertex_count,
+            instance_count,
+        } => {
+            encoder.u8(IndirectCommandKind::Draw.code());
+            encoder.u32(vertex_count);
+            encoder.u32(instance_count);
+        }
+        IndirectCommandDescriptor::DrawIndexed {
+            index_count,
+            instance_count,
+        } => {
+            encoder.u8(IndirectCommandKind::DrawIndexed.code());
+            encoder.u32(index_count);
+            encoder.u32(instance_count);
+        }
+        IndirectCommandDescriptor::Dispatch { threadgroups } => {
+            encoder.u8(IndirectCommandKind::Dispatch.code());
+            encoder.u32(threadgroups[0]);
+            encoder.u32(threadgroups[1]);
+            encoder.u32(threadgroups[2]);
+        }
+    }
+}
+
 fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
     let schema_version = decoder.u16()?;
     let device_epoch = get_epoch(decoder)?;
@@ -1706,13 +1863,20 @@ fn get_trace(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
         encoder_dispatch_type,
         passes,
         completion_policy: get_completion_policy(decoder)?,
+        heap: None,
+        indirect: None,
     })
 }
 
 /// Decode a trace whose pass list is tagged. Only a `SUBMIT_RENDER_REQUEST`
-/// frame uses this layout; a `SUBMIT_REQUEST` frame keeps decoding through
-/// [`get_trace`] and stays compute-only.
-fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecError> {
+/// or `SUBMIT_HEAP_ICB_REQUEST` frame uses this layout; a `SUBMIT_REQUEST`
+/// frame keeps decoding through [`get_trace`] and stays compute-only. When the
+/// frame tag is the heap/ICB one, the completion policy is followed by the
+/// tagged heap/ICB tail, which `has_heap_icb_tail` selects.
+fn get_trace_tagged(
+    decoder: &mut Decoder<'_>,
+    has_heap_icb_tail: bool,
+) -> Result<ComputeTrace, CodecError> {
     let schema_version = decoder.u16()?;
     let device_epoch = get_epoch(decoder)?;
     let operation_id = OperationId::new(decoder.u64()?);
@@ -1748,6 +1912,12 @@ fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecErro
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
+    let completion_policy = get_completion_policy(decoder)?;
+    let (heap, indirect) = if has_heap_icb_tail {
+        get_heap_icb_tail(decoder)?
+    } else {
+        (None, None)
+    };
     Ok(ComputeTrace {
         schema_version,
         device_epoch,
@@ -1755,7 +1925,9 @@ fn get_trace_tagged(decoder: &mut Decoder<'_>) -> Result<ComputeTrace, CodecErro
         pipelines,
         encoder_dispatch_type,
         passes,
-        completion_policy: get_completion_policy(decoder)?,
+        completion_policy,
+        heap,
+        indirect,
     })
 }
 
@@ -1896,6 +2068,145 @@ fn get_present_descriptor(decoder: &mut Decoder<'_>) -> Result<PresentDescriptor
         mode,
         acquire,
     })
+}
+
+type HeapIcbTail = (
+    Option<Box<HeapPayload>>,
+    Option<Box<IndirectCommandPayload>>,
+);
+
+/// Decode the heap/ICB tail that follows the completion policy of a
+/// [`SUBMIT_HEAP_ICB_REQUEST`] frame.
+fn get_heap_icb_tail(decoder: &mut Decoder<'_>) -> Result<HeapIcbTail, CodecError> {
+    let heap = if decoder.bool()? {
+        Some(Box::new(get_heap_payload(decoder)?))
+    } else {
+        None
+    };
+    let indirect = if decoder.bool()? {
+        Some(Box::new(get_indirect_payload(decoder)?))
+    } else {
+        None
+    };
+    Ok((heap, indirect))
+}
+
+/// Decode one heap payload: the descriptor followed by its placements.
+fn get_heap_payload(decoder: &mut Decoder<'_>) -> Result<HeapPayload, CodecError> {
+    let descriptor = HeapDescriptor {
+        size: decoder.u64()?,
+        storage_mode: get_storage_mode(decoder)?,
+        allows_aliasing: decoder.bool()?,
+    };
+    let placement_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+    if placement_count > MAX_HEAP_PLACEMENTS {
+        return Err(CodecError::HeapPlacementCount {
+            count: placement_count,
+            maximum: MAX_HEAP_PLACEMENTS,
+        });
+    }
+    let mut placements = Vec::with_capacity(placement_count);
+    for _ in 0..placement_count {
+        placements.push(get_heap_placement(decoder)?);
+    }
+    Ok(HeapPayload {
+        descriptor,
+        placements,
+    })
+}
+
+/// Decode one heap placement: its heap identity, offset and resource.
+fn get_heap_placement(decoder: &mut Decoder<'_>) -> Result<HeapPlacement, CodecError> {
+    let heap_id = HeapId::new(decoder.u64()?);
+    let offset = decoder.u64()?;
+    let resource = get_heap_resource(decoder)?;
+    Ok(HeapPlacement {
+        heap_id,
+        offset,
+        resource,
+    })
+}
+
+/// Decode the resource a heap placement puts at an offset. An unknown kind is a
+/// decoder refusal, not a silent default.
+fn get_heap_resource(decoder: &mut Decoder<'_>) -> Result<HeapResource, CodecError> {
+    let kind = decoder.u8()?;
+    let byte_size = decoder.u64()?;
+    match kind {
+        0 => Ok(HeapResource::Buffer { byte_size }),
+        1 => Ok(HeapResource::Texture { byte_size }),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "heap resource kind",
+            value,
+        }),
+    }
+}
+
+/// Decode one indirect-command payload: the buffer descriptor, one command and
+/// the replay range.
+fn get_indirect_payload(decoder: &mut Decoder<'_>) -> Result<IndirectCommandPayload, CodecError> {
+    let max_commands = decoder.u32()?;
+    let kind_count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+        needed: usize::MAX,
+        remaining: decoder.remaining(),
+    })?;
+    if kind_count > MAX_SUPPORTED_INDIRECT_COMMANDS {
+        return Err(CodecError::IndirectCommandKindCount {
+            count: kind_count,
+            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+        });
+    }
+    let mut kinds = Vec::with_capacity(kind_count);
+    for _ in 0..kind_count {
+        let code = decoder.u8()?;
+        let kind = IndirectCommandKind::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "indirect command kind",
+            value: code,
+        })?;
+        kinds.push(kind);
+    }
+    let command = get_indirect_command(decoder)?;
+    let range = IndirectCommandRange {
+        start: decoder.u32()?,
+        count: decoder.u32()?,
+    };
+    Ok(IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands,
+            kinds,
+        },
+        command,
+        range,
+    })
+}
+
+/// Decode one indirect command: the kind first, then the closed variant's
+/// fields.
+fn get_indirect_command(
+    decoder: &mut Decoder<'_>,
+) -> Result<IndirectCommandDescriptor, CodecError> {
+    let code = decoder.u8()?;
+    match IndirectCommandKind::from_code(code) {
+        Some(IndirectCommandKind::Draw) => Ok(IndirectCommandDescriptor::Draw {
+            vertex_count: decoder.u32()?,
+            instance_count: decoder.u32()?,
+        }),
+        Some(IndirectCommandKind::DrawIndexed) => Ok(IndirectCommandDescriptor::DrawIndexed {
+            index_count: decoder.u32()?,
+            instance_count: decoder.u32()?,
+        }),
+        Some(IndirectCommandKind::Dispatch) => Ok(IndirectCommandDescriptor::Dispatch {
+            threadgroups: [decoder.u32()?, decoder.u32()?, decoder.u32()?],
+        }),
+        None => Err(CodecError::UnknownEnumValue {
+            field: "indirect command kind",
+            value: code,
+        }),
+    }
 }
 
 fn get_render_attachment(decoder: &mut Decoder<'_>) -> Result<RenderAttachment, CodecError> {
@@ -2425,6 +2736,37 @@ fn put_capabilities(
         encoder.u8(mode.code());
     }
     encoder.u32(capabilities.max_present_image_count);
+    // The heap and ICB bits (`research/docs/25-heaps与ICB设计.md` §4.1)
+    // travel in the same extended payload as the render and present bits. A
+    // snapshot whose heap and ICB bits all stay at their defaults never
+    // reaches this function, because `declares_render_support` treats them as
+    // part of the same question — which keeps both current providers' frames
+    // at their previous bytes.
+    encoder.bool(capabilities.supports_heaps);
+    encoder.u64(capabilities.max_heap_bytes);
+    if capabilities.supported_heap_storage_modes.len() > MAX_SUPPORTED_HEAP_STORAGE_MODES {
+        return Err(CodecError::HeapStorageModeCount {
+            count: capabilities.supported_heap_storage_modes.len(),
+            maximum: MAX_SUPPORTED_HEAP_STORAGE_MODES,
+        });
+    }
+    encoder.u64(capabilities.supported_heap_storage_modes.len() as u64);
+    for mode in &capabilities.supported_heap_storage_modes {
+        put_storage_mode(encoder, *mode);
+    }
+    encoder.bool(capabilities.supports_heap_aliasing);
+    encoder.bool(capabilities.supports_indirect_command_buffers);
+    encoder.u32(capabilities.max_indirect_commands);
+    if capabilities.supported_indirect_commands.len() > MAX_SUPPORTED_INDIRECT_COMMANDS {
+        return Err(CodecError::IndirectCommandKindCount {
+            count: capabilities.supported_indirect_commands.len(),
+            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+        });
+    }
+    encoder.u64(capabilities.supported_indirect_commands.len() as u64);
+    for kind in &capabilities.supported_indirect_commands {
+        encoder.u8(kind.code());
+    }
     Ok(())
 }
 
@@ -2555,5 +2897,47 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
     }
     capabilities.supported_present_modes = supported_present_modes;
     capabilities.max_present_image_count = decoder.u32()?;
+    capabilities.supports_heaps = decoder.bool()?;
+    capabilities.max_heap_bytes = decoder.u64()?;
+    let heap_mode_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::HeapStorageModeCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_HEAP_STORAGE_MODES,
+        })?;
+    if heap_mode_count > MAX_SUPPORTED_HEAP_STORAGE_MODES {
+        return Err(CodecError::HeapStorageModeCount {
+            count: heap_mode_count,
+            maximum: MAX_SUPPORTED_HEAP_STORAGE_MODES,
+        });
+    }
+    let mut supported_heap_storage_modes = Vec::with_capacity(heap_mode_count);
+    for _ in 0..heap_mode_count {
+        supported_heap_storage_modes.push(get_storage_mode(decoder)?);
+    }
+    capabilities.supported_heap_storage_modes = supported_heap_storage_modes;
+    capabilities.supports_heap_aliasing = decoder.bool()?;
+    capabilities.supports_indirect_command_buffers = decoder.bool()?;
+    capabilities.max_indirect_commands = decoder.u32()?;
+    let icb_kind_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::IndirectCommandKindCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+        })?;
+    if icb_kind_count > MAX_SUPPORTED_INDIRECT_COMMANDS {
+        return Err(CodecError::IndirectCommandKindCount {
+            count: icb_kind_count,
+            maximum: MAX_SUPPORTED_INDIRECT_COMMANDS,
+        });
+    }
+    let mut supported_indirect_commands = Vec::with_capacity(icb_kind_count);
+    for _ in 0..icb_kind_count {
+        let code = decoder.u8()?;
+        let kind = IndirectCommandKind::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "indirect command kind",
+            value: code,
+        })?;
+        supported_indirect_commands.push(kind);
+    }
+    capabilities.supported_indirect_commands = supported_indirect_commands;
     Ok(capabilities)
 }

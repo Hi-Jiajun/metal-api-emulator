@@ -619,6 +619,8 @@ mod tests {
                 textures: Vec::new(),
             })],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let resources = || {
             let mut snapshot = ResourceTableSnapshot::new();
@@ -752,6 +754,8 @@ mod tests {
                 textures: Vec::new(),
             })],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let mut snapshot = ResourceTableSnapshot::new();
         snapshot
@@ -828,6 +832,8 @@ mod tests {
                 textures: Vec::new(),
             })],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let mut split_snapshot = ResourceTableSnapshot::new();
         for allocation in 1..=2 {
@@ -927,6 +933,8 @@ mod tests {
                 textures: Vec::new(),
             })],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let resources = || {
             let mut snapshot = ResourceTableSnapshot::new();
@@ -1130,6 +1138,8 @@ mod tests {
                     textures: Vec::new(),
                 })],
                 completion_policy: CompletionPolicy::HostReadback,
+                heap: None,
+                indirect: None,
             }
         };
 

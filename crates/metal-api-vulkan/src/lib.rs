@@ -6682,6 +6682,8 @@ mod tests {
                 },
             })],
             completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
         };
         let mut resources = ResourceTableSnapshot::new();
         for view in &trace.passes[0]

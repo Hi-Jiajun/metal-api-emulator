@@ -2509,6 +2509,8 @@ fn case_trace(
         encoder_dispatch_type: DispatchType::Serial,
         passes: passes.into_iter().map(TracePass::Compute).collect(),
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     })
 }
 

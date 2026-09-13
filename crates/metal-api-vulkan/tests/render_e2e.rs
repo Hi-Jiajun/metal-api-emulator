@@ -262,6 +262,8 @@ fn fixture_with_stage(format: AttachmentFormat, fragment_spirv: &[u8]) -> Option
             TracePass::Render(render_pass(render.pipeline_id, format, 2, 2)),
         ],
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     };
 
     let mut resources = ResourceTableSnapshot::new();

@@ -1650,6 +1650,8 @@ fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>>
             textures: Vec::new(),
         })],
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     };
     let mut resources = ResourceTableSnapshot::new();
     resources.insert_allocation(AllocationRecord {
@@ -3193,6 +3195,8 @@ fn borrowed_lease_trace_for(
             textures: Vec::new(),
         })],
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     }
 }
 
@@ -3400,6 +3404,8 @@ fn make_trace(
             textures: Vec::new(),
         })],
         completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
     })
 }
 
