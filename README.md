@@ -118,8 +118,13 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   provider, Vulkan objects, Rust Metal objects) in CI. The object API
   declares textures with `new_texture_with_bytes` and binds them with
   `set_texture`; see `conformance/SUITE-V10.md`'s successor state in
-  `research/docs/18`. Multi-invocation texture reads are blocked by a
-  translator defect recorded in `research/docs/17`.
+  `research/docs/18`. suite-v12 reads every cell of that image under two
+  dispatch shapes over the same five rails. The multi-invocation failures that
+  first looked like a translator defect were a provider bug: the Vulkan upload
+  assumed tightly packed rows and ignored `VkSubresourceLayout.rowPitch`, which
+  `15a6be3` fixed. The old attribution and its retraction are recorded in
+  `research/docs/17`, which now carries a correction record rather than an
+  upstream issue draft.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the

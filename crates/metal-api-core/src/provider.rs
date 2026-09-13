@@ -970,10 +970,11 @@ impl PipelineContract {
 pub struct ComputePass {
     pub pipeline: PipelineId,
     pub buffers: Vec<BufferView>,
-    /// Texture bindings for this pass. The first texture increment carries the
-    /// values through the trace and the command channel, but no provider
-    /// executes them yet: admission refuses a non-empty list with a typed
-    /// capability error (`research/docs/16` §4.2).
+    /// Texture bindings for this pass. Both providers execute sampled texture
+    /// bindings: the Vulkan upload places linear-image rows at the driver's
+    /// `VkSubresourceLayout.rowPitch` and the native provider uses
+    /// `MTLTexture`, and the v11/v12 suites run them over every rail
+    /// (`research/docs/16` §4.5, §4.9).
     pub textures: Vec<TextureView>,
     pub dispatch: Dispatch,
 }
@@ -3922,6 +3923,10 @@ pub enum ContractError {
         texture_type: TextureType,
         array_length: u64,
     },
+    /// Retained for binding shapes that are not implemented yet. Admission no
+    /// longer uses it: `ComputePass::validate` accepts texture bindings and both
+    /// providers execute them, so the variant currently has **no construction
+    /// point** — only the error-class/slug mapping and its `Display` arm remain.
     TextureBindingUnsupported(u32),
     LeaseSourceLengthMismatch {
         lease: LeaseId,
