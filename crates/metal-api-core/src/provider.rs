@@ -8,8 +8,11 @@
 //!
 //! The render contract family ([`AttachmentFormat`], [`RenderAttachment`],
 //! [`RenderPassDescriptor`]) is `research/docs/23-render-pipeline启动设计.md`
-//! Step 1: types and validation only. Execution (admission, `MCC1` payload,
-//! Vulkan render pass, native `MTLRenderCommandEncoder`) is Step 2+.
+//! Step 1: types and validation only. Step 2 carries those passes through the
+//! trace and the `MCC1` payload, and Step 3a adds the attachment-pipeline
+//! sibling [`RenderPipelineContract`] as a value without wiring it to a
+//! provider yet. Execution (admission, Vulkan render pass, native
+//! `MTLRenderCommandEncoder`) is Step 3b+.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -1379,6 +1382,134 @@ impl RenderPassDescriptor {
                 viewport: [width, height],
                 attachment: [attachment.width, attachment.height],
             });
+        }
+        Ok(())
+    }
+}
+
+/// Which of a render pipeline's two compiled entry points a refusal is about.
+///
+/// Both entries live in one [`RenderPipelineContract`], so an entry-level
+/// refusal has to name the stage that produced it: a bare entry name would not
+/// say which of the two fields to fix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderPipelineStage {
+    /// The stage that runs once per vertex (`vertex` in Metal Shading Language).
+    Vertex,
+    /// The stage that runs once per covered fragment (`fragment`).
+    Fragment,
+}
+
+impl RenderPipelineStage {
+    /// Lowercase spelling used by `Display` output and test failure messages.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "fragment",
+        }
+    }
+}
+
+/// How the vertex stage of a [`RenderPipelineContract`] receives its vertices.
+///
+/// `research/docs/23` §1.2 draws the first milestone's full-screen triangle
+/// from `vertex_id` alone, so the pipeline binds no vertex buffer. The layout is
+/// a value rather than an empty attribute list on purpose: Step 4 has to add a
+/// vertex-buffer value beside [`VertexLayout::None`], and an empty `Vec` would
+/// make "this pipeline has no vertex attributes" indistinguishable from
+/// "vertex attributes are not decoded yet" in a wire format that is frozen
+/// before that mapping exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexLayout {
+    /// No vertex buffer is bound; positions come from the vertex index.
+    None,
+}
+
+/// Provider-admission metadata for one registered render pipeline: the render
+/// sibling of [`PipelineContract`].
+///
+/// Field set and refusals only. No trace, provider, capability default or
+/// `MCC1` field references this value yet, so registering one changes no
+/// behavior (`research/docs/23` §6 Step 3a). Step 3b pairs it with the two
+/// translated artifacts and Step 4 executes it. [`PipelineContract`] stays the
+/// compute-side contract and keeps its field semantics.
+///
+/// Entry organization: the first increment compiles one reviewed source module
+/// twice, once per stage, the way [`CompiledComputePipeline`] pairs one
+/// [`FunctionIdentity`] with one provider-owned [`crate::PipelineArtifact`]. The
+/// two names therefore address two distinct stage functions of that module, so
+/// duplicate entry names are refused instead of silently compiling one function
+/// for both stages. Digest and source fields are deliberately absent here; Step
+/// 3b's registration is where a [`FunctionIdentity`] is attached per stage,
+/// exactly as the compute path does it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderPipelineContract {
+    /// Entry point of the vertex-stage build of the module.
+    pub vertex_entry: String,
+    /// Entry point of the fragment-stage build of the module.
+    pub fragment_entry: String,
+    /// Colour-attachment format both stages were compiled against. One format,
+    /// because the first increment admits one colour attachment
+    /// ([`MAX_COLOR_ATTACHMENTS`]).
+    pub color_format: AttachmentFormat,
+    /// The vertex input shape the vertex stage was compiled for.
+    pub vertex_layout: VertexLayout,
+}
+
+impl RenderPipelineContract {
+    /// Structural validation of the contract alone. Whether a device can render
+    /// to this format at all is admission's question, exactly as it is for
+    /// [`RenderAttachment::validate_shape`].
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.vertex_entry.trim().is_empty() {
+            return Err(ContractError::EmptyRenderPipelineEntry(
+                RenderPipelineStage::Vertex,
+            ));
+        }
+        if self.fragment_entry.trim().is_empty() {
+            return Err(ContractError::EmptyRenderPipelineEntry(
+                RenderPipelineStage::Fragment,
+            ));
+        }
+        if self.vertex_entry == self.fragment_entry {
+            // The fragment entry is the later of the two fields, so it is the
+            // one that repeats the vertex entry.
+            return Err(ContractError::DuplicateRenderPipelineEntry(
+                RenderPipelineStage::Fragment,
+            ));
+        }
+        if !self.color_format.is_admitted_for_color_attachment() {
+            // The pipeline's format reuses the attachment's variant: an admitted
+            // pipeline format is a subset of an admitted attachment format, so
+            // one message and one capability slug stay correct for both sides
+            // of the pair.
+            return Err(ContractError::UnsupportedAttachmentFormat(
+                self.color_format,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cross-contract check against the pass that names this pipeline.
+    ///
+    /// The pass's own shape rules stay [`RenderPassDescriptor::validate`]'s job;
+    /// this adds only the agreement the pass cannot check by itself, because it
+    /// carries a [`PipelineId`] and not the pipeline's compiled format. An empty
+    /// attachment list is reported as the pass's own
+    /// [`ContractError::EmptyAttachmentList`] rather than as a vacuous
+    /// agreement about formats that are not there.
+    pub fn validate_against(&self, pass: &RenderPassDescriptor) -> Result<(), ContractError> {
+        self.validate()?;
+        if pass.color_attachments.is_empty() {
+            return Err(ContractError::EmptyAttachmentList);
+        }
+        for attachment in &pass.color_attachments {
+            if attachment.format != self.color_format {
+                return Err(ContractError::RenderPipelineFormatMismatch {
+                    pipeline: self.color_format,
+                    attachment: attachment.format,
+                });
+            }
         }
         Ok(())
     }
@@ -3750,6 +3881,13 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MissingSnapshotIdentity(_)
         | E::UnknownSnapshotIdentity(_)
         | E::EmptyAttachmentList
+        // Render pipeline, Step 3a: the entry shape and the
+        // pipeline/attachment agreement are structural, like the pass rules
+        // above. The colour format is not listed here; it reuses
+        // `UnsupportedAttachmentFormat`, which stays a capability refusal.
+        | E::EmptyRenderPipelineEntry(_)
+        | E::DuplicateRenderPipelineEntry(_)
+        | E::RenderPipelineFormatMismatch { .. }
         | E::DispatchKindMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
     };
     ProviderError::new(ProviderPhase::Resolve, class, slug)
@@ -4566,6 +4704,19 @@ pub enum ContractError {
         expected: u32,
         actual: u32,
     },
+    // Render pipeline contract, Step 3a (`research/docs/23` §3.4). The entry
+    // shape and the pipeline/attachment agreement are caller-fixable structure,
+    // like the pass rules above; the colour format reuses
+    // `UnsupportedAttachmentFormat`, whose refusal stays a capability narrowing
+    // rather than becoming an argument error.
+    EmptyRenderPipelineEntry(RenderPipelineStage),
+    /// The stage whose entry repeats the other stage's entry name. Reported for
+    /// the later of the two fields, i.e. always the fragment entry.
+    DuplicateRenderPipelineEntry(RenderPipelineStage),
+    RenderPipelineFormatMismatch {
+        pipeline: AttachmentFormat,
+        attachment: AttachmentFormat,
+    },
     LeaseSourceLengthMismatch {
         lease: LeaseId,
         expected: u64,
@@ -4782,6 +4933,23 @@ impl fmt::Display for ContractError {
             Self::DrawVertexCountMismatch { expected, actual } => write!(
                 formatter,
                 "draw vertex count mismatch: expected {expected}, received {actual}"
+            ),
+            Self::EmptyRenderPipelineEntry(stage) => write!(
+                formatter,
+                "render pipeline {} entry name must not be empty",
+                stage.name()
+            ),
+            Self::DuplicateRenderPipelineEntry(stage) => write!(
+                formatter,
+                "render pipeline {} entry repeats the other stage's entry name",
+                stage.name()
+            ),
+            Self::RenderPipelineFormatMismatch {
+                pipeline,
+                attachment,
+            } => write!(
+                formatter,
+                "render pipeline colour format {pipeline:?} does not match attachment format {attachment:?}"
             ),
             Self::LeaseSourceLengthMismatch {
                 lease,
@@ -9098,6 +9266,198 @@ mod tests {
         assert_eq!(
             attachment.validate_shape(),
             Err(ContractError::ArithmeticOverflow("attachment bytes"))
+        );
+    }
+
+    // Render pipeline contract, Step 3a (`research/docs/23` §3.4, §6). The value
+    // is referenced by no trace and no provider yet, so these tests pin the field
+    // set and the refusals; execution stays unpinned.
+
+    fn render_pipeline_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: "full_screen_vertex".to_owned(),
+            fragment_entry: "solid_color_fragment".to_owned(),
+            color_format: AttachmentFormat::Rgba8Unorm,
+            vertex_layout: VertexLayout::None,
+        }
+    }
+
+    #[test]
+    fn render_pipeline_contract_accepts_the_first_increment_shape() {
+        let contract = render_pipeline_contract();
+        contract
+            .validate()
+            .expect("the first-increment render pipeline is well formed");
+        assert!(
+            matches!(contract.vertex_layout, VertexLayout::None),
+            "the first increment fixes one explicitly empty vertex layout"
+        );
+        assert_eq!(RenderPipelineStage::Vertex.name(), "vertex");
+        assert_eq!(RenderPipelineStage::Fragment.name(), "fragment");
+        assert_ne!(
+            contract.vertex_entry, contract.fragment_entry,
+            "the two stage entries address two compiled stage functions"
+        );
+
+        // Every admitted attachment format is admitted on the pipeline side too,
+        // so the two contracts cannot drift apart on the format set.
+        for format in AttachmentFormat::ADMITTED {
+            let mut admitted = contract.clone();
+            admitted.color_format = format;
+            admitted.validate().expect("an admitted format compiles");
+        }
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_an_empty_entry_name() {
+        let mut contract = render_pipeline_contract();
+        contract.vertex_entry.clear();
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::EmptyRenderPipelineEntry(
+                RenderPipelineStage::Vertex
+            ))
+        );
+
+        // Whitespace is empty too, matching the trim rule the compute side
+        // already applies to entry names.
+        let mut contract = render_pipeline_contract();
+        contract.fragment_entry = "   ".to_owned();
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::EmptyRenderPipelineEntry(
+                RenderPipelineStage::Fragment
+            ))
+        );
+
+        let refusal = contract_error_refusal(ContractError::EmptyRenderPipelineEntry(
+            RenderPipelineStage::Vertex,
+        ));
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("vertex entry")),
+            "the refusal detail has to name the stage to fix, got {:?}",
+            refusal.detail
+        );
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_one_entry_name_for_both_stages() {
+        let mut contract = render_pipeline_contract();
+        let shared = contract.vertex_entry.clone();
+        contract.fragment_entry = shared;
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::DuplicateRenderPipelineEntry(
+                RenderPipelineStage::Fragment
+            ))
+        );
+        // Duplication is checked before the format, so a contract that is wrong
+        // twice reports the entry shape a caller can see without a device.
+        contract.color_format = AttachmentFormat::R32Uint;
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::DuplicateRenderPipelineEntry(
+                RenderPipelineStage::Fragment
+            ))
+        );
+
+        let refusal = contract_error_refusal(ContractError::DuplicateRenderPipelineEntry(
+            RenderPipelineStage::Fragment,
+        ));
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_an_unsupported_color_format() {
+        // R32Uint is expressible but outside the first render increment, and the
+        // pipeline refuses it with the same variant and slug as the attachment.
+        let mut contract = render_pipeline_contract();
+        contract.color_format = AttachmentFormat::R32Uint;
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::UnsupportedAttachmentFormat(
+                AttachmentFormat::R32Uint
+            ))
+        );
+        let refusal = contract_error_refusal(ContractError::UnsupportedAttachmentFormat(
+            AttachmentFormat::R32Uint,
+        ));
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        assert_eq!(refusal.slug, "attachment_format_unsupported");
+
+        // The pipeline's own format is checked before it is compared against the
+        // pass, so the capability narrowing is not reported as a mismatch.
+        let mut pass = render_pass();
+        pass.color_attachments[0].format = AttachmentFormat::Rgba8Unorm;
+        assert_eq!(
+            contract.validate_against(&pass),
+            Err(ContractError::UnsupportedAttachmentFormat(
+                AttachmentFormat::R32Uint
+            ))
+        );
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_a_pass_with_a_different_attachment_format() {
+        let contract = render_pipeline_contract();
+        let mut pass = render_pass();
+        pass.color_attachments[0].format = AttachmentFormat::Bgra8Unorm;
+        assert_eq!(
+            contract.validate_against(&pass),
+            Err(ContractError::RenderPipelineFormatMismatch {
+                pipeline: AttachmentFormat::Rgba8Unorm,
+                attachment: AttachmentFormat::Bgra8Unorm,
+            })
+        );
+
+        let refusal = contract_error_refusal(ContractError::RenderPipelineFormatMismatch {
+            pipeline: AttachmentFormat::Rgba8Unorm,
+            attachment: AttachmentFormat::Bgra8Unorm,
+        });
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("does not match attachment format")),
+            "the refusal detail has to name both formats, got {:?}",
+            refusal.detail
+        );
+    }
+
+    #[test]
+    fn render_pipeline_contract_accepts_a_pass_with_the_compiled_format() {
+        // The control for the mismatch above: the pass the pipeline was compiled
+        // for is accepted, for every admitted format.
+        for format in AttachmentFormat::ADMITTED {
+            let mut contract = render_pipeline_contract();
+            contract.color_format = format;
+            let mut pass = render_pass();
+            pass.color_attachments[0].format = format;
+            contract
+                .validate_against(&pass)
+                .expect("a pipeline compiles for the attachment it renders into");
+            // The pass keeps its own shape rules; agreement does not replace
+            // them.
+            pass.validate().expect("the pass is well formed on its own");
+        }
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_to_agree_with_an_empty_attachment_list() {
+        let contract = render_pipeline_contract();
+        let mut pass = render_pass();
+        pass.color_attachments.clear();
+        assert_eq!(
+            contract.validate_against(&pass),
+            Err(ContractError::EmptyAttachmentList)
         );
     }
 }
