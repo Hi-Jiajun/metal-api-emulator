@@ -6,10 +6,8 @@ render case looks like, what a render capture reports, and which rails report
 one today. `conformance/suite-v13.json` is the first committed suite that
 declares render cases, `conformance/compare.py` has the matching attachment
 section, and the case is named by every rail that owns a render execution path:
-the Vulkan trace rail, the Vulkan object rail, the native provider's trace rail
-and the Swift oracle's suite path. One rail is still **pending**: the native
-object API has no render command encoder, so it runs a render-bearing suite and
-reports its declaring pass only. The one-device check ran on an Apple
+the Vulkan trace and object rails, the native provider's trace and object rails,
+and the Swift oracle's suite path. The one-device check ran on an Apple
 Paravirtual device in CI run `34774478149` (`--render-selftest`, §5), and both
 Apple-side suite captures have since run too: the oracle and the Rust provider
 each read `4080c0ff` four times back for v13 (run `34781060564`) and v14
@@ -173,12 +171,14 @@ counters, so the contract does not apply to `native-metal`
 
 ## 4. Which rails report a render case
 
-The first render increment has four executable rails: the Vulkan trace rail,
+The first render increment has five executable rails: the Vulkan trace rail,
 the Vulkan object rail (the render command encoder in
 `crates/metal-api-core/src/provider_api.rs`, executed by
 `VulkanComputeProvider` for both the object and object-async shapes), the native
 trace rail (`crates/metal-api-native/src/render.rs`, wired into
-`NativeMetalProvider::submit` in Step 7) and the Swift oracle's suite path
+`NativeMetalProvider::submit` in Step 7), the native object rail (the same
+encoder surface executed by `NativeMetalProvider`, `8793b7a`) and the Swift
+oracle's suite path
 (`NativeOracle.swift::capture`, which runs the render cases its marker names
 after the compute cases, exactly as it runs them for its own `--render-selftest`).
 The native provider declares `supports_render_passes = true` with the rail's own
@@ -187,10 +187,7 @@ flip condition below is met; before that flip it refused a render-bearing trace
 with `render_passes_unsupported`. Each Rust rail registers the reviewed pipeline
 on its own concrete context: the Vulkan rail's SPIR-V pair
 (`VulkanComputeProvider::register_render_pipeline`) and the native rail's
-reviewed MSL module (`NativeMetalProvider::register_render_pipeline`). The
-native object rail still has no render command encoder, so a render case cannot
-be expressed there at all; it runs the suite and reports its declaring pass, and
-the marker does not name it.
+reviewed MSL module (`NativeMetalProvider::register_render_pipeline`).
 
 A render case therefore declares the capture backends that owe the attachment
 in its `capture_rails` marker:
@@ -202,11 +199,10 @@ in its `capture_rails` marker:
   produce one.
 
 `suite-v13.json` marks `["vulkan", "vulkan-objects", "native-metal",
-"native-metal-provider"]`, so the attachment is reported by the Vulkan trace
-rail, the Vulkan object rail (both `--api objects` and `--api objects --async`),
-the native provider's trace rail and the Swift oracle, while the native object
-rail reports the declaring case only. `suite-v14.json` marks the two provider
-rails (`["vulkan", "vulkan-objects", "native-metal-provider"]`): the Swift
+"native-metal-provider", "native-metal-provider-objects"]`, so the attachment is
+reported by all five backends. `suite-v14.json` marks the four provider rails
+(`["vulkan", "vulkan-objects", "native-metal-provider",
+"native-metal-provider-objects"]`): the Swift
 oracle does not report provider counters, so its present evidence is the
 `--present-selftest` check (§7) rather than a marked capture. The v14 Vulkan
 object rail executes the present action too, because the object encoder carries
@@ -331,8 +327,9 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   marker that names an object-API rail, which has no render command encoder;
 * that `suite-v13.json`'s attachment section is the reviewed shape, that the
   capture pins the reviewed SPIR-V stage pair and entries, that every rail the
-  marker names reports the attachment while the native object rail omits it,
-  and that a tampered attachment byte, a dropped texel, a buffer writeback
+  marker names reports the attachment (and that a marker which drops one rail
+  makes that rail's report of the case refused), and that a tampered attachment
+  byte, a dropped texel, a buffer writeback
   standing in for the attachment (in either direction) and a wrong copy count
   are all
   refused (`conformance/test_suite_v13.py`, run by `python3 -m unittest
@@ -396,8 +393,8 @@ therefore directly observable if the draw does not run.
 The marker rule is the same one §4 describes, with one extra consequence: the
 Swift oracle does not report provider counters (`research/docs/24` §5.1), so a
 present-bearing case cannot be marked for `native-metal`. Suite-v14 marks
-`vulkan`, `vulkan-objects` and `native-metal-provider`; the native object rail
-skips it exactly as it skips v13's render case. The Apple half of the evidence is the oracle's
+`vulkan`, `vulkan-objects`, `native-metal-provider` and
+`native-metal-provider-objects`; the Apple half of the evidence is the oracle's
 `--present-selftest` (§5): it presets the sentinel, runs the reviewed render
 equivalent and fails if the readback is the sentinel instead of `4080c0ff` x4.
 
@@ -424,7 +421,5 @@ on an Apple Paravirtual device, and `--present-selftest` passing; the RTX 5060
 run is archived in `evidence/windows-rtx5060-v14-1f8adc1-2026-09-14/` (direct
 capture: `present = {"acquire": 1, "present": 1}`, bytes
 `4080c0ff4080c0ff4080c0ff4080c0ff`; the object and async-object captures pass with
-the same case and counts, run through the object API's render command encoder,
-while the native object rail reports the declaring case only). The native
-object-API render/present path is still open, so that rail continues to skip the
-case.
+the same case and counts, run through the object API's render command encoder on
+both backends).

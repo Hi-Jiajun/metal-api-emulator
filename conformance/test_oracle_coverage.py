@@ -37,22 +37,19 @@ SUITE_FILES = "suite*.json"
 SUITE_IDENTITY = re.compile(r"compute-buffer-v([0-9]+)")
 
 # The capture backends that report an attachment observation in the first
-# render increment. Every render-capable rail owns a render execution path
-# (`conformance/RENDER-CAPTURE.md` §4): the Vulkan trace rail, the Vulkan
-# object rail (its render command encoder runs the same reviewed pass), the
-# native provider's trace rail and the Swift oracle.
+# render increment. Every rail owns a render execution path
+# (`conformance/RENDER-CAPTURE.md` §4): the Vulkan trace and object rails, the
+# native provider's trace and object rails, and the Swift oracle.
 VULKAN_TRACE_RAIL = "vulkan"
-RENDER_CAPABLE_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider")
+RENDER_CAPABLE_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider",
+                        "native-metal-provider-objects")
 
-# The capture backends that still cannot carry an attachment observation: the
-# native object API exposes no render command encoder yet, so a render case
-# cannot be expressed there. That rail runs a render-bearing suite and reports
-# its declaring pass, but a marker that names it is refused here rather than
-# reported as compliant. Wiring it in needs a render command encoder in the
-# native provider's object surface first.
-RAILS_WITHOUT_ATTACHMENT_OBSERVATION = frozenset({
-    "native-metal-provider-objects",
-})
+# No capture backend is missing an attachment observation anymore: the native
+# object rail gained the same render command encoder the Vulkan object rail has
+# (`8793b7a`). The set stays as the place a future rail that cannot report one
+# is refused; it is empty today, and the test below still enforces that a
+# marker may only name rails with a render execution path.
+RAILS_WITHOUT_ATTACHMENT_OBSERVATION = frozenset()
 
 # Every command rail in the CI workflow that writes its suites out explicitly.
 # Order matters: a parity line also contains `compare.py --suite`, and the

@@ -134,11 +134,10 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   Vulkan executor in `2e64eff`/`0319da1`, the observation in `e581562`, and
   `8430446` added the suite to CI. CI run `34776215859` reports five-rail
   parity for it — Swift native oracle, Vulkan trace, Rust Metal provider,
-  Vulkan objects and Rust Metal objects all agree byte for byte; since the
-  Vulkan object rail gained a render command encoder (`ea0eb25`,
-  CI run `34784255291`), four of the five backends execute the pass (the
-  Vulkan object rail in both its direct and async shapes) and only the native
-  object rail reports the declaring case — and
+  Vulkan objects and Rust Metal objects all agree byte for byte; since both
+  object rails gained a render command encoder (`ea0eb25` for Vulkan,
+  `8793b7a` for native), all five backends execute the pass (each object rail
+  in both its direct and async shapes) — and
   the attachment observation travels the same writeback channel as every other
   case. The native flip was earned, not assumed: CI run `34774478149` ran
   `native-oracle --render-selftest` on an Apple Paravirtual device and read
@@ -159,8 +158,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   five-rail parity for v14; the RTX 5060 run is archived in
   `evidence/windows-rtx5060-v14-1f8adc1-2026-09-14/`. Since `ea0eb25`/`341b334`
   the Vulkan object rail executes the same render and present tail through its
-  own render command encoder (both the object and object-async shapes report
-  `present: {"acquire": 1, "present": 1}`, CI run `34784255291`), with the RTX
+  own render command encoder, and the native object rail follows (`8793b7a`);
+  the object and object-async shapes on both backends report
+  `present: {"acquire": 1, "present": 1}` (Vulkan CI run `34784255291`), with the RTX
   5060 v13/v14 captures archived in
   `evidence/windows-rtx5060-v13v14-objects-341b334-2026-09-14/`. This is a *readable-target
   equivalent*: it does not create a `VkSurfaceKHR`, a swapchain or a window, and
@@ -193,8 +193,7 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   texture generalisation beyond the sampled fixture, presentation beyond the
   surfaceless readable-target equivalent (real surfaces and swapchains,
   multi-buffering, present modes other than FIFO, vsync, suboptimal handling),
-  the native object-API render/present path (the Vulkan object rail executes
-  both; `research/docs/24` §6 Step 5), heap placement and ICB execution (the
+  heap placement and ICB execution (the
   core value types and default-off capability gates landed in `90771cc`;
   `research/docs/25` is the eight-step design), general MTLB function-name
   resolution, Windows MSL compilation, arbitrary AIR/MSL compilation and

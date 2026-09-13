@@ -33,11 +33,11 @@ TEXELS = "4080c0ff" * 4
 
 # The capture backends `suite-v13.json` marks this case executable on
 # (`conformance/RENDER-CAPTURE.md` §4): every rail that owns a render execution
-# path has to report the attachment. The Vulkan object rail now owns one
-# (its render command encoder runs the same reviewed pass), while the native
-# object rail still exposes no render command encoder and has to omit it.
-REPORTING_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider")
-OBJECT_RAILS = ("native-metal-provider-objects",)
+# path has to report the attachment. All five backends own one now: the Vulkan
+# object rail gained a render command encoder first, the native object rail
+# followed (`8793b7a`).
+REPORTING_RAILS = ("vulkan", "vulkan-objects", "native-metal", "native-metal-provider",
+                   "native-metal-provider-objects")
 
 # Read by hand from suite-v13.json: the declaring pass copies the attachment
 # view's first word (`fe fe fe fe`, the clear sentinel) into the probe view, and
@@ -74,6 +74,21 @@ def synthetic_capture(suite, digest, backend="vulkan"):
     if backend in REPORTING_RAILS:
         report["results"].append(render_result(backend != "native-metal"))
     return report
+
+
+def suite_without_marker_rail(suite, rail):
+    """A copy of `suite` whose render-case marker omits `rail`.
+
+    The committed suites name every rail, so the "a rail the marker does not
+    name must not report the case" rule is exercised against a fixture whose
+    marker drops one rail rather than against a committed suite that no longer
+    exists in that shape.
+    """
+    trimmed = copy.deepcopy(suite)
+    for case in trimmed.get("render_cases", []):
+        case["capture_rails"] = [named for named in case["capture_rails"] if named != rail]
+    digest = hashlib.sha256(json.dumps(trimmed, sort_keys=True).encode("utf-8")).hexdigest()
+    return trimmed, digest
 
 
 class RenderObservationTests(unittest.TestCase):
@@ -184,13 +199,6 @@ class RenderObservationTests(unittest.TestCase):
                 compare.validate_capture(self.suite, self.digest,
                                          synthetic_capture(self.suite, self.digest, backend),
                                          backend)
-        # A rail the marker does not name still has to validate its own capture:
-        # it reports the declaring pass and omits the attachment.
-        for backend in OBJECT_RAILS:
-            with self.subTest(backend=backend):
-                compare.validate_capture(self.suite, self.digest,
-                                         synthetic_capture(self.suite, self.digest, backend),
-                                         backend)
 
     def test_v13_refuses_tampered_attachment_bytes(self):
         for mutation, message in (
@@ -237,10 +245,14 @@ class RenderObservationTests(unittest.TestCase):
             compare.validate_capture(self.suite, self.digest, report)
 
     def test_v13_refuses_a_rail_the_marker_does_not_name(self):
-        report = synthetic_capture(self.suite, self.digest, OBJECT_RAILS[0])
+        suite, digest = suite_without_marker_rail(self.suite, "native-metal-provider-objects")
+        # Build the capture by hand: `synthetic_capture` appends the attachment
+        # for every rail in REPORTING_RAILS, and this rail is named there even
+        # though this trimmed copy's marker drops it.
+        report = synthetic_report(suite, digest, "native-metal-provider-objects")
         report["results"].append(render_result())
         with self.assertRaisesRegex(compare.CaptureError, "not a rail this render case runs on"):
-            compare.validate_capture(self.suite, self.digest, report)
+            compare.validate_capture(suite, digest, report)
 
     def test_v13_count_contract_is_one_copy_per_touched_and_written_allocation(self):
         for counts, message in (

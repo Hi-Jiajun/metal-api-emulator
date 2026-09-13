@@ -21,8 +21,8 @@ import unittest
 
 import compare
 from test_compare import synthetic_report
-from test_suite_v13 import (ATTACHMENT, OBJECT_RAILS, REPORTING_RAILS, RENDER_ID,
-                            TEXELS, render_result)
+from test_suite_v13 import (ATTACHMENT, REPORTING_RAILS, RENDER_ID, TEXELS,
+                            render_result, suite_without_marker_rail)
 
 
 CONFORMANCE = Path(__file__).resolve().parent
@@ -53,12 +53,29 @@ PINNED_PLANS = {
     },
 }
 
+# The rails `suite-v14.json` marks (`research/docs/24` §5.1/§5.5): every rail
+# that reports provider present counts. The Swift oracle reports no counters,
+# so it is the one render-capable rail v14 leaves out; gating a present case on
+# its capture would ask for an observation it cannot produce.
+V14_REPORTING_RAILS = ("vulkan", "vulkan-objects", "native-metal-provider",
+                       "native-metal-provider-objects")
+
 
 def synthetic_suite(present=PRESENT):
-    """`suite-v13.json` plus the present section, with a digest over the result."""
+    """`suite-v13.json` reshaped into v14: present section, provider-only marker.
+
+    The synthetic suite keeps v13's case ids (the committed v14 fixture renames
+    the render case, but the comparator rules under test do not depend on the
+    name) while dropping `native-metal` from the marker, because the Swift
+    oracle reports no provider counters (`research/docs/24` §5.1). Its marker
+    therefore matches the committed `suite-v14.json`'s rail set.
+    """
     suite = json.loads(V13_PATH.read_text(encoding="utf-8"))
     if present is not None:
         suite["render_cases"][0]["present"] = copy.deepcopy(present)
+    for case in suite.get("render_cases", []):
+        case["capture_rails"] = [rail for rail in case["capture_rails"]
+                                 if rail != "native-metal"]
     digest = hashlib.sha256(json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
     return suite, digest
 
@@ -99,7 +116,7 @@ def capture_for(suite, digest, backend="vulkan", observation=OBSERVATION, report
         for result in report["results"]:
             result["copy_in"], result["copy_out"] = 2, 1
     if report_case is None:
-        report_case = backend in REPORTING_RAILS
+        report_case = backend in V14_REPORTING_RAILS
     if report_case:
         result = render_result(backend != "native-metal")
         if observation is not None:
@@ -190,19 +207,26 @@ class PresentObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(compare.CaptureError, message):
             self.validate(report, backend)
 
+    def validate_trimmed(self, suite, digest, report, backend):
+        compare.validate_capture(suite, digest, report, backend)
+
+    def reject_trimmed(self, suite, digest, report, message, backend):
+        with self.assertRaisesRegex(compare.CaptureError, message):
+            self.validate_trimmed(suite, digest, report, backend)
+
     def test_every_named_rail_reports_the_counts_the_suite_declares(self):
-        for backend in REPORTING_RAILS:
+        for backend in V14_REPORTING_RAILS:
             with self.subTest(backend=backend):
                 self.validate(capture_for(self.suite, self.digest, backend), backend)
 
     def test_a_named_rail_has_to_report_the_observation(self):
-        for backend in REPORTING_RAILS:
+        for backend in V14_REPORTING_RAILS:
             with self.subTest(backend=backend):
                 self.reject(capture_for(self.suite, self.digest, backend, observation=None),
                             "has to report the present observation", backend)
 
     def test_a_named_rail_has_to_report_the_case_at_all(self):
-        for backend in REPORTING_RAILS:
+        for backend in V14_REPORTING_RAILS:
             with self.subTest(backend=backend):
                 self.reject(capture_for(self.suite, self.digest, backend, report_case=False),
                             "missing cases", backend)
@@ -246,19 +270,26 @@ class PresentObservationTests(unittest.TestCase):
                             message)
 
     def test_a_rail_the_marker_does_not_name_must_not_report_the_observation(self):
-        for backend in OBJECT_RAILS:
+        # Every committed rail is named now, so the unnamed-rail rule is
+        # exercised against a copy of the suite whose marker drops one rail.
+        suite, digest = suite_without_marker_rail(self.suite, "native-metal-provider-objects")
+        for backend in ("native-metal-provider-objects",):
             with self.subTest(backend=backend, reported="the case only"):
                 # The byte rule already refuses the case itself; the present
                 # rule has to refuse it as well rather than let an unnamed rail
                 # report the counts of a case it does not run.
-                self.reject(capture_for(self.suite, self.digest, backend, observation=None,
-                                        report_case=True),
-                            "not a rail this render case runs on", backend)
+                self.reject_trimmed(suite, digest,
+                                    capture_for(suite, digest, backend, observation=None,
+                                                report_case=True),
+                                    "not a rail this render case runs on", backend)
             with self.subTest(backend=backend, reported="the observation"):
-                self.reject(capture_for(self.suite, self.digest, backend, report_case=True),
-                            "must not report the present observation", backend)
+                self.reject_trimmed(suite, digest,
+                                    capture_for(suite, digest, backend, report_case=True),
+                                    "must not report the present observation", backend)
             with self.subTest(backend=backend, reported="nothing"):
-                self.validate(capture_for(self.suite, self.digest, backend), backend)
+                self.validate_trimmed(suite, digest,
+                                      capture_for(suite, digest, backend, report_case=False),
+                                      backend)
 
     def test_an_undeclared_observation_is_refused(self):
         # The committed v13 suite declares no present section, so no rail may
@@ -290,7 +321,8 @@ PINNED_V14_PLAN = {
         "allocations": [[900, TEXELS]],
         "touched": [900, 920],
         "written": [900, 920],
-        "rails": sorted(["vulkan", "vulkan-objects", "native-metal-provider"]),
+        "rails": sorted(["vulkan", "vulkan-objects", "native-metal-provider",
+                         "native-metal-provider-objects"]),
         "attachment": list(ATTACHMENT),
         "present": {
             "mode": "fifo",
