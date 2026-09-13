@@ -88,6 +88,8 @@ const MIX: &str = include_str!("../../../conformance/shaders/mix_3d.metal");
 const REMAP: &str = include_str!("../../../conformance/shaders/remap_3d.metal");
 #[cfg(any(target_os = "macos", test))]
 const COPY_3D: &str = include_str!("../../../conformance/shaders/copy_3d.metal");
+#[cfg(any(target_os = "macos", test))]
+const READ_TEXTURE_2D: &str = include_str!("../../../conformance/shaders/read_texture_2d.metal");
 
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
@@ -162,6 +164,12 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
                 binding(4, BufferAccess::Read, affine(&[4, 20, 60])),
                 binding(9, BufferAccess::Write, affine(&[4, 20, 60])),
             ],
+        ),
+        // The v11 texture case writes one 64-byte cell per invocation; the
+        // sampled texture itself is not a buffer binding.
+        ("read_texture_2d", READ_TEXTURE_2D) => (
+            [1, 1, 1],
+            vec![binding(0, BufferAccess::Write, static_word())],
         ),
         _ => {
             return Err(refusal(
