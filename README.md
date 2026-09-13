@@ -125,23 +125,22 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `15a6be3` fixed. The old attribution and its retraction are recorded in
   `research/docs/17-纹理多invocation归因修正记录.md`, which is a correction
   record rather than an upstream issue draft.
-- Offscreen rendering executes on the Vulkan trace rail: `suite-v13` declares
+- Offscreen rendering runs on all five rails: `suite-v13` declares
   one `rgba8_unorm` 2x2 colour attachment, a two-stage graphics pipeline draws
   the reviewed fullscreen triangle so that every texel reads `40 80 c0 ff`,
   and the comparator observes the image through the same allocation writeback
   channel as every other case. The contract and trace values landed in
   `cd5bced`/`b14f496`, the
   Vulkan executor in `2e64eff`/`0319da1`, the observation in `e581562`, and
-  `8430446` added the suite to CI on the trace rail and both Vulkan object-API
-  loops. Three rails report the suite's attachment: the Vulkan trace rail, the
-  native provider's trace rail and the Swift oracle's suite path, which
-  `run_native.py --suite conformance/suite-v13.json` now asks for. The two
-  object-API rails report the declaring case only — the object API has no render
-  command encoder — and the native provider's encoder body has not run on Apple
-  hardware itself yet; the reviewed fixture it compiles is the one CI run
-  `34774478149`'s `native-oracle --render-selftest` read back as `40 80 c0 ff`
-  four times on an Apple Paravirtual device, which is what flipped
-  `supports_render_passes`. See `conformance/RENDER-CAPTURE.md`.
+  `8430446` added the suite to CI. CI run `34776215859` reports five-rail
+  parity for it — Swift native oracle, Vulkan trace, Rust Metal provider,
+  Vulkan objects and Rust Metal objects all agree byte for byte, three of them
+  by executing the render pass and two by reporting the declaring case — and
+  the attachment observation travels the same writeback channel as every other
+  case. The native flip was earned, not assumed: CI run `34774478149` ran
+  `native-oracle --render-selftest` on an Apple Paravirtual device and read
+  `40 80 c0 ff` four times back, and the suite path afterwards captured the same
+  bytes through the Rust native provider. See `conformance/RENDER-CAPTURE.md`.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
@@ -150,10 +149,12 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   lease is retired. See `research/docs/19`.
 - Open design work: device-loss reclamation beyond the bounded abandonment
   budget (the `ProviderLifecycle` admission/refusal and lease-retirement
-  contract exists, and both the Vulkan context and the native Metal provider
-  admit and report health through it, but the only deterministic teardown
-  evidence is still the injected test loss rather than a real
-  `VK_ERROR_DEVICE_LOST`), general native shader admission and CPU uploads
+  contract exists, both providers admit and report health through it, and a
+  real `VK_ERROR_DEVICE_LOST` from `submit`, `wait` or the render submission now
+  routes to the device-loss terminal state instead of a generic execution
+  failure — what is still missing is a *reproducible* real loss: the
+  deterministic teardown evidence remains the injected test loss), general
+  native shader admission and CPU uploads
   during command-buffer execution, guest-memory lifecycle wiring beyond the
   owner-side contract (the owner-side `HostRegion`/`DirtySet`/`GuestWindows`
   pieces exist, and `research/docs/20` designs the reims-side projection and
@@ -162,10 +163,9 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   marking that carries them to a remote provider over the command channel now
   exist, while nothing maps an `MTLCommandQueue` to a tier yet). Resource
   snapshots do not hold live guest pages.
-- Not implemented: render passes beyond the three rails that report the v13
-  attachment (the Vulkan trace rail, the native provider's trace rail and the
-  Swift oracle's suite path; the object API has no render command encoder, and
-  the native provider's render path has not run on Apple hardware yet), sampler and
+- Not implemented: render features beyond the one-additional-suite increment
+  (vertex buffers and MRT, `LoadOp::Load`, `StoreOp::DontCare`, formats beyond
+  `rgba8_unorm` inside a suite), sampler and
   texture generalisation beyond the sampled fixture, presentation and
   swapchain, heaps, ICBs, general MTLB function-name resolution, Windows MSL
   compilation, arbitrary AIR/MSL compilation and reflection, and production
