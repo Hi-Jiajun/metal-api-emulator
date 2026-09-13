@@ -798,9 +798,87 @@ fn encode(
         .enumerate()
         .map(|(index, view)| (view.view_id, index))
         .collect();
+    // Owned views of one allocation share one MTLBuffer, bound with the view's
+    // own offset, so the image is uploaded once (`research/docs/15` §3). A lone
+    // owned view keeps its exact-length buffer at offset zero. The image spans
+    // the largest end offset across the allocation's views and is zero-filled
+    // between them: nothing reads or writes there, because each view's
+    // footprint proof bounds its own accesses.
+    let overflow = || {
+        refusal(
+            ProviderPhase::Encode,
+            ProviderErrorClass::Args,
+            "buffer_range_overflow",
+        )
+    };
+    let mut owned_per_allocation = BTreeMap::<AllocationId, usize>::new();
+    for view in &pool {
+        if matches!(view.source, BufferSource::OwnedBytes(_)) {
+            *owned_per_allocation.entry(view.allocation_id).or_default() += 1;
+        }
+    }
+    let mut shared_images = BTreeMap::<AllocationId, Vec<u8>>::new();
+    for view in &pool {
+        let BufferSource::OwnedBytes(_) = &view.source else {
+            continue;
+        };
+        if owned_per_allocation
+            .get(&view.allocation_id)
+            .copied()
+            .unwrap_or(0)
+            < 2
+        {
+            continue;
+        }
+        let end = view.offset.checked_add(view.length).ok_or_else(overflow)?;
+        let size = usize::try_from(end).map_err(|_| overflow())?;
+        shared_images
+            .entry(view.allocation_id)
+            .and_modify(|image| {
+                if image.len() < size {
+                    image.resize(size, 0);
+                }
+            })
+            .or_insert_with(|| vec![0_u8; size]);
+    }
+    for view in &pool {
+        let BufferSource::OwnedBytes(bytes) = &view.source else {
+            continue;
+        };
+        let Some(image) = shared_images.get_mut(&view.allocation_id) else {
+            continue;
+        };
+        let start = usize::try_from(view.offset).map_err(|_| overflow())?;
+        let end = start.checked_add(bytes.len()).ok_or_else(overflow)?;
+        if end > image.len() {
+            return Err(overflow());
+        }
+        image[start..end].copy_from_slice(bytes);
+    }
+    // The first view of an allocation creates its MTLBuffer and owns that
+    // reference; every sibling retains the same object explicitly, which
+    // balances the release its own wrapper performs on drop.
+    let mut shared_buffers = BTreeMap::<AllocationId, *mut metal::MTLBuffer>::new();
     let mut buffers = Vec::with_capacity(pool.len());
     for view in &pool {
         let (buffer, offset) = match resolve(view)? {
+            ResolvedBuffer::Owned(_) if shared_images.contains_key(&view.allocation_id) => unsafe {
+                let image = &shared_images[&view.allocation_id];
+                let pointer: *mut metal::MTLBuffer = match shared_buffers.get(&view.allocation_id) {
+                    Some(existing) => msg_send![*existing, retain],
+                    None => {
+                        let created: *mut metal::MTLBuffer = msg_send![state.device.as_ref(),
+                            newBufferWithBytes:image.as_ptr().cast::<std::ffi::c_void>()
+                            length:image.len() options:MTLResourceOptions::StorageModeShared];
+                        if created.is_null() {
+                            return Err(resource_error("metal_buffer_allocation_failed"));
+                        }
+                        shared_buffers.insert(view.allocation_id, created);
+                        created
+                    }
+                };
+                (Buffer::from_ptr(pointer), view.offset)
+            },
             ResolvedBuffer::Owned(bytes) => unsafe {
                 // The resolved bytes contain the view itself, not the entire
                 // logical allocation. Binding offset is zero; writebacks
