@@ -367,12 +367,22 @@ also captures committed suites through the Rust provider's own encoder: run
 
 `suite-v14.json` is v13's 2x2 `rgba8_unorm` render case plus a `present` section
 (`research/docs/24` §3.1, §6 Step 3): the render pass's own attachment is a
-provider-owned present target that starts as the `efefefef` sentinel, is
-acquired once, is rendered into, and is made readable by one explicit
+provider-owned present target that is pre-seeded with the `efefefef` sentinel,
+is acquired once, is rendered into, and is made readable by one explicit
 `COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL` transition followed by the
 same `vkCmdCopyImageToBuffer` readback every other case uses. A successful case
 reports the target through the existing `writebacks`/`allocations` shape and adds
 `"present": {"acquire": 1, "present": 1}`.
+
+What each observable proves, precisely: the case's `load: "clear"` overwrites
+the pre-seeded sentinel inside the same submission, so the target's bytes prove
+that the clear and the draw ran (the clear colour `fefefefe` differs from the
+expected texel) and the reported `acquire`/`present` counts prove that the
+present action was taken; the sentinel is not itself a surviving observable in
+this shape — it pins the target's initial state and the compare rule refuses a
+sentinel equal to the expectation. The `--present-selftest` shape uses
+`load: "load"`, where the sentinel *is* the pass's starting content and is
+therefore directly observable if the draw does not run.
 
 The marker rule is the same one §4 describes, with one extra consequence: the
 Swift oracle does not report provider counters (`research/docs/24` §5.1), so a

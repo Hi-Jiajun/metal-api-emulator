@@ -391,9 +391,13 @@ def _present_declaration(value, texel, where):
     The section is the suite's own falsifiability statement rather than a
     fixture knob: the first present increment presents one target image once,
     and the sentinel the provider pre-seeds the target with has to differ from
-    the texel the render pass is expected to leave there, so "the present never
-    happened" cannot read as a pass. A missing `initial_hex` is Undefined, which
-    pre-seeds nothing.
+    the texel the render pass is expected to leave there, so a capture whose
+    target still held its pre-seeded bytes could not be read as a pass. A
+    missing `initial_hex` is Undefined, which pre-seeds nothing. What the
+    sentinel proves depends on the pass: a `load: "clear"` case overwrites it
+    in the same submission (its falsifier is the clear colour and the reported
+    counts), while a `load: "load"` case starts from it directly — which is the
+    shape `native-oracle --present-selftest` uses.
     """
     _require(isinstance(value, dict), f"{where}.present: expected an object")
     required = ("mode", "image_count", "acquire", "present")
