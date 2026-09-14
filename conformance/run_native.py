@@ -123,6 +123,47 @@ def validate_heap_selftest(report):
     return writebacks[0]["bytes_hex"]
 
 
+def validate_vertex_selftest(report):
+    """One vertex-input self-test report is the reviewed indexed quad's
+    observation: the fixture id, one writeback naming the attachment's own view
+    (900/910) and one allocation of that view, both holding `4080c0ff` four
+    times and never the `fefefefe` sentinel the pass started from
+    (`research/docs/23` §6 Step 3.3, `conformance/RENDER-CAPTURE.md` §8).
+
+    The fixture id is part of the check rather than decoration: the streams are
+    inputs, so the attachment's bytes are the *same* four texels the plain
+    `--render-selftest` reports, and the id is the only field that says those
+    bytes were drawn through the caller-held stream and index buffer instead of
+    `vertex_id`. The CI step reuses this instead of inlining its byte
+    comparison, so the comparison is exercised by `test_run_native.py` on a host
+    without Metal.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("vertex selftest: report is not an object")
+    if report.get("id") != "vertex_quad_indexed_2x2":
+        raise NativeRunError(
+            "vertex selftest: report id " + repr(report.get("id"))
+            + " is not the reviewed indexed fixture"
+        )
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError("vertex selftest: completion is not CompletedVisible")
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    expected = "4080c0ff" * 4
+    expected_writeback = {"allocation": 900, "view": 910, "offset": 0,
+                          "bytes_hex": expected}
+    expected_allocations = [{"allocation": 900, "bytes_hex": expected}]
+    # The shape is part of the claim: the reviewed fixture reports exactly one
+    # writeback and one allocation, both the attachment. The streams do not
+    # appear in the observation because they are inputs.
+    if writebacks != [expected_writeback] or allocations != expected_allocations:
+        raise NativeRunError(
+            "vertex selftest: observations do not match the reviewed indexed quad, got "
+            + repr((writebacks, allocations))
+        )
+    return writebacks[0]["bytes_hex"]
+
+
 def run_capture(oracle, suite_path, output_dir, *, require_metal=False, revision=None,
                 run_command=subprocess.run):
     """Create a new evidence directory. A partial or failed capture cannot pass."""

@@ -277,5 +277,89 @@ class HeapSelftestValidationTests(unittest.TestCase):
             run_native.validate_heap_selftest([])
 
 
+class VertexSelftestValidationTests(unittest.TestCase):
+    """The vertex-input self-test's byte comparison, exercised without Metal.
+
+    `run_native.validate_vertex_selftest` is the function the CI step reuses, so
+    the sentinel and observation-shape rules are pinned here rather than only in
+    an inline heredoc. The fixture id is part of the claim: the indexed quad
+    writes the same four texels the plain render self-test does, so the id is
+    what separates the two observations.
+    """
+
+    TARGET = "4080c0ff" * 4
+    SENTINEL = "fefefefe" * 4
+
+    def reviewed_report(self, report_id="vertex_quad_indexed_2x2",
+                        completion="CompletedVisible", writebacks=None,
+                        allocations=None):
+        if writebacks is None:
+            writebacks = [{"allocation": 900, "view": 910, "offset": 0,
+                           "bytes_hex": self.TARGET}]
+        if allocations is None:
+            allocations = [{"allocation": 900, "bytes_hex": self.TARGET}]
+        return {"id": report_id, "completion": completion,
+                "writebacks": writebacks, "allocations": allocations}
+
+    def test_accepts_the_reviewed_indexed_quad_observation(self):
+        report = self.reviewed_report()
+        self.assertEqual(run_native.validate_vertex_selftest(report), self.TARGET)
+
+    def test_rejects_the_clear_sentinel_in_either_channel(self):
+        for writeback, allocation in (
+            (self.SENTINEL, self.TARGET),
+            (self.TARGET, self.SENTINEL),
+            (self.SENTINEL, self.SENTINEL),
+        ):
+            with self.subTest(writeback=writeback, allocation=allocation):
+                report = self.reviewed_report(
+                    writebacks=[{"allocation": 900, "view": 910, "offset": 0,
+                                 "bytes_hex": writeback}],
+                    allocations=[{"allocation": 900, "bytes_hex": allocation}])
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_vertex_selftest(report)
+
+    def test_rejects_the_plain_render_selftest_report(self):
+        # The `vertex_id` fixture reaches the same attachment bytes, so only the
+        # id distinguishes it; a report from that self-test must not pass here.
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_vertex_selftest(
+                self.reviewed_report(report_id="render_offscreen_2x2"))
+
+    def test_rejects_a_missing_or_extra_observation(self):
+        writeback = [{"allocation": 900, "view": 910, "offset": 0,
+                      "bytes_hex": self.TARGET}]
+        allocations = [{"allocation": 900, "bytes_hex": self.TARGET}]
+        for writebacks, observed in (
+            ([], []),
+            (writeback, []),
+            ([], allocations),
+            (writeback, allocations + [{"allocation": 950, "bytes_hex": self.TARGET}]),
+            (writeback + writeback, allocations),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=observed):
+                report = self.reviewed_report(writebacks=writebacks, allocations=observed)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_vertex_selftest(report)
+
+    def test_rejects_a_wrong_writeback_identity_or_offset(self):
+        for change in ({"offset": 4}, {"view": 911}, {"allocation": 901}):
+            with self.subTest(change=change):
+                writeback = [dict({"allocation": 900, "view": 910, "offset": 0,
+                                   "bytes_hex": self.TARGET}, **change)]
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_vertex_selftest(
+                        self.reviewed_report(writebacks=writeback))
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_vertex_selftest(
+                self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_vertex_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()

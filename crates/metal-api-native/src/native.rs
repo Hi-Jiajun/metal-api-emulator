@@ -214,6 +214,11 @@ impl NativeMetalProvider {
             // snapshot and the rail cannot disagree; the unit tests assert that
             // agreement against core admission on a host without Metal.
             let render_bits = render::capability_bits();
+            // The vertex-input bits come from the same rail value, for the same
+            // reason: `render::plan_vertex_input` owns the stride and index
+            // footprints, and this snapshot publishes exactly the formats and
+            // the stream count that rail translates.
+            let vertex_bits = render::vertex_input_capability_bits();
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
@@ -264,15 +269,20 @@ impl NativeMetalProvider {
                 max_color_attachments: render_bits.max_color_attachments,
                 max_attachment_dimension: render_bits.max_attachment_dimension,
                 supported_color_formats: render_bits.supported_color_formats,
-                // Vertex input is not executed on this rail yet: the reviewed
-                // module still generates positions from `vertex_id`, so the
-                // three bits stay at "cannot read a caller-held stream" and a
-                // pass that binds one is refused during core admission instead
-                // of being executed with generated positions
-                // (`research/docs/23` §3.3).
-                max_vertex_buffers: 0,
-                supported_vertex_formats: Vec::new(),
-                supported_index_formats: Vec::new(),
+                // Vertex input is executed by this rail as of the vertex-input
+                // increment: a pass that binds streams is translated into an
+                // `MTLVertexDescriptor` plus `setVertexBuffer` /
+                // `drawIndexedPrimitives` by `render.rs`, whose own plan proves
+                // every stride and index footprint on the host beforehand
+                // (`research/docs/23` §3.3). The flip condition is the
+                // `--vertex-selftest` observation recorded on
+                // `render::vertex_input_capability_bits`; before the flip these
+                // three bits were at their defaults and core admission refused
+                // such a trace instead of executing it with positions the trace
+                // did not ask for.
+                max_vertex_buffers: vertex_bits.max_vertex_buffers,
+                supported_vertex_formats: vertex_bits.supported_vertex_formats,
+                supported_index_formats: vertex_bits.supported_index_formats,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).
