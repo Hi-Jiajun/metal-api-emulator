@@ -4,7 +4,8 @@ use crate::provider::{
     BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof,
     FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
     ProviderErrorClass, ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability,
-    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace, VertexLayout,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
 
@@ -63,6 +64,7 @@ struct FakeProvider {
     wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     render: bool,
+    vertex_input: bool,
     heap: bool,
     icb: bool,
 }
@@ -84,6 +86,7 @@ impl FakeProvider {
             wait_calls: AtomicUsize::new(0),
             gate: None,
             render: false,
+            vertex_input: false,
             heap: false,
             icb: false,
         }
@@ -94,6 +97,10 @@ impl FakeProvider {
     }
     fn with_render(mut self) -> Self {
         self.render = true;
+        self
+    }
+    fn with_vertex_input(mut self) -> Self {
+        self.vertex_input = true;
         self
     }
     fn with_heap(mut self) -> Self {
@@ -141,9 +148,21 @@ impl ComputeProvider for FakeProvider {
                 .then_some(AttachmentFormat::Rgba8Unorm)
                 .into_iter()
                 .collect(),
-            max_vertex_buffers: 0,
-            supported_vertex_formats: Vec::new(),
-            supported_index_formats: Vec::new(),
+            max_vertex_buffers: if self.vertex_input {
+                MAX_VERTEX_BUFFERS as u32
+            } else {
+                0
+            },
+            supported_vertex_formats: if self.vertex_input {
+                VertexFormat::ADMITTED.to_vec()
+            } else {
+                Vec::new()
+            },
+            supported_index_formats: if self.vertex_input {
+                IndexFormat::ADMITTED.to_vec()
+            } else {
+                Vec::new()
+            },
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self
@@ -167,6 +186,7 @@ impl ComputeProvider for FakeProvider {
                 .then_some(IndirectCommandKind::Dispatch)
                 .into_iter()
                 .chain(self.icb.then_some(IndirectCommandKind::Draw))
+                .chain(self.icb.then_some(IndirectCommandKind::DrawIndexed))
                 .collect(),
         }
     }
@@ -399,6 +419,14 @@ impl PipelineProvider for FakeProvider {
             // A render case's declaring pass: one read-only view of the
             // attachment the render pass later stores into.
             vec![(0, BufferAccess::Read)]
+        } else if let Some(list) = request.entry_name.strip_prefix("read:") {
+            // A declaring pass for a render case whose draw reads more than one
+            // view (`read:0,1`): every named slot is read-only, so the pass
+            // leaves no writeback and no compute write for the draw's own
+            // read of the same bytes to conflict with.
+            list.split(',')
+                .map(|slot| (slot.parse().unwrap(), BufferAccess::Read))
+                .collect()
         } else if let Some(count) = request.entry_name.strip_prefix("wide:") {
             (0..count.parse().unwrap())
                 .map(|slot| (slot, BufferAccess::ReadWrite))
@@ -1700,7 +1728,7 @@ fn indirect_encoder_refuses_kind_mismatch_direct_conflict_and_second_buffer() {
     assert!(matches!(
         shape(&mut encoder, &draw_icb),
         Err(Error::IndirectKindMismatch {
-            expected: IndirectCommandKind::Dispatch,
+            accepted: &[IndirectCommandKind::Dispatch],
             actual: IndirectCommandKind::Draw
         })
     ));
@@ -1788,4 +1816,674 @@ fn render_draw_indirect_replays_the_attachment() {
     let payload = traces[0].indirect.as_ref().expect("indirect payload");
     assert_eq!(payload.command.kind(), IndirectCommandKind::Draw);
     assert!(traces[0].passes[1].as_render().is_some());
+}
+
+/// [`render_metadata`] with a vertex layout that binds caller-held streams, the
+/// way a pipeline compiled against `MTLVertexDescriptor` metadata names them.
+fn render_metadata_with_layout(
+    provider: &FakeProvider,
+    layout: VertexLayout,
+) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    metadata.render = Some(RenderPipelineContract {
+        vertex_entry: "vertex_main".into(),
+        fragment_entry: "fragment_main".into(),
+        color_format: AttachmentFormat::Rgba8Unorm,
+        vertex_layout: layout,
+    });
+    metadata
+}
+
+/// One vertex stream: eight bytes per vertex, one `float32x2` at offset 0.
+fn stream_layout(location: u32) -> VertexBufferLayout {
+    VertexBufferLayout {
+        stride: 8,
+        attributes: vec![VertexAttribute {
+            location,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }],
+    }
+}
+
+/// The pass-shaped view a bound draw input has to become: `metal_binding` as the
+/// pass's label, the view's own range, the contract's read-only access and the
+/// bytes the trace has to carry.
+///
+/// The expectation is stated here rather than read back from the code under
+/// test, so a pass that spells a different label, range, access or byte count
+/// fails the comparison.
+fn stream_view(view: &BufferView, metal_binding: u32, bytes: Vec<u8>) -> contract::BufferView {
+    contract::BufferView {
+        view_id: view.view_id(),
+        metal_binding,
+        allocation_id: view.allocation_id(),
+        offset: view.offset as u64,
+        length: view.length as u64,
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(bytes),
+    }
+}
+
+/// Register a render table entry with `layout` and wrap it for the encoder: the
+/// fake keeps the registration the way a rail's own context does before any
+/// command names it (`Device::render_pipeline`).
+fn render_pipeline_with_layout(
+    provider: &FakeProvider,
+    device: &Device,
+    layout: VertexLayout,
+) -> RenderPipeline {
+    let metadata = render_metadata_with_layout(provider, layout);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(metadata.pipeline_id);
+    device.render_pipeline(&metadata).unwrap()
+}
+
+#[test]
+fn render_encoder_refuses_repeated_out_of_range_and_foreign_inputs() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let (_other_provider, other_device) = setup();
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0), stream_layout(1)]),
+    );
+    let (_, stream_view) = buffer(&device, 0x11);
+    let (_, second_stream) = buffer(&device, 0x22);
+    let (_, index_view) = buffer(&device, 0x33);
+    let (_, foreign) = buffer(&other_device, 0x44);
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    // Ownership is answered first, then the binding the encoder already holds:
+    // the order a heap placement uses.
+    assert_eq!(
+        encoder.set_vertex_buffer(0, &foreign),
+        Err(Error::ForeignBuffer)
+    );
+    assert_eq!(
+        encoder.set_index_buffer(&foreign, IndexFormat::Uint32),
+        Err(Error::ForeignBuffer)
+    );
+    encoder.set_vertex_buffer(0, &stream_view).unwrap();
+    assert_eq!(
+        encoder.set_vertex_buffer(0, &second_stream),
+        Err(Error::VertexBufferAlreadyBound { index: 0 })
+    );
+    assert_eq!(
+        encoder.set_vertex_buffer(MAX_VERTEX_BUFFERS as u32, &second_stream),
+        Err(Error::VertexBufferIndexOutOfRange {
+            index: MAX_VERTEX_BUFFERS as u32,
+            maximum: MAX_VERTEX_BUFFERS,
+        })
+    );
+    // The cap is on the pass's own list, so the last admitted index is the one
+    // below it.
+    encoder
+        .set_vertex_buffer(MAX_VERTEX_BUFFERS as u32 - 1, &second_stream)
+        .unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    assert_eq!(
+        encoder.set_index_buffer(&index_view, IndexFormat::Uint32),
+        Err(Error::IndexBufferAlreadyBound)
+    );
+}
+
+#[test]
+fn direct_draws_refuse_missing_inputs_and_counts_below_the_milestone() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0)]),
+    );
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (_, stream_view) = buffer(&device, 0x11);
+    let (_, index_view) = buffer(&device, 0x22);
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    // Neither shape has the input it draws from: the vertex-buffer draw has no
+    // stream, the indexed draw no index buffer. The vertex_id-only shape is
+    // `draw_render_pass`, which binds no input at all.
+    assert_eq!(
+        encoder.draw_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::MissingVertexBuffer)
+    );
+    assert_eq!(
+        encoder.draw_indexed_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::MissingIndexBuffer)
+    );
+    encoder.set_vertex_buffer(0, &stream_view).unwrap();
+    assert_eq!(
+        encoder.draw_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES - 1,
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: FULL_SCREEN_TRIANGLE_VERTICES - 1,
+            }
+        ))
+    );
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint32)
+        .unwrap();
+    assert_eq!(
+        encoder.draw_indexed_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES - 1,
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: FULL_SCREEN_TRIANGLE_VERTICES - 1,
+            }
+        ))
+    );
+}
+
+#[test]
+fn direct_draws_refuse_a_pipeline_layout_that_disagrees_with_the_pass() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let two_streams = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0), stream_layout(1)]),
+    );
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (_, stream_view) = buffer(&device, 0x11);
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&two_streams).unwrap();
+    // The vertex_id shape binds nothing, so a pipeline whose layout binds two
+    // streams is refused when the pass is recorded: the pass the caller asked
+    // for and the pipeline it names cannot both be executed.
+    assert_eq!(
+        encoder.draw_render_pass(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers: 2,
+                pass_buffers: 0,
+            }
+        ))
+    );
+    // One bound stream against a two-stream layout is the same refusal, and it
+    // names both counts.
+    encoder.set_vertex_buffer(0, &stream_view).unwrap();
+    assert_eq!(
+        encoder.draw_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers: 2,
+                pass_buffers: 1,
+            }
+        ))
+    );
+}
+
+#[test]
+fn indexed_draw_records_the_bound_streams_in_binding_order() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    // Only the attachment needs a compute declaration: a draw input carries its
+    // own bytes, so the two streams and the index buffer never enter the pool.
+    let declaring = pipeline(&device, "read:0");
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0), stream_layout(1)]),
+    );
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (_, first_stream) = buffer(&device, 0x11);
+    let (_, second_stream) = buffer(&device, 0x22);
+    let index = device.new_buffer_with_bytes(vec![0; 12]).unwrap();
+    let index_view = index.view(0, 12).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        // Bound in the reverse order of the pipeline's layout: the pass's own
+        // binding list is positional, so the first stream still lands first.
+        encoder.set_vertex_buffer(1, &second_stream).unwrap();
+        encoder.set_vertex_buffer(0, &first_stream).unwrap();
+        encoder
+            .set_index_buffer(&index_view, IndexFormat::Uint32)
+            .unwrap();
+        encoder
+            .draw_indexed_primitives(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(
+        attachment.read().unwrap(),
+        [0x40, 0x80, 0xc0, 0xff].repeat(4)
+    );
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(
+        traces[0].passes[0]
+            .as_compute()
+            .expect("the declaring compute pass")
+            .buffers
+            .iter()
+            .map(|view| view.view_id)
+            .collect::<Vec<_>>(),
+        vec![attachment_view.view_id()],
+        "only the attachment is declared: a draw input carries its own bytes"
+    );
+    let pass = traces[0]
+        .render_passes()
+        .next()
+        .expect("the indexed pass reached the trace");
+    assert_eq!(
+        pass.vertices, FULL_SCREEN_TRIANGLE_VERTICES,
+        "an indexed draw's `vertices` is its index count"
+    );
+    assert_eq!(
+        pass.vertex_buffers,
+        vec![
+            stream_view(&first_stream, 0, vec![0x11; 4]),
+            stream_view(&second_stream, 1, vec![0x22; 4]),
+        ],
+        "entry i is binding i, whatever order the caller bound them in, and the \
+         pass carries each stream's own bytes"
+    );
+    assert_eq!(
+        pass.indices,
+        Some(IndexBufferBinding {
+            view: stream_view(&index_view, 0, vec![0; 12]),
+            format: IndexFormat::Uint32,
+        })
+    );
+}
+
+#[test]
+fn indexed_draw_without_streams_keeps_the_vertex_id_shape() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    // The index buffer needs no declaration of its own: the pass carries its
+    // bytes, so the compute pass only has to bring the attachment in.
+    let declaring = pipeline(&device, "read:0");
+    let render = render_pipeline_with_layout(&provider, &device, VertexLayout::None);
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let index = device.new_buffer_with_bytes(vec![0; 12]).unwrap();
+    let index_view = index.view(0, 12).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .set_index_buffer(&index_view, IndexFormat::Uint32)
+            .unwrap();
+        encoder
+            .draw_indexed_primitives(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(
+        attachment.read().unwrap(),
+        [0x40, 0x80, 0xc0, 0xff].repeat(4)
+    );
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let pass = traces[0]
+        .render_passes()
+        .next()
+        .expect("the index-only pass reached the trace");
+    assert!(
+        pass.vertex_buffers.is_empty(),
+        "an index-only draw selects through vertex_id"
+    );
+    assert_eq!(
+        pass.indices,
+        Some(IndexBufferBinding {
+            view: stream_view(&index_view, 0, vec![0; 12]),
+            format: IndexFormat::Uint32,
+        })
+    );
+}
+
+#[test]
+fn a_stream_bound_at_a_skipped_index_has_no_position_to_land_at() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0)]),
+    );
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    // Binding index 1 alone leaves no view for entry 0 of the pass's positional
+    // list, so the draw is refused rather than drawing stream 1's bytes at
+    // binding 0 — the position is the binding, and the contract holds the entry
+    // to the label the view carries.
+    encoder.set_vertex_buffer(1, &stream).unwrap();
+    assert_eq!(
+        encoder.draw_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            [0xfe; 4],
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::VertexBufferBindingMismatch {
+                index: 0,
+                metal_binding: 1,
+            }
+        ))
+    );
+}
+
+#[test]
+fn draw_inputs_carry_the_bytes_the_command_commits_with() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0");
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0)]),
+    );
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (stream, bound_view) = buffer(&device, 0x11);
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_vertex_buffer(0, &bound_view).unwrap();
+        encoder
+            .draw_primitives(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    // A draw input is not a copy taken while recording: the bytes the command
+    // commits with are the ones the trace uploads, the same boundary a compute
+    // binding's bytes are taken at.
+    stream.write(2, &[0x33; 4]).unwrap();
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let pass = traces[0]
+        .render_passes()
+        .next()
+        .expect("the stream draw reached the trace");
+    assert_eq!(
+        pass.vertex_buffers,
+        vec![stream_view(&bound_view, 0, vec![0x33; 4])],
+        "the pass carries the bytes the command committed with"
+    );
+}
+
+#[test]
+fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
+    let provider = Arc::new(
+        FakeProvider::new()
+            .with_render()
+            .with_icb()
+            .with_vertex_input(),
+    );
+    let device = Device::new(provider.clone());
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let (_, stream_view) = buffer(&device, 0x11);
+    let indexed_icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::DrawIndexed,
+            1,
+            vec![IndirectCommandKind::DrawIndexed],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::DrawIndexed {
+                index_count: 3,
+                instance_count: 1,
+            },
+        )
+        .unwrap();
+    let dispatch_icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::Dispatch,
+            1,
+            vec![IndirectCommandKind::Dispatch],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::Dispatch {
+                threadgroups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+
+    // A render encoder still refuses a dispatch command, and the refusal names
+    // the whole accepted set rather than one member of it.
+    let probe = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = probe.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        let error = encoder
+            .draw_indirect(
+                &dispatch_icb,
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            Error::IndirectKindMismatch {
+                accepted: &[IndirectCommandKind::Draw, IndirectCommandKind::DrawIndexed],
+                actual: IndirectCommandKind::Dispatch,
+            }
+        );
+        assert!(
+            error.to_string().contains("DrawIndexed"),
+            "the refusal spells the accepted set: {error}"
+        );
+        // A stream bound for a direct draw cannot also be replayed: the ICB
+        // supplies the draw's own input.
+        encoder.set_vertex_buffer(0, &stream_view).unwrap();
+        assert_eq!(
+            encoder.draw_indirect(
+                &indexed_icb,
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                None,
+            ),
+            Err(Error::IndirectReplayInputConflict {
+                vertex_buffers: 1,
+                index_buffer: false,
+            })
+        );
+    }
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .draw_indirect(
+                &indexed_icb,
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(
+        attachment.read().unwrap(),
+        [0x40, 0x80, 0xc0, 0xff].repeat(4)
+    );
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(
+        traces.len(),
+        1,
+        "the refused probe never reached a provider"
+    );
+    let payload = traces[0].indirect.as_ref().expect("indirect payload");
+    assert_eq!(payload.command.kind(), IndirectCommandKind::DrawIndexed);
+    let pass = traces[0]
+        .render_passes()
+        .next()
+        .expect("the replayed pass reached the trace");
+    assert_eq!(pass.vertices, 3, "the ICB's own index count");
+    assert!(
+        pass.vertex_buffers.is_empty() && pass.indices.is_none(),
+        "the replay reads its input from the ICB payload, not from the pass"
+    );
 }
