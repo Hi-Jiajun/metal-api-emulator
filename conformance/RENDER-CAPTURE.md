@@ -136,7 +136,7 @@ Field by field, against the core values the rail builds:
 | `attachment.allocation` / `.view` | `RenderAttachment::allocation_id` / `view_id` | nonzero; must be declared by `declaring_case` |
 | `attachment.format` | `RenderAttachment::format` | `rgba8_unorm` only |
 | `attachment.width` / `.height` | `RenderAttachment::width` / `height` | `2` x `2` only |
-| `attachment.load` + `clear_hex` | `LoadOp::Clear(ClearColor)` | four bytes in memory order, different from the expected texel; `load: "load"` with `initial_hex` covering the whole attachment is admitted by the schema but refused by the Vulkan rail, which has no upload path yet |
+| `attachment.load` + `clear_hex` | `LoadOp::Clear(ClearColor)` | four bytes in memory order, different from the expected texel; `load: "load"` with `initial_hex` covering the whole attachment is admitted and uploaded into the attachment before the pass opens (§9) |
 | `attachment.store` | `StoreOp::Store` | `store` only; a discarded attachment could not be compared |
 | `vertices` / `viewport` | `RenderPassDescriptor::vertices` / `viewport` | three vertices and a viewport covering the attachment, or six *indices* for the indexed shape below |
 | `vertex_layout` | `RenderPipelineContract::vertex_layout` | optional; when present it has to equal the reviewed indexed layout: one stream, stride 8, one `float32x2` attribute at location 0, offset 0 |
@@ -390,7 +390,8 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 
 * the rail's plan: the reviewed (source, entry pair) allowlist, the format
   mapping, the extent cap, the viewport and draw shape, the load/store mapping,
-  the `LoadOp::Load` agreement, the readback extent and row pitch;
+  the previous bytes a loading pass resolves from its declaring view
+  (`render::previous_bytes`, §9), the readback extent and row pitch;
 * the clear-value decoding per format, including the B/G/R/A memory order of
   `bgra8_unorm` and the single-channel float format;
 * the vertex-input plan (`render::plan_vertex_input`): the stream identity rule
@@ -418,9 +419,10 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   `icb_command_unsupported` before any Metal object exists;
 * that the rail's refusal slugs and classes are the ones core admission uses,
   including the trace path's own refusals (`attachment_load_op_unsupported` for
-  a `Load` the trace cannot carry, `render_attachment_landing_unsupported` for
-  an attachment no declared view covers, `render_pass_order_unsupported` for a
-  compute pass that would read after a render store);
+  a loading pass whose declaring view owns no bytes, §9,
+  `render_attachment_landing_unsupported` for an attachment no declared view
+  covers, `render_pass_order_unsupported` for a compute pass that would read
+  after a render store);
 * the trace path's device-free plan (`render::plan_trace`) and writeback merge
   (`render::merge_writebacks`): the planned extent and readback length, the
   attachment's landing view, the canonical one-writeback-per-view order, and
@@ -459,8 +461,8 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
 
 * that `MTLRenderPipelineState` creation succeeds for the reviewed pair and
   `rgba8Unorm` attachment 0;
-* that `loadAction = .clear` (and `.load` with `replace_region`-uploaded
-  texels) behaves as the contract's `LoadOp` means;
+* that `loadAction = .clear` (and `.load` with the `replaceRegion`-uploaded
+  previous bytes of §9) behaves as the contract's `LoadOp` means;
 * the readback bytes: that all four texels are `40 80 c0 ff`;
 * that `getBytes` on a `usage = .renderTarget`, `storageMode = .shared` 2x2
   texture returns the tightly packed rows this report assumes;
@@ -622,3 +624,57 @@ the six indices, and that the readback is the fragment's texel rather than the
 clear sentinel. Until the CI job that runs it is green, that half is a
 condition, not an observation: the host half above is what `cargo test -p
 metal-api-native` and the `aarch64-apple-darwin` cross-check cover today.
+
+## 9. The load milestone (`LoadOp::Load` offscreen)
+
+The first render increments admitted `load: "load"` through the schema but had
+no rail that could execute it offscreen: the render pass restates the
+attachment's identity and shape and carries no contents, so a `Load` executed
+before this increment would have had to become a clear. The load increment gives
+that load op a source: the declaring case's view — the same view that is already
+the attachment's landing for the writeback — names the attachment's previous
+bytes, and the bytes that view owns (`BufferSource::OwnedBytes`) are uploaded
+into the attachment before the pass opens (`research/docs/23` §3.3).
+
+What each rail does with those bytes:
+
+* the Vulkan rail stages them through a host-visible buffer and
+  `vkCmdCopyBufferToImage` (`UNDEFINED -> TRANSFER_DST_OPTIMAL`), then hands the
+  image to the render pass as `COLOR_ATTACHMENT_OPTIMAL` with `LOAD_OP_LOAD`;
+  the image declares `TRANSFER_DST` usage exactly when a load uploads;
+* the native rail presets the attachment with `MTLTexture.replaceRegion`
+  (`render::upload_texels`) and opens the render pass with `MTLLoadAction.Load`;
+  `render::plan_trace` resolves the bytes at plan time and `RenderPlan::initial`
+  carries them to the encoder.
+
+The judgement conditions, all host-side:
+
+* `render::plan_trace` resolves previous bytes exactly for an offscreen `Load`,
+  and from the *declaring view*: the trace's serial pool is the only channel
+  that carries them, and the plan re-checks their length against the attachment
+  (`width * height * bytes_per_texel`, the tightly packed extent). A wrong
+  length is `render_attachment_initial_mismatch`;
+* a loading pass whose declaring view owns no bytes — `StagedLease` or
+  `BorrowedNoCopy` — is refused with `attachment_load_op_unsupported`
+  (Capability, Resolve), naming the storage mode, rather than executed as a
+  clear. An attachment that no view covers at all stays
+  `render_attachment_landing_unsupported`: the landing rail and the previous
+  bytes are the same declaration;
+* a `Clear` pass resolves no previous bytes, and `plan` still refuses initial
+  bytes a clear would overwrite;
+* a present pass's `Load` resolves no bytes either: it keeps the present
+  target's own initial state (`InitialState::Sentinel` or `Undefined`), which is
+  the shape §7's `--present-selftest` exercises (`research/docs/24` §3.1).
+
+Evidence. On Lavapipe, `crates/metal-api-vulkan/tests/render_e2e.rs` runs
+`a_loading_pass_keeps_the_bytes_the_draw_does_not_cover`: a quadrant-sized
+triangle covers exactly one of four texels, the other three read back the
+declaring view's bytes, and the same fixture with `LOAD_OP_CLEAR` reads back the
+clear sentinel. On the native side the plan half above is what
+`cargo test -p metal-api-native` covers; the encoder half —
+`replaceRegion` followed by `MTLLoadAction.Load` — is the same `.load` branch
+the oracle's `--present-selftest` already exercises on Apple hardware, and an
+offscreen loading capture of its own has not been run there yet. That is the
+half the increment still owes: the Rust provider executes an offscreen loading
+pass end to end once a trace declares `Load` with a view whose bytes it owns,
+but no committed suite or self-test captures that shape on an Apple GPU today.

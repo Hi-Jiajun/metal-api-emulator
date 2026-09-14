@@ -1036,23 +1036,33 @@ pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), P
     Ok(())
 }
 
-/// The load op the trace path can honour.
+/// The previous bytes an offscreen `LoadOp::Load` pass uploads before it opens.
 ///
-/// The rail itself executes `LoadOp::Load` when it is handed the attachment's
-/// previous texels, and the tests below exercise that. `ComputeTrace` has no
-/// channel that carries those bytes: [`metal_api_core::provider::RenderAttachment`]
-/// restates the attachment's shape and names no contents, so a trace asking for
-/// `Load` would have to be executed as a clear. The refusal reuses the slug,
-/// class and phase this rail and the Vulkan rail give an unexecutable load op.
-pub(crate) fn admit_trace_load(load: LoadOp) -> Result<(), ProviderError> {
-    match load {
-        LoadOp::Load => Err(capability_refusal("attachment_load_op_unsupported")
+/// The declaring case's view is the only channel that carries an attachment's
+/// previous contents: [`metal_api_core::provider::RenderAttachment`] restates
+/// the view's identity and shape and names no bytes, so a `Load` resolves them
+/// from what the declaration itself owns ([`BufferSource::OwnedBytes`])
+/// (`research/docs/23` §3.3). A lease-backed declaration carries bytes this rail
+/// does not hold, and the refusal reuses the slug, class and phase this rail and
+/// the Vulkan rail give an unexecutable load op
+/// (`crates/metal-api-vulkan/src/compute_provider.rs`, the `loading` branch).
+pub(crate) fn previous_bytes(
+    load: LoadOp,
+    view: &BufferView,
+) -> Result<Option<&[u8]>, ProviderError> {
+    match (load, &view.source) {
+        (LoadOp::Load, BufferSource::OwnedBytes(bytes)) => Ok(Some(bytes.as_slice())),
+        (LoadOp::Load, other) => Err(capability_refusal("attachment_load_op_unsupported")
             .with_field("load_op", FieldValue::Text("load".to_owned()))
+            .with_field(
+                "storage_mode",
+                FieldValue::Text(storage_mode_name(other).to_owned()),
+            )
             .with_detail(
-                "the trace carries no attachment-initial-bytes channel, so an executed \
-                 `Load` would silently become a clear",
+                "the first `LoadOp::Load` increment uploads the bytes the declaring view \
+                 owns; a leased declaration has no path through this rail",
             )),
-        _ => Ok(()),
+        (LoadOp::Clear(_) | LoadOp::DontCare, _) => Ok(None),
     }
 }
 
@@ -1249,14 +1259,14 @@ impl TraceRenderPlan<'_> {
 /// of them are answerable from values: the order the rails run in
 /// ([`refuse_reordered_render_reads`], whose rule core admission also states as
 /// part of the contract), the reviewed allowlist, the attachment's landing view,
-/// and the load op the trace can carry
-/// ([`admit_trace_load`]). `pool` is [`ComputeTrace::serial_resources`], the same
-/// pool the encoder binds, and `contracts` holds the render contracts the
-/// provider registered for the pipeline ids this trace names — a caller-supplied
-/// table entry is checked against those registrations in `native.rs`, where the
-/// registry lives. The pool's only job here is the attachment's landing view: a
-/// render input carries its own bytes, so the streams a draw reads are resolved
-/// from the pass itself ([`plan_vertex_input`]).
+/// and the previous bytes a loading pass uploads ([`previous_bytes`]). `pool` is
+/// [`ComputeTrace::serial_resources`], the same pool the encoder binds, and
+/// `contracts` holds the render contracts the provider registered for the
+/// pipeline ids this trace names — a caller-supplied table entry is checked
+/// against those registrations in `native.rs`, where the registry lives. The
+/// pool's only job here is the attachment's landing view: a render input carries
+/// its own bytes, so the streams a draw reads are resolved from the pass itself
+/// ([`plan_vertex_input`]).
 pub(crate) fn plan_trace<'a>(
     trace: &'a ComputeTrace,
     pool: &'a [BufferView],
@@ -1291,16 +1301,11 @@ pub(crate) fn plan_trace<'a>(
         let Some(attachment) = pass.color_attachments.first() else {
             return Err(contract_refusal(ContractError::EmptyAttachmentList));
         };
-        // An offscreen pass has no channel for previous contents, so a `Load`
-        // would silently become a clear. A present pass's `Load` keeps the
-        // target's initial state, which the present path supplies, so it is
-        // refused only when the pass does not present (`research/docs/24` §3.1).
-        if pass.present.is_none() {
-            admit_trace_load(attachment.load)?;
-        }
         // An attachment that no buffer view covers has no landing rail: the
         // texels would have nowhere to go, so the pass is refused instead of
-        // being executed and dropped.
+        // being executed and dropped. The declared view is resolved before the
+        // load op because a loading pass reads its previous bytes from the same
+        // declaration (`research/docs/23` §3.3).
         let landing = pool
             .iter()
             .find(|view| {
@@ -1318,11 +1323,20 @@ pub(crate) fn plan_trace<'a>(
                          and this trace declares no buffer view covering the attachment",
                     )
             })?;
+        // An offscreen `Load` uploads the bytes the declaring view owns before
+        // the pass opens. A present pass's `Load` keeps the target's own initial
+        // state, which the present path supplies, so it resolves no bytes
+        // (`research/docs/24` §3.1).
+        let previous = if pass.present.is_none() {
+            previous_bytes(attachment.load, landing)?
+        } else {
+            None
+        };
         let plan_of_pass = plan(&OffscreenRenderRequest {
             pass,
             pipeline: contract,
             source: reviewed_module(&contract.vertex_layout).source,
-            initial: None,
+            initial: previous,
             present: pass.present.is_some(),
         })?;
         let present = pass.present.as_ref().map(|descriptor| {
@@ -2871,16 +2885,51 @@ mod tests {
             .is_empty());
     }
 
-    /// `LoadOp::Load` is the one load op the trace cannot carry, and it is
-    /// refused before the pass is planned rather than executed as a clear.
+    /// A loading pass uploads the bytes its declaring view owns: the plan keeps
+    /// `Load` as the load action and carries those bytes, which is what the
+    /// encoder presets into the attachment instead of clearing it
+    /// (`research/docs/23` §3.3).
     #[test]
-    fn plan_trace_refuses_a_load_op_the_trace_cannot_carry() {
+    fn plan_trace_plans_a_loading_pass_and_its_previous_bytes() {
         let (trace, _) = milestone_trace(LoadOp::Load);
         let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("the declaring view's own bytes are what a load uploads");
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        assert_eq!(planned.plan.load, RenderLoadAction::Load);
+        // The declaration's 16-byte range is the tightly packed 2x2 rgba8
+        // texels, so the plan carries exactly those bytes.
+        assert_eq!(planned.plan.initial, Some([0xfe; 16].as_slice()));
+    }
+
+    /// A lease-backed declaration carries bytes this rail does not hold, so a
+    /// loading pass is refused by name rather than executed as a clear.
+    #[test]
+    fn plan_trace_refuses_a_leased_attachment_load() {
+        let (trace, _) = milestone_trace(LoadOp::Load);
+        let mut pool = trace.serial_resources().expect("admitted serial pool");
+        let view = pool
+            .iter_mut()
+            .find(|view| {
+                view.view_id == ViewId::new(7) && view.allocation_id == AllocationId::new(9)
+            })
+            .expect("the milestone trace declares the attachment view");
+        view.source = BufferSource::StagedLease(LeaseId::new(5));
         let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
         assert_eq!(error.slug, "attachment_load_op_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("load_op"),
+            Some(&FieldValue::Text("load".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
     }
 
     /// The landing rail is the writeback channel: an attachment no declared view
@@ -2903,6 +2952,17 @@ mod tests {
             Some(&FieldValue::Unsigned(8)),
             "the refusal names the attachment that has no landing rail"
         );
+
+        // A loading pass needs the declaration twice over — as its landing and
+        // as the source of the bytes it uploads — so an undeclared attachment
+        // is refused under the same slug rather than planned without bytes.
+        let (mut loading, _) = milestone_trace(LoadOp::Load);
+        let Some(TracePass::Render(pass)) = loading.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.color_attachments[0].view_id = ViewId::new(8);
+        let error = plan_trace(&loading, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_landing_unsupported");
     }
 
     /// The ordering rule the trace path shares with the Vulkan rail: every
