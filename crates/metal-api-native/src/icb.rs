@@ -94,6 +94,21 @@ pub(crate) struct IcbPlan {
     pub(crate) range: IndirectCommandRange,
 }
 
+impl IcbPlan {
+    /// The observation a successful replay publishes: one command, the plan's
+    /// kind and the plan's replay range (`research/docs/25` §5.1). All three
+    /// publish sites (sync, async render-bearing, async compute-only) derive
+    /// the record from this one shape so none of them can drift.
+    pub(crate) fn observation(&self) -> IcbReplayObservation {
+        IcbReplayObservation {
+            kind: self.command.kind(),
+            start: self.range.start,
+            count: self.range.count,
+            commands: 1,
+        }
+    }
+}
+
 /// Map a trace's indirect payload onto one replayed command and record the
 /// rules the first increment can honour (`research/docs/25` §6 Step 7b).
 ///
@@ -108,6 +123,11 @@ pub(crate) fn plan_replay(trace: &ComputeTrace) -> Result<Option<IcbPlan>, Provi
     };
     let plan = match indirect.command {
         IndirectCommandDescriptor::Dispatch { threadgroups } => {
+            if trace.has_render_passes() {
+                return Err(icb_refusal(
+                    "an indirect dispatch replays a compute pass, not a render pass",
+                ));
+            }
             let mut passes = trace.compute_passes();
             let pass = passes.next().ok_or_else(|| {
                 icb_refusal("an indirect dispatch replays exactly one compute pass")
@@ -145,6 +165,11 @@ pub(crate) fn plan_replay(trace: &ComputeTrace) -> Result<Option<IcbPlan>, Provi
             vertex_count,
             instance_count,
         } => {
+            if trace.compute_passes().next().is_some() {
+                return Err(icb_refusal(
+                    "an indirect draw replays a render pass, not a compute pass",
+                ));
+            }
             let mut passes = trace.render_passes();
             let pass = passes
                 .next()
@@ -446,6 +471,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_replay_refuses_a_render_pass() {
+        let trace = trace_with(
+            vec![compute_pass([1, 1, 1], [1, 1, 1]), render_pass()],
+            Some(dispatch_payload([1, 1, 1])),
+        );
+        let error = plan_replay(&trace).unwrap_err();
+        assert_eq!(error.slug, "icb_command_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+    }
+
+    #[test]
+    fn compute_only_dispatch_publishes_the_expected_replay_observation() {
+        // The async compute-only submission cannot run on a host without a
+        // Metal device, so this pins the pure half: the exact observation the
+        // completion handler publishes once the command buffer completes.
+        let trace = trace_with(
+            vec![compute_pass([2, 3, 4], [1, 1, 1])],
+            Some(dispatch_payload([2, 3, 4])),
+        );
+        let plan = plan_replay(&trace)
+            .unwrap()
+            .expect("dispatch payload plans");
+        assert_eq!(
+            plan.observation(),
+            IcbReplayObservation {
+                kind: IndirectCommandKind::Dispatch,
+                start: 0,
+                count: 1,
+                commands: 1,
+            }
+        );
+    }
+
+    #[test]
     fn draw_replay_accepts_one_render_pass() {
         let trace = trace_with(vec![render_pass()], Some(draw_payload()));
         let plan = plan_replay(&trace).unwrap().expect("draw payload plans");
@@ -464,6 +523,17 @@ mod tests {
         let trace = trace_with(vec![render_pass(), render_pass()], Some(draw_payload()));
         let error = plan_replay(&trace).unwrap_err();
         assert_eq!(error.slug, "icb_command_unsupported");
+    }
+
+    #[test]
+    fn draw_replay_refuses_a_compute_pass() {
+        let trace = trace_with(
+            vec![compute_pass([1, 1, 1], [1, 1, 1]), render_pass()],
+            Some(draw_payload()),
+        );
+        let error = plan_replay(&trace).unwrap_err();
+        assert_eq!(error.slug, "icb_command_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
     }
 
     #[test]

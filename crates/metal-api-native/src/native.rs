@@ -1440,12 +1440,7 @@ impl NativeMetalProvider {
             self.publish_heap_observations(observations);
         }
         if let Some(plan) = &icb_replay {
-            self.publish_icb_observation(
-                plan.command.kind(),
-                plan.range.start,
-                plan.range.count,
-                1,
-            );
+            self.publish_icb_observation(plan.observation());
         }
         Ok(submission)
     }
@@ -1547,24 +1542,13 @@ impl NativeMetalProvider {
 
     /// Record one indirect replay, replacing whatever the previous submission
     /// left behind (the same bounded shape the heap observation uses).
-    fn publish_icb_observation(
-        &self,
-        kind: IndirectCommandKind,
-        start: u32,
-        count: u32,
-        commands: u32,
-    ) {
+    fn publish_icb_observation(&self, observation: icb::IcbReplayObservation) {
         let mut observations = self
             .icb_observations
             .lock()
             .expect("icb observation lock poisoned");
         observations.clear();
-        observations.push(icb::IcbReplayObservation {
-            kind,
-            start,
-            count,
-            commands,
-        });
+        observations.push(observation);
     }
 
     /// Staged lease registry owned by this provider.
@@ -1916,12 +1900,7 @@ impl NativeMetalProvider {
                 self.publish_heap_observations(observations.clone());
             }
             if let Some(plan) = &icb_replay {
-                self.publish_icb_observation(
-                    plan.command.kind(),
-                    plan.range.start,
-                    plan.range.count,
-                    1,
-                );
+                self.publish_icb_observation(plan.observation());
             }
             return Ok(ProviderSubmission {
                 completion: CompletionDisposition::Submitted { token },
@@ -1955,6 +1934,7 @@ impl NativeMetalProvider {
         let outbox = self.completion_outbox.clone();
         let counters = Arc::clone(&self.counters);
         let heap_observations_arc = Arc::clone(&self.heap_observations);
+        let icb_observations_arc = Arc::clone(&self.icb_observations);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -2007,6 +1987,13 @@ impl NativeMetalProvider {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                             observations.clone();
+                    }
+                    if let Some(plan) = &icb_replay {
+                        let mut observations = icb_observations_arc
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        observations.clear();
+                        observations.push(plan.observation());
                     }
                     record.complete(writebacks)
                 }
