@@ -356,18 +356,18 @@ class ShippedSuitePlanTests(unittest.TestCase):
 
     def test_shipped_plans_are_pinned(self):
         paths = sorted(CONFORMANCE.glob("suite*.json"))
-        # One suite with a render plan (v13), the committed v14, v15 and v16
+        # One suite with a render plan (v13), the committed v14 and v15
         # fixtures, and the twelve suites that carry no render case at all.
-        # v16's plan is pinned by `test_suite_v16.py`, which owns the
-        # vertex-input section this file predates.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 15)
+        # v16's and v17's plans are pinned by their own test modules, which own
+        # the sections this file predates.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 16)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
             signature = plan_signature(compare._render_plan(compare._suite_plan(suite), suite))
             expected = PINNED_PLANS.get(suite["suite"])
             if expected is None:
-                if suite["suite"] == "compute-buffer-v16":
+                if suite["suite"] in ("compute-buffer-v16", "compute-buffer-v17"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

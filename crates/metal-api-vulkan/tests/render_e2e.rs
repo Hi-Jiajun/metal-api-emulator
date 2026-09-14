@@ -1066,8 +1066,6 @@ fn collapsed_vertex_bytes() -> Vec<u8> {
     bytes
 }
 
-/// Two `uint16` triangles over the four corners: `0,1,2` and `1,3,2`.
-
 /// The reviewed stream's four vertices moved into the top-left quadrant:
 /// `(-1,-1) (0,-1) (-1,0) (0,0)`. With the six reviewed indices the two
 /// triangles cover exactly one pixel centre of a 2x2 attachment, which leaves
@@ -1083,6 +1081,7 @@ fn quadrant_vertex_bytes() -> Vec<u8> {
     bytes
 }
 fn quad_index_bytes() -> Vec<u8> {
+    // Two `uint16` triangles over the four corners: `0,1,2` and `1,3,2`.
     let mut bytes = Vec::with_capacity(12);
     for index in [0_u16, 1, 2, 1, 3, 2] {
         bytes.extend_from_slice(&index.to_ne_bytes());

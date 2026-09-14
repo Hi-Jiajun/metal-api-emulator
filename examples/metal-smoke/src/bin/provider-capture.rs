@@ -1808,6 +1808,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v14") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v15") => &["heap_placement_copy_word", "icb_dispatch_copy_word"],
         (1, "compute-buffer-v16") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v17") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2222,15 +2223,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     if texels.len() != extent {
         return Err(format!("{where_}: expected texel bytes do not match the attachment").into());
     }
-    let texel = &texels[..4];
-    if texels.chunks_exact(4).any(|chunk| chunk != texel) {
-        return Err(format!(
-            "{where_}: every texel of the expectation has to be the fragment output"
-        )
-        .into());
-    }
+    // The uniform-expectation rule belongs to the clearing shape: a `Load` case
+    // deliberately mixes the fragment output with the bytes the load handed it
+    // (`research/docs/23` §3.3).
+    let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
     match attachment.load.as_str() {
         "clear" => {
+            if !uniform_texel {
+                return Err(format!(
+                    "{where_}: every texel of a cleared attachment has to be the fragment output"
+                )
+                .into());
+            }
+            let texel = &texels[..4];
             let clear = unhex(
                 attachment
                     .clear_hex
@@ -2264,13 +2269,59 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             if initial == texels {
                 return Err(format!("{where_}: the initial texels equal the expectation").into());
             }
-            // The rail has no attachment upload path in this increment: core
-            // refuses `LoadOp::Load` at admission (`render_load_unsupported`),
-            // so a case that asks for it cannot be reported honestly.
-            return Err(format!(
-                "{where_}: the Vulkan rail has no attachment upload path for LoadOp::Load yet"
-            )
-            .into());
+            // A loading pass uploads the declaring view's own bytes
+            // (`research/docs/23` §3.3), so the case's `initial_hex` has to be
+            // exactly what that case declares: a trace whose declaration and
+            // expectation disagree would report bytes the rail never held.
+            let declared = suite
+                .cases
+                .iter()
+                .find(|declared| declared.id == case.declaring_case)
+                .and_then(|declared| {
+                    declared.buffers.iter().find(|buffer| {
+                        buffer.allocation == attachment.allocation && buffer.view == attachment.view
+                    })
+                })
+                .ok_or(format!(
+                    "{where_}: the declaring case does not carry the attachment view"
+                ))?;
+            if unhex(&declared.initial_hex)? != initial {
+                return Err(format!(
+                    "{where_}: the declared view's bytes are not the attachment's initial texels"
+                )
+                .into());
+            }
+            // Partial coverage, in both directions: every texel is either the
+            // byte the load handed it or the pass's fragment output, every
+            // drawn texel carries the *same* output, and both halves appear.
+            let mut drawn: Option<&[u8]> = None;
+            let mut drawn_count = 0_usize;
+            let mut kept_count = 0_usize;
+            for (position, texel) in texels.chunks_exact(4).enumerate() {
+                let previous = &initial[position * 4..position * 4 + 4];
+                if texel == previous {
+                    kept_count += 1;
+                    continue;
+                }
+                match drawn {
+                    None => drawn = Some(texel),
+                    Some(value) if value == texel => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "{where_}: drawn texels disagree about the fragment output"
+                        )
+                        .into())
+                    }
+                }
+                drawn_count += 1;
+            }
+            if drawn_count == 0 || kept_count == 0 {
+                return Err(format!(
+                    "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
+                     got {drawn_count} drawn and {kept_count} kept"
+                )
+                .into());
+            }
         }
         other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
     }
@@ -3423,12 +3474,23 @@ fn run_render_case(
     // carry their bytes, so the declaring case needs no extra binding and the
     // reviewed-shape validation already pinned what the draw reads.
     let (vertex_buffers, indices) = render_inputs(case, &format!("render case {}", case.id))?;
-    let clear = unhex(
-        attachment
-            .clear_hex
-            .as_deref()
-            .ok_or("a clear attachment needs clear_hex")?,
-    )?;
+    // A clearing pass carries its colour; a loading pass carries nothing and
+    // uploads the declaring view's own bytes (`research/docs/23` §3.3), so the
+    // descriptor's load operation is the fixture's own choice.
+    let load = match attachment.load.as_str() {
+        "clear" => LoadOp::Clear(ClearColor::new(
+            unhex(
+                attachment
+                    .clear_hex
+                    .as_deref()
+                    .ok_or("a clear attachment needs clear_hex")?,
+            )?
+            .try_into()
+            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+        )),
+        "load" => LoadOp::Load,
+        other => return Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
+    };
     let present = match &case.present {
         Some(definition) => Some(PresentDescriptor {
             target: PresentTarget {
@@ -3458,11 +3520,7 @@ fn run_render_case(
             format: AttachmentFormat::Rgba8Unorm,
             width: attachment.width,
             height: attachment.height,
-            load: LoadOp::Clear(ClearColor::new(
-                clear
-                    .try_into()
-                    .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
-            )),
+            load,
             store: StoreOp::Store,
         }],
         viewport: [

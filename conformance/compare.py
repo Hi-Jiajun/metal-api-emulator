@@ -761,14 +761,17 @@ def _render_plan(plan, suite):
         _require(len(expected) == width * height * 4,
                  f"{where}: expected texel bytes do not match the attachment")
         texel = expected[:4]
-        # Full coverage is the milestone's whole point (`research/docs/23` §1.3):
-        # an expectation that admits different texels could be satisfied by a
-        # partially covered attachment.
-        _require(all(expected[offset:offset + 4] == texel
-                     for offset in range(0, len(expected), 4)),
-                 f"{where}: every texel of the expectation has to be the fragment output")
+        texels = [expected[offset:offset + 4] for offset in range(0, len(expected), 4)]
+        # Clearing and loading agree about what a drawn texel is — one fragment
+        # output, repeated — and disagree about the rest: a cleared attachment
+        # has no previous bytes to compare against (`research/docs/23` §1.3),
+        # while a loaded one is expected to keep them where the draw missed
+        # (§3.3). The classification below is the loading rule; the clearing
+        # arm keeps the milestone's stricter one.
         load = attachment.get("load")
         if load == "clear":
+            _require(all(chunk == texel for chunk in texels),
+                     f"{where}: every texel of the expectation has to be the fragment output")
             clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
             _require(len(clear) == 4, f"{where}: a clear colour is four bytes")
             _require("initial_hex" not in attachment,
@@ -782,6 +785,26 @@ def _render_plan(plan, suite):
                      f"{where}: the initial texels equal the expectation")
             _require("clear_hex" not in attachment,
                      f"{where}: a loaded attachment carries no clear colour")
+            # The loading pass uploads the declaring case's own bytes, so the
+            # case's `initial_hex` has to be exactly what that case declares.
+            declaring_buffers = by_id[declaring]["buffers"]
+            declared_bytes = [buffer for buffer in declaring_buffers
+                              if buffer["allocation"] == allocation and buffer["view"] == view]
+            _require(len(declared_bytes) == 1,
+                     f"{where}: the declaring case has to declare exactly the attachment view")
+            _require(declared_bytes[0].get("initial_hex") == attachment.get("initial_hex"),
+                     f"{where}: the declared view's bytes are not the attachment's initial texels")
+            # Partial coverage, both directions: every texel is either the
+            # fragment output or the byte the load handed it, every drawn texel
+            # carries the same output, and both halves appear.
+            drawn = {chunk for position, chunk in enumerate(texels)
+                     if chunk != previous[position * 4:position * 4 + 4]}
+            kept = sum(1 for position, chunk in enumerate(texels)
+                       if chunk == previous[position * 4:position * 4 + 4])
+            _require(len(drawn) == 1,
+                     f"{where}: drawn texels disagree about the fragment output: {sorted(drawn)}")
+            _require(0 < kept < len(texels),
+                     f"{where}: a loaded attachment needs both drawn and kept texels")
         else:
             raise CaptureError(f"{where}: unknown attachment load op {load!r}")
 
