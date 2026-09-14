@@ -582,34 +582,45 @@ impl VulkanComputeProvider {
         pool: &[BufferView],
         plan: &[PlannedRenderPass],
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
+        // The indirect payload replays one command into exactly one plain
+        // render pass (`research/docs/25` §6 Step 4). The guards run before the
+        // empty-plan early return on purpose: a trace that carries an indirect
+        // command but no render pass has nothing to replay into, and reporting
+        // success while dropping the command would be fail-open.
+        if trace.indirect.is_some() {
+            if plan.is_empty() {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "icb_command_unsupported",
+                )
+                .with_detail("the first indirect increment needs a render pass to replay into"));
+            }
+            if plan.len() != 1 {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "icb_command_unsupported",
+                )
+                .with_field(
+                    "passes",
+                    FieldValue::Unsigned(u64::try_from(plan.len()).unwrap_or(u64::MAX)),
+                )
+                .with_detail("the first indirect increment replays into exactly one render pass"));
+            }
+            if plan.iter().any(|planned| planned.pass.present.is_some()) {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "icb_command_unsupported",
+                )
+                .with_detail(
+                    "the first indirect increment replays plain render passes, not presenting ones",
+                ));
+            }
+        }
         if plan.is_empty() {
             return Ok(Vec::new());
-        }
-        // The indirect payload replays one command into one pass
-        // (`research/docs/25` §6 Step 4): a trace that carries it with a
-        // different number of render passes is refused rather than replaying
-        // the same command into an ambiguous pass.
-        if trace.indirect.is_some() && plan.len() != 1 {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Capability,
-                "icb_command_unsupported",
-            )
-            .with_field(
-                "passes",
-                FieldValue::Unsigned(u64::try_from(plan.len()).unwrap_or(u64::MAX)),
-            )
-            .with_detail("the first indirect increment replays into exactly one render pass"));
-        }
-        if trace.indirect.is_some() && plan.iter().any(|planned| planned.pass.present.is_some()) {
-            return Err(refusal(
-                ProviderPhase::Resolve,
-                ProviderErrorClass::Capability,
-                "icb_command_unsupported",
-            )
-            .with_detail(
-                "the first indirect increment replays plain render passes, not presenting ones",
-            ));
         }
         let host_readback = trace.completion_policy == CompletionPolicy::HostReadback;
         let mut writebacks = Vec::with_capacity(plan.len());

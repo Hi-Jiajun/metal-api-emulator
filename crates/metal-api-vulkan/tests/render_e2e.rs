@@ -782,6 +782,89 @@ fn an_indirect_dispatch_is_refused_by_the_first_increment() {
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }
 
+/// An indirect command with no render pass to replay into is refused, not
+/// dropped: admission admits the payload (it validates the command, not the
+/// pass list), so the provider's own guard is what keeps the submission from
+/// reporting success while never replaying the draw.
+#[test]
+fn an_indirect_command_without_a_render_pass_is_refused() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let mut trace = direct.trace.clone();
+    trace.passes.truncate(1);
+    // The truncated render pass is gone, so its pipeline cannot stay in the
+    // table: admission refuses unused pipeline metadata before it reaches the
+    // provider.
+    trace
+        .pipelines
+        .retain(|pipeline| pipeline.pipeline_id != direct.render_pipeline);
+    trace.indirect = Some(Box::new(indirect_draw()));
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("admission validates the indirect payload, not the pass list");
+    let refused = direct
+        .provider
+        .submit(admitted)
+        .expect_err("a replayed command needs a render pass");
+    assert_eq!(refused.slug, "icb_command_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// An indirect command cannot be replayed into a presenting pass in the first
+/// increment: the present tail owns the pass's terminal layout, so the
+/// combination is refused rather than silently running one of the two.
+#[test]
+fn an_indirect_presenting_pass_is_refused() {
+    let Some(presenting) = presenting_fixture() else {
+        return;
+    };
+    let mut trace = presenting.trace.clone();
+    trace.indirect = Some(Box::new(indirect_draw()));
+    let admitted = presenting
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), presenting.resources.clone())
+        .expect("the payload itself is admissible");
+    let refused = presenting
+        .provider
+        .submit(admitted)
+        .expect_err("an indirect replay into a presenting pass is outside the increment");
+    assert_eq!(refused.slug, "icb_command_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+/// One indirect command replays into exactly one render pass: a trace with two
+/// render passes is refused rather than replaying the command into an ambiguous
+/// pass (or into one of them and silently dropping the other).
+#[test]
+fn an_indirect_command_with_two_render_passes_is_refused() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let mut trace = direct.trace.clone();
+    let Some(render) = trace.passes.last().cloned() else {
+        return;
+    };
+    trace.passes.push(render);
+    trace.indirect = Some(Box::new(indirect_draw()));
+    // Admission admits the two-pass shape; the provider owns the one-pass
+    // indirect guard, so the refusal has to come from `submit`.
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("admission admits the two-pass trace");
+    let refused = direct
+        .provider
+        .submit(admitted)
+        .expect_err("one indirect command needs exactly one render pass");
+    assert_eq!(refused.slug, "icb_command_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
 #[test]
 fn a_second_present_reuses_the_same_target_image() {
     let Some(fixture) = presenting_fixture() else {
