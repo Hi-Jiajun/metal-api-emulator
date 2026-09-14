@@ -27,6 +27,22 @@ stage entries:
 | `render_fullscreen_triangle` | vertex | position from `vertex_id` alone: `(-1,-1)`, `(3,-1)`, `(-1,3)` |
 | `render_solid_rgba8` | fragment | writes `(64/255, 128/255, 192/255, 1)`, i.e. `40 80 c0 ff` in an 8-bit UNORM attachment |
 
+`conformance/shaders/quad_indexed_2x2.metal` is the second reviewed module, the
+one the vertex-input increment adds (`research/docs/23` §3.3), with the same
+fragment entry and a vertex stage that reads a caller-held stream:
+
+| Entry | Stage | What it does |
+|---|---|---|
+| `render_quad_vertex` | vertex | `float2 position [[attribute(0)]]` from `[[stage_in]]`, i.e. from the pass's bound stream, returned as `float4(position, 0, 1)` |
+| `render_solid_rgba8` | fragment | the same fixed colour texel as above |
+
+The indexed fixture's stream is four NDC corners — `(-1,-1)`, `(1,-1)`,
+`(-1,1)`, `(1,1)`, `float32x2` little-endian, 32 bytes — and its index buffer is
+six `uint16` values `(0,1,2)` and `(2,1,3)`, 12 bytes. The two triangles cover
+the whole square, so every pixel centre of the 2x2 viewport is covered just as
+the oversize triangle covers it: the second fixture changes where the positions
+come from, not what a capture can conclude from the texels.
+
 Two rules in that file are deliberate and are what make the milestone
 falsifiable:
 
@@ -42,11 +58,17 @@ The module's identity is pinned **in code** in four places, because a matching
 file name or an updated hash must not be enough to admit different source for
 execution:
 
-* `crates/metal-api-native/src/render.rs`: `REVIEWED_SOURCE`, `VERTEX_ENTRY`,
-  `FRAGMENT_ENTRY`;
-* `NativeOracle.swift`: `reviewedRenderModule()`, whose `RenderSourcePin` path
-  and SHA-256 are checked against the file before any capture;
-* `NativeOracle.swift`'s `--render-selftest` expectation `40 80 c0 ff` x4.
+* `crates/metal-api-native/src/render.rs`: `REVIEWED_MODULES`, i.e. the
+  `vertex_id` module (`REVIEWED_SOURCE`, `VERTEX_ENTRY`, `FRAGMENT_ENTRY`) and
+  the indexed one (`REVIEWED_VERTEX_SOURCE`, `QUAD_VERTEX_ENTRY`,
+  `FRAGMENT_ENTRY`). A pipeline's `VertexLayout` selects which of the two may
+  compile, so a stream-bearing layout cannot reach the `vertex_id` source and a
+  `VertexLayout::None` pipeline cannot reach the indexed one;
+* `NativeOracle.swift`: `reviewedRenderModule()` and `reviewedIndexedModule()`,
+  whose `RenderSourcePin` paths and SHA-256s are checked against the files
+  before any capture, plus the vertex layout `reviewedIndexedModule()` pins;
+* `NativeOracle.swift`'s `--render-selftest` and `--vertex-selftest`
+  expectations `40 80 c0 ff` x4.
 * `examples/metal-smoke/src/bin/provider-capture.rs`: each trace rail's half.
   The Vulkan rail pins the two reviewed SPIR-V stage modules
   (`RENDER_VERTEX_SPV`, `RENDER_FRAGMENT_SPV`) and their entry names
@@ -116,18 +138,90 @@ Field by field, against the core values the rail builds:
 | `attachment.width` / `.height` | `RenderAttachment::width` / `height` | `2` x `2` only |
 | `attachment.load` + `clear_hex` | `LoadOp::Clear(ClearColor)` | four bytes in memory order, different from the expected texel; `load: "load"` with `initial_hex` covering the whole attachment is admitted by the schema but refused by the Vulkan rail, which has no upload path yet |
 | `attachment.store` | `StoreOp::Store` | `store` only; a discarded attachment could not be compared |
-| `vertices` / `viewport` | `RenderPassDescriptor::vertices` / `viewport` | three vertices and a viewport covering the attachment |
+| `vertices` / `viewport` | `RenderPassDescriptor::vertices` / `viewport` | three vertices and a viewport covering the attachment, or six *indices* for the indexed shape below |
+| `vertex_layout` | `RenderPipelineContract::vertex_layout` | optional; when present it has to equal the reviewed indexed layout: one stream, stride 8, one `float32x2` attribute at location 0, offset 0 |
+| `vertex_buffers[]` | `RenderPassDescriptor::vertex_buffers` | optional; one read-only `BufferView` per reviewed stream, in binding order, carrying its own bytes: `allocation`, `view`, `offset`, `length`, `initial_hex` (exactly `length` bytes) |
+| `indices` | `RenderPassDescriptor::indices` | optional; the index view (`view.view` = the same five fields) plus `uint16`/`uint32` |
 | `expected_hex` | `RenderAttachment::expected_bytes` | every texel identical, and different from the value the pass started from |
 | `declaring_case` | — | a `cases` entry: one submission, one dispatch, declaring the attachment view read-only |
 | `capture_rails` | — | the capture backends required to report the case; see §4 |
 
+The oracle's whitelist admits two shapes: the `vertex_id` triangle, where all
+three vertex-input fields are absent, and the indexed quad, where all three are
+present. The contract itself also admits a non-indexed draw out of streams
+(`RenderPassDescriptor::validate`), which `render.rs::plan_vertex_input` plans;
+the oracle's suite path stays with the reviewed indexed fixture, the same way it
+reviews one render shape per increment.
+
+A render input declares its own source (`research/docs/23` §3.6): each
+`vertex_buffers[]` entry *is* the pass's `BufferView`, bytes included, and the
+index buffer carries its view beside the width. That is what lets an object-API
+trace bind a caller's buffer into a trace with no compute pass at all, and it is
+why the declaring case does not have to declare the streams: the streams are not
+part of the serial pool — the compute rail's binding set — and each rail uploads
+them itself. What the ordering rules still add is that no compute binding may
+write bytes the draw reads, and no later compute pass may bind overlapping
+bytes, exactly as for the attachment. The indexed shape looks like this:
+
+```json
+{
+  "id": "offscreen_quad_indexed_clear_2x2",
+  "declaring_case": "render_declaring_copy_word",
+  "vertex_entry": "render_quad_vertex",
+  "fragment_entry": "render_solid_rgba8",
+  "metal": {
+    "path": "shaders/quad_indexed_2x2.metal",
+    "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+  },
+  "vertices": 6,
+  "viewport": [0, 0, 2, 2],
+  "vertex_layout": {
+    "buffers": [
+      {"stride": 8, "attributes": [{"location": 0, "offset": 0, "format": "float32x2"}]}
+    ]
+  },
+  "vertex_buffers": [
+    {
+      "allocation": 940,
+      "view": 950,
+      "offset": 0,
+      "length": 32,
+      "initial_hex": "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
+    }
+  ],
+  "indices": {
+    "allocation": 960,
+    "view": 970,
+    "offset": 0,
+    "length": 12,
+    "initial_hex": "000001000200010003000200",
+    "format": "uint16"
+  },
+  "attachment": {
+    "allocation": 900,
+    "view": 910,
+    "format": "rgba8_unorm",
+    "width": 2,
+    "height": 2,
+    "load": "clear",
+    "store": "store",
+    "clear_hex": "fefefefe"
+  },
+  "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
+  "capture_rails": ["vulkan", "native-metal"]
+}
+```
+
 The oracle validates this shape as a whitelist, not as a per-case table: the
 first render increment has exactly one render shape (`research/docs/23` §1.2,
-§3), so the shape *is* the review, and a fixture cannot widen it by renaming a
-case. `conformance/compare.py` repeats the same rules when it builds the render
-plan, so a suite the oracle would refuse cannot pass the comparator either. The
-admitted values are one `rgba8_unorm` `2x2` attachment, three drawn vertices,
-the reviewed entry pair and module, `store`, and either
+§3) and the vertex-input increment adds exactly one more, so the shape *is* the
+review, and a fixture cannot widen it by renaming a case.
+`conformance/compare.py` repeats the same rules when it builds the render plan,
+so a suite the oracle would refuse cannot pass the comparator either. The
+admitted values are one `rgba8_unorm` `2x2` attachment, `store`, the reviewed
+module and its entry pair — the `vertex_id` pair with three drawn vertices, or
+the indexed pair with the reviewed layout, six indices and their views — and
+either
 
 * `load: "clear"` with a four-byte `clear_hex`, or
 * `load: "load"` with `initial_hex` covering the whole attachment.
@@ -299,6 +393,29 @@ Verified on a Linux host, by `cargo test -p metal-api-native` and the
   the `LoadOp::Load` agreement, the readback extent and row pitch;
 * the clear-value decoding per format, including the B/G/R/A memory order of
   `bgra8_unorm` and the single-channel float format;
+* the vertex-input plan (`render::plan_vertex_input`): the stream identity rule
+  (`render_vertex_buffer_unsupported` / `render_index_buffer_unsupported` for a
+  view the trace does not declare and for a lease-backed stream this rail holds
+  no bytes for), the footprint proof (`render_vertex_footprint_unsupported` for
+  a non-indexed draw whose stream is shorter than `vertices * stride`,
+  `render_index_footprint_unsupported` for an index view shorter than
+  `index_count * index_bytes`), and `render_index_value_out_of_range` for an
+  index value that selects a vertex no stream covers (including the
+  `vertex_id` shape indexed through a buffer, where the module's three
+  positions are the bound);
+* the descriptor translation itself: one `PlannedVertexStream` per bound
+  layout entry with the binding index, stride, attribute locations/offsets and
+  the `VertexFormat` → `RenderVertexFormat` mapping, one `PlannedIndexStream`
+  with the `IndexFormat` → `RenderIndexType` mapping, the index count and the
+  vertex span, and the two module/entry pairs the rail's allowlist is made of
+  (a stream-bearing layout cannot compile the `vertex_id` module or the
+  reverse);
+* that the declared vertex-input bits are the rail's limits and that core
+  admission admits exactly the indexed trace the rail plans, while a
+  pre-flip snapshot refuses it with `vertex_buffer_limit`,
+  `index_format_unsupported` or `vertex_format_unsupported` — and that an
+  indirect draw whose replayed pass binds streams is refused with
+  `icb_command_unsupported` before any Metal object exists;
 * that the rail's refusal slugs and classes are the ones core admission uses,
   including the trace path's own refusals (`attachment_load_op_unsupported` for
   a `Load` the trace cannot carry, `render_attachment_landing_unsupported` for
@@ -369,6 +486,13 @@ also captures committed suites through the Rust provider's own encoder: run
 `34781060564` captured v13 and run `34782615760` captured v14 with
 `render case completed: present_triangle_clear_2x2 attachment=4080c0ff...`.
 
+The vertex-input increment's Apple-side half is §8's `--vertex-selftest`: the
+descriptor, the two `setVertexBuffer`-style bindings and the indexed draw are
+exercised there and nowhere else yet. Its host-side half is what the bullets
+above cover — the plan, the footprint proof, the index-value bound, the
+descriptor translation and the admission agreement — so the two together are
+the increment's evidence, and neither is a claim about the other.
+
 ## 7. The present milestone (suite-v14)
 
 `suite-v14.json` is v13's 2x2 `rgba8_unorm` render case plus a `present` section
@@ -423,3 +547,78 @@ capture: `present = {"acquire": 1, "present": 1}`, bytes
 `4080c0ff4080c0ff4080c0ff4080c0ff`; the object and async-object captures pass with
 the same case and counts, run through the object API's render command encoder on
 both backends).
+
+## 8. The vertex-input milestone (`--vertex-selftest`)
+
+The vertex-input increment (`research/docs/23` §3.3, §6 Step 3.3) adds the
+caller-held half of the render contract: a pass may bind vertex streams and an
+index buffer, and the pipeline says what their strides and attributes are. The
+rail reads each stream out of the view the pass itself carries — a render input
+declares its own bytes (`research/docs/23` §3.6), and the compute rail's pool
+holds only the views a compute binding declares — proves every footprint and
+every index value on the host (`render::plan_vertex_input`), and only then
+translates the plan into an `MTLVertexDescriptor`
+(`MTLVertexBufferLayoutDescriptor` per stream, `MTLVertexAttributeDescriptor`
+per attribute), one `setVertexBuffer` binding per stream and one
+`drawIndexedPrimitives` call whose index buffer is named in the draw, which is
+where Metal takes it.
+
+The one-device check is the suite-free equivalent, in the same shape as §5:
+
+```sh
+swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal \
+  -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
+(cd conformance && /tmp/native-oracle --vertex-selftest)
+```
+
+It resolves `shaders/quad_indexed_2x2.metal` relative to the working directory
+and checks its pinned SHA-256, builds the reviewed indexed module and the
+fixture's `float32x2` stream (four NDC corners) and `uint16` index buffer
+(`(0,1,2)`, `(2,1,3)`) through the same `validateRenderCase` a suite uses, draws
+with `drawIndexedPrimitives` into a cleared 2x2 `rgba8Unorm` attachment, and
+prints the case result as JSON. The self-test fixture spells its stream and
+index views the way a suite does — each view carries its own `initial_hex`,
+exactly `length` bytes — so the bytes the draw reads travel with the case rather
+than being resolved out of a declaring case's `buffers[]`.
+
+The judgement condition is `conformance/run_native.py::validate_vertex_selftest`,
+which a CI step of the probe-gated shape §5 describes reuses and which
+`conformance/test_run_native.py` exercises on a host without Metal. A report
+passes only when all four of these hold, and the step then prints
+`vertex_selftest: PASS (4080c0ff)`:
+
+* the report's `id` is the reviewed fixture's (`vertex_quad_indexed_2x2`). This
+  is not decoration: the streams are *inputs*, so the attachment's texels are
+  the same `4080c0ff` x4 the plain `--render-selftest` reports, and the id is
+  the only field that says those bytes were drawn through the caller-held stream
+  and index buffer instead of `vertex_id`;
+* `completion` is `CompletedVisible`;
+* there is exactly one `writebacks` entry, naming the attachment's own view
+  (`allocation` 900, `view` 910, `offset` 0) with `bytes_hex` `4080c0ff` x4 —
+  the fragment's texel, never the `fefefefe` sentinel the pass started from;
+* there is exactly one `allocations` entry, the same allocation, holding those
+  same four texels.
+
+`--vertex-selftest`'s Rust counterpart is the plan the same bytes feed: the
+footprint proof (`stride * vertices` for a non-indexed draw, `count * width` for
+an indexed one), the index-value bound (`index < bytes / stride`), the reviewed
+layout and the reviewed module's exact bytes.
+
+The provider's vertex-input bits (`crates/metal-api-native/src/render.rs`,
+`vertex_input_capability_bits`; `crates/metal-api-native/src/native.rs`) name
+that observation as their flip condition: the three bits say this rail builds
+vertex-input state, a stream count of `MAX_VERTEX_BUFFERS` and the admitted
+`VertexFormat`/`IndexFormat` sets, and a trace that binds a stream is now
+admitted and executed instead of being refused during admission. Before the flip
+the same trace was refused with `vertex_buffer_limit` /
+`index_format_unsupported`, which is the refusal the unit tests still pin on a
+constructed pre-flip snapshot, so the flip is falsifiable in both directions.
+
+What the host cannot answer, and this self-test exists to answer, is the Apple
+half: that the reviewed indexed module compiles against the descriptor, that the
+bound stream and the index buffer are read from the byte ranges the trace
+declared, that `drawIndexedPrimitives` covers the whole 2x2 attachment through
+the six indices, and that the readback is the fragment's texel rather than the
+clear sentinel. Until the CI job that runs it is green, that half is a
+condition, not an observation: the host half above is what `cargo test -p
+metal-api-native` and the `aarch64-apple-darwin` cross-check cover today.

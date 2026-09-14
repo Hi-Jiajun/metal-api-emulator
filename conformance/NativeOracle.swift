@@ -135,6 +135,58 @@ private struct RenderAttachmentDefinition: Decodable {
     let initial_hex: String?
 }
 
+/// One attribute of a render case's vertex stream.
+///
+/// The fields mirror `metal_api_core::provider::VertexAttribute`: the
+/// shader-visible location, the byte offset inside one vertex and the format the
+/// rails translate. The format is a string because it is a wire spelling
+/// (`"float32x2"`, …), not a `MTLVertexFormat`.
+private struct RenderVertexAttributeDefinition: Decodable, Equatable {
+    let location: UInt64
+    let offset: UInt64
+    let format: String
+}
+
+/// One vertex stream of a render case's layout
+/// (`metal_api_core::provider::VertexBufferLayout`).
+private struct RenderVertexBufferLayoutDefinition: Decodable, Equatable {
+    let stride: UInt64
+    let attributes: [RenderVertexAttributeDefinition]
+}
+
+/// The vertex-input shape a render case draws with: one entry per bound stream,
+/// in binding order (`metal_api_core::provider::VertexLayout::Buffers`).
+private struct RenderVertexLayoutDefinition: Decodable, Equatable {
+    let buffers: [RenderVertexBufferLayoutDefinition]
+}
+
+/// One vertex stream bound for a render case: the view whose bytes the draw
+/// reads, in binding order (`metal_api_core::provider::BufferView`,
+/// `research/docs/23` §3.6).
+///
+/// The position in the array is the binding index, and the bytes travel with the
+/// view — `initial_hex` is exactly `length` bytes — so no compute case has to
+/// declare the stream. `offset` is where the view starts inside its allocation,
+/// which is where the oracle places its binding.
+private struct RenderVertexBufferDefinition: Decodable {
+    let allocation: UInt64
+    let view: UInt64
+    let offset: UInt64
+    let length: UInt64
+    let initial_hex: String
+}
+
+/// The index buffer a render case draws through: the same view fields plus the
+/// width of the indices (`metal_api_core::provider::IndexBufferBinding`).
+private struct RenderIndexBufferDefinition: Decodable {
+    let allocation: UInt64
+    let view: UInt64
+    let offset: UInt64
+    let length: UInt64
+    let initial_hex: String
+    let format: String
+}
+
 /// One offscreen render case (`research/docs/23` §1.2, §5.1).
 private struct RenderCaseDefinition: Decodable {
     let id: String
@@ -147,6 +199,14 @@ private struct RenderCaseDefinition: Decodable {
     let metal: RenderSourcePin
     let vertices: UInt64
     let viewport: [UInt64]
+    /// The vertex-input half, absent for the `vertex_id` shape
+    /// (`research/docs/23` §3.3). A case that carries a layout draws the
+    /// indexed reviewed module instead: the layout, its bindings and the index
+    /// buffer arrive together or not at all, and each binding carries its own
+    /// bytes (`research/docs/23` §3.6).
+    let vertex_layout: RenderVertexLayoutDefinition?
+    let vertex_buffers: [RenderVertexBufferDefinition]?
+    let indices: RenderIndexBufferDefinition?
     let attachment: RenderAttachmentDefinition
     let expected_hex: String
     /// Which capture rails the suite marks this render case executable on. The
@@ -162,6 +222,58 @@ private struct ValidatedRender {
     let definition: RenderCaseDefinition
     let source: String
     let attachment: ValidatedRenderAttachment
+    /// One entry per bound vertex stream, in binding order, with the bytes the
+    /// case's own views carry. Empty for the `vertex_id` shape.
+    let vertexStreams: [ValidatedVertexStream]
+    /// The index buffer of an indexed case, with its footprint and index values
+    /// already proved against the streams above.
+    let indexStream: ValidatedIndexStream?
+}
+
+/// One vertex stream the draw reads: its binding index, stride, attributes and
+/// the bytes themselves, taken from the view the case declares.
+private struct ValidatedVertexStream {
+    let binding: Int
+    let stride: UInt64
+    let attributes: [RenderVertexAttributeDefinition]
+    /// Where the view starts inside its allocation, which is where the binding
+    /// points (`render.rs::stream_buffer`).
+    let offset: UInt64
+    let bytes: Data
+}
+
+/// The two index widths the contract admits, with the Metal type and the byte
+/// width the footprint proof reads (`metal_api_core::provider::IndexFormat`).
+private enum ReviewedIndexType {
+    case uint16
+    case uint32
+
+    init?(spelling: String) {
+        switch spelling {
+        case "uint16": self = .uint16
+        case "uint32": self = .uint32
+        default: return nil
+        }
+    }
+
+    var metal: MTLIndexType {
+        self == .uint16 ? .uint16 : .uint32
+    }
+
+    var byteWidth: UInt64 {
+        self == .uint16 ? 2 : 4
+    }
+}
+
+/// The index buffer of an indexed case, with the count and the span the streams
+/// have to cover.
+private struct ValidatedIndexStream {
+    let format: ReviewedIndexType
+    let indexCount: UInt64
+    /// Where the view starts inside its allocation, for the draw call's
+    /// `indexBufferOffset`.
+    let offset: UInt64
+    let bytes: Data
 }
 
 private struct ValidatedRenderAttachment {
@@ -281,6 +393,7 @@ private struct Options {
     let probe: Bool
     let renderSelfTest: Bool
     let presentSelfTest: Bool
+    let vertexSelfTest: Bool
     let heapSelfTest: Bool
 }
 
@@ -290,6 +403,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --probe
        native-metal-oracle --render-selftest
        native-metal-oracle --present-selftest
+       native-metal-oracle --vertex-selftest
        native-metal-oracle --heap-selftest
        native-metal-oracle --help
 
@@ -311,6 +425,13 @@ directory. The present target is preset with the fefefefe sentinel, the
 reviewed fragment draws over it, and the report fails unless all four texels
 read back as the fragment output rather than the sentinel. It cannot be
 combined with other options.
+--vertex-selftest needs no suite: it captures the reviewed indexed 2x2 quad,
+resolving the indexed module (shaders/quad_indexed_2x2.metal) relative to the
+current working directory. The fixture's float32x2 stream and uint16 index
+buffer are bound through an MTLVertexDescriptor and drawn with
+drawIndexedPrimitives, and the report fails unless all four texels read back as
+the reviewed fragment output rather than the clear sentinel. It cannot be
+combined with other options.
 --heap-selftest needs no suite: it allocates two reviewed heap buffers from one
 MTLHeap, records their heap offsets, runs the reviewed copy_word kernel across
 the pair, and reports the copied bytes. It fails unless both buffers are in the
@@ -327,6 +448,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var probe = false
     var renderSelfTest = false
     var presentSelfTest = false
+    var vertexSelfTest = false
     var heapSelfTest = false
     var index = 0
     while index < arguments.count {
@@ -361,6 +483,10 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!presentSelfTest, "Duplicate --present-selftest option")
             presentSelfTest = true
             index += 1
+        case "--vertex-selftest":
+            try require(!vertexSelfTest, "Duplicate --vertex-selftest option")
+            vertexSelfTest = true
+            index += 1
         case "--heap-selftest":
             try require(!heapSelfTest, "Duplicate --heap-selftest option")
             heapSelfTest = true
@@ -370,28 +496,39 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !heapSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       heapSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !heapSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false)
+                       renderSelfTest: true, presentSelfTest: false, vertexSelfTest: false,
+                       heapSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !heapSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: true, vertexSelfTest: false,
+                       heapSelfTest: false)
+    }
+    if vertexSelfTest {
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
+                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: true,
+                       heapSelfTest: false)
     }
     if heapSelfTest {
         try require(suite == nil && output == nil && !validateOnly,
                     "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true)
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       heapSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -400,7 +537,8 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
                     "Output already exists: \(outputURL.path)")
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
-                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
+                   renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                   heapSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -897,9 +1035,14 @@ private struct ReviewedRenderModule {
     let vertex_entry: String
     let fragment_entry: String
     let metal: RenderSourcePin
+    /// The vertex layout the module was written for: `nil` for the
+    /// `vertex_id` fixture, the reviewed stream list for the indexed one. A
+    /// case's declared layout has to equal it, so a fixture cannot widen the
+    /// strides or attributes the reviewed module reads.
+    let buffers: [RenderVertexBufferLayoutDefinition]?
 }
 
-/// The reviewed render fixture.
+/// The reviewed `vertex_id` render fixture.
 ///
 /// Code-side, like `reviewedProgram`'s table: an updated fixture hash must not
 /// be enough to admit a different module for execution. `RenderSourcePin` is a
@@ -911,7 +1054,50 @@ private func reviewedRenderModule() -> ReviewedRenderModule {
         vertex_entry: "render_fullscreen_triangle",
         fragment_entry: "render_solid_rgba8",
         metal: RenderSourcePin(path: "shaders/render_offscreen_2x2.metal",
-                               sha256: "7430cd19a3497582618226066e95fb6f4ead9071f83b00c53398ccab8ba9d7de"))
+                               sha256: "7430cd19a3497582618226066e95fb6f4ead9071f83b00c53398ccab8ba9d7de"),
+        buffers: nil)
+}
+
+/// The reviewed indexed render fixture (`research/docs/23` §3.3): the same
+/// fragment entry, a vertex stage that reads `[[stage_in]]`, one `float32x2`
+/// position attribute at location 0, and an index buffer the draw selects
+/// through.
+///
+/// A second module rather than a second entry pair in one file, because the two
+/// shapes need different pipeline state: the `vertex_id` module carries no
+/// `MTLVertexDescriptor` at all, while this one is meaningless without the
+/// descriptor its layout states. Pinning the layout here is what keeps a
+/// fixture from describing a stream the reviewed module does not read.
+private func reviewedIndexedModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_quad_vertex",
+        fragment_entry: "render_solid_rgba8",
+        metal: RenderSourcePin(path: "shaders/quad_indexed_2x2.metal",
+                               sha256: "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 8,
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x2")])])
+}
+
+/// The reviewed module a render case's vertex-input shape selects, mirroring
+/// `crates/metal-api-native/src/render.rs::reviewed_module`: a `vertex_id` case
+/// draws the triangle module, a case that carries a layout the indexed one.
+private func reviewedModule(for definition: RenderCaseDefinition) -> ReviewedRenderModule {
+    definition.vertex_layout == nil ? reviewedRenderModule() : reviewedIndexedModule()
+}
+
+/// The `MTLVertexFormat` one contract format spelling names
+/// (`metal_api_core::provider::VertexFormat`), or `nil` for a spelling this
+/// oracle does not build a descriptor from.
+private func vertexFormat(_ spelling: String) -> MTLVertexFormat? {
+    switch spelling {
+    case "float32x2": return .float2
+    case "float32x3": return .float3
+    case "float32x4": return .float4
+    case "uint32": return .uint
+    default: return nil
+    }
 }
 
 @available(macOS 11.0, *)
@@ -926,18 +1112,18 @@ private func loadRenderSource(_ pin: RenderSourcePin, root: URL) throws -> Data 
 
 @available(macOS 11.0, *)
 private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [ValidatedRender] {
-    var cases = [ValidatedRender]()
+    var renderCases = [ValidatedRender]()
     for definition in suite.render_cases ?? [] {
-        cases.append(try validateRenderCase(definition, root: root))
+        renderCases.append(try validateRenderCase(definition, root: root))
     }
-    let ids = cases.map { $0.definition.id }
+    let ids = renderCases.map { $0.definition.id }
     try require(Set(ids).count == ids.count, "\(suite.suite): duplicate render case id")
     let computeIDs = Set(suite.cases.map { $0.id })
     for id in ids {
         try require(!computeIDs.contains(id),
                     "\(suite.suite): render case \(id) repeats a compute case id")
     }
-    return cases
+    return renderCases
 }
 
 /// The render milestone's shape, admitted as a whitelist rather than as a
@@ -950,7 +1136,7 @@ private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [Val
 @available(macOS 11.0, *)
 private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 root: URL) throws -> ValidatedRender {
-    let reviewed = reviewedRenderModule()
+    let reviewed = reviewedModule(for: definition)
     try require(definition.vertex_entry == reviewed.vertex_entry
                 && definition.fragment_entry == reviewed.fragment_entry
                 && definition.metal == reviewed.metal,
@@ -958,6 +1144,93 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     let sourceBytes = try loadRenderSource(reviewed.metal, root: root)
     guard let source = String(data: sourceBytes, encoding: .utf8) else {
         throw OracleError("\(definition.id): reviewed MSL source is not UTF-8")
+    }
+    // The vertex-input half: the reviewed layout is an identity, not a knob, so
+    // a case declares exactly the streams the module was written for, and each
+    // binding carries its own bytes (`research/docs/23` §3.6). The footprint and
+    // index-value rules mirror `render.rs::plan_vertex_input`: they are proved
+    // here, before a device exists, because Metal would read past a short buffer
+    // without refusing.
+    let vertexStreams: [ValidatedVertexStream]
+    let indexStream: ValidatedIndexStream?
+    switch (definition.vertex_layout, definition.vertex_buffers, definition.indices) {
+    case (nil, nil, nil):
+        try require(definition.vertices == 3,
+                    "\(definition.id): expected the full-screen triangle")
+        vertexStreams = []
+        indexStream = nil
+    case (let layout?, let bindings?, let indices?):
+        guard let reviewedBuffers = reviewed.buffers else {
+            throw OracleError("\(definition.id): a vertex layout selects an unreviewed module")
+        }
+        try require(layout.buffers == reviewedBuffers,
+                    "\(definition.id): the vertex layout is not the reviewed one")
+        try require(bindings.count == reviewedBuffers.count,
+                    "\(definition.id): one binding per reviewed stream")
+        // The reviewed indexed fixture draws six `uint16` indices over the four
+        // stream vertices, which is what makes the expectation a covered 2x2
+        // attachment rather than a partially drawn one.
+        try require(definition.vertices == 6,
+                    "\(definition.id): expected the reviewed six-index quad")
+        var resolved = [ValidatedVertexStream]()
+        for (binding, buffer) in bindings.enumerated() {
+            try require(buffer.view > 0 && buffer.allocation > 0,
+                        "\(definition.id): zero vertex stream identity")
+            let bytes = try decodeHex(buffer.initial_hex,
+                                      context: "\(definition.id) vertex stream \(binding)")
+            try require(UInt64(bytes.count) == buffer.length,
+                        "\(definition.id): vertex stream \(binding) declares "
+                        + "\(buffer.length) bytes and carries \(bytes.count)")
+            resolved.append(ValidatedVertexStream(binding: binding,
+                                                  stride: reviewedBuffers[binding].stride,
+                                                  attributes: reviewedBuffers[binding].attributes,
+                                                  offset: buffer.offset,
+                                                  bytes: bytes))
+        }
+        guard let format = ReviewedIndexType(spelling: indices.format) else {
+            throw OracleError("\(definition.id): unsupported index format \(indices.format)")
+        }
+        try require(indices.view > 0 && indices.allocation > 0,
+                    "\(definition.id): zero index buffer identity")
+        let indexBytes = try decodeHex(indices.initial_hex,
+                                       context: "\(definition.id) index buffer")
+        try require(UInt64(indexBytes.count) == indices.length,
+                    "\(definition.id): the index buffer declares \(indices.length) bytes "
+                    + "and carries \(indexBytes.count)")
+        let indexCount = definition.vertices
+        let indexFootprint = indexCount * format.byteWidth
+        try require(UInt64(indexBytes.count) >= indexFootprint,
+                    "\(definition.id): the index view holds \(indexBytes.count) bytes, "
+                    + "the draw reads \(indexFootprint)")
+        // The highest index value decides how many vertices the streams have to
+        // cover, the same span `render.rs` plans from the same bytes.
+        var span: UInt64 = 0
+        indexBytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            for offset in stride(from: 0, to: Int(indexFootprint), by: Int(format.byteWidth)) {
+                let value: UInt64
+                switch format {
+                case .uint16:
+                    value = UInt64(base.load(fromByteOffset: offset, as: UInt16.self))
+                case .uint32:
+                    value = UInt64(base.load(fromByteOffset: offset, as: UInt32.self))
+                }
+                span = max(span, value + 1)
+            }
+        }
+        for stream in resolved {
+            let covered = UInt64(stream.bytes.count) / stream.stride
+            try require(span <= covered,
+                        "\(definition.id): index values reach vertex \(span - 1) of "
+                        + "binding \(stream.binding), which covers \(covered)")
+        }
+        vertexStreams = resolved
+        indexStream = ValidatedIndexStream(format: format, indexCount: indexCount,
+                                           offset: indices.offset,
+                                           bytes: indexBytes)
+    default:
+        throw OracleError("\(definition.id): a vertex layout, its bindings and the index "
+                          + "buffer are declared together")
     }
     let attachment = definition.attachment
     try require(attachment.format == "rgba8_unorm",
@@ -968,8 +1241,6 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 "\(definition.id): zero attachment identity")
     try require(attachment.store == "store",
                 "\(definition.id): the attachment has to be stored for a byte comparison")
-    try require(definition.vertices == 3,
-                "\(definition.id): expected the full-screen triangle")
     try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
                 "\(definition.id): the viewport must cover the attachment")
     let byteCount = attachment.width * attachment.height * 4
@@ -1025,7 +1296,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                                allocation: attachment.allocation, view: attachment.view,
                                width: attachment.width, height: attachment.height,
                                load: attachment.load, clearComponents: clearComponents,
-                               initial: initial, expected: expected))
+                               initial: initial, expected: expected),
+                           vertexStreams: vertexStreams, indexStream: indexStream)
 }
 
 private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throws -> ProgramDefinition {
@@ -1277,8 +1549,48 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
 }
 
+private func hostOffset(_ value: UInt64, id: String) throws -> Int {
+    // A view offset is a wire `u64`, so the narrowing is fallible by
+    // construction; refusing it is the same answer `render.rs::stream_buffer`
+    // gives for the same field instead of trapping on the conversion.
+    guard let narrowed = Int(exactly: value) else {
+        throw OracleError("\(id): a view offset does not fit this host")
+    }
+    return narrowed
+}
+
+/// One `MTLBuffer` holding a stream view's bytes at the view's own offset.
+///
+/// The image is the view's bytes placed at `offset` inside its allocation, and
+/// the binding points at that same offset — the convention the provider rail's
+/// `render.rs::stream_buffer` follows, so a view that starts above the
+/// allocation's first byte still reads the byte range the case named instead of
+/// being silently re-based at zero.
+@available(macOS 11.0, *)
+private func makeStreamBuffer(device: MTLDevice, id: String,
+                              offset: UInt64, bytes: Data) throws -> MTLBuffer {
+    guard !bytes.isEmpty else {
+        throw OracleError("\(id): a stream view carries no bytes")
+    }
+    let start = try hostOffset(offset, id: id)
+    guard start <= Int.max - bytes.count else {
+        throw OracleError("\(id): a stream view offset does not fit this host")
+    }
+    var image = Data(count: start + bytes.count)
+    image.replaceSubrange(start..<(start + bytes.count), with: bytes)
+    let buffer: MTLBuffer? = image.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        guard let base = raw.baseAddress else { return nil }
+        return device.makeBuffer(bytes: base, length: image.count, options: .storageModeShared)
+    }
+    guard let allocated = buffer else {
+        throw OracleError("\(id): cannot allocate a stream buffer")
+    }
+    return allocated
+}
+
 /// One offscreen render case: a 2x2 `rgba8Unorm` attachment, the reviewed
-/// two-entry pipeline and a full-screen-triangle draw, read back as texels.
+/// two-entry pipeline and either the full-screen-triangle draw or the indexed
+/// quad, read back as texels.
 ///
 /// The observable is the attachment's tightly packed texels, reported in the
 /// same `writebacks`/`allocations` shape every other case uses, so a render case
@@ -1328,6 +1640,45 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     pipelineDescriptor.label = "native oracle: \(definition.id)"
     pipelineDescriptor.vertexFunction = vertexFunction
     pipelineDescriptor.fragmentFunction = fragmentFunction
+    // The vertex descriptor is what makes `[[attribute(n)]]` mean a byte range
+    // of a bound stream: the reviewed module names the attribute locations, this
+    // descriptor says which binding, stride, offset and format each one reads.
+    // The `vertex_id` fixture binds no stream and carries none, the same split
+    // `render.rs::render_pipeline_state` makes.
+    var streamBuffers = [MTLBuffer]()
+    if !fixture.vertexStreams.isEmpty {
+        let vertexDescriptor = MTLVertexDescriptor()
+        for stream in fixture.vertexStreams {
+            // The descriptor's subscript is an implicitly unwrapped optional on
+            // the Swift side of Metal; referencing a member before unwrapping is
+            // a compile error under `-warnings-as-errors`, so unwrap explicitly.
+            guard let layout = vertexDescriptor.layouts[stream.binding] else {
+                throw OracleError("\(definition.id): the vertex descriptor has no layout "
+                                  + "\(stream.binding)")
+            }
+            layout.stride = Int(stream.stride)
+            // One stream advance per vertex: per-instance step rates are not
+            // part of this increment.
+            layout.stepFunction = .perVertex
+            for attribute in stream.attributes {
+                guard let format = vertexFormat(attribute.format) else {
+                    throw OracleError("\(definition.id): unsupported vertex attribute format "
+                                      + attribute.format)
+                }
+                guard let target = vertexDescriptor.attributes[Int(attribute.location)] else {
+                    throw OracleError("\(definition.id): the vertex descriptor has no attribute "
+                                      + "\(attribute.location)")
+                }
+                target.format = format
+                target.offset = Int(attribute.offset)
+                target.bufferIndex = stream.binding
+            }
+            streamBuffers.append(try makeStreamBuffer(device: device, id: definition.id,
+                                                      offset: stream.offset,
+                                                      bytes: stream.bytes))
+        }
+        pipelineDescriptor.vertexDescriptor = vertexDescriptor
+    }
     // Attachment 0 is the only colour attachment the first increment admits, and
     // its pixel format is the one the reviewed fragment was written for.
     pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
@@ -1370,7 +1721,32 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                     width: Double(attachment.width),
                                     height: Double(attachment.height),
                                     znear: 0, zfar: 1))
-    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: Int(definition.vertices))
+    // The streams are bound at the same indices the descriptor names, and they
+    // stay alive until the command buffer has completed (the buffers array is
+    // released after the readback below).
+    for (stream, buffer) in zip(fixture.vertexStreams, streamBuffers) {
+        encoder.setVertexBuffer(buffer,
+                                offset: try hostOffset(stream.offset, id: definition.id),
+                                index: stream.binding)
+    }
+    if let indexStream = fixture.indexStream {
+        // An indexed draw names its index buffer in the draw call, and the count
+        // is the one the case declares for that shape
+        // (`RenderPassDescriptor::vertices`, `research/docs/23` §3.3).
+        let indexBuffer = try makeStreamBuffer(device: device, id: definition.id,
+                                               offset: indexStream.offset,
+                                               bytes: indexStream.bytes)
+        streamBuffers.append(indexBuffer)
+        encoder.drawIndexedPrimitives(type: .triangle,
+                                      indexCount: Int(indexStream.indexCount),
+                                      indexType: indexStream.format.metal,
+                                      indexBuffer: indexBuffer,
+                                      indexBufferOffset: try hostOffset(indexStream.offset,
+                                                                        id: definition.id))
+    } else {
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: Int(definition.vertices))
+    }
     encoder.endEncoding()
     let completed = DispatchSemaphore(value: 0)
     commandBuffer.addCompletedHandler { _ in completed.signal() }
@@ -1423,6 +1799,11 @@ private func renderSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        // The `vertex_id` shape: positions come from the vertex index, so the
+        // case declares no layout, no stream and no index buffer.
+        vertex_layout: nil,
+        vertex_buffers: nil,
+        indices: nil,
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
@@ -1432,6 +1813,8 @@ private func renderSelfTest() throws -> CaseResult {
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    // No stream to read: the shape declares none, and the vertex stage reads
+    // its positions from `vertex_id`.
     let fixture = try validateRenderCase(definition, root: root)
     guard let device = MTLCreateSystemDefaultDevice() else {
         throw OracleError("No default Metal device is available; the render self-test requires an Apple silicon Mac")
@@ -1471,6 +1854,11 @@ private func presentSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        // The present equivalent replays the `vertex_id` shape, so it declares
+        // no vertex input either.
+        vertex_layout: nil,
+        vertex_buffers: nil,
+        indices: nil,
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "load", store: "store",
@@ -1491,6 +1879,85 @@ private func presentSelfTest() throws -> CaseResult {
         throw OracleError("Cannot create a Metal command queue")
     }
     diagnostic("native present self-test: device=\(device.name) platform=\(eligibility.platform)")
+    return try runRenderCase(fixture, device: device, queue: queue)
+}
+
+/// The vertex-input milestone's own fixture, constructed in code.
+///
+/// This is the one-device check the native provider's vertex-input bits point
+/// at (`conformance/RENDER-CAPTURE.md` §8): the reviewed indexed module, the
+/// fixture's `float32x2` stream of four NDC corners and its six `uint16`
+/// indices, bound through an `MTLVertexDescriptor` and drawn with
+/// `drawIndexedPrimitives` into the same 2x2 `rgba8Unorm` attachment the render
+/// self-test uses. The stream and index bytes are spelled here exactly as a
+/// suite spells them in the view's own `initial_hex` (`research/docs/23` §3.6),
+/// so the self-test reaches `runRenderCase` through the same validation a suite
+/// capture does. It fails unless **all four texels read back as the reviewed
+/// fragment's `40 80 c0 ff`** instead of the `fe` clear sentinel, and unless the
+/// report's `writebacks`/`allocations` name the attachment view — the same
+/// falsifiability rule as `--render-selftest`, reached through the caller-held
+/// streams this increment adds. The pass counts as observed only once a runner
+/// reusing `conformance/run_native.py::validate_vertex_selftest` prints
+/// `vertex_selftest: PASS (4080c0ff)`.
+@available(macOS 11.0, *)
+private func vertexSelfTest() throws -> CaseResult {
+    let reviewed = reviewedIndexedModule()
+    // The four NDC corners, `float32x2` little-endian: (-1,-1), (1,-1), (-1,1),
+    // (1,1). The same 32 bytes `render.rs`'s fixture builds.
+    let vertices = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+    ])
+    // The six `uint16` indices (0,1,2) and (2,1,3): the two triangles that
+    // cover the whole square, 12 bytes.
+    let indices = Data([
+        0x00, 0x00, 0x01, 0x00, 0x02, 0x00,
+        0x02, 0x00, 0x01, 0x00, 0x03, 0x00,
+    ])
+    let definition = RenderCaseDefinition(
+        id: "vertex_quad_indexed_2x2",
+        declaring_case: "",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        // `vertices` is the index count in the indexed shape.
+        vertices: 6,
+        viewport: [0, 0, 2, 2],
+        vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
+        // The stream and index views, spelled exactly as a suite spells them:
+        // each view carries its own bytes (`research/docs/23` §3.6), which is
+        // the same shape `validateRenderCase` reads out of a suite's render
+        // case. Both start at their allocation's first byte, like the reviewed
+        // fixture's do.
+        vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
+                                                      length: UInt64(vertices.count),
+                                                      initial_hex: hex(vertices))],
+        indices: RenderIndexBufferDefinition(allocation: 960, view: 970, offset: 0,
+                                             length: UInt64(indices.count),
+                                             initial_hex: hex(indices),
+                                             format: "uint16"),
+        attachment: RenderAttachmentDefinition(
+            allocation: 900, view: 910, format: "rgba8_unorm",
+            width: 2, height: 2, load: "clear", store: "store",
+            clear_hex: "fefefefe", initial_hex: nil),
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        // The self-test runs on this rail by construction; the marker is the
+        // same one a suite would name for it.
+        capture_rails: ["native-metal"])
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fixture = try validateRenderCase(definition, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the vertex self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native vertex self-test: device=\(device.name) platform=\(eligibility.platform)")
     return try runRenderCase(fixture, device: device, queue: queue)
 }
 
@@ -1730,6 +2197,15 @@ do {
         // evidence, four `40 80 c0 ff` texels, never the `fe` sentinel the
         // target was preset with (`research/docs/24` §6 Step 7).
         let result = try presentSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.vertexSelfTest {
+        // The vertex-input milestone's one-device check: the reported bytes are
+        // the evidence, four `40 80 c0 ff` texels written through the caller's
+        // own vertex stream and index buffer instead of `vertex_id`, never the
+        // `fe` clear sentinel (`research/docs/23` §6 Step 3.3).
+        let result = try vertexSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

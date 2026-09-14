@@ -1,5 +1,5 @@
 //! Offscreen render rail for the native provider (`research/docs/23` §6 Steps 6
-//! and 7).
+//! and 7, §6 Step 3.3 for the vertex-input half).
 //!
 //! The rail answers the one question Step 6 owns on the Apple side: can the
 //! native provider build a colour attachment, a render pass descriptor, a
@@ -10,6 +10,19 @@
 //! alone, [`TraceRenderPlan::writeback`] and [`merge_writebacks`] put the texels
 //! into the same writeback channel a compute pass uses, and `native.rs` calls
 //! both around `encode_offscreen_render`.
+//!
+//! The vertex-input increment adds the caller-held half of the same contract
+//! (`docs/23` §3.3): a pass may bind vertex streams and an index buffer whose
+//! views carry their own bytes, which this rail reads out of the pass itself,
+//! proves the footprint of on the host ([`plan_vertex_input`]) and translates
+//! into an `MTLVertexDescriptor` plus `setVertexBuffer` /
+//! `drawIndexedPrimitives`. Those bytes are uploaded here rather than through the
+//! compute rail's pool, which only carries views a compute binding declares
+//! (`docs/23` §3.6). Two reviewed modules exist for the two shapes — `vertex_id`
+//! positions ([`REVIEWED_SOURCE`]) and `[[stage_in]]` positions
+//! ([`REVIEWED_VERTEX_SOURCE`]) — and the pipeline's [`VertexLayout`] is what
+//! selects which one may compile, so a trace cannot reach source the rail did not
+//! review.
 //!
 //! **The encoder body has still never run on an Apple GPU.** What is
 //! different from the pre-flip state is the evidence: CI run `34774478149`
@@ -36,10 +49,11 @@
 use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
-    AttachmentFormat, BufferView, BufferWriteback, ClearColor, ComputeTrace, ContractError,
-    FieldValue, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, StoreOp,
-    TracePass, ViewId,
+    AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
+    ContractError, FieldValue, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor, LoadOp,
+    PipelineId, PresentDescriptor, PresentMode, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout,
+    ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -47,12 +61,12 @@ use std::collections::BTreeMap;
 use foreign_types::ForeignType;
 #[cfg(target_os = "macos")]
 use metal::{
-    CommandQueue, CompileOptions, Device, IndirectCommandBufferDescriptor, MTLClearColor,
-    MTLCommandBufferStatus, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, MTLViewport, NSRange, NSUInteger,
-    RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
-    RenderPipelineState, Texture, TextureDescriptor,
+    Buffer, CommandQueue, CompileOptions, Device, IndirectCommandBufferDescriptor, MTLClearColor,
+    MTLCommandBufferStatus, MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction,
+    MTLViewport, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
+    RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
@@ -66,6 +80,19 @@ use objc::{msg_send, sel, sel_impl};
 pub(crate) const REVIEWED_SOURCE: &str =
     include_str!("../../../conformance/shaders/render_offscreen_2x2.metal");
 
+/// The reviewed indexed fixture: the same two stages, but the vertex stage
+/// reads its position from `[[stage_in]]`, i.e. from a caller-held vertex
+/// stream, and the pass draws through an index buffer.
+///
+/// A second constant rather than a second entry pair in one module, because the
+/// two shapes need different pipeline state: the `vertex_id` module carries no
+/// `MTLVertexDescriptor` at all, while the indexed one is meaningless without
+/// the descriptor the pass's stream declares. Both files are pinned by exact
+/// bytes for the same reason [`REVIEWED_SOURCE`] is: a matching entry name
+/// cannot establish the footprint of caller-supplied source.
+pub(crate) const REVIEWED_VERTEX_SOURCE: &str =
+    include_str!("../../../conformance/shaders/quad_indexed_2x2.metal");
+
 /// Vertex entry of the reviewed module: positions from `vertex_id`, no vertex
 /// buffer (`VertexLayout::None`).
 pub(crate) const VERTEX_ENTRY: &str = "render_fullscreen_triangle";
@@ -73,11 +100,73 @@ pub(crate) const VERTEX_ENTRY: &str = "render_fullscreen_triangle";
 /// Fragment entry of the reviewed module: the fixed colour texel.
 pub(crate) const FRAGMENT_ENTRY: &str = "render_solid_rgba8";
 
+/// Vertex entry of the reviewed indexed module: the position arrives through
+/// `[[stage_in]]`, i.e. through the vertex descriptor the pipeline carries.
+pub(crate) const QUAD_VERTEX_ENTRY: &str = "render_quad_vertex";
+
+/// One reviewed render module and the vertex-input shape it was written for.
+///
+/// The [`VertexLayout`] of a render pipeline selects the entry: a pipeline
+/// whose layout binds streams can only be the module whose vertex stage reads
+/// `[[stage_in]]`, and a `VertexLayout::None` pipeline can only be the module
+/// that derives positions from `vertex_id`. Both the entry pair and the source
+/// bytes of that one module are then the allowlist, so neither a renamed entry
+/// nor an edited file can execute.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReviewedModule {
+    /// The exact module bytes this rail compiles.
+    pub(crate) source: &'static str,
+    /// The module's path, for refusals and the documentation's sake.
+    pub(crate) path: &'static str,
+    /// The vertex entry the module carries.
+    pub(crate) vertex_entry: &'static str,
+    /// The fragment entry the module carries.
+    pub(crate) fragment_entry: &'static str,
+    /// Whether the module's vertex stage reads a caller-held stream.
+    pub(crate) binds_buffers: bool,
+}
+
+/// The two reviewed modules, one per vertex-input shape.
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 2] = [
+    ReviewedModule {
+        source: REVIEWED_SOURCE,
+        path: "conformance/shaders/render_offscreen_2x2.metal",
+        vertex_entry: VERTEX_ENTRY,
+        fragment_entry: FRAGMENT_ENTRY,
+        binds_buffers: false,
+    },
+    ReviewedModule {
+        source: REVIEWED_VERTEX_SOURCE,
+        path: "conformance/shaders/quad_indexed_2x2.metal",
+        vertex_entry: QUAD_VERTEX_ENTRY,
+        fragment_entry: FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
+];
+
+/// The reviewed module a pipeline's vertex-input shape selects.
+///
+/// Total by construction: [`VertexLayout`] has exactly two variants and
+/// [`REVIEWED_MODULES`] carries exactly one module per variant, so there is no
+/// layout this rail would compile nothing for.
+pub(crate) fn reviewed_module(layout: &VertexLayout) -> &'static ReviewedModule {
+    match layout {
+        VertexLayout::None => &REVIEWED_MODULES[0],
+        VertexLayout::Buffers(_) => &REVIEWED_MODULES[1],
+    }
+}
+
 /// Colour attachments the first render increment admits. The same value the
 /// core contract states (`metal_api_core::provider::MAX_COLOR_ATTACHMENTS`); it
 /// is restated here because a capability value has to be spelled by the provider
 /// that declares it (`research/docs/23` §4.2).
 pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 1;
+
+/// Vertex streams one render pass may bind. The same value the core contract
+/// states (`metal_api_core::provider::MAX_VERTEX_BUFFERS`), restated for the
+/// same reason [`MAX_COLOR_ATTACHMENTS`] is: a capability value belongs to the
+/// provider that declares it (`research/docs/23` §3.3, §4.2).
+pub(crate) const MAX_VERTEX_BUFFERS: u32 = metal_api_core::provider::MAX_VERTEX_BUFFERS as u32;
 
 /// Largest attachment the first milestone renders into: 2x2, so full coverage
 /// stays distinguishable from "one texel was written" (`research/docs/23` §1.3).
@@ -179,6 +268,50 @@ pub(crate) fn present_capability_bits() -> PresentCapabilityBits {
         max_present_targets: MAX_PRESENT_TARGETS,
         supported_present_modes: PresentMode::ADMITTED.to_vec(),
         max_present_image_count: MAX_PRESENT_IMAGE_COUNT,
+    }
+}
+
+/// The vertex-input bits the provider declares, in one value so the macOS
+/// capability snapshot and the host-side unit tests cannot drift.
+///
+/// Split out from the render bits for the same reason the present bits are: the
+/// three values are the *rail's own* limits (as many streams as the contract
+/// caps, and exactly the formats the rail translates into
+/// `MTLVertexFormat` / `MTLIndexType`), so capability admission and this rail
+/// agree by construction instead of by a second list that could drift.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VertexInputCapabilityBits {
+    pub(crate) max_vertex_buffers: u32,
+    pub(crate) supported_vertex_formats: Vec<VertexFormat>,
+    pub(crate) supported_index_formats: Vec<IndexFormat>,
+}
+
+/// The vertex-input bits this provider declares as of the vertex-input flip.
+///
+/// Flip condition (`research/docs/23` §3.3, §6 Step 3.3;
+/// `conformance/RENDER-CAPTURE.md` §8): the Swift oracle's `--vertex-selftest`
+/// on an Apple GPU, i.e. the same shape as the render bits' `--render-selftest`
+/// evidence. That self-test builds the indexed reviewed module, binds the
+/// fixture's `float32x2` stream and `uint16` index buffer through an
+/// `MTLVertexDescriptor`, draws with `drawIndexedPrimitives` and reads the 2x2
+/// attachment back as `4080c0ff` four times, printing `vertex_selftest: PASS
+/// (4080c0ff)`. A green job whose log said `SKIP` is not that evidence: it
+/// reports a runner without an eligible device rather than an executed reviewed
+/// path.
+///
+/// Before the flip these three bits were all at their defaults, so core
+/// admission refused a vertex-bearing trace with `vertex_buffer_limit` /
+/// `index_format_unsupported` instead of executing it with positions the trace
+/// did not ask for; the test below keeps that refusal path pinned on a
+/// constructed pre-flip snapshot. The host-side half this rail owns is
+/// [`plan_vertex_input`]: the stream bytes, the stride and index footprints and
+/// the index values are all proved before a device object exists, and the
+/// remaining Apple-only question is whether Metal executes exactly that plan.
+pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
+    VertexInputCapabilityBits {
+        max_vertex_buffers: MAX_VERTEX_BUFFERS,
+        supported_vertex_formats: VertexFormat::ADMITTED.to_vec(),
+        supported_index_formats: IndexFormat::ADMITTED.to_vec(),
     }
 }
 
@@ -300,6 +433,399 @@ pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, Provider
     }
 }
 
+/// The vertex format this rail hands its `MTLVertexAttributeDescriptor`.
+///
+/// A value of its own rather than `MTLVertexFormat` directly, so the descriptor
+/// translation is host-testable: `MTLVertexFormat` only exists on macOS, while
+/// the binding index, the stride and the attribute offsets are decided here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenderVertexFormat {
+    Float2,
+    Float3,
+    Float4,
+    Uint,
+}
+
+impl RenderVertexFormat {
+    /// Stable spelling used by tests and refusals.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Float2 => "float32x2",
+            Self::Float3 => "float32x3",
+            Self::Float4 => "float32x4",
+            Self::Uint => "uint32",
+        }
+    }
+}
+
+/// Map an admitted vertex format onto the format this rail builds.
+///
+/// Total: `VertexFormat`'s four values are exactly the four
+/// `MTLVertexFormat`s the reviewed rails translate, so a fifth wire code
+/// arriving without a mapping fails to compile here rather than silently
+/// becoming a different descriptor.
+pub(crate) const fn vertex_format(format: VertexFormat) -> RenderVertexFormat {
+    match format {
+        VertexFormat::Float32x2 => RenderVertexFormat::Float2,
+        VertexFormat::Float32x3 => RenderVertexFormat::Float3,
+        VertexFormat::Float32x4 => RenderVertexFormat::Float4,
+        VertexFormat::Uint32 => RenderVertexFormat::Uint,
+    }
+}
+
+/// The index width this rail hands `drawIndexedPrimitives(indexType:)`.
+///
+/// The sibling of [`RenderVertexFormat`]: a host-visible value so the
+/// `IndexFormat` → `MTLIndexType` mapping is testable without a device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenderIndexType {
+    Uint16,
+    Uint32,
+}
+
+impl RenderIndexType {
+    /// Stable spelling used by tests and refusals.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Uint16 => "uint16",
+            Self::Uint32 => "uint32",
+        }
+    }
+
+    /// Bytes one index of this width occupies, restated from the contract value
+    /// the mapping came from so the footprint proof and the width cannot drift.
+    pub(crate) const fn bytes(self) -> u64 {
+        match self {
+            Self::Uint16 => 2,
+            Self::Uint32 => 4,
+        }
+    }
+}
+
+/// Map an admitted index format onto the width this rail draws with. Total for
+/// the same reason [`vertex_format`] is.
+pub(crate) const fn index_type(format: IndexFormat) -> RenderIndexType {
+    match format {
+        IndexFormat::Uint16 => RenderIndexType::Uint16,
+        IndexFormat::Uint32 => RenderIndexType::Uint32,
+    }
+}
+
+/// One vertex attribute as the descriptor builder needs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedVertexAttribute {
+    /// Shader-visible attribute location (`[[attribute(n)]]`).
+    pub(crate) location: u32,
+    /// Byte offset inside one vertex.
+    pub(crate) offset: u64,
+    /// The translated format.
+    pub(crate) format: RenderVertexFormat,
+}
+
+/// One vertex stream the pass binds, resolved before any Metal object exists.
+///
+/// The bytes are the view's own (`BufferSource::OwnedBytes`), i.e. exactly the
+/// `view.length` bytes the trace declared at the view, and `offset` is where
+/// that view starts inside its allocation. The macOS encoder builds one
+/// MTLBuffer with the bytes at that offset and binds it at the same offset, the
+/// convention the compute pool's merged images follow (`native.rs`): a stream
+/// reads the byte range the trace named instead of being silently re-based at
+/// zero.
+#[derive(Debug)]
+pub(crate) struct PlannedVertexStream<'a> {
+    /// Binding index: entry `i` of the pipeline layout is binding `i`, which is
+    /// also its `MTLVertexBufferLayoutDescriptor` index and the
+    /// `setVertexBuffer(_:offset:index:)` index.
+    pub(crate) buffer_index: u32,
+    /// Bytes between consecutive vertices.
+    pub(crate) stride: u64,
+    /// Attributes this stream is read through.
+    pub(crate) attributes: Vec<PlannedVertexAttribute>,
+    /// The view's own bytes.
+    pub(crate) bytes: &'a [u8],
+    /// The view's offset inside its allocation.
+    pub(crate) offset: u64,
+}
+
+/// The index buffer the pass draws through, resolved the same way.
+#[derive(Debug)]
+pub(crate) struct PlannedIndexStream<'a> {
+    /// The view the indices come from.
+    pub(crate) view_id: ViewId,
+    /// The view's own bytes.
+    pub(crate) bytes: &'a [u8],
+    /// The view's offset inside its allocation.
+    pub(crate) offset: u64,
+    /// The translated index width.
+    pub(crate) format: RenderIndexType,
+    /// Indices the draw consumes, i.e. `RenderPassDescriptor::vertices` in the
+    /// indexed shape.
+    pub(crate) index_count: u32,
+    /// The highest index the draw reads plus one: the number of vertices the
+    /// bound streams have to cover for this draw.
+    pub(crate) vertex_span: u64,
+}
+
+/// Resolve a pass's vertex streams and index buffer from the pass itself.
+///
+/// A render input declares its own bytes (`research/docs/23` §3.6): entry `i` of
+/// [`RenderPassDescriptor::vertex_buffers`] is a read-only [`BufferView`] whose
+/// `source` carries the vertices, and an index binding carries its view beside
+/// the width. Neither has to be declared by a compute pass, so this rail uploads
+/// what the pass hands it instead of resolving a name against a pool.
+///
+/// Two rules are checked here because a driver answers both with undefined
+/// behaviour instead of an error:
+///
+/// * the stream's bytes are ones this rail holds (`BufferSource::OwnedBytes`).
+///   The compute rail resolves leases; this one has no lease path, so a leased
+///   stream is refused instead of uploaded from bytes the rail does not have;
+/// * the declared range covers every vertex and index the draw reads (the
+///   footprint proof `research/docs/23` §3.3 asks for: Metal would read past the
+///   buffer, or index a stream out of range, without refusing). Which count the
+///   proof is against depends on the draw: a non-indexed draw reads its vertex
+///   count in order, while an indexed draw reads the vertices its index values
+///   select, so the refusal names the index rather than the stream in that case.
+///
+/// What is *not* checked here is the binding label: the entry's position is the
+/// binding index both rails use, and core admission already holds each view's
+/// own `metal_binding` to it ([`validate_vertex_buffer_binding`]), which `plan`
+/// re-runs before this function.
+fn plan_vertex_input<'a>(
+    pass: &'a RenderPassDescriptor,
+    pipeline: &RenderPipelineContract,
+) -> Result<(Vec<PlannedVertexStream<'a>>, Option<PlannedIndexStream<'a>>), ProviderError> {
+    let mut streams = Vec::with_capacity(pass.vertex_buffers.len());
+    // One layout entry per bound stream, in binding order; core admission
+    // refuses a pass and a layout that disagree about the count
+    // (`ContractError::VertexLayoutBindingMismatch`), which `plan` re-runs
+    // before this function, so the zip covers every bound stream.
+    for (buffer_index, (view, layout)) in pass
+        .vertex_buffers
+        .iter()
+        .zip(pipeline.vertex_layout.buffers())
+        .enumerate()
+    {
+        let bytes = stream_bytes(view, VERTEX_SLUG)?;
+        streams.push(PlannedVertexStream {
+            buffer_index: u32::try_from(buffer_index)
+                .map_err(|_| capability_refusal("vertex_buffer_limit"))?,
+            stride: layout.stride,
+            attributes: layout
+                .attributes
+                .iter()
+                .map(|attribute| PlannedVertexAttribute {
+                    location: attribute.location,
+                    offset: attribute.offset,
+                    format: vertex_format(attribute.format),
+                })
+                .collect(),
+            bytes,
+            offset: view.offset,
+        });
+    }
+    let indices = match &pass.indices {
+        None => None,
+        Some(binding) => Some(plan_index_stream(binding, pass.vertices)?),
+    };
+    match &indices {
+        // An indexed draw reads the vertices its index values select, so each
+        // stream has to cover that span. The refusal names the index that
+        // reached past the stream, because that is what the trace has to change.
+        Some(indices) => {
+            for (buffer_index, stream) in streams.iter().enumerate() {
+                // `stride == 0` cannot reach here (`plan` re-runs the layout
+                // validator), so `checked_div` is only the safe spelling of the
+                // quotient: a zero stride would be refused upstairs rather than
+                // read as an unbounded stream.
+                let covered = u64::try_from(stream.bytes.len())
+                    .unwrap_or(u64::MAX)
+                    .checked_div(stream.stride)
+                    .unwrap_or(0);
+                if indices.vertex_span > covered {
+                    return Err(
+                        index_value_refusal(highest_index(indices.vertex_span), covered)
+                            .with_field(
+                                "buffer_index",
+                                FieldValue::Unsigned(
+                                    u64::try_from(buffer_index).unwrap_or(u64::MAX),
+                                ),
+                            )
+                            .with_field("view", FieldValue::Unsigned(indices.view_id.get())),
+                    );
+                }
+            }
+            // The `vertex_id` shape binds no stream to bound its index values:
+            // the reviewed module generates exactly
+            // `FULL_SCREEN_TRIANGLE_VERTICES` positions, so an index at or above
+            // that count would read a position the module does not carry.
+            if pass.vertex_buffers.is_empty()
+                && indices.vertex_span > u64::from(FULL_SCREEN_TRIANGLE_VERTICES)
+            {
+                return Err(index_value_refusal(
+                    highest_index(indices.vertex_span),
+                    u64::from(FULL_SCREEN_TRIANGLE_VERTICES),
+                )
+                .with_field("view", FieldValue::Unsigned(indices.view_id.get())));
+            }
+        }
+        // A non-indexed draw reads vertices `0..vertices` in order, so every
+        // stream has to cover the pass's own count.
+        None => {
+            for (buffer_index, stream) in streams.iter().enumerate() {
+                // Saturating, because the proof only has to decide whether the
+                // stream covers the count: an unrepresentable product is by
+                // definition larger than any buffer this provider admits.
+                let required = u64::from(pass.vertices).saturating_mul(stream.stride);
+                if u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX) < required {
+                    return Err(vertex_footprint_refusal(
+                        buffer_index,
+                        stream.stride,
+                        required,
+                        stream.bytes.len(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((streams, indices))
+}
+
+/// The highest index value a span of `vertex_span` vertices reads.
+fn highest_index(vertex_span: u64) -> u32 {
+    u32::try_from(vertex_span.saturating_sub(1)).unwrap_or(u32::MAX)
+}
+
+/// The index buffer of one pass, with its footprint and its index values proved.
+///
+/// The bytes are the binding's own view, exactly as a vertex stream's are
+/// ([`plan_vertex_input`]): an index buffer declares its source instead of
+/// naming a view a compute pass happens to carry.
+fn plan_index_stream<'a>(
+    binding: &'a IndexBufferBinding,
+    index_count: u32,
+) -> Result<PlannedIndexStream<'a>, ProviderError> {
+    let view = &binding.view;
+    let bytes = stream_bytes(view, INDEX_SLUG)?;
+    let format = index_type(binding.format);
+    let width = usize::try_from(format.bytes()).unwrap_or(usize::MAX);
+    let needed = usize::try_from(index_count)
+        .ok()
+        .and_then(|count| count.checked_mul(width))
+        .ok_or_else(|| index_footprint_refusal(width, usize::MAX, bytes.len()))?;
+    if bytes.len() < needed {
+        return Err(index_footprint_refusal(width, needed, bytes.len()));
+    }
+    let highest = match format {
+        RenderIndexType::Uint16 => bytes[..needed]
+            .chunks_exact(2)
+            .map(|chunk| u32::from(u16::from_le_bytes([chunk[0], chunk[1]])))
+            .max(),
+        RenderIndexType::Uint32 => bytes[..needed]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .max(),
+    };
+    // `u64`, so an index of `u32::MAX` is a span rather than an overflow: the
+    // footprint proof below refuses it like any other index that reaches past
+    // the streams.
+    let vertex_span = match highest {
+        None => 0,
+        Some(value) => u64::from(value) + 1,
+    };
+    Ok(PlannedIndexStream {
+        view_id: view.view_id,
+        bytes,
+        offset: view.offset,
+        format,
+        index_count,
+        vertex_span,
+    })
+}
+
+/// The bytes of a stream view, or the refusal that names the storage this rail
+/// cannot read.
+fn stream_bytes<'a>(view: &'a BufferView, slug: &'static str) -> Result<&'a [u8], ProviderError> {
+    match &view.source {
+        BufferSource::OwnedBytes(bytes) => Ok(bytes),
+        other => Err(capability_refusal(slug)
+            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+            .with_field(
+                "storage_mode",
+                FieldValue::Text(storage_mode_name(other).to_owned()),
+            )
+            .with_detail(
+                "the render rail binds the bytes a view declares as `OwnedBytes`; a leased \
+                 stream has no path through this rail",
+            )),
+    }
+}
+
+/// The storage modes a stream view can carry, as the refusal spells them.
+fn storage_mode_name(source: &BufferSource) -> &'static str {
+    match source {
+        BufferSource::OwnedBytes(_) => "owned_bytes",
+        BufferSource::StagedLease(_) => "staged_lease",
+        BufferSource::BorrowedNoCopy(_) => "borrowed_no_copy",
+    }
+}
+
+fn vertex_footprint_refusal(
+    buffer_index: usize,
+    stride: u64,
+    covered: u64,
+    available: usize,
+) -> ProviderError {
+    capability_refusal("render_vertex_footprint_unsupported")
+        .with_field(
+            "buffer_index",
+            FieldValue::Unsigned(u64::try_from(buffer_index).unwrap_or(u64::MAX)),
+        )
+        .with_field("stride", FieldValue::Unsigned(stride))
+        .with_field("required_bytes", FieldValue::Unsigned(covered))
+        .with_field(
+            "available_bytes",
+            FieldValue::Unsigned(u64::try_from(available).unwrap_or(u64::MAX)),
+        )
+        .with_detail(
+            "the declared vertex view does not cover every vertex the draw reads; a bound \
+             stream would be read past its end",
+        )
+}
+
+fn index_footprint_refusal(width: usize, required: usize, available: usize) -> ProviderError {
+    capability_refusal("render_index_footprint_unsupported")
+        .with_field(
+            "index_bytes",
+            FieldValue::Unsigned(u64::try_from(width).unwrap_or(u64::MAX)),
+        )
+        .with_field(
+            "required_bytes",
+            FieldValue::Unsigned(u64::try_from(required).unwrap_or(u64::MAX)),
+        )
+        .with_field(
+            "available_bytes",
+            FieldValue::Unsigned(u64::try_from(available).unwrap_or(u64::MAX)),
+        )
+        .with_detail("the declared index view does not cover the indices the draw consumes")
+}
+
+fn index_value_refusal(highest: u32, vertices_covered: u64) -> ProviderError {
+    capability_refusal("render_index_value_out_of_range")
+        .with_field("highest_index", FieldValue::Unsigned(u64::from(highest)))
+        .with_field("vertices_covered", FieldValue::Unsigned(vertices_covered))
+        .with_detail(
+            "an index selects a vertex the bound streams do not cover; the driver would \
+             read outside the stream instead of refusing",
+        )
+}
+
+/// Slug of a vertex stream this rail cannot read.
+const VERTEX_SLUG: &str = "render_vertex_buffer_unsupported";
+
+/// Slug of an index stream this rail cannot read.
+const INDEX_SLUG: &str = "render_index_buffer_unsupported";
+
 /// One offscreen render pass to execute.
 ///
 /// The pass and the pipeline are the core values themselves, so this rail cannot
@@ -310,7 +836,11 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub(crate) pass: &'a RenderPassDescriptor,
     /// The registered render pipeline the pass names.
     pub(crate) pipeline: &'a RenderPipelineContract,
-    /// The MSL module to compile. Only [`REVIEWED_SOURCE`] is accepted.
+    /// The MSL module to compile. The pipeline's [`VertexLayout`] selects which
+    /// reviewed module is the only one accepted here — `vertex_id` positions
+    /// ([`REVIEWED_SOURCE`]) or `[[stage_in]]` positions
+    /// ([`REVIEWED_VERTEX_SOURCE`]) — so a caller cannot pair one shape's
+    /// descriptor with the other shape's module.
     pub(crate) source: &'a str,
     /// Tightly packed texels the attachment already holds, for [`LoadOp::Load`].
     /// Required exactly then, refused for a clear.
@@ -325,6 +855,12 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 /// Everything the encoder needs, decided before the first Metal object exists.
 #[derive(Debug)]
 pub(crate) struct RenderPlan<'a> {
+    /// The reviewed module this plan compiles. The entry pair below is read out
+    /// of the contract, which [`review_contract`] has already compared with the
+    /// module, so the two cannot disagree about what runs.
+    pub(crate) source: &'a str,
+    /// The module's path, for diagnostics.
+    pub(crate) module_path: &'static str,
     pub(crate) vertex_entry: &'a str,
     pub(crate) fragment_entry: &'a str,
     pub(crate) format: RenderPixelFormat,
@@ -335,6 +871,11 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) load: RenderLoadAction,
     pub(crate) store: RenderStoreAction,
     pub(crate) vertices: u32,
+    /// One entry per bound vertex stream, in binding order, with the bytes and
+    /// footprints [`plan_vertex_input`] proved.
+    pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
+    /// The index buffer of an indexed draw, resolved from the pass's own view.
+    pub(crate) indices: Option<PlannedIndexStream<'a>>,
     /// Readback length in bytes: the tightly packed texel extent.
     pub(crate) texel_bytes: usize,
     /// Bytes per attachment row, which is the tight pitch the contract's bytes
@@ -346,17 +887,23 @@ pub(crate) struct RenderPlan<'a> {
 /// Validate a render request against the contract and the rail's own allowlist.
 ///
 /// Runs entirely without a device, so every refusal here is testable on a host
-/// that cannot load Metal.
+/// that cannot load Metal. Nothing outside the request is read: the pass carries
+/// its own streams' bytes and its own attachment, so this call answers the same
+/// way for a trace pass and for the device-level helper's trace-less request.
 pub(crate) fn plan<'a>(
     request: &OffscreenRenderRequest<'a>,
 ) -> Result<RenderPlan<'a>, ProviderError> {
-    // The reviewed (source, entry pair) triple is the rail's whole allowlist.
-    if request.source != REVIEWED_SOURCE {
+    // The pipeline's vertex-input shape selects the one reviewed module this
+    // call may compile; the (module, entry pair) pair is then the whole
+    // allowlist, re-checked by `review_contract` below.
+    let module = reviewed_module(&request.pipeline.vertex_layout);
+    if request.source != module.source {
         return Err(
-            allowlist_refusal("native_render_source_not_reviewed").with_detail(
-                "the rail compiles the bytes of \
-             `conformance/shaders/render_offscreen_2x2.metal` and nothing else",
-            ),
+            allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+                "a {} layout compiles the bytes of `{}` and nothing else",
+                layout_name(&request.pipeline.vertex_layout),
+                module.path
+            )),
         );
     }
     review_contract(request.pipeline)?;
@@ -406,6 +953,10 @@ pub(crate) fn plan<'a>(
             .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
     let load = load_action(attachment.load, format)?;
     let store = store_action(attachment.store)?;
+    // The vertex-input half: the streams with their bytes and their footprints.
+    // Planned after the attachment because a stream is the draw's own input,
+    // exactly as the attachment is its output.
+    let (vertex_streams, indices) = plan_vertex_input(request.pass, request.pipeline)?;
     let initial = match (load, request.initial, request.present) {
         (RenderLoadAction::Clear(_), None, _) => None,
         (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
@@ -428,6 +979,8 @@ pub(crate) fn plan<'a>(
         }
     };
     Ok(RenderPlan {
+        source: module.source,
+        module_path: module.path,
         vertex_entry: request.pipeline.vertex_entry.as_str(),
         fragment_entry: request.pipeline.fragment_entry.as_str(),
         format,
@@ -436,27 +989,47 @@ pub(crate) fn plan<'a>(
         load,
         store,
         vertices: request.pass.vertices,
+        vertex_streams,
+        indices,
         texel_bytes,
         row_pitch,
         initial,
     })
 }
 
+/// The vertex-input shape of a pipeline, as the refusals spell it.
+pub(crate) fn layout_name(layout: &VertexLayout) -> &'static str {
+    match layout {
+        VertexLayout::None => "vertex_id",
+        VertexLayout::Buffers(_) => "vertex-buffer",
+    }
+}
+
 /// The rail's review gate for a render pipeline contract.
 ///
-/// The reviewed module carries exactly one vertex entry and one fragment entry,
-/// so a contract naming anything else is refused with the same slug, class and
-/// phase the compute allowlist gives an unreviewed kernel
-/// (`lib.rs::bounded_contract`, `native_shader_not_allowlisted`): a matching
-/// file name, an edited module or a recompiled one must not be enough to run
-/// different source (`research/docs/23` §6 Step 7). Registration
+/// Each reviewed module carries exactly one vertex entry and one fragment entry,
+/// and the contract's [`VertexLayout`] says which module it may be: a contract
+/// whose layout binds streams has to name the `[[stage_in]]` module's entries,
+/// and a `VertexLayout::None` contract the `vertex_id` module's. Anything else
+/// is refused with the same slug, class and phase the compute allowlist gives
+/// an unreviewed kernel (`lib.rs::bounded_contract`,
+/// `native_shader_not_allowlisted`): a matching file name, an edited module or a
+/// recompiled one must not be enough to run different source
+/// (`research/docs/23` §6 Step 7). Registration
 /// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
 /// so the refusal is reachable before a submission as well as inside one.
 pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
-    if contract.vertex_entry != VERTEX_ENTRY || contract.fragment_entry != FRAGMENT_ENTRY {
+    let module = reviewed_module(&contract.vertex_layout);
+    if contract.vertex_entry != module.vertex_entry
+        || contract.fragment_entry != module.fragment_entry
+    {
         return Err(
             allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
-                "the reviewed module carries {VERTEX_ENTRY:?} and {FRAGMENT_ENTRY:?}"
+                "a {} layout compiles `{}`, which carries {:?} and {:?}",
+                layout_name(&contract.vertex_layout),
+                module.path,
+                module.vertex_entry,
+                module.fragment_entry,
             )),
         );
     }
@@ -673,7 +1246,7 @@ impl TraceRenderPlan<'_> {
 /// Plan every render pass of a trace, without a device.
 ///
 /// Four decisions have to be made before the first Metal object exists, and all
-/// four are answerable from values: the order the rails run in
+/// of them are answerable from values: the order the rails run in
 /// ([`refuse_reordered_render_reads`], whose rule core admission also states as
 /// part of the contract), the reviewed allowlist, the attachment's landing view,
 /// and the load op the trace can carry
@@ -681,7 +1254,9 @@ impl TraceRenderPlan<'_> {
 /// pool the encoder binds, and `contracts` holds the render contracts the
 /// provider registered for the pipeline ids this trace names — a caller-supplied
 /// table entry is checked against those registrations in `native.rs`, where the
-/// registry lives.
+/// registry lives. The pool's only job here is the attachment's landing view: a
+/// render input carries its own bytes, so the streams a draw reads are resolved
+/// from the pass itself ([`plan_vertex_input`]).
 pub(crate) fn plan_trace<'a>(
     trace: &'a ComputeTrace,
     pool: &'a [BufferView],
@@ -696,6 +1271,23 @@ pub(crate) fn plan_trace<'a>(
         let contract = contracts
             .get(&pass.pipeline)
             .ok_or_else(|| unknown_render_pipeline(pass.pipeline))?;
+        // An indirect draw replays its pass through `MTLIndirectRenderCommand`
+        // state, and the first indirect increment builds a command that carries
+        // the pipeline state and the draw counts — not the vertex streams a
+        // caller-held layout reads. A pass that binds one is refused here
+        // rather than replayed from buffers nothing bound (`research/docs/25`
+        // §6 Step 7b; the same slug the ICB rail uses for a shape it cannot
+        // replay).
+        if matches!(
+            trace.indirect.as_ref().map(|indirect| indirect.command),
+            Some(IndirectCommandDescriptor::Draw { .. })
+        ) && (!pass.vertex_buffers.is_empty() || pass.indices.is_some())
+        {
+            return Err(capability_refusal("icb_command_unsupported").with_detail(
+                "an indirect draw replays the vertex_id shape; a pass that binds caller-held \
+                 vertex or index streams is not part of the first indirect increment",
+            ));
+        }
         let Some(attachment) = pass.color_attachments.first() else {
             return Err(contract_refusal(ContractError::EmptyAttachmentList));
         };
@@ -729,7 +1321,7 @@ pub(crate) fn plan_trace<'a>(
         let plan_of_pass = plan(&OffscreenRenderRequest {
             pass,
             pipeline: contract,
-            source: REVIEWED_SOURCE,
+            source: reviewed_module(&contract.vertex_layout).source,
             initial: None,
             present: pass.present.is_some(),
         })?;
@@ -785,6 +1377,13 @@ pub(crate) fn merge_writebacks(
 /// is the Rust provider's own render path in a committed suite, and the macOS
 /// oracle's `--render-selftest` run `34774478149` is the observation behind the
 /// capability flip (`conformance/RENDER-CAPTURE.md` §5, §6).
+///
+/// This entry point has no trace, but a render input carries its own bytes, so a
+/// pass that binds vertex or index streams still executes from the bytes it
+/// declared (`research/docs/23` §3.6). What such a call does not have is an
+/// attachment landing view, which is why the trace path is
+/// [`plan_trace`] + [`encode_offscreen_render`]: the texels of this entry point
+/// are returned to the caller instead of landing in a pooled view.
 #[cfg(target_os = "macos")]
 pub(crate) fn execute_offscreen_render(
     device: &Device,
@@ -848,6 +1447,17 @@ pub(crate) fn encode_indirect_offscreen_render(
     planned: &RenderPlan<'_>,
     replay: &icb::IcbPlan,
 ) -> Result<Vec<u8>, ProviderError> {
+    // `plan_trace` refuses an indirect draw whose pass binds streams, because
+    // the replay shape this rail builds carries the pipeline state and the draw
+    // counts rather than the streams a caller-held layout reads. This is the
+    // same rule one level down, for a caller that reaches the encoder without a
+    // trace plan.
+    if !planned.vertex_streams.is_empty() || planned.indices.is_some() {
+        return Err(capability_refusal("icb_command_unsupported").with_detail(
+            "an indirect draw replays the vertex_id shape; a pass that binds caller-held \
+             vertex or index streams is not part of the first indirect increment",
+        ));
+    }
     objc::rc::autoreleasepool(|| {
         let attachment = attachment_texture(device, planned)?;
         encode_into_and_readback(device, queue, planned, &attachment, Some(*replay))
@@ -893,6 +1503,21 @@ fn encode_into_and_readback(
     let command = queue.new_command_buffer();
     let encoder = command.new_render_command_encoder(pass);
     encoder.set_render_pipeline_state(&pipeline);
+    // The vertex streams the plan resolved, bound at the same indices the
+    // pipeline's `MTLVertexDescriptor` names. The MTLBuffers are kept for the
+    // whole call: they have to outlive the encoder that reads them, and the
+    // plan's bytes do not.
+    let mut stream_buffers = Vec::with_capacity(planned.vertex_streams.len() + 1);
+    for stream in &planned.vertex_streams {
+        let offset = NSUInteger::try_from(stream.offset).unwrap_or(NSUInteger::MAX);
+        let buffer = stream_buffer(device, stream.offset, stream.bytes)?;
+        encoder.set_vertex_buffer(
+            NSUInteger::from(stream.buffer_index),
+            Some(buffer.as_ref()),
+            offset,
+        );
+        stream_buffers.push(buffer);
+    }
     // The viewport is explicit because the contract carries it, even though
     // the first increment only accepts the attachment-covering default.
     encoder.set_viewport(MTLViewport {
@@ -904,7 +1529,28 @@ fn encode_into_and_readback(
         zfar: 1.0,
     });
     match indirect {
-        None => encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices)),
+        None => match &planned.indices {
+            // An indexed draw names its index buffer in the draw call, which is
+            // where Metal takes it: the contract's index binding becomes one
+            // `drawIndexedPrimitives(indexCount:indexType:indexBuffer:
+            // indexBufferOffset:)`, with the count the pass carries in the
+            // indexed shape.
+            Some(indices) => {
+                let offset = NSUInteger::try_from(indices.offset).unwrap_or(NSUInteger::MAX);
+                let buffer = stream_buffer(device, indices.offset, indices.bytes)?;
+                encoder.draw_indexed_primitives(
+                    MTLPrimitiveType::Triangle,
+                    u64::from(indices.index_count),
+                    metal_index_type(indices.format),
+                    buffer.as_ref(),
+                    offset,
+                );
+                stream_buffers.push(buffer);
+            }
+            None => {
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices))
+            }
+        },
         Some(replay) => {
             let icb::IcbCommand::Draw {
                 vertex_count,
@@ -996,6 +1642,36 @@ pub(crate) fn present_target_texture(
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
 
+/// One MTLBuffer holding a stream view's bytes, for a vertex or index binding.
+///
+/// The image is the view's bytes placed at the view's own offset inside its
+/// allocation, and the binding uses that same offset — the convention the
+/// compute pool's merged images follow (`native.rs`: an allocation image is
+/// bound at `view.offset`). For the reviewed fixture the offset is zero, so the
+/// image is exactly the declared bytes; for a view that starts above the
+/// allocation's first byte the stream still reads the byte range the trace
+/// named instead of being silently re-based at zero.
+#[cfg(target_os = "macos")]
+fn stream_buffer(device: &Device, offset: u64, bytes: &[u8]) -> Result<Buffer, ProviderError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| resource_refusal("metal_render_stream_offset_overflow"))?;
+    let end = start
+        .checked_add(bytes.len())
+        .ok_or_else(|| resource_refusal("metal_render_stream_offset_overflow"))?;
+    let mut image = vec![0_u8; end];
+    image[start..end].copy_from_slice(bytes);
+    let pointer: *mut metal::MTLBuffer = unsafe {
+        msg_send![device.as_ref(),
+            newBufferWithBytes:image.as_ptr().cast::<std::ffi::c_void>()
+            length:image.len()
+            options:MTLResourceOptions::StorageModeShared]
+    };
+    if pointer.is_null() {
+        return Err(resource_refusal("metal_render_stream_buffer_failed"));
+    }
+    Ok(unsafe { Buffer::from_ptr(pointer) })
+}
+
 /// Upload tightly packed texels into a texture's whole extent.
 ///
 /// `replace_region` takes the source stride and owns the texture-side layout,
@@ -1039,6 +1715,41 @@ fn render_pipeline_state(
     let descriptor = RenderPipelineDescriptor::new();
     descriptor.set_vertex_function(Some(vertex.as_ref()));
     descriptor.set_fragment_function(Some(fragment.as_ref()));
+    // The vertex descriptor is what makes `[[attribute(n)]]` mean a byte range
+    // of a bound stream: the MSL module names the attribute locations, the
+    // descriptor says which binding, stride, offset and format each one reads.
+    // A `VertexLayout::None` pipeline carries none — its vertex stage takes
+    // `vertex_id` and reads no stream — which is why the descriptor is built
+    // only from a plan that has streams.
+    if !planned.vertex_streams.is_empty() {
+        let vertex_descriptor = VertexDescriptor::new();
+        for stream in &planned.vertex_streams {
+            let layout = vertex_descriptor
+                .layouts()
+                .object_at(NSUInteger::from(stream.buffer_index))
+                .ok_or_else(|| {
+                    resource_refusal("metal_render_vertex_layout_descriptor_unavailable")
+                })?;
+            layout.set_stride(NSUInteger::try_from(stream.stride).unwrap_or(NSUInteger::MAX));
+            // One stream advance per vertex: per-instance step rates are not
+            // part of this increment (`VertexBufferLayout` carries no step
+            // rate), so the descriptor states the only rate it can mean.
+            layout.set_step_function(MTLVertexStepFunction::PerVertex);
+            for attribute in &stream.attributes {
+                let target = vertex_descriptor
+                    .attributes()
+                    .object_at(NSUInteger::from(attribute.location))
+                    .ok_or_else(|| {
+                        resource_refusal("metal_render_vertex_attribute_descriptor_unavailable")
+                    })?;
+                target.set_format(metal_vertex_format(attribute.format));
+                target
+                    .set_offset(NSUInteger::try_from(attribute.offset).unwrap_or(NSUInteger::MAX));
+                target.set_buffer_index(NSUInteger::from(stream.buffer_index));
+            }
+        }
+        descriptor.set_vertex_descriptor(Some(vertex_descriptor));
+    }
     // Attachment 0 is the pass's only colour attachment, and its pixel format is
     // the one the pipeline is compiled against (`render_targets` locations are
     // deferred, `research/docs/23` §3.3).
@@ -1086,6 +1797,29 @@ const fn metal_pixel_format(format: RenderPixelFormat) -> MTLPixelFormat {
     }
 }
 
+/// The `MTLVertexFormat` one planned attribute format names.
+#[cfg(target_os = "macos")]
+const fn metal_vertex_format(format: RenderVertexFormat) -> MTLVertexFormat {
+    match format {
+        RenderVertexFormat::Float2 => MTLVertexFormat::Float2,
+        RenderVertexFormat::Float3 => MTLVertexFormat::Float3,
+        RenderVertexFormat::Float4 => MTLVertexFormat::Float4,
+        // The contract's `uint32` is Metal's scalar `UInt`, not `UInt2`: the
+        // attribute is one 32-bit unsigned integer, and `UInt` is the format
+        // whose width matches `VertexFormat::Uint32::bytes()`.
+        RenderVertexFormat::Uint => MTLVertexFormat::UInt,
+    }
+}
+
+/// The `MTLIndexType` one planned index width names.
+#[cfg(target_os = "macos")]
+const fn metal_index_type(format: RenderIndexType) -> MTLIndexType {
+    match format {
+        RenderIndexType::Uint16 => MTLIndexType::UInt16,
+        RenderIndexType::Uint32 => MTLIndexType::UInt32,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn resource_refusal(slug: &'static str) -> ProviderError {
     refusal(ProviderPhase::Resolve, ProviderErrorClass::Resource, slug)
@@ -1098,9 +1832,11 @@ mod tests {
         AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BufferAccess,
         BufferBindingContract, BufferSource, CompiledComputePipeline, CompletionPolicy,
         ComputePass, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-        FunctionIdentity, FunctionSource, InitialState, OperationId, PipelineContract,
-        PresentTarget, ProviderCapabilities, RenderAttachment, ResourceTableSnapshot,
-        SemanticDigest, StorageMode, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        FunctionIdentity, FunctionSource, IndirectCommandBufferDescriptor, IndirectCommandKind,
+        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, OperationId,
+        PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
+        ResourceTableSnapshot, SemanticDigest, StorageMode, VertexAttribute, VertexBufferLayout,
+        VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -1158,6 +1894,17 @@ mod tests {
         }
     }
 
+    /// [`plan`] for the device-level helper's shape.
+    ///
+    /// The helper has no trace, but a render input carries its own bytes, so
+    /// this is the same call the trace path makes; only the attachment's landing
+    /// view belongs to [`plan_trace`].
+    fn plan_pass<'a>(
+        request: &OffscreenRenderRequest<'a>,
+    ) -> Result<RenderPlan<'a>, ProviderError> {
+        plan(request)
+    }
+
     /// The refusal of a (source, entry pair) triple the rail does not review.
     fn allowlist_refusal(source: &str, vertex: &str, fragment: &str) -> ProviderError {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
@@ -1174,14 +1921,14 @@ mod tests {
             initial: None,
             present: false,
         };
-        plan(&request).map(|_| ()).unwrap_err()
+        plan_pass(&request).map(|_| ()).unwrap_err()
     }
 
     #[test]
     fn plan_accepts_the_milestone_shape_and_fixes_the_readback_extent() {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let pipeline = milestone_pipeline();
-        let planned = plan(&milestone_request(&pass, &pipeline, None)).unwrap();
+        let planned = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap();
         assert_eq!(planned.vertex_entry, VERTEX_ENTRY);
         assert_eq!(planned.fragment_entry, FRAGMENT_ENTRY);
         assert_eq!(planned.format, RenderPixelFormat::Rgba8Unorm);
@@ -1332,7 +2079,7 @@ mod tests {
         attachment.width = 4;
         attachment.height = 4;
         let pipeline = milestone_pipeline();
-        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "attachment_dimension_limit");
         assert_eq!(error.class, ProviderErrorClass::Capability);
     }
@@ -1342,7 +2089,7 @@ mod tests {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let mut pipeline = milestone_pipeline();
         pipeline.color_format = AttachmentFormat::Bgra8Unorm;
-        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "trace_contract_invalid");
         assert_eq!(error.class, ProviderErrorClass::Args);
     }
@@ -1352,7 +2099,7 @@ mod tests {
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
         pass.vertices = 6;
         let pipeline = milestone_pipeline();
-        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "draw_shape_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
     }
@@ -1361,21 +2108,22 @@ mod tests {
     fn load_requires_the_previous_texels_and_clear_refuses_them() {
         let pass = milestone_pass(LoadOp::Load);
         let pipeline = milestone_pipeline();
-        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "render_attachment_initial_mismatch");
         assert_eq!(error.class, ProviderErrorClass::Args);
 
         let previous = [0x11_u8; 16];
-        let planned = plan(&milestone_request(&pass, &pipeline, Some(&previous))).unwrap();
+        let planned = plan_pass(&milestone_request(&pass, &pipeline, Some(&previous))).unwrap();
         assert_eq!(planned.load, RenderLoadAction::Load);
         assert_eq!(planned.initial, Some(previous.as_slice()));
 
         let short = [0x11_u8; 15];
-        let error = plan(&milestone_request(&pass, &pipeline, Some(&short))).unwrap_err();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, Some(&short))).unwrap_err();
         assert_eq!(error.slug, "render_attachment_initial_mismatch");
 
         let cleared = milestone_pass(LoadOp::Clear(sentinel()));
-        let error = plan(&milestone_request(&cleared, &pipeline, Some(&previous))).unwrap_err();
+        let error =
+            plan_pass(&milestone_request(&cleared, &pipeline, Some(&previous))).unwrap_err();
         assert_eq!(error.slug, "render_attachment_initial_mismatch");
     }
 
@@ -1385,7 +2133,7 @@ mod tests {
     fn a_cleared_attachment_cannot_imitate_the_fragment_output() {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let pipeline = milestone_pipeline();
-        let planned = plan(&milestone_request(&pass, &pipeline, None)).unwrap();
+        let planned = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap();
         let RenderLoadAction::Clear(components) = planned.load else {
             panic!("the milestone clears its attachment");
         };
@@ -1472,16 +2220,7 @@ mod tests {
                 entry_name: VERTEX_ENTRY.to_owned(),
                 source: FunctionSource::MetalSource,
             },
-            contract: PipelineContract {
-                dispatch_kind: DispatchKind::ThreadsExact,
-                required_local_size: None,
-                fixed_grid: None,
-                push_constant_offset: 0,
-                push_constant_bytes: 0,
-                buffer_bindings: Vec::new(),
-                shader_capabilities: Vec::new(),
-                translator_revision: None,
-            },
+            contract: render_table_contract(),
             render: Some(RenderPipelineContract {
                 vertex_entry: VERTEX_ENTRY.to_owned(),
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
@@ -1554,6 +2293,15 @@ mod tests {
     /// The capability snapshot the macOS provider builds, with the render bits
     /// taken from the value under test and the compute bits from `native.rs`.
     fn capabilities(bits: &RenderCapabilityBits) -> ProviderCapabilities {
+        capabilities_with(bits, &vertex_input_capability_bits())
+    }
+
+    /// The same snapshot with the vertex-input bits spelled out, so a test can
+    /// construct the pre-flip declaration (`native.rs` takes both from the rail).
+    fn capabilities_with(
+        bits: &RenderCapabilityBits,
+        vertex: &VertexInputCapabilityBits,
+    ) -> ProviderCapabilities {
         ProviderCapabilities {
             max_passes: 8,
             supports_threads_exact: true,
@@ -1574,9 +2322,9 @@ mod tests {
             max_color_attachments: bits.max_color_attachments,
             max_attachment_dimension: bits.max_attachment_dimension,
             supported_color_formats: bits.supported_color_formats.clone(),
-            max_vertex_buffers: 0,
-            supported_vertex_formats: Vec::new(),
-            supported_index_formats: Vec::new(),
+            max_vertex_buffers: vertex.max_vertex_buffers,
+            supported_vertex_formats: vertex.supported_vertex_formats.clone(),
+            supported_index_formats: vertex.supported_index_formats.clone(),
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -1594,6 +2342,336 @@ mod tests {
     /// The registrations `plan_trace` resolves the trace's pipeline ids against.
     fn milestone_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
         BTreeMap::from([(PipelineId::new(3), milestone_pipeline())])
+    }
+
+    /// The vertex-input fixture's identities: one 32-byte vertex stream
+    /// (`view` 21 inside allocation 12) and one 12-byte index buffer (`view` 22
+    /// inside allocation 13). Both are separate whole-allocation views, the
+    /// shape the reviewed fixture declares, so the rail's footprint proof is
+    /// stated against the bytes the trace itself carries.
+    const QUAD_VERTEX_VIEW: ViewId = ViewId::new(21);
+    const QUAD_VERTEX_ALLOCATION: AllocationId = AllocationId::new(12);
+    const QUAD_INDEX_VIEW: ViewId = ViewId::new(22);
+    const QUAD_INDEX_ALLOCATION: AllocationId = AllocationId::new(13);
+    /// The reviewed quad pipeline's id: one counter with the render rail's other
+    /// registration, so 3 stays the milestone's triangle.
+    const QUAD_PIPELINE: PipelineId = PipelineId::new(4);
+
+    /// The four NDC corners of the reviewed quad, as the 32 little-endian
+    /// `float32x2` bytes the stream holds.
+    fn quad_vertex_bytes() -> Vec<u8> {
+        let corners: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
+        let mut bytes = Vec::with_capacity(32);
+        for corner in corners {
+            for component in corner {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// The six `uint16` indices that select the quad's two triangles: (0,1,2)
+    /// and (2,1,3), i.e. 12 little-endian bytes covering all four vertices.
+    fn quad_index_bytes() -> Vec<u8> {
+        let indices: [u16; 6] = [0, 1, 2, 2, 1, 3];
+        indices
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>()
+    }
+
+    /// The reviewed vertex stream as the render pass declares it: a read-only
+    /// view at binding 0 whose `source` carries the four NDC corners
+    /// (`RenderPassDescriptor::vertex_buffers`).
+    fn quad_vertex_view() -> BufferView {
+        let bytes = quad_vertex_bytes();
+        BufferView {
+            view_id: QUAD_VERTEX_VIEW,
+            metal_binding: 0,
+            allocation_id: QUAD_VERTEX_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(bytes.len()).expect("the fixture's lengths fit u64"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        }
+    }
+
+    /// The reviewed index buffer: the same shape one level over, with the
+    /// `metal_binding` an index binding always carries
+    /// (`IndexBufferBinding::validate_shape` refuses any other value).
+    fn quad_index_view() -> BufferView {
+        let bytes = quad_index_bytes();
+        BufferView {
+            view_id: QUAD_INDEX_VIEW,
+            metal_binding: 0,
+            allocation_id: QUAD_INDEX_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(bytes.len()).expect("the fixture's lengths fit u64"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        }
+    }
+
+    /// The reviewed indexed pipeline contract: one `float32x2` stream,
+    /// `[[stage_in]]` positions.
+    fn quad_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: QUAD_VERTEX_ENTRY.to_owned(),
+            fragment_entry: FRAGMENT_ENTRY.to_owned(),
+            color_format: AttachmentFormat::Rgba8Unorm,
+            vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                stride: 8,
+                attributes: vec![VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            }]),
+        }
+    }
+
+    /// The reviewed indexed pass: the same 2x2 attachment, six indices over the
+    /// bound stream.
+    fn quad_pass() -> RenderPassDescriptor {
+        RenderPassDescriptor {
+            pipeline: QUAD_PIPELINE,
+            color_attachments: vec![RenderAttachment {
+                view_id: ViewId::new(7),
+                allocation_id: AllocationId::new(9),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                load: LoadOp::Clear(sentinel()),
+                store: StoreOp::Store,
+            }],
+            viewport: [0, 0, 2, 2],
+            vertices: 6,
+            vertex_buffers: vec![quad_vertex_view()],
+            indices: Some(IndexBufferBinding {
+                view: quad_index_view(),
+                format: IndexFormat::Uint16,
+            }),
+            present: None,
+        }
+    }
+
+    /// The compute pass that declares the attachment view and both streams.
+    ///
+    /// The attachment lands through view 7, which only a compute declaration
+    /// puts into the serial pool, so this pass is what makes the landing view
+    /// real. The two streams are declared here as well — with the pass's own
+    /// stream bytes, which core admission requires to agree with the render
+    /// pass's views for the same identity — even though the render rail no
+    /// longer needs a declaration to read them.
+    fn quad_declaration_pass() -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(11),
+            buffers: vec![
+                BufferView {
+                    view_id: ViewId::new(7),
+                    metal_binding: 0,
+                    allocation_id: AllocationId::new(9),
+                    offset: 0,
+                    length: 16,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xfe; 16]),
+                },
+                BufferView {
+                    metal_binding: 1,
+                    ..quad_vertex_view()
+                },
+                BufferView {
+                    metal_binding: 2,
+                    ..quad_index_view()
+                },
+            ],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The declaration pass's compute registration: three read-only bindings
+    /// whose static footprints are exactly the views' own lengths.
+    fn quad_declaration_pipeline() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(11),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-vertex-fixture", vec![11]).unwrap(),
+                entry_name: "declares_the_render_views".to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: PipelineContract {
+                dispatch_kind: DispatchKind::ThreadsExact,
+                required_local_size: None,
+                fixed_grid: None,
+                push_constant_offset: 0,
+                push_constant_bytes: 0,
+                buffer_bindings: vec![
+                    BufferBindingContract {
+                        metal_binding: 0,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 16 },
+                    },
+                    BufferBindingContract {
+                        metal_binding: 1,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 32 },
+                    },
+                    BufferBindingContract {
+                        metal_binding: 2,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 12 },
+                    },
+                ],
+                shader_capabilities: Vec::new(),
+                translator_revision: None,
+            },
+            render: None,
+        }
+    }
+
+    /// The trace-table entry of the quad registration, minted the way
+    /// `NativeMetalProvider::register_render_pipeline` mints it.
+    fn quad_table_entry() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: QUAD_PIPELINE,
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-vertex-fixture", vec![4]).unwrap(),
+                entry_name: QUAD_VERTEX_ENTRY.to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: render_table_contract(),
+            render: Some(quad_pipeline()),
+        }
+    }
+
+    /// The trace-table entry's compute half: the most permissive exact-thread
+    /// contract, which no render pass reads as a compute contract.
+    fn render_table_contract() -> PipelineContract {
+        PipelineContract {
+            dispatch_kind: DispatchKind::ThreadsExact,
+            required_local_size: None,
+            fixed_grid: None,
+            push_constant_offset: 0,
+            push_constant_bytes: 0,
+            buffer_bindings: Vec::new(),
+            shader_capabilities: Vec::new(),
+            translator_revision: None,
+        }
+    }
+
+    /// The vertex-input fixture's trace and resource namespace: the declaration
+    /// pass, then the indexed render pass.
+    fn quad_trace() -> (ComputeTrace, ResourceTableSnapshot) {
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(2),
+            pipelines: vec![quad_declaration_pipeline(), quad_table_entry()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(quad_declaration_pass()),
+                TracePass::Render(quad_pass()),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        for (allocation, size) in [
+            (AllocationId::new(9), 16),
+            (QUAD_VERTEX_ALLOCATION, 32),
+            (QUAD_INDEX_ALLOCATION, 12),
+        ] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(3),
+                    size,
+                })
+                .unwrap();
+        }
+        (trace, resources)
+    }
+
+    /// The registrations `plan_trace` resolves the vertex-input trace against.
+    fn quad_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
+        BTreeMap::from([(QUAD_PIPELINE, quad_pipeline())])
+    }
+
+    /// The request the trace path builds for the reviewed indexed pass.
+    fn quad_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_VERTEX_SOURCE,
+            initial: None,
+            present: false,
+        }
+    }
+
+    /// Shrink a declared stream to `length` bytes, keeping the view's shape
+    /// self-consistent so a footprint refusal is the only rule that can fire.
+    fn shorten(view: &mut BufferView, length: u64) {
+        let BufferSource::OwnedBytes(bytes) = &view.source else {
+            panic!("the fixture's streams are owned bytes");
+        };
+        let end = usize::try_from(length).expect("the fixture's lengths fit a host usize");
+        view.length = length;
+        view.source = BufferSource::OwnedBytes(bytes[..end].to_vec());
+    }
+
+    /// Replace a declared stream's bytes and length together, for the index
+    /// values a footprint test wants to vary.
+    fn replace_bytes(view: &mut BufferView, bytes: Vec<u8>) {
+        view.length = u64::try_from(bytes.len()).expect("the fixture's lengths fit u64");
+        view.source = BufferSource::OwnedBytes(bytes);
+    }
+
+    /// The `vertex_id` milestone pass with an index buffer bound to it: three
+    /// indices select through the module's three generated positions, which is
+    /// the shape core admission states for a pass with indices and no stream
+    /// (`RenderPassDescriptor::validate`).
+    ///
+    /// The index bytes travel in the binding's own view, so the serial pool this
+    /// trace returns is the compute declaration's — view 7, the attachment's
+    /// landing view — and holds no stream at all.
+    fn vertex_id_indexed_trace(indices: [u16; 3]) -> (ComputeTrace, Vec<BufferView>) {
+        let index_bytes = indices
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>();
+        let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the milestone fixture ends with its render pass");
+        };
+        pass.indices = Some(IndexBufferBinding {
+            view: BufferView {
+                view_id: QUAD_INDEX_VIEW,
+                metal_binding: 0,
+                allocation_id: QUAD_INDEX_ALLOCATION,
+                offset: 0,
+                length: u64::try_from(index_bytes.len()).expect("the fixture's lengths fit u64"),
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(index_bytes),
+            },
+            format: IndexFormat::Uint16,
+        });
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        (trace, pool)
     }
 
     /// The trace's table entry and the registry have to carry the same render
@@ -1897,5 +2975,527 @@ mod tests {
         };
         let merged = merge_writebacks(vec![later_view.clone(), attachment], vec![rendered.clone()]);
         assert_eq!(merged, vec![rendered, later_view]);
+    }
+
+    /// The vertex-input bits the provider declares have to be the rail's own
+    /// limits, and core admission has to admit exactly the trace the rail plans
+    /// — the same agreement the render and present bits are held to. The
+    /// pre-flip snapshot is the falsifiable half: with the three bits at their
+    /// defaults the same trace is refused during admission instead of being
+    /// executed with positions the trace did not ask for.
+    #[test]
+    fn declared_vertex_input_bits_admit_what_the_rail_plans() {
+        let bits = vertex_input_capability_bits();
+        assert_eq!(bits.max_vertex_buffers, MAX_VERTEX_BUFFERS);
+        // The rail's limits are core's own values, not a second spelling that
+        // could drift from the contract's.
+        assert_eq!(
+            bits.max_vertex_buffers,
+            u32::try_from(metal_api_core::provider::MAX_VERTEX_BUFFERS).unwrap()
+        );
+        assert_eq!(
+            bits.supported_vertex_formats,
+            VertexFormat::ADMITTED.to_vec()
+        );
+        assert_eq!(bits.supported_index_formats, IndexFormat::ADMITTED.to_vec());
+        // The four translated formats and both index widths are the whole
+        // admitted set, which is what makes the mapping total.
+        assert_eq!(
+            bits.supported_vertex_formats.len(),
+            VertexFormat::ADMITTED.len()
+        );
+        assert_eq!(
+            bits.supported_index_formats.len(),
+            IndexFormat::ADMITTED.len()
+        );
+
+        let (trace, resources) = quad_trace();
+        capabilities(&capability_bits())
+            .admit(&trace, &resources)
+            .expect("the declared bits admit the vertex-input trace");
+
+        // Closed stream count: the pass's binding is refused before its formats
+        // are read, which is the order capability admission documents.
+        let mut closed = vertex_input_capability_bits();
+        closed.max_vertex_buffers = 0;
+        let refused = capabilities_with(&capability_bits(), &closed)
+            .admit(&trace, &resources)
+            .unwrap_err();
+        assert_eq!(refused.slug, "vertex_buffer_limit");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // Closed index widths: the same trace, refused one gate later.
+        let mut no_indices = vertex_input_capability_bits();
+        no_indices.supported_index_formats = Vec::new();
+        let refused = capabilities_with(&capability_bits(), &no_indices)
+            .admit(&trace, &resources)
+            .unwrap_err();
+        assert_eq!(refused.slug, "index_format_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+        // Closed vertex formats: the layout's attribute format is the fact this
+        // gate reads, after the pass and the layout already agreed.
+        let mut no_formats = vertex_input_capability_bits();
+        no_formats.supported_vertex_formats = Vec::new();
+        let refused = capabilities_with(&capability_bits(), &no_formats)
+            .admit(&trace, &resources)
+            .unwrap_err();
+        assert_eq!(refused.slug, "vertex_format_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+    }
+
+    /// The descriptor translation: what the rail hands Metal is the layout's
+    /// binding order, stride and attributes, plus the digits' formats and the
+    /// index width. Every value here is what the macOS encoder writes into its
+    /// `MTLVertexDescriptor` and its draw call.
+    #[test]
+    fn plan_translates_the_indexed_layout_into_a_descriptor_plan() {
+        let pass = quad_pass();
+        let pipeline = quad_pipeline();
+        let planned = plan(&quad_request(&pass, &pipeline)).expect("the reviewed pass plans");
+
+        assert_eq!(planned.source, REVIEWED_VERTEX_SOURCE);
+        assert_eq!(
+            planned.module_path,
+            "conformance/shaders/quad_indexed_2x2.metal"
+        );
+        assert_eq!(planned.vertex_entry, QUAD_VERTEX_ENTRY);
+        assert_eq!(planned.fragment_entry, FRAGMENT_ENTRY);
+        assert_eq!(planned.vertices, 6);
+
+        let [stream] = planned.vertex_streams.as_slice() else {
+            panic!("the reviewed layout binds one stream");
+        };
+        assert_eq!(stream.buffer_index, 0);
+        assert_eq!(stream.stride, 8);
+        assert_eq!(
+            stream.attributes,
+            vec![PlannedVertexAttribute {
+                location: 0,
+                offset: 0,
+                format: RenderVertexFormat::Float2,
+            }]
+        );
+        assert_eq!(stream.offset, 0);
+        assert_eq!(stream.bytes, quad_vertex_bytes());
+
+        let indices = planned.indices.as_ref().expect("the pass is indexed");
+        assert_eq!(indices.format, RenderIndexType::Uint16);
+        assert_eq!(indices.index_count, 6);
+        assert_eq!(indices.vertex_span, 4);
+        assert_eq!(indices.offset, 0);
+        assert_eq!(indices.bytes, quad_index_bytes());
+
+        // The format mappings the encoder reads these values through.
+        for (format, expected) in [
+            (VertexFormat::Float32x2, RenderVertexFormat::Float2),
+            (VertexFormat::Float32x3, RenderVertexFormat::Float3),
+            (VertexFormat::Float32x4, RenderVertexFormat::Float4),
+            (VertexFormat::Uint32, RenderVertexFormat::Uint),
+        ] {
+            assert_eq!(vertex_format(format), expected);
+        }
+        assert_eq!(RenderVertexFormat::Float2.name(), "float32x2");
+        assert_eq!(RenderVertexFormat::Float3.name(), "float32x3");
+        assert_eq!(RenderVertexFormat::Float4.name(), "float32x4");
+        assert_eq!(RenderVertexFormat::Uint.name(), "uint32");
+        for (format, expected) in [
+            (IndexFormat::Uint16, RenderIndexType::Uint16),
+            (IndexFormat::Uint32, RenderIndexType::Uint32),
+        ] {
+            assert_eq!(index_type(format), expected);
+            // The footprint proof and the draw's width read the same value.
+            assert_eq!(expected.bytes(), format.bytes());
+        }
+        assert_eq!(RenderIndexType::Uint16.name(), "uint16");
+        assert_eq!(RenderIndexType::Uint32.name(), "uint32");
+    }
+
+    /// A stream's bytes travel with the pass, so the rail needs no compute
+    /// declaration to read them (`research/docs/23` §3.6) — what it does need is
+    /// bytes it holds, which a lease-backed view does not carry here.
+    #[test]
+    fn plan_refuses_a_stream_whose_bytes_this_rail_does_not_hold() {
+        // The reviewed pass with its stream bytes declared by no pass at all: the
+        // device-level helper's shape, which the vertex-input increment admits.
+        let pass = quad_pass();
+        let pipeline = quad_pipeline();
+        let planned = plan_pass(&quad_request(&pass, &pipeline))
+            .expect("a render input carries its own bytes");
+        assert_eq!(planned.vertex_streams[0].bytes, quad_vertex_bytes());
+        assert_eq!(
+            planned.indices.as_ref().map(|indices| indices.bytes),
+            Some(quad_index_bytes().as_slice())
+        );
+
+        // A lease-backed view carries bytes this rail does not hold: the render
+        // path has no lease resolver, so the stream is refused by name and the
+        // storage mode it arrived with is part of the refusal.
+        let mut leased_pass = quad_pass();
+        leased_pass.vertex_buffers[0].source = BufferSource::StagedLease(LeaseId::new(5));
+        let error = plan(&quad_request(&leased_pass, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_vertex_buffer_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(QUAD_VERTEX_VIEW.get()))
+        );
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
+
+        // The index half is refused under its own slug, so a capture can tell
+        // which of the two inputs the rail could not read.
+        let mut borrowed_pass = quad_pass();
+        borrowed_pass.indices.as_mut().unwrap().view.source =
+            BufferSource::BorrowedNoCopy(LeaseId::new(6));
+        let error = plan(&quad_request(&borrowed_pass, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_index_buffer_unsupported");
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+    }
+
+    /// The footprint proof `research/docs/23` §3.3 asks for: every vertex and
+    /// every index the draw reads has to be inside the bytes the trace
+    /// declared, and every index value has to select a vertex the streams
+    /// cover. Metal reads past a short buffer without refusing, so the rail
+    /// refuses first.
+    ///
+    /// For an indexed draw the stream-coverage rule and the index-value rule
+    /// are the same condition (`stride * (highest + 1) <= bytes`), so the
+    /// refusal names the index that reached past the stream; the stream's own
+    /// footprint is the refusal a non-indexed draw gets, where the pass's count
+    /// is the only bound.
+    #[test]
+    fn plan_refuses_a_stream_that_does_not_cover_the_draw() {
+        // 24 bytes cover three of the four vertices the index values select.
+        let mut short_stream = quad_pass();
+        shorten(&mut short_stream.vertex_buffers[0], 24);
+        let error = plan(&quad_request(&short_stream, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_index_value_out_of_range");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("highest_index"),
+            Some(&FieldValue::Unsigned(3))
+        );
+        assert_eq!(
+            error.fields.get("vertices_covered"),
+            Some(&FieldValue::Unsigned(3))
+        );
+        assert_eq!(
+            error.fields.get("buffer_index"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // A non-indexed draw reads its vertex count in order, so the same
+        // stream has to cover `vertices * stride` instead of the index span.
+        let mut non_indexed = quad_pass();
+        non_indexed.indices = None;
+        non_indexed.vertices = 4;
+        shorten(&mut non_indexed.vertex_buffers[0], 24);
+        let error = plan(&quad_request(&non_indexed, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_vertex_footprint_unsupported");
+        assert_eq!(
+            error.fields.get("required_bytes"),
+            Some(&FieldValue::Unsigned(32))
+        );
+
+        // 10 bytes cannot hold the six `uint16` indices.
+        let mut short_indices = quad_pass();
+        shorten(&mut short_indices.indices.as_mut().unwrap().view, 10);
+        let error = plan(&quad_request(&short_indices, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_index_footprint_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("required_bytes"),
+            Some(&FieldValue::Unsigned(12))
+        );
+
+        // An index value at or above the four vertices the stream covers.
+        let mut out_of_range = quad_pass();
+        replace_bytes(
+            &mut out_of_range.indices.as_mut().unwrap().view,
+            [0_u16, 1, 2, 2, 1, 9]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        );
+        let error = plan(&quad_request(&out_of_range, &quad_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_index_value_out_of_range");
+        assert_eq!(
+            error.fields.get("highest_index"),
+            Some(&FieldValue::Unsigned(9)),
+            "the refusal names the largest index value the draw reads"
+        );
+        assert_eq!(
+            error.fields.get("vertices_covered"),
+            Some(&FieldValue::Unsigned(4)),
+            "the refusal names the vertices the stream covers"
+        );
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(QUAD_INDEX_VIEW.get()))
+        );
+    }
+
+    /// The `vertex_id` shape indexed through a buffer instead of drawn in
+    /// order: the same reviewed module, three indices over three generated
+    /// positions. Its index values are bounded by the module's own positions,
+    /// because no stream carries a vertex count.
+    #[test]
+    fn an_indexed_vertex_id_draw_is_bounded_by_the_modules_positions() {
+        let (trace, pool) = vertex_id_indexed_trace([0, 1, 2]);
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("three indices over three generated positions plan");
+        let [planned] = planned.as_slice() else {
+            panic!("the computed milestone trace carries one render pass");
+        };
+        assert!(planned.plan.vertex_streams.is_empty());
+        let indices = planned.plan.indices.as_ref().expect("the pass is indexed");
+        assert_eq!(indices.index_count, 3);
+        assert_eq!(indices.vertex_span, 3);
+
+        // The fourth position the module does not carry is refused by value,
+        // before a driver would read it.
+        let (trace, pool) = vertex_id_indexed_trace([0, 1, 9]);
+        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_index_value_out_of_range");
+        assert_eq!(
+            error.fields.get("highest_index"),
+            Some(&FieldValue::Unsigned(9))
+        );
+        assert_eq!(
+            error.fields.get("vertices_covered"),
+            Some(&FieldValue::Unsigned(u64::from(
+                FULL_SCREEN_TRIANGLE_VERTICES
+            )))
+        );
+    }
+
+    /// The trace path over the vertex-input fixture: the same plan the macOS
+    /// encoder consumes. The streams carry their own bytes, so only the
+    /// attachment's landing view comes from the serial pool, and the writeback
+    /// lands where the trace declared it.
+    #[test]
+    fn plan_trace_plans_the_indexed_pass_and_its_landing_view() {
+        let (trace, _) = quad_trace();
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = quad_contracts();
+        let planned =
+            plan_trace(&trace, &pool, &contracts).expect("the reviewed indexed pass plans");
+        assert_eq!(planned.len(), 1);
+        let [planned] = planned.as_slice() else {
+            panic!("the vertex-input trace carries one render pass");
+        };
+        assert_eq!(planned.contract, &quad_pipeline());
+        assert_eq!(planned.plan.vertices, 6);
+        assert_eq!(planned.plan.vertex_streams.len(), 1);
+        assert_eq!(planned.plan.vertex_streams[0].bytes, quad_vertex_bytes());
+        assert_eq!(
+            planned
+                .plan
+                .indices
+                .as_ref()
+                .map(|indices| indices.index_count),
+            Some(6)
+        );
+        assert_eq!(planned.landing.view_id, ViewId::new(7));
+        assert_eq!(planned.landing.allocation_id, AllocationId::new(9));
+        let writeback = planned.writeback(EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(writeback.view_id, ViewId::new(7));
+        assert_eq!(writeback.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+    }
+
+    /// A render input carries its own bytes, so the trace does not have to
+    /// declare the streams through a compute binding (`research/docs/23` §3.6).
+    /// What the pool — the compute rail's binding set — still carries is the
+    /// attachment's landing view, which is why this trace keeps exactly one
+    /// declaration and still plans the draw.
+    #[test]
+    fn a_trace_plans_streams_no_compute_binding_declares() {
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(2),
+            pipelines: vec![declaration_pipeline(), quad_table_entry()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(declaration_pass()),
+                TracePass::Render(quad_pass()),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        trace
+            .validate()
+            .expect("the declaration pass declares the attachment only");
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        assert_eq!(
+            pool.iter().map(|view| view.view_id).collect::<Vec<_>>(),
+            vec![ViewId::new(7)],
+            "neither stream is part of the compute rail's binding set"
+        );
+
+        let contracts = quad_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts).expect("the draw plans");
+        let [planned] = planned.as_slice() else {
+            panic!("the vertex-input trace carries one render pass");
+        };
+        assert_eq!(planned.plan.vertex_streams[0].bytes, quad_vertex_bytes());
+        assert_eq!(
+            planned.plan.indices.as_ref().map(|indices| indices.bytes),
+            Some(quad_index_bytes().as_slice())
+        );
+    }
+
+    /// An indirect draw replays its pass through `MTLIndirectRenderCommand`
+    /// state, which carries the pipeline state and the draw counts rather than
+    /// the streams a caller-held layout reads: the shape is refused before any
+    /// Metal object exists, with the slug the ICB rail uses for a replay it
+    /// cannot build.
+    #[test]
+    fn plan_trace_refuses_an_indirect_draw_of_a_stream_pass() {
+        let (mut trace, _) = quad_trace();
+        trace.indirect = Some(Box::new(IndirectCommandPayload {
+            buffer: IndirectCommandBufferDescriptor {
+                max_commands: 1,
+                kinds: vec![IndirectCommandKind::Draw],
+            },
+            command: IndirectCommandDescriptor::Draw {
+                vertex_count: 6,
+                instance_count: 1,
+            },
+            range: IndirectCommandRange { start: 0, count: 1 },
+        }));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let error = plan_trace(&trace, &pool, &quad_contracts()).unwrap_err();
+        assert_eq!(error.slug, "icb_command_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+    }
+
+    /// The reviewed allowlist is a pair of (module, layout): a layout that binds
+    /// streams may only compile the `[[stage_in]]` module, and a `vertex_id`
+    /// pipeline only the module whose vertex stage reads no stream. A caller
+    /// cannot pair one shape's descriptor with the other shape's source.
+    #[test]
+    fn a_vertex_layout_selects_the_reviewed_module() {
+        let pass = quad_pass();
+        let pipeline = quad_pipeline();
+
+        assert_eq!(reviewed_module(&VertexLayout::None).source, REVIEWED_SOURCE);
+        assert_eq!(
+            reviewed_module(&pipeline.vertex_layout).source,
+            REVIEWED_VERTEX_SOURCE
+        );
+        assert!(!reviewed_module(&VertexLayout::None).binds_buffers);
+        assert!(reviewed_module(&pipeline.vertex_layout).binds_buffers);
+        assert_eq!(layout_name(&VertexLayout::None), "vertex_id");
+        assert_eq!(layout_name(&pipeline.vertex_layout), "vertex-buffer");
+
+        // The reviewed contract is accepted, and so is the milestone's.
+        assert_eq!(review_contract(&pipeline), Ok(()));
+        assert_eq!(review_contract(&quad_pipeline()), Ok(()));
+
+        // A stream layout with the `vertex_id` module's bytes, and the reverse.
+        let crossed = OffscreenRenderRequest {
+            source: REVIEWED_SOURCE,
+            ..quad_request(&pass, &pipeline)
+        };
+        let error = plan(&crossed).unwrap_err();
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Compile);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("vertex-buffer layout")),
+            "the refusal names the layout the source was paired with: {:?}",
+            error.detail
+        );
+
+        let milestone = milestone_pipeline();
+        let milestone_pass = milestone_pass(LoadOp::Clear(sentinel()));
+        let crossed = OffscreenRenderRequest {
+            source: REVIEWED_VERTEX_SOURCE,
+            ..milestone_request(&milestone_pass, &milestone, None)
+        };
+        let error = plan_pass(&crossed).unwrap_err();
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
+
+        // The entry pair is checked against the selected module too: the
+        // indexed entries with a `vertex_id` layout are not a reviewed pair.
+        let mut wrong_entry = milestone_pipeline();
+        wrong_entry.vertex_entry = QUAD_VERTEX_ENTRY.to_owned();
+        let error = review_contract(&wrong_entry).unwrap_err();
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
+        assert_eq!(
+            error
+                .detail
+                .as_deref()
+                .map(|detail| detail.contains(VERTEX_ENTRY)),
+            Some(true)
+        );
+    }
+
+    /// The indexed fixture is held to the same two falsifiability rules the
+    /// `vertex_id` fixture is: the fragment writes a byte/255 texel with no
+    /// half-integer tie, and the module carries exactly the reviewed entries.
+    #[test]
+    fn reviewed_indexed_fixture_matches_the_expected_texel_bytes() {
+        for literal in ["64.0 / 255.0", "128.0 / 255.0", "192.0 / 255.0"] {
+            assert!(
+                REVIEWED_VERTEX_SOURCE.contains(literal),
+                "the indexed fixture no longer writes {literal}"
+            );
+        }
+        assert!(
+            !REVIEWED_VERTEX_SOURCE.contains("0.5"),
+            "the indexed fixture must not carry a half-integer tie constant"
+        );
+        for entry in [QUAD_VERTEX_ENTRY, FRAGMENT_ENTRY] {
+            assert!(
+                REVIEWED_VERTEX_SOURCE.contains(entry),
+                "the indexed fixture no longer carries {entry}"
+            );
+        }
+        // The vertex stage reads a stage-in attribute: a module without
+        // `[[stage_in]]` would make the pass's descriptor meaningless.
+        assert!(REVIEWED_VERTEX_SOURCE.contains("[[stage_in]]"));
+        assert!(REVIEWED_VERTEX_SOURCE.contains("[[attribute(0)]]"));
+        // The fixture's own bytes, spelled the way a suite's `initial_hex`
+        // spells them, so a drift between this rail's fixture, the Swift
+        // self-test and the suite is visible on a host without a GPU.
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(&quad_vertex_bytes()),
+            "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
+        );
+        assert_eq!(hex(&quad_index_bytes()), "000001000200020001000300");
+        // The two modules share one fragment entry, which is what keeps a
+        // capture from telling the draws apart by their colour.
+        assert_eq!(
+            REVIEWED_MODULES[0].fragment_entry,
+            REVIEWED_MODULES[1].fragment_entry
+        );
+        assert_eq!(REVIEWED_MODULES[0].vertex_entry, VERTEX_ENTRY);
+        assert_eq!(REVIEWED_MODULES[1].vertex_entry, QUAD_VERTEX_ENTRY);
     }
 }
