@@ -3,16 +3,17 @@
 //! staged lease windows.
 
 use crate::{
-    bounded_contract, classify_command_buffer_error, device_lost_refusal, heap,
+    bounded_contract, classify_command_buffer_error, device_lost_refusal, heap, icb,
     lifecycle::NativeLifecycle, refusal, render, unknown_completion, CommandBufferFailure,
 };
 use block::ConcreteBlock;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef,
-    ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode,
-    MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
-    MTLTextureType, MTLTextureUsage, NSUInteger, Texture, TextureDescriptor,
+    ComputePipelineState, Device, IndirectCommandBuffer, IndirectCommandBufferDescriptor,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLHazardTrackingMode, MTLIndirectCommandType, MTLOrigin,
+    MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType,
+    MTLTextureUsage, NSRange, NSUInteger, Texture, TextureDescriptor,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentBudget, CompletionRecord, ObservationDeadline};
@@ -169,6 +170,10 @@ pub struct NativeMetalProvider {
     /// appending, so it stays bounded to one submission (`research/docs/25`
     /// §6 Step 3).
     heap_observations: Arc<Mutex<Vec<heap::HeapPlacementObservation>>>,
+    /// Indirect replays the provider most recently executed. Like the heap
+    /// observation, a successful ICB-bearing submission replaces the vector
+    /// instead of appending (`research/docs/25` §6 Step 7b).
+    icb_observations: Arc<Mutex<Vec<icb::IcbReplayObservation>>>,
 }
 
 impl NativeMetalProvider {
@@ -213,6 +218,10 @@ impl NativeMetalProvider {
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
             let heap_bits = heap::heap_capability_bits();
+            // The ICB bits stay closed until `--icb-selftest` passes on an
+            // Apple GPU; they come from one spelling (`crate::icb`) so the
+            // snapshot and the flip condition cannot drift.
+            let icb_bits = icb::icb_capability_bits();
             let capabilities = ProviderCapabilities {
                 max_passes: 8,
                 supports_threads_exact: true,
@@ -266,9 +275,9 @@ impl NativeMetalProvider {
                 max_heap_bytes: heap_bits.max_heap_bytes,
                 supported_heap_storage_modes: heap_bits.supported_heap_storage_modes,
                 supports_heap_aliasing: heap_bits.supports_heap_aliasing,
-                supports_indirect_command_buffers: false,
-                max_indirect_commands: 0,
-                supported_indirect_commands: Vec::new(),
+                supports_indirect_command_buffers: icb_bits.supports_indirect_command_buffers,
+                max_indirect_commands: icb_bits.max_indirect_commands,
+                supported_indirect_commands: icb_bits.supported_indirect_commands,
             };
             Ok(Self {
                 epoch: allocate_device_epoch()?,
@@ -294,6 +303,7 @@ impl NativeMetalProvider {
                 lease_allocations: Mutex::new(BTreeMap::new()),
                 borrowed: Arc::new(BorrowedLeaseRegistry::new()),
                 heap_observations: Arc::new(Mutex::new(Vec::new())),
+                icb_observations: Arc::new(Mutex::new(Vec::new())),
             })
         })
     }
@@ -832,6 +842,9 @@ struct SubmissionResources {
     buffers: Vec<BoundBuffer>,
     /// Sampled textures by their contract view id (`research/docs/16` §4.8).
     textures: BTreeMap<ViewId, TextureRef>,
+    /// The indirect command buffer a compute dispatch replays from, retained
+    /// for the submission's whole lifetime (`research/docs/25` §6 Step 7b).
+    indirect: Option<IndirectCommandBuffer>,
     // Keep owner mappings imported and retained until Metal retires the work.
     _borrowed: BorrowedRetains,
 }
@@ -890,6 +903,9 @@ struct EncodedSubmission {
     /// Heap placement observations planned with the submission, published once
     /// its command buffer reaches a terminal success.
     heap_observations: Option<Vec<heap::HeapPlacementObservation>>,
+    /// The indirect replay planned with the submission, consumed by the
+    /// dispatch encode path here and by the draw encode path in `render.rs`.
+    icb_replay: Option<icb::IcbPlan>,
 }
 
 /// One admitted view resolved for binding. Owned and staged views return their
@@ -934,6 +950,10 @@ fn encode(
     let heap_plan = heap::plan_heap_placements(trace, &pool, resources)?;
     let heap_observations = heap_plan.as_ref().map(|plan| plan.observations.clone());
     let heap_offsets = heap_plan.as_ref().map(|plan| &plan.offsets);
+    // The indirect payload maps onto one replayed command; a trace without one
+    // keeps the direct draw/dispatch shape. The plan is pure, so a trace the
+    // first increment cannot replay is refused before any Metal object exists.
+    let icb_replay = icb::plan_replay(trace)?;
     let heap_slab = match &heap_plan {
         Some(plan) => {
             let slab = state
@@ -1177,6 +1197,29 @@ fn encode(
         // commandBuffer is autoreleased, so retain it for the pending guard.
         CommandBufferRef::from_ptr(pointer).to_owned()
     };
+    // The dispatch replay's device object is created here, after the buffers it
+    // re-binds but before the command buffer that executes it, so it is
+    // retained for the submission's whole lifetime (`research/docs/25` §6
+    // Step 7b). The draw replay's object is created in `render.rs`.
+    let indirect = match &icb_replay {
+        Some(plan) if matches!(plan.command, icb::IcbCommand::Dispatch { .. }) => {
+            let descriptor = IndirectCommandBufferDescriptor::new();
+            descriptor.set_command_types(MTLIndirectCommandType::ConcurrentDispatch);
+            descriptor.set_max_kernel_buffer_bind_count(31);
+            let buffer = state.device.new_indirect_command_buffer_with_descriptor(
+                &descriptor,
+                u64::from(plan.max_commands),
+                MTLResourceOptions::StorageModeShared,
+            );
+            if buffer.as_ptr().is_null() {
+                return Err(resource_error(
+                    "metal_indirect_command_buffer_allocation_failed",
+                ));
+            }
+            Some(buffer)
+        }
+        _ => None,
+    };
     let pending = crate::PendingSubmission {
         resources: Some(SubmissionResources {
             _device: state.device.clone(),
@@ -1185,6 +1228,7 @@ fn encode(
             command,
             buffers,
             textures: bound_textures,
+            indirect,
             _borrowed: retains,
         }),
         submitted: false,
@@ -1203,6 +1247,52 @@ fn encode(
             }
             ComputeCommandEncoderRef::from_ptr(pointer)
         };
+        // A dispatch replay is encoded entirely on the indirect command: its
+        // own pipeline and buffer bindings, then one `concurrentDispatchThread-
+        // groups` and an `executeCommandsInBuffer` from the encoder. Nothing is
+        // bound on the encoder itself, which is what makes a direct dispatch
+        // unable to stand in for it.
+        if let Some(plan) = &icb_replay {
+            let icb::IcbCommand::Dispatch { threadgroups } = plan.command else {
+                unreachable!("a dispatch replay was planned for a non-dispatch command");
+            };
+            let buffer = resources
+                .indirect
+                .as_ref()
+                .expect("the dispatch ICB was created during encode");
+            let command = buffer.indirect_compute_command_at_index(u64::from(plan.range.start));
+            command.set_compute_pipeline_state(&resources.pipelines[pass_index]);
+            for view in &pass.buffers {
+                let bound = &resources.buffers[pool_positions[&view.view_id]];
+                command.set_kernel_buffer(
+                    u64::from(view.metal_binding),
+                    Some(&bound.buffer),
+                    bound.offset,
+                );
+            }
+            command.concurrent_dispatch_threadgroups(
+                MTLSize::new(
+                    u64::from(threadgroups[0]),
+                    u64::from(threadgroups[1]),
+                    u64::from(threadgroups[2]),
+                ),
+                MTLSize::new(
+                    pass.dispatch.threads_per_threadgroup[0],
+                    pass.dispatch.threads_per_threadgroup[1],
+                    pass.dispatch.threads_per_threadgroup[2],
+                ),
+            );
+            let range = NSRange::new(u64::from(plan.range.start), u64::from(plan.range.count));
+            unsafe {
+                let _: () = msg_send![
+                    encoder,
+                    executeCommandsInBuffer: buffer.as_ref()
+                    withRange: range
+                ];
+            }
+            encoder.end_encoding();
+            continue;
+        }
         encoder.set_compute_pipeline_state(&resources.pipelines[pass_index]);
         for view in &pass.buffers {
             // serial_resources validated that each pass binds a subset of this pool.
@@ -1229,6 +1319,7 @@ fn encode(
         pending,
         pool,
         heap_observations,
+        icb_replay,
     })
 }
 
@@ -1253,6 +1344,7 @@ impl NativeMetalProvider {
             mut pending,
             pool,
             heap_observations,
+            icb_replay,
         } = encode(
             state,
             &self.counters,
@@ -1325,7 +1417,8 @@ impl NativeMetalProvider {
         // lands its texels: the attachment's view is already a written view of
         // the compute pool, so its pre-render bytes are replaced rather than
         // reported alongside.
-        let render_writebacks = self.execute_render_passes(state, &render_plan)?;
+        let render_writebacks =
+            self.execute_render_passes(state, &render_plan, icb_replay.as_ref())?;
         let writebacks = render::merge_writebacks(
             collect_writebacks(&pool, &resources.buffers, &self.counters),
             render_writebacks,
@@ -1345,6 +1438,9 @@ impl NativeMetalProvider {
         })?;
         if let Some(observations) = heap_observations {
             self.publish_heap_observations(observations);
+        }
+        if let Some(plan) = &icb_replay {
+            self.publish_icb_observation(plan.observation());
         }
         Ok(submission)
     }
@@ -1432,6 +1528,27 @@ impl NativeMetalProvider {
             .heap_observations
             .lock()
             .expect("heap observation lock poisoned") = observations;
+    }
+
+    /// The indirect replay the native provider executed last, if the last
+    /// submission carried one. Like the heap observation, a successful
+    /// ICB-bearing submission replaces the vector instead of appending to it.
+    pub fn icb_replay_observations(&self) -> Vec<icb::IcbReplayObservation> {
+        self.icb_observations
+            .lock()
+            .expect("icb observation lock poisoned")
+            .clone()
+    }
+
+    /// Record one indirect replay, replacing whatever the previous submission
+    /// left behind (the same bounded shape the heap observation uses).
+    fn publish_icb_observation(&self, observation: icb::IcbReplayObservation) {
+        let mut observations = self
+            .icb_observations
+            .lock()
+            .expect("icb observation lock poisoned");
+        observations.clear();
+        observations.push(observation);
     }
 
     /// Staged lease registry owned by this provider.
@@ -1611,11 +1728,18 @@ impl NativeMetalProvider {
         &self,
         state: &mut State,
         plan: &[render::TraceRenderPlan<'_>],
+        icb_replay: Option<&icb::IcbPlan>,
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
             let texels = match &planned.present {
                 Some(present) => self.execute_present_render(state, planned, present)?,
+                None if icb_replay.is_some() => render::encode_indirect_offscreen_render(
+                    &state.device,
+                    &state.queue,
+                    &planned.plan,
+                    icb_replay.expect("the indirect draw was planned"),
+                )?,
                 None => {
                     render::encode_offscreen_render(&state.device, &state.queue, &planned.plan)?
                 }
@@ -1690,6 +1814,7 @@ impl NativeMetalProvider {
             mut pending,
             pool,
             heap_observations,
+            icb_replay,
         } = encode(
             state,
             &self.counters,
@@ -1723,7 +1848,8 @@ impl NativeMetalProvider {
             // leaking the whole bundle (the sync rail clears it before render
             // for the same reason).
             pending.submitted = false;
-            let render_writebacks = self.execute_render_passes(state, &render_plan)?;
+            let render_writebacks =
+                self.execute_render_passes(state, &render_plan, icb_replay.as_ref())?;
             // The render command buffer serialized after the compute command
             // buffer, so a completed render implies a terminal compute status.
             match resources.command.status() {
@@ -1773,6 +1899,9 @@ impl NativeMetalProvider {
             if let Some(observations) = &heap_observations {
                 self.publish_heap_observations(observations.clone());
             }
+            if let Some(plan) = &icb_replay {
+                self.publish_icb_observation(plan.observation());
+            }
             return Ok(ProviderSubmission {
                 completion: CompletionDisposition::Submitted { token },
                 writebacks: Vec::new(),
@@ -1785,6 +1914,7 @@ impl NativeMetalProvider {
             command,
             buffers,
             textures: _textures,
+            indirect: _indirect,
             _borrowed,
         } = pending.resources.take().expect("encoded resources");
         pending.submitted = true;
@@ -1804,11 +1934,18 @@ impl NativeMetalProvider {
         let outbox = self.completion_outbox.clone();
         let counters = Arc::clone(&self.counters);
         let heap_observations_arc = Arc::clone(&self.heap_observations);
+        let icb_observations_arc = Arc::clone(&self.icb_observations);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
             // buffer until it is invoked.
-            let _retain = (&_device, &_queue, &retained_pipelines, &_borrowed);
+            let _retain = (
+                &_device,
+                &_queue,
+                &retained_pipelines,
+                &_indirect,
+                &_borrowed,
+            );
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 objc::rc::autoreleasepool(|| match command.status() {
                     MTLCommandBufferStatus::Completed => {
@@ -1850,6 +1987,13 @@ impl NativeMetalProvider {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                             observations.clone();
+                    }
+                    if let Some(plan) = &icb_replay {
+                        let mut observations = icb_observations_arc
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        observations.clear();
+                        observations.push(plan.observation());
                     }
                     record.complete(writebacks)
                 }

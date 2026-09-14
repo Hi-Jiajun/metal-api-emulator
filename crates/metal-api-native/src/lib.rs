@@ -40,6 +40,15 @@ mod heap;
 #[cfg(any(target_os = "macos", test))]
 pub use heap::HeapPlacementObservation;
 
+// The ICB rail's capability spelling and replay planning are provider logic
+// too, so they are compiled for the macOS provider and for the unit tests that
+// pin them on a host without Metal. Only the Metal encode bodies in
+// `native.rs` and `render.rs` need a device.
+#[cfg(any(target_os = "macos", test))]
+mod icb;
+#[cfg(any(target_os = "macos", test))]
+pub use icb::IcbReplayObservation;
+
 #[cfg(not(target_os = "macos"))]
 mod unsupported;
 #[cfg(not(target_os = "macos"))]
