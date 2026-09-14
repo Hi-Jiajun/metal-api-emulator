@@ -18,10 +18,12 @@ use crate::provider::{
     self as contract, AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat,
     BufferAccess, BufferRange, BufferSource, BufferWriteback, ClearColor, CompiledComputePipeline,
     CompletionDisposition, CompletionPolicy, CompletionToken, ComputeTrace, ContractError,
-    Dispatch, DispatchKind, DispatchType, InitialState, LoadOp, OperationId,
+    Dispatch, DispatchKind, DispatchType, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
+    HeapResource, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
     PipelineCompileRequest, PipelineId, PipelineProvider, PresentDescriptor, PresentMode,
     PresentTarget, ProviderCapabilities, ProviderError, ProviderHealth, ProviderSubmission,
-    RenderAttachment, RenderPassDescriptor, ResourceTableSnapshot, StoreOp, ViewId,
+    RenderAttachment, RenderPassDescriptor, ResourceTableSnapshot, StorageMode, StoreOp, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES,
     PROVIDER_SCHEMA_VERSION,
 };
@@ -45,10 +47,24 @@ pub enum Error {
     ForeignTexture,
     IdentityExhausted,
     InvalidPipelineMetadata,
-    PassLimit { requested: usize, maximum: usize },
+    PassLimit {
+        requested: usize,
+        maximum: usize,
+    },
     ProviderPanicked,
     CompletionUnavailable(CompletionDisposition),
     CompletionObservationMismatch,
+    ForeignHeap,
+    ForeignIndirectCommandBuffer,
+    HeapPlacementDuplicate {
+        allocation: AllocationId,
+    },
+    IndirectKindMismatch {
+        expected: IndirectCommandKind,
+        actual: IndirectCommandKind,
+    },
+    IndirectAlreadyRecorded,
+    IndirectDirectConflict,
 }
 
 impl fmt::Display for Error {
@@ -77,6 +93,25 @@ impl fmt::Display for Error {
             ),
             Self::CompletionObservationMismatch => {
                 f.write_str("provider wait disagrees with submitted completion")
+            }
+            Self::ForeignHeap => f.write_str("heap belongs to a different object device"),
+            Self::ForeignIndirectCommandBuffer => {
+                f.write_str("indirect command buffer belongs to a different object device")
+            }
+            Self::HeapPlacementDuplicate { allocation } => write!(
+                f,
+                "allocation {} is placed in the heap more than once",
+                allocation.get()
+            ),
+            Self::IndirectKindMismatch { expected, actual } => write!(
+                f,
+                "encoder replays {actual:?} commands but the indirect buffer holds {expected:?}"
+            ),
+            Self::IndirectAlreadyRecorded => {
+                f.write_str("command buffer already carries an indirect command buffer")
+            }
+            Self::IndirectDirectConflict => {
+                f.write_str("one encoder cannot mix direct and indirect dispatch or draw")
             }
         }
     }
@@ -286,6 +321,66 @@ impl Device {
         CommandQueue {
             owner: Arc::clone(&self.state),
         }
+    }
+
+    /// Declare one heap (`research/docs/25` §6 Step 6). The first increment is
+    /// fixed-size and refuses aliasing: those rules run here, while the
+    /// capability questions (whether this snapshot can back the heap at all)
+    /// stay with admission at [`CommandBuffer::commit`].
+    pub fn new_heap(
+        &self,
+        size: u64,
+        storage_mode: StorageMode,
+        allows_aliasing: bool,
+    ) -> Result<Heap, Error> {
+        let descriptor = HeapDescriptor {
+            size,
+            storage_mode,
+            allows_aliasing,
+        };
+        descriptor.validate()?;
+        Ok(Heap {
+            inner: Arc::new(HeapInner {
+                owner: Arc::clone(&self.state),
+                heap_id: HeapId::new(next_id()?),
+                descriptor,
+                placements: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    /// Declare one indirect command buffer (`research/docs/25` §6 Step 6).
+    ///
+    /// `kind` is the explicit statement of what the single command replays; it
+    /// has to agree with `command`'s own kind and appear in `kinds`, so the
+    /// caller cannot split the command's shape across two places. Structural
+    /// validation runs here; capability refusals stay with admission.
+    pub fn new_indirect_command_buffer(
+        &self,
+        kind: IndirectCommandKind,
+        max_commands: u32,
+        kinds: Vec<IndirectCommandKind>,
+        range: IndirectCommandRange,
+        command: IndirectCommandDescriptor,
+    ) -> Result<IndirectCommandBuffer, Error> {
+        if command.kind() != kind {
+            return Err(ContractError::IcbCommandKindUnsupported(command.kind()).into());
+        }
+        let payload = IndirectCommandPayload {
+            buffer: IndirectCommandBufferDescriptor {
+                max_commands,
+                kinds,
+            },
+            command,
+            range,
+        };
+        payload.validate()?;
+        Ok(IndirectCommandBuffer {
+            inner: Arc::new(IndirectCommandBufferInner {
+                owner: Arc::clone(&self.state),
+                payload,
+            }),
+        })
     }
 }
 
@@ -791,6 +886,160 @@ impl BufferView {
     }
 }
 
+/// A heap and the resources placed inside it (`research/docs/25` §6 Step 6).
+///
+/// [`Device::new_heap`] fixes the descriptor for the heap's lifetime.
+/// [`Heap::place`] records one buffer placement, keeping the placement's
+/// allocation identity so commit can publish the placements in ascending
+/// allocation order — the exact order the provider's placement map reads
+/// (`compute_provider.rs::plan_heap_placements`). The heap's identity and
+/// descriptor are shared across clones, so several commands can name the same
+/// slab.
+#[derive(Clone)]
+pub struct Heap {
+    inner: Arc<HeapInner>,
+}
+
+struct HeapInner {
+    owner: Arc<DeviceState>,
+    heap_id: HeapId,
+    descriptor: HeapDescriptor,
+    placements: Mutex<Vec<HeapPlacementRecord>>,
+}
+
+#[derive(Clone, Copy)]
+struct HeapPlacementRecord {
+    allocation_id: AllocationId,
+    offset: u64,
+    byte_size: u64,
+}
+
+impl Heap {
+    /// The neutral heap identifier shared by every placement.
+    pub fn heap_id(&self) -> HeapId {
+        self.inner.heap_id
+    }
+
+    /// The fixed descriptor this heap was declared with.
+    pub fn descriptor(&self) -> HeapDescriptor {
+        self.inner.descriptor
+    }
+
+    /// Place one whole allocation at `offset` inside this heap.
+    ///
+    /// The buffer has to belong to the heap's device, an allocation may only
+    /// be placed once, `offset + buffer.length` has to fit the slab, and — the
+    /// first increment always refuses aliasing — the byte interval has to stay
+    /// disjoint from every earlier placement. Alignment is a provider concern
+    /// and is not stored here (`research/docs/25` §4.2).
+    pub fn place(&self, buffer: &Buffer, offset: u64) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.inner.owner, &buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        let allocation_id = buffer.allocation_id();
+        let byte_size = u64::try_from(buffer.inner.length)
+            .map_err(|_| ContractError::ArithmeticOverflow("heap placement size"))?;
+        let mut placements = lock(&self.inner.placements, "provider heap placements")?;
+        if placements
+            .iter()
+            .any(|placement| placement.allocation_id == allocation_id)
+        {
+            return Err(Error::HeapPlacementDuplicate {
+                allocation: allocation_id,
+            });
+        }
+        let candidate = HeapPlacement {
+            heap_id: self.inner.heap_id,
+            offset,
+            resource: HeapResource::Buffer { byte_size },
+        };
+        candidate.validate_against(&self.inner.descriptor)?;
+        if !self.inner.descriptor.allows_aliasing {
+            let overlap = placements.iter().find(|placement| {
+                candidate.overlaps(&HeapPlacement {
+                    heap_id: self.inner.heap_id,
+                    offset: placement.offset,
+                    resource: HeapResource::Buffer {
+                        byte_size: placement.byte_size,
+                    },
+                })
+            });
+            if let Some(previous) = overlap {
+                return Err(ContractError::HeapPlacementOverlap {
+                    heap: self.inner.heap_id,
+                    first_offset: previous.offset,
+                    first_size: previous.byte_size,
+                    second_offset: offset,
+                    second_size: byte_size,
+                }
+                .into());
+            }
+        }
+        placements.push(HeapPlacementRecord {
+            allocation_id,
+            offset,
+            byte_size,
+        });
+        Ok(())
+    }
+
+    /// The trace payload this heap contributes, or `None` when nothing has been
+    /// placed yet. Placements are published in ascending allocation order, the
+    /// order the provider's placement map zips against the trace's owned
+    /// allocations.
+    fn payload(&self) -> Option<HeapPayload> {
+        let mut records = lock(&self.inner.placements, "provider heap placements")
+            .ok()?
+            .clone();
+        if records.is_empty() {
+            return None;
+        }
+        records.sort_by_key(|record| record.allocation_id);
+        Some(HeapPayload {
+            descriptor: self.inner.descriptor,
+            placements: records
+                .into_iter()
+                .map(|record| HeapPlacement {
+                    heap_id: self.inner.heap_id,
+                    offset: record.offset,
+                    resource: HeapResource::Buffer {
+                        byte_size: record.byte_size,
+                    },
+                })
+                .collect(),
+        })
+    }
+}
+
+/// One indirect command buffer (`research/docs/25` §6 Step 6).
+///
+/// The object wraps the neutral [`IndirectCommandPayload`] verbatim: a fixed
+/// command cap and kind whitelist plus the single command and replay range the
+/// first increment encodes. Encoders replay it with
+/// [`ComputeCommandEncoder::dispatch_indirect`] or
+/// [`RenderCommandEncoder::draw_indirect`].
+#[derive(Clone)]
+pub struct IndirectCommandBuffer {
+    inner: Arc<IndirectCommandBufferInner>,
+}
+
+struct IndirectCommandBufferInner {
+    owner: Arc<DeviceState>,
+    payload: IndirectCommandPayload,
+}
+
+impl IndirectCommandBuffer {
+    /// The neutral payload the command replays.
+    pub fn payload(&self) -> &IndirectCommandPayload {
+        &self.inner.payload
+    }
+
+    /// The kind of the single command this buffer encodes.
+    pub fn command_kind(&self) -> IndirectCommandKind {
+        self.inner.payload.command.kind()
+    }
+}
+
 #[derive(Clone)]
 pub struct CommandQueue {
     owner: Arc<DeviceState>,
@@ -803,6 +1052,8 @@ impl CommandQueue {
                 inner: Mutex::new(CommandInner {
                     passes: Vec::new(),
                     encoder_open: false,
+                    heap: None,
+                    indirect: None,
                     recording_error: None,
                     status: CommandBufferStatus::Recording,
                     failure: None,
@@ -832,6 +1083,8 @@ enum RecordedPass {
 struct CommandInner {
     passes: Vec<RecordedPass>,
     encoder_open: bool,
+    heap: Option<Heap>,
+    indirect: Option<IndirectCommandBuffer>,
     recording_error: Option<Error>,
     status: CommandBufferStatus,
     failure: Option<Error>,
@@ -885,6 +1138,22 @@ impl CommandBuffer {
     pub fn status(&self) -> Result<CommandBufferStatus, Error> {
         Ok(lock(&self.shared.inner, "provider command")?.status)
     }
+
+    /// Attach a heap to this command. Its placements are snapshotted at
+    /// [`CommandBuffer::commit`]: the heap may only belong to this device, and
+    /// a committed command refuses the set like any other recording action.
+    pub fn set_heap(&self, heap: &Heap) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.shared.owner, &heap.inner.owner) {
+            return Err(Error::ForeignHeap);
+        }
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        if inner.status != CommandBufferStatus::Recording {
+            return Err(ApiError::CommandBufferAlreadyCommitted.into());
+        }
+        inner.heap = Some(heap.clone());
+        Ok(())
+    }
+
     pub fn compute_command_encoder(&self) -> Result<ComputeCommandEncoder, Error> {
         let mut inner = lock(&self.shared.inner, "provider command")?;
         if inner.status != CommandBufferStatus::Recording {
@@ -900,6 +1169,7 @@ impl CommandBuffer {
             buffers: BTreeMap::new(),
             textures: BTreeMap::new(),
             dispatch_count: 0,
+            indirect: false,
             ended: false,
         })
     }
@@ -925,12 +1195,13 @@ impl CommandBuffer {
             shared: Arc::clone(&self.shared),
             pipeline: None,
             draw_count: 0,
+            indirect: false,
             ended: false,
         })
     }
 
     pub fn commit(&self) -> Result<(), Error> {
-        let passes = {
+        let (passes, heap, indirect) = {
             let mut inner = lock(&self.shared.inner, "provider command")?;
             if inner.status != CommandBufferStatus::Recording {
                 return Err(ApiError::CommandBufferAlreadyCommitted.into());
@@ -948,13 +1219,17 @@ impl CommandBuffer {
                 return Err(ApiError::NoEncodedCommands.into());
             }
             inner.status = CommandBufferStatus::Committed;
-            inner.passes.clone()
+            (
+                inner.passes.clone(),
+                inner.heap.clone(),
+                inner.indirect.clone(),
+            )
         };
         let mut token = None;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let reservations = reserve_buffers(&passes)?;
             let textures = collect_textures(&passes);
-            self.execute(&passes, reservations, textures, &mut token)
+            self.execute(&passes, reservations, textures, heap, indirect, &mut token)
         }))
         .unwrap_or(Err(Error::ProviderPanicked));
         let mut inner = lock(&self.shared.inner, "provider command")?;
@@ -1053,6 +1328,8 @@ impl CommandBuffer {
         passes: &[RecordedPass],
         reservations: Vec<BufferReservation>,
         textures: Vec<Texture>,
+        heap: Option<Heap>,
+        indirect: Option<IndirectCommandBuffer>,
         token: &mut Option<CompletionToken>,
     ) -> Result<ExecutionOutcome, Error> {
         let owner = &self.shared.owner;
@@ -1150,6 +1427,8 @@ impl CommandBuffer {
         }
         // Snapshot complete: no later step of this command reads the host bytes.
         drop(guards);
+        let heap_payload = heap.and_then(|heap| heap.payload()).map(Box::new);
+        let indirect_payload = indirect.map(|icb| Box::new(icb.payload().clone()));
         let trace = contract::ComputeTrace {
             schema_version: PROVIDER_SCHEMA_VERSION,
             device_epoch: owner.epoch,
@@ -1158,8 +1437,8 @@ impl CommandBuffer {
             encoder_dispatch_type: DispatchType::Serial,
             passes: trace_passes,
             completion_policy: CompletionPolicy::HostReadback,
-            heap: None,
-            indirect: None,
+            heap: heap_payload,
+            indirect: indirect_payload,
         };
         let admitted = owner
             .capabilities
@@ -1305,6 +1584,7 @@ pub struct ComputeCommandEncoder {
     buffers: BTreeMap<u32, BufferView>,
     textures: BTreeMap<u32, Texture>,
     dispatch_count: usize,
+    indirect: bool,
     ended: bool,
 }
 impl ComputeCommandEncoder {
@@ -1358,6 +1638,9 @@ impl ComputeCommandEncoder {
     }
     pub fn dispatch_threads(&mut self, grid: Size, local: Size) -> Result<(), Error> {
         self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
         let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
         for slot in &pipeline.metadata().contract.buffer_bindings {
             if !self.buffers.contains_key(&slot.metal_binding) {
@@ -1405,6 +1688,85 @@ impl ComputeCommandEncoder {
             },
         });
         self.dispatch_count += 1;
+        Ok(())
+    }
+
+    /// Replay one indirect dispatch from an encoded command instead of a direct
+    /// [`Self::dispatch_threads`]. The replayed threadgroups are the ICB's own;
+    /// `grid` and `local` restate the pass the footprint proofs describe, so
+    /// the provider can check the replay's group count against the planned one
+    /// (`research/docs/25` §6 Step 4).
+    pub fn dispatch_indirect(
+        &mut self,
+        icb: &IndirectCommandBuffer,
+        grid: Size,
+        local: Size,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if !Arc::ptr_eq(&self.shared.owner, &icb.inner.owner) {
+            return Err(Error::ForeignIndirectCommandBuffer);
+        }
+        if icb.command_kind() != IndirectCommandKind::Dispatch {
+            return Err(Error::IndirectKindMismatch {
+                expected: IndirectCommandKind::Dispatch,
+                actual: icb.command_kind(),
+            });
+        }
+        if self.dispatch_count > 0 || self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
+        for slot in &pipeline.metadata().contract.buffer_bindings {
+            if !self.buffers.contains_key(&slot.metal_binding) {
+                return Err(ContractError::MissingBinding(slot.metal_binding).into());
+            }
+        }
+        for binding in self.buffers.keys() {
+            if !pipeline
+                .metadata()
+                .contract
+                .buffer_bindings
+                .iter()
+                .any(|slot| slot.metal_binding == *binding)
+            {
+                return Err(ContractError::UnknownBinding(*binding).into());
+            }
+        }
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        if inner.indirect.is_some() {
+            return Err(Error::IndirectAlreadyRecorded);
+        }
+        let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
+            .unwrap_or(usize::MAX)
+            .min(8);
+        if inner.passes.len() >= maximum {
+            return Err(Error::PassLimit {
+                requested: inner.passes.len() + 1,
+                maximum,
+            });
+        }
+        let mut unique = recorded_view_ids(&inner.passes);
+        unique.extend(self.buffers.values().map(|view| view.view_id));
+        if unique.len() > MAX_SERIAL_RESOURCES {
+            return Err(ContractError::SerialResourceLimit {
+                requested: unique.len(),
+                maximum: MAX_SERIAL_RESOURCES,
+            }
+            .into());
+        }
+        inner.passes.push(RecordedPass::Compute {
+            pipeline: pipeline.clone(),
+            buffers: self.buffers.clone(),
+            textures: self.textures.clone(),
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: grid.dimensions().map(u64::from),
+                threads_per_threadgroup: local.dimensions().map(u64::from),
+            },
+        });
+        inner.indirect = Some(icb.clone());
+        self.dispatch_count += 1;
+        self.indirect = true;
         Ok(())
     }
     pub fn end_encoding(mut self) -> Result<(), Error> {
@@ -1458,6 +1820,7 @@ pub struct RenderCommandEncoder {
     shared: Arc<CommandShared>,
     pipeline: Option<RenderPipeline>,
     draw_count: usize,
+    indirect: bool,
     ended: bool,
 }
 impl RenderCommandEncoder {
@@ -1495,6 +1858,9 @@ impl RenderCommandEncoder {
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
         self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
         let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
         if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
             return Err(Error::ForeignBuffer);
@@ -1549,6 +1915,94 @@ impl RenderCommandEncoder {
             target,
         });
         self.draw_count += 1;
+        Ok(())
+    }
+
+    /// Record the milestone's single render pass replayed from one encoded
+    /// indirect draw (`research/docs/25` §6 Step 4). The attachment, viewport
+    /// and clear shapes are the direct [`Self::draw_render_pass`] ones; only
+    /// the draw command comes from the ICB, so the vertex/instance counts are
+    /// the ICB's own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indirect(
+        &mut self,
+        icb: &IndirectCommandBuffer,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        clear: [u8; 4],
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if !Arc::ptr_eq(&self.shared.owner, &icb.inner.owner) {
+            return Err(Error::ForeignIndirectCommandBuffer);
+        }
+        if icb.command_kind() != IndirectCommandKind::Draw {
+            return Err(Error::IndirectKindMismatch {
+                expected: IndirectCommandKind::Draw,
+                actual: icb.command_kind(),
+            });
+        }
+        if self.draw_count > 0 || self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
+        if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        let expected_bytes = width
+            .checked_mul(height)
+            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
+            .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
+        if u64::try_from(attachment.length).unwrap_or(u64::MAX) != expected_bytes {
+            return Err(ContractError::AttachmentExtentMismatch {
+                pass_index: 0,
+                view: attachment.view_id,
+                expected: expected_bytes,
+                declared: u64::try_from(attachment.length).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        let target = RenderTarget {
+            view: attachment.clone(),
+            format,
+            width,
+            height,
+            clear,
+            present,
+        };
+        let pipeline_id = pipeline.metadata().pipeline_id;
+        target.descriptor(pipeline_id)?;
+        let mut inner = lock(&self.shared.inner, "provider command")?;
+        if inner.indirect.is_some() {
+            return Err(Error::IndirectAlreadyRecorded);
+        }
+        let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
+            .unwrap_or(usize::MAX)
+            .min(8);
+        if inner.passes.len() >= maximum {
+            return Err(Error::PassLimit {
+                requested: inner.passes.len() + 1,
+                maximum,
+            });
+        }
+        let mut unique = recorded_view_ids(&inner.passes);
+        unique.insert(attachment.view_id);
+        if unique.len() > MAX_SERIAL_RESOURCES {
+            return Err(ContractError::SerialResourceLimit {
+                requested: unique.len(),
+                maximum: MAX_SERIAL_RESOURCES,
+            }
+            .into());
+        }
+        inner.passes.push(RecordedPass::Render {
+            pipeline: pipeline.clone(),
+            target,
+        });
+        inner.indirect = Some(icb.clone());
+        self.draw_count += 1;
+        self.indirect = true;
         Ok(())
     }
 

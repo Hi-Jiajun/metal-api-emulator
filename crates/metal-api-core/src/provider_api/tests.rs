@@ -63,6 +63,8 @@ struct FakeProvider {
     wait_calls: AtomicUsize,
     gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     render: bool,
+    heap: bool,
+    icb: bool,
 }
 
 impl FakeProvider {
@@ -82,6 +84,8 @@ impl FakeProvider {
             wait_calls: AtomicUsize::new(0),
             gate: None,
             render: false,
+            heap: false,
+            icb: false,
         }
     }
     fn with_alias_mode(mut self, alias_mode: AliasMode) -> Self {
@@ -90,6 +94,14 @@ impl FakeProvider {
     }
     fn with_render(mut self) -> Self {
         self.render = true;
+        self
+    }
+    fn with_heap(mut self) -> Self {
+        self.heap = true;
+        self
+    }
+    fn with_icb(mut self) -> Self {
+        self.icb = true;
         self
     }
     fn error(&self, token: CompletionToken) -> ProviderError {
@@ -137,13 +149,22 @@ impl ComputeProvider for FakeProvider {
                 .into_iter()
                 .collect(),
             max_present_image_count: u32::from(self.render),
-            supports_heaps: false,
-            max_heap_bytes: 0,
-            supported_heap_storage_modes: Vec::new(),
+            supports_heaps: self.heap,
+            max_heap_bytes: u64::from(self.heap) * 65536,
+            supported_heap_storage_modes: self
+                .heap
+                .then_some(StorageMode::OwnedBytes)
+                .into_iter()
+                .collect(),
             supports_heap_aliasing: false,
-            supports_indirect_command_buffers: false,
-            max_indirect_commands: 0,
-            supported_indirect_commands: Vec::new(),
+            supports_indirect_command_buffers: self.icb,
+            max_indirect_commands: u32::from(self.icb) * 8,
+            supported_indirect_commands: self
+                .icb
+                .then_some(IndirectCommandKind::Dispatch)
+                .into_iter()
+                .chain(self.icb.then_some(IndirectCommandKind::Draw))
+                .collect(),
         }
     }
     fn health(&self) -> ProviderHealth {
@@ -1503,4 +1524,265 @@ fn object_render_commit_routes_the_attachment_through_submit_and_lands_texels() 
         render_pass.present.is_some(),
         "the present tail rides the same recorded render pass"
     );
+}
+
+#[test]
+fn heap_placement_publishes_placements_in_allocation_order() {
+    let provider = Arc::new(FakeProvider::new().with_heap());
+    let device = Device::new(provider.clone());
+    let copy = pipeline(&device, "copy");
+    let (first, first_view) = buffer(&device, 1);
+    let (second, second_view) = buffer(&device, 2);
+
+    let heap = device.new_heap(64, StorageMode::OwnedBytes, false).unwrap();
+    // Place the later allocation first: commit still publishes the payload in
+    // ascending allocation order, the exact order the provider's placement map
+    // zips against the trace's owned allocations.
+    heap.place(&second, 8).unwrap();
+    heap.place(&first, 0).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    command.set_heap(&heap).unwrap();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&copy).unwrap();
+    encoder.set_buffer(4, &first_view).unwrap();
+    encoder.set_buffer(9, &second_view).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let payload = traces[0].heap.as_ref().expect("heap payload");
+    assert_eq!(payload.descriptor.size, 64);
+    assert_eq!(payload.descriptor.storage_mode, StorageMode::OwnedBytes);
+    assert_eq!(payload.placements.len(), 2);
+    assert_eq!(payload.placements[0].offset, 0);
+    assert_eq!(payload.placements[1].offset, 8);
+    assert_eq!(payload.placements[0].resource.byte_size(), 8);
+}
+
+#[test]
+fn heap_place_refuses_duplicate_overflow_overlap_and_foreign_buffers() {
+    let provider = Arc::new(FakeProvider::new().with_heap());
+    let device = Device::new(provider.clone());
+    let other = Device::new(provider.clone());
+    let (first, _) = buffer(&device, 1);
+    let (second, _) = buffer(&device, 2);
+    let (foreign, _) = buffer(&other, 3);
+
+    let heap = device.new_heap(32, StorageMode::OwnedBytes, false).unwrap();
+    assert_eq!(heap.place(&foreign, 0), Err(Error::ForeignBuffer));
+    heap.place(&first, 0).unwrap();
+    assert!(matches!(
+        heap.place(&first, 16),
+        Err(Error::HeapPlacementDuplicate { .. })
+    ));
+    assert!(matches!(
+        heap.place(&second, 4),
+        Err(Error::Contract(ContractError::HeapPlacementOverlap { .. }))
+    ));
+    assert!(matches!(
+        heap.place(&second, 25),
+        Err(Error::Contract(ContractError::HeapPlacementOverflow { .. }))
+    ));
+}
+
+#[test]
+fn heap_construction_refuses_zero_size_and_aliasing() {
+    let device = Device::new(Arc::new(FakeProvider::new()));
+    assert!(matches!(
+        device.new_heap(0, StorageMode::OwnedBytes, false),
+        Err(Error::Contract(ContractError::ZeroLength(_)))
+    ));
+    assert!(matches!(
+        device.new_heap(64, StorageMode::OwnedBytes, true),
+        Err(Error::Contract(ContractError::HeapAliasingUnsupported))
+    ));
+}
+
+#[test]
+fn indirect_dispatch_publishes_the_replayed_payload() {
+    let provider = Arc::new(FakeProvider::new().with_icb());
+    let device = Device::new(provider.clone());
+    let copy = pipeline(&device, "copy");
+    let (_, first_view) = buffer(&device, 1);
+    let (_, second_view) = buffer(&device, 2);
+    let icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::Dispatch,
+            1,
+            vec![IndirectCommandKind::Dispatch],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::Dispatch {
+                threadgroups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&copy).unwrap();
+    encoder.set_buffer(4, &first_view).unwrap();
+    encoder.set_buffer(9, &second_view).unwrap();
+    encoder
+        .dispatch_indirect(
+            &icb,
+            Size::new(1, 1, 1).unwrap(),
+            Size::new(1, 1, 1).unwrap(),
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let payload = traces[0].indirect.as_ref().expect("indirect payload");
+    assert_eq!(payload.command.kind(), IndirectCommandKind::Dispatch);
+    assert_eq!(payload.buffer.max_commands, 1);
+    assert_eq!(payload.range.start, 0);
+    assert_eq!(payload.range.count, 1);
+}
+
+#[test]
+fn indirect_encoder_refuses_kind_mismatch_direct_conflict_and_second_buffer() {
+    let provider = Arc::new(FakeProvider::new().with_icb());
+    let device = Device::new(provider.clone());
+    let copy = pipeline(&device, "copy");
+    let (_, first_view) = buffer(&device, 1);
+    let (_, second_view) = buffer(&device, 2);
+    let dispatch_icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::Dispatch,
+            1,
+            vec![IndirectCommandKind::Dispatch],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::Dispatch {
+                threadgroups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    let draw_icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::Draw,
+            1,
+            vec![IndirectCommandKind::Draw],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+        )
+        .unwrap();
+
+    let bind = |encoder: &mut ComputeCommandEncoder| {
+        encoder.set_buffer(4, &first_view).unwrap();
+        encoder.set_buffer(9, &second_view).unwrap();
+    };
+    let shape = |encoder: &mut ComputeCommandEncoder, icb: &IndirectCommandBuffer| {
+        encoder.dispatch_indirect(
+            icb,
+            Size::new(1, 1, 1).unwrap(),
+            Size::new(1, 1, 1).unwrap(),
+        )
+    };
+
+    // A dispatch encoder refuses a draw command.
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&copy).unwrap();
+    bind(&mut encoder);
+    assert!(matches!(
+        shape(&mut encoder, &draw_icb),
+        Err(Error::IndirectKindMismatch {
+            expected: IndirectCommandKind::Dispatch,
+            actual: IndirectCommandKind::Draw
+        })
+    ));
+    // The same encoder refuses a direct dispatch after an indirect one.
+    shape(&mut encoder, &dispatch_icb).unwrap();
+    assert!(matches!(
+        encoder.dispatch_threads(Size::new(1, 1, 1).unwrap(), Size::new(1, 1, 1).unwrap()),
+        Err(Error::IndirectDirectConflict)
+    ));
+    encoder.end_encoding().unwrap();
+
+    // A second encoder cannot add another indirect command buffer.
+    let mut second = command.compute_command_encoder().unwrap();
+    second.set_compute_pipeline_state(&copy).unwrap();
+    bind(&mut second);
+    assert!(matches!(
+        shape(&mut second, &dispatch_icb),
+        Err(Error::IndirectAlreadyRecorded)
+    ));
+}
+
+#[test]
+fn render_draw_indirect_replays_the_attachment() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_icb());
+    let device = Device::new(provider.clone());
+
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let icb = device
+        .new_indirect_command_buffer(
+            IndirectCommandKind::Draw,
+            1,
+            vec![IndirectCommandKind::Draw],
+            IndirectCommandRange { start: 0, count: 1 },
+            IndirectCommandDescriptor::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+        )
+        .unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .draw_indirect(
+                &icb,
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                [0xfe; 4],
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(
+        attachment.read().unwrap(),
+        [0x40, 0x80, 0xc0, 0xff].repeat(4)
+    );
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let payload = traces[0].indirect.as_ref().expect("indirect payload");
+    assert_eq!(payload.command.kind(), IndirectCommandKind::Draw);
+    assert!(traces[0].passes[1].as_render().is_some());
 }
