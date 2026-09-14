@@ -1697,8 +1697,12 @@ fn render_pipeline_state(
     planned: &RenderPlan<'_>,
 ) -> Result<RenderPipelineState, ProviderError> {
     let options = CompileOptions::new();
+    // The plan's own module, not the milestone's: a vertex-input pipeline is
+    // built from `quad_indexed_2x2.metal`, and compiling the `vertex_id` module
+    // for it would fail on the entry name rather than run the reviewed quad
+    // (`research/docs/23` §3.3).
     let library = device
-        .new_library_with_source(REVIEWED_SOURCE, &options)
+        .new_library_with_source(planned.source, &options)
         .map_err(|error| {
             compile_refusal("metal_render_library_compile_failed").with_detail(error)
         })?;
