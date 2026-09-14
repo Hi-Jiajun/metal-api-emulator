@@ -245,6 +245,19 @@ private struct HeapSelfTestReport: Encodable {
     let platform: String
 }
 
+/// The one-device ICB check's report (`research/docs/25` §6 Step 7b). It
+/// reuses the same writeback/allocation observation shape the heap self-test
+/// uses, and carries the device and platform so the CI step can assert the
+/// observations came from the probed device rather than a fixture.
+private struct IcbSelfTestReport: Encodable {
+    let id: String
+    let completion: String
+    let writebacks: [Writeback]
+    let allocations: [AllocationResult]
+    let device: String
+    let platform: String
+}
+
 private struct DeviceProbe: Encodable {
     let schema_version: UInt64 = 1
     let kind = "metal-device-probe"
@@ -282,6 +295,7 @@ private struct Options {
     let renderSelfTest: Bool
     let presentSelfTest: Bool
     let heapSelfTest: Bool
+    let icbSelfTest: Bool
 }
 
 private let usage = """
@@ -291,6 +305,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --render-selftest
        native-metal-oracle --present-selftest
        native-metal-oracle --heap-selftest
+       native-metal-oracle --icb-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -317,6 +332,10 @@ the pair, and reports the copied bytes. It fails unless both buffers are in the
 same heap with non-overlapping ranges and the write buffer reads back the
 reviewed word rather than the sentinel. It cannot be combined with other
 options.
+--icb-selftest needs no suite: it encodes the reviewed copy_word kernel on one
+MTLIndirectCommandBuffer, replays it with executeCommandsInBuffer, and reports
+the copied bytes. It fails unless the write buffer reads back the reviewed word
+rather than the sentinel. It cannot be combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -328,6 +347,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var renderSelfTest = false
     var presentSelfTest = false
     var heapSelfTest = false
+    var icbSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -365,33 +385,48 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!heapSelfTest, "Duplicate --heap-selftest option")
             heapSelfTest = true
             index += 1
+        case "--icb-selftest":
+            try require(!icbSelfTest, "Duplicate --icb-selftest option")
+            icbSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest && !icbSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --heap-selftest, or --icb-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
+                       icbSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest && !icbSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --heap-selftest, or --icb-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false)
+                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false,
+                       icbSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest && !icbSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --heap-selftest, or --icb-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false,
+                       icbSelfTest: false)
     }
     if heapSelfTest {
-        try require(suite == nil && output == nil && !validateOnly,
-                    "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
+        try require(suite == nil && output == nil && !validateOnly && !icbSelfTest,
+                    "--heap-selftest cannot be combined with --suite, --output, --validate-suite, or --icb-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true)
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true,
+                       icbSelfTest: false)
+    }
+    if icbSelfTest {
+        try require(suite == nil && output == nil && !validateOnly,
+                    "--icb-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
+                       icbSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -400,7 +435,8 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
                     "Output already exists: \(outputURL.path)")
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
-                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
+                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
+                   icbSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -1613,6 +1649,110 @@ private func heapSelfTest() throws -> HeapSelfTestReport {
                               device: device.name, platform: eligibility.platform)
 }
 
+/// The ICB milestone's own fixture, constructed in code.
+///
+/// This is the one-device indirect-command check (`research/docs/25` §6
+/// Step 7b): the reviewed `copy_word` kernel is encoded on one
+/// `MTLIndirectComputeCommand` inside an `MTLIndirectCommandBuffer`, replayed
+/// with `executeCommandsInBuffer`, and the write buffer's first word is read
+/// back. It fails unless the copied word equals the reviewed `fefefefe` rather
+/// than the `ffffffff` sentinel the write buffer was preset with. The buffers
+/// are ordinary device buffers, not heap-backed: the heap placement is its own
+/// check, and this check isolates the indirect replay.
+@available(macOS 11.0, *)
+private func icbSelfTest() throws -> IcbSelfTestReport {
+    let program = try reviewedProgram("copy_word")
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let source = try loadProgram(program, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the ICB self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native ICB self-test: device=\(device.name) platform=\(eligibility.platform)")
+
+    guard let readBuffer = device.makeBuffer(length: 16, options: .storageModeShared) else {
+        throw OracleError("icb self-test: cannot allocate the read buffer")
+    }
+    guard let writeBuffer = device.makeBuffer(length: 12, options: .storageModeShared) else {
+        throw OracleError("icb self-test: cannot allocate the write buffer")
+    }
+    let readInitial = Data(repeating: 0xfe, count: 16)
+    let writeInitial = Data(repeating: 0xff, count: 12)
+    readInitial.withUnsafeBytes { bytes in
+        if let source = bytes.baseAddress {
+            readBuffer.contents().copyMemory(from: source, byteCount: readInitial.count)
+        }
+    }
+    writeInitial.withUnsafeBytes { bytes in
+        if let source = bytes.baseAddress {
+            writeBuffer.contents().copyMemory(from: source, byteCount: writeInitial.count)
+        }
+    }
+
+    let library = try device.makeLibrary(source: source, options: nil)
+    guard let function = library.makeFunction(name: "copy_word") else {
+        throw OracleError("icb self-test: copy_word function was not found")
+    }
+    let pipeline = try device.makeComputePipelineState(function: function)
+
+    let descriptor = MTLIndirectCommandBufferDescriptor()
+    descriptor.commandTypes = [.concurrentDispatch]
+    descriptor.maxKernelBufferBindCount = 2
+    guard let icb = device.makeIndirectCommandBuffer(descriptor: descriptor,
+                                                     maxCommandCount: 1,
+                                                     options: .storageModeShared) else {
+        throw OracleError("icb self-test: cannot allocate the indirect command buffer")
+    }
+    guard let indirectCommand = icb.indirectComputeCommand(at: 0) else {
+        throw OracleError("icb self-test: cannot address the first indirect compute command")
+    }
+    indirectCommand.setComputePipelineState(pipeline)
+    indirectCommand.setKernelBuffer(readBuffer, offset: 0, at: 0)
+    indirectCommand.setKernelBuffer(writeBuffer, offset: 0, at: 1)
+    indirectCommand.concurrentDispatchThreadgroups(threadgroupsPerGrid: MTLSize(width: 1, height: 1, depth: 1),
+                                                   threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("icb self-test: cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "icb self-test: command buffer does not retain resources")
+    commandBuffer.label = "native oracle: icb selftest"
+    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        throw OracleError("icb self-test: cannot create a compute encoder")
+    }
+    encoder.executeCommands(in: icb, range: NSRange(location: 0, length: 1))
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("icb self-test: GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "icb self-test: Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+
+    let copied = Data(bytes: writeBuffer.contents(), count: 4)
+    let expected = Data(repeating: 0xfe, count: 4)
+    try require(copied == expected,
+                "icb self-test: copied word \(hex(copied)) does not match the reviewed expectation \(hex(expected))")
+    let writeback = Writeback(allocation: 920, view: 930, offset: 0, bytes_hex: hex(copied))
+    let allocations = [
+        AllocationResult(allocation: 900,
+                         bytes_hex: hex(Data(bytes: readBuffer.contents(), count: 16))),
+        AllocationResult(allocation: 920,
+                         bytes_hex: hex(Data(bytes: writeBuffer.contents(), count: 12))),
+    ]
+    return IcbSelfTestReport(id: "icb_dispatch_copy_word", completion: "CompletedVisible",
+                             writebacks: [writeback], allocations: allocations,
+                             device: device.name, platform: eligibility.platform)
+}
+
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -1737,6 +1877,16 @@ do {
         // readback that must be the reviewed word rather than the sentinel
         // (`research/docs/25` §6 Step 7a).
         let result = try heapSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.icbSelfTest {
+        // The ICB milestone's one-device check: the reviewed copy_word kernel
+        // encoded on one MTLIndirectCommandBuffer and replayed with
+        // executeCommandsInBuffer, and a write-buffer readback that must be the
+        // reviewed word rather than the sentinel (`research/docs/25` §6
+        // Step 7b).
+        let result = try icbSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

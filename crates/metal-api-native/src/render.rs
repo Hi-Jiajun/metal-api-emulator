@@ -32,6 +32,8 @@
 //! compile.
 #![allow(dead_code)] // the trace path does not reach this rail yet (Step 4/7)
 
+#[cfg(target_os = "macos")]
+use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferView, BufferWriteback, ClearColor, ComputeTrace, ContractError,
@@ -45,9 +47,10 @@ use std::collections::BTreeMap;
 use foreign_types::ForeignType;
 #[cfg(target_os = "macos")]
 use metal::{
-    CommandQueue, CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction,
-    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLViewport, NSUInteger,
+    CommandQueue, CompileOptions, Device, IndirectCommandBufferDescriptor, MTLClearColor,
+    MTLCommandBufferStatus, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTextureType, MTLTextureUsage, MTLViewport, NSRange, NSUInteger,
     RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
     RenderPipelineState, Texture, TextureDescriptor,
 };
@@ -807,7 +810,7 @@ pub(crate) fn encode_offscreen_render(
 ) -> Result<Vec<u8>, ProviderError> {
     objc::rc::autoreleasepool(|| {
         let attachment = attachment_texture(device, planned)?;
-        encode_into_and_readback(device, queue, planned, &attachment)
+        encode_into_and_readback(device, queue, planned, &attachment, None)
     })
 }
 
@@ -826,7 +829,29 @@ pub(crate) fn encode_present_render(
     planned: &RenderPlan<'_>,
     target: &Texture,
 ) -> Result<Vec<u8>, ProviderError> {
-    objc::rc::autoreleasepool(|| encode_into_and_readback(device, queue, planned, target))
+    objc::rc::autoreleasepool(|| encode_into_and_readback(device, queue, planned, target, None))
+}
+
+/// Encode, commit and read back one already planned offscreen pass whose
+/// full-screen triangle is replayed from one `MTLIndirectCommandBuffer`
+/// (`research/docs/25` §6 Step 7b).
+///
+/// The pass shape rules are the ones [`encode_offscreen_render`] already
+/// enforces — this entry point only swaps the direct draw for an indirect
+/// replay, so a pass that is not admitted as an offscreen render cannot reach
+/// it. The draw command's vertex and instance counts are the ones the
+/// [`crate::icb::plan_replay`] narrowed to a non-indexed draw.
+#[cfg(target_os = "macos")]
+pub(crate) fn encode_indirect_offscreen_render(
+    device: &Device,
+    queue: &CommandQueue,
+    planned: &RenderPlan<'_>,
+    replay: &icb::IcbPlan,
+) -> Result<Vec<u8>, ProviderError> {
+    objc::rc::autoreleasepool(|| {
+        let attachment = attachment_texture(device, planned)?;
+        encode_into_and_readback(device, queue, planned, &attachment, Some(*replay))
+    })
 }
 
 /// The shared encoder body of the offscreen and present rails: build the
@@ -838,6 +863,7 @@ fn encode_into_and_readback(
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
     target: &Texture,
+    indirect: Option<icb::IcbPlan>,
 ) -> Result<Vec<u8>, ProviderError> {
     let pipeline = render_pipeline_state(device, planned)?;
     // The pass descriptor is autoreleased; it only has to outlive the
@@ -877,7 +903,45 @@ fn encode_into_and_readback(
         znear: 0.0,
         zfar: 1.0,
     });
-    encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices));
+    match indirect {
+        None => encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices)),
+        Some(replay) => {
+            let icb::IcbCommand::Draw {
+                vertex_count,
+                instance_count,
+            } = replay.command
+            else {
+                return Err(capability_refusal("icb_command_unsupported")
+                    .with_field("kind", FieldValue::Text("dispatch".to_owned()))
+                    .with_detail("the first indirect increment replays non-indexed draws only"));
+            };
+            let descriptor = IndirectCommandBufferDescriptor::new();
+            descriptor.set_command_types(MTLIndirectCommandType::Draw);
+            let buffer = device.new_indirect_command_buffer_with_descriptor(
+                &descriptor,
+                u64::from(replay.max_commands),
+                MTLResourceOptions::StorageModeShared,
+            );
+            if buffer.as_ptr().is_null() {
+                return Err(resource_refusal(
+                    "metal_indirect_command_buffer_allocation_failed",
+                ));
+            }
+            let command = buffer.indirect_render_command_at_index(u64::from(replay.range.start));
+            command.set_render_pipeline_state(&pipeline);
+            command.draw_primitives(
+                MTLPrimitiveType::Triangle,
+                0,
+                u64::from(vertex_count),
+                u64::from(instance_count),
+                0,
+            );
+            encoder.execute_commands_in_buffer(
+                &buffer,
+                NSRange::new(u64::from(replay.range.start), u64::from(replay.range.count)),
+            );
+        }
+    }
     encoder.end_encoding();
     command.commit();
     command.wait_until_completed();
