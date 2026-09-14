@@ -54,16 +54,20 @@ pub(crate) struct IcbCapabilityBits {
     pub(crate) supported_indirect_commands: Vec<IndirectCommandKind>,
 }
 
-/// The pre-flip ICB bits: no indirect command buffers. The Apple selftest is
-/// what turns them on, and the parent flips them only after that CI evidence.
+/// The ICB bits stay closed: the platform blocks the selftest that would flip
+/// them.
 ///
-/// Flip evidence (`research/docs/25` §6 Step 7b): the draw replay selftest on
-/// an Apple GPU. macOS's Swift SDK marks the *compute* indirect command API
-/// (`MTLIndirectComputeCommand`) unavailable, so once flipped this snapshot
-/// lists `Draw` only: core admission refuses a dispatch payload with
-/// `icb_command_unsupported` instead of advertising a replay the platform
-/// cannot encode. The dispatch half of [`plan_replay`] stays implemented for
-/// the objc runtime path but is deliberately unreachable from the contract.
+/// `research/docs/25` §6 Step 7b requires a one-device check on Apple hardware
+/// before the bits turn on, and the macOS Swift SDK does not expose the
+/// CPU-side indirect-command encoding API: `MTLIndirectComputeCommand` is
+/// marked unavailable in macOS, and `MTLIndirectCommandBuffer` exposes no
+/// `indirectRenderCommand` accessor to Swift at all (both compile errors were
+/// observed on the CI runner). An ObjC++ probe can still reach those selectors
+/// at runtime — which is why [`plan_replay`] and the encode body keep the
+/// implementation — but until such a probe lands and passes on the runner, the
+/// snapshot must not advertise a replay it cannot prove: every field here stays
+/// at its default, and core admission refuses an ICB-bearing trace with
+/// `icb_unsupported`.
 pub(crate) fn icb_capability_bits() -> IcbCapabilityBits {
     IcbCapabilityBits {
         supports_indirect_command_buffers: false,

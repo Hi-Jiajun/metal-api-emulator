@@ -245,19 +245,6 @@ private struct HeapSelfTestReport: Encodable {
     let platform: String
 }
 
-/// The one-device ICB check's report (`research/docs/25` §6 Step 7b). It
-/// reuses the same writeback/allocation observation shape the heap self-test
-/// uses, and carries the device and platform so the CI step can assert the
-/// observations came from the probed device rather than a fixture.
-private struct IcbSelfTestReport: Encodable {
-    let id: String
-    let completion: String
-    let writebacks: [Writeback]
-    let allocations: [AllocationResult]
-    let device: String
-    let platform: String
-}
-
 private struct DeviceProbe: Encodable {
     let schema_version: UInt64 = 1
     let kind = "metal-device-probe"
@@ -295,7 +282,6 @@ private struct Options {
     let renderSelfTest: Bool
     let presentSelfTest: Bool
     let heapSelfTest: Bool
-    let icbSelfTest: Bool
 }
 
 private let usage = """
@@ -305,7 +291,6 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --render-selftest
        native-metal-oracle --present-selftest
        native-metal-oracle --heap-selftest
-       native-metal-oracle --icb-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -332,12 +317,6 @@ the pair, and reports the copied bytes. It fails unless both buffers are in the
 same heap with non-overlapping ranges and the write buffer reads back the
 reviewed word rather than the sentinel. It cannot be combined with other
 options.
---icb-selftest needs no suite: it encodes the reviewed full-screen triangle on
-one MTLIndirectCommandBuffer, replays it with executeCommandsInBuffer, and
-reports the 2x2 attachment's texels. macOS's Swift SDK marks the compute
-indirect command API unavailable, so this rail replays draws. It fails unless
-the attachment reads back the fragment output rather than the clear sentinel.
-It cannot be combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -349,7 +328,6 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var renderSelfTest = false
     var presentSelfTest = false
     var heapSelfTest = false
-    var icbSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -387,48 +365,33 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!heapSelfTest, "Duplicate --heap-selftest option")
             heapSelfTest = true
             index += 1
-        case "--icb-selftest":
-            try require(!icbSelfTest, "Duplicate --icb-selftest option")
-            icbSelfTest = true
-            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest && !icbSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --heap-selftest, or --icb-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
-                       icbSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest && !icbSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --heap-selftest, or --icb-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false,
-                       icbSelfTest: false)
+                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest && !icbSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --heap-selftest, or --icb-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false,
-                       icbSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false)
     }
     if heapSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !icbSelfTest,
-                    "--heap-selftest cannot be combined with --suite, --output, --validate-suite, or --icb-selftest")
-        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true,
-                       icbSelfTest: false)
-    }
-    if icbSelfTest {
         try require(suite == nil && output == nil && !validateOnly,
-                    "--icb-selftest cannot be combined with --suite, --output, or --validate-suite")
+                    "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
-                       icbSelfTest: true)
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -437,8 +400,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
                     "Output already exists: \(outputURL.path)")
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
-                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false,
-                   icbSelfTest: false)
+                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -1651,142 +1613,6 @@ private func heapSelfTest() throws -> HeapSelfTestReport {
                               device: device.name, platform: eligibility.platform)
 }
 
-/// The ICB milestone's own fixture, constructed in code.
-///
-/// macOS's Swift SDK marks the *compute* indirect command API unavailable, so
-/// this rail's indirect increment is a draw (`research/docs/25` §6 Step 7b):
-/// the reviewed full-screen triangle is encoded into one
-/// `MTLIndirectRenderCommand` inside an `MTLIndirectCommandBuffer` and replayed
-/// with `executeCommandsInBuffer`, and the 2x2 attachment's texels are the
-/// evidence. It fails unless the readback is the reviewed `4080c0ff` x4 rather
-/// than the `fefefefe` clear sentinel the pass started from.
-@available(macOS 11.0, *)
-private func icbSelfTest() throws -> IcbSelfTestReport {
-    let reviewed = reviewedRenderModule()
-    let definition = RenderCaseDefinition(
-        id: "icb_draw_2x2",
-        declaring_case: "",
-        vertex_entry: reviewed.vertex_entry,
-        fragment_entry: reviewed.fragment_entry,
-        metal: reviewed.metal,
-        vertices: 3,
-        viewport: [0, 0, 2, 2],
-        attachment: RenderAttachmentDefinition(
-            allocation: 900, view: 910, format: "rgba8_unorm",
-            width: 2, height: 2, load: "clear", store: "store",
-            clear_hex: "fefefefe", initial_hex: nil),
-        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
-        capture_rails: ["native-metal"])
-    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let fixture = try validateRenderCase(definition, root: root)
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        throw OracleError("No default Metal device is available; the ICB self-test requires an Apple silicon Mac")
-    }
-    let eligibility = assessDevice(device)
-    try require(eligibility.eligible,
-                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
-    guard let queue = device.makeCommandQueue() else {
-        throw OracleError("Cannot create a Metal command queue")
-    }
-    diagnostic("native ICB self-test: device=\(device.name) platform=\(eligibility.platform)")
-
-    let attachment = fixture.attachment
-    let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rgba8Unorm, width: attachment.width, height: attachment.height, mipmapped: false)
-    textureDescriptor.usage = .renderTarget
-    textureDescriptor.storageMode = .shared
-    guard let target = device.makeTexture(descriptor: textureDescriptor) else {
-        throw OracleError("icb self-test: cannot allocate the colour attachment")
-    }
-    let library = try device.makeLibrary(source: fixture.source, options: nil)
-    guard let vertexFunction = library.makeFunction(name: definition.vertex_entry) else {
-        throw OracleError("icb self-test: vertex entry was not found")
-    }
-    guard let fragmentFunction = library.makeFunction(name: definition.fragment_entry) else {
-        throw OracleError("icb self-test: fragment entry was not found")
-    }
-    let pipelineDescriptor = MTLRenderPipelineDescriptor()
-    pipelineDescriptor.label = "native oracle: icb draw"
-    pipelineDescriptor.vertexFunction = vertexFunction
-    pipelineDescriptor.fragmentFunction = fragmentFunction
-    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
-    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
-
-    let icbDescriptor = MTLIndirectCommandBufferDescriptor()
-    icbDescriptor.commandTypes = [.draw]
-    icbDescriptor.inheritPipelineState = true
-    guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDescriptor,
-                                                     maxCommandCount: 1,
-                                                     options: .storageModeShared) else {
-        throw OracleError("icb self-test: cannot allocate the indirect command buffer")
-    }
-    // `indirectRenderCommand(at:)` is the macOS-available accessor; the compute
-    // one is marked unavailable in the macOS SDK, which is why this rail's ICB
-    // increment replays draws.
-    let command = icb.indirectRenderCommand(atIndex: 0)
-    command.setRenderPipelineState(pipeline)
-    command.drawPrimitives(.triangle, vertexStart: 0, vertexCount: Int(definition.vertices))
-
-    let pass = MTLRenderPassDescriptor()
-    guard let color = pass.colorAttachments[0] else {
-        throw OracleError("icb self-test: cannot reach the colour attachment descriptor")
-    }
-    color.texture = target
-    color.storeAction = .store
-    color.loadAction = .clear
-    guard attachment.clearComponents.count == 4 else {
-        throw OracleError("icb self-test: a clear colour is four components")
-    }
-    color.clearColor = MTLClearColor(red: attachment.clearComponents[0],
-                                     green: attachment.clearComponents[1],
-                                     blue: attachment.clearComponents[2],
-                                     alpha: attachment.clearComponents[3])
-
-    guard let commandBuffer = queue.makeCommandBuffer() else {
-        throw OracleError("icb self-test: cannot create a command buffer")
-    }
-    try require(commandBuffer.retainedReferences,
-                "icb self-test: command buffer does not retain resources")
-    commandBuffer.label = "native oracle: icb selftest"
-    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
-        throw OracleError("icb self-test: cannot create a render encoder")
-    }
-    encoder.setRenderPipelineState(pipeline)
-    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
-                                    width: Double(attachment.width),
-                                    height: Double(attachment.height),
-                                    znear: 0, zfar: 1))
-    encoder.executeCommandsInBuffer(icb, range: 0..<1)
-    encoder.endEncoding()
-    let completed = DispatchSemaphore(value: 0)
-    commandBuffer.addCompletedHandler { _ in completed.signal() }
-    commandBuffer.commit()
-    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
-        throw OracleError("icb self-test: GPU completion timed out after 20 seconds; submitted work was not cancelled")
-    }
-    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
-                "icb self-test: Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
-
-    var observed = Data(count: attachment.width * attachment.height * 4)
-    observed.withUnsafeMutableBytes { bytes in
-        if let destination = bytes.baseAddress {
-            target.getBytes(destination,
-                            bytesPerRow: attachment.width * 4,
-                            from: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
-                            mipmapLevel: 0)
-        }
-    }
-    try require(observed == attachment.expected,
-                "icb self-test: attachment bytes \(hex(observed)) do not match the reviewed expectation \(hex(attachment.expected))")
-    return IcbSelfTestReport(id: "icb_draw_2x2", completion: "CompletedVisible",
-                             writebacks: [Writeback(allocation: attachment.allocation,
-                                                    view: attachment.view,
-                                                    offset: 0, bytes_hex: hex(observed))],
-                             allocations: [AllocationResult(allocation: attachment.allocation,
-                                                            bytes_hex: hex(observed))],
-                             device: device.name, platform: eligibility.platform)
-}
-
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -1911,16 +1737,6 @@ do {
         // readback that must be the reviewed word rather than the sentinel
         // (`research/docs/25` §6 Step 7a).
         let result = try heapSelfTest()
-        try writeJSON(result)
-        exit(EXIT_SUCCESS)
-    }
-    if options.icbSelfTest {
-        // The ICB milestone's one-device check: the reviewed copy_word kernel
-        // encoded on one MTLIndirectCommandBuffer and replayed with
-        // executeCommandsInBuffer, and a write-buffer readback that must be the
-        // reviewed word rather than the sentinel (`research/docs/25` §6
-        // Step 7b).
-        let result = try icbSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

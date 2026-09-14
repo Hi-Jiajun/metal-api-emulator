@@ -123,48 +123,6 @@ def validate_heap_selftest(report):
     return writebacks[0]["bytes_hex"]
 
 
-def validate_icb_selftest(report):
-    """One ICB self-test report carries exactly one reviewed writeback and one
-    reviewed allocation: the 2x2 attachment the indirectly replayed full-screen
-    triangle stored `4080c0ff` into. macOS's Swift SDK marks the *compute*
-    indirect command API unavailable, so the native rail's increment replays a
-    draw (`research/docs/25` §6 Step 7b); the bytes must be the fragment output,
-    never the `fefefefe` clear sentinel the pass started from.
-
-    The CI step reuses this instead of inlining its byte comparison, so the
-    comparison is exercised by `test_run_native.py` on a host without Metal.
-    """
-    if not isinstance(report, dict):
-        raise NativeRunError("icb selftest: report is not an object")
-    device = report.get("device")
-    platform = report.get("platform")
-    if not isinstance(device, str) or not device.strip():
-        raise NativeRunError("icb selftest: missing or empty device")
-    if not isinstance(platform, str) or not platform.strip():
-        raise NativeRunError("icb selftest: missing or empty platform")
-    if report.get("completion") != "CompletedVisible":
-        raise NativeRunError("icb selftest: completion is not CompletedVisible")
-    writebacks = report.get("writebacks", [])
-    allocations = report.get("allocations", [])
-    expected_texels = "4080c0ff" * 4
-    expected_writeback = {
-        "allocation": 900, "view": 910, "offset": 0, "bytes_hex": expected_texels
-    }
-    expected_allocations = [
-        {"allocation": 900, "bytes_hex": expected_texels},
-    ]
-    # The shape is part of the claim: the reviewed fixture produces exactly one
-    # writeback and one allocation, so a report that reached the same bytes by
-    # another route (for example no writeback) is refused rather than compared
-    # as if it were the same observation.
-    if writebacks != [expected_writeback] or allocations != expected_allocations:
-        raise NativeRunError(
-            "icb selftest: observations do not match the reviewed shape, got "
-            + repr((writebacks, allocations))
-        )
-    return writebacks[0]["bytes_hex"]
-
-
 def run_capture(oracle, suite_path, output_dir, *, require_metal=False, revision=None,
                 run_command=subprocess.run):
     """Create a new evidence directory. A partial or failed capture cannot pass."""
