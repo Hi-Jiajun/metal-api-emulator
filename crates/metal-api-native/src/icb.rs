@@ -56,6 +56,14 @@ pub(crate) struct IcbCapabilityBits {
 
 /// The pre-flip ICB bits: no indirect command buffers. The Apple selftest is
 /// what turns them on, and the parent flips them only after that CI evidence.
+///
+/// Flip evidence (`research/docs/25` §6 Step 7b): the draw replay selftest on
+/// an Apple GPU. macOS's Swift SDK marks the *compute* indirect command API
+/// (`MTLIndirectComputeCommand`) unavailable, so once flipped this snapshot
+/// lists `Draw` only: core admission refuses a dispatch payload with
+/// `icb_command_unsupported` instead of advertising a replay the platform
+/// cannot encode. The dispatch half of [`plan_replay`] stays implemented for
+/// the objc runtime path but is deliberately unreachable from the contract.
 pub(crate) fn icb_capability_bits() -> IcbCapabilityBits {
     IcbCapabilityBits {
         supports_indirect_command_buffers: false,

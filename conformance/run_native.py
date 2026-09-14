@@ -124,12 +124,12 @@ def validate_heap_selftest(report):
 
 
 def validate_icb_selftest(report):
-    """One ICB self-test report carries exactly one reviewed writeback and two
-    reviewed allocations: the read buffer (16 `fe` bytes) and the write buffer
-    whose first word `copy_word` overwrote with `fefefefe`, leaving the eight
-    sentinel `ff` bytes after it. The write word must be `fefefefe`, never the
-    `ffffffff` sentinel the buffer was preset with (`research/docs/25` §6
-    Step 7b).
+    """One ICB self-test report carries exactly one reviewed writeback and one
+    reviewed allocation: the 2x2 attachment the indirectly replayed full-screen
+    triangle stored `4080c0ff` into. macOS's Swift SDK marks the *compute*
+    indirect command API unavailable, so the native rail's increment replays a
+    draw (`research/docs/25` §6 Step 7b); the bytes must be the fragment output,
+    never the `fefefefe` clear sentinel the pass started from.
 
     The CI step reuses this instead of inlining its byte comparison, so the
     comparison is exercised by `test_run_native.py` on a host without Metal.
@@ -146,17 +146,17 @@ def validate_icb_selftest(report):
         raise NativeRunError("icb selftest: completion is not CompletedVisible")
     writebacks = report.get("writebacks", [])
     allocations = report.get("allocations", [])
+    expected_texels = "4080c0ff" * 4
     expected_writeback = {
-        "allocation": 920, "view": 930, "offset": 0, "bytes_hex": "fefefefe"
+        "allocation": 900, "view": 910, "offset": 0, "bytes_hex": expected_texels
     }
     expected_allocations = [
-        {"allocation": 900, "bytes_hex": "fefefefefefefefefefefefefefefefe"},
-        {"allocation": 920, "bytes_hex": "fefefefeffffffffffffffff"},
+        {"allocation": 900, "bytes_hex": expected_texels},
     ]
     # The shape is part of the claim: the reviewed fixture produces exactly one
-    # writeback and two allocations, so a report that reached the same bytes by
-    # another route (for example one allocation and no writeback) is refused
-    # rather than compared as if it were the same observation.
+    # writeback and one allocation, so a report that reached the same bytes by
+    # another route (for example no writeback) is refused rather than compared
+    # as if it were the same observation.
     if writebacks != [expected_writeback] or allocations != expected_allocations:
         raise NativeRunError(
             "icb selftest: observations do not match the reviewed shape, got "

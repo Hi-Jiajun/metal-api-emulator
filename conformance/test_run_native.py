@@ -281,88 +281,72 @@ class IcbSelftestValidationTests(unittest.TestCase):
     """The CI step's ICB-selftest byte comparison, exercised without Metal.
 
     `run_native.validate_icb_selftest` is the function the workflow reuses, so
-    the sentinel and observation-shape rules are pinned here rather than only
-    in the inline heredoc.
+    the sentinel and observation-shape rules are pinned here rather than only in
+    the inline heredoc. macOS's Swift SDK marks the compute indirect command API
+    unavailable, so the native rail's ICB increment is a draw and its evidence is
+    the 2x2 attachment's `4080c0ff` texels.
     """
 
-    WORD = "fefefefe"
-    READ_ALLOCATION = "fefefefefefefefefefefefefefefefe"
-    WRITE_ALLOCATION = "fefefefeffffffffffffffff"
-    SENTINEL_WRITE = "ffffffff"
+    TEXELS = "4080c0ff" * 4
+    SENTINEL = "fefefefe" * 4
 
     def reviewed_report(self, completion="CompletedVisible", device="Apple GPU",
                         platform="macOS 15.0", writeback_bytes=None,
-                        read_allocation=None, write_allocation=None,
-                        writebacks=None, allocations=None):
+                        allocation_bytes=None, writebacks=None, allocations=None):
         if writebacks is None:
-            writebacks = [{"allocation": 920, "view": 930, "offset": 0,
-                           "bytes_hex": self.WORD if writeback_bytes is None else writeback_bytes}]
+            writebacks = [{"allocation": 900, "view": 910, "offset": 0,
+                           "bytes_hex": self.TEXELS if writeback_bytes is None else writeback_bytes}]
         if allocations is None:
-            allocations = [
-                {"allocation": 900, "bytes_hex": self.READ_ALLOCATION if read_allocation is None else read_allocation},
-                {"allocation": 920, "bytes_hex": self.WRITE_ALLOCATION if write_allocation is None else write_allocation},
-            ]
-        return {"id": "icb_dispatch_copy_word", "completion": completion,
+            allocations = [{"allocation": 900,
+                            "bytes_hex": self.TEXELS if allocation_bytes is None else allocation_bytes}]
+        return {"id": "icb_draw_2x2", "completion": completion,
                 "writebacks": writebacks, "allocations": allocations,
                 "device": device, "platform": platform}
 
     def test_accepts_the_reviewed_icb_observation(self):
         report = self.reviewed_report()
-        self.assertEqual(run_native.validate_icb_selftest(report), self.WORD)
+        self.assertEqual(run_native.validate_icb_selftest(report), self.TEXELS)
 
-    def test_rejects_a_sentinel_writeback(self):
-        with self.assertRaises(run_native.NativeRunError):
-            run_native.validate_icb_selftest(
-                self.reviewed_report(writeback_bytes=self.SENTINEL_WRITE))
-
-    def test_rejects_a_sentinel_in_either_allocation(self):
-        sentinel_read = "ffffffff" * 4
-        sentinel_write = "ffffffff" * 3
-        for read_allocation, write_allocation in (
-            (sentinel_read, self.WRITE_ALLOCATION),
-            (self.READ_ALLOCATION, sentinel_write),
-            (sentinel_read, sentinel_write),
+    def test_rejects_the_clear_sentinel_in_either_channel(self):
+        for writeback_bytes, allocation_bytes in (
+            (self.SENTINEL, self.TEXELS),
+            (self.TEXELS, self.SENTINEL),
+            (self.SENTINEL, self.SENTINEL),
         ):
-            with self.subTest(read=read_allocation, write=write_allocation):
-                report = self.reviewed_report(read_allocation=read_allocation,
-                                              write_allocation=write_allocation)
+            with self.subTest(writeback=writeback_bytes, allocation=allocation_bytes):
+                report = self.reviewed_report(writeback_bytes=writeback_bytes,
+                                              allocation_bytes=allocation_bytes)
                 with self.assertRaises(run_native.NativeRunError):
                     run_native.validate_icb_selftest(report)
 
     def test_rejects_a_missing_or_extra_observation(self):
-        writeback = [{"allocation": 920, "view": 930, "offset": 0,
-                      "bytes_hex": self.WORD}]
-        allocations = [
-            {"allocation": 900, "bytes_hex": self.READ_ALLOCATION},
-            {"allocation": 920, "bytes_hex": self.WRITE_ALLOCATION},
-        ]
-        for writebacks, extra_allocations in (
+        writeback = [{"allocation": 900, "view": 910, "offset": 0,
+                      "bytes_hex": self.TEXELS}]
+        allocation = [{"allocation": 900, "bytes_hex": self.TEXELS}]
+        for writebacks, allocations in (
             ([], []),
             (writeback, []),
-            ([], allocations),
-            (writeback, allocations[:1]),
-            (writeback, allocations + [{"allocation": 921, "bytes_hex": "00"}]),
-            (writeback + writeback, allocations),
+            ([], allocation),
+            (writeback, allocation + [{"allocation": 901, "bytes_hex": "00"}]),
+            (writeback + writeback, allocation),
         ):
-            with self.subTest(writebacks=writebacks, allocations=extra_allocations):
-                report = self.reviewed_report(writebacks=writebacks,
-                                              allocations=extra_allocations)
+            with self.subTest(writebacks=writebacks, allocations=allocations):
+                report = self.reviewed_report(writebacks=writebacks, allocations=allocations)
                 with self.assertRaises(run_native.NativeRunError):
                     run_native.validate_icb_selftest(report)
 
     def test_rejects_a_wrong_writeback_offset_or_identity(self):
-        for change in ({"offset": 4}, {"view": 931}, {"allocation": 921}):
+        for change in ({"offset": 4}, {"view": 911}, {"allocation": 901}):
             with self.subTest(change=change):
-                writeback = [dict({"allocation": 920, "view": 930, "offset": 0,
-                                   "bytes_hex": self.WORD}, **change)]
+                writeback = [dict({"allocation": 900, "view": 910, "offset": 0,
+                                   "bytes_hex": self.TEXELS}, **change)]
                 report = self.reviewed_report(writebacks=writeback)
                 with self.assertRaises(run_native.NativeRunError):
                     run_native.validate_icb_selftest(report)
 
     def test_rejects_a_non_visible_completion(self):
         with self.assertRaises(run_native.NativeRunError):
-            run_native.validate_icb_selftest(
-                self.reviewed_report(completion="Submitted"))
+            run_native.validate_icb_selftest(self.reviewed_report(completion="Submitted"))
 
     def test_rejects_a_missing_device_or_platform(self):
         for device, platform in (("", "macOS 15.0"), ("Apple GPU", ""),

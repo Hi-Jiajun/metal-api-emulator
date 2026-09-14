@@ -332,10 +332,12 @@ the pair, and reports the copied bytes. It fails unless both buffers are in the
 same heap with non-overlapping ranges and the write buffer reads back the
 reviewed word rather than the sentinel. It cannot be combined with other
 options.
---icb-selftest needs no suite: it encodes the reviewed copy_word kernel on one
-MTLIndirectCommandBuffer, replays it with executeCommandsInBuffer, and reports
-the copied bytes. It fails unless the write buffer reads back the reviewed word
-rather than the sentinel. It cannot be combined with other options.
+--icb-selftest needs no suite: it encodes the reviewed full-screen triangle on
+one MTLIndirectCommandBuffer, replays it with executeCommandsInBuffer, and
+reports the 2x2 attachment's texels. macOS's Swift SDK marks the compute
+indirect command API unavailable, so this rail replays draws. It fails unless
+the attachment reads back the fragment output rather than the clear sentinel.
+It cannot be combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -1651,19 +1653,32 @@ private func heapSelfTest() throws -> HeapSelfTestReport {
 
 /// The ICB milestone's own fixture, constructed in code.
 ///
-/// This is the one-device indirect-command check (`research/docs/25` §6
-/// Step 7b): the reviewed `copy_word` kernel is encoded on one
-/// `MTLIndirectComputeCommand` inside an `MTLIndirectCommandBuffer`, replayed
-/// with `executeCommandsInBuffer`, and the write buffer's first word is read
-/// back. It fails unless the copied word equals the reviewed `fefefefe` rather
-/// than the `ffffffff` sentinel the write buffer was preset with. The buffers
-/// are ordinary device buffers, not heap-backed: the heap placement is its own
-/// check, and this check isolates the indirect replay.
+/// macOS's Swift SDK marks the *compute* indirect command API unavailable, so
+/// this rail's indirect increment is a draw (`research/docs/25` §6 Step 7b):
+/// the reviewed full-screen triangle is encoded into one
+/// `MTLIndirectRenderCommand` inside an `MTLIndirectCommandBuffer` and replayed
+/// with `executeCommandsInBuffer`, and the 2x2 attachment's texels are the
+/// evidence. It fails unless the readback is the reviewed `4080c0ff` x4 rather
+/// than the `fefefefe` clear sentinel the pass started from.
 @available(macOS 11.0, *)
 private func icbSelfTest() throws -> IcbSelfTestReport {
-    let program = try reviewedProgram("copy_word")
+    let reviewed = reviewedRenderModule()
+    let definition = RenderCaseDefinition(
+        id: "icb_draw_2x2",
+        declaring_case: "",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        vertices: 3,
+        viewport: [0, 0, 2, 2],
+        attachment: RenderAttachmentDefinition(
+            allocation: 900, view: 910, format: "rgba8_unorm",
+            width: 2, height: 2, load: "clear", store: "store",
+            clear_hex: "fefefefe", initial_hex: nil),
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        capture_rails: ["native-metal"])
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let source = try loadProgram(program, root: root)
+    let fixture = try validateRenderCase(definition, root: root)
     guard let device = MTLCreateSystemDefaultDevice() else {
         throw OracleError("No default Metal device is available; the ICB self-test requires an Apple silicon Mac")
     }
@@ -1675,47 +1690,57 @@ private func icbSelfTest() throws -> IcbSelfTestReport {
     }
     diagnostic("native ICB self-test: device=\(device.name) platform=\(eligibility.platform)")
 
-    guard let readBuffer = device.makeBuffer(length: 16, options: .storageModeShared) else {
-        throw OracleError("icb self-test: cannot allocate the read buffer")
+    let attachment = fixture.attachment
+    let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm, width: attachment.width, height: attachment.height, mipmapped: false)
+    textureDescriptor.usage = .renderTarget
+    textureDescriptor.storageMode = .shared
+    guard let target = device.makeTexture(descriptor: textureDescriptor) else {
+        throw OracleError("icb self-test: cannot allocate the colour attachment")
     }
-    guard let writeBuffer = device.makeBuffer(length: 12, options: .storageModeShared) else {
-        throw OracleError("icb self-test: cannot allocate the write buffer")
+    let library = try device.makeLibrary(source: fixture.source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: definition.vertex_entry) else {
+        throw OracleError("icb self-test: vertex entry was not found")
     }
-    let readInitial = Data(repeating: 0xfe, count: 16)
-    let writeInitial = Data(repeating: 0xff, count: 12)
-    readInitial.withUnsafeBytes { bytes in
-        if let source = bytes.baseAddress {
-            readBuffer.contents().copyMemory(from: source, byteCount: readInitial.count)
-        }
+    guard let fragmentFunction = library.makeFunction(name: definition.fragment_entry) else {
+        throw OracleError("icb self-test: fragment entry was not found")
     }
-    writeInitial.withUnsafeBytes { bytes in
-        if let source = bytes.baseAddress {
-            writeBuffer.contents().copyMemory(from: source, byteCount: writeInitial.count)
-        }
-    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: icb draw"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
-    let library = try device.makeLibrary(source: source, options: nil)
-    guard let function = library.makeFunction(name: "copy_word") else {
-        throw OracleError("icb self-test: copy_word function was not found")
-    }
-    let pipeline = try device.makeComputePipelineState(function: function)
-
-    let descriptor = MTLIndirectCommandBufferDescriptor()
-    descriptor.commandTypes = [.concurrentDispatch]
-    descriptor.maxKernelBufferBindCount = 2
-    guard let icb = device.makeIndirectCommandBuffer(descriptor: descriptor,
+    let icbDescriptor = MTLIndirectCommandBufferDescriptor()
+    icbDescriptor.commandTypes = [.draw]
+    icbDescriptor.inheritPipelineState = true
+    guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDescriptor,
                                                      maxCommandCount: 1,
                                                      options: .storageModeShared) else {
         throw OracleError("icb self-test: cannot allocate the indirect command buffer")
     }
-    guard let indirectCommand = icb.indirectComputeCommand(at: 0) else {
-        throw OracleError("icb self-test: cannot address the first indirect compute command")
+    // `indirectRenderCommand(at:)` is the macOS-available accessor; the compute
+    // one is marked unavailable in the macOS SDK, which is why this rail's ICB
+    // increment replays draws.
+    let command = icb.indirectRenderCommand(at: 0)
+    command.setRenderPipelineState(pipeline)
+    command.drawPrimitives(.triangle, vertexStart: 0, vertexCount: Int(definition.vertices))
+
+    let pass = MTLRenderPassDescriptor()
+    guard let color = pass.colorAttachments[0] else {
+        throw OracleError("icb self-test: cannot reach the colour attachment descriptor")
     }
-    indirectCommand.setComputePipelineState(pipeline)
-    indirectCommand.setKernelBuffer(readBuffer, offset: 0, at: 0)
-    indirectCommand.setKernelBuffer(writeBuffer, offset: 0, at: 1)
-    indirectCommand.concurrentDispatchThreadgroups(threadgroupsPerGrid: MTLSize(width: 1, height: 1, depth: 1),
-                                                   threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+    color.texture = target
+    color.storeAction = .store
+    color.loadAction = .clear
+    guard attachment.clearComponents.count == 4 else {
+        throw OracleError("icb self-test: a clear colour is four components")
+    }
+    color.clearColor = MTLClearColor(red: attachment.clearComponents[0],
+                                     green: attachment.clearComponents[1],
+                                     blue: attachment.clearComponents[2],
+                                     alpha: attachment.clearComponents[3])
 
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("icb self-test: cannot create a command buffer")
@@ -1723,10 +1748,15 @@ private func icbSelfTest() throws -> IcbSelfTestReport {
     try require(commandBuffer.retainedReferences,
                 "icb self-test: command buffer does not retain resources")
     commandBuffer.label = "native oracle: icb selftest"
-    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-        throw OracleError("icb self-test: cannot create a compute encoder")
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("icb self-test: cannot create a render encoder")
     }
-    encoder.executeCommands(in: icb, range: NSRange(location: 0, length: 1))
+    encoder.setRenderPipelineState(pipeline)
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(attachment.width),
+                                    height: Double(attachment.height),
+                                    znear: 0, zfar: 1))
+    encoder.executeCommandsInBuffer(icb, withRange: NSRange(location: 0, length: 1))
     encoder.endEncoding()
     let completed = DispatchSemaphore(value: 0)
     commandBuffer.addCompletedHandler { _ in completed.signal() }
@@ -1737,19 +1767,23 @@ private func icbSelfTest() throws -> IcbSelfTestReport {
     try require(commandBuffer.status == .completed && commandBuffer.error == nil,
                 "icb self-test: Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
 
-    let copied = Data(bytes: writeBuffer.contents(), count: 4)
-    let expected = Data(repeating: 0xfe, count: 4)
-    try require(copied == expected,
-                "icb self-test: copied word \(hex(copied)) does not match the reviewed expectation \(hex(expected))")
-    let writeback = Writeback(allocation: 920, view: 930, offset: 0, bytes_hex: hex(copied))
-    let allocations = [
-        AllocationResult(allocation: 900,
-                         bytes_hex: hex(Data(bytes: readBuffer.contents(), count: 16))),
-        AllocationResult(allocation: 920,
-                         bytes_hex: hex(Data(bytes: writeBuffer.contents(), count: 12))),
-    ]
-    return IcbSelfTestReport(id: "icb_dispatch_copy_word", completion: "CompletedVisible",
-                             writebacks: [writeback], allocations: allocations,
+    var observed = Data(count: attachment.width * attachment.height * 4)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            target.getBytes(destination,
+                            bytesPerRow: attachment.width * 4,
+                            from: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
+                            mipmapLevel: 0)
+        }
+    }
+    try require(observed == attachment.expected,
+                "icb self-test: attachment bytes \(hex(observed)) do not match the reviewed expectation \(hex(attachment.expected))")
+    return IcbSelfTestReport(id: "icb_draw_2x2", completion: "CompletedVisible",
+                             writebacks: [Writeback(allocation: attachment.allocation,
+                                                    view: attachment.view,
+                                                    offset: 0, bytes_hex: hex(observed))],
+                             allocations: [AllocationResult(allocation: attachment.allocation,
+                                                            bytes_hex: hex(observed))],
                              device: device.name, platform: eligibility.platform)
 }
 
