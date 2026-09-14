@@ -177,6 +177,22 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   names only `vulkan`: the native rails do not execute heap/indirect cases yet
   (`research/docs/25` Step 7), and indexed draws and heap aliasing remain outside
   the increment.
+- The render track's first generalisation is committed as `suite-v16`:
+  `quad_indexed_clear_2x2` draws a caller-held `float32x2` vertex stream through a
+  caller-held `uint16` index buffer (`vkCmdBindVertexBuffers` +
+  `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed`), with the pipeline's vertex input
+  state built from the contract's `VertexLayout::Buffers`. Render inputs carry
+  their own bytes (`Vec<BufferView>`), so a trace with no compute pass can still
+  declare them. The rail proves the footprint before touching the device (stream
+  covers `stride × vertices`, index view covers `count × width`, every index names
+  a vertex the stream holds), and `render_e2e`'s collapsed-stream case shows the
+  draw reads the caller's bytes rather than `vertex_id`. CI run `34863349995` and
+  the RTX 5060 capture
+  (`evidence/windows-rtx5060-v16-4a926a0-2026-09-14/`) cover the Vulkan rail; the
+  fixture's marker names only `vulkan` until the object binding surface and the
+  native `MTLVertexDescriptor` path land (`research/docs/23` §10). MRT,
+  `LoadOp::Load`, `StoreOp::DontCare`, more attachment formats, depth/stencil,
+  instancing and dynamic state remain outside the increment.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
