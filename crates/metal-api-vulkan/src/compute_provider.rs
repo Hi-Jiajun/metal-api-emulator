@@ -12,18 +12,19 @@ pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
     CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
-    ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, LeaseId,
-    LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
-    PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
+    ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, HeapId,
+    HeapResource, LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract,
+    PipelineId, PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TracePass,
+    ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
 };
 use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,29 @@ use std::time::Duration;
 
 const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
 const GPU_DEADLINE: Duration = Duration::from_secs(20);
+
+/// One heap placement a provider executed: which heap a resource landed in,
+/// which allocation it belongs to, and the byte range it occupies there.
+///
+/// This is the falsifiable placement observation `research/docs/25` §6 Step 3
+/// asks for: two resources placed in the same heap at different offsets are
+/// reported as two records sharing one `heap_id`, not merely "looks shared".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeapPlacementObservation {
+    pub heap_id: HeapId,
+    pub allocation_id: AllocationId,
+    pub offset: u64,
+    pub byte_size: u64,
+}
+
+/// The provider-side half of a heap payload's mapping to the trace's owned
+/// allocations: the slab size and, for each owned allocation, its binding
+/// offset inside the slab.
+struct HeapPlan {
+    slab_size: u64,
+    offsets: BTreeMap<u64, u64>,
+    observations: Vec<HeapPlacementObservation>,
+}
 
 struct RegisteredPipeline {
     metadata: CompiledComputePipeline,
@@ -85,6 +109,9 @@ struct CompletionSlot {
     /// deferred, so its bytes ride alongside the deferred pool readback and are
     /// merged into the completion record once the compute fence retires.
     render_writebacks: Vec<BufferWriteback>,
+    /// Heap placement observations recorded when the async submission is
+    /// planned, published once its writebacks become visible.
+    heap_observations: Vec<HeapPlacementObservation>,
     deadline: ObservationDeadline,
 }
 
@@ -156,6 +183,7 @@ pub struct VulkanComputeProvider {
     render_pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredRenderPipeline>>>,
     present_targets: Mutex<BTreeMap<(AllocationId, ViewId), Arc<render::PresentTargetImage>>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
+    heap_observations: Mutex<Vec<HeapPlacementObservation>>,
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
     observation_deadline: Duration,
     async_execution: bool,
@@ -210,6 +238,7 @@ impl VulkanComputeProvider {
             render_pipelines: Mutex::new(BTreeMap::new()),
             present_targets: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
+            heap_observations: Mutex::new(Vec::new()),
             retire_tx: Mutex::new(None),
             observation_deadline: GPU_DEADLINE,
             async_execution: false,
@@ -228,6 +257,20 @@ impl VulkanComputeProvider {
 
     pub fn async_execution(&self) -> bool {
         self.async_execution
+    }
+
+    /// Heap placements this provider has executed, in submission order.
+    ///
+    /// Each record names the heap, the owned allocation placed in it, and the
+    /// `[offset, offset + byte_size)` range it occupies. Two resources in the
+    /// same heap therefore appear as two records sharing one `heap_id`, which
+    /// is the falsifiable observation `research/docs/25` §6 Step 3 requires
+    /// rather than a "looks shared" assertion.
+    pub fn heap_placement_observations(&self) -> Vec<HeapPlacementObservation> {
+        self.heap_observations
+            .lock()
+            .expect("heap observation lock poisoned")
+            .clone()
     }
 
     /// Publish admission, terminal transitions and device health through
@@ -710,7 +753,7 @@ impl VulkanComputeProvider {
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.validate_token(token)?;
-        let (record, pending, pool, render_writebacks, deadline) = {
+        let (record, pending, pool, render_writebacks, heap_observations, deadline) = {
             let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
             let slot = completions
                 .get_mut(&token.submission_id)
@@ -721,6 +764,7 @@ impl VulkanComputeProvider {
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                     slot.deadline,
                 )
             } else if let Some(pending) = slot.pending.take() {
@@ -729,12 +773,14 @@ impl VulkanComputeProvider {
                     Some(pending),
                     slot.pool.clone(),
                     slot.render_writebacks.clone(),
+                    slot.heap_observations.clone(),
                     slot.deadline,
                 )
             } else {
                 (
                     Arc::clone(&slot.record),
                     None,
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     slot.deadline,
@@ -760,6 +806,7 @@ impl VulkanComputeProvider {
                         merged.insert((writeback.allocation_id, writeback.view_id), writeback);
                     }
                     record.complete(merged.into_values().collect());
+                    self.publish_heap_observations(heap_observations);
                     Ok(CompletionDisposition::CompletedVisible { token })
                 }
                 Err(error) => {
@@ -881,6 +928,117 @@ impl VulkanComputeProvider {
     /// No-copy lease registry owned by this provider.
     pub fn borrowed_registry(&self) -> &Arc<BorrowedLeaseRegistry> {
         &self.borrowed
+    }
+
+    /// Map a trace's heap payload onto its owned allocations and record the
+    /// placement observations (`research/docs/25-heaps与ICB设计.md` §6 Step 3).
+    ///
+    /// The mapping is: the trace's distinct owned allocations in ascending
+    /// identity order, zipped one-to-one with `placements`. Staged and borrowed
+    /// views keep their own backing and are not part of the heap, so a count
+    /// or size mismatch is a typed refusal instead of a silent drop.
+    fn plan_heap_placements(
+        &self,
+        trace: &ComputeTrace,
+        pool: &[BufferView],
+        resources: &ResourceTableSnapshot,
+    ) -> Result<Option<HeapPlan>, ProviderError> {
+        let Some(heap) = &trace.heap else {
+            return Ok(None);
+        };
+        // The first increment binds buffers only; a texture placement has no
+        // Vulkan image binding yet (`research/docs/25` §6 Step 3).
+        if let Some(placement) = heap
+            .placements
+            .iter()
+            .find(|placement| matches!(placement.resource, HeapResource::Texture { .. }))
+        {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "heap_placement_unsupported",
+            )
+            .with_field("resource", FieldValue::Text("texture".to_string()))
+            .with_field("heap", FieldValue::Unsigned(placement.heap_id.get())));
+        }
+        let mut owned = BTreeSet::<u64>::new();
+        for resource in pool {
+            if matches!(resource.source, BufferSource::OwnedBytes(_)) {
+                owned.insert(resource.allocation_id.get());
+            }
+        }
+        let owned: Vec<u64> = owned.into_iter().collect();
+        if heap.placements.len() != owned.len() {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "heap_placement_mismatch",
+            )
+            .with_field(
+                "placements",
+                FieldValue::Unsigned(heap.placements.len() as u64),
+            )
+            .with_field("allocations", FieldValue::Unsigned(owned.len() as u64)));
+        }
+        let mut heap_ids = BTreeSet::<u64>::new();
+        let mut offsets = BTreeMap::<u64, u64>::new();
+        let mut observations = Vec::with_capacity(owned.len());
+        for (placement, allocation) in heap.placements.iter().zip(owned.iter()) {
+            heap_ids.insert(placement.heap_id.get());
+            let record = resources
+                .allocation(AllocationId::new(*allocation))
+                .ok_or_else(|| {
+                    refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Resource,
+                        "heap_placement_mismatch",
+                    )
+                    .with_field("allocation", FieldValue::Unsigned(*allocation))
+                })?;
+            if placement.resource.byte_size() != record.size {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Args,
+                    "heap_placement_mismatch",
+                )
+                .with_field("allocation", FieldValue::Unsigned(*allocation))
+                .with_field(
+                    "placement_size",
+                    FieldValue::Unsigned(placement.resource.byte_size()),
+                )
+                .with_field("allocation_size", FieldValue::Unsigned(record.size)));
+            }
+            offsets.insert(*allocation, placement.offset);
+            observations.push(HeapPlacementObservation {
+                heap_id: placement.heap_id,
+                allocation_id: AllocationId::new(*allocation),
+                offset: placement.offset,
+                byte_size: placement.resource.byte_size(),
+            });
+        }
+        if heap_ids.len() != 1 {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Args,
+                "heap_placement_mismatch",
+            )
+            .with_field(
+                "distinct_heaps",
+                FieldValue::Unsigned(heap_ids.len() as u64),
+            ));
+        }
+        Ok(Some(HeapPlan {
+            slab_size: heap.descriptor.size,
+            offsets,
+            observations,
+        }))
+    }
+
+    fn publish_heap_observations(&self, observations: Vec<HeapPlacementObservation>) {
+        self.heap_observations
+            .lock()
+            .expect("heap observation lock poisoned")
+            .extend(observations);
     }
 }
 
@@ -1093,6 +1251,7 @@ impl ComputeProvider for VulkanComputeProvider {
             )
             .with_detail(error.to_string())
         })?;
+        let heap_plan = self.plan_heap_placements(trace, &pool, admitted.resources())?;
         let mut dispatches = Vec::with_capacity(trace.passes.len());
         for pass in trace.compute_passes() {
             let grid = narrow_dimensions(pass.dispatch.grid)?.dimensions();
@@ -1172,6 +1331,28 @@ impl ComputeProvider for VulkanComputeProvider {
             let index = position as u32;
             match &resource.source {
                 BufferSource::OwnedBytes(bytes) => {
+                    // A heap-bearing trace binds every owned allocation into
+                    // the heap slab instead of its own device memory. The
+                    // allocation's buffer is bound at its placement offset and
+                    // the view still addresses its own window inside it
+                    // (`research/docs/25` §6 Step 3).
+                    if let Some(plan) = &heap_plan {
+                        if let Some(heap_offset) = plan.offsets.get(&resource.allocation_id.get()) {
+                            buffers.push(PoolBinding::HeapOwned {
+                                index,
+                                allocation: resource.allocation_id.get(),
+                                offset: usize::try_from(resource.offset).map_err(|_| overflow())?,
+                                length: usize::try_from(resource.length).map_err(|_| overflow())?,
+                                access: resource.access,
+                                bytes: bytes.clone(),
+                                heap_offset: usize::try_from(*heap_offset)
+                                    .map_err(|_| overflow())?,
+                                heap_size: usize::try_from(plan.slab_size)
+                                    .map_err(|_| overflow())?,
+                            });
+                            continue;
+                        }
+                    }
                     // A lone owned view keeps its exact-length buffer; only a
                     // repeated allocation shares one backing across its views.
                     if owned_per_allocation
@@ -1307,6 +1488,10 @@ impl ComputeProvider for VulkanComputeProvider {
                         pending: Some(pending),
                         pool,
                         render_writebacks,
+                        heap_observations: heap_plan
+                            .as_ref()
+                            .map(|plan| plan.observations.clone())
+                            .unwrap_or_default(),
                         deadline: ObservationDeadline::new(self.observation_deadline),
                     },
                 );
@@ -1355,6 +1540,11 @@ impl ComputeProvider for VulkanComputeProvider {
             }
             Err(_) => None,
         };
+        if result.is_ok() {
+            if let Some(plan) = &heap_plan {
+                self.publish_heap_observations(plan.observations.clone());
+            }
+        }
         if let Some(observation) = observation {
             self.completions
                 .lock()
@@ -1366,6 +1556,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         pending: None,
                         pool: Vec::new(),
                         render_writebacks: Vec::new(),
+                        heap_observations: Vec::new(),
                         deadline: ObservationDeadline::new(self.observation_deadline),
                     },
                 );

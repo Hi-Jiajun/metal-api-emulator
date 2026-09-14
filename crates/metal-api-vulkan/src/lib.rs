@@ -2500,6 +2500,24 @@ pub(crate) enum PoolBinding {
         access: metal_api_core::provider::BufferAccess,
         bytes: Vec<u8>,
     },
+    /// One device buffer bound at a placement offset inside a heap slab.
+    ///
+    /// `index`/`allocation`/`offset`/`length` keep the same meaning as
+    /// [`Self::SharedOwned`]: the pool key is the view, the allocation
+    /// identifies the buffer, and the view is its `[offset, offset + length)`
+    /// window. `heap_offset` is the buffer's base inside the slab and
+    /// `heap_size` is the total slab byte size; both come straight from the
+    /// trace's heap payload (`research/docs/25-heaps与ICB设计.md` §6 Step 3).
+    HeapOwned {
+        index: u32,
+        allocation: u64,
+        offset: usize,
+        length: usize,
+        access: metal_api_core::provider::BufferAccess,
+        bytes: Vec<u8>,
+        heap_offset: usize,
+        heap_size: usize,
+    },
     Imported {
         index: u32,
         pointer: usize,
@@ -2512,7 +2530,9 @@ impl PoolBinding {
     pub(crate) fn index(&self) -> u32 {
         match self {
             Self::Owned(binding) => binding.index,
-            Self::SharedOwned { index, .. } | Self::Imported { index, .. } => *index,
+            Self::SharedOwned { index, .. }
+            | Self::HeapOwned { index, .. }
+            | Self::Imported { index, .. } => *index,
         }
     }
 
@@ -2520,7 +2540,7 @@ impl PoolBinding {
         match self {
             Self::Owned(binding) => binding.bytes.len(),
             // The reflected binding width is the view, not the shared backing.
-            Self::SharedOwned { length, .. } => *length,
+            Self::SharedOwned { length, .. } | Self::HeapOwned { length, .. } => *length,
             Self::Imported { len, .. } => *len,
         }
     }
@@ -2565,6 +2585,11 @@ struct GpuBuffer {
     index: u64,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// Byte offset of `buffer` within `memory`. Owned and imported backings
+    /// bind at zero; a heap-placed buffer is bound at its placement offset
+    /// inside the shared slab, so `buffer` and `memory` no longer share a
+    /// base address.
+    bind_offset: usize,
     len: usize,
     /// Borrowed mappings are the owner's pointer; owned mappings are the
     /// device mapping made at creation time and kept for sparse uploads.
@@ -2615,6 +2640,14 @@ struct ExecutionResources {
     device_loss_fault: Option<DeviceFaultSnapshot>,
     leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+    /// The single heap slab backing every heap-placed buffer in this
+    /// submission. Allocated once, mapped once and freed once at `Drop`;
+    /// heap-placed `GpuBuffer`s carry `memory == null()` so their `Drop` pass
+    /// never double-frees the slab (`research/docs/25-heaps与ICB设计.md` §6
+    /// Step 3).
+    heap_memory: Option<vk::DeviceMemory>,
+    /// Byte size of `heap_memory`, for the abandonment budget.
+    heap_bytes: Option<u64>,
     /// Sampled textures addressed by their Metal argument index.
     textures: Vec<GpuTexture>,
     /// Pool key to its window in `buffers`. `research/docs/15` §3.
@@ -2959,6 +2992,8 @@ impl ExecutionResources {
             device_loss_fault: None,
             leak_is_budgeted: false,
             buffers: Vec::new(),
+            heap_memory: None,
+            heap_bytes: None,
             textures: Vec::new(),
             view_windows: BTreeMap::new(),
             borrowed: None,
@@ -2966,12 +3001,14 @@ impl ExecutionResources {
     }
 
     fn owned_bytes(&self) -> u64 {
-        self.buffers.iter().fold(0_u64, |total, buffer| {
-            if buffer.host_pointer.is_some() {
+        let heap_bytes = self.heap_bytes.unwrap_or(0);
+        let buffers = self.buffers.iter().fold(0_u64, |total, buffer| {
+            if buffer.host_pointer.is_some() || buffer.memory == vk::DeviceMemory::null() {
                 return total;
             }
             total.saturating_add(u64::try_from(buffer.len).unwrap_or(u64::MAX))
-        })
+        });
+        heap_bytes.saturating_add(buffers)
     }
 
     fn set_borrowed_leases(
@@ -3019,24 +3056,74 @@ impl ExecutionResources {
         // Every shared backing must be sized before any of them is created:
         // the first view of an allocation may not be its largest end offset.
         let mut shared_sizes = BTreeMap::<u64, usize>::new();
+        // Heap placements are one buffer per allocation inside a single slab:
+        // `heap_sizes` is each allocation's device buffer size (its largest
+        // view end), `heap_offsets` its binding offset inside the slab, and
+        // `heap_slab_size` the slab's total byte size from the trace payload.
+        let mut heap_sizes = BTreeMap::<u64, usize>::new();
+        let mut heap_offsets = BTreeMap::<u64, usize>::new();
+        let mut heap_slab_size: Option<usize> = None;
         for supplied in bindings {
-            if let PoolBinding::SharedOwned {
-                allocation,
-                offset,
-                length,
-                ..
-            } = supplied
-            {
-                let end = offset.checked_add(*length).ok_or_else(|| {
-                    failure(format!(
-                        "shared buffer {allocation} view range overflows usize"
-                    ))
-                })?;
-                shared_sizes
-                    .entry(*allocation)
-                    .and_modify(|size| *size = (*size).max(end))
-                    .or_insert(end);
+            match supplied {
+                PoolBinding::SharedOwned {
+                    allocation,
+                    offset,
+                    length,
+                    ..
+                } => {
+                    let end = offset.checked_add(*length).ok_or_else(|| {
+                        failure(format!(
+                            "shared buffer {allocation} view range overflows usize"
+                        ))
+                    })?;
+                    shared_sizes
+                        .entry(*allocation)
+                        .and_modify(|size| *size = (*size).max(end))
+                        .or_insert(end);
+                }
+                PoolBinding::HeapOwned {
+                    allocation,
+                    offset,
+                    length,
+                    heap_offset,
+                    heap_size,
+                    ..
+                } => {
+                    let end = offset.checked_add(*length).ok_or_else(|| {
+                        failure(format!(
+                            "heap buffer {allocation} view range overflows usize"
+                        ))
+                    })?;
+                    heap_sizes
+                        .entry(*allocation)
+                        .and_modify(|size| *size = (*size).max(end))
+                        .or_insert(end);
+                    match heap_offsets.get(allocation) {
+                        Some(existing) if *existing != *heap_offset => {
+                            return Err(failure(format!(
+                                "heap allocation {allocation} has conflicting offsets {existing} and {heap_offset}"
+                            ))
+                            .into());
+                        }
+                        _ => {
+                            heap_offsets.insert(*allocation, *heap_offset);
+                        }
+                    }
+                    match heap_slab_size {
+                        Some(existing) if existing != *heap_size => {
+                            return Err(failure(format!(
+                                "heap slab size disagrees across placements: {existing} and {heap_size}"
+                            ))
+                            .into());
+                        }
+                        _ => heap_slab_size = Some(*heap_size),
+                    }
+                }
+                _ => {}
             }
+        }
+        if let Some(slab_size) = heap_slab_size {
+            self.create_heap_buffers(&heap_sizes, &heap_offsets, slab_size)?;
         }
         for supplied in bindings {
             match supplied {
@@ -3110,6 +3197,64 @@ impl ExecutionResources {
                     }
                     self.register_view(PoolKey::buffer(*index), *allocation, *offset, *length)?;
                 }
+                PoolBinding::HeapOwned {
+                    index,
+                    allocation,
+                    offset,
+                    length,
+                    access,
+                    bytes,
+                    ..
+                } => {
+                    // The slab and the allocation's buffer already exist;
+                    // only the view's own bytes are uploaded at its window
+                    // inside the buffer (`research/docs/25` §6 Step 3). A
+                    // write-only view uploads nothing.
+                    if bytes.len() != *length {
+                        return Err(failure(format!(
+                            "heap buffer {allocation} view has {} bytes, expected {length}",
+                            bytes.len()
+                        ))
+                        .into());
+                    }
+                    let gpu = self
+                        .buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.index == *allocation)
+                        .expect("heap buffer was just created");
+                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
+                        &bytes[..0]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    if !upload.is_empty() {
+                        if gpu.uploaded_ranges.contains_key(offset) {
+                            return Err(failure(format!(
+                                "heap buffer {allocation} already uploaded bytes at offset {offset}"
+                            ))
+                            .into());
+                        }
+                        let mapping = gpu
+                            .host_pointer
+                            .unwrap_or_else(|| gpu.mapping.expect("heap slab is mapped"));
+                        let host_offset =
+                            gpu.bind_offset.checked_add(*offset).ok_or_else(|| {
+                                failure(format!(
+                                    "heap buffer {allocation} host offset overflows usize"
+                                ))
+                            })?;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                upload.as_ptr(),
+                                (mapping as *mut u8).add(host_offset),
+                                upload.len(),
+                            );
+                        }
+                        gpu.uploaded_ranges.insert(*offset, upload.len());
+                        self.context.record_buffer_upload_bytes(upload.len());
+                    }
+                    self.register_view(PoolKey::buffer(*index), *allocation, *offset, *length)?;
+                }
                 PoolBinding::Imported {
                     index,
                     pointer,
@@ -3123,6 +3268,154 @@ impl ExecutionResources {
             }
         }
         self.buffers.sort_by_key(|buffer| buffer.index);
+        Ok(())
+    }
+
+    /// Create one heap slab and one `VkBuffer` per heap placement, bound at
+    /// the placement offset inside the slab (`research/docs/25-heaps与ICB设计.md`
+    /// §6 Step 3). The slab is a single `VkDeviceMemory` allocation selected
+    /// from the intersection of every buffer's `VkMemoryRequirements`, mapped
+    /// once for upload/readback, and freed once at `Drop`.
+    fn create_heap_buffers(
+        &mut self,
+        heap_sizes: &BTreeMap<u64, usize>,
+        heap_offsets: &BTreeMap<u64, usize>,
+        slab_size: usize,
+    ) -> Result<(), ExecutionFailure> {
+        struct PendingHeapBuffer {
+            allocation: u64,
+            buffer: vk::Buffer,
+            requirements: vk::MemoryRequirements,
+            offset: usize,
+            size: usize,
+        }
+
+        // Buffers are created first so the slab memory type can be chosen from
+        // the intersection of every buffer's requirements instead of assuming
+        // one representative allocation is representative.
+        let mut pending = Vec::<PendingHeapBuffer>::new();
+        for (allocation, size) in heap_sizes {
+            let offset = *heap_offsets
+                .get(allocation)
+                .expect("heap offset pass covered every allocation");
+            let size_u64 =
+                u64::try_from(*size).map_err(|_| failure("heap buffer size overflows u64"))?;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size_u64)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(
+                |error| {
+                    ExecutionFailure::vulkan(
+                        error,
+                        format!("create heap buffer {allocation}: {error}"),
+                    )
+                },
+            )?;
+            let requirements =
+                unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+            let alignment = usize::try_from(requirements.alignment).unwrap_or(usize::MAX);
+            if alignment == 0 || !offset.is_multiple_of(alignment) {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(failure(format!(
+                    "heap buffer {allocation} offset {offset} is not a multiple of its {alignment}-byte alignment"
+                ))
+                .into());
+            }
+            pending.push(PendingHeapBuffer {
+                allocation: *allocation,
+                buffer,
+                requirements,
+                offset,
+                size: *size,
+            });
+        }
+
+        let mut type_bits = pending
+            .first()
+            .map_or(0, |head| head.requirements.memory_type_bits);
+        for head in &pending[1..] {
+            type_bits &= head.requirements.memory_type_bits;
+        }
+        let memory_type = match self.context.memory_type(
+            type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                return Err(error.into());
+            }
+        };
+        let slab_size =
+            u64::try_from(slab_size).map_err(|_| failure("heap slab size overflows u64"))?;
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(slab_size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate heap slab memory: {error}"),
+                ));
+            }
+        };
+        let mapped = match unsafe {
+            self.context
+                .device
+                .map_memory(memory, 0, slab_size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                unsafe { self.context.device.free_memory(memory, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map heap slab: {error}"),
+                ));
+            }
+        };
+        self.heap_memory = Some(memory);
+        self.heap_bytes = Some(slab_size);
+        for head in pending {
+            if let Err(error) = unsafe {
+                self.context
+                    .device
+                    .bind_buffer_memory(head.buffer, memory, head.offset as u64)
+            } {
+                unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                self.heap_memory = None;
+                unsafe {
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!(
+                        "bind heap buffer {} at offset {}: {error}",
+                        head.allocation, head.offset
+                    ),
+                ));
+            }
+            self.context.record_buffer_upload();
+            self.buffers.push(GpuBuffer {
+                index: head.allocation,
+                buffer: head.buffer,
+                memory: vk::DeviceMemory::null(),
+                bind_offset: head.offset,
+                len: head.size,
+                host_pointer: None,
+                mapping: Some(mapped as usize),
+                uploaded_ranges: BTreeMap::new(),
+            });
+        }
         Ok(())
     }
 
@@ -3481,6 +3774,7 @@ impl ExecutionResources {
             index,
             buffer,
             memory,
+            bind_offset: 0,
             len: usize::try_from(size).unwrap_or(usize::MAX),
             host_pointer: None,
             mapping: Some(mapped as usize),
@@ -3583,6 +3877,7 @@ impl ExecutionResources {
             index: u64::from(index),
             buffer,
             memory,
+            bind_offset: 0,
             len,
             host_pointer: Some(pointer),
             mapping: None,
@@ -4000,8 +4295,13 @@ impl ExecutionResources {
                 ))
                 .into());
             }
+            let host_offset = gpu.bind_offset.checked_add(window.offset).ok_or_else(|| {
+                failure(format!(
+                    "buffer pool key {pool_key} host offset overflows usize"
+                ))
+            })?;
             let bytes = unsafe {
-                std::slice::from_raw_parts((mapping as *const u8).add(window.offset), window.length)
+                std::slice::from_raw_parts((mapping as *const u8).add(host_offset), window.length)
             };
             let bytes = bytes.to_vec();
             if !bytes.is_empty() {
@@ -4066,7 +4366,12 @@ impl Drop for ExecutionResources {
             self.pipeline_objects.clear();
             for buffer in &self.buffers {
                 self.context.device.destroy_buffer(buffer.buffer, None);
-                self.context.device.free_memory(buffer.memory, None);
+                if buffer.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(buffer.memory, None);
+                }
+            }
+            if let Some(memory) = self.heap_memory {
+                self.context.device.free_memory(memory, None);
             }
             for texture in &self.textures {
                 self.context.device.destroy_sampler(texture.sampler, None);

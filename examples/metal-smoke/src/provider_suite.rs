@@ -13,10 +13,11 @@ use metal_api_core::provider::{
     BufferLease, BufferSource, BufferView, CompletionDisposition, CompletionPolicy,
     CompletionToken, ComputePass, ComputeProvider, ComputeTrace, ContractError, DeviceEpoch,
     Dispatch, DispatchKind, DispatchType, FieldValue, FootprintProof, GuestWindow, GuestWindows,
-    HostRegion, LeaseId, LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation,
-    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, ProviderError,
-    ProviderHealth, ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, HostRegion, LeaseId,
+    LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, NoCopyLeaseImporter,
+    OperationId, PipelineCompileRequest, PipelineProvider, ProviderError, ProviderHealth,
+    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
+    StorageMode, SubmissionId, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 #[cfg(unix)]
 use metal_api_core::provider::{ProviderErrorClass, Retryability};
@@ -137,6 +138,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_object_serial_dependency()?;
     run_object_concurrent_enqueue()?;
     run_device_lifecycle()?;
+    run_heap_placement(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -3362,6 +3364,293 @@ fn run_indexed_and_refusals(
         .map_err(provider_error)?;
     expect_refusal(provider.submit(admitted), "unknown_pipeline")?;
     println!("PASS provider_release completion=unknown_completion pipeline=unknown_pipeline");
+    Ok(())
+}
+
+/// Build a compute trace whose owned buffers are placed in one heap. Every
+/// fixture binding is a single owned view at allocation offset zero, so its
+/// allocation size equals the view byte length and the heap placement's
+/// `byte_size` can be asserted one-to-one against it.
+fn make_heap_trace(
+    pipeline: &CompiledComputePipeline,
+    operation: u64,
+    dispatch: Dispatch,
+    heap: HeapPayload,
+    bindings: Vec<(u32, Vec<u8>)>,
+) -> Result<ComputeTrace, Box<dyn Error>> {
+    let mut buffers = Vec::with_capacity(bindings.len());
+    for (index, bytes) in bindings {
+        let access = pipeline
+            .contract
+            .buffer_bindings
+            .iter()
+            .find(|binding| binding.metal_binding == index)
+            .ok_or("fixture binding is missing from pipeline reflection")?
+            .access;
+        buffers.push(BufferView {
+            view_id: ViewId::new(200 + u64::from(index)),
+            metal_binding: index,
+            allocation_id: AllocationId::new(100 + u64::from(index)),
+            offset: 0,
+            length: u64::try_from(bytes.len())?,
+            access,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        });
+    }
+    Ok(ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: pipeline.device_epoch,
+        operation_id: OperationId::new(operation),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch,
+            textures: Vec::new(),
+        })],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: Some(Box::new(heap)),
+        indirect: None,
+    })
+}
+
+/// One allocation per fixture binding, sized exactly as `sizes` describes so
+/// the heap mapping can be validated against it.
+fn heap_resources(
+    trace: &ComputeTrace,
+    sizes: &[u64],
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    let mut resources = ResourceTableSnapshot::new();
+    for (view, size) in trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+        .iter()
+        .zip(sizes)
+    {
+        resources.insert_allocation(AllocationRecord {
+            allocation_id: view.allocation_id,
+            owner_epoch: trace.device_epoch,
+            size: *size,
+        })?;
+    }
+    Ok(resources)
+}
+
+fn run_heap_placement(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = Device::new(executor);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"heap_placement".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let input = 0x6745_2301u32.to_le_bytes().to_vec();
+    let output = 0xabab_ababu32.to_le_bytes().to_vec();
+    let heap_id = HeapId::new(61);
+
+    let heap = |placements: Vec<HeapPlacement>| HeapPayload {
+        descriptor: HeapDescriptor {
+            size: 4096,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: false,
+        },
+        placements,
+    };
+
+    // Success: two 4-byte buffers placed at 0 and 256 in one slab; the copy
+    // kernel writes the input bytes into the output buffer.
+    let trace = make_heap_trace(
+        &pipeline,
+        700,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 256,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let resources = heap_resources(&trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!("heap placement did not complete: {:?}", result.completion).into());
+    };
+    if provider
+        .wait(token, Duration::ZERO)
+        .map_err(provider_error)?
+        != (CompletionDisposition::CompletedVisible { token })
+    {
+        return Err("heap placement token did not stay visible".into());
+    }
+    let output_view = trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+        .iter()
+        .find(|view| view.metal_binding == 1)
+        .ok_or("output binding is missing from heap fixture")?;
+    let [writeback] = result.writebacks.as_slice() else {
+        return Err("heap fixture requires exactly one writable view".into());
+    };
+    if writeback.allocation_id != output_view.allocation_id
+        || writeback.view_id != output_view.view_id
+        || writeback.offset != 0
+        || writeback.bytes != input
+    {
+        return Err(format!("heap placement writeback mismatch: {writeback:?}").into());
+    }
+    let observations = provider.heap_placement_observations();
+    let [first, second] = observations.as_slice() else {
+        return Err(format!(
+            "heap placement reported {} observations, expected 2",
+            observations.len()
+        )
+        .into());
+    };
+    if first.heap_id != heap_id
+        || first.allocation_id != AllocationId::new(100)
+        || first.offset != 0
+        || first.byte_size != 4
+    {
+        return Err(format!("first heap placement observation is wrong: {first:?}").into());
+    }
+    if second.heap_id != heap_id
+        || second.allocation_id != AllocationId::new(101)
+        || second.offset != 256
+        || second.byte_size != 4
+    {
+        return Err(format!("second heap placement observation is wrong: {second:?}").into());
+    }
+    println!(
+        "PASS provider_heap_placement heap=61 same_slab=true offsets=0,256 writeback=exact observations=2"
+    );
+
+    // Provider-side count mismatch: one placement against two owned allocations.
+    let count_trace = make_heap_trace(
+        &pipeline,
+        701,
+        dispatch,
+        heap(vec![HeapPlacement {
+            heap_id,
+            offset: 0,
+            resource: HeapResource::Buffer { byte_size: 4 },
+        }]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let count_resources = heap_resources(&count_trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(count_trace.clone(), count_resources)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "heap_placement_mismatch")?;
+
+    // Provider-side size mismatch: placement byte size disagrees with the
+    // allocation it maps to.
+    let size_trace = make_heap_trace(
+        &pipeline,
+        702,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 8 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 256,
+                resource: HeapResource::Buffer { byte_size: 8 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let size_resources = heap_resources(&size_trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(size_trace.clone(), size_resources)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "heap_placement_mismatch")?;
+
+    // Neutral overflow refusal, caught before provider mapping.
+    let overflow_trace = make_heap_trace(
+        &pipeline,
+        703,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 4096,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let overflow_resources = heap_resources(&overflow_trace, &[4, 4])?;
+    expect_refusal(
+        provider
+            .capabilities()
+            .validate_trace(overflow_trace, overflow_resources),
+        "heap_placement_overflow",
+    )?;
+
+    // Neutral overlap refusal: aliasing is not part of the first increment.
+    let overlap_trace = make_heap_trace(
+        &pipeline,
+        704,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 2,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let overlap_resources = heap_resources(&overlap_trace, &[4, 4])?;
+    expect_refusal(
+        provider
+            .capabilities()
+            .validate_trace(overlap_trace, overlap_resources),
+        "heap_alias_unsupported",
+    )?;
+    println!("PASS provider_heap_refusals count=heap_placement_mismatch size=heap_placement_mismatch overflow=heap_placement_overflow overlap=heap_alias_unsupported");
+    release_case(&provider, &pipeline, &result)?;
     Ok(())
 }
 
