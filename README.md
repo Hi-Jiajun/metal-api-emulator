@@ -165,6 +165,18 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   `evidence/windows-rtx5060-v13v14-objects-341b334-2026-09-14/`. This is a *readable-target
   equivalent*: it does not create a `VkSurfaceKHR`, a swapchain or a window, and
   it models neither multi-buffering nor vsync (`research/docs/24` §3.6).
+- The heap and indirect-command tracks have their first committed suite:
+  `suite-v15` carries one heap case (two allocations bound into one
+  `VkDeviceMemory` slab at offsets 0 and 256), one indirect-dispatch case and one
+  indirect-draw render case, each reporting the provider's own placement/replay
+  record next to the same writeback-byte comparison every other case uses. CI run
+  `34826165116` is green — Lavapipe runs all three Vulkan shapes, the macOS rails
+  validate and capture the suite, compare-captures reports five-rail parity — and
+  the RTX 5060 run is archived in
+  `evidence/windows-rtx5060-v15-suite-87cd4bc-2026-09-14/`. The fixture's marker
+  names only `vulkan`: the native rails do not execute heap/indirect cases yet
+  (`research/docs/25` Step 7), and indexed draws and heap aliasing remain outside
+  the increment.
 - Guest memory has its owner-side contract: `HostRegion` registers a host
   address range and derives page-aligned borrowed windows,
   `provider-smoke` imports such a window without copying and observes the
@@ -193,12 +205,11 @@ runs the same fixtures against the reims Vulkan engine in a separate workspace.
   texture generalisation beyond the sampled fixture, presentation beyond the
   surfaceless readable-target equivalent (real surfaces and swapchains,
   multi-buffering, present modes other than FIFO, vsync, suboptimal handling),
-  heap placement and ICB execution (the
-  core value types and default-off capability gates landed in `90771cc`;
-  `research/docs/25` is the eight-step design), general MTLB function-name
-  resolution, Windows MSL compilation, arbitrary AIR/MSL compilation and
-  reflection, and production reims integration (Gate 2/3). This is not a
-  Metal.framework ABI implementation.
+  heap and indirect execution on the native rails and through the object API,
+  indexed draws and heap aliasing (`research/docs/25` Steps 6-7), general MTLB
+  function-name resolution, Windows MSL compilation, arbitrary AIR/MSL
+  compilation and reflection, and production reims integration (Gate 2/3). This
+  is not a Metal.framework ABI implementation.
 
 A [native Metal capture harness](conformance/README.md) is prepared for two
 shared fixtures, with a Vulkan JSON capture runner and comparator. The Swift
