@@ -1316,8 +1316,16 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             }
             drawnCount += 1
         }
-        try require(drawnCount > 0 && keptCount > 0,
-                    "\(definition.id): a loaded attachment needs both drawn and kept texels")
+        // The suite comparator additionally requires at least one *kept* texel,
+        // because a loading case whose draw covers everything cannot show that
+        // the load happened (`conformance/compare.py`). This oracle's own
+        // self-test fixtures are deliberately that shape — the present
+        // self-test exists to show the sentinel was replaced, not to falsify
+        // the load — so the oracle only insists that something was drawn here
+        // and leaves the falsifiability rule to the comparator and to the
+        // suite fixtures.
+        try require(drawnCount > 0,
+                    "\(definition.id): a loaded attachment needs at least one drawn texel")
         clearComponents = []
         initial = previous
     default:
