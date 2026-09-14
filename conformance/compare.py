@@ -174,26 +174,28 @@ def _present_observation(value, expectation, where):
              "the suite declares")
 
 
-def _icb_declaration(value, expected_kind, where):
+def _icb_declaration(value, expected_kinds, where):
     """Parse one case's indirect-command section (`research/docs/25` §4.3).
 
     The first indirect increment replays exactly one command of one kind per
     case, so the section is a whitelist: the command kind has to be the one the
-    case's execution path can carry (`draw` for a render case, `dispatch` for a
-    compute case), the buffer's kind list has to contain it, the replayed range
-    has to stay inside the buffer, and the command's own counts are validated
-    here so a suite cannot spell a zero-vertex draw.
+    case's execution path can carry (`draw`/`draw_indexed` for a render case,
+    `dispatch` for a compute case), the buffer's kind list has to contain it,
+    the replayed range has to stay inside the buffer, and the command's own
+    counts are validated here so a suite cannot spell a zero-vertex draw.
     """
     _object(value, ("kind", "max_commands", "kinds", "range", "command"),
             f"{where}.icb")
     kind = value["kind"]
-    _require(kind in ("draw", "dispatch"), f"{where}.icb: unknown command kind")
-    _require(kind == expected_kind,
-             f"{where}.icb: this case's execution path replays a {expected_kind} command")
+    _require(kind in ("draw", "draw_indexed", "dispatch"),
+             f"{where}.icb: unknown command kind")
+    _require(kind in expected_kinds,
+             f"{where}.icb: this case's execution path replays a "
+             f"{' or '.join(expected_kinds)} command")
     max_commands = _integer(value["max_commands"], f"{where}.icb.max_commands", 1, U32_MAX)
     kinds = _list(value["kinds"], f"{where}.icb.kinds")
     _require(kinds and len(set(kinds)) == len(kinds)
-             and all(named in ("draw", "dispatch") for named in kinds),
+             and all(named in ("draw", "draw_indexed", "dispatch") for named in kinds),
              f"{where}.icb: kinds has to name distinct known command kinds")
     _require(kind in kinds, f"{where}.icb: the buffer does not admit its own command kind")
     range_ = value["range"]
@@ -206,6 +208,10 @@ def _icb_declaration(value, expected_kind, where):
     if kind == "draw":
         _object(command, ("vertex_count", "instance_count"), f"{where}.icb.command")
         _integer(command["vertex_count"], f"{where}.icb.command.vertex_count", 1, U32_MAX)
+        _integer(command["instance_count"], f"{where}.icb.command.instance_count", 1, U32_MAX)
+    elif kind == "draw_indexed":
+        _object(command, ("index_count", "instance_count"), f"{where}.icb.command")
+        _integer(command["index_count"], f"{where}.icb.command.index_count", 1, U32_MAX)
         _integer(command["instance_count"], f"{where}.icb.command.instance_count", 1, U32_MAX)
     else:
         _object(command, ("x", "y", "z"), f"{where}.icb.command")
@@ -543,7 +549,7 @@ def _suite_plan(suite):
         if "heap" in case:
             heap = _heap_declaration(case["heap"], allocations, where)
         if "icb" in case:
-            icb = _icb_declaration(case["icb"], "dispatch", where)
+            icb = _icb_declaration(case["icb"], ("dispatch",), where)
         if "capture_rails" in case:
             rails = _list(case["capture_rails"], f"{where}.capture_rails")
             _require(rails and len(set(rails)) == len(rails)
@@ -717,7 +723,7 @@ def _render_plan(plan, suite):
         # record cannot prove which path produced them.
         icb = None
         if "icb" in case:
-            icb = _icb_declaration(case["icb"], "draw", where)
+            icb = _icb_declaration(case["icb"], ("draw", "draw_indexed"), where)
 
         rails = _list(case["capture_rails"], f"{where}.capture_rails")
         _require(rails and len(set(rails)) == len(rails)

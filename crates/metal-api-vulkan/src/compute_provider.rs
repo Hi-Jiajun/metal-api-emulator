@@ -672,19 +672,21 @@ impl VulkanComputeProvider {
         pool: &[BufferView],
         plan: &[PlannedRenderPass],
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
-        // The render rail's indirect payload replays one draw command into
-        // exactly one plain render pass (`research/docs/25` §6 Step 4). The
-        // guards run before the empty-plan early return on purpose: a trace
-        // that carries an indirect draw but no render pass has nothing to
-        // replay into, and reporting success while dropping the command would
-        // be fail-open. A dispatch payload never reaches this guard: it is
-        // owned by the compute rail, and `indirect_dispatch_threadgroups`
-        // already refused the render-pass-plus-dispatch shape before the
-        // render plan was built.
-        let render_replays_indirect = trace
-            .indirect
-            .as_deref()
-            .is_some_and(|payload| payload.command.kind() == IndirectCommandKind::Draw);
+        // The render rail's indirect payload replays one draw or indexed draw
+        // command into exactly one plain render pass (`research/docs/25` §6
+        // Step 4). The guards run before the empty-plan early return on
+        // purpose: a trace that carries an indirect draw but no render pass has
+        // nothing to replay into, and reporting success while dropping the
+        // command would be fail-open. A dispatch payload never reaches this
+        // guard: it is owned by the compute rail, and
+        // `indirect_dispatch_threadgroups` already refused the
+        // render-pass-plus-dispatch shape before the render plan was built.
+        let render_replays_indirect = trace.indirect.as_deref().is_some_and(|payload| {
+            matches!(
+                payload.command.kind(),
+                IndirectCommandKind::Draw | IndirectCommandKind::DrawIndexed
+            )
+        });
         if render_replays_indirect {
             if plan.is_empty() {
                 return Err(refusal(

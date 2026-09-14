@@ -717,6 +717,23 @@ fn indirect_draw() -> IndirectCommandPayload {
     }
 }
 
+/// The indirect payload one indexed replay carries: one `draw_indexed` of the
+/// milestone's full-screen triangle through the rail's own `[0, 1, 2]` index
+/// buffer (`research/docs/25` §6 Step 4).
+fn indirect_draw_indexed() -> IndirectCommandPayload {
+    IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: 1,
+            kinds: vec![IndirectCommandKind::DrawIndexed],
+        },
+        command: IndirectCommandDescriptor::DrawIndexed {
+            index_count: 3,
+            instance_count: 1,
+        },
+        range: IndirectCommandRange { start: 0, count: 1 },
+    }
+}
+
 /// The first indirect increment replays the pass's full-screen triangle from a
 /// CPU-encoded `VkDrawIndirectCommand`. The falsifiable claim is byte equality
 /// with the direct draw: the same attachment, the same fragment output, and
@@ -756,6 +773,80 @@ fn an_indirect_draw_replays_the_same_attachment_bytes_as_a_direct_draw() {
     assert_eq!(indirect_bytes, expected);
     assert_eq!(indirect_bytes, direct_bytes);
     assert_ne!(indirect_bytes, CLEAR_SENTINEL.repeat(4));
+}
+
+/// The indexed sibling of the draw replay: the same attachment bytes come back
+/// from a `vkCmdDrawIndexedIndirect` replay that binds the rail's `[0, 1, 2]`
+/// index buffer. The falsifiable claim stays byte equality with the direct
+/// draw, so an index buffer that selected a different vertex set could not
+/// pass.
+#[test]
+fn an_indirect_indexed_draw_replays_the_same_attachment_bytes_as_a_direct_draw() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let direct_bytes = attachment_readback(&direct, &submit_fixture(&direct));
+    let expected = expected_texels(AttachmentFormat::Rgba8Unorm).repeat(4);
+    assert_eq!(direct_bytes, expected);
+
+    let mut trace = direct.trace.clone();
+    trace.indirect = Some(Box::new(indirect_draw_indexed()));
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("the indexed-indirect-bearing trace is admitted");
+    let submitted = direct
+        .provider
+        .submit(admitted)
+        .expect("the indexed indirect replay completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the replay lands the attachment writeback");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    let indirect_bytes = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("indexed indirect draw readback: {}", hex(&indirect_bytes));
+    assert_eq!(indirect_bytes, expected);
+    assert_eq!(indirect_bytes, direct_bytes);
+    assert_ne!(indirect_bytes, CLEAR_SENTINEL.repeat(4));
+}
+
+/// The first indexed increment replays exactly the milestone's three indices.
+/// A command that names another index count clears admission (the command's own
+/// validation only rejects zero), so the provider's own guard is what refuses
+/// the un-reviewed shape before any render object is created.
+#[test]
+fn an_indirect_indexed_draw_with_an_unreviewed_index_count_is_refused() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let mut trace = direct.trace.clone();
+    trace.indirect = Some(Box::new(IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: 1,
+            kinds: vec![IndirectCommandKind::DrawIndexed],
+        },
+        command: IndirectCommandDescriptor::DrawIndexed {
+            index_count: 2,
+            instance_count: 1,
+        },
+        range: IndirectCommandRange { start: 0, count: 1 },
+    }));
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("admission validates the indexed command's nonzero counts");
+    let refused = direct
+        .provider
+        .submit(admitted)
+        .expect_err("the reviewed indexed shape is three indices only");
+    assert_eq!(refused.slug, "icb_command_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
 }
 
 /// A dispatch command is now in the admitted set, so it clears admission; the
