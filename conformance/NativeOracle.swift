@@ -1550,8 +1550,10 @@ private func heapSelfTest() throws -> HeapSelfTestReport {
                 "heap self-test: a buffer was not heap-backed")
     try require(readBuffer.heap === writeBuffer.heap,
                 "heap self-test: the two buffers are not in the same heap")
-    let readOffset = readBuffer.offset
-    let writeOffset = writeBuffer.offset
+    // `MTLResource.heapOffset` is the byte offset a heap-backed resource was
+    // placed at; `MTLBuffer.offset` does not exist.
+    let readOffset = readBuffer.heapOffset
+    let writeOffset = writeBuffer.heapOffset
     try require(readOffset + 16 <= writeOffset || writeOffset + 12 <= readOffset,
                 "heap self-test: the two heap ranges overlap")
 
