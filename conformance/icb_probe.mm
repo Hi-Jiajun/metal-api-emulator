@@ -35,7 +35,18 @@ int main(int argc, const char *argv[]) {
         const char *shaderPath = "conformance/shaders/render_offscreen_2x2.metal";
         NSString *path = [NSString stringWithUTF8String:shaderPath];
         NSError *error = nil;
-        id<MTLLibrary> library = [device newLibraryWithFile:path error:&error];
+        // The reviewed fixture is MSL *source*; `newLibraryWithFile:` expects a
+        // compiled `.metallib`, so the probe compiles the source string instead.
+        NSString *source = [NSString stringWithContentsOfFile:path
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:&error];
+        if (source == nil) {
+            std::printf("icb_probe: FAIL (cannot read shader source %s: %s)\n",
+                        shaderPath,
+                        error.localizedDescription.UTF8String ?: "(no detail)");
+            return 1;
+        }
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (library == nil) {
             std::printf("icb_probe: FAIL (cannot build shader library from %s: %s)\n",
                         shaderPath,
