@@ -334,21 +334,40 @@ PINNED_V14_PLAN = {
     },
 }
 
+# The committed v15 suite's render plan (`research/docs/25` §6 Step 8): v13's
+# 2x2 attachment replayed from one indirect draw command, marked for the Vulkan
+# trace rail only. The heap and dispatch cases are compute cases and do not
+# appear in the render plan.
+PINNED_V15_PLAN = {
+    "icb_draw_clear_2x2": {
+        "writes": [[[900, 910, 0], TEXELS]],
+        "allocations": [[900, TEXELS]],
+        "touched": [900, 920],
+        "written": [900, 920],
+        "rails": sorted(["vulkan"]),
+        "attachment": list(ATTACHMENT),
+        "present": None,
+    },
+}
+
 
 class ShippedSuitePlanTests(unittest.TestCase):
     """v1-v13 keep their plan; v14 is pinned with its present section."""
 
     def test_shipped_plans_are_pinned(self):
         paths = sorted(CONFORMANCE.glob("suite*.json"))
-        # One suite with a render plan (v13), the committed v14 fixture, and
-        # the twelve suites that carry no render case at all.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 13)
+        # One suite with a render plan (v13), the committed v14 fixture, the
+        # committed v15 fixture, and the twelve suites that carry no render
+        # case at all.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 14)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
             signature = plan_signature(compare._render_plan(compare._suite_plan(suite), suite))
-            expected = PINNED_PLANS.get(suite["suite"], PINNED_V14_PLAN if suite["suite"]
-                                        == "compute-buffer-v14" else {})
+            expected = PINNED_PLANS.get(suite["suite"])
+            if expected is None:
+                expected = {"compute-buffer-v14": PINNED_V14_PLAN,
+                            "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})
             self.assertEqual(signature, expected, path.name + ": the render plan drifted")
             observed[suite["suite"]] = signature
         for identity, signature in observed.items():

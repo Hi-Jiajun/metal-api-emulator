@@ -87,6 +87,12 @@ private struct CaseDefinition: Decodable {
     let buffers: [BufferDefinition]
     let textures: [TextureDefinition]?
     let expected_writebacks: [Writeback]
+    /// Which capture rails the suite marks this compute case executable on.
+    /// `nil` keeps the pre-v15 shape: a case every rail owes. A case that
+    /// carries a heap or indirect section is only executable on the rails its
+    /// marker names (`research/docs/25` §5.2), and this oracle is not one of
+    /// them yet.
+    let capture_rails: [String]?
 }
 
 private struct TextureDefinition: Decodable {
@@ -786,8 +792,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v14":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v15":
+        expectedIDs = ["heap_placement_copy_word", "icb_dispatch_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v14 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v15 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1464,6 +1472,15 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     // across cases while runCase creates fresh commands and buffers each time.
     var pipelines = [String: MTLComputePipelineState]()
     for fixture in suite.cases {
+        // A compute case that carries a heap or indirect section is executable
+        // only on the rails its marker names (`research/docs/25` §5.2); this
+        // oracle runs no heap placement and no indirect replay, so it omits a
+        // case the marker does not name instead of reporting a direct run as
+        // if it were that case.
+        if let rails = fixture.definition.capture_rails,
+           !rails.contains("native-metal") {
+            continue
+        }
         var selected = [MTLComputePipelineState]()
         for program in fixture.programs {
             let entry = program.definition.entry

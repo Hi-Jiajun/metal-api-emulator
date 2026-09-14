@@ -1663,6 +1663,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v12") => &["texture_cell_local_4x4", "texture_cell_local_1x1"],
         (1, "compute-buffer-v13") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v14") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v15") => &["heap_placement_copy_word", "icb_dispatch_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2287,7 +2288,7 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // a second allocation, so the render submission also proves the
         // declaring pass really read the attachment view. The attachment
         // allocation carries no guard bytes: it is the attachment.
-        "render_declaring_copy_word" => (
+        "render_declaring_copy_word" | "heap_placement_copy_word" | "icb_dispatch_copy_word" => (
             "copy_word",
             [1, 1, 1],
             [1, 1, 1],
