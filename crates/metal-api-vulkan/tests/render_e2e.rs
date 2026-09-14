@@ -1067,6 +1067,21 @@ fn collapsed_vertex_bytes() -> Vec<u8> {
 }
 
 /// Two `uint16` triangles over the four corners: `0,1,2` and `1,3,2`.
+
+/// The reviewed stream's four vertices moved into the top-left quadrant:
+/// `(-1,-1) (0,-1) (-1,0) (0,0)`. With the six reviewed indices the two
+/// triangles cover exactly one pixel centre of a 2x2 attachment, which leaves
+/// three texels for the loaded bytes to show through. A full-size triangle
+/// would put its hypotenuse through two pixel centres, where the top-left fill
+/// rule — not the fixture — would decide coverage (`research/docs/23` §3.3).
+fn quadrant_vertex_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    for (x, y) in [(-1.0_f32, -1.0_f32), (0.0, -1.0), (-1.0, 0.0), (0.0, 0.0)] {
+        bytes.extend_from_slice(&x.to_ne_bytes());
+        bytes.extend_from_slice(&y.to_ne_bytes());
+    }
+    bytes
+}
 fn quad_index_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(12);
     for index in [0_u16, 1, 2, 1, 3, 2] {
@@ -1092,6 +1107,17 @@ fn quad_layout() -> VertexLayout {
 fn vertex_input_fixture(
     vertex_bytes: Vec<u8>,
     index_bytes: Vec<u8>,
+) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
+    vertex_input_fixture_with_load(vertex_bytes, index_bytes, false)
+}
+
+/// The same fixture with the attachment's load op selected: `clear` for the
+/// milestone's shape, `load` for the pass that uploads the declaring view's
+/// bytes first (`research/docs/23` §3.3).
+fn vertex_input_fixture_with_load(
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+    load: bool,
 ) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
     let executor = executor()?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
@@ -1122,7 +1148,14 @@ fn vertex_input_fixture(
         .expect("the vertex-input render pipeline registers");
 
     let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
-    pass.vertices = 6;
+    if load {
+        // The declaring compute case's attachment view carries the previous
+        // bytes; the rail uploads them before the draw.
+        pass.color_attachments[0].load = LoadOp::Load;
+    }
+    // The draw's count is the index count: six for the reviewed quad, three for
+    // the load fixture's single triangle.
+    pass.vertices = u32::try_from(index_bytes.len() / 2).expect("uint16 index count");
     pass.vertex_buffers = vec![BufferView {
         view_id: VERTEX_VIEW,
         metal_binding: 0,
@@ -1277,6 +1310,57 @@ fn the_draw_reads_the_caller_bytes_rather_than_vertex_id() {
             hex(&attachment)
         );
     }
+}
+
+#[test]
+fn a_loading_pass_keeps_the_bytes_the_draw_does_not_cover() {
+    // The `LoadOp::Load` shape (`research/docs/23` §3.3): the same reviewed
+    // layout and pipeline, but a quadrant-sized stream that leaves three pixel
+    // centres uncovered, drawn into an attachment the rail first fills with the
+    // declaring case's own bytes. The uncovered texels keep those bytes, which
+    // is what makes "the upload happened" falsifiable: a clearing pass would
+    // leave the clear colour there instead.
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture_with_load(quadrant_vertex_bytes(), quad_index_bytes(), true)
+    else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("loading triangle readback: {}", hex(&attachment));
+    assert_eq!(attachment.len(), 16);
+    let covered = attachment
+        .chunks_exact(4)
+        .filter(|texel| *texel == QUAD_TEXEL)
+        .count();
+    let previous = attachment
+        .chunks_exact(4)
+        .filter(|texel| *texel == ATTACHMENT_WORD)
+        .count();
+    assert_eq!(
+        (covered, previous),
+        (1, 3),
+        "one texel is drawn and the other three keep the uploaded bytes: {}",
+        hex(&attachment)
+    );
+
+    // The counter-shape: the identical geometry and index buffer with
+    // `LoadOp::Clear` leaves the clear sentinel everywhere the draw missed,
+    // so the two runs differ in exactly the texel the load is about.
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quadrant_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let cleared = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("clearing triangle readback: {}", hex(&cleared));
+    assert!(
+        cleared.chunks_exact(4).any(|texel| texel == CLEAR_SENTINEL),
+        "a clearing pass leaves its own colour where the draw missed: {}",
+        hex(&cleared)
+    );
+    assert_ne!(cleared, attachment);
 }
 
 #[test]

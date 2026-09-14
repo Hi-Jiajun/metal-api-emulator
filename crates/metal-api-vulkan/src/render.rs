@@ -137,6 +137,11 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub vertex_streams: Vec<VertexStream<'a>>,
     /// How the draw issues when [`Self::indirect`] is `None`.
     pub draw: DrawShape,
+    /// The attachment's previous bytes for a `LoadOp::Load` pass
+    /// (`research/docs/23` §3.3). `Some` means the rail uploads them into the
+    /// image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
+    /// `Clear` shape every earlier increment used.
+    pub previous: Option<&'a [u8]>,
     /// The caller-held index buffer, when the draw is indexed.
     pub index_stream: Option<IndexStream<'a>>,
     /// When set, the full-screen triangle is replayed from one CPU-encoded
@@ -337,8 +342,9 @@ pub(crate) fn execute_render_pass(
     context: &VulkanContext,
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
+    previous: Option<&[u8]>,
 ) -> Result<Vec<u8>, ProviderError> {
-    let request = prepare_render_request(stages, pass)?;
+    let request = prepare_render_request(stages, pass, previous)?;
     execute_offscreen_render(context, &request)
 }
 
@@ -353,6 +359,7 @@ pub(crate) fn execute_render_pass(
 fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
+    previous: Option<&'a [u8]>,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
@@ -379,12 +386,19 @@ fn prepare_render_request<'a>(
     let clear = match attachment.load {
         LoadOp::Clear(clear) => clear,
         LoadOp::Load => {
-            return Err(capability_refusal("attachment_load_op_unsupported")
-                .with_field("load_op", FieldValue::Text("load".to_owned()))
-                .with_detail(
-                    "the first render increment has no rail that uploads an attachment's \
-                     previous bytes into the image, so `Load` would silently become a clear",
-                ))
+            // The rail uploads the attachment's previous bytes before opening
+            // the render pass (`research/docs/23` §3.3). The caller resolves
+            // them from the trace's own declaration, so a `Load` that carries
+            // no bytes is refused rather than silently executed as a clear.
+            if previous.is_none() {
+                return Err(capability_refusal("attachment_load_op_unsupported")
+                    .with_field("load_op", FieldValue::Text("load".to_owned()))
+                    .with_detail(
+                        "a `LoadOp::Load` pass needs the attachment's previous bytes from \
+                         the trace's own view declaration; this pass resolved none",
+                    ));
+            }
+            ClearColor::new([0; 4])
         }
         LoadOp::DontCare => {
             return Err(capability_refusal("attachment_load_op_unsupported")
@@ -497,6 +511,7 @@ fn prepare_render_request<'a>(
         },
         vertex_streams: streams,
         draw,
+        previous,
         index_stream,
         indirect: None,
     };
@@ -599,6 +614,17 @@ fn decode_indices(
     Ok(indices)
 }
 
+/// The colour subresource range every attachment barrier names.
+fn color_subresource() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
 /// Execute one admitted render pass whose full-screen triangle is replayed from
 /// one CPU-encoded `VkDrawIndirectCommand` or `VkDrawIndexedIndirectCommand`
 /// (`research/docs/25` §6 Step 4).
@@ -613,6 +639,7 @@ pub(crate) fn execute_indirect_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
+    previous: Option<&[u8]>,
 ) -> Result<Vec<u8>, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
@@ -657,7 +684,7 @@ pub(crate) fn execute_indirect_render_pass(
                 .with_detail("the first indirect increment replays draws only"));
         }
     };
-    let mut request = prepare_render_request(stages, pass)?;
+    let mut request = prepare_render_request(stages, pass, previous)?;
     request.indirect = Some(replay);
     execute_offscreen_render(context, &request)
 }
@@ -848,6 +875,31 @@ pub(crate) fn execute_offscreen_render(
     let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
     let mut objects = OffscreenObjects::new(context);
+    // A loading pass declares its load operation before the image exists: the
+    // transfer-destination usage is only legal on the image when the rail is
+    // actually going to upload into it (`research/docs/23` §3.3).
+    if request.previous.is_some() {
+        if !format_features(context, format, tiling).contains(vk::FormatFeatureFlags::TRANSFER_DST)
+        {
+            return Err(attachment_format_refusal()
+                .with_field("vk_format", FieldValue::Unsigned(format.as_raw() as u64))
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("transfer_dst".to_owned()),
+                )
+                .with_detail(
+                    "a `LoadOp::Load` pass uploads the attachment's previous bytes with \
+                     vkCmdCopyBufferToImage",
+                ));
+        }
+        objects.load_op = vk::AttachmentLoadOp::LOAD;
+        // The upload leaves the image in the colour-attachment layout, which is
+        // the layout the render pass has to declare as its initial one: an
+        // `UNDEFINED` initial layout would tell the pass it may discard what the
+        // copy just wrote (`research/docs/23` §3.3).
+        objects.initial_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    }
     objects.create_attachment(format, width, height)?;
     objects.create_render_pass(format)?;
     objects.create_framebuffer(width, height)?;
@@ -861,6 +913,9 @@ pub(crate) fn execute_offscreen_render(
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
+    if let Some(previous) = request.previous {
+        objects.create_previous_bytes(previous)?;
+    }
     match request.indirect {
         Some(IndirectReplay::Draw {
             vertex_count,
@@ -1249,8 +1304,9 @@ pub(crate) fn execute_present_render(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     target: &PresentTargetImage,
+    previous: Option<&[u8]>,
 ) -> Result<Vec<u8>, ProviderError> {
-    let request = prepare_render_request(stages, pass)?;
+    let request = prepare_render_request(stages, pass, previous)?;
     let [width, height] = request.extent;
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
@@ -1390,6 +1446,12 @@ struct OffscreenObjects<'a> {
     draw: DrawShape,
     /// Index width of the caller-held index buffer.
     input_index_type: vk::IndexType,
+    /// The host-visible staging buffer holding an attachment's previous bytes
+    /// for a `LoadOp::Load` pass, plus the load operation the render pass opens
+    /// with. Null/`CLEAR` for a clearing pass.
+    previous_buffer: vk::Buffer,
+    previous_memory: vk::DeviceMemory,
+    load_op: vk::AttachmentLoadOp,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -1422,6 +1484,9 @@ impl<'a> OffscreenObjects<'a> {
             input_index_memory: vk::DeviceMemory::null(),
             draw: DrawShape::Milestone,
             input_index_type: vk::IndexType::UINT16,
+            previous_buffer: vk::Buffer::null(),
+            previous_memory: vk::DeviceMemory::null(),
+            load_op: vk::AttachmentLoadOp::CLEAR,
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1471,7 +1536,19 @@ impl<'a> OffscreenObjects<'a> {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    // A loading pass receives its previous bytes through
+                    // `vkCmdCopyBufferToImage`, so the image needs the transfer
+                    // destination usage exactly when one is uploaded
+                    // (`research/docs/23` §3.3).
+                    | if self.load_op == vk::AttachmentLoadOp::LOAD {
+                        vk::ImageUsageFlags::TRANSFER_DST
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    },
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let (image, memory, _) = crate::allocate_image_backing(
@@ -1505,7 +1582,7 @@ impl<'a> OffscreenObjects<'a> {
         let attachments = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(self.load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -1742,6 +1819,22 @@ impl<'a> OffscreenObjects<'a> {
             self.input_index_memory = memory;
             self.input_index_type = indices_format(index.format);
         }
+        Ok(())
+    }
+
+    /// Upload an attachment's previous bytes into a host-visible staging buffer
+    /// for the `vkCmdCopyBufferToImage` a `LoadOp::Load` pass issues
+    /// (`research/docs/23` §3.3).
+    fn create_previous_bytes(&mut self, bytes: &[u8]) -> Result<(), ProviderError> {
+        let (buffer, memory) = self.create_host_visible_buffer(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            bytes,
+            "attachment previous bytes",
+        )?;
+        self.previous_buffer = buffer;
+        self.previous_memory = memory;
+        self.load_op = vk::AttachmentLoadOp::LOAD;
         Ok(())
     }
 
@@ -2113,6 +2206,74 @@ impl<'a> OffscreenObjects<'a> {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
+        // A loading pass fills the image before the render pass opens: the
+        // previous bytes travel through a host-visible staging buffer, land in
+        // the image with `vkCmdCopyBufferToImage`, and the image is then
+        // transitioned to the colour-attachment layout the render pass declares
+        // as its initial layout (`research/docs/23` §3.3). Both barriers run in
+        // the same command buffer, so the copy cannot be observed after the
+        // draw.
+        if self.previous_buffer != vk::Buffer::null() {
+            unsafe {
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.image)
+                        .subresource_range(color_subresource())
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+                );
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                self.context.device.cmd_copy_buffer_to_image(
+                    self.command,
+                    self.previous_buffer,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    std::slice::from_ref(&copy),
+                );
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(self.image)
+                        .subresource_range(color_subresource())
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)],
+                );
+            }
+        }
         unsafe {
             self.context.device.cmd_begin_render_pass(
                 self.command,
@@ -2398,6 +2559,14 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 self.context
                     .device
                     .free_memory(self.input_index_memory, None);
+            }
+            if self.previous_buffer != vk::Buffer::null() {
+                self.context
+                    .device
+                    .destroy_buffer(self.previous_buffer, None);
+            }
+            if self.previous_memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.previous_memory, None);
             }
         }
     }
@@ -2767,6 +2936,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                previous: None,
                 index_stream: None,
                 indirect: None,
             },
@@ -3002,6 +3172,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            previous: None,
             index_stream: None,
             indirect: None,
         };
@@ -3057,6 +3228,7 @@ mod tests {
                     vertex: single_pixel_vertex(),
                     vertex_streams: Vec::new(),
                     draw: DrawShape::Milestone,
+                    previous: None,
                     index_stream: None,
                     indirect: None,
                 },
@@ -3188,6 +3360,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            previous: None,
             index_stream: None,
             indirect: None,
         };
@@ -3258,7 +3431,7 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass)
+        let refused = execute_render_pass(&context, &stages, &pass, None)
             .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
@@ -3279,7 +3452,7 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass)
+        let refused = execute_render_pass(&context, &stages, &pass, None)
             .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
@@ -3301,7 +3474,7 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass)
+        let error = execute_render_pass(&context, &stages, &pass, None)
             .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);

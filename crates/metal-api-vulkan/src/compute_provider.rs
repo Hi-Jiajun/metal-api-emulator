@@ -733,30 +733,51 @@ impl VulkanComputeProvider {
                 )
                 .with_detail("the render rail executes exactly one colour attachment"));
             };
-            let view = if host_readback {
-                Some(
-                    pool.iter()
-                        .find(|view| {
-                            view.view_id == attachment.view_id
-                                && view.allocation_id == attachment.allocation_id
-                        })
-                        .ok_or_else(|| {
-                            refusal(
-                                ProviderPhase::Resolve,
-                                ProviderErrorClass::Capability,
-                                "render_attachment_landing_unsupported",
-                            )
-                            .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                            .with_field(
-                                "allocation",
-                                FieldValue::Unsigned(attachment.allocation_id.get()),
-                            )
-                            .with_detail(
-                                "attachment bytes land through the buffer writeback channel, \
-                                 and this trace declares no buffer view covering the attachment",
-                            )
-                        })?,
-                )
+            // The declared view serves two purposes: it is the attachment's
+            // landing for the writeback channel, and it is the source of the
+            // previous bytes a `LoadOp::Load` pass uploads before it opens
+            // (`research/docs/23` §3.3). A loading pass therefore needs the
+            // declaration even when the trace asks for no host readback.
+            let declared = pool.iter().find(|view| {
+                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
+            });
+            let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
+            let view = if host_readback || loading {
+                Some(declared.ok_or_else(|| {
+                    refusal(
+                        ProviderPhase::Resolve,
+                        ProviderErrorClass::Capability,
+                        "render_attachment_landing_unsupported",
+                    )
+                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                    .with_field(
+                        "allocation",
+                        FieldValue::Unsigned(attachment.allocation_id.get()),
+                    )
+                    .with_detail(
+                        "attachment bytes land through the buffer writeback channel and \
+                         `LoadOp::Load` uploads the trace's own bytes, and this trace declares \
+                         no buffer view covering the attachment",
+                    )
+                })?)
+            } else {
+                None
+            };
+            let previous = if loading {
+                match view.map(|view| &view.source) {
+                    Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
+                    _ => {
+                        return Err(refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "attachment_load_op_unsupported",
+                        )
+                        .with_field("load_op", FieldValue::Text("load".to_owned()))
+                        .with_detail(
+                            "the first `LoadOp::Load` increment uploads trace-owned bytes only",
+                        ));
+                    }
+                }
             } else {
                 None
             };
@@ -768,6 +789,7 @@ impl VulkanComputeProvider {
                         &planned.stages,
                         &planned.pass,
                         &target,
+                        previous,
                     )?
                 }
                 None => match trace.indirect.as_deref() {
@@ -777,6 +799,7 @@ impl VulkanComputeProvider {
                             &planned.stages,
                             &planned.pass,
                             &payload.command,
+                            previous,
                         )?;
                         // Publish what was actually replayed: the command kind,
                         // the range and the one command the first increment
@@ -793,6 +816,7 @@ impl VulkanComputeProvider {
                         &self.executor.context,
                         &planned.stages,
                         &planned.pass,
+                        previous,
                     )?,
                 },
             };
