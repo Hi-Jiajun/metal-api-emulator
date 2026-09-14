@@ -1723,7 +1723,7 @@ private func icbSelfTest() throws -> IcbSelfTestReport {
     // `indirectRenderCommand(at:)` is the macOS-available accessor; the compute
     // one is marked unavailable in the macOS SDK, which is why this rail's ICB
     // increment replays draws.
-    let command = icb.indirectRenderCommand(at: 0)
+    let command = icb.indirectRenderCommand(atIndex: 0)
     command.setRenderPipelineState(pipeline)
     command.drawPrimitives(.triangle, vertexStart: 0, vertexCount: Int(definition.vertices))
 
@@ -1756,7 +1756,7 @@ private func icbSelfTest() throws -> IcbSelfTestReport {
                                     width: Double(attachment.width),
                                     height: Double(attachment.height),
                                     znear: 0, zfar: 1))
-    encoder.executeCommandsInBuffer(icb, withRange: NSRange(location: 0, length: 1))
+    encoder.executeCommandsInBuffer(icb, range: 0..<1)
     encoder.endEncoding()
     let completed = DispatchSemaphore(value: 0)
     commandBuffer.addCompletedHandler { _ in completed.signal() }
