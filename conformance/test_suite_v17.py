@@ -31,10 +31,12 @@ TEXEL = "4080c0ff"
 EXPECTED = TEXEL + PREVIOUS * 3
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
-# The rails v17 marks: the Vulkan trace rail executes the upload path today. The
-# native rails follow once `MTLLoadAction.Load` lands, and the object rails once
-# their binding surface can express "load" rather than "clear".
-V17_REPORTING_RAILS = ("vulkan",)
+# The rails v17 marks: the three trace rails execute the upload path (Vulkan on
+# Lavapipe and the RTX 5060, the native provider and the Swift oracle on Apple
+# Paravirtual). The object rails stay out until their binding surface can
+# express "load" rather than "clear", and a rail the marker does not name has to
+# omit the case.
+V17_REPORTING_RAILS = ("vulkan", "native-metal", "native-metal-provider")
 
 
 def render_result(provider_backend=True):

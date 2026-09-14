@@ -1249,15 +1249,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     let expected = try decodeHex(definition.expected_hex, context: "\(definition.id) expected texels")
     try require(expected.count == byteCount,
                 "\(definition.id): expected texel bytes do not match the attachment")
-    // Full coverage is the milestone's whole point (`research/docs/23` §1.3): the
-    // expectation admits only identical texels, so a partially covered
-    // attachment cannot be asserted as correct.
+    // What a drawn texel has to be depends on what the pass started from. A
+    // clearing pass has nothing to preserve, so every texel has to be the same
+    // fragment output (`research/docs/23` §1.3) — a partially covered
+    // attachment cannot be asserted as correct. A loading pass deliberately
+    // keeps the bytes it was handed wherever the draw missed, so its
+    // expectation is classified once the previous bytes are decoded, below.
     let texel = Data(expected.prefix(4))
     var texels = 0
-    for offset in stride(from: 0, to: expected.count, by: 4) {
-        try require(Data(expected[offset..<(offset + 4)]) == texel,
-                    "\(definition.id): the milestone expects every texel to equal the fragment output")
-        texels += 1
+    if attachment.load == "clear" {
+        for offset in stride(from: 0, to: expected.count, by: 4) {
+            try require(Data(expected[offset..<(offset + 4)]) == texel,
+                        "\(definition.id): the milestone expects every texel to equal the fragment output")
+            texels += 1
+        }
+    } else {
+        texels = expected.count / 4
     }
     try require(texels == attachment.width * attachment.height,
                 "\(definition.id): attachment texel count mismatch")
@@ -1288,6 +1295,29 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): initial texels do not match the attachment")
         try require(previous != expected,
                     "\(definition.id): the initial texels equal the expectation")
+        // Partial coverage, in both directions: every texel is either the byte
+        // the load handed it or the pass's fragment output, every drawn texel
+        // carries the *same* output, and both halves appear (`docs/23` §3.3).
+        var drawn: Data? = nil
+        var drawnCount = 0
+        var keptCount = 0
+        for offset in stride(from: 0, to: expected.count, by: 4) {
+            let chunk = Data(expected[offset..<(offset + 4)])
+            let previousChunk = Data(previous[offset..<(offset + 4)])
+            if chunk == previousChunk {
+                keptCount += 1
+                continue
+            }
+            if let drawn {
+                try require(chunk == drawn,
+                            "\(definition.id): drawn texels disagree about the fragment output")
+            } else {
+                drawn = chunk
+            }
+            drawnCount += 1
+        }
+        try require(drawnCount > 0 && keptCount > 0,
+                    "\(definition.id): a loaded attachment needs both drawn and kept texels")
         clearComponents = []
         initial = previous
     default:

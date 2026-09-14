@@ -116,7 +116,9 @@
       },
       "expected_hex": "4080c0fffefefefefefefefefefefefe",
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
       ]
     }
   ]
