@@ -7,18 +7,21 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
-    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-    TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, InitialState, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
+    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
+    StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
 use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemoteProvider};
 #[cfg(target_os = "macos")]
 use metal_api_native::{NativeMetalProvider, NativeRenderPipelineRequest};
-use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
+use metal_api_vulkan::{
+    HeapPlacementObservation, RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor,
+};
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -112,7 +115,10 @@ impl Backend {
 /// `dyn PipelineProvider`, so the concrete handle has to be kept here to read
 /// the counters around each case (`research/docs/15` §5).
 enum CopyCounters {
-    Vulkan(Arc<VulkanExecutor>),
+    Vulkan {
+        executor: Arc<VulkanExecutor>,
+        provider: Arc<VulkanComputeProvider>,
+    },
     #[cfg(target_os = "macos")]
     Native(Arc<NativeMetalProvider>),
 }
@@ -145,7 +151,7 @@ impl CopyCounters {
     /// Cumulative (copy-in, copy-out) device-buffer operations.
     fn read(&self) -> (usize, usize) {
         match self {
-            Self::Vulkan(executor) => executor.buffer_copy_counts(),
+            Self::Vulkan { executor, .. } => executor.buffer_copy_counts(),
             #[cfg(target_os = "macos")]
             Self::Native(provider) => provider.buffer_copy_counts(),
         }
@@ -158,9 +164,20 @@ impl CopyCounters {
     /// on the provider backends (`compare.py` keys the rule on `backend`).
     fn present_counts(&self) -> (usize, usize) {
         match self {
-            Self::Vulkan(executor) => executor.present_counts(),
+            Self::Vulkan { executor, .. } => executor.present_counts(),
             #[cfg(target_os = "macos")]
             Self::Native(provider) => provider.present_counts(),
+        }
+    }
+
+    /// The placements the provider actually bound during its last submission
+    /// (`research/docs/25` §5.1). The native rail has no heap execution yet, so
+    /// it reports nothing to observe.
+    fn heap_observations(&self) -> Vec<HeapPlacementObservation> {
+        match self {
+            Self::Vulkan { provider, .. } => provider.heap_placement_observations(),
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => Vec::new(),
         }
     }
 }
@@ -690,7 +707,10 @@ fn create_provider(
             Ok((
                 Arc::clone(&provider) as Arc<dyn PipelineProvider>,
                 name,
-                CopyCounters::Vulkan(executor),
+                CopyCounters::Vulkan {
+                    executor,
+                    provider: Arc::clone(&provider),
+                },
                 RenderRegistrar::Vulkan(provider),
             ))
         }
@@ -826,6 +846,31 @@ struct Case {
     dispatches: Option<Vec<CaseDispatch>>,
     programs: Option<Vec<CaseProgram>>,
     command_buffers: Option<Vec<Vec<usize>>>,
+    /// Optional heap section (`research/docs/25` §4.2). A case that carries it
+    /// also carries `capture_rails`, because only a rail that declares heap
+    /// support can report the placement observation; the capture tool skips a
+    /// heap case on any rail its marker does not name.
+    #[serde(default)]
+    heap: Option<HeapCase>,
+    #[serde(default)]
+    capture_rails: Option<Vec<String>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeapCase {
+    size: u64,
+    storage_mode: String,
+    allows_aliasing: bool,
+    placements: Vec<HeapPlacementCase>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeapPlacementCase {
+    allocation: u64,
+    offset: u64,
+    byte_size: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -992,6 +1037,24 @@ struct PresentCounts {
     present: u32,
 }
 
+/// The heap placement observation for one compute case, reported when the case
+/// carries a heap section (`research/docs/25` §5.1). The bytes stay with the
+/// ordinary writeback comparison; this segment is what proves the placements
+/// landed in one slab at the declared offsets.
+#[derive(Serialize)]
+struct HeapSegment {
+    heap: u64,
+    same_slab: bool,
+    placements: Vec<HeapPlacementReport>,
+}
+
+#[derive(Serialize)]
+struct HeapPlacementReport {
+    allocation: u64,
+    offset: u64,
+    byte_size: u64,
+}
+
 #[derive(Serialize)]
 struct CaseResult {
     id: String,
@@ -1015,6 +1078,10 @@ struct CaseResult {
     /// a provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     present: Option<PresentCounts>,
+    /// The heap placement observation. Absent from cases that carry no heap
+    /// section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heap: Option<HeapSegment>,
 }
 
 #[derive(Serialize)]
@@ -1301,6 +1368,14 @@ fn main() -> Result<()> {
             }
         }
         let before = counters.read();
+        // A heap case is owed only by the rails its marker names
+        // (`research/docs/25` §5.2): a rail that declares no heap support must
+        // omit the case rather than report a placement it never bound.
+        if let Some(rails) = &case.capture_rails {
+            if !rails.iter().any(|rail| rail == backend.report_name(api)) {
+                continue;
+            }
+        }
         let mut result = if let Some(device) = &object_device {
             let programs = case_programs(case)
                 .iter()
@@ -1329,6 +1404,9 @@ fn main() -> Result<()> {
         let after = counters.read();
         result.copy_in = Some(u32::try_from(after.0 - before.0)?);
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
+        if case.heap.is_some() {
+            result.heap = Some(heap_segment(counters.heap_observations())?);
+        }
         results.push(result);
     }
     // Render cases run after the compute cases on every rail, since every rail
@@ -2474,8 +2552,114 @@ fn case_trace(
         encoder_dispatch_type: DispatchType::Serial,
         passes: passes.into_iter().map(TracePass::Compute).collect(),
         completion_policy: CompletionPolicy::HostReadback,
-        heap: None,
+        heap: case_heap_payload(case)?.map(Box::new),
         indirect: None,
+    })
+}
+
+/// The heap identifier one capture's placements share.
+///
+/// The suite's heap section names a slab by its size, not by an identity (the
+/// comparator only requires a non-zero id, `research/docs/25` §5.1), so the
+/// capture tool picks a stable one; every placement in a case's payload uses
+/// it, which is what makes the provider's `same_slab` observation meaningful.
+const HEAP_PLACEMENT_ID: HeapId = HeapId::new(61);
+
+/// Translate a suite case's heap section into the trace payload
+/// (`research/docs/25` §4.2). The structural rules (one allocation per
+/// placement, no overlap, placements fit the slab) stay core admission's job;
+/// this only refuses the shapes the suite cannot spell at all.
+fn case_heap_payload(case: &Case) -> Result<Option<HeapPayload>> {
+    let Some(heap) = &case.heap else {
+        return Ok(None);
+    };
+    // The provider maps placements to the trace's owned allocations in
+    // ascending allocation order (`research/docs/25` §6 Step 3), so the suite
+    // has to name them in that order and cover every owned allocation. Texture
+    // placement is outside the first increment.
+    if !case.textures.is_empty() {
+        return Err(format!(
+            "case {}: texture placement is outside the first heap increment",
+            case.id
+        )
+        .into());
+    }
+    let mut owned: Vec<u64> = case
+        .buffers
+        .iter()
+        .map(|buffer| buffer.allocation)
+        .collect();
+    owned.sort_unstable();
+    owned.dedup();
+    if owned.len() != heap.placements.len() {
+        return Err(format!(
+            "case {}: the heap section has {} placements for {} owned allocations",
+            case.id,
+            heap.placements.len(),
+            owned.len()
+        )
+        .into());
+    }
+    for (placement, allocation) in heap.placements.iter().zip(&owned) {
+        if placement.allocation != *allocation {
+            return Err(format!(
+                "case {}: heap placements must be in ascending allocation order",
+                case.id
+            )
+            .into());
+        }
+    }
+    let storage_mode = match heap.storage_mode.as_str() {
+        "owned_bytes" => StorageMode::OwnedBytes,
+        "staged_lease" => StorageMode::StagedLease,
+        "borrowed_no_copy" => StorageMode::BorrowedNoCopy,
+        other => {
+            return Err(format!("case {}: unknown heap storage mode {other:?}", case.id).into())
+        }
+    };
+    let placements = heap
+        .placements
+        .iter()
+        .map(|placement| HeapPlacement {
+            heap_id: HEAP_PLACEMENT_ID,
+            offset: placement.offset,
+            resource: HeapResource::Buffer {
+                byte_size: placement.byte_size,
+            },
+        })
+        .collect();
+    Ok(Some(HeapPayload {
+        descriptor: HeapDescriptor {
+            size: heap.size,
+            storage_mode,
+            allows_aliasing: heap.allows_aliasing,
+        },
+        placements,
+    }))
+}
+
+/// Turn the provider's last submission's placement records into the report
+/// segment (`research/docs/25` §5.1). The records come from the `vkBind*`
+/// results the provider observed, not from the suite's request, so a provider
+/// that did not place the resources cannot fake this segment.
+fn heap_segment(observations: Vec<HeapPlacementObservation>) -> Result<HeapSegment> {
+    let first = observations
+        .first()
+        .ok_or("heap case reported no placement observations")?;
+    let same_slab = observations
+        .iter()
+        .all(|observation| observation.heap_id == first.heap_id);
+    Ok(HeapSegment {
+        heap: first.heap_id.get(),
+        same_slab,
+        placements: observations
+            .iter()
+            .map(|observation| HeapPlacementReport {
+                allocation: observation.allocation_id.get(),
+                offset: observation.offset,
+                byte_size: observation.byte_size,
+            })
+            .collect(),
     })
 }
 
@@ -2705,6 +2889,7 @@ fn run_render_case(
         copy_out: None,
         group_counts: None,
         present: None,
+        heap: None,
     })
 }
 
@@ -2876,6 +3061,7 @@ fn run_object_case(
         copy_out: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
         present: None,
+        heap: None,
     })
 }
 
@@ -3068,6 +3254,7 @@ fn run_object_render_case(
         copy_out: None,
         group_counts: None,
         present: None,
+        heap: None,
     })
 }
 
@@ -3349,6 +3536,7 @@ fn run_case(
         copy_out: None,
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
         present: None,
+        heap: None,
     })
 }
 

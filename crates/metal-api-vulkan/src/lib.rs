@@ -35,7 +35,9 @@ mod compute_provider;
 mod provider;
 mod render;
 
-pub use compute_provider::{CompiledComputePipeline, RenderPipelineRequest, VulkanComputeProvider};
+pub use compute_provider::{
+    CompiledComputePipeline, HeapPlacementObservation, RenderPipelineRequest, VulkanComputeProvider,
+};
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;
