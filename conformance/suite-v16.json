@@ -6,8 +6,16 @@
     {
       "id": "render_declaring_copy_word",
       "entry": "copy_word",
-      "grid": [1, 1, 1],
-      "local": [1, 1, 1],
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
       "air": {
         "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
         "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
@@ -63,7 +71,11 @@
           {
             "stride": 8,
             "attributes": [
-              {"location": 0, "offset": 0, "format": "float32x2"}
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
             ]
           }
         ]
@@ -86,7 +98,12 @@
         "format": "uint16"
       },
       "vertices": 6,
-      "viewport": [0, 0, 2, 2],
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
       "attachment": {
         "allocation": 900,
         "view": 910,
@@ -98,7 +115,10 @@
         "clear_hex": "fefefefe"
       },
       "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
-      "capture_rails": ["vulkan"]
+      "capture_rails": [
+        "vulkan",
+        "vulkan-objects"
+      ]
     }
   ]
 }

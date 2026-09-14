@@ -3065,6 +3065,19 @@ fn compute_icb_payload(case: &Case) -> Result<Option<IndirectCommandPayload>> {
 /// render case in the first increment; the command parameters are required by
 /// kind, and a parameter of another kind is a typed refusal rather than a
 /// silently ignored field.
+/// The bytes one render input view carries.
+///
+/// The object rail creates its own device buffer per stream, exactly as the
+/// trace rail does, so the view has to hold trace-owned bytes: a lease-backed
+/// stream is a later increment's landing on both rails
+/// (`research/docs/23` §3.3).
+fn component_bytes<'a>(view: &'a BufferView, label: &str) -> Result<&'a [u8]> {
+    match &view.source {
+        BufferSource::OwnedBytes(bytes) => Ok(bytes),
+        _ => Err(format!("{label}: the object rail executes trace-owned bytes only").into()),
+    }
+}
+
 fn render_icb_payload(case: &RenderCase) -> Result<Option<IndirectCommandPayload>> {
     let Some(icb) = &case.icb else {
         return Ok(None);
@@ -3907,6 +3920,36 @@ fn run_object_render_case(
     let clear = clear
         .try_into()
         .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?;
+    // The pass's own streams (`research/docs/23` §3.3): the object API binds
+    // the views the case declares, and the encoder carries their bytes into the
+    // trace at commit. A vertex-input case is a direct indexed draw by
+    // construction, so it never reaches the indirect arm.
+    let (vertex_buffers, indices) = render_inputs(case, &format!("render case {}", case.id))?;
+    let mut object_streams = Vec::with_capacity(vertex_buffers.len());
+    for view in &vertex_buffers {
+        let buffer = device.new_buffer_with_bytes(
+            component_bytes(view, &format!("render case {} vertex stream", case.id))?.to_vec(),
+        )?;
+        let stream = buffer.view(usize::try_from(view.offset)?, usize::try_from(view.length)?)?;
+        object_streams.push(stream);
+    }
+    let object_index = match &indices {
+        Some(indices) => {
+            let buffer = device.new_buffer_with_bytes(
+                component_bytes(
+                    &indices.view,
+                    &format!("render case {} index buffer", case.id),
+                )?
+                .to_vec(),
+            )?;
+            let view = buffer.view(
+                usize::try_from(indices.view.offset)?,
+                usize::try_from(indices.view.length)?,
+            )?;
+            Some((view, indices.format))
+        }
+        None => None,
+    };
     if let Some(icb) = &icb {
         render.draw_indirect(
             icb,
@@ -3915,6 +3958,20 @@ fn run_object_render_case(
             case.attachment.width,
             case.attachment.height,
             clear,
+            present,
+        )?;
+    } else if let Some((index, format)) = &object_index {
+        for (binding, stream) in object_streams.iter().enumerate() {
+            render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
+        }
+        render.set_index_buffer(index, *format)?;
+        render.draw_indexed_primitives(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            case.attachment.width,
+            case.attachment.height,
+            clear,
+            u32::try_from(case.vertices)?,
             present,
         )?;
     } else {

@@ -50,11 +50,11 @@ TEXELS = "4080c0ff" * 4
 ATTACHMENT = (900, 910, 0, 16)
 QUAD_VIEW = (940, 950, 0, 32)
 INDEX_VIEW = (960, 970, 0, 12)
-# The rails v16 marks: the Vulkan trace rail executes caller-held streams today.
-# The object rail follows once its binding API lands, and the native rails once
-# the MSL rail flips its own vertex-input bits; until then a rail the marker
-# does not name must omit the case rather than run the `vertex_id` shape.
-V16_REPORTING_RAILS = ("vulkan",)
+# The rails v16 marks: the Vulkan trace rail and the Vulkan object rail execute
+# caller-held streams today. The native rails follow once the Apple self-test
+# observes the same quad; until then a rail the marker does not name must omit
+# the case rather than run the `vertex_id` shape.
+V16_REPORTING_RAILS = ("vulkan", "vulkan-objects")
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
 
