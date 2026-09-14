@@ -88,17 +88,21 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_heap_bytes: MAX_HEAP_BYTES,
         supported_heap_storage_modes: vec![StorageMode::OwnedBytes],
         supports_heap_aliasing: false,
-        // Indirect replay is executed for the one reviewed render shape: the
-        // rail encodes a `VkDrawIndirectCommand` into a host-visible
-        // `INDIRECT_BUFFER` and replays it with `vkCmdDrawIndirect`
-        // (`render.rs::execute_indirect_render_pass`, `research/docs/25` §6
-        // Step 4). Evidence: `tests/render_e2e.rs` replays the milestone's
-        // full-screen triangle indirectly and reads the same `40 80 c0 ff`
-        // texels back on Lavapipe. The first increment is one command, one
-        // non-indexed draw; dispatches and indexed draws stay refused.
+        // Indirect replay is executed for the reviewed draw and dispatch
+        // shapes: the render rail encodes a `VkDrawIndirectCommand` into a
+        // host-visible `INDIRECT_BUFFER` and replays it with
+        // `vkCmdDrawIndirect` (`render.rs::execute_indirect_render_pass`), and
+        // the compute rail encodes a `VkDispatchIndirectCommand` and replays it
+        // with `vkCmdDispatchIndirect` (`lib.rs::ExecutionResources::record`,
+        // `research/docs/25` §6 Step 4). Evidence: `tests/render_e2e.rs`
+        // replays the milestone's full-screen triangle indirectly and reads the
+        // same `40 80 c0 ff` texels back on Lavapipe;
+        // `tests/indirect_dispatch_e2e.rs` replays one compute dispatch and
+        // reads the same output bytes as a direct dispatch. The first
+        // increment is one command; indexed draws stay refused.
         supports_indirect_command_buffers: true,
         max_indirect_commands: 1,
-        supported_indirect_commands: vec![IndirectCommandKind::Draw],
+        supported_indirect_commands: vec![IndirectCommandKind::Draw, IndirectCommandKind::Dispatch],
     }
 }
 

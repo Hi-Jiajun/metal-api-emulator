@@ -758,11 +758,12 @@ fn an_indirect_draw_replays_the_same_attachment_bytes_as_a_direct_draw() {
     assert_ne!(indirect_bytes, CLEAR_SENTINEL.repeat(4));
 }
 
-/// The first increment replays non-indexed draws only: a compute dispatch
-/// command is refused in admission with the capability slug the contract
-/// publishes, before any Vulkan object exists.
+/// A dispatch command is now in the admitted set, so it clears admission; the
+/// provider then refuses the shape mismatch — a dispatch cannot replay into a
+/// render pass — with the capability slug the contract publishes, before any
+/// render object is created.
 #[test]
-fn an_indirect_dispatch_is_refused_by_the_first_increment() {
+fn an_indirect_dispatch_into_a_render_trace_is_refused() {
     let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
         return;
     };
@@ -777,7 +778,15 @@ fn an_indirect_dispatch_is_refused_by_the_first_increment() {
         },
         range: IndirectCommandRange { start: 0, count: 1 },
     }));
-    let refused = admit_error(&direct.provider.capabilities(), &trace, &direct.resources);
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("the dispatch command is in the first increment's admitted set");
+    let refused = direct
+        .provider
+        .submit(admitted)
+        .expect_err("a dispatch command cannot replay into a render pass");
     assert_eq!(refused.slug, "icb_command_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }

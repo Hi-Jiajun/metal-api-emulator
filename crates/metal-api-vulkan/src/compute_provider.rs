@@ -3,8 +3,8 @@
 
 use crate::{
     execute_pool_sequence_with_status, render, Binding, BoundDispatch, PendingExecution,
-    PoolBinding, PoolKey, PoolKind, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
-    VulkanPipelineArtifact,
+    PoolBinding, PoolKey, PoolKind, SequenceTail, TranslatedComputePipeline, VulkanContext,
+    VulkanExecutor, VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -13,12 +13,12 @@ use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
     CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
     ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, HeapId,
-    HeapResource, LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract,
-    PipelineId, PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TracePass,
-    ValidatedComputeTrace, ViewId,
+    HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId, LeaseImporter,
+    LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
+    PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -567,6 +567,50 @@ impl VulkanComputeProvider {
         Ok(plan)
     }
 
+    /// Resolve the indirect dispatch the compute rail replays, or `None` when
+    /// the trace carries no indirect command or carries the render rail's draw
+    /// command.
+    ///
+    /// The compute rail owns `Dispatch` (`research/docs/25` §6 Step 4): the
+    /// payload's `threadgroups` is the single workgroup count the rail encodes
+    /// and replays. A dispatch that arrives next to a render pass, or a trace
+    /// whose compute passes do not give the command exactly one target, is a
+    /// shape mismatch the first increment refuses fail-closed rather than
+    /// silently replaying into one pass or dropping the command.
+    fn indirect_dispatch_threadgroups(
+        &self,
+        trace: &ComputeTrace,
+    ) -> Result<Option<[u32; 3]>, ProviderError> {
+        let Some(payload) = trace.indirect.as_deref() else {
+            return Ok(None);
+        };
+        let IndirectCommandDescriptor::Dispatch { threadgroups } = payload.command else {
+            return Ok(None);
+        };
+        if trace.has_render_passes() {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "icb_command_unsupported",
+            )
+            .with_detail("an indirect dispatch replays a compute pass, not a render pass"));
+        }
+        let compute_passes = trace.compute_passes().count();
+        if compute_passes != 1 {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "icb_command_unsupported",
+            )
+            .with_field(
+                "passes",
+                FieldValue::Unsigned(u64::try_from(compute_passes).unwrap_or(u64::MAX)),
+            )
+            .with_detail("an indirect dispatch replays exactly one compute pass"));
+        }
+        Ok(Some(threadgroups))
+    }
+
     /// Execute the planned render passes in trace order, after the compute
     /// sequence, and turn each attachment readback into a buffer writeback.
     ///
@@ -582,12 +626,20 @@ impl VulkanComputeProvider {
         pool: &[BufferView],
         plan: &[PlannedRenderPass],
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
-        // The indirect payload replays one command into exactly one plain
-        // render pass (`research/docs/25` §6 Step 4). The guards run before the
-        // empty-plan early return on purpose: a trace that carries an indirect
-        // command but no render pass has nothing to replay into, and reporting
-        // success while dropping the command would be fail-open.
-        if trace.indirect.is_some() {
+        // The render rail's indirect payload replays one draw command into
+        // exactly one plain render pass (`research/docs/25` §6 Step 4). The
+        // guards run before the empty-plan early return on purpose: a trace
+        // that carries an indirect draw but no render pass has nothing to
+        // replay into, and reporting success while dropping the command would
+        // be fail-open. A dispatch payload never reaches this guard: it is
+        // owned by the compute rail, and `indirect_dispatch_threadgroups`
+        // already refused the render-pass-plus-dispatch shape before the
+        // render plan was built.
+        let render_replays_indirect = trace
+            .indirect
+            .as_deref()
+            .is_some_and(|payload| payload.command.kind() == IndirectCommandKind::Draw);
+        if render_replays_indirect {
             if plan.is_empty() {
                 return Err(refusal(
                     ProviderPhase::Resolve,
@@ -1276,6 +1328,10 @@ impl ComputeProvider for VulkanComputeProvider {
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
         self.capabilities.admit(trace, admitted.resources())?;
+        // The indirect dispatch the compute rail replays, resolved and shape
+        // checked before any compute resource exists. The render rail owns the
+        // draw half; `None` here means the compute sequence dispatches directly.
+        let indirect_dispatch = self.indirect_dispatch_threadgroups(trace)?;
         // Render work is planned before the compute sequence runs, so a trace
         // this provider cannot execute end to end is refused with no execution
         // at all rather than after its compute passes already wrote bytes.
@@ -1510,8 +1566,11 @@ impl ComputeProvider for VulkanComputeProvider {
                     &artifacts,
                     &buffers,
                     &dispatches,
-                    retains.take(),
-                    &textures,
+                    SequenceTail {
+                        borrowed: retains.take(),
+                        textures: &textures,
+                        indirect_dispatch,
+                    },
                 )?
             };
             // The render rail completes inside `submit` even in deferred mode:
@@ -1573,6 +1632,7 @@ impl ComputeProvider for VulkanComputeProvider {
             &dispatches,
             &mut retains,
             &textures,
+            indirect_dispatch,
         )
         .and_then(|updates| {
             // Compute and render writebacks share one channel and one rule: one
@@ -1858,6 +1918,7 @@ fn execute_on_context(
     dispatches: &[BoundDispatch],
     retains: &mut BorrowedRetains,
     textures: &[metal_api_core::provider::TextureView],
+    indirect_dispatch: Option<[u32; 3]>,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     // The synchronous path goes through the same queue policy as the deferred
     // object path (`research/docs/21` §4): the tier table decides which idle
@@ -1873,8 +1934,11 @@ fn execute_on_context(
         artifacts,
         buffers,
         dispatches,
-        retains.take(),
-        textures,
+        SequenceTail {
+            borrowed: retains.take(),
+            textures,
+            indirect_dispatch,
+        },
         queue_index,
     )
 }
