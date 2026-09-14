@@ -232,6 +232,19 @@ private struct SuiteResult: Encodable {
     let results: [CaseResult]
 }
 
+/// The one-device heap check's report (`research/docs/25` §6 Step 7a). It
+/// reuses the same writeback/allocation observation shape every other report
+/// uses, and carries the device and platform so the CI step can assert the
+/// observations came from the probed device rather than a fixture.
+private struct HeapSelfTestReport: Encodable {
+    let id: String
+    let completion: String
+    let writebacks: [Writeback]
+    let allocations: [AllocationResult]
+    let device: String
+    let platform: String
+}
+
 private struct DeviceProbe: Encodable {
     let schema_version: UInt64 = 1
     let kind = "metal-device-probe"
@@ -268,6 +281,7 @@ private struct Options {
     let probe: Bool
     let renderSelfTest: Bool
     let presentSelfTest: Bool
+    let heapSelfTest: Bool
 }
 
 private let usage = """
@@ -276,6 +290,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --probe
        native-metal-oracle --render-selftest
        native-metal-oracle --present-selftest
+       native-metal-oracle --heap-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -296,6 +311,12 @@ directory. The present target is preset with the fefefefe sentinel, the
 reviewed fragment draws over it, and the report fails unless all four texels
 read back as the fragment output rather than the sentinel. It cannot be
 combined with other options.
+--heap-selftest needs no suite: it allocates two reviewed heap buffers from one
+MTLHeap, records their heap offsets, runs the reviewed copy_word kernel across
+the pair, and reports the copied bytes. It fails unless both buffers are in the
+same heap with non-overlapping ranges and the write buffer reads back the
+reviewed word rather than the sentinel. It cannot be combined with other
+options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -306,6 +327,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var probe = false
     var renderSelfTest = false
     var presentSelfTest = false
+    var heapSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -339,27 +361,37 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!presentSelfTest, "Duplicate --present-selftest option")
             presentSelfTest = true
             index += 1
+        case "--heap-selftest":
+            try require(!heapSelfTest, "Duplicate --heap-selftest option")
+            heapSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, or --present-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !heapSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
-                       renderSelfTest: false, presentSelfTest: false)
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, or --present-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !heapSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: true, presentSelfTest: false)
+                       renderSelfTest: true, presentSelfTest: false, heapSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly,
-                    "--present-selftest cannot be combined with --suite, --output, or --validate-suite")
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
-                       renderSelfTest: false, presentSelfTest: true)
+                       renderSelfTest: false, presentSelfTest: true, heapSelfTest: false)
+    }
+    if heapSelfTest {
+        try require(suite == nil && output == nil && !validateOnly,
+                    "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, heapSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -368,7 +400,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
                     "Output already exists: \(outputURL.path)")
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
-                   renderSelfTest: false, presentSelfTest: false)
+                   renderSelfTest: false, presentSelfTest: false, heapSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -1460,6 +1492,114 @@ private func presentSelfTest() throws -> CaseResult {
     return try runRenderCase(fixture, device: device, queue: queue)
 }
 
+/// The heap milestone's own fixture, constructed in code.
+///
+/// This is the one-device heap check (`research/docs/25` §6 Step 7a): two
+/// buffers allocated from one `MTLHeap`, their offsets recorded, the reviewed
+/// `copy_word` kernel run across the pair, and the write buffer read back. It
+/// fails unless both buffers are heap-backed and share one heap with
+/// non-overlapping byte ranges, and the write buffer's first word equals the
+/// reviewed `fefefefe` rather than the `ffffffff` sentinel it was preset with.
+/// `MTLHeap` does not promise to honour a requested offset, so this selftest
+/// only asserts "same heap + non-overlap + correct bytes"; the suite's explicit
+/// offset semantics belong to the provider-side slab + sub-range equivalent.
+@available(macOS 11.0, *)
+private func heapSelfTest() throws -> HeapSelfTestReport {
+    let program = try reviewedProgram("copy_word")
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let source = try loadProgram(program, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the heap self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native heap self-test: device=\(device.name) platform=\(eligibility.platform)")
+
+    let heapDescriptor = MTLHeapDescriptor()
+    heapDescriptor.size = 512
+    heapDescriptor.storageMode = .shared
+    guard let heap = device.makeHeap(descriptor: heapDescriptor) else {
+        throw OracleError("heap self-test: cannot allocate the heap")
+    }
+    guard let readBuffer = heap.makeBuffer(length: 16, options: .storageModeShared) else {
+        throw OracleError("heap self-test: cannot allocate the read buffer")
+    }
+    guard let writeBuffer = heap.makeBuffer(length: 12, options: .storageModeShared) else {
+        throw OracleError("heap self-test: cannot allocate the write buffer")
+    }
+    let readInitial = Data(repeating: 0xfe, count: 16)
+    let writeInitial = Data(repeating: 0xff, count: 12)
+    readInitial.withUnsafeBytes { bytes in
+        if let source = bytes.baseAddress {
+            readBuffer.contents().copyMemory(from: source, byteCount: readInitial.count)
+        }
+    }
+    writeInitial.withUnsafeBytes { bytes in
+        if let source = bytes.baseAddress {
+            writeBuffer.contents().copyMemory(from: source, byteCount: writeInitial.count)
+        }
+    }
+    // The placement observation: both buffers are heap-backed, share one heap,
+    // and occupy non-overlapping byte ranges. `nil === nil` is true, so the
+    // identity check only runs after both heap references are non-nil.
+    try require(readBuffer.heap != nil && writeBuffer.heap != nil,
+                "heap self-test: a buffer was not heap-backed")
+    try require(readBuffer.heap === writeBuffer.heap,
+                "heap self-test: the two buffers are not in the same heap")
+    let readOffset = readBuffer.offset
+    let writeOffset = writeBuffer.offset
+    try require(readOffset + 16 <= writeOffset || writeOffset + 12 <= readOffset,
+                "heap self-test: the two heap ranges overlap")
+
+    let library = try device.makeLibrary(source: source, options: nil)
+    guard let function = library.makeFunction(name: "copy_word") else {
+        throw OracleError("heap self-test: copy_word function was not found")
+    }
+    let pipeline = try device.makeComputePipelineState(function: function)
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("heap self-test: cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "heap self-test: command buffer does not retain resources")
+    commandBuffer.label = "native oracle: heap selftest"
+    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        throw OracleError("heap self-test: cannot create a compute encoder")
+    }
+    encoder.setComputePipelineState(pipeline)
+    encoder.setBuffer(readBuffer, offset: 0, index: 0)
+    encoder.setBuffer(writeBuffer, offset: 0, index: 1)
+    encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("heap self-test: GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "heap self-test: Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+
+    let copied = Data(bytes: writeBuffer.contents(), count: 4)
+    let expected = Data(repeating: 0xfe, count: 4)
+    try require(copied == expected,
+                "heap self-test: copied word \(hex(copied)) does not match the reviewed expectation \(hex(expected))")
+    let writeback = Writeback(allocation: 920, view: 930, offset: 0, bytes_hex: hex(copied))
+    let allocations = [
+        AllocationResult(allocation: 900,
+                         bytes_hex: hex(Data(bytes: readBuffer.contents(), count: 16))),
+        AllocationResult(allocation: 920,
+                         bytes_hex: hex(Data(bytes: writeBuffer.contents(), count: 12))),
+    ]
+    return HeapSelfTestReport(id: "heap_placement_copy_word", completion: "CompletedVisible",
+                              writebacks: [writeback], allocations: allocations,
+                              device: device.name, platform: eligibility.platform)
+}
+
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -1575,6 +1715,15 @@ do {
         // evidence, four `40 80 c0 ff` texels, never the `fe` sentinel the
         // target was preset with (`research/docs/24` §6 Step 7).
         let result = try presentSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.heapSelfTest {
+        // The heap milestone's one-device check: two buffers in one MTLHeap,
+        // the reviewed copy_word kernel across them, and a write-buffer
+        // readback that must be the reviewed word rather than the sentinel
+        // (`research/docs/25` §6 Step 7a).
+        let result = try heapSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

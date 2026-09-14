@@ -179,5 +179,103 @@ class PresentSelftestValidationTests(unittest.TestCase):
             run_native.validate_present_selftest([])
 
 
+class HeapSelftestValidationTests(unittest.TestCase):
+    """The CI step's heap-selftest byte comparison, exercised without Metal.
+
+    `run_native.validate_heap_selftest` is the function the workflow reuses, so
+    the sentinel and observation-shape rules are pinned here rather than only in
+    the inline heredoc.
+    """
+
+    WORD = "fefefefe"
+    READ_ALLOCATION = "fefefefefefefefefefefefefefefefe"
+    WRITE_ALLOCATION = "fefefefeffffffffffffffffff"
+    SENTINEL_WRITE = "ffffffff"
+
+    def reviewed_report(self, completion="CompletedVisible", device="Apple GPU",
+                        platform="macOS 15.0", writeback_bytes=None,
+                        read_allocation=None, write_allocation=None,
+                        writebacks=None, allocations=None):
+        if writebacks is None:
+            writebacks = [{"allocation": 920, "view": 930, "offset": 0,
+                           "bytes_hex": self.WORD if writeback_bytes is None else writeback_bytes}]
+        if allocations is None:
+            allocations = [
+                {"allocation": 900, "bytes_hex": self.READ_ALLOCATION if read_allocation is None else read_allocation},
+                {"allocation": 920, "bytes_hex": self.WRITE_ALLOCATION if write_allocation is None else write_allocation},
+            ]
+        return {"id": "heap_placement_copy_word", "completion": completion,
+                "writebacks": writebacks, "allocations": allocations,
+                "device": device, "platform": platform}
+
+    def test_accepts_the_reviewed_heap_observation(self):
+        report = self.reviewed_report()
+        self.assertEqual(run_native.validate_heap_selftest(report), self.WORD)
+
+    def test_rejects_a_sentinel_writeback(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_heap_selftest(self.reviewed_report(writeback_bytes=self.SENTINEL_WRITE))
+
+    def test_rejects_a_sentinel_in_either_allocation(self):
+        sentinel_read = "ffffffff" * 4
+        sentinel_write = "ffffffff" * 3
+        for read_allocation, write_allocation in (
+            (sentinel_read, self.WRITE_ALLOCATION),
+            (self.READ_ALLOCATION, sentinel_write),
+            (sentinel_read, sentinel_write),
+        ):
+            with self.subTest(read=read_allocation, write=write_allocation):
+                report = self.reviewed_report(read_allocation=read_allocation,
+                                              write_allocation=write_allocation)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_heap_selftest(report)
+
+    def test_rejects_a_missing_or_extra_observation(self):
+        writeback = [{"allocation": 920, "view": 930, "offset": 0,
+                      "bytes_hex": self.WORD}]
+        allocations = [
+            {"allocation": 900, "bytes_hex": self.READ_ALLOCATION},
+            {"allocation": 920, "bytes_hex": self.WRITE_ALLOCATION},
+        ]
+        for writebacks, extra_allocations in (
+            ([], []),
+            (writeback, []),
+            ([], allocations),
+            (writeback, allocations[:1]),
+            (writeback, allocations + [{"allocation": 921, "bytes_hex": "00"}]),
+            (writeback + writeback, allocations),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=extra_allocations):
+                report = self.reviewed_report(writebacks=writebacks,
+                                              allocations=extra_allocations)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_heap_selftest(report)
+
+    def test_rejects_a_wrong_writeback_offset_or_identity(self):
+        for change in ({"offset": 4}, {"view": 931}, {"allocation": 921}):
+            with self.subTest(change=change):
+                writeback = [dict({"allocation": 920, "view": 930, "offset": 0,
+                                   "bytes_hex": self.WORD}, **change)]
+                report = self.reviewed_report(writebacks=writeback)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_heap_selftest(report)
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_heap_selftest(self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_missing_device_or_platform(self):
+        for device, platform in (("", "macOS 15.0"), ("Apple GPU", ""),
+                                 (None, "macOS 15.0"), ("Apple GPU", None)):
+            with self.subTest(device=device, platform=platform):
+                report = self.reviewed_report(device=device, platform=platform)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_heap_selftest(report)
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_heap_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()

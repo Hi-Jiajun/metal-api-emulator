@@ -31,6 +31,15 @@ mod lifecycle;
 #[cfg(any(target_os = "macos", test))]
 mod render;
 
+// The heap rail's capability spelling and placement planning are provider
+// logic too, so they are compiled for the macOS provider and for the unit
+// tests that pin them on a host without Metal. Only the slab encode body in
+// `native.rs` needs a device.
+#[cfg(any(target_os = "macos", test))]
+mod heap;
+#[cfg(any(target_os = "macos", test))]
+pub use heap::HeapPlacementObservation;
+
 #[cfg(not(target_os = "macos"))]
 mod unsupported;
 #[cfg(not(target_os = "macos"))]

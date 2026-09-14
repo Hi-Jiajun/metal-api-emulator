@@ -3,7 +3,7 @@
 //! staged lease windows.
 
 use crate::{
-    bounded_contract, classify_command_buffer_error, device_lost_refusal,
+    bounded_contract, classify_command_buffer_error, device_lost_refusal, heap,
     lifecycle::NativeLifecycle, refusal, render, unknown_completion, CommandBufferFailure,
 };
 use block::ConcreteBlock;
@@ -164,6 +164,11 @@ pub struct NativeMetalProvider {
     borrowed: Arc<BorrowedLeaseRegistry>,
     counters: Arc<CopyCounters>,
     present_counters: Arc<PresentCounters>,
+    /// Heap placements the provider most recently executed successfully. Every
+    /// successful heap-bearing submission replaces the vector instead of
+    /// appending, so it stays bounded to one submission (`research/docs/25`
+    /// §6 Step 3).
+    heap_observations: Arc<Mutex<Vec<heap::HeapPlacementObservation>>>,
 }
 
 impl NativeMetalProvider {
@@ -204,6 +209,10 @@ impl NativeMetalProvider {
             // snapshot and the rail cannot disagree; the unit tests assert that
             // agreement against core admission on a host without Metal.
             let render_bits = render::capability_bits();
+            // The heap bits stay closed until `--heap-selftest` passes on an
+            // Apple GPU; they come from one spelling (`crate::heap`) so the
+            // snapshot and the flip condition cannot drift.
+            let heap_bits = heap::heap_capability_bits();
             let capabilities = ProviderCapabilities {
                 max_passes: 8,
                 supports_threads_exact: true,
@@ -253,10 +262,10 @@ impl NativeMetalProvider {
                 max_present_targets: render_bits.max_present_targets,
                 supported_present_modes: render_bits.supported_present_modes,
                 max_present_image_count: render_bits.max_present_image_count,
-                supports_heaps: false,
-                max_heap_bytes: 0,
-                supported_heap_storage_modes: Vec::new(),
-                supports_heap_aliasing: false,
+                supports_heaps: heap_bits.supports_heaps,
+                max_heap_bytes: heap_bits.max_heap_bytes,
+                supported_heap_storage_modes: heap_bits.supported_heap_storage_modes,
+                supports_heap_aliasing: heap_bits.supports_heap_aliasing,
                 supports_indirect_command_buffers: false,
                 max_indirect_commands: 0,
                 supported_indirect_commands: Vec::new(),
@@ -284,6 +293,7 @@ impl NativeMetalProvider {
                 staging: LeaseRegistry::new(),
                 lease_allocations: Mutex::new(BTreeMap::new()),
                 borrowed: Arc::new(BorrowedLeaseRegistry::new()),
+                heap_observations: Arc::new(Mutex::new(Vec::new())),
             })
         })
     }
@@ -723,12 +733,28 @@ impl ComputeProvider for NativeMetalProvider {
             }
         };
         if self.async_execution {
-            let result = self.submit_async(&mut state, trace, pipelines, token, &resolve, retains);
+            let result = self.submit_async(
+                &mut state,
+                trace,
+                admitted.resources(),
+                pipelines,
+                token,
+                &resolve,
+                retains,
+            );
             self.publish_health(self.lifecycle.health());
             return result;
         }
         let result = objc::rc::autoreleasepool(|| {
-            self.execute(&mut state, trace, pipelines, token, &resolve, retains)
+            self.execute(
+                &mut state,
+                trace,
+                admitted.resources(),
+                pipelines,
+                token,
+                &resolve,
+                retains,
+            )
         });
         let observation = match &result {
             Ok(submission) => Some(self.terminal_record(token, submission.writebacks.clone())),
@@ -861,6 +887,9 @@ impl Drop for BorrowedRetains {
 struct EncodedSubmission {
     pending: crate::PendingSubmission<SubmissionResources>,
     pool: Vec<BufferView>,
+    /// Heap placement observations planned with the submission, published once
+    /// its command buffer reaches a terminal success.
+    heap_observations: Option<Vec<heap::HeapPlacementObservation>>,
 }
 
 /// One admitted view resolved for binding. Owned and staged views return their
@@ -881,6 +910,7 @@ fn encode(
     state: &mut State,
     counters: &CopyCounters,
     trace: &ComputeTrace,
+    resources: &ResourceTableSnapshot,
     pipelines: Vec<ComputePipelineState>,
     resolve: &BufferResolver<'_>,
     retains: BorrowedRetains,
@@ -898,6 +928,24 @@ fn encode(
         .enumerate()
         .map(|(index, view)| (view.view_id, index))
         .collect();
+    // The heap payload maps the trace's owned allocations onto one shared slab;
+    // a heap-less trace keeps the per-allocation buffer path unchanged
+    // (`research/docs/25` §6 Step 7).
+    let heap_plan = heap::plan_heap_placements(trace, &pool, resources)?;
+    let heap_observations = heap_plan.as_ref().map(|plan| plan.observations.clone());
+    let heap_offsets = heap_plan.as_ref().map(|plan| &plan.offsets);
+    let heap_slab = match &heap_plan {
+        Some(plan) => {
+            let slab = state
+                .device
+                .new_buffer(plan.slab_size, MTLResourceOptions::StorageModeShared);
+            if slab.as_ptr().is_null() {
+                return Err(resource_error("metal_heap_slab_allocation_failed"));
+            }
+            Some(slab)
+        }
+        None => None,
+    };
     // Owned views of one allocation share one MTLBuffer, bound with the view's
     // own offset, so the image is uploaded once (`research/docs/15` §3). A lone
     // owned view keeps its exact-length buffer at offset zero. The image spans
@@ -922,6 +970,11 @@ fn encode(
         let BufferSource::OwnedBytes(_) = &view.source else {
             continue;
         };
+        // A heap-placed allocation lives in the shared slab, not in a
+        // per-allocation shared image, so it never enters this merge.
+        if heap_offsets.is_some_and(|offsets| offsets.contains_key(&view.allocation_id)) {
+            continue;
+        }
         if owned_per_allocation
             .get(&view.allocation_id)
             .copied()
@@ -962,6 +1015,30 @@ fn encode(
     let mut buffers = Vec::with_capacity(pool.len());
     for view in &pool {
         let (buffer, offset) = match resolve(view)? {
+            ResolvedBuffer::Owned(bytes)
+                if heap_offsets
+                    .is_some_and(|offsets| offsets.contains_key(&view.allocation_id)) =>
+            {
+                unsafe {
+                    // A heap-placed owned view uploads its own bytes into the
+                    // slab at the allocation's placement offset plus the view's
+                    // own offset inside that allocation, and binds the slab at
+                    // the same absolute offset (`research/docs/25` §6 Step 7).
+                    let placement_offset = heap_offsets
+                        .expect("heap branch requires placement offsets")[&view.allocation_id];
+                    let binding_offset = placement_offset
+                        .checked_add(view.offset)
+                        .ok_or_else(overflow)?;
+                    let slab = heap_slab.as_ref().expect("heap branch requires a slab");
+                    let destination = slab
+                        .contents()
+                        .cast::<u8>()
+                        .add(usize::try_from(binding_offset).map_err(|_| overflow())?);
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+                    counters.uploads.fetch_add(1, Ordering::Relaxed);
+                    (slab.clone(), binding_offset)
+                }
+            }
             ResolvedBuffer::Owned(_) if shared_images.contains_key(&view.allocation_id) => unsafe {
                 let image = &shared_images[&view.allocation_id];
                 let pointer: *mut metal::MTLBuffer = match shared_buffers.get(&view.allocation_id) {
@@ -1148,7 +1225,11 @@ fn encode(
         encoder.dispatch_threads(MTLSize::new(gx, gy, gz), MTLSize::new(lx, ly, lz));
         encoder.end_encoding();
     }
-    Ok(EncodedSubmission { pending, pool })
+    Ok(EncodedSubmission {
+        pending,
+        pool,
+        heap_observations,
+    })
 }
 
 impl NativeMetalProvider {
@@ -1157,17 +1238,30 @@ impl NativeMetalProvider {
     /// The lifecycle and the copy counters are the provider's, which is why
     /// this is a method: a terminal command buffer has to record its outcome on
     /// the same admission state `submit` read before the work was encoded.
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         state: &mut State,
         trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
         pipelines: Vec<ComputePipelineState>,
         token: CompletionToken,
         resolve: &BufferResolver<'_>,
         retains: BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
-        let EncodedSubmission { mut pending, pool } =
-            encode(state, &self.counters, trace, pipelines, resolve, retains)?;
+        let EncodedSubmission {
+            mut pending,
+            pool,
+            heap_observations,
+        } = encode(
+            state,
+            &self.counters,
+            trace,
+            resources,
+            pipelines,
+            resolve,
+            retains,
+        )?;
         // Render work is planned after the compute objects exist but before the
         // compute command buffer is committed: the ordering rule, the reviewed
         // allowlist, the attachment landing and the load op are all decided
@@ -1249,6 +1343,9 @@ impl NativeMetalProvider {
             .with_detail(error.to_string())
             .with_completion(CompletionDisposition::Failed { token: Some(token) })
         })?;
+        if let Some(observations) = heap_observations {
+            self.publish_heap_observations(observations);
+        }
         Ok(submission)
     }
 }
@@ -1309,6 +1406,32 @@ impl NativeMetalProvider {
             self.present_counters.acquires.load(Ordering::Relaxed),
             self.present_counters.presents.load(Ordering::Relaxed),
         )
+    }
+
+    /// Heap placements the native provider most recently executed.
+    ///
+    /// Every successful heap-bearing submission replaces the previous vector
+    /// instead of appending to it, so this stays bounded to one submission
+    /// rather than growing across a long-running process. Each record names the
+    /// heap, the owned allocation placed in it, and the
+    /// `[offset, offset + byte_size)` range it occupies; two resources in one
+    /// heap therefore appear as two records sharing one `heap_id`, which is the
+    /// falsifiable observation `research/docs/25` §6 Step 3 requires rather
+    /// than a "looks shared" assertion.
+    pub fn heap_placement_observations(&self) -> Vec<heap::HeapPlacementObservation> {
+        self.heap_observations
+            .lock()
+            .expect("heap observation lock poisoned")
+            .clone()
+    }
+
+    /// Record one heap placement set, replacing whatever the previous
+    /// submission left behind (the same bounded shape the Vulkan rail uses).
+    fn publish_heap_observations(&self, observations: Vec<heap::HeapPlacementObservation>) {
+        *self
+            .heap_observations
+            .lock()
+            .expect("heap observation lock poisoned") = observations;
     }
 
     /// Staged lease registry owned by this provider.
@@ -1552,17 +1675,30 @@ impl NativeMetalProvider {
         Ok(texels)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_async(
         &self,
         state: &mut State,
         trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
         pipelines: Vec<ComputePipelineState>,
         token: CompletionToken,
         resolve: &BufferResolver<'_>,
         retains: BorrowedRetains,
     ) -> Result<ProviderSubmission, ProviderError> {
-        let EncodedSubmission { mut pending, pool } =
-            encode(state, &self.counters, trace, pipelines, resolve, retains)?;
+        let EncodedSubmission {
+            mut pending,
+            pool,
+            heap_observations,
+        } = encode(
+            state,
+            &self.counters,
+            trace,
+            resources,
+            pipelines,
+            resolve,
+            retains,
+        )?;
         if trace.has_render_passes() {
             // Render-bearing deferred submission. The render rail runs on the
             // same Metal queue, so it serializes after the compute command
@@ -1634,6 +1770,9 @@ impl NativeMetalProvider {
                     deferred_writebacks: Some(merged),
                 },
             );
+            if let Some(observations) = &heap_observations {
+                self.publish_heap_observations(observations.clone());
+            }
             return Ok(ProviderSubmission {
                 completion: CompletionDisposition::Submitted { token },
                 writebacks: Vec::new(),
@@ -1664,6 +1803,7 @@ impl NativeMetalProvider {
         let lifecycle = Arc::clone(&self.lifecycle);
         let outbox = self.completion_outbox.clone();
         let counters = Arc::clone(&self.counters);
+        let heap_observations_arc = Arc::clone(&self.heap_observations);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -1704,7 +1844,15 @@ impl NativeMetalProvider {
                 })
             }));
             match outcome {
-                Ok(Ok(writebacks)) => record.complete(writebacks),
+                Ok(Ok(writebacks)) => {
+                    if let Some(observations) = &heap_observations {
+                        *heap_observations_arc
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            observations.clone();
+                    }
+                    record.complete(writebacks)
+                }
                 Ok(Err(error)) => record.fail(error),
                 Err(_) => record.fail(
                     refusal(
