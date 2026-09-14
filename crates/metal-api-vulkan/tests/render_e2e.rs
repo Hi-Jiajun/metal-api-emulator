@@ -1066,15 +1066,20 @@ fn collapsed_vertex_bytes() -> Vec<u8> {
     bytes
 }
 
-/// The reviewed stream's four vertices moved into the top-left quadrant:
-/// `(-1,-1) (0,-1) (-1,0) (0,0)`. With the six reviewed indices the two
-/// triangles cover exactly one pixel centre of a 2x2 attachment, which leaves
-/// three texels for the loaded bytes to show through. A full-size triangle
-/// would put its hypotenuse through two pixel centres, where the top-left fill
-/// rule — not the fixture — would decide coverage (`research/docs/23` §3.3).
-fn quadrant_vertex_bytes() -> Vec<u8> {
+/// The reviewed stream's four vertices moved into the left column: `(-1,-1)
+/// (0,-1) (-1,1) (0,1)`. With the six reviewed indices the two triangles cover
+/// exactly two of the four texels, which leaves the other two for the loaded
+/// bytes to show through.
+///
+/// The band is chosen to be *symmetric under the NDC y flip* the two rails
+/// disagree about — Vulkan's y points down, Metal's points up — so both rails
+/// cover the same texel pair `(row 0, col 0)` and `(row 1, col 0)` and the byte
+/// expectation stays identical. A quadrant-shaped band covered the top-left
+/// texel on Lavapipe and the bottom-left one on Apple Paravirtual (CI run
+/// `34870722991`), which no single expectation can describe.
+fn left_column_vertex_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(32);
-    for (x, y) in [(-1.0_f32, -1.0_f32), (0.0, -1.0), (-1.0, 0.0), (0.0, 0.0)] {
+    for (x, y) in [(-1.0_f32, -1.0_f32), (0.0, -1.0), (-1.0, 1.0), (0.0, 1.0)] {
         bytes.extend_from_slice(&x.to_ne_bytes());
         bytes.extend_from_slice(&y.to_ne_bytes());
     }
@@ -1314,13 +1319,13 @@ fn the_draw_reads_the_caller_bytes_rather_than_vertex_id() {
 #[test]
 fn a_loading_pass_keeps_the_bytes_the_draw_does_not_cover() {
     // The `LoadOp::Load` shape (`research/docs/23` §3.3): the same reviewed
-    // layout and pipeline, but a quadrant-sized stream that leaves three pixel
+    // layout and pipeline, but a left-column stream that leaves half the pixel
     // centres uncovered, drawn into an attachment the rail first fills with the
     // declaring case's own bytes. The uncovered texels keep those bytes, which
     // is what makes "the upload happened" falsifiable: a clearing pass would
     // leave the clear colour there instead.
     let Some((provider, trace, resources)) =
-        vertex_input_fixture_with_load(quadrant_vertex_bytes(), quad_index_bytes(), true)
+        vertex_input_fixture_with_load(left_column_vertex_bytes(), quad_index_bytes(), true)
     else {
         return;
     };
@@ -1338,8 +1343,8 @@ fn a_loading_pass_keeps_the_bytes_the_draw_does_not_cover() {
         .count();
     assert_eq!(
         (covered, previous),
-        (1, 3),
-        "one texel is drawn and the other three keep the uploaded bytes: {}",
+        (2, 2),
+        "the left column is drawn and the other two texels keep the uploaded bytes: {}",
         hex(&attachment)
     );
 
@@ -1347,7 +1352,7 @@ fn a_loading_pass_keeps_the_bytes_the_draw_does_not_cover() {
     // `LoadOp::Clear` leaves the clear sentinel everywhere the draw missed,
     // so the two runs differ in exactly the texel the load is about.
     let Some((provider, trace, resources)) =
-        vertex_input_fixture(quadrant_vertex_bytes(), quad_index_bytes())
+        vertex_input_fixture(left_column_vertex_bytes(), quad_index_bytes())
     else {
         return;
     };

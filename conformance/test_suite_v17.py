@@ -28,7 +28,7 @@ QUAD_VIEW = (940, 950, 0, 32)
 INDEX_VIEW = (960, 970, 0, 12)
 PREVIOUS = "fefefefe"
 TEXEL = "4080c0ff"
-EXPECTED = TEXEL + PREVIOUS * 3
+EXPECTED = TEXEL + PREVIOUS + TEXEL + PREVIOUS
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
 # The rails v17 marks: the three trace rails execute the upload path (Vulkan on
@@ -73,10 +73,12 @@ class LoadObservationTests(unittest.TestCase):
         self.assertEqual(attachment["initial_hex"], PREVIOUS * 4)
         expected = case["expected_hex"]
         self.assertEqual(expected, EXPECTED)
-        # The stream is the reviewed layout moved into the top-left quadrant, so
-        # exactly one of the four texels is covered.
+        # The stream is the reviewed layout moved into the left column, which is
+        # symmetric under the NDC y flip the two rails disagree about: both
+        # cover the same two texels, so one expectation describes both.
         self.assertEqual(case["vertex_buffers"][0]["length"], 32)
-        self.assertEqual(case["vertex_buffers"][0]["initial_hex"][:16], "000080bf000080bf")
+        self.assertEqual(case["vertex_buffers"][0]["initial_hex"],
+                         "000080bf000080bf00000000000080bf000080bf0000803f000000000000803f")
         self.assertEqual(case["indices"]["format"], "uint16")
 
     def test_v17_plan_keeps_both_halves_of_the_observation(self):
