@@ -24,9 +24,8 @@ use crate::provider::{
     InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineId, PipelineProvider,
     PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
     ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
-    ResourceTableSnapshot, StorageMode, StoreOp, VertexBufferBinding, ViewId,
-    FULL_SCREEN_TRIANGLE_VERTICES, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES,
-    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    ResourceTableSnapshot, StorageMode, StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -528,23 +527,83 @@ struct RenderTarget {
     draw: RenderDraw,
 }
 
-/// The draw one recorded render pass replays, in the shape the pass's own
-/// descriptor carries: the counts, plus the identities of the streams and index
-/// buffer — no host view, because the trace resolves those identities through
-/// its own resource pool, exactly as an attachment's do (`research/docs/23`
-/// §3.3).
+/// One vertex stream a recorded draw reads: the encoder's own view plus the
+/// binding index the pass's positional list has to carry it at.
+///
+/// The index is stored beside the view instead of being re-derived while the
+/// list is built, so the label a view spells and the position it sits at come
+/// from one fact: entry `i` of `RenderPassDescriptor::vertex_buffers` is binding
+/// `i`, which is what the contract holds a view's own `metal_binding` to
+/// (`research/docs/23` §3.6).
+#[derive(Clone)]
+struct RenderStream {
+    binding: u32,
+    view: BufferView,
+}
+
+/// The index buffer one recorded draw selects through: the encoder's own view
+/// plus the width of the indices it holds. An index buffer carries no binding
+/// index, so the pass spells it with `metal_binding` zero.
+#[derive(Clone)]
+struct RenderIndex {
+    view: BufferView,
+    format: IndexFormat,
+}
+
+/// The draw one recorded render pass replays: the counts, plus the views of the
+/// streams and index buffer it reads.
+///
+/// Every draw input carries its own bytes --
+/// `RenderPassDescriptor::vertex_buffers` is the positional `Vec<BufferView>`
+/// and `IndexBufferBinding` embeds one -- so an object-API trace needs no
+/// compute pass to declare them (`research/docs/23` §3.6). The bytes those views
+/// carry are taken at commit, under the command's own reservations, exactly as a
+/// compute binding's are; recording answers the contract's shape questions only.
 #[derive(Clone)]
 struct RenderDraw {
     /// Vertices of a non-indexed draw, or indices of an indexed one. The
     /// descriptor carries both in one `u32` field, which is why this one does
     /// too (`RenderPassDescriptor::vertices`).
     vertices: u32,
-    /// One binding per bound stream, in binding order: entry `i` is binding `i`
+    /// One entry per bound stream, in binding order: entry `i` is binding `i`
     /// of the pipeline's vertex layout, the way the descriptor is positional.
-    vertex_buffers: Vec<VertexBufferBinding>,
+    vertex_buffers: Vec<RenderStream>,
     /// The index buffer this draw selects through, or `None` for a non-indexed
     /// draw.
-    indices: Option<IndexBufferBinding>,
+    indices: Option<RenderIndex>,
+}
+
+/// The pass-shaped view one bound draw input becomes.
+///
+/// A draw input is read-only: the object API has no way to declare a write on a
+/// bound view (a compute binding's access comes from the reflected pipeline
+/// contract, and a render input has no such reflection), so the access the trace
+/// carries is the contract's own read. A view that reached the trace writable
+/// would be refused by `validate_vertex_buffer_binding` as
+/// [`ContractError::RenderInputAccessUnsupported`].
+fn draw_input_view(view: &BufferView, metal_binding: u32, bytes: Vec<u8>) -> contract::BufferView {
+    contract::BufferView {
+        view_id: view.view_id(),
+        metal_binding,
+        allocation_id: view.allocation_id(),
+        offset: view.offset as u64,
+        length: view.length as u64,
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(bytes),
+    }
+}
+
+/// The recording-time byte source for a pass's draw inputs.
+///
+/// A view declares the length its bytes have, and the contract's shape rules
+/// compare exactly that, so a placeholder of the declared length answers them
+/// without reading the host buffer. The bytes that reach the trace are the ones
+/// the commit snapshot takes under its reservations ([`RenderDraw`]); a recorded
+/// pass is only the shape proof [`RenderPassDescriptor::validate`] and the
+/// pipeline's agreement read.
+fn shape_only_bytes(view: &BufferView) -> Vec<u8> {
+    vec![0; view.length]
 }
 
 impl RenderDraw {
@@ -561,7 +620,20 @@ impl RenderDraw {
 }
 
 impl RenderTarget {
-    fn descriptor(&self, pipeline_id: PipelineId) -> Result<RenderPassDescriptor, Error> {
+    /// The pass this target becomes.
+    ///
+    /// `input_bytes` supplies the bytes each draw input's own view carries: the
+    /// commit snapshot hands back the host bytes its reservations hold, which is
+    /// what the trace keeps, while recording hands back a placeholder of the
+    /// declared length ([`shape_only_bytes`]) because the shape rules never read
+    /// a byte's value. Only the bytes behind the descriptor differ between the
+    /// two; the descriptor itself is the same value, and the bytes that reach a
+    /// provider are taken once, at commit.
+    fn descriptor(
+        &self,
+        pipeline_id: PipelineId,
+        input_bytes: &dyn Fn(&BufferView) -> Vec<u8>,
+    ) -> Result<RenderPassDescriptor, Error> {
         let attachment = RenderAttachment {
             view_id: self.view.view_id,
             allocation_id: self.view.allocation_id(),
@@ -588,6 +660,20 @@ impl RenderTarget {
             mode: PresentMode::Fifo,
             acquire: AcquirePolicy::Blocking,
         });
+        let vertex_buffers = self
+            .draw
+            .vertex_buffers
+            .iter()
+            .map(|stream| draw_input_view(&stream.view, stream.binding, input_bytes(&stream.view)))
+            .collect();
+        let indices = self
+            .draw
+            .indices
+            .as_ref()
+            .map(|indices| IndexBufferBinding {
+                view: draw_input_view(&indices.view, 0, input_bytes(&indices.view)),
+                format: indices.format,
+            });
         let descriptor = RenderPassDescriptor {
             pipeline: pipeline_id,
             color_attachments: vec![attachment],
@@ -600,8 +686,8 @@ impl RenderTarget {
                     .map_err(|_| ContractError::ArithmeticOverflow("attachment height"))?,
             ],
             vertices: self.draw.vertices,
-            vertex_buffers: self.draw.vertex_buffers.clone(),
-            indices: self.draw.indices,
+            vertex_buffers,
+            indices,
             present,
         };
         descriptor.validate()?;
@@ -881,6 +967,13 @@ fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
     ids
 }
 
+/// Reserve every range every recorded pass touches, in identity order.
+///
+/// A render pass reserves its attachment as a write (the pass lands texels
+/// there) and each stream and index buffer it draws through as a read: the
+/// commit snapshot copies those bytes into the trace, and a read range only
+/// excludes a conflicting write (`research/docs/14` §3.2), so a CPU reader of a
+/// draw input does not wait out the whole window.
 fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
     let mut by_allocation =
         BTreeMap::<AllocationId, (&Buffer, BTreeMap<(usize, usize), bool>)>::new();
@@ -915,6 +1008,24 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
                     .entry((view.offset, view.offset + view.length))
                     .and_modify(|write| *write = true)
                     .or_insert(true);
+                // The draw's own inputs are read: the commit snapshot copies
+                // their bytes into the trace, and a read range only excludes a
+                // conflicting write (`research/docs/14` §3.2), so a CPU reader
+                // of a stream is not made to wait out the whole window.
+                let inputs = target
+                    .draw
+                    .vertex_buffers
+                    .iter()
+                    .map(|stream| &stream.view)
+                    .chain(target.draw.indices.iter().map(|indices| &indices.view));
+                for view in inputs {
+                    by_allocation
+                        .entry(view.allocation_id())
+                        .or_insert_with(|| (&view.buffer, BTreeMap::new()))
+                        .1
+                        .entry((view.offset, view.offset + view.length))
+                        .or_insert(false);
+                }
             }
         }
     }
@@ -1529,8 +1640,18 @@ impl CommandBuffer {
                             return Err(Error::InvalidPipelineMetadata);
                         }
                     }
+                    // A draw input carries its own bytes, so the pass the trace
+                    // keeps is the one holding the host bytes this snapshot
+                    // takes. The reservations above hold every range the draw
+                    // reads, so the bytes are the ones the caller had when the
+                    // command committed — the same boundary a compute binding's
+                    // bytes are taken at (`research/docs/23` §3.6).
+                    let input_bytes = |view: &BufferView| -> Vec<u8> {
+                        let bytes = &guards[positions[&view.allocation_id()]];
+                        bytes[view.offset..view.offset + view.length].to_vec()
+                    };
                     trace_passes.push(contract::TracePass::Render(
-                        target.descriptor(metadata.pipeline_id)?,
+                        target.descriptor(metadata.pipeline_id, &input_bytes)?,
                     ));
                 }
             }
@@ -1958,13 +2079,18 @@ impl RenderCommandEncoder {
     ///
     /// `index` is the binding the pipeline's vertex layout names, and the pass's
     /// descriptor carries the bound streams in ascending index order
-    /// (`RenderPassDescriptor::vertex_buffers` is positional). The checks run in
-    /// the order a heap placement's do — ownership, then the binding the encoder
-    /// already holds — because each one is answerable here, without a provider
-    /// and without a pass to attach it to: a buffer from another device is
-    /// [`Error::ForeignBuffer`], a repeated index is
+    /// (`RenderPassDescriptor::vertex_buffers` is positional, and the entry a
+    /// stream lands at also carries this index as its own `metal_binding`). The
+    /// checks run in the order a heap placement's do — ownership, then the
+    /// binding the encoder already holds — because each one is answerable here,
+    /// without a provider and without a pass to attach it to: a buffer from
+    /// another device is [`Error::ForeignBuffer`], a repeated index is
     /// [`Error::VertexBufferAlreadyBound`], and an index at or past
     /// [`MAX_VERTEX_BUFFERS`] is [`Error::VertexBufferIndexOutOfRange`].
+    ///
+    /// The stream's bytes are not copied here: they travel with the pass the
+    /// draw records, taken at commit under the command's reservations, exactly
+    /// as a compute binding's are.
     ///
     /// A binding is direct-draw state, so it is refused once an indirect replay
     /// has been recorded, exactly as [`Self::draw_render_pass`] is.
@@ -2016,17 +2142,21 @@ impl RenderCommandEncoder {
         Ok(())
     }
 
-    /// The bound streams as the pass's own bindings, in binding order.
+    /// The bound streams as the pass's own inputs, in binding order.
     ///
     /// The map's keys are the binding indices, so iterating them in key order
     /// yields entry `i` = binding `i` — the positional rule the descriptor
-    /// states, without a second list that could disagree with this one.
-    fn bound_vertex_buffers(&self) -> Vec<VertexBufferBinding> {
+    /// states, without a second list that could disagree with this one. A set
+    /// that skips an index has no view to put at the position it skips, so the
+    /// draw is refused by the contract's own
+    /// [`ContractError::VertexBufferBindingMismatch`] rather than quietly
+    /// shifting a stream's bytes to another binding.
+    fn bound_vertex_buffers(&self) -> Vec<RenderStream> {
         self.vertex_buffers
-            .values()
-            .map(|view| VertexBufferBinding {
-                view_id: view.view_id(),
-                allocation_id: view.allocation_id(),
+            .iter()
+            .map(|(binding, view)| RenderStream {
+                binding: *binding,
+                view: view.clone(),
             })
             .collect()
     }
@@ -2165,9 +2295,8 @@ impl RenderCommandEncoder {
         let draw = RenderDraw {
             vertices: index_count,
             vertex_buffers: self.bound_vertex_buffers(),
-            indices: Some(IndexBufferBinding {
-                view_id: index_view.view_id(),
-                allocation_id: index_view.allocation_id(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
                 format: *index_format,
             }),
         };
@@ -2232,7 +2361,11 @@ impl RenderCommandEncoder {
         // pipeline's own render contract, which is the one agreement the pass
         // cannot answer by itself because it carries an id and not the
         // pipeline's compiled layout.
-        let descriptor = target.descriptor(pipeline_id)?;
+        //
+        // The draw's inputs are shapes here: their bytes are taken once, at
+        // commit, under that command's reservations, and a recorded pass never
+        // reads them.
+        let descriptor = target.descriptor(pipeline_id, &shape_only_bytes)?;
         pipeline
             .metadata()
             .render
