@@ -131,13 +131,30 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub clear: ClearColor,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
-    /// When set, the full-screen triangle is replayed from a
-    /// `VkDrawIndirectCommand` the rail encodes into a host-visible
-    /// `INDIRECT_BUFFER` instead of being issued with `vkCmdDraw`
-    /// (`research/docs/25` §6 Step 4). The pair is the command's vertex and
-    /// instance counts; the first increment fixes `firstVertex`/`firstInstance`
-    /// to zero.
-    pub indirect: Option<(u32, u32)>,
+    /// When set, the full-screen triangle is replayed from one CPU-encoded
+    /// indirect command instead of being issued with `vkCmdDraw`
+    /// (`research/docs/25` §6 Step 4). `Draw` carries the command's vertex and
+    /// instance counts and fixes `firstVertex`/`firstInstance` to zero;
+    /// `DrawIndexed` carries its index and instance counts and replays through
+    /// the rail's own `[0, 1, 2]` index buffer.
+    pub indirect: Option<IndirectReplay>,
+}
+
+/// The indirect command one offscreen pass replays (`research/docs/25` §6
+/// Step 4). The first increment supports exactly the reviewed draw shapes: a
+/// non-indexed draw over the milestone's three vertices, and an indexed draw
+/// whose `[0, 1, 2]` index buffer selects the same three `gl_VertexIndex`
+/// values the vertex stage already maps to the full-screen triangle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndirectReplay {
+    Draw {
+        vertex_count: u32,
+        instance_count: u32,
+    },
+    DrawIndexed {
+        index_count: u32,
+        instance_count: u32,
+    },
 }
 
 /// The vertex stage entry one offscreen render pipeline pairs with the rail's
@@ -358,32 +375,65 @@ fn prepare_render_request<'a>(
 }
 
 /// Execute one admitted render pass whose full-screen triangle is replayed from
-/// one CPU-encoded `VkDrawIndirectCommand` (`research/docs/25` §6 Step 4).
+/// one CPU-encoded `VkDrawIndirectCommand` or `VkDrawIndexedIndirectCommand`
+/// (`research/docs/25` §6 Step 4).
 ///
 /// The pass shape rules are the ones [`execute_render_pass`] already enforces —
 /// this entry point only swaps the draw for an indirect replay, so a trace that
-/// is not admitted as a render pass cannot reach it. Indexed draws and compute
-/// dispatches are outside the first indirect increment and are refused with the
-/// capability slug the contract publishes for them.
+/// is not admitted as a render pass cannot reach it. Compute dispatches and the
+/// un-reviewed indexed shapes are outside the first indirect increment and are
+/// refused with the capability slug the contract publishes for them.
 pub(crate) fn execute_indirect_render_pass(
     context: &VulkanContext,
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
 ) -> Result<Vec<u8>, ProviderError> {
-    let (vertex_count, instance_count) = match command {
+    let replay = match command {
         IndirectCommandDescriptor::Draw {
             vertex_count,
             instance_count,
-        } => (*vertex_count, *instance_count),
+        } => IndirectReplay::Draw {
+            vertex_count: *vertex_count,
+            instance_count: *instance_count,
+        },
+        IndirectCommandDescriptor::DrawIndexed {
+            index_count,
+            instance_count,
+        } => {
+            // The reviewed indexed shape is the same full-screen triangle the
+            // non-indexed rail draws: three indices into a vertex stage that
+            // selects its positions from `gl_VertexIndex`. Any other index
+            // count would name vertices the reviewed fixture does not cover, so
+            // it is refused rather than executed with an un-reviewed shape.
+            if *index_count != 3 {
+                return Err(capability_refusal("icb_command_unsupported")
+                    .with_field("kind", FieldValue::Text("DrawIndexed".to_owned()))
+                    .with_field("index_count", FieldValue::Unsigned(u64::from(*index_count)))
+                    .with_detail(
+                        "the first indexed indirect increment replays exactly the milestone's \
+                         three-index full-screen triangle",
+                    ));
+            }
+            if *instance_count == 0 {
+                return Err(capability_refusal("icb_command_unsupported")
+                    .with_field("kind", FieldValue::Text("DrawIndexed".to_owned()))
+                    .with_field("instance_count", FieldValue::Unsigned(0))
+                    .with_detail("an indexed indirect draw needs at least one instance"));
+            }
+            IndirectReplay::DrawIndexed {
+                index_count: *index_count,
+                instance_count: *instance_count,
+            }
+        }
         other => {
             return Err(capability_refusal("icb_command_unsupported")
                 .with_field("kind", FieldValue::Text(format!("{:?}", other.kind())))
-                .with_detail("the first indirect increment replays non-indexed draws only"));
+                .with_detail("the first indirect increment replays draws only"));
         }
     };
     let mut request = prepare_render_request(stages, pass)?;
-    request.indirect = Some((vertex_count, instance_count));
+    request.indirect = Some(replay);
     execute_offscreen_render(context, &request)
 }
 
@@ -583,8 +633,20 @@ pub(crate) fn execute_offscreen_render(
         &fragment_entry,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
-    if let Some((vertex_count, instance_count)) = request.indirect {
-        objects.create_indirect_draw(vertex_count, instance_count)?;
+    match request.indirect {
+        Some(IndirectReplay::Draw {
+            vertex_count,
+            instance_count,
+        }) => {
+            objects.create_indirect_draw(vertex_count, instance_count)?;
+        }
+        Some(IndirectReplay::DrawIndexed {
+            index_count,
+            instance_count,
+        }) => {
+            objects.create_indirect_draw_indexed(index_count, instance_count)?;
+        }
+        None => {}
     }
     objects.create_command_pool(queue_index)?;
     objects.record(request.format, request.clear, width, height)?;
@@ -1081,6 +1143,10 @@ struct OffscreenObjects<'a> {
     /// for a direct draw.
     indirect_buffer: vk::Buffer,
     indirect_memory: vk::DeviceMemory,
+    /// The rail's own `INDEX_BUFFER` holding `[0, 1, 2]` for an indexed
+    /// indirect draw. Null for a direct or non-indexed draw.
+    index_buffer: vk::Buffer,
+    index_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -1106,6 +1172,8 @@ impl<'a> OffscreenObjects<'a> {
             readback_memory: vk::DeviceMemory::null(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
+            index_buffer: vk::Buffer::null(),
+            index_memory: vk::DeviceMemory::null(),
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1502,6 +1570,144 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Create one host-visible, host-coherent buffer, copy `bytes` into it and
+    /// return the bound buffer/memory pair. The name labels the refusal details
+    /// so a failure spells which rail buffer it was creating.
+    fn create_host_visible_buffer(
+        &self,
+        byte_length: u64,
+        usage: vk::BufferUsageFlags,
+        bytes: &[u8],
+        name: &'static str,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
+        let info = vk::BufferCreateInfo::default()
+            .size(byte_length)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                execution_refusal(&format!("create {name} buffer"), &error.to_string())
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    &format!("find {name} memory type"),
+                    &error.to_string(),
+                ));
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    &format!("allocate {name} memory"),
+                    &error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(execution_refusal(
+                &format!("bind {name} memory"),
+                &error.to_string(),
+            ));
+        }
+        let mapping = match unsafe {
+            self.context.device.map_memory(
+                memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(execution_refusal(
+                    &format!("map {name} memory"),
+                    &error.to_string(),
+                ));
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping as *mut u8, bytes.len());
+            self.context.device.unmap_memory(memory);
+        }
+        Ok((buffer, memory))
+    }
+
+    /// Encode one `VkDrawIndexedIndirectCommand` into a host-visible
+    /// `INDIRECT_BUFFER` and build the rail's own `[0, 1, 2]` `UINT32` index
+    /// buffer the pass replays with `vkCmdDrawIndexedIndirect`
+    /// (`research/docs/25` §6 Step 4). The index buffer is an implementation
+    /// detail of the first increment: the reviewed vertex stage picks its
+    /// positions from `gl_VertexIndex`, so the three index values select exactly
+    /// the same full-screen triangle the non-indexed draw issues. Caller-owned
+    /// vertex/index buffers belong to the render-generalisation rail and stay
+    /// out of scope here.
+    fn create_indirect_draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+    ) -> Result<(), ProviderError> {
+        // The reviewed indexed shape is exactly three indices and the caller
+        // (`execute_indirect_render_pass`) refused anything else, so the rail
+        // always writes this fixed index list.
+        let indices: [u32; 3] = [0, 1, 2];
+        let index_bytes = indices
+            .iter()
+            .flat_map(|index| index.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let (index_buffer, index_memory) = self.create_host_visible_buffer(
+            index_bytes.len() as u64,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &index_bytes,
+            "index",
+        )?;
+        self.index_buffer = index_buffer;
+        self.index_memory = index_memory;
+
+        let command = vk::DrawIndexedIndirectCommand {
+            index_count,
+            instance_count,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 0,
+        };
+        let byte_length = std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u64;
+        let command_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &command as *const vk::DrawIndexedIndirectCommand as *const u8,
+                byte_length as usize,
+            )
+        };
+        let (buffer, memory) = self.create_host_visible_buffer(
+            byte_length,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
+            command_bytes,
+            "indirect",
+        )?;
+        self.indirect_buffer = buffer;
+        self.indirect_memory = memory;
+        Ok(())
+    }
+
     fn create_command_pool(&mut self, queue_index: usize) -> Result<(), ProviderError> {
         let family = self
             .context
@@ -1589,7 +1795,25 @@ impl<'a> OffscreenObjects<'a> {
             self.context
                 .device
                 .cmd_set_scissor(self.command, 0, std::slice::from_ref(&scissor));
-            if self.indirect_buffer == vk::Buffer::null() {
+            if self.index_buffer != vk::Buffer::null() {
+                // An indexed indirect replay binds the rail's own `[0, 1, 2]`
+                // index buffer and reads its counts from the `INDIRECT_BUFFER`
+                // the CPU encoded above. `stride` is the struct size because
+                // the first increment writes exactly one command.
+                self.context.device.cmd_bind_index_buffer(
+                    self.command,
+                    self.index_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.context.device.cmd_draw_indexed_indirect(
+                    self.command,
+                    self.indirect_buffer,
+                    0,
+                    1,
+                    std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                );
+            } else if self.indirect_buffer == vk::Buffer::null() {
                 self.context
                     .device
                     .cmd_draw(self.command, FULL_SCREEN_TRIANGLE_VERTICES, 1, 0, 0);
@@ -1771,6 +1995,14 @@ impl<'a> Drop for OffscreenObjects<'a> {
             }
             if self.indirect_memory != vk::DeviceMemory::null() {
                 self.context.device.free_memory(self.indirect_memory, None);
+            }
+            // The index buffer is unbound by construction (its memory is freed
+            // right after), so destroy before free.
+            if self.index_buffer != vk::Buffer::null() {
+                self.context.device.destroy_buffer(self.index_buffer, None);
+            }
+            if self.index_memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.index_memory, None);
             }
         }
     }

@@ -1105,6 +1105,8 @@ struct IcbCommandCase {
     #[serde(default)]
     vertex_count: Option<u32>,
     #[serde(default)]
+    index_count: Option<u32>,
+    #[serde(default)]
     instance_count: Option<u32>,
     #[serde(default)]
     x: Option<u32>,
@@ -2753,59 +2755,111 @@ fn compute_icb_payload(case: &Case) -> Result<Option<IndirectCommandPayload>> {
 }
 
 /// Translate a render case's indirect section into the trace payload
-/// (`research/docs/25` §4.3). Only the draw kind reaches a render case in the
-/// first increment; the command parameters are required by kind.
+/// (`research/docs/25` §4.3). The `draw` and `draw_indexed` kinds reach a
+/// render case in the first increment; the command parameters are required by
+/// kind, and a parameter of another kind is a typed refusal rather than a
+/// silently ignored field.
 fn render_icb_payload(case: &RenderCase) -> Result<Option<IndirectCommandPayload>> {
     let Some(icb) = &case.icb else {
         return Ok(None);
     };
-    if icb.kind != "draw" {
-        return Err(format!(
-            "render case {}: the first indirect increment replays draws only",
-            case.id
-        )
-        .into());
-    }
-    if !icb.kinds.iter().any(|kind| kind == "draw") {
-        return Err(format!(
-            "render case {}: the indirect buffer does not admit its own command kind",
-            case.id
-        )
-        .into());
-    }
-    let vertex_count = icb.command.vertex_count.ok_or_else(|| -> Box<dyn Error> {
-        format!(
-            "render case {}: the draw command needs vertex_count",
-            case.id
-        )
-        .into()
-    })?;
-    let instance_count = icb
-        .command
-        .instance_count
-        .ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "render case {}: the draw command needs instance_count",
+    let command = match icb.kind.as_str() {
+        "draw" => {
+            if !icb.kinds.iter().any(|kind| kind == "draw") {
+                return Err(format!(
+                    "render case {}: the indirect buffer does not admit its own command kind",
+                    case.id
+                )
+                .into());
+            }
+            let vertex_count = icb.command.vertex_count.ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "render case {}: the draw command needs vertex_count",
+                    case.id
+                )
+                .into()
+            })?;
+            let instance_count = icb
+                .command
+                .instance_count
+                .ok_or_else(|| -> Box<dyn Error> {
+                    format!(
+                        "render case {}: the draw command needs instance_count",
+                        case.id
+                    )
+                    .into()
+                })?;
+            if icb.command.index_count.is_some()
+                || icb.command.x.is_some()
+                || icb.command.y.is_some()
+                || icb.command.z.is_some()
+            {
+                return Err(format!(
+                    "render case {}: a draw command carries no index or dispatch parameters",
+                    case.id
+                )
+                .into());
+            }
+            IndirectCommandDescriptor::Draw {
+                vertex_count,
+                instance_count,
+            }
+        }
+        "draw_indexed" => {
+            if !icb.kinds.iter().any(|kind| kind == "draw_indexed") {
+                return Err(format!(
+                    "render case {}: the indirect buffer does not admit its own command kind",
+                    case.id
+                )
+                .into());
+            }
+            let index_count = icb.command.index_count.ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "render case {}: the draw_indexed command needs index_count",
+                    case.id
+                )
+                .into()
+            })?;
+            let instance_count = icb
+                .command
+                .instance_count
+                .ok_or_else(|| -> Box<dyn Error> {
+                    format!(
+                        "render case {}: the draw_indexed command needs instance_count",
+                        case.id
+                    )
+                    .into()
+                })?;
+            if icb.command.vertex_count.is_some()
+                || icb.command.x.is_some()
+                || icb.command.y.is_some()
+                || icb.command.z.is_some()
+            {
+                return Err(format!(
+                    "render case {}: a draw_indexed command carries no vertex or dispatch parameters",
+                    case.id
+                )
+                .into());
+            }
+            IndirectCommandDescriptor::DrawIndexed {
+                index_count,
+                instance_count,
+            }
+        }
+        other => {
+            return Err(format!(
+                "render case {}: the first indirect increment replays draws only, not {other}",
                 case.id
             )
-            .into()
-        })?;
-    if icb.command.x.is_some() || icb.command.y.is_some() || icb.command.z.is_some() {
-        return Err(format!(
-            "render case {}: a draw command carries no dispatch parameters",
-            case.id
-        )
-        .into());
-    }
+            .into());
+        }
+    };
     Ok(Some(IndirectCommandPayload {
         buffer: IndirectCommandBufferDescriptor {
             max_commands: icb.max_commands,
-            kinds: vec![IndirectCommandKind::Draw],
+            kinds: vec![command.kind()],
         },
-        command: IndirectCommandDescriptor::Draw {
-            vertex_count,
-            instance_count,
-        },
+        command,
         range: IndirectCommandRange {
             start: icb.range.start,
             count: icb.range.count,

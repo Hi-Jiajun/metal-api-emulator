@@ -225,6 +225,13 @@ ICB_DRAW = {
     "range": {"start": 0, "count": 1},
     "command": {"vertex_count": 3, "instance_count": 1},
 }
+ICB_DRAW_INDEXED = {
+    "kind": "draw_indexed",
+    "max_commands": 1,
+    "kinds": ["draw_indexed"],
+    "range": {"start": 0, "count": 1},
+    "command": {"index_count": 3, "instance_count": 1},
+}
 ICB_DISPATCH = {
     "kind": "dispatch",
     "max_commands": 1,
@@ -274,7 +281,24 @@ class IcbDeclarationTests(unittest.TestCase):
         self.assertEqual((expectation.start, expectation.count), (0, 1))
 
     def test_a_kind_the_case_cannot_replay_is_refused(self):
-        self.reject(ICB_DISPATCH, "replays a draw command")
+        self.reject(ICB_DISPATCH, "replays a draw or draw_indexed command")
+
+    def test_a_draw_indexed_section_is_planned(self):
+        plan = self.plan(copy.deepcopy(ICB_DRAW_INDEXED))
+        expectation = next(iter(plan.values())).icb
+        self.assertEqual(expectation.kind, "draw_indexed")
+        self.assertEqual((expectation.max_commands, expectation.kinds), (1, ("draw_indexed",)))
+        self.assertEqual((expectation.start, expectation.count), (0, 1))
+
+    def test_a_zero_index_draw_indexed_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW_INDEXED)
+        icb["command"]["index_count"] = 0
+        self.reject(icb, "expected integer")
+
+    def test_a_draw_indexed_with_vertex_count_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW_INDEXED)
+        icb["command"]["vertex_count"] = 3
+        self.reject(icb, "expected fields")
 
     def test_a_range_outside_the_buffer_is_refused(self):
         icb = copy.deepcopy(ICB_DRAW)
@@ -326,6 +350,17 @@ class IcbObservationTests(unittest.TestCase):
         observation = dict(ICB_OBSERVATION, kind="dispatch")
         self.reject(draw_capture(self.suite, self.digest, icb=observation),
                     "replayed kind does not match")
+
+    def test_a_draw_indexed_observation_is_reported(self):
+        suite, digest = render_suite_with_icb(icb=ICB_DRAW_INDEXED)
+        report = draw_capture(suite, digest, icb=dict(ICB_OBSERVATION, kind="draw_indexed"))
+        compare.validate_capture(suite, digest, report, "vulkan")
+
+    def test_a_draw_indexed_observation_with_a_draw_kind_is_refused(self):
+        suite, digest = render_suite_with_icb(icb=ICB_DRAW_INDEXED)
+        report = draw_capture(suite, digest, icb=dict(ICB_OBSERVATION, kind="draw"))
+        with self.assertRaisesRegex(compare.CaptureError, "replayed kind does not match"):
+            compare.validate_capture(suite, digest, report, "vulkan")
 
     def test_a_different_range_is_refused(self):
         observation = dict(ICB_OBSERVATION, count=2, commands=2)
