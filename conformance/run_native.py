@@ -109,7 +109,7 @@ def validate_heap_selftest(report):
     }
     expected_allocations = [
         {"allocation": 900, "bytes_hex": "fefefefefefefefefefefefefefefefe"},
-        {"allocation": 920, "bytes_hex": "fefefefeffffffffffffffffff"},
+        {"allocation": 920, "bytes_hex": "fefefefeffffffffffffffff"},
     ]
     # The shape is part of the claim: the reviewed fixture produces exactly one
     # writeback and two allocations, so a report that reached the same bytes by

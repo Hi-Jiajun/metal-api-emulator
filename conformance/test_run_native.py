@@ -189,7 +189,7 @@ class HeapSelftestValidationTests(unittest.TestCase):
 
     WORD = "fefefefe"
     READ_ALLOCATION = "fefefefefefefefefefefefefefefefe"
-    WRITE_ALLOCATION = "fefefefeffffffffffffffffff"
+    WRITE_ALLOCATION = "fefefefeffffffffffffffff"
     SENTINEL_WRITE = "ffffffff"
 
     def reviewed_report(self, completion="CompletedVisible", device="Apple GPU",
