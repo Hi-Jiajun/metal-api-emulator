@@ -67,6 +67,14 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
+        // Vertex input is not executed yet: the rail still draws the
+        // `vertex_id` triangle, so the three bits stay at "cannot read a
+        // caller-held stream" until the vertex-input rail lands
+        // (`research/docs/23` §3.3). A pass that binds one is refused during
+        // core admission, not silently executed with generated positions.
+        max_vertex_buffers: 0,
+        supported_vertex_formats: Vec::new(),
+        supported_index_formats: Vec::new(),
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

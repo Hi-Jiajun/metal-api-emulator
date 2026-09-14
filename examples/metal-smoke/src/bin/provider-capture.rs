@@ -3149,6 +3149,11 @@ fn run_render_case(
             u32::try_from(case.viewport[3])?,
         ],
         vertices: u32::try_from(case.vertices)?,
+        // The capture tool's vertex-input wiring is a later step of the same
+        // increment; until it lands the tool binds no caller-held stream, which
+        // is the shape every existing suite declares.
+        vertex_buffers: Vec::new(),
+        indices: None,
         present,
     }));
 

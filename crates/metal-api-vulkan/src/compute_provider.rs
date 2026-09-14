@@ -2184,6 +2184,8 @@ mod tests {
             }],
             viewport: [0, 0, 2, 2],
             vertices: 3,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         }
     }

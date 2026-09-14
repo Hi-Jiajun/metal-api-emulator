@@ -70,13 +70,19 @@ pub enum CodecError {
     QueuePriorityCount { count: usize, maximum: usize },
     TracePassCount { count: usize, maximum: usize },
     ColorAttachmentCount { count: usize, maximum: usize },
+    VertexBufferCount { count: usize, maximum: usize },
+    VertexAttributeCount { count: usize, maximum: usize },
     SupportedColorFormatCount { count: usize, maximum: usize },
+    SupportedVertexFormatCount { count: usize, maximum: usize },
+    SupportedIndexFormatCount { count: usize, maximum: usize },
     PresentModeCount { count: usize, maximum: usize },
     PresentSentinelLength { length: usize, maximum: usize },
     HeapPlacementCount { count: usize, maximum: usize },
     HeapStorageModeCount { count: usize, maximum: usize },
     IndirectCommandKindCount { count: usize, maximum: usize },
     UnknownPassTag(u8),
+    UnknownRenderFeature(u8),
+    UnknownCapabilityTail(u8),
     UnknownPipelineTag(u8),
     UnknownEnumValue { field: &'static str, value: u8 },
     InvalidUtf8(std::string::FromUtf8Error),
@@ -148,9 +154,25 @@ impl fmt::Display for CodecError {
                 formatter,
                 "render pass carries {count} colour attachments, maximum {maximum}"
             ),
+            Self::VertexBufferCount { count, maximum } => write!(
+                formatter,
+                "render pass carries {count} vertex buffers, maximum {maximum}"
+            ),
+            Self::VertexAttributeCount { count, maximum } => write!(
+                formatter,
+                "vertex buffer layout carries {count} attributes, maximum {maximum}"
+            ),
             Self::SupportedColorFormatCount { count, maximum } => write!(
                 formatter,
                 "capability snapshot names {count} colour formats, maximum {maximum}"
+            ),
+            Self::SupportedVertexFormatCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} vertex formats, maximum {maximum}"
+            ),
+            Self::SupportedIndexFormatCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} index formats, maximum {maximum}"
             ),
             Self::PresentSentinelLength { length, maximum } => write!(
                 formatter,
@@ -174,6 +196,13 @@ impl fmt::Display for CodecError {
             ),
             Self::UnknownPassTag(tag) => {
                 write!(formatter, "unknown trace pass tag {tag:#04x}")
+            }
+            Self::UnknownRenderFeature(features) => write!(
+                formatter,
+                "unknown extended render pass feature bits {features:#04x}"
+            ),
+            Self::UnknownCapabilityTail(tag) => {
+                write!(formatter, "unknown capability payload tail tag {tag:#04x}")
             }
             Self::UnknownPipelineTag(tag) => {
                 write!(formatter, "unknown pipeline table entry tag {tag:#04x}")

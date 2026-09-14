@@ -1266,6 +1266,267 @@ pub const MAX_COLOR_ATTACHMENTS: usize = 1;
 /// triangle generated from `vertex_id` (`research/docs/23` §1.2).
 pub const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 
+// ---------------------------------------------------------------------------
+// Vertex input contract (`research/docs/23` §3.3, "顶点缓冲与
+// `MTLVertexDescriptor`：§6 Step 7 之后单独一段").
+//
+// The render pass gains a caller-held vertex stream: a pipeline contract names
+// the vertex layout (strides and attributes, Metal's
+// `MTLVertexDescriptor` half) and the pass binds the buffers that layout reads
+// (Metal's `setVertexBuffer(_:offset:index:)` half). Positions no longer have
+// to be generated from `vertex_id`, and a draw may be indexed by a caller-held
+// index buffer.
+//
+// Deliberately absent, i.e. the features this increment does not schedule:
+// per-instance step rates (no `step_rate` field), base vertex and instance
+// offsets (no such field on the index binding or the pass), and instancing
+// counts. As everywhere in the render contract, "not supported yet" is
+// expressed by a missing field or a validator refusal rather than by a default
+// value a trace could rely on.
+// ---------------------------------------------------------------------------
+
+/// Vertex buffer bindings one render pass may declare.
+///
+/// A cap, not a device limit: the first vertex-input increment needs at most
+/// the reviewed fixture's bindings, and a cap keeps a trace from smuggling an
+/// unbounded list past the wire format before a provider publishes its own
+/// `max_vertex_buffers`.
+pub const MAX_VERTEX_BUFFERS: usize = 4;
+
+/// Attributes one [`VertexBufferLayout`] may declare. Same rule as
+/// [`MAX_VERTEX_BUFFERS`]: the reviewed fixture needs one per buffer, and the
+/// cap keeps the wire payload bounded.
+pub const MAX_VERTEX_ATTRIBUTES: usize = 8;
+
+/// Component layout of one vertex attribute.
+///
+/// The list is closed and contains only formats the reviewed Vulkan and Metal
+/// rails can both build from a vertex buffer: two, three and four `float32`
+/// components and one `uint32`. The code values are this contract's own
+/// (0..=3), because neither Vulkan's `VkFormat` nor Metal's `MTLVertexFormat`
+/// numbering is a stable wire vocabulary — the same reasoning
+/// [`AttachmentFormat`] records for its reuse of the texture codes.
+///
+/// 8-bit and 16-bit packed formats (Metal's `half`, `uchar4`, `short2`, …) are
+/// deliberately absent: their Vulkan counterparts carry normalisation state
+/// that the byte-parity discipline would have to pin first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexFormat {
+    /// `VK_FORMAT_R32G32_SFLOAT` / `MTLVertexFormat::Float2`.
+    Float32x2,
+    /// `VK_FORMAT_R32G32B32_SFLOAT` / `MTLVertexFormat::Float3`.
+    Float32x3,
+    /// `VK_FORMAT_R32G32B32A32_SFLOAT` / `MTLVertexFormat::Float4`.
+    Float32x4,
+    /// `VK_FORMAT_R32_UINT` / `MTLVertexFormat::UInt`.
+    Uint32,
+}
+
+impl VertexFormat {
+    /// Formats this increment admits. All four, because each one already has a
+    /// reviewed mapping on both rails; the list stays closed so admitting a
+    /// fifth is a deliberate wire-visible change.
+    pub const ADMITTED: [Self; 4] = [
+        Self::Float32x2,
+        Self::Float32x3,
+        Self::Float32x4,
+        Self::Uint32,
+    ];
+
+    /// Bytes one attribute of this format occupies in the vertex stream.
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Float32x2 => 8,
+            Self::Float32x3 => 12,
+            Self::Float32x4 => 16,
+            Self::Uint32 => 4,
+        }
+    }
+
+    /// Stable wire code. See [`VertexFormat`] for why this is not the
+    /// `VkFormat` value.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Float32x2 => 0,
+            Self::Float32x3 => 1,
+            Self::Float32x4 => 2,
+            Self::Uint32 => 3,
+        }
+    }
+
+    /// Inverse of [`VertexFormat::code`]. An unknown code is a decoder error,
+    /// not a silent default.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Float32x2),
+            1 => Some(Self::Float32x3),
+            2 => Some(Self::Float32x4),
+            3 => Some(Self::Uint32),
+            _ => None,
+        }
+    }
+
+    /// Whether this increment admits the format. Present so a capability
+    /// snapshot can spell its `supported_vertex_formats` from the same
+    /// predicate the validator uses.
+    pub const fn is_admitted(self) -> bool {
+        matches!(
+            self,
+            Self::Float32x2 | Self::Float32x3 | Self::Float32x4 | Self::Uint32
+        )
+    }
+}
+
+/// One attribute inside a vertex stream: where the vertex stage reads it from.
+///
+/// `location` is the shader-visible attribute location (Metal's
+/// `[[attribute(n)]]`, Vulkan's `Location n`), `offset` is its byte offset
+/// inside one vertex, and the format fixes its width. The triple is what both
+/// rails translate into their own descriptor (`VkVertexInputAttributeDescription`
+/// / `MTLVertexAttributeDescriptor`), so no further field is needed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VertexAttribute {
+    pub location: u32,
+    pub offset: u64,
+    pub format: VertexFormat,
+}
+
+/// One vertex stream: the stride between consecutive vertices and the
+/// attributes read out of it (Metal's `MTLVertexBufferLayoutDescriptor`,
+/// without the step function this increment does not schedule).
+///
+/// The entry's position in [`VertexLayout::Buffers`] is the binding index both
+/// rails use: Vulkan's vertex input binding `i` and Metal's
+/// `setVertexBuffer(_:offset:index: i)` / `MTLVertexAttributeDescriptor.bufferIndex`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexBufferLayout {
+    /// Bytes between consecutive vertices.
+    pub stride: u64,
+    /// Attributes read out of this stream. At least one: a stream with no
+    /// attribute is not a layout this increment can execute.
+    pub attributes: Vec<VertexAttribute>,
+}
+
+/// Index width of a render pass's index buffer.
+///
+/// The two values are Metal's `MTLIndexType` and Vulkan's `VkIndexType`; the
+/// codes are this contract's own, for the reason [`VertexFormat`] records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexFormat {
+    /// `VK_INDEX_TYPE_UINT16` / `MTLIndexTypeUInt16`.
+    Uint16,
+    /// `VK_INDEX_TYPE_UINT32` / `MTLIndexTypeUInt32`.
+    Uint32,
+}
+
+impl IndexFormat {
+    /// Index widths this increment admits. Both: each one exists on both rails,
+    /// and the codec's closed code space keeps a third from arriving silently.
+    pub const ADMITTED: [Self; 2] = [Self::Uint16, Self::Uint32];
+
+    /// Bytes one index occupies.
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Uint16 => 2,
+            Self::Uint32 => 4,
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Uint16 => 0,
+            Self::Uint32 => 1,
+        }
+    }
+
+    /// Inverse of [`IndexFormat::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Uint16),
+            1 => Some(Self::Uint32),
+            _ => None,
+        }
+    }
+
+    pub const fn is_admitted(self) -> bool {
+        matches!(self, Self::Uint16 | Self::Uint32)
+    }
+}
+
+/// One vertex buffer bound for a render pass, by view identity.
+///
+/// The pass references a view the trace already declares (the same rule
+/// [`RenderAttachment`] follows): the bytes come from the trace's resource
+/// pool, whose view carries the range and source, while the pass states only
+/// which view sits at this binding index. The index is positional — entry `i`
+/// of [`RenderPassDescriptor::vertex_buffers`] is binding `i` — so no
+/// binding-index field can disagree with the layout's own indexing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VertexBufferBinding {
+    pub view_id: ViewId,
+    pub allocation_id: AllocationId,
+}
+
+impl VertexBufferBinding {
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("vertex buffer view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity(
+                "vertex buffer allocation id",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One index buffer bound for a render pass: a view identity plus the width of
+/// the indices it holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexBufferBinding {
+    pub view_id: ViewId,
+    pub allocation_id: AllocationId,
+    pub format: IndexFormat,
+}
+
+/// Which render input a resolution refusal is about.
+///
+/// The vertex and index halves resolve identically — declared view, agreeing
+/// allocation, no overlapping compute write — so one refusal family carries
+/// this discriminator instead of duplicating three variants. It is a value
+/// rather than a string so a provider can match on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderInputKind {
+    VertexBuffer,
+    IndexBuffer,
+}
+
+impl RenderInputKind {
+    /// Lowercase spelling used by `Display` output and test failure messages.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::VertexBuffer => "vertex buffer",
+            Self::IndexBuffer => "index buffer",
+        }
+    }
+}
+
+impl IndexBufferBinding {
+    pub fn validate_shape(&self) -> Result<(), ContractError> {
+        if self.view_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("index buffer view id"));
+        }
+        if self.allocation_id.is_zero() {
+            return Err(ContractError::InvalidIdentity("index buffer allocation id"));
+        }
+        if !self.format.is_admitted() {
+            return Err(ContractError::UnsupportedIndexFormat(self.format));
+        }
+        Ok(())
+    }
+}
+
 /// One colour attachment of a render pass.
 ///
 /// It references an existing resource by identity instead of embedding a
@@ -1337,9 +1598,9 @@ impl RenderAttachment {
 /// Deliberately absent fields, i.e. the features `docs/23` §3.3 schedules
 /// later: MSAA (no `sample_count`), depth/stencil attachments, MRT (the
 /// attachment list is capped at [`MAX_COLOR_ATTACHMENTS`] until
-/// `render_targets` locations are mapped), indexed and instanced draws (no
-/// index or instance field) and dynamic state beyond the explicit viewport (no
-/// scissor, blend, cull or winding).
+/// `render_targets` locations are mapped), instancing (no instance count, and
+/// the vertex layouts carry no step rate) and dynamic state beyond the explicit
+/// viewport (no scissor, blend, cull or winding).
 ///
 /// This type is not referenced by [`ComputeTrace`] yet: Step 1 fixes the shape,
 /// Step 2 makes `passes` a tagged union, extends the `MCC1` payload and teaches
@@ -1358,7 +1619,26 @@ pub struct RenderPassDescriptor {
     pub viewport: [u32; 4],
     /// Vertices of the single non-indexed draw. The first milestone draws
     /// [`FULL_SCREEN_TRIANGLE_VERTICES`].
+    ///
+    /// When [`Self::indices`] is present this is the number of *indices* the
+    /// draw consumes, matching Metal's `drawIndexedPrimitives(indexCount:)`;
+    /// otherwise it is the number of vertices, matching
+    /// `drawPrimitives(vertexCount:)`. Both are one `u32` on the wire, which is
+    /// why the field keeps its name and position.
     pub vertices: u32,
+    /// Vertex buffers bound for this pass, in binding order: entry `i` is
+    /// binding `i` of the pipeline's [`VertexLayout`]. Empty for a pass whose
+    /// pipeline declares [`VertexLayout::None`], where positions come from
+    /// `vertex_id`.
+    ///
+    /// Unlike a compute pass's binding, the pass states no `metal_binding`: the
+    /// position *is* the binding, so a trace cannot bind stream 1's range at
+    /// index 0. The bytes come from the trace's pool view this entry names,
+    /// exactly as an attachment's do.
+    pub vertex_buffers: Vec<VertexBufferBinding>,
+    /// Index buffer this pass draws through, or `None` for a non-indexed draw.
+    /// When present, [`Self::vertices`] is the index count.
+    pub indices: Option<IndexBufferBinding>,
     /// The present action this pass hands its own attachment on to, or `None`
     /// for the offscreen-only pass.
     ///
@@ -1389,9 +1669,32 @@ impl RenderPassDescriptor {
         for attachment in &self.color_attachments {
             attachment.validate_shape()?;
         }
-        if self.vertices != FULL_SCREEN_TRIANGLE_VERTICES {
+        if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
+            return Err(ContractError::VertexBufferLimitExceeded {
+                requested: self.vertex_buffers.len(),
+                maximum: MAX_VERTEX_BUFFERS,
+            });
+        }
+        for binding in &self.vertex_buffers {
+            binding.validate_shape()?;
+        }
+        if let Some(indices) = &self.indices {
+            indices.validate_shape()?;
+        }
+        // The `vertex_id`-only shape keeps the milestone's fixed count whether
+        // or not an index buffer selects through it: three indices over three
+        // generated vertices is the same reviewed triangle the v15 indexed
+        // replay uses. A vertex-buffer layout brings its own count, which the
+        // pipeline's layout checks against the bound ranges.
+        if self.vertex_buffers.is_empty() && self.vertices != FULL_SCREEN_TRIANGLE_VERTICES {
             return Err(ContractError::DrawVertexCountMismatch {
                 expected: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: self.vertices,
+            });
+        }
+        if !self.vertex_buffers.is_empty() && self.vertices < FULL_SCREEN_TRIANGLE_VERTICES {
+            return Err(ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
                 actual: self.vertices,
             });
         }
@@ -1458,16 +1761,36 @@ impl RenderPipelineStage {
 /// How the vertex stage of a [`RenderPipelineContract`] receives its vertices.
 ///
 /// `research/docs/23` §1.2 draws the first milestone's full-screen triangle
-/// from `vertex_id` alone, so the pipeline binds no vertex buffer. The layout is
-/// a value rather than an empty attribute list on purpose: Step 4 has to add a
-/// vertex-buffer value beside [`VertexLayout::None`], and an empty `Vec` would
-/// make "this pipeline has no vertex attributes" indistinguishable from
-/// "vertex attributes are not decoded yet" in a wire format that is frozen
-/// before that mapping exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// from `vertex_id` alone, so the pipeline binds no vertex buffer; the
+/// vertex-input increment (`docs/23` §3.3) adds the caller-held streams beside
+/// it. The layout is a value rather than an empty attribute list on purpose: an
+/// empty `Vec` would make "this pipeline has no vertex attributes"
+/// indistinguishable from "vertex attributes are not decoded yet" in a wire
+/// format that is frozen before that mapping exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VertexLayout {
     /// No vertex buffer is bound; positions come from the vertex index.
     None,
+    /// One entry per vertex buffer binding, in binding order. At least one
+    /// entry: a pipeline that binds streams has to say what their strides and
+    /// attributes are, and neither rail can build a vertex input state from an
+    /// empty list.
+    Buffers(Vec<VertexBufferLayout>),
+}
+
+impl VertexLayout {
+    /// Whether this layout binds caller-held vertex buffers.
+    pub const fn binds_buffers(&self) -> bool {
+        matches!(self, Self::Buffers(_))
+    }
+
+    /// The per-binding layouts, or an empty slice for [`VertexLayout::None`].
+    pub fn buffers(&self) -> &[VertexBufferLayout] {
+        match self {
+            Self::None => &[],
+            Self::Buffers(buffers) => buffers,
+        }
+    }
 }
 
 /// Provider-admission metadata for one registered render pipeline: the render
@@ -1532,6 +1855,9 @@ impl RenderPipelineContract {
                 self.color_format,
             ));
         }
+        if let VertexLayout::Buffers(buffers) = &self.vertex_layout {
+            validate_vertex_layout(buffers)?;
+        }
         Ok(())
     }
 
@@ -1556,8 +1882,79 @@ impl RenderPipelineContract {
                 });
             }
         }
+        // One pipeline layout entry per bound stream, in binding order: the
+        // layout says what each stream's stride and attributes are, so the
+        // count is the only thing the pair can disagree about without the
+        // stream itself. A pass that binds a buffer the layout does not
+        // describe (or the reverse) is refused here rather than left to a
+        // driver's vertex-input state.
+        let pipeline_buffers = self.vertex_layout.buffers().len();
+        if pipeline_buffers != pass.vertex_buffers.len() {
+            return Err(ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers,
+                pass_buffers: pass.vertex_buffers.len(),
+            });
+        }
         Ok(())
     }
+}
+
+/// Structural validation of one [`VertexLayout::Buffers`] list, shared by the
+/// pipeline contract and its tests.
+///
+/// Every rule is a fact the layout alone can answer: non-empty, bounded, each
+/// stream with a non-zero stride and at least one attribute, every attribute
+/// inside its stride, and attribute locations unique across the whole layout
+/// (both rails index attributes by location, so a duplicate would silently
+/// overwrite one of the two).
+fn validate_vertex_layout(buffers: &[VertexBufferLayout]) -> Result<(), ContractError> {
+    if buffers.is_empty() {
+        return Err(ContractError::EmptyVertexLayout);
+    }
+    if buffers.len() > MAX_VERTEX_BUFFERS {
+        return Err(ContractError::VertexBufferLimitExceeded {
+            requested: buffers.len(),
+            maximum: MAX_VERTEX_BUFFERS,
+        });
+    }
+    let mut locations = BTreeMap::new();
+    for (index, buffer) in buffers.iter().enumerate() {
+        if buffer.stride == 0 {
+            return Err(ContractError::ZeroVertexStride { buffer: index });
+        }
+        if buffer.attributes.is_empty() {
+            return Err(ContractError::EmptyVertexBufferLayout { buffer: index });
+        }
+        if buffer.attributes.len() > MAX_VERTEX_ATTRIBUTES {
+            return Err(ContractError::VertexAttributeLimitExceeded {
+                buffer: index,
+                requested: buffer.attributes.len(),
+                maximum: MAX_VERTEX_ATTRIBUTES,
+            });
+        }
+        for attribute in &buffer.attributes {
+            let format_bytes = attribute.format.bytes();
+            let end = attribute
+                .offset
+                .checked_add(format_bytes)
+                .ok_or(ContractError::ArithmeticOverflow("vertex attribute range"))?;
+            if end > buffer.stride {
+                return Err(ContractError::VertexAttributeOutOfRange {
+                    buffer: index,
+                    location: attribute.location,
+                    offset: attribute.offset,
+                    format_bytes,
+                    stride: buffer.stride,
+                });
+            }
+            if locations.insert(attribute.location, index).is_some() {
+                return Err(ContractError::DuplicateVertexAttribute {
+                    location: attribute.location,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3758,6 +4155,100 @@ impl ComputeTrace {
                 });
             }
         }
+        // Render vertex and index buffers resolve the same way an attachment
+        // does: the trace has to declare the view, the declaration has to agree
+        // about the allocation, and no compute write may overlap the bytes the
+        // draw reads (`research/docs/23` §3.3). The bytes themselves come from
+        // the declared view, so an undeclared stream would otherwise be read as
+        // whatever the provider happened to have uploaded.
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            let Some(pass) = pass.as_render() else {
+                continue;
+            };
+            let inputs = pass
+                .vertex_buffers
+                .iter()
+                .map(|binding| {
+                    (
+                        RenderInputKind::VertexBuffer,
+                        binding.view_id,
+                        binding.allocation_id,
+                    )
+                })
+                .chain(pass.indices.iter().map(|indices| {
+                    (
+                        RenderInputKind::IndexBuffer,
+                        indices.view_id,
+                        indices.allocation_id,
+                    )
+                }));
+            for (kind, view_id, allocation_id) in inputs {
+                let Some(declarations) = declared.get(&view_id) else {
+                    return Err(ContractError::RenderInputViewUnknown {
+                        pass_index,
+                        view: view_id,
+                        allocation: allocation_id,
+                        kind,
+                    });
+                };
+                for declaration in declarations {
+                    if declaration.allocation_id() != allocation_id {
+                        return Err(ContractError::RenderInputViewAllocationMismatch {
+                            pass_index,
+                            view: view_id,
+                            kind,
+                            declared: declaration.allocation_id(),
+                            referenced: allocation_id,
+                        });
+                    }
+                }
+                let ranges = declarations
+                    .iter()
+                    .map(|declaration| declaration.byte_range())
+                    .collect::<Vec<_>>();
+                for (compute_view, others) in &declared {
+                    for other in others {
+                        if !other.is_writable()
+                            || !ranges
+                                .iter()
+                                .any(|range| range.overlaps(&other.byte_range()))
+                        {
+                            continue;
+                        }
+                        return Err(ContractError::RenderInputComputeConflict {
+                            pass_index,
+                            view: view_id,
+                            kind,
+                            compute_view: *compute_view,
+                            compute_pass: other.pass_index(),
+                        });
+                    }
+                }
+                for (compute_view, others) in &declared {
+                    for other in others {
+                        if other.pass_index() <= pass_index
+                            || !ranges
+                                .iter()
+                                .any(|range| range.overlaps(&other.byte_range()))
+                        {
+                            continue;
+                        }
+                        return Err(ContractError::RenderPassOrderUnsupported {
+                            pass_index,
+                            compute_pass: other.pass_index(),
+                            view: view_id,
+                            compute_view: *compute_view,
+                        });
+                    }
+                }
+                if pool.insert(view_id) && pool.len() > MAX_SERIAL_RESOURCES {
+                    return Err(ContractError::SerialResourceLimit {
+                        requested: pool.len(),
+                        maximum: MAX_SERIAL_RESOURCES,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3804,6 +4295,31 @@ impl ComputeTrace {
                 BufferAccess::Read => BufferAccess::ReadWrite,
                 BufferAccess::Write | BufferAccess::ReadWrite => resource.access,
             };
+        }
+        // Render vertex and index buffers read their views, so a view a compute
+        // pass declared write-only has to become readable before the pool is
+        // uploaded: a view that cannot read uploads nothing, and the render rail
+        // would then read bytes the trace never put in device memory
+        // (`research/docs/23` §3.3). A view the trace does not declare is left
+        // alone here — the render rail refuses it by name, the same way it
+        // refuses an undeclared attachment.
+        for pass in self.render_passes() {
+            let inputs = pass
+                .vertex_buffers
+                .iter()
+                .map(|binding| binding.view_id)
+                .chain(pass.indices.iter().map(|indices| indices.view_id));
+            for view_id in inputs {
+                let Some(&position) = positions.get(&view_id) else {
+                    continue;
+                };
+                let resource = &mut resources[position];
+                resource.access = match resource.access {
+                    BufferAccess::Unused => BufferAccess::Read,
+                    BufferAccess::Write => BufferAccess::ReadWrite,
+                    BufferAccess::Read | BufferAccess::ReadWrite => resource.access,
+                };
+            }
         }
         Ok(resources)
     }
@@ -4285,6 +4801,18 @@ pub struct ProviderCapabilities {
     /// own format family; its wire codes are the `MCC1` texture-format codes,
     /// so no second mapping is needed (`docs/23` §3.1).
     pub supported_color_formats: Vec<AttachmentFormat>,
+    /// Vertex buffer bindings one render pass may declare. `0` means the
+    /// snapshot cannot read caller-held vertex streams at all, so a pass that
+    /// binds one is refused during admission instead of being executed with
+    /// `vertex_id` positions the trace did not ask for
+    /// (`research/docs/23` §3.3).
+    pub max_vertex_buffers: u32,
+    /// Vertex attribute formats this snapshot admits. Empty means none; the
+    /// first vertex-input increment admits [`VertexFormat::ADMITTED`].
+    pub supported_vertex_formats: Vec<VertexFormat>,
+    /// Index widths this snapshot admits. Empty means none, and then no
+    /// indexed draw is admissible even with a vertex buffer bound.
+    pub supported_index_formats: Vec<IndexFormat>,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -4352,9 +4880,21 @@ impl ProviderCapabilities {
             || self.max_color_attachments != 0
             || self.max_attachment_dimension != [0, 0]
             || !self.supported_color_formats.is_empty()
+            || self.declares_vertex_input_support()
             || self.declares_presentation_support()
             || self.declares_heap_support()
             || self.declares_icb_support()
+    }
+
+    /// Whether any vertex-input bit differs from its default. Part of the
+    /// render bits on purpose: a snapshot that declared vertex buffers without
+    /// declaring render would otherwise keep sending the legacy capability
+    /// payload, and the three bits would be lost on the wire — the same failure
+    /// [`ProviderCapabilities::declares_render_support`] documents.
+    pub fn declares_vertex_input_support(&self) -> bool {
+        self.max_vertex_buffers != 0
+            || !self.supported_vertex_formats.is_empty()
+            || !self.supported_index_formats.is_empty()
     }
 
     /// Whether any present bit differs from its default.
@@ -4716,6 +5256,30 @@ impl ProviderCapabilities {
                         ));
                 }
             }
+            // Vertex input is admitted next, before the pipeline agreement
+            // below, for the same reason the colour bits come first: a snapshot
+            // whose vertex-input bits stay at their defaults refuses the shape
+            // it cannot read instead of reporting a binding mismatch against a
+            // layout it would never execute (`docs/23` §3.3).
+            if pass.vertex_buffers.len() > self.max_vertex_buffers as usize {
+                return Err(capability_error("vertex_buffer_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.vertex_buffers.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(u64::from(self.max_vertex_buffers)),
+                    ));
+            }
+            if let Some(indices) = &pass.indices {
+                if !self.supported_index_formats.contains(&indices.format) {
+                    return Err(capability_error("index_format_unsupported").with_field(
+                        "format",
+                        FieldValue::Unsigned(u64::from(indices.format.code())),
+                    ));
+                }
+            }
             // The pass's own shape rules are already `trace.validate()`'s job,
             // which ran before this gate. What is added here is the agreement
             // only the table entry can answer: the pass names a
@@ -4735,6 +5299,25 @@ impl ProviderCapabilities {
             render
                 .validate_against(pass)
                 .map_err(contract_error_refusal)?;
+            // The vertex formats and strides the layout asks for are the last
+            // bits only this snapshot can answer: the pass already agreed with
+            // the layout's shape, so a refusal here names a format or a stride
+            // the device would not build a vertex input state from.
+            for layout in render.vertex_layout.buffers() {
+                if layout.stride > self.max_buffer_range {
+                    return Err(capability_error("vertex_stride_limit")
+                        .with_field("stride", FieldValue::Unsigned(layout.stride))
+                        .with_field("maximum", FieldValue::Unsigned(self.max_buffer_range)));
+                }
+                for attribute in &layout.attributes {
+                    if !self.supported_vertex_formats.contains(&attribute.format) {
+                        return Err(capability_error("vertex_format_unsupported").with_field(
+                            "format",
+                            FieldValue::Unsigned(u64::from(attribute.format.code())),
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -5014,6 +5597,34 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::DrawVertexCountMismatch { .. } => {
             (ProviderErrorClass::Capability, "draw_shape_unsupported")
         }
+        // Vertex input contract (`research/docs/23` §3.3): the caps and the
+        // format lists are first-increment narrowings on a well-formed request,
+        // like the colour-attachment bits above. A layout that disagrees with
+        // its own pass, or with itself, is caller-fixable structure instead.
+        E::VertexBufferLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "vertex_buffer_limit",
+        ),
+        E::DrawVertexCountBelowMinimum { .. } => {
+            (ProviderErrorClass::Capability, "draw_shape_unsupported")
+        }
+        E::UnsupportedIndexFormat(_) => (
+            ProviderErrorClass::Capability,
+            "index_format_unsupported",
+        ),
+        E::EmptyVertexLayout
+        | E::ZeroVertexStride { .. }
+        | E::EmptyVertexBufferLayout { .. }
+        | E::VertexAttributeLimitExceeded { .. }
+        | E::DuplicateVertexAttribute { .. }
+        | E::VertexAttributeOutOfRange { .. }
+        | E::VertexLayoutBindingMismatch { .. }
+        | E::RenderInputViewUnknown { .. }
+        | E::RenderInputViewAllocationMismatch { .. }
+        | E::RenderInputComputeConflict { .. } => (
+            ProviderErrorClass::Args,
+            "trace_contract_invalid",
+        ),
         E::ViewportExtentMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
         // Presentation contract, Step 1. The three first-increment narrowings
         // are capability refusals for the same reason the render track's are:
@@ -6530,6 +7141,87 @@ pub enum ContractError {
         pipeline: AttachmentFormat,
         attachment: AttachmentFormat,
     },
+    // Vertex input contract (`research/docs/23` §3.3). The layout refusals are
+    // caller-fixable structure, like the attachment shape rules; the binding
+    // count mismatch is the pipeline/pass agreement the pass cannot check by
+    // itself.
+    /// A render pass declares more vertex buffer bindings than
+    /// [`MAX_VERTEX_BUFFERS`].
+    VertexBufferLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    /// A pipeline's [`VertexLayout::Buffers`] carries no stream at all.
+    EmptyVertexLayout,
+    /// A vertex stream declares a zero stride, so every vertex would read the
+    /// same bytes.
+    ZeroVertexStride {
+        buffer: usize,
+    },
+    /// A vertex stream declares no attribute, so it contributes nothing the
+    /// vertex stage could read.
+    EmptyVertexBufferLayout {
+        buffer: usize,
+    },
+    /// A vertex stream declares more attributes than [`MAX_VERTEX_ATTRIBUTES`].
+    VertexAttributeLimitExceeded {
+        buffer: usize,
+        requested: usize,
+        maximum: usize,
+    },
+    /// Two attributes of one layout claim the same shader-visible location.
+    DuplicateVertexAttribute {
+        location: u32,
+    },
+    /// An attribute's byte range does not fit in one vertex of its stream.
+    VertexAttributeOutOfRange {
+        buffer: usize,
+        location: u32,
+        offset: u64,
+        format_bytes: u64,
+        stride: u64,
+    },
+    /// A draw with a caller-held vertex stream would consume fewer than
+    /// [`FULL_SCREEN_TRIANGLE_VERTICES`] vertices, which no reviewed rail can
+    /// produce a covered attachment from.
+    DrawVertexCountBelowMinimum {
+        minimum: u32,
+        actual: u32,
+    },
+    /// An index buffer declares a width this increment does not admit.
+    UnsupportedIndexFormat(IndexFormat),
+    /// The pipeline's vertex layout and the pass's bound vertex buffers
+    /// disagree about how many streams the draw reads.
+    VertexLayoutBindingMismatch {
+        pipeline_buffers: usize,
+        pass_buffers: usize,
+    },
+    /// A vertex or index binding names a view the trace never declares, so no
+    /// rail knows which bytes the draw would read.
+    RenderInputViewUnknown {
+        pass_index: usize,
+        view: ViewId,
+        allocation: AllocationId,
+        kind: RenderInputKind,
+    },
+    /// A vertex or index binding and the trace's declaration of the same view
+    /// disagree about which allocation the view lives in.
+    RenderInputViewAllocationMismatch {
+        pass_index: usize,
+        view: ViewId,
+        kind: RenderInputKind,
+        declared: AllocationId,
+        referenced: AllocationId,
+    },
+    /// A compute binding writes bytes the draw reads, so the draw would observe
+    /// a value the trace's order does not define.
+    RenderInputComputeConflict {
+        pass_index: usize,
+        view: ViewId,
+        kind: RenderInputKind,
+        compute_view: ViewId,
+        compute_pass: usize,
+    },
     /// A render pass names a table entry that carries no render half, so the
     /// trace cannot say what the pass would render with.
     ///
@@ -6947,6 +7639,91 @@ impl fmt::Display for ContractError {
             } => write!(
                 formatter,
                 "render pipeline colour format {pipeline:?} does not match attachment format {attachment:?}"
+            ),
+            Self::VertexBufferLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "render pass declares {requested} vertex buffers, exceeding {maximum}"
+            ),
+            Self::EmptyVertexLayout => {
+                formatter.write_str("vertex layout declares no vertex buffer stream")
+            }
+            Self::ZeroVertexStride { buffer } => write!(
+                formatter,
+                "vertex buffer {buffer} declares a zero stride"
+            ),
+            Self::EmptyVertexBufferLayout { buffer } => write!(
+                formatter,
+                "vertex buffer {buffer} declares no attribute"
+            ),
+            Self::VertexAttributeLimitExceeded {
+                buffer,
+                requested,
+                maximum,
+            } => write!(
+                formatter,
+                "vertex buffer {buffer} declares {requested} attributes, exceeding {maximum}"
+            ),
+            Self::DuplicateVertexAttribute { location } => write!(
+                formatter,
+                "vertex layout repeats attribute location {location}"
+            ),
+            Self::VertexAttributeOutOfRange {
+                buffer,
+                location,
+                offset,
+                format_bytes,
+                stride,
+            } => write!(
+                formatter,
+                "vertex buffer {buffer} attribute {location} spans bytes {offset}..{} of a {stride}-byte vertex",
+                offset.saturating_add(*format_bytes)
+            ),
+            Self::DrawVertexCountBelowMinimum { minimum, actual } => write!(
+                formatter,
+                "draw vertex count {actual} is below the reviewed minimum {minimum}"
+            ),
+            Self::UnsupportedIndexFormat(format) => write!(
+                formatter,
+                "index format {format:?} is outside the first vertex-input increment"
+            ),
+            Self::VertexLayoutBindingMismatch {
+                pipeline_buffers,
+                pass_buffers,
+            } => write!(
+                formatter,
+                "render pipeline declares {pipeline_buffers} vertex buffer layouts, but the pass binds {pass_buffers}"
+            ),
+            Self::RenderInputViewUnknown {
+                pass_index,
+                view,
+                allocation,
+                kind,
+            } => write!(
+                formatter,
+                "render pass {pass_index} {} view {view:?} (allocation {allocation:?}) is not declared by this trace",
+                kind.name()
+            ),
+            Self::RenderInputViewAllocationMismatch {
+                pass_index,
+                view,
+                kind,
+                declared,
+                referenced,
+            } => write!(
+                formatter,
+                "render pass {pass_index} {} view {view:?} references allocation {referenced:?}, but the trace declares it as {declared:?}",
+                kind.name()
+            ),
+            Self::RenderInputComputeConflict {
+                pass_index,
+                view,
+                kind,
+                compute_view,
+                compute_pass,
+            } => write!(
+                formatter,
+                "render pass {pass_index} {} view {view:?} reads bytes compute pass {compute_pass} writes through view {compute_view:?}",
+                kind.name()
             ),
             Self::MissingRenderPipelineContract {
                 pass_index,
@@ -8007,6 +8784,8 @@ mod tests {
             }],
             viewport: [0, 0, width as u32, height as u32],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         })
     }
@@ -8242,6 +9021,9 @@ mod tests {
             max_color_attachments: 0,
             max_attachment_dimension: [0, 0],
             supported_color_formats: Vec::new(),
+            max_vertex_buffers: 0,
+            supported_vertex_formats: Vec::new(),
+            supported_index_formats: Vec::new(),
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -11186,6 +11968,8 @@ mod tests {
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
             viewport: [0, 0, 2, 2],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         }
     }
@@ -11439,6 +12223,274 @@ mod tests {
         );
     }
 
+    /// The reviewed vertex-input shape: one `float32x2` position stream, four
+    /// vertices of eight bytes each (`research/docs/23` §3.3).
+    fn quad_layout() -> VertexLayout {
+        VertexLayout::Buffers(vec![VertexBufferLayout {
+            stride: 8,
+            attributes: vec![VertexAttribute {
+                location: 0,
+                offset: 0,
+                format: VertexFormat::Float32x2,
+            }],
+        }])
+    }
+
+    fn quad_binding(view: u64, allocation: u64) -> VertexBufferBinding {
+        VertexBufferBinding {
+            view_id: ViewId::new(view),
+            allocation_id: AllocationId::new(allocation),
+        }
+    }
+
+    /// A pass that draws the reviewed indexed quad: four vertices behind one
+    /// stream and six `uint16` indices over them.
+    fn indexed_quad_pass() -> RenderPassDescriptor {
+        let mut pass = render_pass();
+        pass.vertices = 6;
+        pass.vertex_buffers = vec![quad_binding(41, 43)];
+        pass.indices = Some(IndexBufferBinding {
+            view_id: ViewId::new(45),
+            allocation_id: AllocationId::new(47),
+            format: IndexFormat::Uint16,
+        });
+        pass
+    }
+
+    #[test]
+    fn vertex_layout_accepts_the_reviewed_quad_shape() {
+        let layout = quad_layout();
+        let contract = RenderPipelineContract {
+            vertex_layout: layout.clone(),
+            ..render_pipeline_contract()
+        };
+        contract
+            .validate()
+            .expect("the reviewed quad layout is valid");
+        assert!(layout.binds_buffers());
+        assert_eq!(layout.buffers().len(), 1);
+        assert_eq!(VertexFormat::Float32x2.bytes(), 8);
+        assert_eq!(IndexFormat::Uint16.bytes(), 2);
+        assert_eq!(IndexFormat::Uint32.bytes(), 4);
+        // The code space is closed and round-trips through `from_code`.
+        for format in VertexFormat::ADMITTED {
+            assert_eq!(VertexFormat::from_code(format.code()), Some(format));
+            assert!(format.is_admitted());
+        }
+        for format in IndexFormat::ADMITTED {
+            assert_eq!(IndexFormat::from_code(format.code()), Some(format));
+            assert!(format.is_admitted());
+        }
+        assert_eq!(VertexFormat::from_code(4), None);
+        assert_eq!(IndexFormat::from_code(2), None);
+    }
+
+    #[test]
+    fn vertex_layout_refuses_its_structural_defects() {
+        let base = quad_layout();
+        let mut zero_stride = base.clone();
+        let VertexLayout::Buffers(buffers) = &mut zero_stride else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers[0].stride = 0;
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: zero_stride,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::ZeroVertexStride { buffer: 0 })
+        );
+
+        let mut empty_attributes = base.clone();
+        let VertexLayout::Buffers(buffers) = &mut empty_attributes else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers[0].attributes.clear();
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: empty_attributes,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::EmptyVertexBufferLayout { buffer: 0 })
+        );
+
+        let mut no_streams = base.clone();
+        let VertexLayout::Buffers(buffers) = &mut no_streams else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers.clear();
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: no_streams,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::EmptyVertexLayout)
+        );
+
+        // An attribute that leaves its own vertex is refused with the range it
+        // asked for, so a caller can fix the stride or the offset.
+        let mut out_of_range = base.clone();
+        let VertexLayout::Buffers(buffers) = &mut out_of_range else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers[0].attributes[0].offset = 4;
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: out_of_range,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::VertexAttributeOutOfRange {
+                buffer: 0,
+                location: 0,
+                offset: 4,
+                format_bytes: 8,
+                stride: 8,
+            })
+        );
+
+        // Two attributes cannot claim one shader location; both rails index
+        // attributes by location, so the second would silently win.
+        let mut duplicate = base.clone();
+        let VertexLayout::Buffers(buffers) = &mut duplicate else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers[0].attributes.push(VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Uint32,
+        });
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: duplicate,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::DuplicateVertexAttribute { location: 0 })
+        );
+
+        let mut too_many = base;
+        let VertexLayout::Buffers(buffers) = &mut too_many else {
+            unreachable!("the fixture is a buffer layout")
+        };
+        buffers[0].attributes = (0..=MAX_VERTEX_ATTRIBUTES as u32)
+            .map(|location| VertexAttribute {
+                location,
+                offset: 0,
+                format: VertexFormat::Uint32,
+            })
+            .collect();
+        assert_eq!(
+            RenderPipelineContract {
+                vertex_layout: too_many,
+                ..render_pipeline_contract()
+            }
+            .validate(),
+            Err(ContractError::VertexAttributeLimitExceeded {
+                buffer: 0,
+                requested: MAX_VERTEX_ATTRIBUTES + 1,
+                maximum: MAX_VERTEX_ATTRIBUTES,
+            })
+        );
+    }
+
+    #[test]
+    fn indexed_quad_pass_agrees_with_its_pipeline_layout() {
+        let pass = indexed_quad_pass();
+        pass.validate()
+            .expect("the indexed quad pass is well formed");
+        let contract = RenderPipelineContract {
+            vertex_layout: quad_layout(),
+            ..render_pipeline_contract()
+        };
+        contract
+            .validate_against(&pass)
+            .expect("one layout entry binds the one stream");
+
+        // A pass that binds a second stream the layout does not describe is a
+        // caller-fixable disagreement, not a driver decision.
+        let mut extra = pass.clone();
+        extra.vertex_buffers.push(quad_binding(49, 51));
+        assert_eq!(
+            contract.validate_against(&extra),
+            Err(ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers: 1,
+                pass_buffers: 2,
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers: 1,
+                pass_buffers: 2,
+            })
+            .slug,
+            "trace_contract_invalid"
+        );
+
+        // The reverse direction: a `vertex_id` pipeline cannot be handed a
+        // stream, and a pass that binds none keeps the milestone's shape.
+        let vertex_id_contract = render_pipeline_contract();
+        assert_eq!(
+            vertex_id_contract.validate_against(&pass),
+            Err(ContractError::VertexLayoutBindingMismatch {
+                pipeline_buffers: 0,
+                pass_buffers: 1,
+            })
+        );
+        vertex_id_contract
+            .validate_against(&render_pass())
+            .expect("the milestone pass still agrees with its own layout");
+    }
+
+    #[test]
+    fn render_pass_refuses_vertex_buffers_beyond_its_own_caps() {
+        let mut pass = render_pass();
+        pass.vertex_buffers = (0..=MAX_VERTEX_BUFFERS as u64)
+            .map(|index| quad_binding(41 + index, 43 + index))
+            .collect();
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::VertexBufferLimitExceeded {
+                requested: MAX_VERTEX_BUFFERS + 1,
+                maximum: MAX_VERTEX_BUFFERS,
+            })
+        );
+
+        let mut zero_view = render_pass();
+        zero_view.vertex_buffers = vec![quad_binding(0, 43)];
+        assert_eq!(
+            zero_view.validate(),
+            Err(ContractError::InvalidIdentity("vertex buffer view id"))
+        );
+
+        let mut zero_index = render_pass();
+        zero_index.indices = Some(IndexBufferBinding {
+            view_id: ViewId::new(45),
+            allocation_id: AllocationId::new(0),
+            format: IndexFormat::Uint16,
+        });
+        assert_eq!(
+            zero_index.validate(),
+            Err(ContractError::InvalidIdentity("index buffer allocation id"))
+        );
+
+        // A draw over a caller-held stream still has to cover an attachment:
+        // fewer than the reviewed minimum cannot be distinguished from "the
+        // pass never ran".
+        let mut too_few = indexed_quad_pass();
+        too_few.vertices = 2;
+        assert_eq!(
+            too_few.validate(),
+            Err(ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: 2,
+            })
+        );
+    }
+
     #[test]
     fn render_attachment_refuses_zero_identities_before_any_format() {
         let attachment = render_attachment(AttachmentFormat::Rgba8Unorm);
@@ -11546,6 +12598,8 @@ mod tests {
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],
             color_attachments: vec![attachment],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         })
     }
@@ -11670,6 +12724,21 @@ mod tests {
         pool
     }
 
+    /// The landing allocation plus the two stream allocations the vertex-input
+    /// fixture declares.
+    fn vertex_input_resources() -> ResourceTableSnapshot {
+        let mut pool = landing_resources();
+        for (allocation, size) in [(43_u64, 32_u64), (47, 12)] {
+            pool.insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(allocation),
+                owner_epoch: DeviceEpoch::new(1),
+                size,
+            })
+            .unwrap();
+        }
+        pool
+    }
+
     fn render_capabilities() -> ProviderCapabilities {
         let mut provider = capabilities();
         provider.max_passes = 8;
@@ -11680,6 +12749,208 @@ mod tests {
         provider
     }
 
+    /// A snapshot that declares the vertex-input bits (`research/docs/23`
+    /// §3.3) on top of the render bits the fixture already declares.
+    fn vertex_input_capabilities() -> ProviderCapabilities {
+        let mut provider = render_capabilities();
+        provider.max_vertex_buffers = MAX_VERTEX_BUFFERS as u32;
+        provider.supported_vertex_formats = VertexFormat::ADMITTED.to_vec();
+        provider.supported_index_formats = IndexFormat::ADMITTED.to_vec();
+        provider
+    }
+
+    /// One read-only stream view of its own allocation, the way a declaring
+    /// case spells a vertex or index buffer.
+    fn stream_view(view_id: u64, binding: u32, allocation_id: u64, length: usize) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(view_id),
+            metal_binding: binding,
+            allocation_id: AllocationId::new(allocation_id),
+            offset: 0,
+            length: length as u64,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; length]),
+        }
+    }
+
+    /// The attachment fixture extended with the reviewed quad's resolvable
+    /// streams: the declaring compute case carries both views and the render
+    /// pass binds them.
+    fn vertex_input_trace() -> ComputeTrace {
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        for binding in [1_u32, 2] {
+            value.pipelines[0]
+                .contract
+                .buffer_bindings
+                .push(BufferBindingContract {
+                    metal_binding: binding,
+                    access: BufferAccess::Read,
+                    footprint: FootprintProof::Affine {
+                        accesses: Vec::new(),
+                    },
+                });
+        }
+        let compute = compute_passes_mut(&mut value)
+            .next()
+            .expect("the fixture declares one compute pass");
+        compute.buffers.push(stream_view(41, 1, 43, 32));
+        compute.buffers.push(stream_view(45, 2, 47, 12));
+        value.pipelines[0]
+            .render
+            .as_mut()
+            .expect("the fixture declares the render half")
+            .vertex_layout = quad_layout();
+        let pass = render_entry(&mut value);
+        pass.vertices = 6;
+        pass.vertex_buffers = vec![quad_binding(41, 43)];
+        pass.indices = Some(IndexBufferBinding {
+            view_id: ViewId::new(45),
+            allocation_id: AllocationId::new(47),
+            format: IndexFormat::Uint16,
+        });
+        value
+    }
+
+    #[test]
+    fn vertex_input_bits_default_to_unsupported_and_are_admitted_when_declared() {
+        let value = vertex_input_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(!capabilities().declares_vertex_input_support());
+        assert!(!capabilities().declares_render_support());
+        assert!(vertex_input_capabilities().declares_vertex_input_support());
+
+        vertex_input_capabilities()
+            .admit(&value, &vertex_input_resources())
+            .expect("a snapshot that declares the three bits admits the streams");
+
+        // Each bit narrowed on its own, and the stride bound, name the field a
+        // caller has to fix rather than falling through to the rail.
+        let mut no_buffers = vertex_input_capabilities();
+        no_buffers.max_vertex_buffers = 0;
+        assert_eq!(
+            no_buffers
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "vertex_buffer_limit"
+        );
+        let mut no_vertex_formats = vertex_input_capabilities();
+        no_vertex_formats.supported_vertex_formats.clear();
+        assert_eq!(
+            no_vertex_formats
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "vertex_format_unsupported"
+        );
+        let mut no_index_formats = vertex_input_capabilities();
+        no_index_formats.supported_index_formats.clear();
+        assert_eq!(
+            no_index_formats
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "index_format_unsupported"
+        );
+        let mut narrow_range = vertex_input_capabilities();
+        narrow_range.max_buffer_range = 4;
+        assert_eq!(
+            narrow_range
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "vertex_stride_limit"
+        );
+    }
+
+    #[test]
+    fn render_inputs_resolve_against_the_traces_own_declarations() {
+        let value = vertex_input_trace();
+        let pool = value.serial_resources().expect("the streams resolve");
+        assert!(
+            pool.iter().any(|view| view.view_id == ViewId::new(41)),
+            "the vertex stream joins the pool"
+        );
+        assert!(
+            pool.iter().any(|view| view.view_id == ViewId::new(45)),
+            "the index stream joins the pool"
+        );
+
+        // An undeclared stream is refused rather than read as whatever the
+        // provider happened to upload.
+        let mut undeclared = value.clone();
+        render_entry(&mut undeclared).vertex_buffers[0].view_id = ViewId::new(99);
+        assert_eq!(
+            undeclared.serial_resources(),
+            Err(ContractError::RenderInputViewUnknown {
+                pass_index: 1,
+                view: ViewId::new(99),
+                allocation: AllocationId::new(43),
+                kind: RenderInputKind::VertexBuffer,
+            })
+        );
+
+        // A declaration that disagrees about the allocation is a caller-fixable
+        // mismatch, not a provider decision.
+        let mut mismatch = value.clone();
+        render_entry(&mut mismatch).indices = Some(IndexBufferBinding {
+            view_id: ViewId::new(45),
+            allocation_id: AllocationId::new(48),
+            format: IndexFormat::Uint16,
+        });
+        assert_eq!(
+            mismatch.serial_resources(),
+            Err(ContractError::RenderInputViewAllocationMismatch {
+                pass_index: 1,
+                view: ViewId::new(45),
+                kind: RenderInputKind::IndexBuffer,
+                declared: AllocationId::new(47),
+                referenced: AllocationId::new(48),
+            })
+        );
+
+        // A compute pass that writes bytes the draw reads would hand the
+        // fragment stage a value no ordering rule defines.
+        let mut conflicting = value.clone();
+        compute_passes_mut(&mut conflicting)
+            .next()
+            .expect("one compute pass")
+            .buffers[2]
+            .access = BufferAccess::ReadWrite;
+        conflicting.pipelines[0].contract.buffer_bindings[2].access = BufferAccess::ReadWrite;
+        assert_eq!(
+            conflicting.serial_resources(),
+            Err(ContractError::RenderInputComputeConflict {
+                pass_index: 1,
+                view: ViewId::new(45),
+                kind: RenderInputKind::IndexBuffer,
+                compute_view: ViewId::new(45),
+                compute_pass: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unused_stream_becomes_readable_in_the_pool() {
+        // A declaring case may carry a view the compute pass does not read. The
+        // render pass does read it, so the pool entry has to become readable or
+        // the provider uploads nothing for it (`research/docs/23` §3.3), and the
+        // draw would read bytes the trace never put in device memory.
+        let mut value = vertex_input_trace();
+        compute_passes_mut(&mut value)
+            .next()
+            .expect("one compute pass")
+            .buffers[1]
+            .access = BufferAccess::Unused;
+        value.pipelines[0].contract.buffer_bindings[1].access = BufferAccess::Unused;
+        let pool = value.serial_resources().expect("the pool resolves");
+        let vertex = pool
+            .iter()
+            .find(|view| view.view_id == ViewId::new(41))
+            .expect("the vertex stream is in the pool");
+        assert_eq!(vertex.access, BufferAccess::Read);
+    }
     fn admitted_completion() -> CompletionDisposition {
         CompletionDisposition::CompletedVisible {
             token: CompletionToken {

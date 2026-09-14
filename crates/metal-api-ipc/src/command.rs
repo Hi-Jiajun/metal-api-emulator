@@ -1420,17 +1420,19 @@ mod tests {
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch,
         DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor, HeapId,
-        HeapPayload, HeapPlacement, HeapResource, IndirectCommandBufferDescriptor,
-        IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
-        OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
-        PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
-        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-        RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-        Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp,
-        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-        TracePass, ValidatedComputeTrace, VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
-        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, PROVIDER_SCHEMA_VERSION,
+        HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+        IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
+        LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
+        PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+        ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+        RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+        StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
+        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
+        VertexBufferBinding, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1586,6 +1588,8 @@ mod tests {
             color_attachments: vec![render_attachment(width, height)],
             viewport: [0, 0, width as u32, height as u32],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         }
     }
@@ -1920,6 +1924,156 @@ mod tests {
             acquire: AcquirePolicy::Blocking,
         });
         trace
+    }
+
+    /// The fixture's render contract extended with the reviewed quad's vertex
+    /// layout (`research/docs/23` §3.3).
+    fn vertex_input_render_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                stride: 8,
+                attributes: vec![VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            }]),
+            ..render_contract()
+        }
+    }
+
+    /// A render trace whose pass binds a caller-held vertex stream and an index
+    /// buffer, drawing the reviewed indexed quad.
+    fn vertex_input_trace() -> ComputeTrace {
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(vertex_input_render_contract());
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.vertices = 6;
+        pass.vertex_buffers = vec![VertexBufferBinding {
+            view_id: ViewId::new(41),
+            allocation_id: AllocationId::new(43),
+        }];
+        pass.indices = Some(IndexBufferBinding {
+            view_id: ViewId::new(45),
+            allocation_id: AllocationId::new(47),
+            format: IndexFormat::Uint16,
+        });
+        trace
+    }
+
+    #[test]
+    fn vertex_input_frames_use_the_extended_render_tag_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: vertex_input_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        // The frame tag stays the render one: the extended kind is a pass tag
+        // inside the payload, so an older decoder that knows the render frame
+        // still refuses the shape it cannot read instead of misreading it.
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+
+        // The pass tag itself is the extended kind, immediately followed by a
+        // feature byte whose vertex bit is set.
+        let extended = frame
+            .iter()
+            .enumerate()
+            .skip(10)
+            .filter(|(_, byte)| **byte == 0x10)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extended.len(),
+            1,
+            "the fixture carries exactly one extended pass tag, got {extended:?}"
+        );
+        assert_eq!(frame[extended[0] + 1] & 0x01, 0x01);
+        assert_eq!(
+            frame[extended[0] + 1] & 0x02,
+            0x00,
+            "an offscreen pass carries no present bit"
+        );
+
+        // An unknown feature bit is a decoder refusal rather than a section the
+        // decoder silently skips.
+        let mut patched = frame.clone();
+        patched[extended[0] + 1] |= 0x40;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x41
+        ));
+    }
+
+    #[test]
+    fn vertex_input_and_present_travel_as_independent_bits() {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.present = presenting_trace()
+            .passes
+            .first()
+            .and_then(TracePass::as_render)
+            .and_then(|pass| pass.present.clone());
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let extended = frame
+            .iter()
+            .enumerate()
+            .skip(10)
+            .find(|(_, byte)| **byte == 0x10)
+            .map(|(index, _)| index)
+            .expect("the vertex-input pass carries the extended tag");
+        assert_eq!(
+            frame[extended + 1] & 0x03,
+            0x03,
+            "the pass carries both the vertex-input and present bits"
+        );
+    }
+
+    #[test]
+    fn vertex_input_capability_bits_round_trip_and_keep_the_legacy_frame_shape() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.max_vertex_buffers = MAX_VERTEX_BUFFERS as u32;
+        capabilities.supported_vertex_formats = VertexFormat::ADMITTED.to_vec();
+        capabilities.supported_index_formats = IndexFormat::ADMITTED.to_vec();
+        assert!(capabilities.declares_vertex_input_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The vertex block is the extended payload's optional tail, so a
+        // snapshot that declares none of the three bits keeps the exact bytes
+        // its predecessors wrote; the existing legacy-frame pins cover that
+        // half.
+        let mut legacy = fake_capabilities();
+        legacy.supports_render_passes = true;
+        legacy.max_color_attachments = 1;
+        legacy.max_attachment_dimension = [2, 2];
+        legacy.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        legacy.max_vertex_buffers = 0;
+        legacy.supported_vertex_formats = Vec::new();
+        legacy.supported_index_formats = Vec::new();
+        let legacy_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: legacy,
+        })
+        .unwrap();
+        assert!(legacy_frame.len() < frame.len());
     }
 
     /// A compute-only trace that also carries a heap payload: two disjoint
@@ -2766,6 +2920,9 @@ mod tests {
                     max_color_attachments: 0,
                     max_attachment_dimension: [0, 0],
                     supported_color_formats: Vec::new(),
+                    max_vertex_buffers: 0,
+                    supported_vertex_formats: Vec::new(),
+                    supported_index_formats: Vec::new(),
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -3126,6 +3283,9 @@ mod tests {
             max_color_attachments: 0,
             max_attachment_dimension: [0, 0],
             supported_color_formats: Vec::new(),
+            max_vertex_buffers: 0,
+            supported_vertex_formats: Vec::new(),
+            supported_index_formats: Vec::new(),
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

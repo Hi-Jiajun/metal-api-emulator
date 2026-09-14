@@ -15,16 +15,17 @@ use metal_api_core::provider::{
     BufferWriteback, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
     DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
     OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
     PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexLayout, ViewId,
-    MAX_COLOR_ATTACHMENTS,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferBinding, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -114,6 +115,30 @@ const PASS_KIND_RENDER: u8 = 0x01;
 /// payload or add a tag").
 const PASS_KIND_RENDER_PRESENT: u8 = 0x02;
 
+/// A render pass that carries a caller-held vertex stream, a present action, or
+/// both (`research/docs/23` §3.3).
+///
+/// The tag is followed by one feature byte, so the two optional sections that
+/// may follow the base render payload stay orthogonal instead of multiplying
+/// the tag space: bit 0 is the vertex/index input block and bit 1 is the
+/// present tail. A decoder that predates this tag answers
+/// [`CodecError::UnknownPassTag`], and an older encoder keeps writing
+/// [`PASS_KIND_RENDER`] / [`PASS_KIND_RENDER_PRESENT`] for the shapes it
+/// already published, so every pre-vertex frame keeps its exact bytes.
+const PASS_KIND_RENDER_EXT: u8 = 0x10;
+
+/// Feature bits carried by [`PASS_KIND_RENDER_EXT`].
+const RENDER_FEATURE_VERTEX_INPUT: u8 = 0x01;
+const RENDER_FEATURE_PRESENT: u8 = 0x02;
+/// Every bit this version knows. An unknown bit is a decoder refusal rather
+/// than a silently skipped section.
+const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT | RENDER_FEATURE_PRESENT;
+
+/// Pipeline vertex-layout discriminators. `None` keeps the single byte the
+/// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
+const VERTEX_LAYOUT_NONE: u8 = 0x00;
+const VERTEX_LAYOUT_BUFFERS: u8 = 0x01;
+
 /// Pipeline-table discriminator inside the tagged trace layout.
 ///
 /// The pipeline table carries one entry per registration, and the render half
@@ -148,6 +173,24 @@ pub const MAX_SUPPORTED_COLOR_FORMATS: usize = 16;
 /// refuse a well-formed snapshot; like [`MAX_SUPPORTED_COLOR_FORMATS`] it only
 /// stops a corrupt count from driving the decoder.
 pub const MAX_SUPPORTED_PRESENT_MODES: usize = 8;
+
+/// Maximum vertex formats one capability snapshot may declare.
+///
+/// [`VertexFormat`] is a closed four-value family, so this bound can never
+/// refuse a well-formed snapshot; it only stops a corrupt count from driving
+/// the decoder.
+pub const MAX_SUPPORTED_VERTEX_FORMATS: usize = 8;
+
+/// Maximum index widths one capability snapshot may declare. Same rule as
+/// [`MAX_SUPPORTED_VERTEX_FORMATS`] over the closed two-value family.
+pub const MAX_SUPPORTED_INDEX_FORMATS: usize = 4;
+
+/// Presence tag of the capability tail's vertex-input block.
+///
+/// The block travels inside the extended capability frame's optional tail,
+/// after the heap/ICB half (`research/docs/23` §3.3). A tag rather than a bare
+/// field keeps a future third section from being read as this one.
+const CAPABILITY_VERTEX_INPUT_TAIL: u8 = 0x01;
 
 /// Maximum number of bytes one present target's sentinel may carry.
 ///
@@ -1168,27 +1211,72 @@ fn put_pipeline(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
 
 /// Encode one pipeline-table entry of the tagged layout: the entry kind, then
 /// the compute half, then the render half when the entry carries one.
-fn put_pipeline_tagged(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
+fn put_pipeline_tagged(
+    encoder: &mut Encoder,
+    pipeline: &CompiledComputePipeline,
+) -> Result<(), CodecError> {
     match &pipeline.render {
         Some(contract) => {
             encoder.u8(PIPELINE_KIND_RENDER);
             put_pipeline(encoder, pipeline);
-            put_render_pipeline_contract(encoder, contract);
+            put_render_pipeline_contract(encoder, contract)?;
         }
         None => {
             encoder.u8(PIPELINE_KIND_COMPUTE);
             put_pipeline(encoder, pipeline);
         }
     }
+    Ok(())
 }
 
-fn put_render_pipeline_contract(encoder: &mut Encoder, contract: &RenderPipelineContract) {
+fn put_render_pipeline_contract(
+    encoder: &mut Encoder,
+    contract: &RenderPipelineContract,
+) -> Result<(), CodecError> {
     encoder.text(&contract.vertex_entry);
     encoder.text(&contract.fragment_entry);
     put_attachment_format(encoder, contract.color_format);
-    encoder.u8(match contract.vertex_layout {
-        VertexLayout::None => 0,
-    });
+    put_vertex_layout(encoder, &contract.vertex_layout)
+}
+
+/// Encode one vertex layout.
+///
+/// [`VertexLayout::None`] keeps the single `0x00` byte the pre-vertex pipeline
+/// payload wrote, so every existing registration keeps its exact bytes; the
+/// buffer variant appends its own length-prefixed block after the tag.
+fn put_vertex_layout(encoder: &mut Encoder, layout: &VertexLayout) -> Result<(), CodecError> {
+    match layout {
+        VertexLayout::None => {
+            encoder.u8(VERTEX_LAYOUT_NONE);
+            Ok(())
+        }
+        VertexLayout::Buffers(buffers) => {
+            if buffers.len() > MAX_VERTEX_BUFFERS {
+                return Err(CodecError::VertexBufferCount {
+                    count: buffers.len(),
+                    maximum: MAX_VERTEX_BUFFERS,
+                });
+            }
+            encoder.u8(VERTEX_LAYOUT_BUFFERS);
+            encoder.u64(buffers.len() as u64);
+            for buffer in buffers {
+                if buffer.attributes.len() > MAX_VERTEX_ATTRIBUTES {
+                    return Err(CodecError::VertexAttributeCount {
+                        count: buffer.attributes.len(),
+                        maximum: MAX_VERTEX_ATTRIBUTES,
+                    });
+                }
+                encoder.u64(buffer.stride);
+                encoder.u64(buffer.attributes.len() as u64);
+                for attribute in &buffer.attributes {
+                    encoder.u32(attribute.location);
+                    encoder.u64(attribute.offset);
+                    encoder.u8(attribute.format.code());
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Decode the compute half of one pipeline-table entry.
@@ -1230,12 +1318,78 @@ fn get_render_pipeline_contract(
 
 fn get_vertex_layout(decoder: &mut Decoder<'_>) -> Result<VertexLayout, CodecError> {
     match decoder.u8()? {
-        0 => Ok(VertexLayout::None),
+        VERTEX_LAYOUT_NONE => Ok(VertexLayout::None),
+        VERTEX_LAYOUT_BUFFERS => {
+            let count = bounded_vertex_buffer_count(decoder.u64()?)?;
+            let mut buffers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let stride = decoder.u64()?;
+                let attribute_count = bounded_vertex_attribute_count(decoder.u64()?)?;
+                let mut attributes = Vec::with_capacity(attribute_count);
+                for _ in 0..attribute_count {
+                    let location = decoder.u32()?;
+                    let offset = decoder.u64()?;
+                    let format = get_vertex_format(decoder)?;
+                    attributes.push(VertexAttribute {
+                        location,
+                        offset,
+                        format,
+                    });
+                }
+                buffers.push(VertexBufferLayout { stride, attributes });
+            }
+            Ok(VertexLayout::Buffers(buffers))
+        }
         value => Err(CodecError::UnknownEnumValue {
             field: "vertex layout",
             value,
         }),
     }
+}
+
+fn get_vertex_format(decoder: &mut Decoder<'_>) -> Result<VertexFormat, CodecError> {
+    let code = decoder.u8()?;
+    VertexFormat::from_code(code).ok_or(CodecError::UnknownEnumValue {
+        field: "vertex format",
+        value: code,
+    })
+}
+
+fn get_index_format(decoder: &mut Decoder<'_>) -> Result<IndexFormat, CodecError> {
+    let code = decoder.u8()?;
+    IndexFormat::from_code(code).ok_or(CodecError::UnknownEnumValue {
+        field: "index format",
+        value: code,
+    })
+}
+
+/// Read one vertex-buffer count and refuse it before it can drive an
+/// allocation.
+///
+/// The bound is the contract's own cap ([`MAX_VERTEX_BUFFERS`]), which a
+/// well-formed trace cannot exceed; a corrupt count is refused here instead of
+/// sizing a `Vec` the payload cannot fill.
+fn bounded_vertex_buffer_count(value: u64) -> Result<usize, CodecError> {
+    let count = usize::try_from(value).unwrap_or(usize::MAX);
+    if count > MAX_VERTEX_BUFFERS {
+        return Err(CodecError::VertexBufferCount {
+            count,
+            maximum: MAX_VERTEX_BUFFERS,
+        });
+    }
+    Ok(count)
+}
+
+/// Sibling of [`bounded_vertex_buffer_count`] for one layout's attribute list.
+fn bounded_vertex_attribute_count(value: u64) -> Result<usize, CodecError> {
+    let count = usize::try_from(value).unwrap_or(usize::MAX);
+    if count > MAX_VERTEX_ATTRIBUTES {
+        return Err(CodecError::VertexAttributeCount {
+            count,
+            maximum: MAX_VERTEX_ATTRIBUTES,
+        });
+    }
+    Ok(count)
 }
 
 fn put_contract(encoder: &mut Encoder, contract: &PipelineContract) {
@@ -1569,7 +1723,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
     encoder.u64(trace.pipelines.len() as u64);
     for pipeline in &trace.pipelines {
         if tagged {
-            put_pipeline_tagged(encoder, pipeline);
+            put_pipeline_tagged(encoder, pipeline)?;
         } else {
             put_pipeline(encoder, pipeline);
         }
@@ -1597,12 +1751,33 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // keeps `PASS_KIND_RENDER` and its previous bytes exactly, and
                 // a presenting pass is a tag an older decoder refuses
                 // (`docs/24` §4.1, §4.3).
+                //
+                // A pass that binds a caller-held vertex stream takes the
+                // feature-tagged kind instead, because two of the three
+                // optional sections would otherwise multiply the tag space
+                // (`docs/23` §3.3). Its present half travels as a feature bit,
+                // so the pair stays orthogonal.
+                let has_vertex_input = !pass.vertex_buffers.is_empty() || pass.indices.is_some();
+                if has_vertex_input {
+                    encoder.u8(PASS_KIND_RENDER_EXT);
+                    let mut features = RENDER_FEATURE_VERTEX_INPUT;
+                    if pass.present.is_some() {
+                        features |= RENDER_FEATURE_PRESENT;
+                    }
+                    encoder.u8(features);
+                    put_render_pass(encoder, pass, false)?;
+                    put_vertex_input(encoder, pass)?;
+                    if let Some(present) = &pass.present {
+                        put_present_descriptor(encoder, present)?;
+                    }
+                    continue;
+                }
                 encoder.u8(if pass.present.is_some() {
                     PASS_KIND_RENDER_PRESENT
                 } else {
                     PASS_KIND_RENDER
                 });
-                put_render_pass(encoder, pass)?;
+                put_render_pass(encoder, pass, true)?;
             }
         }
     }
@@ -1626,7 +1801,19 @@ fn put_compute_pass(encoder: &mut Encoder, pass: &ComputePass) {
     put_dispatch(encoder, &pass.dispatch);
 }
 
-fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result<(), CodecError> {
+/// Encode one render pass's base payload: the pipeline, the colour
+/// attachments, the viewport and the vertex/index count.
+///
+/// `with_present` is what keeps the two tag families byte-exact. A legacy
+/// tagged pass writes its present tail here, exactly as it did before the
+/// vertex-input tag existed; an extended pass writes it after the vertex-input
+/// block instead, because that block sits between the base payload and the
+/// tail.
+fn put_render_pass(
+    encoder: &mut Encoder,
+    pass: &RenderPassDescriptor,
+    with_present: bool,
+) -> Result<(), CodecError> {
     encoder.u64(pass.pipeline.get());
     encoder.u64(pass.color_attachments.len() as u64);
     for attachment in &pass.color_attachments {
@@ -1636,8 +1823,36 @@ fn put_render_pass(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result
         encoder.u32(dimension);
     }
     encoder.u32(pass.vertices);
-    if let Some(present) = &pass.present {
-        put_present_descriptor(encoder, present)?;
+    if with_present {
+        if let Some(present) = &pass.present {
+            put_present_descriptor(encoder, present)?;
+        }
+    }
+    Ok(())
+}
+
+/// Encode the vertex-input block of an extended render pass: the bound vertex
+/// buffers by view identity, then the index buffer when the draw is indexed.
+fn put_vertex_input(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result<(), CodecError> {
+    if pass.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
+        return Err(CodecError::VertexBufferCount {
+            count: pass.vertex_buffers.len(),
+            maximum: MAX_VERTEX_BUFFERS,
+        });
+    }
+    encoder.u64(pass.vertex_buffers.len() as u64);
+    for binding in &pass.vertex_buffers {
+        encoder.u64(binding.view_id.get());
+        encoder.u64(binding.allocation_id.get());
+    }
+    match &pass.indices {
+        Some(indices) => {
+            encoder.u8(1);
+            encoder.u64(indices.view_id.get());
+            encoder.u64(indices.allocation_id.get());
+            encoder.u8(indices.format.code());
+        }
+        None => encoder.u8(0),
     }
     Ok(())
 }
@@ -1909,6 +2124,24 @@ fn get_trace_tagged(
             // the render payload, so a frame cannot claim a present section it
             // did not write (`docs/24` §4.1).
             PASS_KIND_RENDER_PRESENT => TracePass::Render(get_render_pass(decoder, true)?),
+            // The extended kind carries a feature byte: bit 0 is the
+            // vertex-input block and bit 1 the present tail, in that order
+            // after the base payload. A bit this version does not know is a
+            // decoder refusal, so a future section cannot be skipped silently.
+            PASS_KIND_RENDER_EXT => {
+                let features = decoder.u8()?;
+                if features & !RENDER_FEATURE_KNOWN != 0 {
+                    return Err(CodecError::UnknownRenderFeature(features));
+                }
+                let mut pass = get_render_pass(decoder, false)?;
+                if features & RENDER_FEATURE_VERTEX_INPUT != 0 {
+                    get_vertex_input(decoder, &mut pass)?;
+                }
+                if features & RENDER_FEATURE_PRESENT != 0 {
+                    pass.present = Some(get_present_descriptor(decoder)?);
+                }
+                TracePass::Render(pass)
+            }
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -1995,8 +2228,46 @@ fn get_render_pass(
         color_attachments,
         viewport,
         vertices,
+        vertex_buffers: Vec::new(),
+        indices: None,
         present,
     })
+}
+
+/// Decode the vertex-input block of an extended render pass: the bound vertex
+/// buffers by view identity, then the index buffer when the draw is indexed.
+///
+/// The counts are bounded by the contract's own caps before they can drive an
+/// allocation, and an unknown index-width code is refused rather than defaulted
+/// — the same rules the rest of the tagged payload follows.
+fn get_vertex_input(
+    decoder: &mut Decoder<'_>,
+    pass: &mut RenderPassDescriptor,
+) -> Result<(), CodecError> {
+    let count = bounded_vertex_buffer_count(decoder.u64()?)?;
+    let mut vertex_buffers = Vec::with_capacity(count);
+    for _ in 0..count {
+        vertex_buffers.push(VertexBufferBinding {
+            view_id: ViewId::new(decoder.u64()?),
+            allocation_id: AllocationId::new(decoder.u64()?),
+        });
+    }
+    pass.vertex_buffers = vertex_buffers;
+    pass.indices = match decoder.u8()? {
+        0 => None,
+        1 => Some(IndexBufferBinding {
+            view_id: ViewId::new(decoder.u64()?),
+            allocation_id: AllocationId::new(decoder.u64()?),
+            format: get_index_format(decoder)?,
+        }),
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "index buffer presence",
+                value,
+            })
+        }
+    };
+    Ok(())
 }
 
 /// Decode one present action, the render pass's trailing action
@@ -2745,7 +3016,15 @@ fn put_capabilities(
     // the same additive rule the render and present bits follow: an old
     // decoder sees the frame it always saw, and a new tail is refused with a
     // typed error rather than silently truncated.
-    if capabilities.declares_heap_support() || capabilities.declares_icb_support() {
+    // The vertex-input bits (`research/docs/23` §3.3) extend the same optional
+    // tail. A snapshot that declares them without declaring heap or ICB support
+    // still writes the tail's heap/ICB half at its defaults, so the decoder can
+    // read the vertex block by position instead of guessing which optional
+    // section the remaining bytes carry.
+    if capabilities.declares_heap_support()
+        || capabilities.declares_icb_support()
+        || capabilities.declares_vertex_input_support()
+    {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
         if capabilities.supported_heap_storage_modes.len() > MAX_SUPPORTED_HEAP_STORAGE_MODES {
@@ -2770,6 +3049,30 @@ fn put_capabilities(
         encoder.u64(capabilities.supported_indirect_commands.len() as u64);
         for kind in &capabilities.supported_indirect_commands {
             encoder.u8(kind.code());
+        }
+        if capabilities.declares_vertex_input_support() {
+            encoder.u8(CAPABILITY_VERTEX_INPUT_TAIL);
+            encoder.u32(capabilities.max_vertex_buffers);
+            if capabilities.supported_vertex_formats.len() > MAX_SUPPORTED_VERTEX_FORMATS {
+                return Err(CodecError::SupportedVertexFormatCount {
+                    count: capabilities.supported_vertex_formats.len(),
+                    maximum: MAX_SUPPORTED_VERTEX_FORMATS,
+                });
+            }
+            encoder.u64(capabilities.supported_vertex_formats.len() as u64);
+            for format in &capabilities.supported_vertex_formats {
+                encoder.u8(format.code());
+            }
+            if capabilities.supported_index_formats.len() > MAX_SUPPORTED_INDEX_FORMATS {
+                return Err(CodecError::SupportedIndexFormatCount {
+                    count: capabilities.supported_index_formats.len(),
+                    maximum: MAX_SUPPORTED_INDEX_FORMATS,
+                });
+            }
+            encoder.u64(capabilities.supported_index_formats.len() as u64);
+            for format in &capabilities.supported_index_formats {
+                encoder.u8(format.code());
+            }
         }
     }
     Ok(())
@@ -2839,6 +3142,9 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         max_color_attachments: 0,
         max_attachment_dimension: [0, 0],
         supported_color_formats: Vec::new(),
+        max_vertex_buffers: 0,
+        supported_vertex_formats: Vec::new(),
+        supported_index_formats: Vec::new(),
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
         // here (`docs/24` §4.2): a decoder that predates the present tag reads
@@ -2951,5 +3257,48 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_indirect_commands.push(kind);
     }
     capabilities.supported_indirect_commands = supported_indirect_commands;
+    // The vertex-input block is the tail's last optional section
+    // (`research/docs/23` §3.3). Its presence tag is what keeps a future third
+    // section from being read as this one.
+    if decoder.remaining() == 0 {
+        return Ok(capabilities);
+    }
+    let tag = decoder.u8()?;
+    if tag != CAPABILITY_VERTEX_INPUT_TAIL {
+        return Err(CodecError::UnknownCapabilityTail(tag));
+    }
+    capabilities.max_vertex_buffers = decoder.u32()?;
+    let vertex_format_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::SupportedVertexFormatCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_VERTEX_FORMATS,
+        })?;
+    if vertex_format_count > MAX_SUPPORTED_VERTEX_FORMATS {
+        return Err(CodecError::SupportedVertexFormatCount {
+            count: vertex_format_count,
+            maximum: MAX_SUPPORTED_VERTEX_FORMATS,
+        });
+    }
+    let mut supported_vertex_formats = Vec::with_capacity(vertex_format_count);
+    for _ in 0..vertex_format_count {
+        supported_vertex_formats.push(get_vertex_format(decoder)?);
+    }
+    capabilities.supported_vertex_formats = supported_vertex_formats;
+    let index_format_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::SupportedIndexFormatCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_INDEX_FORMATS,
+        })?;
+    if index_format_count > MAX_SUPPORTED_INDEX_FORMATS {
+        return Err(CodecError::SupportedIndexFormatCount {
+            count: index_format_count,
+            maximum: MAX_SUPPORTED_INDEX_FORMATS,
+        });
+    }
+    let mut supported_index_formats = Vec::with_capacity(index_format_count);
+    for _ in 0..index_format_count {
+        supported_index_formats.push(get_index_format(decoder)?);
+    }
+    capabilities.supported_index_formats = supported_index_formats;
     Ok(capabilities)
 }

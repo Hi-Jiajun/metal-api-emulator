@@ -264,6 +264,15 @@ impl NativeMetalProvider {
                 max_color_attachments: render_bits.max_color_attachments,
                 max_attachment_dimension: render_bits.max_attachment_dimension,
                 supported_color_formats: render_bits.supported_color_formats,
+                // Vertex input is not executed on this rail yet: the reviewed
+                // module still generates positions from `vertex_id`, so the
+                // three bits stay at "cannot read a caller-held stream" and a
+                // pass that binds one is refused during core admission instead
+                // of being executed with generated positions
+                // (`research/docs/23` §3.3).
+                max_vertex_buffers: 0,
+                supported_vertex_formats: Vec::new(),
+                supported_index_formats: Vec::new(),
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).

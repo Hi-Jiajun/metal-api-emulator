@@ -495,6 +495,8 @@ impl RenderTarget {
                     .map_err(|_| ContractError::ArithmeticOverflow("attachment height"))?,
             ],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present,
         };
         descriptor.validate()?;

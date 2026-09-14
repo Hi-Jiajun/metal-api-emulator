@@ -141,6 +141,9 @@ impl ComputeProvider for FakeProvider {
                 .then_some(AttachmentFormat::Rgba8Unorm)
                 .into_iter()
                 .collect(),
+            max_vertex_buffers: 0,
+            supported_vertex_formats: Vec::new(),
+            supported_index_formats: Vec::new(),
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

@@ -1122,6 +1122,8 @@ mod tests {
             }],
             viewport: [0, 0, 2, 2],
             vertices: 3,
+            vertex_buffers: Vec::new(),
+            indices: None,
             present: None,
         }
     }
@@ -1572,6 +1574,9 @@ mod tests {
             max_color_attachments: bits.max_color_attachments,
             max_attachment_dimension: bits.max_attachment_dimension,
             supported_color_formats: bits.supported_color_formats.clone(),
+            max_vertex_buffers: 0,
+            supported_vertex_formats: Vec::new(),
+            supported_index_formats: Vec::new(),
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
