@@ -10,9 +10,9 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
-    DispatchKind, FootprintProof, PipelineContract, PresentMode, ProviderCapabilities,
-    SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-    MAX_PRESENT_TARGETS,
+    DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract, PresentMode,
+    ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
+    MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
 
@@ -88,9 +88,17 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_heap_bytes: MAX_HEAP_BYTES,
         supported_heap_storage_modes: vec![StorageMode::OwnedBytes],
         supports_heap_aliasing: false,
-        supports_indirect_command_buffers: false,
-        max_indirect_commands: 0,
-        supported_indirect_commands: Vec::new(),
+        // Indirect replay is executed for the one reviewed render shape: the
+        // rail encodes a `VkDrawIndirectCommand` into a host-visible
+        // `INDIRECT_BUFFER` and replays it with `vkCmdDrawIndirect`
+        // (`render.rs::execute_indirect_render_pass`, `research/docs/25` §6
+        // Step 4). Evidence: `tests/render_e2e.rs` replays the milestone's
+        // full-screen triangle indirectly and reads the same `40 80 c0 ff`
+        // texels back on Lavapipe. The first increment is one command, one
+        // non-indexed draw; dispatches and indexed draws stay refused.
+        supports_indirect_command_buffers: true,
+        max_indirect_commands: 1,
+        supported_indirect_commands: vec![IndirectCommandKind::Draw],
     }
 }
 

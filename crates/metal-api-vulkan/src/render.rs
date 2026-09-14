@@ -25,8 +25,9 @@
 
 use ash::vk;
 use metal_api_core::provider::{
-    AttachmentFormat, ClearColor, FieldValue, LoadOp, ProviderError, ProviderErrorClass,
-    ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp,
+    AttachmentFormat, ClearColor, FieldValue, IndirectCommandDescriptor, LoadOp, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability,
+    StoreOp,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub clear: ClearColor,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
+    /// When set, the full-screen triangle is replayed from a
+    /// `VkDrawIndirectCommand` the rail encodes into a host-visible
+    /// `INDIRECT_BUFFER` instead of being issued with `vkCmdDraw`
+    /// (`research/docs/25` §6 Step 4). The pair is the command's vertex and
+    /// instance counts; the first increment fixes `firstVertex`/`firstInstance`
+    /// to zero.
+    pub indirect: Option<(u32, u32)>,
 }
 
 /// The vertex stage entry one offscreen render pipeline pairs with the rail's
@@ -344,8 +352,39 @@ fn prepare_render_request<'a>(
             entry: &stages.contract.vertex_entry,
             spirv: &stages.vertex_spirv,
         },
+        indirect: None,
     };
     Ok(request)
+}
+
+/// Execute one admitted render pass whose full-screen triangle is replayed from
+/// one CPU-encoded `VkDrawIndirectCommand` (`research/docs/25` §6 Step 4).
+///
+/// The pass shape rules are the ones [`execute_render_pass`] already enforces —
+/// this entry point only swaps the draw for an indirect replay, so a trace that
+/// is not admitted as a render pass cannot reach it. Indexed draws and compute
+/// dispatches are outside the first indirect increment and are refused with the
+/// capability slug the contract publishes for them.
+pub(crate) fn execute_indirect_render_pass(
+    context: &VulkanContext,
+    stages: &RenderStages,
+    pass: &RenderPassDescriptor,
+    command: &IndirectCommandDescriptor,
+) -> Result<Vec<u8>, ProviderError> {
+    let (vertex_count, instance_count) = match command {
+        IndirectCommandDescriptor::Draw {
+            vertex_count,
+            instance_count,
+        } => (*vertex_count, *instance_count),
+        other => {
+            return Err(capability_refusal("icb_command_unsupported")
+                .with_field("kind", FieldValue::Text(format!("{:?}", other.kind())))
+                .with_detail("the first indirect increment replays non-indexed draws only"));
+        }
+    };
+    let mut request = prepare_render_request(stages, pass)?;
+    request.indirect = Some((vertex_count, instance_count));
+    execute_offscreen_render(context, &request)
 }
 
 /// Narrow one attachment dimension to the `u32` the Vulkan image extent uses.
@@ -544,6 +583,9 @@ pub(crate) fn execute_offscreen_render(
         &fragment_entry,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
+    if let Some((vertex_count, instance_count)) = request.indirect {
+        objects.create_indirect_draw(vertex_count, instance_count)?;
+    }
     objects.create_command_pool(queue_index)?;
     objects.record(request.format, request.clear, width, height)?;
     objects.submit_and_wait(queue_index)?;
@@ -1035,6 +1077,10 @@ struct OffscreenObjects<'a> {
     pipeline: vk::Pipeline,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
+    /// The host-visible `INDIRECT_BUFFER` an indirect draw replays from. Null
+    /// for a direct draw.
+    indirect_buffer: vk::Buffer,
+    indirect_memory: vk::DeviceMemory,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -1058,6 +1104,8 @@ impl<'a> OffscreenObjects<'a> {
             pipeline: vk::Pipeline::null(),
             readback_buffer: vk::Buffer::null(),
             readback_memory: vk::DeviceMemory::null(),
+            indirect_buffer: vk::Buffer::null(),
+            indirect_memory: vk::DeviceMemory::null(),
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1363,6 +1411,97 @@ impl<'a> OffscreenObjects<'a> {
         Ok(mapping)
     }
 
+    /// Encode one `VkDrawIndirectCommand` into a host-visible
+    /// `INDIRECT_BUFFER` the pass replays with `vkCmdDrawIndirect`
+    /// (`research/docs/25` §6 Step 4). The command is written by the CPU, which
+    /// is what makes this the ICB *equivalent* rather than device-generated
+    /// commands: `VK_EXT_device_generated_commands` is not enabled and the
+    /// first increment never needs it.
+    fn create_indirect_draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+    ) -> Result<(), ProviderError> {
+        let command = vk::DrawIndirectCommand {
+            vertex_count,
+            instance_count,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let byte_length = std::mem::size_of::<vk::DrawIndirectCommand>() as u64;
+        let info = vk::BufferCreateInfo::default()
+            .size(byte_length)
+            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.context.device.create_buffer(&info, None) }
+            .map_err(|error| execution_refusal("create indirect buffer", &error.to_string()))?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    "find indirect memory type",
+                    &error.to_string(),
+                ));
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    "allocate indirect memory",
+                    &error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(execution_refusal(
+                "bind indirect memory",
+                &error.to_string(),
+            ));
+        }
+        let mapping = match unsafe {
+            self.context.device.map_memory(
+                memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(execution_refusal("map indirect memory", &error.to_string()));
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &command as *const vk::DrawIndirectCommand as *const u8,
+                mapping as *mut u8,
+                byte_length as usize,
+            );
+            self.context.device.unmap_memory(memory);
+        }
+        self.indirect_buffer = buffer;
+        self.indirect_memory = memory;
+        Ok(())
+    }
+
     fn create_command_pool(&mut self, queue_index: usize) -> Result<(), ProviderError> {
         let family = self
             .context
@@ -1450,9 +1589,22 @@ impl<'a> OffscreenObjects<'a> {
             self.context
                 .device
                 .cmd_set_scissor(self.command, 0, std::slice::from_ref(&scissor));
-            self.context
-                .device
-                .cmd_draw(self.command, FULL_SCREEN_TRIANGLE_VERTICES, 1, 0, 0);
+            if self.indirect_buffer == vk::Buffer::null() {
+                self.context
+                    .device
+                    .cmd_draw(self.command, FULL_SCREEN_TRIANGLE_VERTICES, 1, 0, 0);
+            } else {
+                // The indirect replay reads its counts from the buffer the CPU
+                // encoded above; `stride` is the struct size because the first
+                // increment writes exactly one command.
+                self.context.device.cmd_draw_indirect(
+                    self.command,
+                    self.indirect_buffer,
+                    0,
+                    1,
+                    std::mem::size_of::<vk::DrawIndirectCommand>() as u32,
+                );
+            }
             self.context.device.cmd_end_render_pass(self.command);
         }
 
@@ -1609,6 +1761,16 @@ impl<'a> Drop for OffscreenObjects<'a> {
             }
             if self.readback_memory != vk::DeviceMemory::null() {
                 self.context.device.free_memory(self.readback_memory, None);
+            }
+            // The indirect buffer is unbound by construction (its memory is
+            // freed right after), so destroy before free.
+            if self.indirect_buffer != vk::Buffer::null() {
+                self.context
+                    .device
+                    .destroy_buffer(self.indirect_buffer, None);
+            }
+            if self.indirect_memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.indirect_memory, None);
             }
         }
     }
@@ -1974,6 +2136,7 @@ mod tests {
                 extent: [2, 2],
                 clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                 vertex: milestone_vertex(),
+                indirect: None,
             },
         )
         .unwrap_or_else(|error| panic!("the 2x2 {format:?} render pass executes: {error:?}"));
@@ -2205,6 +2368,7 @@ mod tests {
             extent: [2, 2],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
+            indirect: None,
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("R32Uint is refused before any Vulkan object exists");
@@ -2256,6 +2420,7 @@ mod tests {
                     extent: [2, 2],
                     clear,
                     vertex: single_pixel_vertex(),
+                    indirect: None,
                 },
             )
             .unwrap_or_else(|error| panic!("the partial {format:?} pass executes: {error:?}"));
@@ -2383,6 +2548,7 @@ mod tests {
             extent: [2, 0],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
+            indirect: None,
         };
         let refused = execute_offscreen_render(&context, &request)
             .expect_err("a zero-dimension attachment is a contract refusal");

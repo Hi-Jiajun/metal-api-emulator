@@ -30,10 +30,12 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
-    InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
-    TracePass, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId, PipelineId,
+    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass, VertexLayout, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor};
@@ -699,6 +701,87 @@ fn present_target_lands_rendered_bytes_and_counts_one_acquire_one_present() {
 /// A second present of the same allocation/view reuses the provider-owned
 /// target rather than recreating it: the target image survives across
 /// submissions until the lease is released (`docs/24` §5.2).
+/// The indirect payload one replay carries: one non-indexed draw of the
+/// milestone's full-screen triangle (`research/docs/25` §6 Step 4).
+fn indirect_draw() -> IndirectCommandPayload {
+    IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: 1,
+            kinds: vec![IndirectCommandKind::Draw],
+        },
+        command: IndirectCommandDescriptor::Draw {
+            vertex_count: 3,
+            instance_count: 1,
+        },
+        range: IndirectCommandRange { start: 0, count: 1 },
+    }
+}
+
+/// The first indirect increment replays the pass's full-screen triangle from a
+/// CPU-encoded `VkDrawIndirectCommand`. The falsifiable claim is byte equality
+/// with the direct draw: the same attachment, the same fragment output, and
+/// neither the clear sentinel nor an uninitialised image.
+#[test]
+fn an_indirect_draw_replays_the_same_attachment_bytes_as_a_direct_draw() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let direct_bytes = attachment_readback(&direct, &submit_fixture(&direct));
+    // One texel's bytes replicated over the 2x2 attachment: the fixture covers
+    // every texel with the same fragment output.
+    let expected = expected_texels(AttachmentFormat::Rgba8Unorm).repeat(4);
+    assert_eq!(direct_bytes, expected);
+
+    let mut trace = direct.trace.clone();
+    trace.indirect = Some(Box::new(indirect_draw()));
+    let admitted = direct
+        .provider
+        .capabilities()
+        .validate_trace(trace.clone(), direct.resources.clone())
+        .expect("the indirect-bearing trace is admitted");
+    let submitted = direct
+        .provider
+        .submit(admitted)
+        .expect("the indirect replay completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the replay lands the attachment writeback");
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+    let indirect_bytes = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("indirect draw readback: {}", hex(&indirect_bytes));
+    assert_eq!(indirect_bytes, expected);
+    assert_eq!(indirect_bytes, direct_bytes);
+    assert_ne!(indirect_bytes, CLEAR_SENTINEL.repeat(4));
+}
+
+/// The first increment replays non-indexed draws only: a compute dispatch
+/// command is refused in admission with the capability slug the contract
+/// publishes, before any Vulkan object exists.
+#[test]
+fn an_indirect_dispatch_is_refused_by_the_first_increment() {
+    let Some(direct) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let mut trace = direct.trace.clone();
+    trace.indirect = Some(Box::new(IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: 1,
+            kinds: vec![IndirectCommandKind::Dispatch],
+        },
+        command: IndirectCommandDescriptor::Dispatch {
+            threadgroups: [1, 1, 1],
+        },
+        range: IndirectCommandRange { start: 0, count: 1 },
+    }));
+    let refused = admit_error(&direct.provider.capabilities(), &trace, &direct.resources);
+    assert_eq!(refused.slug, "icb_command_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
 #[test]
 fn a_second_present_reuses_the_same_target_image() {
     let Some(fixture) = presenting_fixture() else {
