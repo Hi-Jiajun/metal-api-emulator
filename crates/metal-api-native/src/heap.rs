@@ -35,10 +35,14 @@ pub struct HeapPlacementObservation {
 /// The heap bits this provider declares, in one value so the macOS capability
 /// snapshot (`native.rs`) and the host-side unit tests cannot drift.
 ///
-/// Flip condition: `conformance/NativeOracle.swift --heap-selftest` has to
-/// print `heap_selftest: PASS` on an Apple GPU CI run before the bits below
-/// turn on; the parent flips them after that evidence is archived. Until then
-/// every field stays at its default, so core admission refuses a heap-bearing
+/// Flip evidence (`research/docs/25` §6 Step 7a): CI run `34838302150`, job
+/// `native-oracle-build`, step "Run native heap self-test when a Metal device
+/// is eligible". The probe reported an eligible Apple Paravirtual device and
+/// the oracle allocated two buffers from one `MTLHeap`, ran the reviewed
+/// `copy_word` kernel and read `heap_selftest: PASS (fefefefe)` back — the
+/// copied word, not the `ffffffff` sentinel the write buffer was preset with.
+/// A green job whose log said `SKIP` is not that evidence. Before the flip
+/// every field stayed at its default, so core admission refused a heap-bearing
 /// trace with `heap_unsupported` instead of silently dropping the placement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HeapCapabilityBits {
@@ -48,12 +52,13 @@ pub(crate) struct HeapCapabilityBits {
     pub(crate) supports_heap_aliasing: bool,
 }
 
-/// The pre-flip heap bits: closed on every field (`research/docs/25` §4.1).
+/// The first heap increment's bits: one owned-byte slab, no aliasing, and the
+/// same 64 MiB ceiling the Vulkan rail declares.
 pub(crate) fn heap_capability_bits() -> HeapCapabilityBits {
     HeapCapabilityBits {
-        supports_heaps: false,
-        max_heap_bytes: 0,
-        supported_heap_storage_modes: Vec::new(),
+        supports_heaps: true,
+        max_heap_bytes: 64 * 1024 * 1024,
+        supported_heap_storage_modes: vec![StorageMode::OwnedBytes],
         supports_heap_aliasing: false,
     }
 }

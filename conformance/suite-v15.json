@@ -73,7 +73,8 @@
       },
       "capture_rails": [
         "vulkan",
-        "vulkan-objects"
+        "vulkan-objects",
+        "native-metal-provider"
       ]
     },
     {

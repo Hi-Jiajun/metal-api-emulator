@@ -22,8 +22,7 @@ use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemotePr
 #[cfg(target_os = "macos")]
 use metal_api_native::{NativeMetalProvider, NativeRenderPipelineRequest};
 use metal_api_vulkan::{
-    HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest, VulkanComputeProvider,
-    VulkanExecutor,
+    IcbReplayObservation, RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor,
 };
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
@@ -174,13 +173,31 @@ impl CopyCounters {
     }
 
     /// The placements the provider actually bound during its last submission
-    /// (`research/docs/25` §5.1). The native rail has no heap execution yet, so
-    /// it reports nothing to observe.
-    fn heap_observations(&self) -> Vec<HeapPlacementObservation> {
+    /// (`research/docs/25` §5.1), mapped to one rail-independent tuple so the
+    /// two providers' observation types do not have to be unified.
+    fn heap_observations(&self) -> Vec<RawHeapPlacement> {
         match self {
-            Self::Vulkan { provider, .. } => provider.heap_placement_observations(),
+            Self::Vulkan { provider, .. } => provider
+                .heap_placement_observations()
+                .into_iter()
+                .map(|observation| RawHeapPlacement {
+                    heap: observation.heap_id.get(),
+                    allocation: observation.allocation_id.get(),
+                    offset: observation.offset,
+                    byte_size: observation.byte_size,
+                })
+                .collect(),
             #[cfg(target_os = "macos")]
-            Self::Native(_) => Vec::new(),
+            Self::Native(provider) => provider
+                .heap_placement_observations()
+                .into_iter()
+                .map(|observation| RawHeapPlacement {
+                    heap: observation.heap_id.get(),
+                    allocation: observation.allocation_id.get(),
+                    offset: observation.offset,
+                    byte_size: observation.byte_size,
+                })
+                .collect(),
         }
     }
 
@@ -1122,6 +1139,15 @@ struct IcbSegment {
     start: u32,
     count: u32,
     commands: u32,
+}
+
+/// One provider-agnostic placement record, mapped from either rail's
+/// observation type before it becomes a [`HeapSegment`].
+struct RawHeapPlacement {
+    heap: u64,
+    allocation: u64,
+    offset: u64,
+    byte_size: u64,
 }
 
 #[derive(Serialize)]
@@ -2890,7 +2916,7 @@ fn case_heap_payload(case: &Case) -> Result<Option<HeapPayload>> {
 /// results the provider observed, not from the suite's request, so a provider
 /// that did not place the resources cannot fake this segment.
 fn heap_segment(
-    observations: Vec<HeapPlacementObservation>,
+    observations: Vec<RawHeapPlacement>,
     remap: Option<&BTreeMap<AllocationId, u64>>,
 ) -> Result<HeapSegment> {
     let first = observations
@@ -2898,17 +2924,17 @@ fn heap_segment(
         .ok_or("heap case reported no placement observations")?;
     let same_slab = observations
         .iter()
-        .all(|observation| observation.heap_id == first.heap_id);
+        .all(|observation| observation.heap == first.heap);
     Ok(HeapSegment {
-        heap: first.heap_id.get(),
+        heap: first.heap,
         same_slab,
         placements: observations
             .iter()
             .map(|observation| HeapPlacementReport {
                 allocation: remap
-                    .and_then(|map| map.get(&observation.allocation_id))
+                    .and_then(|map| map.get(&AllocationId::new(observation.allocation)))
                     .copied()
-                    .unwrap_or_else(|| observation.allocation_id.get()),
+                    .unwrap_or(observation.allocation),
                 offset: observation.offset,
                 byte_size: observation.byte_size,
             })
