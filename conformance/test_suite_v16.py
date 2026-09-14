@@ -50,13 +50,14 @@ TEXELS = "4080c0ff" * 4
 ATTACHMENT = (900, 910, 0, 16)
 QUAD_VIEW = (940, 950, 0, 32)
 INDEX_VIEW = (960, 970, 0, 12)
-# The rails v16 marks: the Vulkan trace rail and the Vulkan object rail execute
-# caller-held streams today. The native rails follow once the Apple self-test
-# observes the same quad; until then a rail the marker does not name must omit
-# the case rather than run the `vertex_id` shape.
-V16_REPORTING_RAILS = ("vulkan", "vulkan-objects")
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
+# Every rail now marks the case: the Vulkan trace and object rails execute the
+# reviewed quad on Lavapipe and the RTX 5060, and the native rails observed the
+# same four texels through `MTLVertexDescriptor` + `drawIndexedPrimitives` on an
+# Apple Paravirtual device (CI run `34866107438`,
+# `vertex_selftest: PASS (vertex_quad_indexed_2x2 4080c0ff...)`).
+V16_REPORTING_RAILS = ALL_RAILS
 
 
 def suite_with_rail(suite, rail):
@@ -77,7 +78,7 @@ class VertexInputObservationTests(unittest.TestCase):
     def test_v16_pins_the_reviewed_quad_and_its_streams(self):
         case = self.suite["render_cases"][0]
         self.assertEqual(case["id"], RENDER_ID)
-        self.assertEqual(case["capture_rails"], list(V16_REPORTING_RAILS))
+        self.assertEqual(sorted(case["capture_rails"]), sorted(V16_REPORTING_RAILS))
         layout = case["vertex_layout"]["buffers"]
         self.assertEqual(len(layout), 1)
         self.assertEqual(layout[0]["stride"], 8)
