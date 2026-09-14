@@ -25,6 +25,13 @@ use metal_api_core::ExecutorError;
 /// to the rail's window and to the conformance case that measures it.
 const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [2, 2];
 
+/// Conservative first-increment heap ceiling (`research/docs/25-heaps与ICB设计.md`
+/// §4.1). The placement rail is proven on a 4096-byte heap; capping admission
+/// far below the device's real single-allocation ceiling (Lavapipe reports a
+/// ~23 GiB heap) keeps the snapshot fail-closed, exactly like the 2×2
+/// attachment window above.
+const MAX_HEAP_BYTES: u64 = 64 * 1024 * 1024;
+
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
 }
@@ -71,9 +78,15 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_present_targets: MAX_PRESENT_TARGETS as u32,
         supported_present_modes: PresentMode::ADMITTED.to_vec(),
         max_present_image_count: MAX_PRESENT_IMAGE_COUNT,
-        supports_heaps: false,
-        max_heap_bytes: 0,
-        supported_heap_storage_modes: Vec::new(),
+        // Heap placement is executed (`compute_provider.rs` builds one
+        // `VkDeviceMemory` slab and binds each owned allocation's buffer at
+        // its placement offset), and the placement observation channel is
+        // exercised by `provider-smoke`'s `provider_heap_placement` case. The
+        // first increment binds buffers only and refuses aliasing and texture
+        // placements (`research/docs/25` §6 Step 3).
+        supports_heaps: true,
+        max_heap_bytes: MAX_HEAP_BYTES,
+        supported_heap_storage_modes: vec![StorageMode::OwnedBytes],
         supports_heap_aliasing: false,
         supports_indirect_command_buffers: false,
         max_indirect_commands: 0,
