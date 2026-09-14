@@ -3941,12 +3941,23 @@ fn run_object_render_case(
         .ok_or("the declaring pass does not declare the attachment view")?
         .1
         .clone();
-    let clear = unhex(
-        case.attachment
-            .clear_hex
-            .as_deref()
-            .ok_or("a clear attachment needs clear_hex")?,
-    )?;
+    // The object rail's attachment shape follows the fixture: a clearing case
+    // carries its colour, a loading case keeps the bytes the attachment view
+    // holds at commit and the rail uploads them (`research/docs/23` §3.3).
+    let load = match case.attachment.load.as_str() {
+        "clear" => objects::RenderAttachmentLoad::Clear(
+            unhex(
+                case.attachment
+                    .clear_hex
+                    .as_deref()
+                    .ok_or("a clear attachment needs clear_hex")?,
+            )?
+            .try_into()
+            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+        ),
+        "load" => objects::RenderAttachmentLoad::Load,
+        other => return Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
+    };
     let present =
         match &case.present {
             Some(definition) => Some(match &definition.initial_hex {
@@ -3975,9 +3986,6 @@ fn run_object_render_case(
     };
     let mut render = command.render_command_encoder()?;
     render.set_render_pipeline_state(render_pipeline)?;
-    let clear = clear
-        .try_into()
-        .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?;
     // The pass's own streams (`research/docs/23` §3.3): the object API binds
     // the views the case declares, and the encoder carries their bytes into the
     // trace at commit. A vertex-input case is a direct indexed draw by
@@ -4015,7 +4023,7 @@ fn run_object_render_case(
             AttachmentFormat::Rgba8Unorm,
             case.attachment.width,
             case.attachment.height,
-            clear,
+            load,
             present,
         )?;
     } else if let Some((index, format)) = &object_index {
@@ -4028,7 +4036,7 @@ fn run_object_render_case(
             AttachmentFormat::Rgba8Unorm,
             case.attachment.width,
             case.attachment.height,
-            clear,
+            load,
             u32::try_from(case.vertices)?,
             present,
         )?;
@@ -4038,7 +4046,7 @@ fn run_object_render_case(
             AttachmentFormat::Rgba8Unorm,
             case.attachment.width,
             case.attachment.height,
-            clear,
+            load,
             present,
         )?;
     }

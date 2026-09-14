@@ -514,6 +514,22 @@ pub enum PresentInitial {
     Sentinel([u8; 4]),
 }
 
+/// How one recorded render pass establishes its attachment's contents.
+///
+/// The contract's `LoadOp` is the trace-side shape; this is the encoder-side
+/// one. `Clear` carries the colour the pass starts from, and `Load` means the
+/// attachment keeps what it already holds: the encoder snapshots the
+/// attachment view's bytes at commit and the trace's own view declaration
+/// carries them, so the provider uploads them before the render pass opens
+/// (`research/docs/23` §3.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderAttachmentLoad {
+    /// Fill every texel with this colour before drawing.
+    Clear([u8; 4]),
+    /// Keep the attachment's current contents.
+    Load,
+}
+
 /// One recorded colour attachment: the buffer view that carries the attachment
 /// identity and byte range, plus the render-contract shape the encoder restates.
 #[derive(Clone)]
@@ -522,7 +538,7 @@ struct RenderTarget {
     format: AttachmentFormat,
     width: u64,
     height: u64,
-    clear: [u8; 4],
+    load: RenderAttachmentLoad,
     present: Option<PresentInitial>,
     draw: RenderDraw,
 }
@@ -640,7 +656,10 @@ impl RenderTarget {
             format: self.format,
             width: self.width,
             height: self.height,
-            load: LoadOp::Clear(ClearColor::new(self.clear)),
+            load: match self.load {
+                RenderAttachmentLoad::Clear(bytes) => LoadOp::Clear(ClearColor::new(bytes)),
+                RenderAttachmentLoad::Load => LoadOp::Load,
+            },
             store: StoreOp::Store,
         };
         let present = self.present.map(|initial| PresentDescriptor {
@@ -2188,7 +2207,7 @@ impl RenderCommandEncoder {
         format: AttachmentFormat,
         width: u64,
         height: u64,
-        clear: [u8; 4],
+        load: RenderAttachmentLoad,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
         self.ensure_open()?;
@@ -2200,7 +2219,7 @@ impl RenderCommandEncoder {
             format,
             width,
             height,
-            clear,
+            load,
             present,
             RenderDraw::vertex_id(),
             None,
@@ -2226,7 +2245,7 @@ impl RenderCommandEncoder {
         format: AttachmentFormat,
         width: u64,
         height: u64,
-        clear: [u8; 4],
+        load: RenderAttachmentLoad,
         vertex_count: u32,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
@@ -2249,9 +2268,7 @@ impl RenderCommandEncoder {
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
         };
-        self.record_render_pass(
-            attachment, format, width, height, clear, present, draw, None,
-        )
+        self.record_render_pass(attachment, format, width, height, load, present, draw, None)
     }
 
     /// Record the milestone's render pass through the bound index buffer.
@@ -2273,7 +2290,7 @@ impl RenderCommandEncoder {
         format: AttachmentFormat,
         width: u64,
         height: u64,
-        clear: [u8; 4],
+        load: RenderAttachmentLoad,
         index_count: u32,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
@@ -2300,9 +2317,7 @@ impl RenderCommandEncoder {
                 format: *index_format,
             }),
         };
-        self.record_render_pass(
-            attachment, format, width, height, clear, present, draw, None,
-        )
+        self.record_render_pass(attachment, format, width, height, load, present, draw, None)
     }
 
     /// Land one render pass in the command's pass list.
@@ -2323,7 +2338,7 @@ impl RenderCommandEncoder {
         format: AttachmentFormat,
         width: u64,
         height: u64,
-        clear: [u8; 4],
+        load: RenderAttachmentLoad,
         present: Option<PresentInitial>,
         draw: RenderDraw,
         indirect: Option<&IndirectCommandBuffer>,
@@ -2350,7 +2365,7 @@ impl RenderCommandEncoder {
             format,
             width,
             height,
-            clear,
+            load,
             present,
             draw,
         };
@@ -2434,7 +2449,7 @@ impl RenderCommandEncoder {
         format: AttachmentFormat,
         width: u64,
         height: u64,
-        clear: [u8; 4],
+        load: RenderAttachmentLoad,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
         self.ensure_open()?;
@@ -2478,7 +2493,7 @@ impl RenderCommandEncoder {
             format,
             width,
             height,
-            clear,
+            load,
             present,
             draw,
             Some(icb),

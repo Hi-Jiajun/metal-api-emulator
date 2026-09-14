@@ -4786,7 +4786,7 @@ mod tests {
             AttachmentFormat, PipelineCompileRequest, RenderPipelineContract, SemanticDigest,
             ShaderSource, VertexLayout,
         };
-        use metal_api_core::provider_api as objects;
+        use metal_api_core::provider_api::{self as objects, RenderAttachmentLoad};
 
         let executor = match VulkanExecutor::new() {
             Ok(executor) => executor,
@@ -4878,7 +4878,7 @@ mod tests {
                     AttachmentFormat::Rgba8Unorm,
                     2,
                     2,
-                    [0xfe; 4],
+                    RenderAttachmentLoad::Clear([0xfe; 4]),
                     Some(objects::PresentInitial::Sentinel([0xef; 4])),
                 )
                 .expect("render pass");
@@ -4907,7 +4907,7 @@ mod tests {
             AttachmentFormat, CompletionDisposition, PipelineCompileRequest,
             RenderPipelineContract, SemanticDigest, ShaderSource, VertexLayout,
         };
-        use metal_api_core::provider_api as objects;
+        use metal_api_core::provider_api::{self as objects, RenderAttachmentLoad};
         use metal_api_core::CommandBufferStatus;
 
         let executor = match VulkanExecutor::new() {
@@ -5000,7 +5000,7 @@ mod tests {
                     AttachmentFormat::Rgba8Unorm,
                     2,
                     2,
-                    [0xfe; 4],
+                    RenderAttachmentLoad::Clear([0xfe; 4]),
                     Some(objects::PresentInitial::Sentinel([0xef; 4])),
                 )
                 .expect("render pass");

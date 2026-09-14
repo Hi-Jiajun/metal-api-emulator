@@ -31,12 +31,12 @@ TEXEL = "4080c0ff"
 EXPECTED = TEXEL + PREVIOUS + TEXEL + PREVIOUS
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
-# The rails v17 marks: the three trace rails execute the upload path (Vulkan on
-# Lavapipe and the RTX 5060, the native provider and the Swift oracle on Apple
-# Paravirtual). The object rails stay out until their binding surface can
-# express "load" rather than "clear", and a rail the marker does not name has to
-# omit the case.
-V17_REPORTING_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+# The rails v17 marks: every rail. The three trace rails execute the upload path
+# (Vulkan on Lavapipe and the RTX 5060, the native provider and the Swift oracle
+# on Apple Paravirtual), and the object rails express it through
+# `RenderAttachmentLoad::Load`, which snapshots the attachment view's own bytes
+# at commit.
+V17_REPORTING_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True):

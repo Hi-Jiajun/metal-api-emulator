@@ -111,6 +111,18 @@ impl FakeProvider {
         self.icb = true;
         self
     }
+    /// The attachment load operation of the most recent trace, for the
+    /// encoder-side load test: the provider rail is what acts on it, so the
+    /// trace has to carry the load the caller recorded.
+    fn last_render_load(&self) -> Option<LoadOp> {
+        self.traces.lock().unwrap().last().and_then(|trace| {
+            trace
+                .render_passes()
+                .next()
+                .map(|pass| pass.color_attachments[0].load)
+        })
+    }
+
     fn error(&self, token: CompletionToken) -> ProviderError {
         ProviderError::new(
             ProviderPhase::Submit,
@@ -1438,6 +1450,59 @@ fn render_encoder_refuses_a_foreign_pipeline() {
 }
 
 #[test]
+fn a_recording_can_load_its_attachment_instead_of_clearing_it() {
+    // The encoder-side load shape (`research/docs/23` §3.3): the attachment
+    // keeps the bytes the view already holds, which the object API snapshots at
+    // commit exactly as it does for the draw inputs. The declaring compute pass
+    // binds the same view, so the trace's own declaration is what the provider
+    // uploads.
+    let provider = Arc::new(FakeProvider::new().with_render());
+    let device = Device::new(provider.clone());
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata(&provider);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Load,
+                None,
+            )
+            .expect("a loading pass records like a clearing one");
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    // The trace the provider actually received carries `LoadOp::Load`: the
+    // provider rail is what uploads the attachment's previous bytes, so a
+    // recording that claims to load has to reach it as a load rather than as a
+    // clear the provider had to reinterpret.
+    assert_eq!(provider.last_render_load(), Some(LoadOp::Load));
+}
+
+#[test]
 fn render_encoder_refuses_attachment_extent_mismatch_and_missing_pipeline() {
     let (provider, device) = setup();
     let render_pipeline = device.render_pipeline(&render_metadata(&provider)).unwrap();
@@ -1446,12 +1511,26 @@ fn render_encoder_refuses_attachment_extent_mismatch_and_missing_pipeline() {
     let command = device.new_command_queue().command_buffer();
     let mut encoder = command.render_command_encoder().unwrap();
     assert!(matches!(
-        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        encoder.draw_render_pass(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0; 4]),
+            None
+        ),
         Err(Error::Api(ApiError::MissingPipeline))
     ));
     encoder.set_render_pipeline_state(&render_pipeline).unwrap();
     assert!(matches!(
-        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        encoder.draw_render_pass(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0; 4]),
+            None
+        ),
         Err(Error::Contract(
             ContractError::AttachmentExtentMismatch { .. }
         ))
@@ -1469,7 +1548,14 @@ fn render_encoder_refuses_a_foreign_buffer() {
     let mut encoder = command.render_command_encoder().unwrap();
     encoder.set_render_pipeline_state(&render_pipeline).unwrap();
     assert!(matches!(
-        encoder.draw_render_pass(&view, AttachmentFormat::Rgba8Unorm, 2, 2, [0; 4], None),
+        encoder.draw_render_pass(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0; 4]),
+            None
+        ),
         Err(Error::ForeignBuffer)
     ));
 }
@@ -1522,7 +1608,7 @@ fn object_render_commit_routes_the_attachment_through_submit_and_lands_texels() 
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 Some(PresentInitial::Sentinel([0xef; 4])),
             )
             .unwrap();
@@ -1797,7 +1883,7 @@ fn render_draw_indirect_replays_the_attachment() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 None,
             )
             .unwrap();
@@ -1963,7 +2049,7 @@ fn direct_draws_refuse_missing_inputs_and_counts_below_the_milestone() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES,
             None,
         ),
@@ -1975,7 +2061,7 @@ fn direct_draws_refuse_missing_inputs_and_counts_below_the_milestone() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES,
             None,
         ),
@@ -1988,7 +2074,7 @@ fn direct_draws_refuse_missing_inputs_and_counts_below_the_milestone() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES - 1,
             None,
         ),
@@ -2008,7 +2094,7 @@ fn direct_draws_refuse_missing_inputs_and_counts_below_the_milestone() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES - 1,
             None,
         ),
@@ -2046,7 +2132,7 @@ fn direct_draws_refuse_a_pipeline_layout_that_disagrees_with_the_pass() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             None,
         ),
         Err(Error::Contract(
@@ -2065,7 +2151,7 @@ fn direct_draws_refuse_a_pipeline_layout_that_disagrees_with_the_pass() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES,
             None,
         ),
@@ -2122,7 +2208,7 @@ fn indexed_draw_records_the_bound_streams_in_binding_order() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 FULL_SCREEN_TRIANGLE_VERTICES,
                 None,
             )
@@ -2210,7 +2296,7 @@ fn indexed_draw_without_streams_keeps_the_vertex_id_shape() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 FULL_SCREEN_TRIANGLE_VERTICES,
                 None,
             )
@@ -2270,7 +2356,7 @@ fn a_stream_bound_at_a_skipped_index_has_no_position_to_land_at() {
             AttachmentFormat::Rgba8Unorm,
             2,
             2,
-            [0xfe; 4],
+            RenderAttachmentLoad::Clear([0xfe; 4]),
             FULL_SCREEN_TRIANGLE_VERTICES,
             None,
         ),
@@ -2316,7 +2402,7 @@ fn draw_inputs_carry_the_bytes_the_command_commits_with() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 FULL_SCREEN_TRIANGLE_VERTICES,
                 None,
             )
@@ -2402,7 +2488,7 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 None,
             )
             .unwrap_err();
@@ -2427,7 +2513,7 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 None,
             ),
             Err(Error::IndirectReplayInputConflict {
@@ -2455,7 +2541,7 @@ fn render_draw_indirect_replays_draw_indexed_and_refuses_bound_inputs() {
                 AttachmentFormat::Rgba8Unorm,
                 2,
                 2,
-                [0xfe; 4],
+                RenderAttachmentLoad::Clear([0xfe; 4]),
                 None,
             )
             .unwrap();
