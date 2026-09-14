@@ -138,6 +138,10 @@ private struct RenderAttachmentDefinition: Decodable {
 /// One offscreen render case (`research/docs/23` §1.2, §5.1).
 private struct RenderCaseDefinition: Decodable {
     let id: String
+    /// The compute case whose pass declares the attachment view. The oracle
+    /// validates the render case's own shape, and the declaring case's
+    /// whole-allocation read view is the exception `validateBuffers` grants.
+    let declaring_case: String
     let vertex_entry: String
     let fragment_entry: String
     let metal: RenderSourcePin
@@ -666,7 +670,8 @@ private func validateTextures(_ definition: CaseDefinition) throws -> [Validated
     return valid
 }
 
-private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) throws -> [ValidatedBuffer] {
+private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8,
+                             declaringCaseIDs: Set<String>) throws -> [ValidatedBuffer] {
     var bindings = Set<UInt64>()
     var views = Set<UInt64>()
     var buffers = [ValidatedBuffer]()
@@ -830,7 +835,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
             }
         }
         try require(usedViews == Set(definition.buffers.map { $0.view }), "Unused declared resource")
-        let buffers = try validateBuffers(definition, guardByte: suite.guard_byte)
+        let buffers = try validateBuffers(definition, guardByte: suite.guard_byte,
+                                          declaringCaseIDs: declaringCaseIDs)
         let textures = try validateTextures(definition)
         let loaded = try programs.map { program in
             (definition: program, source: try loadProgram(program, root: root))
@@ -1371,6 +1377,7 @@ private func renderSelfTest() throws -> CaseResult {
     let reviewed = reviewedRenderModule()
     let definition = RenderCaseDefinition(
         id: "render_offscreen_2x2",
+        declaring_case: "",
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
@@ -1418,6 +1425,7 @@ private func presentSelfTest() throws -> CaseResult {
     let sentinel = Data(repeating: 0xfe, count: 16)
     let definition = RenderCaseDefinition(
         id: "present_offscreen_2x2",
+        declaring_case: "",
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
