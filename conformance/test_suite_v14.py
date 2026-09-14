@@ -344,7 +344,7 @@ PINNED_V15_PLAN = {
         "allocations": [[900, TEXELS]],
         "touched": [900, 920],
         "written": [900, 920],
-        "rails": sorted(["vulkan"]),
+        "rails": sorted(["vulkan", "vulkan-objects"]),
         "attachment": list(ATTACHMENT),
         "present": None,
     },

@@ -72,7 +72,8 @@
         ]
       },
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "vulkan-objects"
       ]
     },
     {
@@ -143,7 +144,8 @@
         }
       },
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "vulkan-objects"
       ]
     }
   ],
@@ -176,7 +178,8 @@
       },
       "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "vulkan-objects"
       ],
       "icb": {
         "kind": "draw",
