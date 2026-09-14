@@ -1449,36 +1449,43 @@ fn main() -> Result<()> {
                 continue;
             }
         }
-        let mut result = if let Some(device) = &object_device {
+        let (mut result, heap_remap) = if let Some(device) = &object_device {
             let programs = case_programs(case)
                 .iter()
                 .map(|program| {
                     object_pipelines[&(program.entry.clone(), case.air_encoding)].clone()
                 })
                 .collect::<Vec<_>>();
-            run_object_case(
+            let (result, allocation_ids) = run_object_case(
                 device,
                 &programs,
                 case,
                 suite.guard_byte,
                 async_execution,
                 &mut || counters.read(),
-            )?
+            )?;
+            (result, Some(allocation_ids))
         } else {
-            run_case(
-                provider.as_ref(),
-                &programs,
-                case,
-                index as u64 + 1,
-                suite.guard_byte,
-                &mut || counters.read(),
-            )?
+            (
+                run_case(
+                    provider.as_ref(),
+                    &programs,
+                    case,
+                    index as u64 + 1,
+                    suite.guard_byte,
+                    &mut || counters.read(),
+                )?,
+                None,
+            )
         };
         let after = counters.read();
         result.copy_in = Some(u32::try_from(after.0 - before.0)?);
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
         if case.heap.is_some() {
-            result.heap = Some(heap_segment(counters.heap_observations())?);
+            result.heap = Some(heap_segment(
+                counters.heap_observations(),
+                heap_remap.as_ref(),
+            )?);
         }
         if case.icb.is_some() {
             result.icb = Some(icb_segment(counters.icb_observations())?);
@@ -2800,6 +2807,18 @@ fn icb_segment(observations: Vec<IcbReplayObservation>) -> Result<IcbSegment> {
     })
 }
 
+/// The one storage-mode name a heap section may spell (`research/docs/25`
+/// §4.2). Kept in one place so the trace and object rails refuse the same
+/// vocabulary.
+fn heap_storage_mode(heap: &HeapCase, case_id: &str) -> Result<StorageMode> {
+    match heap.storage_mode.as_str() {
+        "owned_bytes" => Ok(StorageMode::OwnedBytes),
+        "staged_lease" => Ok(StorageMode::StagedLease),
+        "borrowed_no_copy" => Ok(StorageMode::BorrowedNoCopy),
+        other => Err(format!("case {case_id}: unknown heap storage mode {other:?}").into()),
+    }
+}
+
 /// Translate a suite case's heap section into the trace payload
 /// (`research/docs/25` §4.2). The structural rules (one allocation per
 /// placement, no overlap, placements fit the slab) stay core admission's job;
@@ -2844,14 +2863,7 @@ fn case_heap_payload(case: &Case) -> Result<Option<HeapPayload>> {
             .into());
         }
     }
-    let storage_mode = match heap.storage_mode.as_str() {
-        "owned_bytes" => StorageMode::OwnedBytes,
-        "staged_lease" => StorageMode::StagedLease,
-        "borrowed_no_copy" => StorageMode::BorrowedNoCopy,
-        other => {
-            return Err(format!("case {}: unknown heap storage mode {other:?}", case.id).into())
-        }
-    };
+    let storage_mode = heap_storage_mode(heap, &case.id)?;
     let placements = heap
         .placements
         .iter()
@@ -2877,7 +2889,10 @@ fn case_heap_payload(case: &Case) -> Result<Option<HeapPayload>> {
 /// segment (`research/docs/25` §5.1). The records come from the `vkBind*`
 /// results the provider observed, not from the suite's request, so a provider
 /// that did not place the resources cannot fake this segment.
-fn heap_segment(observations: Vec<HeapPlacementObservation>) -> Result<HeapSegment> {
+fn heap_segment(
+    observations: Vec<HeapPlacementObservation>,
+    remap: Option<&BTreeMap<AllocationId, u64>>,
+) -> Result<HeapSegment> {
     let first = observations
         .first()
         .ok_or("heap case reported no placement observations")?;
@@ -2890,7 +2905,10 @@ fn heap_segment(observations: Vec<HeapPlacementObservation>) -> Result<HeapSegme
         placements: observations
             .iter()
             .map(|observation| HeapPlacementReport {
-                allocation: observation.allocation_id.get(),
+                allocation: remap
+                    .and_then(|map| map.get(&observation.allocation_id))
+                    .copied()
+                    .unwrap_or_else(|| observation.allocation_id.get()),
                 offset: observation.offset,
                 byte_size: observation.byte_size,
             })
@@ -3142,7 +3160,7 @@ fn run_object_case(
     guard: u8,
     async_execution: bool,
     counters: &mut dyn FnMut() -> (usize, usize),
-) -> Result<CaseResult> {
+) -> Result<(CaseResult, BTreeMap<AllocationId, u64>)> {
     // Fixture IDs are report labels only. The object API creates and validates
     // its own allocation/view identities before they are mapped back here.
     let mut resources = BTreeMap::new();
@@ -3208,6 +3226,43 @@ fn run_object_case(
         )?;
         object_textures.insert(texture.binding, created);
     }
+    // A heap section names one slab and covers every owned allocation. The
+    // object rail places each whole allocation at its declared offset and hands
+    // the heap to the command, so commit publishes the placement payload
+    // exactly as the trace rail's `case_heap_payload` does.
+    let heap = match &case.heap {
+        Some(definition) => {
+            let heap = device.new_heap(
+                definition.size,
+                heap_storage_mode(definition, &case.id)?,
+                definition.allows_aliasing,
+            )?;
+            for placement in &definition.placements {
+                let buffer = allocation_buffers
+                    .get(&placement.allocation)
+                    .ok_or("heap placement names an allocation the case does not own")?;
+                heap.place(buffer, placement.offset)?;
+            }
+            Some(heap)
+        }
+        None => None,
+    };
+    // A compute case's indirect section replays its one dispatch from an
+    // encoded command. The payload is built by the same translator the trace
+    // rail uses, so the two rails carry byte-identical requests.
+    let icb = match &case.icb {
+        Some(_) => {
+            let payload = compute_icb_payload(case)?.ok_or("missing compute indirect payload")?;
+            Some(device.new_indirect_command_buffer(
+                payload.command.kind(),
+                payload.buffer.max_commands,
+                payload.buffer.kinds,
+                payload.range,
+                payload.command,
+            )?)
+        }
+        None => None,
+    };
     let mut reported = Vec::new();
     let mut group_counts = Vec::with_capacity(groups.len());
     // Each command buffer commits and completes before the next one records,
@@ -3238,9 +3293,16 @@ fn run_object_case(
                 let (_, view) = resources.get(&view).ok_or("unknown object fixture view")?;
                 encoder.set_buffer(slot.binding, view)?;
             }
-            encoder.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
+            if let Some(icb) = &icb {
+                encoder.dispatch_indirect(icb, narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
+            } else {
+                encoder.dispatch_threads(narrow(dispatch.grid)?, narrow(dispatch.local)?)?;
+            }
         }
         encoder.end_encoding()?;
+        if let Some(heap) = &heap {
+            command.set_heap(heap)?;
+        }
         command.commit()?;
         if async_execution {
             if command.status()? != metal_api_core::CommandBufferStatus::Committed {
@@ -3294,18 +3356,25 @@ fn run_object_case(
         groups.len(),
         dispatches.len()
     );
-    Ok(CaseResult {
-        id: case.id.clone(),
-        completion: "CompletedVisible",
-        writebacks,
-        allocations,
-        copy_in: None,
-        copy_out: None,
-        group_counts: case.command_buffers.as_ref().map(|_| group_counts),
-        present: None,
-        heap: None,
-        icb: None,
-    })
+    let allocation_ids = report_ids
+        .iter()
+        .map(|((allocation, _), (fixture_allocation, _))| (*allocation, *fixture_allocation))
+        .collect::<BTreeMap<_, _>>();
+    Ok((
+        CaseResult {
+            id: case.id.clone(),
+            completion: "CompletedVisible",
+            writebacks,
+            allocations,
+            copy_in: None,
+            copy_out: None,
+            group_counts: case.command_buffers.as_ref().map(|_| group_counts),
+            present: None,
+            heap: None,
+            icb: None,
+        },
+        allocation_ids,
+    ))
 }
 
 /// Run one render case on the object API: the declaring compute pass's own
@@ -3425,18 +3494,47 @@ fn run_object_render_case(
             }),
             None => None,
         };
+    // A render case's indirect section replays its single triangle draw from
+    // one encoded command. The same translator the trace rail uses builds the
+    // payload, so the two rails carry byte-identical requests.
+    let icb = match &case.icb {
+        Some(_) => {
+            let payload = render_icb_payload(case)?.ok_or("missing render indirect payload")?;
+            Some(device.new_indirect_command_buffer(
+                payload.command.kind(),
+                payload.buffer.max_commands,
+                payload.buffer.kinds,
+                payload.range,
+                payload.command,
+            )?)
+        }
+        None => None,
+    };
     let mut render = command.render_command_encoder()?;
     render.set_render_pipeline_state(render_pipeline)?;
-    render.draw_render_pass(
-        &attachment_view,
-        AttachmentFormat::Rgba8Unorm,
-        case.attachment.width,
-        case.attachment.height,
-        clear
-            .try_into()
-            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
-        present,
-    )?;
+    let clear = clear
+        .try_into()
+        .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?;
+    if let Some(icb) = &icb {
+        render.draw_indirect(
+            icb,
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            case.attachment.width,
+            case.attachment.height,
+            clear,
+            present,
+        )?;
+    } else {
+        render.draw_render_pass(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            case.attachment.width,
+            case.attachment.height,
+            clear,
+            present,
+        )?;
+    }
     render.end_encoding()?;
 
     command.commit()?;
