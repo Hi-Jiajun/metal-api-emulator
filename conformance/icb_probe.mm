@@ -1,3 +1,19 @@
+// Native indirect-command-buffer runtime probe (`research/docs/25` §6 Step 7b).
+//
+// Outcome (2026-09-14, CI run 34845904082, Apple Paravirtual device): the
+// ObjC selectors exist and the probe reaches the ICB creation call, but the
+// Metal driver aborts inside `-[IOGPUMetalResource initWithResource:]`
+// (`Assertion failed: (resource != nil)`, abort trap 6) before any command can
+// be encoded. Together with the Swift SDK hiding the CPU-side accessors, that
+// is the platform block recorded in `crates/metal-api-native/src/icb.rs`: the
+// native rail must not advertise indirect command buffers, and this probe is
+// kept as the reproducible check rather than wired into CI (a driver abort
+// cannot be turned into a passing step).
+//
+// It keeps the SKIP-not-PASS discipline for a future platform: no device prints
+// SKIP and exits 0, a missing selector prints UNAVAILABLE and exits nonzero, and
+// any device-side failure exits nonzero.
+
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
