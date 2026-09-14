@@ -430,7 +430,8 @@ private func validateSource(_ definition: SourceDefinition, root: URL,
     return bytes
 }
 
-private func validateShape(_ definition: CaseDefinition, suite: String) throws -> [DispatchDefinition] {
+private func validateShape(_ definition: CaseDefinition, suite: String,
+                           declaringCaseIDs: Set<String>) throws -> [DispatchDefinition] {
     try require(definition.grid.count == 3 && definition.local.count == 3,
                 "\(definition.id): grid and local need three dimensions")
     try require(definition.grid.allSatisfy { $0 > 0 && $0 <= 1024 }
@@ -500,19 +501,19 @@ private func validateShape(_ definition: CaseDefinition, suite: String) throws -
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
-    case "render_declaring_copy_word":
+    case let id where declaringCaseIDs.contains(id):
         // v13's declaring case: the same reviewed copy kernel, but its read
         // view covers the 16 attachment bytes the render case stores into, so
         // the attachment is reported through the existing writeback channel
         // (`conformance/RENDER-CAPTURE.md` §3) rather than a new one.
         try require(definition.entry == "copy_word"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
-                    "render_declaring_copy_word: unsupported entry or dispatch shape")
+                    "\(definition.id): unsupported entry or dispatch shape")
         try require(definition.buffers.count == 2,
-                    "render_declaring_copy_word: expected two buffers")
+                    "\(definition.id): expected two buffers")
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 16 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
-                    "render_declaring_copy_word: expected a 16-byte read buffer at 0 and a 4-byte write buffer at 1")
+                    "\(definition.id): expected a 16-byte read buffer at 0 and a 4-byte write buffer at 1")
     case "indexed_boundary", "indexed_tail", "indexed_full", "indexed_small_grid", "indexed_unit":
         let expectedLocal: [UInt64]
         switch definition.id {
@@ -703,7 +704,7 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8) thr
         // observable there (`conformance/RENDER-CAPTURE.md` §3). The exception
         // is written down here rather than loosening the rule for every case.
         let wholeAllocationDeclaringView =
-            definition.id == "render_declaring_copy_word"
+            declaringCaseIDs.contains(definition.id)
             && buffer.access == "read" && buffer.offset == 0
             && buffer.allocation_size == buffer.length
         let end = buffer.offset + buffer.length
@@ -800,12 +801,17 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
     let root = url.deletingLastPathComponent()
+    // The cases a render case names as its declaring pass share the reviewed
+    // whole-allocation attachment view, which the guard-byte rule otherwise
+    // refuses (`validateShape`'s exception below).
+    let declaringCaseIDs = Set((suite.render_cases ?? []).map { $0.declaring_case })
     var cases = [ValidatedCase]()
     for definition in suite.cases {
         // Review every program identity and interface before decoding any
         // buffer payload or reading shader files from the supplied manifest.
         let programs = try validatePrograms(definition, suite: suite.suite)
-        let dispatches = try validateShape(definition, suite: suite.suite)
+        let dispatches = try validateShape(definition, suite: suite.suite,
+                                           declaringCaseIDs: declaringCaseIDs)
         let commandBuffers = try validateCommandBuffers(definition, suite: suite.suite,
                                                         dispatches: dispatches)
         var usedViews = Set<UInt64>()
