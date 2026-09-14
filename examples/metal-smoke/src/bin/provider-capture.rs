@@ -7,14 +7,15 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
     PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
     QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
     StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -71,6 +72,29 @@ const RENDER_FRAGMENT_ENTRY: &str = "fragment_main";
 /// and [`validate_render_case`] pins them.
 const RENDER_MSL_VERTEX_ENTRY: &str = "render_fullscreen_triangle";
 const RENDER_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
+
+/// The reviewed vertex-input fixture (`research/docs/23` §3.3): a caller-held
+/// `float32x2` position stream and six `uint16` indices over it. The Vulkan rail
+/// compiles `quad_indexed.vert.spv`, the native rail compiles
+/// `conformance/shaders/quad_indexed_2x2.metal`, and both name the same shape —
+/// four NDC corners in two triangles, drawn with the milestone's fragment stage.
+/// A render case that declares vertex streams has to name exactly this pair,
+/// because the reviewed geometry is what makes the expected texels falsifiable
+/// rather than merely observed.
+const QUAD_VERTEX_ENTRY: &str = "vertex_buffer_main";
+const QUAD_FRAGMENT_ENTRY: &str = "fragment_main";
+const QUAD_MSL_VERTEX_ENTRY: &str = "render_quad_vertex";
+const QUAD_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
+const QUAD_VERTEX_SPV: &[u8] =
+    include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/quad_indexed.vert.spv");
+const QUAD_FRAGMENT_SPV: &[u8] =
+    include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/solid_unorm8.frag.spv");
+/// Vertices the reviewed quad declares, and the number of indices its two
+/// triangles consume.
+const QUAD_VERTICES: u64 = 4;
+const QUAD_INDICES: u64 = 6;
+/// Bytes per vertex of the reviewed stream: one `float32x2`.
+const QUAD_STRIDE: u64 = 8;
 
 /// The capture backends a suite may declare a render case executable on. The
 /// vocabulary is `conformance/compare.py`'s `ALLOCATION_OBSERVATIONS`, i.e. the
@@ -779,21 +803,41 @@ fn create_provider(
 fn register_render_pipeline(
     registrar: &RenderRegistrar,
     identity: &str,
+    geometry: RenderGeometry,
 ) -> Result<CompiledComputePipeline> {
     let logical_digest = SemanticDigest::new(
         "suite-sha256-entry-v1",
         format!("{identity}:offscreen_render_pipeline").into_bytes(),
     )?;
+    // The registration names the reviewed pair for the case's geometry: the
+    // Vulkan rail compiles the vertex stage's SPIR-V, the native rail its MSL
+    // sibling, and both re-run their own review gate over the pair
+    // (`research/docs/23` §3.3).
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    let (vulkan_entries, msl_entries, vulkan_stages, layout) = match geometry {
+        RenderGeometry::Milestone => (
+            (RENDER_VERTEX_ENTRY, RENDER_FRAGMENT_ENTRY),
+            (RENDER_MSL_VERTEX_ENTRY, RENDER_MSL_FRAGMENT_ENTRY),
+            (RENDER_VERTEX_SPV, RENDER_FRAGMENT_SPV),
+            VertexLayout::None,
+        ),
+        RenderGeometry::IndexedQuad => (
+            (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+            (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+            (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
+            reviewed_quad_layout(),
+        ),
+    };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
-                vertex_entry: RENDER_VERTEX_ENTRY.to_owned(),
-                fragment_entry: RENDER_FRAGMENT_ENTRY.to_owned(),
+                vertex_entry: vulkan_entries.0.to_owned(),
+                fragment_entry: vulkan_entries.1.to_owned(),
                 color_format: AttachmentFormat::Rgba8Unorm,
-                vertex_layout: VertexLayout::None,
+                vertex_layout: layout.clone(),
             },
-            vertex_spirv: RENDER_VERTEX_SPV.to_vec(),
-            fragment_spirv: RENDER_FRAGMENT_SPV.to_vec(),
+            vertex_spirv: vulkan_stages.0.to_vec(),
+            fragment_spirv: vulkan_stages.1.to_vec(),
             logical_digest,
         }),
         #[cfg(target_os = "macos")]
@@ -805,10 +849,10 @@ fn register_render_pipeline(
             // fixture is refused.
             native.register_render_pipeline(NativeRenderPipelineRequest {
                 contract: RenderPipelineContract {
-                    vertex_entry: RENDER_MSL_VERTEX_ENTRY.to_owned(),
-                    fragment_entry: RENDER_MSL_FRAGMENT_ENTRY.to_owned(),
+                    vertex_entry: msl_entries.0.to_owned(),
+                    fragment_entry: msl_entries.1.to_owned(),
                     color_format: AttachmentFormat::Rgba8Unorm,
-                    vertex_layout: VertexLayout::None,
+                    vertex_layout: layout.clone(),
                 },
                 logical_digest,
             })
@@ -955,6 +999,67 @@ struct RenderCase {
     /// direct draw; only the rails its marker names execute it.
     #[serde(default)]
     icb: Option<IcbCase>,
+    /// Optional vertex layout (`research/docs/23` §3.3): the streams the
+    /// pipeline's vertex input state describes. Absent means the milestone's
+    /// `vertex_id` triangle, which binds no stream at all.
+    #[serde(default)]
+    vertex_layout: Option<VertexLayoutDefinition>,
+    /// The caller-held vertex streams the pass binds, in binding order. Each
+    /// one declares its own bytes, so a render-only trace needs no compute pass
+    /// to carry them (`research/docs/23` §3.6).
+    #[serde(default)]
+    vertex_buffers: Vec<RenderInputDefinition>,
+    /// The index buffer the draw runs through, when the case is indexed.
+    #[serde(default)]
+    indices: Option<IndexInputDefinition>,
+}
+
+/// One vertex layout: the reviewed stream list, in binding order.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VertexLayoutDefinition {
+    buffers: Vec<VertexStreamDefinition>,
+}
+
+/// One stream of a vertex layout: its stride and the attributes read out of it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VertexStreamDefinition {
+    stride: u64,
+    attributes: Vec<VertexAttributeDefinition>,
+}
+
+/// One attribute of a stream, in the contract's own terms.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VertexAttributeDefinition {
+    location: u32,
+    offset: u64,
+    format: String,
+}
+
+/// One render input view: identity, range and bytes, exactly the fields a
+/// `BufferView` needs (`research/docs/23` §3.6).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderInputDefinition {
+    allocation: u64,
+    view: u64,
+    offset: u64,
+    length: u64,
+    initial_hex: String,
+}
+
+/// One index buffer view: the same fields plus the width of the indices.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexInputDefinition {
+    allocation: u64,
+    view: u64,
+    offset: u64,
+    length: u64,
+    initial_hex: String,
+    format: String,
 }
 
 /// The colour attachment a render case draws into. The fields mirror
@@ -1545,6 +1650,7 @@ fn main() -> Result<()> {
             .ok_or("render case declaring pass is not a case of this suite")?;
         let before = counters.read();
         let (acquires_before, presents_before) = counters.present_counts();
+        let geometry = render_geometry(case, &format!("render case {}", case.id))?;
         let mut result = if let Some(device) = &object_device {
             let object_programs = case_programs(declaring)
                 .iter()
@@ -1555,7 +1661,8 @@ fn main() -> Result<()> {
             let object_pipeline = match &object_render_pipeline {
                 Some(pipeline) => pipeline.clone(),
                 None => {
-                    let registered = register_render_pipeline(&render_registrar, &identity)?;
+                    let registered =
+                        register_render_pipeline(&render_registrar, &identity, geometry)?;
                     let wrapped = device.render_pipeline(&registered)?;
                     render_pipeline = Some(registered);
                     object_render_pipeline = Some(wrapped.clone());
@@ -1579,7 +1686,8 @@ fn main() -> Result<()> {
             let pipeline = match &render_pipeline {
                 Some(pipeline) => pipeline.clone(),
                 None => {
-                    let registered = register_render_pipeline(&render_registrar, &identity)?;
+                    let registered =
+                        register_render_pipeline(&render_registrar, &identity, geometry)?;
                     render_pipeline = Some(registered.clone());
                     registered
                 }
@@ -1699,6 +1807,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v13") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v14") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v15") => &["heap_placement_copy_word", "icb_dispatch_copy_word"],
+        (1, "compute-buffer-v16") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -1854,6 +1963,178 @@ fn validate_suite(suite: &Suite) -> Result<()> {
 /// texel of the expectation has to be the fragment output, and the expectation
 /// has to differ from the value the pass started from, so "the pass never ran"
 /// cannot satisfy it.
+/// The reviewed geometry a render case draws (`research/docs/23` §3.3).
+///
+/// Two shapes exist and no third: the milestone's `vertex_id` triangle, and the
+/// reviewed indexed quad whose vertex stream is a `float32x2` position at stride
+/// eight plus six `uint16` indices. A case cannot describe a geometry the two
+/// rails have not been reviewed against — that is what keeps the expected texels
+/// falsifiable instead of merely observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderGeometry {
+    Milestone,
+    IndexedQuad,
+}
+
+/// The reviewed quad layout (`research/docs/23` §3.3): one `float32x2` position
+/// stream at stride eight.
+fn reviewed_quad_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![VertexBufferLayout {
+        stride: QUAD_STRIDE,
+        attributes: vec![VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }],
+    }])
+}
+
+/// Classify a render case's geometry and pin the reviewed shape.
+///
+/// The checks are deliberately exact: the vertex-input case names one stream,
+/// one attribute and one index buffer, and its byte ranges have to cover the
+/// draw the fixture claims, with every index naming one of the four reviewed
+/// vertices. Anything else is a case the reviewers have not seen.
+fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    let Some(layout) = &case.vertex_layout else {
+        if !case.vertex_buffers.is_empty() || case.indices.is_some() {
+            return Err(format!(
+                "{where_}: vertex buffers without a vertex layout describe no stream"
+            )
+            .into());
+        }
+        return Ok(RenderGeometry::Milestone);
+    };
+    if layout.buffers.len() != 1 || case.vertex_buffers.len() != 1 {
+        return Err(format!(
+            "{where_}: the reviewed vertex-input shape is one stream and one binding"
+        )
+        .into());
+    }
+    let stream = &layout.buffers[0];
+    if stream.stride != QUAD_STRIDE || stream.attributes.len() != 1 {
+        return Err(format!(
+            "{where_}: the reviewed stream is one float32x2 position at stride {QUAD_STRIDE}"
+        )
+        .into());
+    }
+    let attribute = &stream.attributes[0];
+    if attribute.location != 0 || attribute.offset != 0 || attribute.format != "float32x2" {
+        return Err(
+            format!("{where_}: the reviewed attribute is location 0, offset 0, float32x2").into(),
+        );
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let required = QUAD_STRIDE
+        .checked_mul(QUAD_VERTICES)
+        .ok_or("vertex stream footprint overflows")?;
+    if buffer.length < required {
+        return Err(format!(
+            "{where_}: the vertex stream declares {} bytes, fewer than the {required} the reviewed quad reads",
+            buffer.length
+        )
+        .into());
+    }
+    let bytes = unhex(&buffer.initial_hex)?;
+    if bytes.len() != usize::try_from(buffer.length)? {
+        return Err(format!("{where_}: the vertex stream bytes do not match its length").into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed vertex-input shape is indexed").into());
+    };
+    if indices.allocation == 0 || indices.view == 0 {
+        return Err(format!("{where_}: zero index buffer identity").into());
+    }
+    let width = match indices.format.as_str() {
+        "uint16" => 2_u64,
+        "uint32" => 4,
+        other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
+    };
+    let required = QUAD_INDICES
+        .checked_mul(width)
+        .ok_or("index footprint overflows")?;
+    if indices.length < required {
+        return Err(format!(
+            "{where_}: the index buffer declares {} bytes, fewer than the {required} the reviewed quad reads",
+            indices.length
+        )
+        .into());
+    }
+    let bytes = unhex(&indices.initial_hex)?;
+    if bytes.len() != usize::try_from(indices.length)? {
+        return Err(format!("{where_}: the index bytes do not match their length").into());
+    }
+    let width = usize::try_from(width)?;
+    for (position, chunk) in bytes.chunks_exact(width).enumerate() {
+        let index = match width {
+            2 => u64::from(u16::from_le_bytes([chunk[0], chunk[1]])),
+            _ => u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+        };
+        if index >= QUAD_VERTICES {
+            return Err(format!(
+                "{where_}: index {position} names vertex {index}, outside the reviewed quad"
+            )
+            .into());
+        }
+    }
+    Ok(RenderGeometry::IndexedQuad)
+}
+
+/// Turn a render case's declared streams into the pass's own bindings.
+///
+/// Each stream carries its bytes, so the trace needs no compute binding for
+/// them (`research/docs/23` §3.6). The reviewed-shape validation runs before
+/// this point, so the translation cannot meet a shape the rails have not been
+/// reviewed against.
+fn render_inputs(
+    case: &RenderCase,
+    where_: &str,
+) -> Result<(Vec<BufferView>, Option<IndexBufferBinding>)> {
+    if render_geometry(case, where_)? == RenderGeometry::Milestone {
+        return Ok((Vec::new(), None));
+    }
+    let Some(definition) = case.vertex_buffers.first() else {
+        return Err(format!("{where_}: the reviewed shape is one vertex stream").into());
+    };
+    let vertex = BufferView {
+        view_id: ViewId::new(definition.view),
+        metal_binding: 0,
+        allocation_id: AllocationId::new(definition.allocation),
+        offset: definition.offset,
+        length: definition.length,
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(unhex(&definition.initial_hex)?),
+    };
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed vertex-input shape is indexed").into());
+    };
+    let format = match indices.format.as_str() {
+        "uint16" => IndexFormat::Uint16,
+        "uint32" => IndexFormat::Uint32,
+        other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
+    };
+    Ok((
+        vec![vertex],
+        Some(IndexBufferBinding {
+            view: BufferView {
+                view_id: ViewId::new(indices.view),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(indices.allocation),
+                offset: indices.offset,
+                length: indices.length,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(unhex(&indices.initial_hex)?),
+            },
+            format,
+        }),
+    ))
+}
+
 fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     let where_ = format!("render case {}", case.id);
     let attachment = &case.attachment;
@@ -1871,8 +2152,27 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     if attachment.store != "store" {
         return Err(format!("{where_}: a discarded attachment cannot be compared").into());
     }
-    if case.vertices != 3 {
-        return Err(format!("{where_}: expected the reviewed full-screen triangle").into());
+    let geometry = render_geometry(case, &where_)?;
+    match geometry {
+        RenderGeometry::Milestone => {
+            if case.vertices != 3 {
+                return Err(format!("{where_}: expected the reviewed full-screen triangle").into());
+            }
+        }
+        RenderGeometry::IndexedQuad => {
+            if case.vertices != QUAD_INDICES {
+                return Err(format!(
+                    "{where_}: the reviewed indexed quad draws {QUAD_INDICES} indices"
+                )
+                .into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a vertex-input case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
     }
     if case.viewport != [0, 0, attachment.width, attachment.height] {
         return Err(format!("{where_}: the viewport must cover the attachment").into());
@@ -1900,10 +2200,16 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             }
         }
     }
-    if case.vertex_entry != RENDER_MSL_VERTEX_ENTRY
-        || case.fragment_entry != RENDER_MSL_FRAGMENT_ENTRY
-    {
-        return Err(format!("{where_}: unreviewed render pipeline identity").into());
+    let reviewed_entries = match geometry {
+        RenderGeometry::Milestone => (RENDER_MSL_VERTEX_ENTRY, RENDER_MSL_FRAGMENT_ENTRY),
+        RenderGeometry::IndexedQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+    };
+    if (case.vertex_entry.as_str(), case.fragment_entry.as_str()) != reviewed_entries {
+        return Err(format!(
+            "{where_}: unreviewed render pipeline identity {:?}/{:?}",
+            case.vertex_entry, case.fragment_entry
+        )
+        .into());
     }
     let texels = unhex(&case.expected_hex)?;
     let extent = usize::try_from(
@@ -3100,6 +3406,10 @@ fn run_render_case(
     // case's own `icb` section belongs to its compute submission, not to this
     // trace, so it is replaced here rather than inherited.
     trace.indirect = render_icb_payload(case)?.map(Box::new);
+    // The pass's own vertex and index streams (`research/docs/23` §3.3). They
+    // carry their bytes, so the declaring case needs no extra binding and the
+    // reviewed-shape validation already pinned what the draw reads.
+    let (vertex_buffers, indices) = render_inputs(case, &format!("render case {}", case.id))?;
     let clear = unhex(
         attachment
             .clear_hex
@@ -3149,11 +3459,8 @@ fn run_render_case(
             u32::try_from(case.viewport[3])?,
         ],
         vertices: u32::try_from(case.vertices)?,
-        // The capture tool's vertex-input wiring is a later step of the same
-        // increment; until it lands the tool binds no caller-held stream, which
-        // is the shape every existing suite declares.
-        vertex_buffers: Vec::new(),
-        indices: None,
+        vertex_buffers,
+        indices,
         present,
     }));
 

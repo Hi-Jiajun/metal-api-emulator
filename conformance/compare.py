@@ -602,6 +602,73 @@ def _present_declaration(value, texel, where):
                               present=presented, sentinel=sentinel)
 
 
+def _vertex_input_declaration(case, where):
+    """Pin the reviewed vertex-input shape of a render case (`docs/23` §3.3).
+
+    Two geometries exist and no third: the milestone's `vertex_id` triangle
+    (no `vertex_layout` at all), and the reviewed indexed quad — one
+    `float32x2` position stream at stride eight bound at index 0, plus six
+    `uint16` or `uint32` indices whose values all name one of the four
+    vertices the stream carries. The rules mirror `provider-capture`'s
+    `render_geometry` and the Swift oracle's own validation, so a suite one
+    rail would refuse cannot pass here either.
+    """
+    quad_vertices, quad_indices, quad_stride = 4, 6, 8
+    layout = case.get("vertex_layout")
+    vertex_buffers = case.get("vertex_buffers", [])
+    indices = case.get("indices")
+    if layout is None:
+        _require(not vertex_buffers and indices is None,
+                 f"{where}: vertex buffers without a vertex layout describe no stream")
+        return None
+    _object(layout, ("buffers",), f"{where}.vertex_layout")
+    streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
+    _require(len(streams) == 1, f"{where}: the reviewed shape is one vertex stream")
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == quad_stride,
+             f"{where}: the reviewed stream has stride {quad_stride}")
+    attributes = _list(streams[0]["attributes"], f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 1, f"{where}: the reviewed stream has one attribute")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    attribute = attributes[0]
+    _require((attribute["location"], attribute["offset"], attribute["format"])
+             == (0, 0, "float32x2"),
+             f"{where}: the reviewed attribute is location 0, offset 0, float32x2")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed shape binds one vertex stream")
+    for position, binding in enumerate(bindings):
+        _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+                f"{where}.vertex_buffers[{position}]")
+        _require(binding["allocation"] > 0 and binding["view"] > 0,
+                 f"{where}: zero vertex stream identity")
+        _require(binding["length"] >= quad_stride * quad_vertices,
+                 f"{where}: the vertex stream is shorter than the reviewed quad reads")
+        _require(len(_hex(binding["initial_hex"],
+                          f"{where}.vertex_buffers[{position}].initial_hex")) == binding["length"],
+                 f"{where}: the vertex stream bytes do not match its length")
+        _require("format" not in binding,
+                 f"{where}: a vertex stream carries no index format")
+    _require(indices is not None, f"{where}: the reviewed vertex-input shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["allocation"] > 0 and indices["view"] > 0,
+             f"{where}: zero index buffer identity")
+    width = {"uint16": 2, "uint32": 4}.get(indices["format"])
+    _require(width is not None, f"{where}: unsupported index format")
+    _require(indices["length"] >= quad_indices * width,
+             f"{where}: the index buffer is shorter than the reviewed quad reads")
+    index_bytes = _hex(indices["initial_hex"], f"{where}.indices.initial_hex")
+    _require(len(index_bytes) == indices["length"],
+             f"{where}: the index bytes do not match their length")
+    for position in range(0, len(index_bytes), width):
+        chunk = index_bytes[position:position + width]
+        index = int.from_bytes(chunk, "little")
+        _require(index < quad_vertices,
+                 f"{where}: index {position // width} names vertex {index} outside the quad")
+    return {"vertices": quad_vertices, "indices": quad_indices}
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -634,7 +701,8 @@ def _render_plan(plan, suite):
                     "vertices", "viewport", "attachment", "expected_hex", "capture_rails")
         missing = [field for field in required if field not in case]
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
-        unexpected = sorted(set(case) - set(required) - {"present", "icb"})
+        unexpected = sorted(set(case) - set(required)
+                            - {"present", "icb", "vertex_layout", "vertex_buffers", "indices"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
@@ -678,7 +746,14 @@ def _render_plan(plan, suite):
                  f"{where}: the first render increment renders into a 2x2 attachment")
         _require(attachment.get("store") == "store",
                  f"{where}: a discarded attachment cannot be compared")
-        _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
+        vertex_input = _vertex_input_declaration(case, where)
+        if vertex_input is None:
+            _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
+        else:
+            _require(case["vertices"] == vertex_input["indices"],
+                     f"{where}: the reviewed indexed quad draws {vertex_input['indices']} indices")
+            _require("present" not in case and "icb" not in case,
+                     f"{where}: a vertex-input case carries neither a present action nor an ICB")
         viewport = _list(case["viewport"], f"{where}.viewport")
         _require(viewport == [0, 0, width, height],
                  f"{where}: the viewport must cover the attachment")

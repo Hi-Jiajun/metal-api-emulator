@@ -159,21 +159,29 @@ class RenderObservationTests(unittest.TestCase):
                          case["metal"]["sha256"])
         text = PROVIDER_PATH.read_text(encoding="utf-8")
         pinned = re.findall(r'include_bytes!\(\s*"([^"]*render_spv/[^"]+)"\s*\)', text)
-        self.assertEqual(len(pinned), 2, "the capture pins two stage modules")
+        # Two reviewed pairs: the milestone's `vertex_id` triangle, and the
+        # vertex-input quad (`research/docs/23` §3.3). Both are pinned by bytes
+        # rather than by name, which is what keeps a renamed module from
+        # slipping past the review.
+        self.assertEqual(len(pinned), 4, "the capture pins two reviewed stage pairs")
         for relative in pinned:
             module = (PROVIDER_PATH.parent / relative).resolve()
             self.assertTrue(module.is_file(), "pinned stage module is missing: " + relative)
             self.assertEqual(module.parent, SPV_DIRECTORY)
-        entries = re.findall(r'const RENDER_(?:VERTEX|FRAGMENT)_ENTRY: &str = "([^"]+)";', text)
-        self.assertEqual(entries, ["vertex_main", "fragment_main"])
-        self.assertEqual(len(set(entries)), 2, "core refuses equal stage entries")
+        entries = re.findall(
+            r'const (?:RENDER|QUAD)_(?:VERTEX|FRAGMENT)_ENTRY: &str = "([^"]+)";', text)
+        self.assertEqual(entries,
+                         ["vertex_main", "fragment_main", "vertex_buffer_main", "fragment_main"])
         vertex = (SPV_DIRECTORY / "fullscreen_triangle.vert.spv").read_bytes()
+        quad = (SPV_DIRECTORY / "quad_indexed.vert.spv").read_bytes()
         # The unorm8 fragment module serves both Rgba8Unorm and Bgra8Unorm,
         # which is why it is not named after one layout (see `render.rs`).
         fragment = (SPV_DIRECTORY / "solid_unorm8.frag.spv").read_bytes()
         # The reviewed SPIR-V sources declare these entries; the MSL entry names
         # are what the native rails compile, so the two identities are distinct.
         self.assertIn(b"vertex_main", vertex)
+        self.assertIn(b"vertex_buffer_main", quad)
+        self.assertNotIn(b"vertex_main", quad)
         self.assertIn(b"fragment_main", fragment)
         self.assertNotIn(b"render_fullscreen_triangle", vertex)
         self.assertNotIn(b"render_solid_unorm8", fragment)
