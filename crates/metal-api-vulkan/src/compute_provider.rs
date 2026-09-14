@@ -53,6 +53,10 @@ pub struct HeapPlacementObservation {
 struct HeapPlan {
     slab_size: u64,
     offsets: BTreeMap<u64, u64>,
+    /// Each owned allocation's full byte size from its `AllocationRecord`, so
+    /// the device buffer spans the whole allocation and matches the
+    /// placement's `byte_size` (`research/docs/25` §6 Step 3).
+    sizes: BTreeMap<u64, u64>,
     observations: Vec<HeapPlacementObservation>,
 }
 
@@ -259,13 +263,16 @@ impl VulkanComputeProvider {
         self.async_execution
     }
 
-    /// Heap placements this provider has executed, in submission order.
+    /// Heap placements the provider most recently executed successfully.
     ///
-    /// Each record names the heap, the owned allocation placed in it, and the
-    /// `[offset, offset + byte_size)` range it occupies. Two resources in the
-    /// same heap therefore appear as two records sharing one `heap_id`, which
-    /// is the falsifiable observation `research/docs/25` §6 Step 3 requires
-    /// rather than a "looks shared" assertion.
+    /// Every successful submission replaces the previous vector instead of
+    /// appending to it, so this stays bounded to one submission rather than
+    /// growing across a long-running process. Each record names the heap, the
+    /// owned allocation placed in it, and the `[offset, offset + byte_size)`
+    /// range it occupies. Two resources in the same heap therefore appear as
+    /// two records sharing one `heap_id`, which is the falsifiable observation
+    /// `research/docs/25` §6 Step 3 requires rather than a "looks shared"
+    /// assertion.
     pub fn heap_placement_observations(&self) -> Vec<HeapPlacementObservation> {
         self.heap_observations
             .lock()
@@ -982,6 +989,7 @@ impl VulkanComputeProvider {
         }
         let mut heap_ids = BTreeSet::<u64>::new();
         let mut offsets = BTreeMap::<u64, u64>::new();
+        let mut sizes = BTreeMap::<u64, u64>::new();
         let mut observations = Vec::with_capacity(owned.len());
         for (placement, allocation) in heap.placements.iter().zip(owned.iter()) {
             heap_ids.insert(placement.heap_id.get());
@@ -1009,6 +1017,7 @@ impl VulkanComputeProvider {
                 .with_field("allocation_size", FieldValue::Unsigned(record.size)));
             }
             offsets.insert(*allocation, placement.offset);
+            sizes.insert(*allocation, record.size);
             observations.push(HeapPlacementObservation {
                 heap_id: placement.heap_id,
                 allocation_id: AllocationId::new(*allocation),
@@ -1030,15 +1039,19 @@ impl VulkanComputeProvider {
         Ok(Some(HeapPlan {
             slab_size: heap.descriptor.size,
             offsets,
+            sizes,
             observations,
         }))
     }
 
     fn publish_heap_observations(&self, observations: Vec<HeapPlacementObservation>) {
-        self.heap_observations
+        // Keep only the latest successful submission's placements: each
+        // completed submission replaces the previous vector instead of
+        // appending, so a long-running process never grows an unbounded log.
+        *self
+            .heap_observations
             .lock()
-            .expect("heap observation lock poisoned")
-            .extend(observations);
+            .expect("heap observation lock poisoned") = observations;
     }
 }
 
@@ -1338,6 +1351,11 @@ impl ComputeProvider for VulkanComputeProvider {
                     // (`research/docs/25` §6 Step 3).
                     if let Some(plan) = &heap_plan {
                         if let Some(heap_offset) = plan.offsets.get(&resource.allocation_id.get()) {
+                            let allocation_size = plan
+                                .sizes
+                                .get(&resource.allocation_id.get())
+                                .copied()
+                                .ok_or_else(&overflow)?;
                             buffers.push(PoolBinding::HeapOwned {
                                 index,
                                 allocation: resource.allocation_id.get(),
@@ -1345,6 +1363,8 @@ impl ComputeProvider for VulkanComputeProvider {
                                 length: usize::try_from(resource.length).map_err(|_| overflow())?,
                                 access: resource.access,
                                 bytes: bytes.clone(),
+                                allocation_size: usize::try_from(allocation_size)
+                                    .map_err(|_| overflow())?,
                                 heap_offset: usize::try_from(*heap_offset)
                                     .map_err(|_| overflow())?,
                                 heap_size: usize::try_from(plan.slab_size)

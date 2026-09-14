@@ -2508,6 +2508,10 @@ pub(crate) enum PoolBinding {
     /// window. `heap_offset` is the buffer's base inside the slab and
     /// `heap_size` is the total slab byte size; both come straight from the
     /// trace's heap payload (`research/docs/25-heaps与ICB设计.md` §6 Step 3).
+    /// `allocation_size` is the allocation's full byte size from its
+    /// `AllocationRecord`: the device buffer spans exactly this many bytes so
+    /// the buffer extent and the placement's `byte_size` stay equal even when
+    /// a view addresses only a prefix of the allocation.
     HeapOwned {
         index: u32,
         allocation: u64,
@@ -2515,6 +2519,7 @@ pub(crate) enum PoolBinding {
         length: usize,
         access: metal_api_core::provider::BufferAccess,
         bytes: Vec<u8>,
+        allocation_size: usize,
         heap_offset: usize,
         heap_size: usize,
     },
@@ -2669,6 +2674,31 @@ fn resource_drop_policy(submitted: bool, completed: bool, device_lost: bool) -> 
     } else {
         ResourceDropPolicy::Destroy
     }
+}
+
+/// One teardown step for an interrupted heap-slab bind.
+///
+/// Vulkan requires every `VkBuffer` bound to a `VkDeviceMemory` be destroyed
+/// before that memory is freed, so the order below is load-bearing.
+#[derive(Debug, Eq, PartialEq)]
+enum HeapSlabCleanup {
+    Destroy(vk::Buffer),
+    Free,
+}
+
+/// Compute the teardown order for a heap slab whose `failing` buffer could not
+/// be bound: the failing buffer, then every buffer already bound by earlier
+/// iterations, and only then `Free`. Extracted as a pure function so a unit
+/// test can pin "free last" without a device.
+fn heap_slab_bind_failure_cleanup(
+    failing: vk::Buffer,
+    already_bound: &[vk::Buffer],
+) -> Vec<HeapSlabCleanup> {
+    let mut steps = Vec::with_capacity(already_bound.len() + 2);
+    steps.push(HeapSlabCleanup::Destroy(failing));
+    steps.extend(already_bound.iter().copied().map(HeapSlabCleanup::Destroy));
+    steps.push(HeapSlabCleanup::Free);
+    steps
 }
 
 struct ExecutionFailure {
@@ -3085,6 +3115,7 @@ impl ExecutionResources {
                     allocation,
                     offset,
                     length,
+                    allocation_size,
                     heap_offset,
                     heap_size,
                     ..
@@ -3094,10 +3125,29 @@ impl ExecutionResources {
                             "heap buffer {allocation} view range overflows usize"
                         ))
                     })?;
-                    heap_sizes
-                        .entry(*allocation)
-                        .and_modify(|size| *size = (*size).max(end))
-                        .or_insert(end);
+                    // The device buffer spans the allocation's full byte size
+                    // (`allocation_size`), not the largest view end, so the
+                    // buffer extent and the placement's `byte_size` agree
+                    // (`research/docs/25` §6 Step 3). Every view window is
+                    // already bounded by the allocation, but the check stays
+                    // here to keep the invariant local.
+                    if end > *allocation_size {
+                        return Err(failure(format!(
+                            "heap buffer {allocation} view ends at {end}, beyond its {allocation_size}-byte allocation"
+                        ))
+                        .into());
+                    }
+                    match heap_sizes.get(allocation) {
+                        Some(existing) if *existing != *allocation_size => {
+                            return Err(failure(format!(
+                                "heap allocation {allocation} has conflicting sizes {existing} and {allocation_size}"
+                            ))
+                            .into());
+                        }
+                        _ => {
+                            heap_sizes.insert(*allocation, *allocation_size);
+                        }
+                    }
                     match heap_offsets.get(allocation) {
                         Some(existing) if *existing != *heap_offset => {
                             return Err(failure(format!(
@@ -3385,17 +3435,31 @@ impl ExecutionResources {
         };
         self.heap_memory = Some(memory);
         self.heap_bytes = Some(slab_size);
+        let mut bound = Vec::<GpuBuffer>::with_capacity(pending.len());
+        let mut bound_buffers = Vec::<vk::Buffer>::with_capacity(pending.len());
         for head in pending {
             if let Err(error) = unsafe {
                 self.context
                     .device
                     .bind_buffer_memory(head.buffer, memory, head.offset as u64)
             } {
-                unsafe { self.context.device.destroy_buffer(head.buffer, None) };
-                self.heap_memory = None;
-                unsafe {
-                    self.context.device.free_memory(memory, None);
+                // Vulkan requires every buffer bound to this slab to be
+                // destroyed before the slab memory is freed. The earlier
+                // iterations' buffers are not in `self.buffers` yet, so the
+                // helper destroys them here, together with the buffer whose
+                // bind just failed, before freeing the slab.
+                for step in heap_slab_bind_failure_cleanup(head.buffer, &bound_buffers) {
+                    match step {
+                        HeapSlabCleanup::Destroy(buffer) => unsafe {
+                            self.context.device.destroy_buffer(buffer, None)
+                        },
+                        HeapSlabCleanup::Free => unsafe {
+                            self.context.device.free_memory(memory, None)
+                        },
+                    }
                 }
+                self.heap_memory = None;
+                self.heap_bytes = None;
                 return Err(ExecutionFailure::vulkan(
                     error,
                     format!(
@@ -3405,7 +3469,8 @@ impl ExecutionResources {
                 ));
             }
             self.context.record_buffer_upload();
-            self.buffers.push(GpuBuffer {
+            bound_buffers.push(head.buffer);
+            bound.push(GpuBuffer {
                 index: head.allocation,
                 buffer: head.buffer,
                 memory: vk::DeviceMemory::null(),
@@ -3416,6 +3481,7 @@ impl ExecutionResources {
                 uploaded_ranges: BTreeMap::new(),
             });
         }
+        self.buffers.extend(bound);
         Ok(())
     }
 
@@ -4386,7 +4452,27 @@ impl Drop for ExecutionResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle;
     use metal_api_core::provider::{FieldValue, Retryability};
+
+    #[test]
+    fn heap_bind_failure_frees_memory_after_every_buffer_is_destroyed() {
+        let failing = vk::Buffer::from_raw(3);
+        let bound = [vk::Buffer::from_raw(1), vk::Buffer::from_raw(2)];
+        let steps = heap_slab_bind_failure_cleanup(failing, &bound);
+        // The slab memory may only be freed after every buffer bound to it has
+        // been destroyed; `Free` must therefore be the final step.
+        assert_eq!(
+            steps,
+            vec![
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(3)),
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(1)),
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(2)),
+                HeapSlabCleanup::Free,
+            ]
+        );
+        assert!(matches!(steps.last(), Some(HeapSlabCleanup::Free)));
+    }
 
     /// Test-only helper: turn (metal_index, pool index) pairs into bindings,
     /// taking each binding's width from the pool it names.
