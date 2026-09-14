@@ -304,6 +304,28 @@ impl VulkanComputeProvider {
             .clone()
     }
 
+    /// Record one indirect replay, replacing whatever the previous submission
+    /// left behind (the same bounded shape the heap observation uses).
+    fn publish_icb_observation(
+        &self,
+        kind: IndirectCommandKind,
+        start: u32,
+        count: u32,
+        commands: u32,
+    ) {
+        let mut observations = self
+            .icb_observations
+            .lock()
+            .expect("icb observation lock poisoned");
+        observations.clear();
+        observations.push(IcbReplayObservation {
+            kind,
+            start,
+            count,
+            commands,
+        });
+    }
+
     /// Publish admission, terminal transitions and device health through
     /// `outbox`. The outbox must be scoped to this provider's device epoch.
     /// Without an outbox the provider keeps its in-process behavior.
@@ -756,20 +778,13 @@ impl VulkanComputeProvider {
                         )?;
                         // Publish what was actually replayed: the command kind,
                         // the range and the one command the first increment
-                        // encodes (`research/docs/25` §5.1). Like the heap
-                        // observation, a submission replaces the vector.
-                        let mut observations = self
-                            .icb_observations
-                            .lock()
-                            .expect("icb observation lock poisoned");
-                        observations.clear();
-                        observations.push(IcbReplayObservation {
-                            kind: payload.command.kind(),
-                            start: payload.range.start,
-                            count: payload.range.count,
-                            commands: 1,
-                        });
-                        drop(observations);
+                        // encodes (`research/docs/25` §5.1).
+                        self.publish_icb_observation(
+                            payload.command.kind(),
+                            payload.range.start,
+                            payload.range.count,
+                            1,
+                        );
                         texels
                     }
                     None => render::execute_render_pass(
@@ -1616,6 +1631,16 @@ impl ComputeProvider for VulkanComputeProvider {
                     },
                 )?
             };
+            // The indirect dispatch replay is encoded and submitted above, so
+            // this is the point where its record becomes true (`docs/25` §5.1).
+            if let Some(payload) = trace.indirect.as_deref() {
+                self.publish_icb_observation(
+                    payload.command.kind(),
+                    payload.range.start,
+                    payload.range.count,
+                    1,
+                );
+            }
             // The render rail completes inside `submit` even in deferred mode:
             // each render/present pass executes here, so a present tail's
             // acquire/present counters and the target's terminal layout are
@@ -1678,6 +1703,17 @@ impl ComputeProvider for VulkanComputeProvider {
             indirect_dispatch,
         )
         .and_then(|updates| {
+            // The compute dispatch -- direct or indirect -- is complete here,
+            // so an indirect replay's record becomes true at this point
+            // (`research/docs/25` §5.1).
+            if let Some(payload) = trace.indirect.as_deref() {
+                self.publish_icb_observation(
+                    payload.command.kind(),
+                    payload.range.start,
+                    payload.range.count,
+                    1,
+                );
+            }
             // Compute and render writebacks share one channel and one rule: one
             // complete writeback per written view, keyed by identity. A view
             // both rails could have written is refused by core admission

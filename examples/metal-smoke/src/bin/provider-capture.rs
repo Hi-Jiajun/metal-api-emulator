@@ -867,6 +867,11 @@ struct Case {
     heap: Option<HeapCase>,
     #[serde(default)]
     capture_rails: Option<Vec<String>>,
+    /// Optional indirect-command section (`research/docs/25` §4.3). A compute
+    /// case that carries it replays its single dispatch from one encoded
+    /// command instead of `vkCmdDispatch`.
+    #[serde(default)]
+    icb: Option<IcbCase>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1474,6 +1479,9 @@ fn main() -> Result<()> {
         result.copy_out = Some(u32::try_from(after.1 - before.1)?);
         if case.heap.is_some() {
             result.heap = Some(heap_segment(counters.heap_observations())?);
+        }
+        if case.icb.is_some() {
+            result.icb = Some(icb_segment(counters.icb_observations())?);
         }
         results.push(result);
     }
@@ -2634,7 +2642,7 @@ fn case_trace(
         passes: passes.into_iter().map(TracePass::Compute).collect(),
         completion_policy: CompletionPolicy::HostReadback,
         heap: case_heap_payload(case)?.map(Box::new),
-        indirect: None,
+        indirect: compute_icb_payload(case)?.map(Box::new),
     })
 }
 
@@ -2646,7 +2654,70 @@ fn case_trace(
 /// it, which is what makes the provider's `same_slab` observation meaningful.
 const HEAP_PLACEMENT_ID: HeapId = HeapId::new(61);
 
-/// Translate a suite case's heap section into the trace payload
+/// Translate a compute case's indirect section into the trace payload
+/// (`research/docs/25` §4.3). The first increment replays exactly one dispatch,
+/// and the encoded threadgroups have to be the pass's own group count: the
+/// provider checks the same equality, so a suite cannot replay a dispatch whose
+/// footprint proofs were computed for a different shape.
+fn compute_icb_payload(case: &Case) -> Result<Option<IndirectCommandPayload>> {
+    let Some(icb) = &case.icb else {
+        return Ok(None);
+    };
+    if icb.kind != "dispatch" {
+        return Err(format!(
+            "case {}: a compute case's indirect section replays a dispatch",
+            case.id
+        )
+        .into());
+    }
+    if !icb.kinds.iter().any(|kind| kind == "dispatch") {
+        return Err(format!(
+            "case {}: the indirect buffer does not admit its own command kind",
+            case.id
+        )
+        .into());
+    }
+    let dispatches = dispatch_sequence(case);
+    if dispatches.len() != 1 {
+        return Err(format!(
+            "case {}: the first indirect increment replays exactly one dispatch",
+            case.id
+        )
+        .into());
+    }
+    let (x, y, z) = (
+        icb.command.x.ok_or_else(|| -> Box<dyn Error> {
+            format!("case {}: the dispatch command needs x", case.id).into()
+        })?,
+        icb.command.y.ok_or_else(|| -> Box<dyn Error> {
+            format!("case {}: the dispatch command needs y", case.id).into()
+        })?,
+        icb.command.z.ok_or_else(|| -> Box<dyn Error> {
+            format!("case {}: the dispatch command needs z", case.id).into()
+        })?,
+    );
+    if icb.command.vertex_count.is_some() || icb.command.instance_count.is_some() {
+        return Err(format!(
+            "case {}: a dispatch command carries no draw parameters",
+            case.id
+        )
+        .into());
+    }
+    Ok(Some(IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: icb.max_commands,
+            kinds: vec![IndirectCommandKind::Dispatch],
+        },
+        command: IndirectCommandDescriptor::Dispatch {
+            threadgroups: [x, y, z],
+        },
+        range: IndirectCommandRange {
+            start: icb.range.start,
+            count: icb.range.count,
+        },
+    }))
+}
+
 /// Translate a render case's indirect section into the trace payload
 /// (`research/docs/25` §4.3). Only the draw kind reaches a render case in the
 /// first increment; the command parameters are required by kind.
@@ -2926,10 +2997,10 @@ fn run_render_case(
     )?;
     // The indirect section replays the render pass's own triangle from one
     // encoded command (`research/docs/25` §6 Step 4); the attachment shape and
-    // every other validation stay the ones the direct case uses.
-    if let Some(payload) = render_icb_payload(case)? {
-        trace.indirect = Some(Box::new(payload));
-    }
+    // every other validation stay the ones the direct case uses. The declaring
+    // case's own `icb` section belongs to its compute submission, not to this
+    // trace, so it is replaced here rather than inherited.
+    trace.indirect = render_icb_payload(case)?.map(Box::new);
     let clear = unhex(
         attachment
             .clear_hex
