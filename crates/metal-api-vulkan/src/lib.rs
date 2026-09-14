@@ -1539,10 +1539,24 @@ pub(crate) fn execute_pipeline_sequence_with_status(
         artifacts,
         &buffers,
         dispatches,
-        None,
-        textures,
+        SequenceTail {
+            borrowed: None,
+            textures,
+            indirect_dispatch: None,
+        },
         queue_index,
     )
+}
+
+/// The trailing inputs a pool-sequence submission carries beyond the core
+/// pipeline/buffer/dispatch arguments. Grouped so the executor entry points
+/// stay under the project's seven-argument ceiling while the provider still
+/// passes borrowed leases, sampled textures, and the optional indirect
+/// dispatch as one unit.
+pub(crate) struct SequenceTail<'a> {
+    pub borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    pub textures: &'a [metal_api_core::provider::TextureView],
+    pub indirect_dispatch: Option<[u32; 3]>,
 }
 
 /// Execute a pool whose bindings are either provider-owned copies or owner
@@ -1556,8 +1570,7 @@ pub(crate) fn execute_pool_sequence_with_status(
     artifacts: &[Arc<VulkanPipelineArtifact>],
     buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
-    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
-    textures: &[metal_api_core::provider::TextureView],
+    tail: SequenceTail<'_>,
     queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
     for artifact in artifacts {
@@ -1567,15 +1580,8 @@ pub(crate) fn execute_pool_sequence_with_status(
             )));
         }
     }
-    let result = execute_submission_stages(
-        context,
-        artifacts,
-        buffers,
-        dispatches,
-        borrowed,
-        textures,
-        queue_index,
-    );
+    let result =
+        execute_submission_stages(context, artifacts, buffers, dispatches, tail, queue_index);
     if result
         .as_ref()
         .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
@@ -1594,19 +1600,11 @@ fn execute_submission_stages(
     artifacts: &[Arc<VulkanPipelineArtifact>],
     buffers: &[PoolBinding],
     dispatches: &[BoundDispatch],
-    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
-    textures: &[metal_api_core::provider::TextureView],
+    tail: SequenceTail<'_>,
     queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
-    let mut pending = PendingExecution::submit(
-        context,
-        queue_index,
-        artifacts,
-        buffers,
-        dispatches,
-        borrowed,
-        textures,
-    )?;
+    let mut pending =
+        PendingExecution::submit(context, queue_index, artifacts, buffers, dispatches, tail)?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
         context.mark_unobservable_submission();
         return Err(ExecutionFailure::vulkan(
@@ -1643,11 +1641,10 @@ impl PendingExecution {
         artifacts: &[Arc<VulkanPipelineArtifact>],
         buffers: &[PoolBinding],
         dispatches: &[BoundDispatch],
-        borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
-        textures: &[metal_api_core::provider::TextureView],
+        tail: SequenceTail<'_>,
     ) -> Result<Self, ProviderError> {
         let mut resources = ExecutionResources::new(Arc::clone(context));
-        resources.set_borrowed_leases(borrowed);
+        resources.set_borrowed_leases(tail.borrowed);
         let translated = artifacts
             .iter()
             .map(|artifact| &artifact.translated)
@@ -1655,6 +1652,31 @@ impl PendingExecution {
         let planned =
             plan_pipeline_sequence(&translated, buffers, &context.properties.limits, dispatches)?;
         let plans = &planned.plans;
+        if let Some(threadgroups) = tail.indirect_dispatch {
+            // One indirect command replays exactly one full-workgroup region:
+            // a single `vkCmdDispatchIndirect` launches one workgroup count at
+            // one local size, so a plan split into partial-tail regions (or
+            // spread over several compute passes) has no faithful indirect
+            // equivalent. The encoded threadgroups must also equal the planned
+            // count, otherwise the footprint proof would describe a different
+            // launch than the one the rail replays.
+            let [plan] = plans.as_slice() else {
+                return Err(indirect_command_refusal(
+                    "an indirect dispatch replays exactly one compute pass",
+                ));
+            };
+            let [region] = plan.regions.as_slice() else {
+                return Err(indirect_command_refusal(
+                    "an indirect dispatch replays a single full-workgroup region",
+                ));
+            };
+            if region.group_count != threadgroups {
+                return Err(indirect_command_refusal(format!(
+                    "indirect dispatch threadgroups {threadgroups:?} disagree with the planned group count {:?}",
+                    region.group_count
+                )));
+            }
+        }
         if plans.iter().all(|plan| plan.regions.is_empty()) {
             return Ok(Self {
                 resources,
@@ -1681,11 +1703,16 @@ impl PendingExecution {
         };
         resources.create_buffers(buffers).map_err(encode_error)?;
         resources
-            .create_textures(textures, dispatches)
+            .create_textures(tail.textures, dispatches)
             .map_err(encode_error)?;
         resources
             .create_descriptors(&translated, dispatches)
             .map_err(encode_error)?;
+        if let Some(threadgroups) = tail.indirect_dispatch {
+            resources
+                .create_indirect_dispatch(threadgroups)
+                .map_err(encode_error)?;
+        }
         resources
             .record(&translated, plans, queue_index)
             .map_err(encode_error)?;
@@ -1751,6 +1778,21 @@ fn dispatch_args_error(error: ExecutorError) -> ProviderError {
         "vulkan-dispatch-args",
         CompletionDisposition::NotSubmitted,
     )
+}
+
+/// The capability refusal the compute rail publishes when an indirect dispatch
+/// cannot be faithfully replayed (`research/docs/25` §4.3). It mirrors the
+/// render rail's `icb_command_unsupported` so both rails name the same slug for
+/// the same "well-formed but wider than this increment" class.
+fn indirect_command_refusal(detail: impl Into<String>) -> ProviderError {
+    let mut error = ProviderError::new(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "icb_command_unsupported",
+    )
+    .expect("static provider refusal slug");
+    error.retryability = Retryability::Never;
+    error.with_detail(detail.into())
 }
 
 fn validate_serial_dispatches(
@@ -2661,6 +2703,11 @@ struct ExecutionResources {
     /// Pool key to its window in `buffers`. `research/docs/15` §3.
     /// Pool key (kind plus index) to its window in `buffers` or `textures`.
     view_windows: BTreeMap<PoolKey, ViewWindow>,
+    /// The host-visible `INDIRECT_BUFFER` an indirect dispatch replays from.
+    /// Null when this submission dispatches directly (`research/docs/25` §6
+    /// Step 4).
+    indirect_buffer: vk::Buffer,
+    indirect_memory: vk::DeviceMemory,
     borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
 }
 
@@ -3029,6 +3076,8 @@ impl ExecutionResources {
             heap_bytes: None,
             textures: Vec::new(),
             view_windows: BTreeMap::new(),
+            indirect_buffer: vk::Buffer::null(),
+            indirect_memory: vk::DeviceMemory::null(),
             borrowed: None,
         }
     }
@@ -4100,6 +4149,93 @@ impl ExecutionResources {
         Ok(())
     }
 
+    /// Encode one `VkDispatchIndirectCommand` into a host-visible
+    /// `INDIRECT_BUFFER` the compute rail replays with `vkCmdDispatchIndirect`
+    /// (`research/docs/25` §6 Step 4). The command is written by the CPU once
+    /// and unmapped, mirroring `render::create_indirect_draw`: this is the ICB
+    /// *equivalent*, not a `VK_EXT_device_generated_commands` device command.
+    fn create_indirect_dispatch(&mut self, threadgroups: [u32; 3]) -> Result<(), ExecutionFailure> {
+        let command = vk::DispatchIndirectCommand {
+            x: threadgroups[0],
+            y: threadgroups[1],
+            z: threadgroups[2],
+        };
+        let byte_length = std::mem::size_of::<vk::DispatchIndirectCommand>() as u64;
+        let info = vk::BufferCreateInfo::default()
+            .size(byte_length)
+            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create indirect buffer: {error}"))
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate indirect memory: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind indirect memory: {error}"),
+            ));
+        }
+        let mapping = match unsafe {
+            self.context.device.map_memory(
+                memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map indirect memory: {error}"),
+                ));
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &command as *const vk::DispatchIndirectCommand as *const u8,
+                mapping.cast::<u8>(),
+                byte_length as usize,
+            );
+            self.context.device.unmap_memory(memory);
+        }
+        self.indirect_buffer = buffer;
+        self.indirect_memory = memory;
+        Ok(())
+    }
+
     fn record(
         &mut self,
         translated: &[&TranslatedComputePipeline],
@@ -4220,12 +4356,22 @@ impl ExecutionResources {
                             region.local_size, region.group_count, region.thread_base
                         );
                     }
-                    self.context.device.cmd_dispatch(
-                        self.command,
-                        region.group_count[0],
-                        region.group_count[1],
-                        region.group_count[2],
-                    );
+                    if self.indirect_buffer == vk::Buffer::null() {
+                        self.context.device.cmd_dispatch(
+                            self.command,
+                            region.group_count[0],
+                            region.group_count[1],
+                            region.group_count[2],
+                        );
+                    } else {
+                        // The indirect replay reads the workgroup count the CPU
+                        // encoded above from the host-visible `INDIRECT_BUFFER`.
+                        self.context.device.cmd_dispatch_indirect(
+                            self.command,
+                            self.indirect_buffer,
+                            0,
+                        );
+                    }
                 }
             }
             // Fence retirement establishes execution completion; this barrier
@@ -4447,6 +4593,17 @@ impl Drop for ExecutionResources {
                 self.context.device.destroy_image_view(texture.view, None);
                 self.context.device.destroy_image(texture.image, None);
                 self.context.device.free_memory(texture.memory, None);
+            }
+            // The indirect buffer is unbound by construction (its memory is
+            // freed right after), so destroy before free, matching the render
+            // rail's `create_indirect_draw` teardown.
+            if self.indirect_buffer != vk::Buffer::null() {
+                self.context
+                    .device
+                    .destroy_buffer(self.indirect_buffer, None);
+            }
+            if self.indirect_memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.indirect_memory, None);
             }
         }
     }
