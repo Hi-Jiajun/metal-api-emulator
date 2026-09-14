@@ -67,14 +67,18 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
-        // Vertex input is not executed yet: the rail still draws the
-        // `vertex_id` triangle, so the three bits stay at "cannot read a
-        // caller-held stream" until the vertex-input rail lands
-        // (`research/docs/23` §3.3). A pass that binds one is refused during
-        // core admission, not silently executed with generated positions.
-        max_vertex_buffers: 0,
-        supported_vertex_formats: Vec::new(),
-        supported_index_formats: Vec::new(),
+        // Vertex input is executed (`render.rs` uploads each bound pool view,
+        // builds the pipeline's vertex input state from the contract layout and
+        // issues `vkCmdBindVertexBuffers` + `vkCmdDrawIndexed`). Evidence:
+        // `tests/render_e2e.rs` reads the 2x2 attachment back as `40 80 c0 ff`
+        // four times from the reviewed `quad_indexed` module on Lavapipe, and
+        // the same suite rail on the RTX 5060. The bits name the rail's own
+        // limits — the contract's binding cap and both closed format families —
+        // so a wider request is still refused by core admission
+        // (`research/docs/23` §3.3).
+        max_vertex_buffers: metal_api_core::provider::MAX_VERTEX_BUFFERS as u32,
+        supported_vertex_formats: metal_api_core::provider::VertexFormat::ADMITTED.to_vec(),
+        supported_index_formats: metal_api_core::provider::IndexFormat::ADMITTED.to_vec(),
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

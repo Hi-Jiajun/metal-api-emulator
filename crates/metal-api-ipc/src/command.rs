@@ -1430,9 +1430,9 @@ mod tests {
         RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
         StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
         TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
-        VertexBufferBinding, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
-        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS,
+        PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1926,6 +1926,35 @@ mod tests {
         trace
     }
 
+    /// The reviewed quad's vertex stream: four `float32x2` positions, declared
+    /// by the render pass itself (`research/docs/23` §3.6).
+    fn vertex_stream_view() -> BufferView {
+        BufferView {
+            view_id: ViewId::new(41),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(43),
+            offset: 0,
+            length: 32,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 32]),
+        }
+    }
+
+    /// The reviewed quad's index buffer: six `uint16` indices.
+    fn index_stream_view() -> BufferView {
+        BufferView {
+            view_id: ViewId::new(45),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(47),
+            offset: 0,
+            length: 12,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 12]),
+        }
+    }
+
     /// The fixture's render contract extended with the reviewed quad's vertex
     /// layout (`research/docs/23` §3.3).
     fn vertex_input_render_contract() -> RenderPipelineContract {
@@ -1951,13 +1980,9 @@ mod tests {
             panic!("the fixture is a render pass");
         };
         pass.vertices = 6;
-        pass.vertex_buffers = vec![VertexBufferBinding {
-            view_id: ViewId::new(41),
-            allocation_id: AllocationId::new(43),
-        }];
+        pass.vertex_buffers = vec![vertex_stream_view()];
         pass.indices = Some(IndexBufferBinding {
-            view_id: ViewId::new(45),
-            allocation_id: AllocationId::new(47),
+            view: index_stream_view(),
             format: IndexFormat::Uint16,
         });
         trace

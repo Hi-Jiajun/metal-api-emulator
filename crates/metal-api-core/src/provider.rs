@@ -1453,41 +1453,73 @@ impl IndexFormat {
     }
 }
 
-/// One vertex buffer bound for a render pass, by view identity.
+/// One index buffer bound for a render pass: the bytes plus the width of the
+/// indices they hold.
 ///
-/// The pass references a view the trace already declares (the same rule
-/// [`RenderAttachment`] follows): the bytes come from the trace's resource
-/// pool, whose view carries the range and source, while the pass states only
-/// which view sits at this binding index. The index is positional — entry `i`
-/// of [`RenderPassDescriptor::vertex_buffers`] is binding `i` — so no
-/// binding-index field can disagree with the layout's own indexing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VertexBufferBinding {
-    pub view_id: ViewId,
-    pub allocation_id: AllocationId,
+/// A render input declares its own source rather than referencing a view a
+/// compute binding happens to carry (`research/docs/23` §3.6): the object API
+/// can bind a caller's buffer into a trace that has no compute pass at all, and
+/// the bytes then still travel with the trace, exactly as a compute pass's own
+/// bindings do. `metal_binding` is not meaningful for an index buffer and must
+/// be zero, and the view is read-only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexBufferBinding {
+    pub view: BufferView,
+    pub format: IndexFormat,
 }
 
-impl VertexBufferBinding {
+impl IndexBufferBinding {
     pub fn validate_shape(&self) -> Result<(), ContractError> {
-        if self.view_id.is_zero() {
-            return Err(ContractError::InvalidIdentity("vertex buffer view id"));
+        self.view.validate_shape()?;
+        if self.view.metal_binding != 0 {
+            return Err(ContractError::IndexBufferBindingMismatch {
+                metal_binding: self.view.metal_binding,
+            });
         }
-        if self.allocation_id.is_zero() {
-            return Err(ContractError::InvalidIdentity(
-                "vertex buffer allocation id",
-            ));
+        if self.view.access != BufferAccess::Read {
+            return Err(ContractError::RenderInputAccessUnsupported {
+                kind: RenderInputKind::IndexBuffer,
+                binding: 0,
+                access: self.view.access,
+            });
+        }
+        if !self.format.is_admitted() {
+            return Err(ContractError::UnsupportedIndexFormat(self.format));
         }
         Ok(())
     }
 }
 
-/// One index buffer bound for a render pass: a view identity plus the width of
-/// the indices it holds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IndexBufferBinding {
-    pub view_id: ViewId,
-    pub allocation_id: AllocationId,
-    pub format: IndexFormat,
+/// Validate one vertex stream bound at `index`.
+///
+/// The entry's position in [`RenderPassDescriptor::vertex_buffers`] is the
+/// binding index both rails use, so the view's own `metal_binding` has to agree
+/// with it: a trace that binds stream 1's bytes at index 0 would otherwise draw
+/// a layout the pipeline's vertex input state does not describe. The stream is
+/// read-only for the same reason an index buffer is.
+pub fn validate_vertex_buffer_binding(
+    index: usize,
+    view: &BufferView,
+) -> Result<(), ContractError> {
+    view.validate_shape()?;
+    let expected = u32::try_from(index).map_err(|_| ContractError::VertexBufferLimitExceeded {
+        requested: index,
+        maximum: MAX_VERTEX_BUFFERS,
+    })?;
+    if view.metal_binding != expected {
+        return Err(ContractError::VertexBufferBindingMismatch {
+            index,
+            metal_binding: view.metal_binding,
+        });
+    }
+    if view.access != BufferAccess::Read {
+        return Err(ContractError::RenderInputAccessUnsupported {
+            kind: RenderInputKind::VertexBuffer,
+            binding: view.metal_binding,
+            access: view.access,
+        });
+    }
+    Ok(())
 }
 
 /// Which render input a resolution refusal is about.
@@ -1509,21 +1541,6 @@ impl RenderInputKind {
             Self::VertexBuffer => "vertex buffer",
             Self::IndexBuffer => "index buffer",
         }
-    }
-}
-
-impl IndexBufferBinding {
-    pub fn validate_shape(&self) -> Result<(), ContractError> {
-        if self.view_id.is_zero() {
-            return Err(ContractError::InvalidIdentity("index buffer view id"));
-        }
-        if self.allocation_id.is_zero() {
-            return Err(ContractError::InvalidIdentity("index buffer allocation id"));
-        }
-        if !self.format.is_admitted() {
-            return Err(ContractError::UnsupportedIndexFormat(self.format));
-        }
-        Ok(())
     }
 }
 
@@ -1631,11 +1648,12 @@ pub struct RenderPassDescriptor {
     /// pipeline declares [`VertexLayout::None`], where positions come from
     /// `vertex_id`.
     ///
-    /// Unlike a compute pass's binding, the pass states no `metal_binding`: the
-    /// position *is* the binding, so a trace cannot bind stream 1's range at
-    /// index 0. The bytes come from the trace's pool view this entry names,
-    /// exactly as an attachment's do.
-    pub vertex_buffers: Vec<VertexBufferBinding>,
+    /// Each entry is a read-only [`BufferView`] that carries its own bytes, so
+    /// an object-API trace needs no compute pass to declare them. The entry's
+    /// position is the binding index, and
+    /// [`validate_vertex_buffer_binding`] holds the view's own `metal_binding`
+    /// to it.
+    pub vertex_buffers: Vec<BufferView>,
     /// Index buffer this pass draws through, or `None` for a non-indexed draw.
     /// When present, [`Self::vertices`] is the index count.
     pub indices: Option<IndexBufferBinding>,
@@ -1675,8 +1693,8 @@ impl RenderPassDescriptor {
                 maximum: MAX_VERTEX_BUFFERS,
             });
         }
-        for binding in &self.vertex_buffers {
-            binding.validate_shape()?;
+        for (index, binding) in self.vertex_buffers.iter().enumerate() {
+            validate_vertex_buffer_binding(index, binding)?;
         }
         if let Some(indices) = &self.indices {
             indices.validate_shape()?;
@@ -4155,12 +4173,11 @@ impl ComputeTrace {
                 });
             }
         }
-        // Render vertex and index buffers resolve the same way an attachment
-        // does: the trace has to declare the view, the declaration has to agree
-        // about the allocation, and no compute write may overlap the bytes the
-        // draw reads (`research/docs/23` §3.3). The bytes themselves come from
-        // the declared view, so an undeclared stream would otherwise be read as
-        // whatever the provider happened to have uploaded.
+        // Render vertex and index buffers declare their own bytes, so the only
+        // questions left are the ones an ordering rule answers: no compute
+        // binding may write bytes the draw reads, and no compute pass after the
+        // render pass may bind overlapping bytes (`research/docs/23` §3.6). They
+        // join the same pool budget the declared views and attachments spend.
         for (pass_index, pass) in self.passes.iter().enumerate() {
             let Some(pass) = pass.as_render() else {
                 continue;
@@ -4168,56 +4185,22 @@ impl ComputeTrace {
             let inputs = pass
                 .vertex_buffers
                 .iter()
-                .map(|binding| {
-                    (
-                        RenderInputKind::VertexBuffer,
-                        binding.view_id,
-                        binding.allocation_id,
-                    )
-                })
-                .chain(pass.indices.iter().map(|indices| {
-                    (
-                        RenderInputKind::IndexBuffer,
-                        indices.view_id,
-                        indices.allocation_id,
-                    )
-                }));
-            for (kind, view_id, allocation_id) in inputs {
-                let Some(declarations) = declared.get(&view_id) else {
-                    return Err(ContractError::RenderInputViewUnknown {
-                        pass_index,
-                        view: view_id,
-                        allocation: allocation_id,
-                        kind,
-                    });
-                };
-                for declaration in declarations {
-                    if declaration.allocation_id() != allocation_id {
-                        return Err(ContractError::RenderInputViewAllocationMismatch {
-                            pass_index,
-                            view: view_id,
-                            kind,
-                            declared: declaration.allocation_id(),
-                            referenced: allocation_id,
-                        });
-                    }
-                }
-                let ranges = declarations
-                    .iter()
-                    .map(|declaration| declaration.byte_range())
-                    .collect::<Vec<_>>();
+                .map(|view| (RenderInputKind::VertexBuffer, view))
+                .chain(
+                    pass.indices
+                        .iter()
+                        .map(|indices| (RenderInputKind::IndexBuffer, &indices.view)),
+                );
+            for (kind, view) in inputs {
+                let range = BufferRange::new(view.allocation_id, view.offset, view.length);
                 for (compute_view, others) in &declared {
                     for other in others {
-                        if !other.is_writable()
-                            || !ranges
-                                .iter()
-                                .any(|range| range.overlaps(&other.byte_range()))
-                        {
+                        if !other.is_writable() || !range.overlaps(&other.byte_range()) {
                             continue;
                         }
                         return Err(ContractError::RenderInputComputeConflict {
                             pass_index,
-                            view: view_id,
+                            view: view.view_id,
                             kind,
                             compute_view: *compute_view,
                             compute_pass: other.pass_index(),
@@ -4226,26 +4209,30 @@ impl ComputeTrace {
                 }
                 for (compute_view, others) in &declared {
                     for other in others {
-                        if other.pass_index() <= pass_index
-                            || !ranges
-                                .iter()
-                                .any(|range| range.overlaps(&other.byte_range()))
+                        if other.pass_index() <= pass_index || !range.overlaps(&other.byte_range())
                         {
                             continue;
                         }
                         return Err(ContractError::RenderPassOrderUnsupported {
                             pass_index,
                             compute_pass: other.pass_index(),
-                            view: view_id,
+                            view: view.view_id,
                             compute_view: *compute_view,
                         });
                     }
                 }
-                if pool.insert(view_id) && pool.len() > MAX_SERIAL_RESOURCES {
-                    return Err(ContractError::SerialResourceLimit {
-                        requested: pool.len(),
-                        maximum: MAX_SERIAL_RESOURCES,
-                    });
+                // A compute binding may declare the same view. The bytes then
+                // have to agree, exactly as they do for a view a second compute
+                // pass rebinds: one view id names one byte range in a serial
+                // trace.
+                if let Some(initial) = initial_buffers.get(&view.view_id) {
+                    if view.allocation_id != initial.allocation_id
+                        || view.offset != initial.offset
+                        || view.length != initial.length
+                        || view.source != initial.source
+                    {
+                        return Err(ContractError::SerialBufferRebinding { pass_index });
+                    }
                 }
             }
         }
@@ -4297,20 +4284,20 @@ impl ComputeTrace {
             };
         }
         // Render vertex and index buffers read their views, so a view a compute
-        // pass declared write-only has to become readable before the pool is
-        // uploaded: a view that cannot read uploads nothing, and the render rail
-        // would then read bytes the trace never put in device memory
-        // (`research/docs/23` §3.3). A view the trace does not declare is left
-        // alone here — the render rail refuses it by name, the same way it
-        // refuses an undeclared attachment.
+        // pass already declared has to become readable before the pool is
+        // uploaded: a view that cannot read uploads nothing, and a compute
+        // binding that happens to be the same view would leave the render rail
+        // reading a buffer it never uploaded. A stream no compute binding
+        // declares stays out of this pool on purpose — the render rail uploads
+        // the pass's own bytes, and the pool is the compute rail's binding set
+        // (`research/docs/23` §3.6).
         for pass in self.render_passes() {
             let inputs = pass
                 .vertex_buffers
                 .iter()
-                .map(|binding| binding.view_id)
-                .chain(pass.indices.iter().map(|indices| indices.view_id));
-            for view_id in inputs {
-                let Some(&position) = positions.get(&view_id) else {
+                .chain(pass.indices.iter().map(|indices| &indices.view));
+            for view in inputs {
+                let Some(&position) = positions.get(&view.view_id) else {
                     continue;
                 };
                 let resource = &mut resources[position];
@@ -5612,6 +5599,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "index_format_unsupported",
         ),
+        E::RenderInputAccessUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_input_access_unsupported",
+        ),
         E::EmptyVertexLayout
         | E::ZeroVertexStride { .. }
         | E::EmptyVertexBufferLayout { .. }
@@ -5619,8 +5610,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::DuplicateVertexAttribute { .. }
         | E::VertexAttributeOutOfRange { .. }
         | E::VertexLayoutBindingMismatch { .. }
-        | E::RenderInputViewUnknown { .. }
-        | E::RenderInputViewAllocationMismatch { .. }
+        | E::VertexBufferBindingMismatch { .. }
+        | E::IndexBufferBindingMismatch { .. }
         | E::RenderInputComputeConflict { .. } => (
             ProviderErrorClass::Args,
             "trace_contract_invalid",
@@ -7196,22 +7187,23 @@ pub enum ContractError {
         pipeline_buffers: usize,
         pass_buffers: usize,
     },
-    /// A vertex or index binding names a view the trace never declares, so no
-    /// rail knows which bytes the draw would read.
-    RenderInputViewUnknown {
-        pass_index: usize,
-        view: ViewId,
-        allocation: AllocationId,
-        kind: RenderInputKind,
+    /// A vertex stream's own binding label does not match its position in the
+    /// pass's binding list.
+    VertexBufferBindingMismatch {
+        index: usize,
+        metal_binding: u32,
     },
-    /// A vertex or index binding and the trace's declaration of the same view
-    /// disagree about which allocation the view lives in.
-    RenderInputViewAllocationMismatch {
-        pass_index: usize,
-        view: ViewId,
+    /// An index buffer carries a `metal_binding` label, which is not meaningful
+    /// for one.
+    IndexBufferBindingMismatch {
+        metal_binding: u32,
+    },
+    /// A render input is not read-only, so the draw's bytes would be a write the
+    /// ordering rules do not describe.
+    RenderInputAccessUnsupported {
         kind: RenderInputKind,
-        declared: AllocationId,
-        referenced: AllocationId,
+        binding: u32,
+        access: BufferAccess,
     },
     /// A compute binding writes bytes the draw reads, so the draw would observe
     /// a value the trace's order does not define.
@@ -7693,25 +7685,24 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render pipeline declares {pipeline_buffers} vertex buffer layouts, but the pass binds {pass_buffers}"
             ),
-            Self::RenderInputViewUnknown {
-                pass_index,
-                view,
-                allocation,
-                kind,
+            Self::VertexBufferBindingMismatch {
+                index,
+                metal_binding,
             } => write!(
                 formatter,
-                "render pass {pass_index} {} view {view:?} (allocation {allocation:?}) is not declared by this trace",
-                kind.name()
+                "vertex buffer {index} carries binding label {metal_binding}, but its position is its binding"
             ),
-            Self::RenderInputViewAllocationMismatch {
-                pass_index,
-                view,
+            Self::IndexBufferBindingMismatch { metal_binding } => write!(
+                formatter,
+                "index buffer carries binding label {metal_binding}, but an index buffer has no binding index"
+            ),
+            Self::RenderInputAccessUnsupported {
                 kind,
-                declared,
-                referenced,
+                binding,
+                access,
             } => write!(
                 formatter,
-                "render pass {pass_index} {} view {view:?} references allocation {referenced:?}, but the trace declares it as {declared:?}",
+                "render {} {binding} is declared {access:?}, but a draw only reads its inputs",
                 kind.name()
             ),
             Self::RenderInputComputeConflict {
@@ -12236,10 +12227,18 @@ mod tests {
         }])
     }
 
-    fn quad_binding(view: u64, allocation: u64) -> VertexBufferBinding {
-        VertexBufferBinding {
-            view_id: ViewId::new(view),
+    /// One read-only render input view: identity, range and bytes in one value
+    /// (`research/docs/23` §3.6).
+    fn stream_view(view_id: u64, binding: u32, allocation: u64, length: usize) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(view_id),
+            metal_binding: binding,
             allocation_id: AllocationId::new(allocation),
+            offset: 0,
+            length: length as u64,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; length]),
         }
     }
 
@@ -12248,10 +12247,9 @@ mod tests {
     fn indexed_quad_pass() -> RenderPassDescriptor {
         let mut pass = render_pass();
         pass.vertices = 6;
-        pass.vertex_buffers = vec![quad_binding(41, 43)];
+        pass.vertex_buffers = vec![stream_view(41, 0, 43, 32)];
         pass.indices = Some(IndexBufferBinding {
-            view_id: ViewId::new(45),
-            allocation_id: AllocationId::new(47),
+            view: stream_view(45, 0, 47, 12),
             format: IndexFormat::Uint16,
         });
         pass
@@ -12413,7 +12411,7 @@ mod tests {
         // A pass that binds a second stream the layout does not describe is a
         // caller-fixable disagreement, not a driver decision.
         let mut extra = pass.clone();
-        extra.vertex_buffers.push(quad_binding(49, 51));
+        extra.vertex_buffers.push(stream_view(49, 1, 51, 32));
         assert_eq!(
             contract.validate_against(&extra),
             Err(ContractError::VertexLayoutBindingMismatch {
@@ -12446,10 +12444,10 @@ mod tests {
     }
 
     #[test]
-    fn render_pass_refuses_vertex_buffers_beyond_its_own_caps() {
+    fn render_pass_refuses_render_input_shapes_it_cannot_read() {
         let mut pass = render_pass();
         pass.vertex_buffers = (0..=MAX_VERTEX_BUFFERS as u64)
-            .map(|index| quad_binding(41 + index, 43 + index))
+            .map(|index| stream_view(41 + index, index as u32, 43 + index, 32))
             .collect();
         assert_eq!(
             pass.validate(),
@@ -12459,22 +12457,49 @@ mod tests {
             })
         );
 
-        let mut zero_view = render_pass();
-        zero_view.vertex_buffers = vec![quad_binding(0, 43)];
+        // The binding index is the stream's position, so a view whose own
+        // `metal_binding` label disagrees with it cannot reach a rail.
+        let mut mislabelled = render_pass();
+        mislabelled.vertex_buffers = vec![stream_view(41, 1, 43, 32)];
         assert_eq!(
-            zero_view.validate(),
-            Err(ContractError::InvalidIdentity("vertex buffer view id"))
+            mislabelled.validate(),
+            Err(ContractError::VertexBufferBindingMismatch {
+                index: 0,
+                metal_binding: 1,
+            })
         );
 
-        let mut zero_index = render_pass();
-        zero_index.indices = Some(IndexBufferBinding {
-            view_id: ViewId::new(45),
-            allocation_id: AllocationId::new(0),
+        let mut zero_view = render_pass();
+        zero_view.vertex_buffers = vec![stream_view(0, 0, 43, 32)];
+        assert_eq!(
+            zero_view.validate(),
+            Err(ContractError::InvalidIdentity("buffer view id"))
+        );
+
+        // A render input is read-only: a writable stream would be a write the
+        // ordering rules do not describe.
+        let mut writable = render_pass();
+        let mut view = stream_view(41, 0, 43, 32);
+        view.access = BufferAccess::Write;
+        writable.vertex_buffers = vec![view];
+        assert_eq!(
+            writable.validate(),
+            Err(ContractError::RenderInputAccessUnsupported {
+                kind: RenderInputKind::VertexBuffer,
+                binding: 0,
+                access: BufferAccess::Write,
+            })
+        );
+
+        // An index buffer carries no binding label at all.
+        let mut labelled_index = render_pass();
+        labelled_index.indices = Some(IndexBufferBinding {
+            view: stream_view(45, 2, 47, 12),
             format: IndexFormat::Uint16,
         });
         assert_eq!(
-            zero_index.validate(),
-            Err(ContractError::InvalidIdentity("index buffer allocation id"))
+            labelled_index.validate(),
+            Err(ContractError::IndexBufferBindingMismatch { metal_binding: 2 })
         );
 
         // A draw over a caller-held stream still has to cover an attachment:
@@ -12759,43 +12784,13 @@ mod tests {
         provider
     }
 
-    /// One read-only stream view of its own allocation, the way a declaring
-    /// case spells a vertex or index buffer.
-    fn stream_view(view_id: u64, binding: u32, allocation_id: u64, length: usize) -> BufferView {
-        BufferView {
-            view_id: ViewId::new(view_id),
-            metal_binding: binding,
-            allocation_id: AllocationId::new(allocation_id),
-            offset: 0,
-            length: length as u64,
-            access: BufferAccess::Read,
-            attribute_stride: None,
-            source: BufferSource::OwnedBytes(vec![0; length]),
-        }
-    }
-
-    /// The attachment fixture extended with the reviewed quad's resolvable
-    /// streams: the declaring compute case carries both views and the render
-    /// pass binds them.
+    /// The attachment fixture extended with the reviewed quad's streams.
+    ///
+    /// The streams are declared by the render pass itself, so the declaring
+    /// compute case carries only the attachment landing and the scratch write
+    /// its own kernel reflects (`research/docs/23` §3.6).
     fn vertex_input_trace() -> ComputeTrace {
         let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
-        for binding in [1_u32, 2] {
-            value.pipelines[0]
-                .contract
-                .buffer_bindings
-                .push(BufferBindingContract {
-                    metal_binding: binding,
-                    access: BufferAccess::Read,
-                    footprint: FootprintProof::Affine {
-                        accesses: Vec::new(),
-                    },
-                });
-        }
-        let compute = compute_passes_mut(&mut value)
-            .next()
-            .expect("the fixture declares one compute pass");
-        compute.buffers.push(stream_view(41, 1, 43, 32));
-        compute.buffers.push(stream_view(45, 2, 47, 12));
         value.pipelines[0]
             .render
             .as_mut()
@@ -12803,10 +12798,9 @@ mod tests {
             .vertex_layout = quad_layout();
         let pass = render_entry(&mut value);
         pass.vertices = 6;
-        pass.vertex_buffers = vec![quad_binding(41, 43)];
+        pass.vertex_buffers = vec![stream_view(41, 0, 43, 32)];
         pass.indices = Some(IndexBufferBinding {
-            view_id: ViewId::new(45),
-            allocation_id: AllocationId::new(47),
+            view: stream_view(45, 0, 47, 12),
             format: IndexFormat::Uint16,
         });
         value
@@ -12865,91 +12859,91 @@ mod tests {
     }
 
     #[test]
-    fn render_inputs_resolve_against_the_traces_own_declarations() {
+    fn render_inputs_stay_out_of_the_compute_pool_and_obey_the_hazard_rules() {
         let value = vertex_input_trace();
-        let pool = value.serial_resources().expect("the streams resolve");
+        let pool = value.serial_resources().expect("the trace resolves");
+        // The streams declare their own bytes, so the compute rail's pool does
+        // not carry them: the render rail uploads the pass's own views, and the
+        // pool stays the set a compute pass is allowed to bind
+        // (`research/docs/23` §3.6).
         assert!(
-            pool.iter().any(|view| view.view_id == ViewId::new(41)),
-            "the vertex stream joins the pool"
+            !pool
+                .iter()
+                .any(|view| view.view_id == ViewId::new(41) || view.view_id == ViewId::new(45)),
+            "a render-only stream is not a compute pool entry: {pool:?}"
         );
-        assert!(
-            pool.iter().any(|view| view.view_id == ViewId::new(45)),
-            "the index stream joins the pool"
-        );
-
-        // An undeclared stream is refused rather than read as whatever the
-        // provider happened to upload.
-        let mut undeclared = value.clone();
-        render_entry(&mut undeclared).vertex_buffers[0].view_id = ViewId::new(99);
         assert_eq!(
-            undeclared.serial_resources(),
-            Err(ContractError::RenderInputViewUnknown {
-                pass_index: 1,
-                view: ViewId::new(99),
-                allocation: AllocationId::new(43),
-                kind: RenderInputKind::VertexBuffer,
-            })
+            pool.iter()
+                .filter(|view| view.view_id == ViewId::new(7))
+                .count(),
+            1,
+            "the attachment landing stays the only pooled view"
         );
 
-        // A declaration that disagrees about the allocation is a caller-fixable
-        // mismatch, not a provider decision.
-        let mut mismatch = value.clone();
-        render_entry(&mut mismatch).indices = Some(IndexBufferBinding {
-            view_id: ViewId::new(45),
-            allocation_id: AllocationId::new(48),
-            format: IndexFormat::Uint16,
-        });
-        assert_eq!(
-            mismatch.serial_resources(),
-            Err(ContractError::RenderInputViewAllocationMismatch {
-                pass_index: 1,
-                view: ViewId::new(45),
-                kind: RenderInputKind::IndexBuffer,
-                declared: AllocationId::new(47),
-                referenced: AllocationId::new(48),
-            })
-        );
-
-        // A compute pass that writes bytes the draw reads would hand the
+        // A compute binding that writes bytes the draw reads would hand the
         // fragment stage a value no ordering rule defines.
         let mut conflicting = value.clone();
+        let mut overlapping = stream_view(41, 1, 43, 32);
+        overlapping.access = BufferAccess::ReadWrite;
         compute_passes_mut(&mut conflicting)
             .next()
             .expect("one compute pass")
-            .buffers[2]
-            .access = BufferAccess::ReadWrite;
-        conflicting.pipelines[0].contract.buffer_bindings[2].access = BufferAccess::ReadWrite;
+            .buffers
+            .push(overlapping);
+        conflicting.pipelines[0]
+            .contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: BufferAccess::ReadWrite,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            });
         assert_eq!(
             conflicting.serial_resources(),
             Err(ContractError::RenderInputComputeConflict {
                 pass_index: 1,
-                view: ViewId::new(45),
-                kind: RenderInputKind::IndexBuffer,
-                compute_view: ViewId::new(45),
+                view: ViewId::new(41),
+                kind: RenderInputKind::VertexBuffer,
+                compute_view: ViewId::new(41),
                 compute_pass: 0,
             })
         );
     }
 
     #[test]
-    fn an_unused_stream_becomes_readable_in_the_pool() {
-        // A declaring case may carry a view the compute pass does not read. The
-        // render pass does read it, so the pool entry has to become readable or
-        // the provider uploads nothing for it (`research/docs/23` §3.3), and the
-        // draw would read bytes the trace never put in device memory.
+    fn a_compute_declared_stream_keeps_its_identity_and_becomes_readable() {
+        // A declaring case may bind the same view without reading it. The render
+        // pass does read it, so the pool entry keeps the declaration's identity
+        // and becomes readable — otherwise the provider uploads nothing for it
+        // and the draw reads bytes the trace never put in device memory
+        // (`research/docs/23` §3.6).
         let mut value = vertex_input_trace();
+        let mut unused = stream_view(41, 1, 43, 32);
+        unused.access = BufferAccess::Unused;
         compute_passes_mut(&mut value)
             .next()
             .expect("one compute pass")
-            .buffers[1]
-            .access = BufferAccess::Unused;
-        value.pipelines[0].contract.buffer_bindings[1].access = BufferAccess::Unused;
+            .buffers
+            .push(unused);
+        value.pipelines[0]
+            .contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: BufferAccess::Unused,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            });
         let pool = value.serial_resources().expect("the pool resolves");
         let vertex = pool
             .iter()
             .find(|view| view.view_id == ViewId::new(41))
             .expect("the vertex stream is in the pool");
         assert_eq!(vertex.access, BufferAccess::Read);
+        assert_eq!(vertex.length, 32);
     }
     fn admitted_completion() -> CompletionDisposition {
         CompletionDisposition::CompletedVisible {

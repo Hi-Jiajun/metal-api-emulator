@@ -30,11 +30,12 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId, PipelineId,
-    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass, VertexLayout, ViewId,
+    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
+    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId,
+    LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, RenderAttachment,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
+    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
@@ -1017,5 +1018,331 @@ fn a_presenting_trace_is_refused_when_the_snapshot_declares_no_presentation() {
         .unwrap_err();
     eprintln!("present bits off: refused: {refused:?}");
     assert_eq!(refused.slug, "present_targets_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+}
+
+// ---------------------------------------------------------------------------
+// Vertex input: caller-held vertex and index buffers (`research/docs/23`
+// §3.3). The rail uploads each bound pool view, builds the pipeline's vertex
+// input state from the contract layout and issues `vkCmdBindVertexBuffers` +
+// `vkCmdDrawIndexed`.
+// ---------------------------------------------------------------------------
+
+/// Vertex stage of the vertex-input rail: `spirv-as` output of
+/// `render_spv/quad_indexed.vert.spvasm` (entry `vertex_buffer_main`). It reads
+/// `vec2` position from location 0 — i.e. from the caller's vertex buffer —
+/// rather than generating positions from `gl_VertexIndex`.
+const QUAD_VERT_SPV: &[u8] = include_bytes!("../src/render_spv/quad_indexed.vert.spv");
+
+const VERTEX_VIEW: ViewId = ViewId::new(703);
+const VERTEX_ALLOCATION: AllocationId = AllocationId::new(803);
+const INDEX_VIEW: ViewId = ViewId::new(704);
+const INDEX_ALLOCATION: AllocationId = AllocationId::new(804);
+
+/// The fragment output the reviewed quad stores, in the attachment's own byte
+/// order: `(64/255, 128/255, 192/255, 1)` as tightly packed `Rgba8Unorm`.
+const QUAD_TEXEL: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
+
+/// Two `float32` components per vertex, four vertices: the reviewed stream.
+fn quad_vertex_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    for (x, y) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        bytes.extend_from_slice(&x.to_ne_bytes());
+        bytes.extend_from_slice(&y.to_ne_bytes());
+    }
+    bytes
+}
+
+/// The same stream collapsed onto one NDC corner: a draw that reads the
+/// caller's bytes covers no pixel centre, while a `vertex_id` triangle would
+/// still cover all four texels. This is what makes "the stream was read"
+/// falsifiable.
+fn collapsed_vertex_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    for _ in 0..4 {
+        bytes.extend_from_slice(&(-1.0_f32).to_ne_bytes());
+        bytes.extend_from_slice(&(-1.0_f32).to_ne_bytes());
+    }
+    bytes
+}
+
+/// Two `uint16` triangles over the four corners: `0,1,2` and `1,3,2`.
+fn quad_index_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12);
+    for index in [0_u16, 1, 2, 1, 3, 2] {
+        bytes.extend_from_slice(&index.to_ne_bytes());
+    }
+    bytes
+}
+
+/// The reviewed vertex layout: one `float32x2` position stream, stride eight.
+fn quad_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![VertexBufferLayout {
+        stride: 8,
+        attributes: vec![VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }],
+    }])
+}
+
+/// A provider with the reviewed vertex-input pipeline registered plus the trace
+/// and resource table that bind `vertex_bytes` and `index_bytes`.
+fn vertex_input_fixture(
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
+    let executor = executor()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let fixture_digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, fixture_digest(b"render_e2e_quad_compute"))
+        .expect("the compute pipeline registers");
+    let render = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_buffer_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_format: AttachmentFormat::Rgba8Unorm,
+                vertex_layout: quad_layout(),
+            },
+            vertex_spirv: QUAD_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
+            logical_digest: fixture_digest(b"render_e2e_quad_stages"),
+        })
+        .expect("the vertex-input render pipeline registers");
+
+    let mut pass = render_pass(render.pipeline_id, AttachmentFormat::Rgba8Unorm, 2, 2);
+    pass.vertices = 6;
+    pass.vertex_buffers = vec![BufferView {
+        view_id: VERTEX_VIEW,
+        metal_binding: 0,
+        allocation_id: VERTEX_ALLOCATION,
+        offset: 0,
+        length: u64::try_from(vertex_bytes.len()).expect("stream length"),
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(vertex_bytes.clone()),
+    }];
+    pass.indices = Some(IndexBufferBinding {
+        view: BufferView {
+            view_id: INDEX_VIEW,
+            metal_binding: 0,
+            allocation_id: INDEX_ALLOCATION,
+            offset: 0,
+            length: u64::try_from(index_bytes.len()).expect("index length"),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(index_bytes.clone()),
+        },
+        format: IndexFormat::Uint16,
+    });
+
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(12),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: 16,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16_u64),
+        (SCRATCH_ALLOCATION, 8),
+        (VERTEX_ALLOCATION, 32),
+        (INDEX_ALLOCATION, 12),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+
+    Some((provider, trace, resources))
+}
+
+/// Submit one vertex-input trace through admission and collect its writebacks.
+fn submit_vertex_input(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+    resources: &ResourceTableSnapshot,
+) -> Vec<(ViewId, Vec<u8>)> {
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the vertex-input trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(trace)
+        .expect("the writebacks cover the trace");
+    submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect()
+}
+
+#[test]
+fn indexed_quad_reads_the_caller_streams_and_lands_the_attachment() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quad_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("indexed quad readback: {}", hex(&attachment));
+    assert_eq!(attachment.len(), 16);
+    for texel in attachment.chunks_exact(4) {
+        assert_eq!(texel, QUAD_TEXEL, "every texel is the fragment output");
+    }
+    assert!(
+        !attachment
+            .chunks_exact(4)
+            .any(|texel| texel == CLEAR_SENTINEL),
+        "the clear sentinel is fully covered: {}",
+        hex(&attachment)
+    );
+}
+
+#[test]
+fn the_draw_reads_the_caller_bytes_rather_than_vertex_id() {
+    // The falsification for "the rail still draws the milestone triangle": the
+    // same pipeline, the same index buffer, but a vertex stream collapsed onto
+    // one corner. Every texel keeps the clear sentinel, which a `vertex_id`
+    // triangle could not produce.
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(collapsed_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("collapsed quad readback: {}", hex(&attachment));
+    for texel in attachment.chunks_exact(4) {
+        assert_eq!(
+            texel,
+            CLEAR_SENTINEL,
+            "a degenerate draw leaves the sentinel: {}",
+            hex(&attachment)
+        );
+    }
+}
+
+#[test]
+fn vertex_input_refusals_name_the_stream_that_cannot_be_read() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quad_vertex_bytes(), quad_index_bytes())
+    else {
+        return;
+    };
+
+    // A stream whose source is not the trace's own bytes: the first increment
+    // does not upload a lease for a render input, so the rail refuses it by name
+    // instead of reading device memory the trace never provided.
+    let mut leased = trace.clone();
+    if let Some(TracePass::Render(pass)) = leased.passes.last_mut() {
+        pass.vertex_buffers[0].source = BufferSource::StagedLease(LeaseId::new(7));
+    }
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased, resources.clone())
+        .expect("a staged lease is a well-formed declaration");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a lease-backed vertex stream is not executed in this increment");
+    eprintln!("lease-backed stream refused: {refused:?}");
+    assert_eq!(refused.slug, "render_vertex_buffer_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+    // An index view too short for the draw's index count: the rail proves the
+    // footprint before touching the device.
+    let mut short_index = trace.clone();
+    if let Some(TracePass::Render(pass)) = short_index.passes.last_mut() {
+        let indices = pass.indices.as_mut().expect("the fixture is indexed");
+        indices.view.length = 4;
+        indices.view.source = BufferSource::OwnedBytes(vec![0; 4]);
+    }
+    let refused = match provider
+        .capabilities()
+        .validate_trace(short_index, resources.clone())
+    {
+        Ok(admitted) => provider
+            .submit(admitted)
+            .expect_err("a four-byte index view cannot cover six indices"),
+        Err(error) => error,
+    };
+    eprintln!("short index view refused: {refused:?}");
+    assert_eq!(refused.slug, "render_index_buffer_footprint_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+
+    // An index that names a vertex the bound stream does not cover: the
+    // footprint proof is what makes the read safe rather than merely bound.
+    let mut out_of_range = quad_index_bytes();
+    out_of_range[0..2].copy_from_slice(&4_u16.to_ne_bytes());
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture(quad_vertex_bytes(), out_of_range)
+    else {
+        return;
+    };
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the trace is well formed");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("index 4 names a fifth vertex the 32-byte stream does not hold");
+    eprintln!("out-of-range index refused: {refused:?}");
+    assert_eq!(refused.slug, "render_vertex_buffer_footprint_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 }

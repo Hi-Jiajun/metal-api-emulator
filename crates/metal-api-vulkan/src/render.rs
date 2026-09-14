@@ -25,9 +25,10 @@
 
 use ash::vk;
 use metal_api_core::provider::{
-    AttachmentFormat, ClearColor, FieldValue, IndirectCommandDescriptor, LoadOp, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability,
-    StoreOp,
+    AttachmentFormat, BufferSource, BufferView, ClearColor, FieldValue, IndexFormat,
+    IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp, VertexBufferLayout,
+    VertexFormat,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -131,6 +132,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub clear: ClearColor,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
+    /// The caller-held vertex streams the pass binds, in binding order
+    /// (`research/docs/23` §3.3). Empty for the `vertex_id` milestone.
+    pub vertex_streams: Vec<VertexStream<'a>>,
+    /// How the draw issues when [`Self::indirect`] is `None`.
+    pub draw: DrawShape,
+    /// The caller-held index buffer, when the draw is indexed.
+    pub index_stream: Option<IndexStream<'a>>,
     /// When set, the full-screen triangle is replayed from one CPU-encoded
     /// indirect command instead of being issued with `vkCmdDraw`
     /// (`research/docs/25` §6 Step 4). `Draw` carries the command's vertex and
@@ -138,6 +146,39 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `DrawIndexed` carries its index and instance counts and replays through
     /// the rail's own `[0, 1, 2]` index buffer.
     pub indirect: Option<IndirectReplay>,
+}
+
+/// One caller-held vertex stream: the layout the pipeline is built from plus
+/// the pool view whose bytes the draw reads.
+///
+/// The view is the trace's own declaration, so the bytes, their range and the
+/// footprint proof come from one place. `offset` inside the view is what the
+/// bind call uses; the first increment uploads the view's bytes into their own
+/// device buffer, so the offset is zero by construction.
+pub(crate) struct VertexStream<'a> {
+    pub layout: &'a VertexBufferLayout,
+    pub view: &'a BufferView,
+}
+
+/// One caller-held index buffer: its width and the pool view holding it.
+pub(crate) struct IndexStream<'a> {
+    pub format: IndexFormat,
+    pub view: &'a BufferView,
+}
+
+/// How an offscreen pass issues its direct draw.
+///
+/// The three shapes are the reviewed ones: the `vertex_id` milestone triangle,
+/// a non-indexed draw over caller-held streams, and an indexed draw over them.
+/// An indirect replay replaces all three (`Self::indirect`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DrawShape {
+    /// The milestone's full-screen triangle, positions from `vertex_id`.
+    Milestone,
+    /// A non-indexed draw over the bound vertex streams.
+    Vertices { vertex_count: u32 },
+    /// An indexed draw through the bound index buffer.
+    Indexed { index_count: u32 },
 }
 
 /// The indirect command one offscreen pass replays (`research/docs/25` §6
@@ -311,7 +352,7 @@ pub(crate) fn execute_render_pass(
 /// through a weaker gate than the offscreen one.
 fn prepare_render_request<'a>(
     stages: &'a RenderStages,
-    pass: &RenderPassDescriptor,
+    pass: &'a RenderPassDescriptor,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
@@ -361,6 +402,91 @@ fn prepare_render_request<'a>(
     }
     let width = narrow_dimension(attachment.width)?;
     let height = narrow_dimension(attachment.height)?;
+    // Vertex input (`research/docs/23` §3.3): every bound stream declares its
+    // own bytes, so the rail proves the footprint the draw reads and refuses
+    // anything the reviewed shape does not cover.
+    let streams = resolve_vertex_streams(stages, pass)?;
+    let (draw, index_stream) = match &pass.indices {
+        Some(indices) => {
+            let view = &indices.view;
+            let required = u64::from(pass.vertices)
+                .checked_mul(indices.format.bytes())
+                .ok_or_else(|| contract_refusal("index buffer footprint overflows u64"))?;
+            if view.length < required {
+                return Err(
+                    capability_refusal("render_index_buffer_footprint_unsupported")
+                        .with_field(
+                            "index_count",
+                            FieldValue::Unsigned(u64::from(pass.vertices)),
+                        )
+                        .with_field("required_bytes", FieldValue::Unsigned(required))
+                        .with_field("declared_bytes", FieldValue::Unsigned(view.length))
+                        .with_detail(
+                            "the draw reads more index bytes than the view the trace declares",
+                        ),
+                );
+            }
+            let index_values = decode_indices(view, indices.format, pass.vertices)?;
+            for stream in &streams {
+                let vertex_capacity = stream.view.length / stream.layout.stride;
+                if let Some(index) = index_values
+                    .iter()
+                    .find(|index| u64::from(**index) >= vertex_capacity)
+                {
+                    return Err(
+                        capability_refusal("render_vertex_buffer_footprint_unsupported")
+                            .with_field("index", FieldValue::Unsigned(u64::from(*index)))
+                            .with_field("vertex_capacity", FieldValue::Unsigned(vertex_capacity))
+                            .with_field("stride", FieldValue::Unsigned(stream.layout.stride))
+                            .with_field("declared_bytes", FieldValue::Unsigned(stream.view.length))
+                            .with_detail(
+                                "the index buffer names a vertex the bound stream does not cover",
+                            ),
+                    );
+                }
+            }
+            (
+                DrawShape::Indexed {
+                    index_count: pass.vertices,
+                },
+                Some(IndexStream {
+                    format: indices.format,
+                    view,
+                }),
+            )
+        }
+        None => {
+            for stream in &streams {
+                let required = u64::from(pass.vertices)
+                    .checked_mul(stream.layout.stride)
+                    .ok_or_else(|| contract_refusal("vertex buffer footprint overflows u64"))?;
+                if stream.view.length < required {
+                    return Err(
+                        capability_refusal("render_vertex_buffer_footprint_unsupported")
+                            .with_field(
+                                "vertex_count",
+                                FieldValue::Unsigned(u64::from(pass.vertices)),
+                            )
+                            .with_field("required_bytes", FieldValue::Unsigned(required))
+                            .with_field("declared_bytes", FieldValue::Unsigned(stream.view.length))
+                            .with_detail(
+                                "the draw reads more vertex bytes than the view the trace declares",
+                            ),
+                    );
+                }
+            }
+            if streams.is_empty() {
+                (DrawShape::Milestone, None)
+            } else {
+                (
+                    DrawShape::Vertices {
+                        vertex_count: pass.vertices,
+                    },
+                    None,
+                )
+            }
+        }
+    };
     let request = OffscreenRenderRequest {
         format: attachment.format,
         extent: [width, height],
@@ -369,9 +495,108 @@ fn prepare_render_request<'a>(
             entry: &stages.contract.vertex_entry,
             spirv: &stages.vertex_spirv,
         },
+        vertex_streams: streams,
+        draw,
+        index_stream,
         indirect: None,
     };
     Ok(request)
+}
+
+/// Pair the pipeline's layout with the pass's bound streams.
+///
+/// Core admission already refused a pass whose binding count disagrees with the
+/// layout, and this rail re-runs `validate_against` before reaching here, so the
+/// zip is length-checked by construction. What is added is the rail's own
+/// minimum: a stream has to hold at least one vertex, and the source has to be
+/// trace-owned bytes, because the first vertex-input increment uploads the
+/// trace's own bytes rather than a lease.
+fn resolve_vertex_streams<'a>(
+    stages: &'a RenderStages,
+    pass: &'a RenderPassDescriptor,
+) -> Result<Vec<VertexStream<'a>>, ProviderError> {
+    let mut streams = Vec::with_capacity(pass.vertex_buffers.len());
+    for (index, (view, layout)) in pass
+        .vertex_buffers
+        .iter()
+        .zip(stages.contract.vertex_layout.buffers())
+        .enumerate()
+    {
+        if layout.stride == 0 {
+            return Err(contract_refusal("vertex buffer declares a zero stride"));
+        }
+        if !matches!(view.source, BufferSource::OwnedBytes(_)) {
+            return Err(capability_refusal("render_vertex_buffer_unsupported")
+                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_detail("the first vertex-input increment executes trace-owned bytes only"));
+        }
+        if view.length < layout.stride {
+            return Err(
+                capability_refusal("render_vertex_buffer_footprint_unsupported")
+                    .with_field("binding", FieldValue::Unsigned(index as u64))
+                    .with_field("required_bytes", FieldValue::Unsigned(layout.stride))
+                    .with_field("declared_bytes", FieldValue::Unsigned(view.length))
+                    .with_detail("one vertex does not fit in the view the trace declares"),
+            );
+        }
+        streams.push(VertexStream { layout, view });
+    }
+    Ok(streams)
+}
+
+/// The Vulkan index type for one contract index width.
+fn indices_format(format: IndexFormat) -> vk::IndexType {
+    match format {
+        IndexFormat::Uint16 => vk::IndexType::UINT16,
+        IndexFormat::Uint32 => vk::IndexType::UINT32,
+    }
+}
+
+/// The `VkFormat` one contract vertex format names.
+///
+/// Like [`indices_format`], this is a closed translation with no default arm:
+/// a contract format that gains no arm here is a compile error rather than a
+/// silently misread stream.
+fn vertex_vk_format(format: VertexFormat) -> Result<vk::Format, ProviderError> {
+    Ok(match format {
+        VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
+        VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
+        VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
+        VertexFormat::Uint32 => vk::Format::R32_UINT,
+    })
+}
+
+/// Read the `count` indices the draw consumes out of one pool view.
+///
+/// The bytes are the trace's own (`BufferSource::OwnedBytes`, whose length
+/// `BufferView::validate_shape` already pinned to the view's length), so this
+/// is a pure translation. The values feed the footprint proof: every index has
+/// to name a vertex the bound stream covers.
+fn decode_indices(
+    view: &BufferView,
+    format: IndexFormat,
+    count: u32,
+) -> Result<Vec<u32>, ProviderError> {
+    let BufferSource::OwnedBytes(bytes) = &view.source else {
+        return Err(capability_refusal("render_index_buffer_unsupported")
+            .with_detail("the first vertex-input increment executes trace-owned bytes only"));
+    };
+    let width = usize::try_from(format.bytes()).expect("index widths are two or four");
+    let count = usize::try_from(count).map_err(|_| contract_refusal("index count overflows"))?;
+    let mut indices = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(width).take(count) {
+        indices.push(match format {
+            IndexFormat::Uint16 => u32::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
+            IndexFormat::Uint32 => u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+        });
+    }
+    if indices.len() != count {
+        return Err(
+            capability_refusal("render_index_buffer_footprint_unsupported")
+                .with_detail("the index view is shorter than the draw's index count"),
+        );
+    }
+    Ok(indices)
 }
 
 /// Execute one admitted render pass whose full-screen triangle is replayed from
@@ -631,8 +856,11 @@ pub(crate) fn execute_offscreen_render(
         &fragment_words,
         &vertex_entry,
         &fragment_entry,
+        &request.vertex_streams,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
+    objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
+    objects.draw = request.draw;
     match request.indirect {
         Some(IndirectReplay::Draw {
             vertex_count,
@@ -1061,8 +1289,11 @@ pub(crate) fn execute_present_render(
         &fragment_words,
         &vertex_entry,
         &fragment_entry,
+        &request.vertex_streams,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
+    objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
+    objects.draw = request.draw;
     objects.create_command_pool(queue_index)?;
     objects.record(request.format, request.clear, width, height)?;
     objects.submit_and_wait(queue_index)?;
@@ -1147,6 +1378,18 @@ struct OffscreenObjects<'a> {
     /// indirect draw. Null for a direct or non-indexed draw.
     index_buffer: vk::Buffer,
     index_memory: vk::DeviceMemory,
+    /// The caller-held vertex streams the pass binds, in binding order
+    /// (`research/docs/23` §3.3). Each entry is the device buffer holding one
+    /// pool view's bytes; empty for the `vertex_id` milestone.
+    vertex_inputs: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// The caller-held index buffer, when the draw is indexed.
+    input_index_buffer: vk::Buffer,
+    input_index_memory: vk::DeviceMemory,
+    /// How the draw issues: the milestone triangle, a vertex-buffer draw or an
+    /// indexed one. An indirect replay replaces it.
+    draw: DrawShape,
+    /// Index width of the caller-held index buffer.
+    input_index_type: vk::IndexType,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
@@ -1174,6 +1417,11 @@ impl<'a> OffscreenObjects<'a> {
             indirect_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
             index_memory: vk::DeviceMemory::null(),
+            vertex_inputs: Vec::new(),
+            input_index_buffer: vk::Buffer::null(),
+            input_index_memory: vk::DeviceMemory::null(),
+            draw: DrawShape::Milestone,
+            input_index_type: vk::IndexType::UINT16,
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1328,6 +1576,7 @@ impl<'a> OffscreenObjects<'a> {
         fragment_words: &[u32],
         vertex_entry: &CStr,
         fragment_entry: &CStr,
+        vertex_streams: &[VertexStream<'_>],
     ) -> Result<(), ProviderError> {
         self.vertex_module = unsafe {
             self.context.device.create_shader_module(
@@ -1354,7 +1603,42 @@ impl<'a> OffscreenObjects<'a> {
                 .module(self.fragment_module)
                 .name(fragment_entry),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        // The vertex input state is derived from the pipeline's own layout, so
+        // the state the pipeline is built with and the buffers `record` binds
+        // come from one description (`research/docs/23` §3.3). A `vertex_id`
+        // pipeline declares no binding and keeps the empty state exactly.
+        let mut binding_descriptions = Vec::with_capacity(vertex_streams.len());
+        let mut attribute_descriptions = Vec::with_capacity(
+            vertex_streams
+                .iter()
+                .map(|stream| stream.layout.attributes.len())
+                .sum(),
+        );
+        for (binding, stream) in vertex_streams.iter().enumerate() {
+            binding_descriptions.push(
+                vk::VertexInputBindingDescription::default()
+                    .binding(binding as u32)
+                    .stride(
+                        u32::try_from(stream.layout.stride)
+                            .map_err(|_| contract_refusal("vertex stride exceeds u32"))?,
+                    )
+                    .input_rate(vk::VertexInputRate::VERTEX),
+            );
+            for attribute in &stream.layout.attributes {
+                attribute_descriptions.push(
+                    vk::VertexInputAttributeDescription::default()
+                        .location(attribute.location)
+                        .binding(binding as u32)
+                        .format(vertex_vk_format(attribute.format)?)
+                        .offset(u32::try_from(attribute.offset).map_err(|_| {
+                            contract_refusal("vertex attribute offset exceeds u32")
+                        })?),
+                );
+            }
+        }
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding_descriptions)
+            .vertex_attribute_descriptions(&attribute_descriptions);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -1407,6 +1691,57 @@ impl<'a> OffscreenObjects<'a> {
         self.pipeline = pipelines.into_iter().next().ok_or_else(|| {
             execution_refusal("create graphics pipeline", "driver returned no pipeline")
         })?;
+        Ok(())
+    }
+
+    /// Upload every caller-held stream the pass binds into its own host-visible
+    /// device buffer (`research/docs/23` §3.3).
+    ///
+    /// One buffer per pool view, holding that view's bytes: the provider's
+    /// compute path binds a lone owned view at its own offset, and this rail
+    /// does the same, so the stream starts at byte zero of the view exactly as
+    /// the footprint proof assumed. The pool upload for the same view may have
+    /// happened on the compute path, but these buffers are the rail's own and
+    /// are destroyed with the pass.
+    fn create_vertex_inputs(
+        &mut self,
+        streams: &[VertexStream<'_>],
+        index: Option<&IndexStream<'_>>,
+    ) -> Result<(), ProviderError> {
+        for stream in streams {
+            let BufferSource::OwnedBytes(bytes) = &stream.view.source else {
+                return Err(
+                    capability_refusal("render_vertex_buffer_unsupported").with_detail(
+                        "the first vertex-input increment executes trace-owned bytes only",
+                    ),
+                );
+            };
+            let (buffer, memory) = self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                bytes,
+                "vertex input",
+            )?;
+            self.vertex_inputs.push((buffer, memory));
+        }
+        if let Some(index) = index {
+            let BufferSource::OwnedBytes(bytes) = &index.view.source else {
+                return Err(
+                    capability_refusal("render_index_buffer_unsupported").with_detail(
+                        "the first vertex-input increment executes trace-owned bytes only",
+                    ),
+                );
+            };
+            let (buffer, memory) = self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                bytes,
+                "index input",
+            )?;
+            self.input_index_buffer = buffer;
+            self.input_index_memory = memory;
+            self.input_index_type = indices_format(index.format);
+        }
         Ok(())
     }
 
@@ -1795,7 +2130,47 @@ impl<'a> OffscreenObjects<'a> {
             self.context
                 .device
                 .cmd_set_scissor(self.command, 0, std::slice::from_ref(&scissor));
-            if self.index_buffer != vk::Buffer::null() {
+            // Caller-held streams first (`research/docs/23` §3.3): they are the
+            // shape this increment adds, and they cannot be combined with an
+            // indirect replay (the pass's own bindings are the direct draw's).
+            if !self.vertex_inputs.is_empty() {
+                let buffers = self
+                    .vertex_inputs
+                    .iter()
+                    .map(|(buffer, _)| *buffer)
+                    .collect::<Vec<_>>();
+                // The pool upload puts each view's bytes at offset zero of its
+                // own buffer, so the bind offsets are zero by construction.
+                let offsets = vec![0_u64; buffers.len()];
+                self.context
+                    .device
+                    .cmd_bind_vertex_buffers(self.command, 0, &buffers, &offsets);
+                match self.draw {
+                    DrawShape::Indexed { index_count } => {
+                        self.context.device.cmd_bind_index_buffer(
+                            self.command,
+                            self.input_index_buffer,
+                            0,
+                            self.input_index_type,
+                        );
+                        self.context
+                            .device
+                            .cmd_draw_indexed(self.command, index_count, 1, 0, 0, 0);
+                    }
+                    DrawShape::Vertices { vertex_count } => {
+                        self.context
+                            .device
+                            .cmd_draw(self.command, vertex_count, 1, 0, 0);
+                    }
+                    // The milestone shape binds no stream, and an indirect
+                    // replay is a separate arm below.
+                    DrawShape::Milestone => {
+                        return Err(contract_refusal(
+                            "a vertex-buffer draw reached the rail without a draw shape",
+                        ));
+                    }
+                }
+            } else if self.index_buffer != vk::Buffer::null() {
                 // An indexed indirect replay binds the rail's own `[0, 1, 2]`
                 // index buffer and reads its counts from the `INDIRECT_BUFFER`
                 // the CPU encoded above. `stride` is the struct size because
@@ -2003,6 +2378,26 @@ impl<'a> Drop for OffscreenObjects<'a> {
             }
             if self.index_memory != vk::DeviceMemory::null() {
                 self.context.device.free_memory(self.index_memory, None);
+            }
+            // The caller-held streams are unbound by construction (their memory
+            // is freed right after), so destroy before free.
+            for (buffer, memory) in self.vertex_inputs.drain(..) {
+                if buffer != vk::Buffer::null() {
+                    self.context.device.destroy_buffer(buffer, None);
+                }
+                if memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(memory, None);
+                }
+            }
+            if self.input_index_buffer != vk::Buffer::null() {
+                self.context
+                    .device
+                    .destroy_buffer(self.input_index_buffer, None);
+            }
+            if self.input_index_memory != vk::DeviceMemory::null() {
+                self.context
+                    .device
+                    .free_memory(self.input_index_memory, None);
             }
         }
     }
@@ -2370,6 +2765,9 @@ mod tests {
                 extent: [2, 2],
                 clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                 vertex: milestone_vertex(),
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                index_stream: None,
                 indirect: None,
             },
         )
@@ -2602,6 +3000,9 @@ mod tests {
             extent: [2, 2],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            index_stream: None,
             indirect: None,
         };
         let refused = execute_offscreen_render(&context, &request)
@@ -2654,6 +3055,9 @@ mod tests {
                     extent: [2, 2],
                     clear,
                     vertex: single_pixel_vertex(),
+                    vertex_streams: Vec::new(),
+                    draw: DrawShape::Milestone,
+                    index_stream: None,
                     indirect: None,
                 },
             )
@@ -2782,6 +3186,9 @@ mod tests {
             extent: [2, 0],
             clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            index_stream: None,
             indirect: None,
         };
         let refused = execute_offscreen_render(&context, &request)

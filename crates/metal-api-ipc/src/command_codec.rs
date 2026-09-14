@@ -24,8 +24,8 @@ use metal_api_core::provider::{
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferBinding, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
-    MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    VertexBufferLayout, VertexFormat, VertexLayout, ViewId, MAX_COLOR_ATTACHMENTS,
+    MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -1832,7 +1832,14 @@ fn put_render_pass(
 }
 
 /// Encode the vertex-input block of an extended render pass: the bound vertex
-/// buffers by view identity, then the index buffer when the draw is indexed.
+/// streams by their own view identity, then the index buffer when the draw is
+/// indexed.
+///
+/// Each stream travels as a full [`BufferView`] — identity, range and source
+/// bytes — because a render input declares its own bytes rather than
+/// referencing a compute binding (`research/docs/23` §3.6). The encoder reuses
+/// the compute path's view encoding for the same reason: one declaration shape
+/// means one set of source rules.
 fn put_vertex_input(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Result<(), CodecError> {
     if pass.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
         return Err(CodecError::VertexBufferCount {
@@ -1841,15 +1848,13 @@ fn put_vertex_input(encoder: &mut Encoder, pass: &RenderPassDescriptor) -> Resul
         });
     }
     encoder.u64(pass.vertex_buffers.len() as u64);
-    for binding in &pass.vertex_buffers {
-        encoder.u64(binding.view_id.get());
-        encoder.u64(binding.allocation_id.get());
+    for view in &pass.vertex_buffers {
+        put_view(encoder, view);
     }
     match &pass.indices {
         Some(indices) => {
             encoder.u8(1);
-            encoder.u64(indices.view_id.get());
-            encoder.u64(indices.allocation_id.get());
+            put_view(encoder, &indices.view);
             encoder.u8(indices.format.code());
         }
         None => encoder.u8(0),
@@ -2235,7 +2240,8 @@ fn get_render_pass(
 }
 
 /// Decode the vertex-input block of an extended render pass: the bound vertex
-/// buffers by view identity, then the index buffer when the draw is indexed.
+/// streams by their own view identity, then the index buffer when the draw is
+/// indexed.
 ///
 /// The counts are bounded by the contract's own caps before they can drive an
 /// allocation, and an unknown index-width code is refused rather than defaulted
@@ -2247,17 +2253,13 @@ fn get_vertex_input(
     let count = bounded_vertex_buffer_count(decoder.u64()?)?;
     let mut vertex_buffers = Vec::with_capacity(count);
     for _ in 0..count {
-        vertex_buffers.push(VertexBufferBinding {
-            view_id: ViewId::new(decoder.u64()?),
-            allocation_id: AllocationId::new(decoder.u64()?),
-        });
+        vertex_buffers.push(get_view(decoder)?);
     }
     pass.vertex_buffers = vertex_buffers;
     pass.indices = match decoder.u8()? {
         0 => None,
         1 => Some(IndexBufferBinding {
-            view_id: ViewId::new(decoder.u64()?),
-            allocation_id: AllocationId::new(decoder.u64()?),
+            view: get_view(decoder)?,
             format: get_index_format(decoder)?,
         }),
         value => {
