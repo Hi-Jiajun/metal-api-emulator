@@ -19,13 +19,14 @@ use crate::provider::{
     BufferAccess, BufferRange, BufferSource, BufferWriteback, ClearColor, CompiledComputePipeline,
     CompletionDisposition, CompletionPolicy, CompletionToken, ComputeTrace, ContractError,
     Dispatch, DispatchKind, DispatchType, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
-    HeapResource, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
-    PipelineCompileRequest, PipelineId, PipelineProvider, PresentDescriptor, PresentMode,
-    PresentTarget, ProviderCapabilities, ProviderError, ProviderHealth, ProviderSubmission,
-    RenderAttachment, RenderPassDescriptor, ResourceTableSnapshot, StorageMode, StoreOp, ViewId,
+    HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineId, PipelineProvider,
+    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+    ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
+    ResourceTableSnapshot, StorageMode, StoreOp, VertexBufferBinding, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES,
-    PROVIDER_SCHEMA_VERSION,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +37,18 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The indirect command kinds the render encoder replays.
+///
+/// A named set rather than a single `expected` kind: one encoder replays both
+/// direct draw shapes an ICB payload can hold (`research/docs/25` §4.3), so a
+/// refusal that spelled only one of them would read as though the other were
+/// inadmissible.
+static RENDER_DRAW_KINDS: [IndirectCommandKind; 2] =
+    [IndirectCommandKind::Draw, IndirectCommandKind::DrawIndexed];
+
+/// The indirect command kinds the compute encoder replays from an ICB.
+static COMPUTE_DISPATCH_KINDS: [IndirectCommandKind; 1] = [IndirectCommandKind::Dispatch];
 
 /// Typed object, contract or provider failure. Provider fields remain intact.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,11 +73,39 @@ pub enum Error {
         allocation: AllocationId,
     },
     IndirectKindMismatch {
-        expected: IndirectCommandKind,
+        /// Every command kind this encoder replays. The set, not one member of
+        /// it: the render encoder replays `Draw` and `DrawIndexed` alike.
+        accepted: &'static [IndirectCommandKind],
         actual: IndirectCommandKind,
     },
     IndirectAlreadyRecorded,
     IndirectDirectConflict,
+    /// One binding index holds two views, so the pass's positional binding
+    /// order would name two streams for one layout entry.
+    VertexBufferAlreadyBound {
+        index: u32,
+    },
+    /// A binding index is at or past [`MAX_VERTEX_BUFFERS`], which is the cap
+    /// the pass's own descriptor carries.
+    VertexBufferIndexOutOfRange {
+        index: u32,
+        maximum: usize,
+    },
+    /// An index buffer is already bound. One pass draws through one index
+    /// buffer, exactly as its descriptor holds one `indices` binding.
+    IndexBufferAlreadyBound,
+    /// A vertex-buffer draw has no stream bound. The `vertex_id`-only shape is
+    /// [`RenderCommandEncoder::draw_render_pass`], which binds no input at all.
+    MissingVertexBuffer,
+    /// An indexed draw has no index buffer bound, so nothing says which indices
+    /// it selects through.
+    MissingIndexBuffer,
+    /// An indirect replay supplies its own draw input, but the encoder bound
+    /// streams or an index buffer for a direct draw.
+    IndirectReplayInputConflict {
+        vertex_buffers: usize,
+        index_buffer: bool,
+    },
 }
 
 impl fmt::Display for Error {
@@ -103,15 +144,46 @@ impl fmt::Display for Error {
                 "allocation {} is placed in the heap more than once",
                 allocation.get()
             ),
-            Self::IndirectKindMismatch { expected, actual } => write!(
+            Self::IndirectKindMismatch { accepted, actual } => write!(
                 f,
-                "encoder replays {actual:?} commands but the indirect buffer holds {expected:?}"
+                "the indirect buffer holds {actual:?} commands; this encoder replays {accepted:?}"
             ),
             Self::IndirectAlreadyRecorded => {
                 f.write_str("command buffer already carries an indirect command buffer")
             }
             Self::IndirectDirectConflict => {
                 f.write_str("one encoder cannot mix direct and indirect dispatch or draw")
+            }
+            Self::VertexBufferAlreadyBound { index } => {
+                write!(f, "vertex buffer binding {index} is bound twice")
+            }
+            Self::VertexBufferIndexOutOfRange { index, maximum } => write!(
+                f,
+                "vertex buffer binding {index} is past the {maximum}-stream limit"
+            ),
+            Self::IndexBufferAlreadyBound => {
+                f.write_str("an index buffer is already bound on this encoder")
+            }
+            Self::MissingVertexBuffer => f.write_str(
+                "a vertex-buffer draw needs a bound vertex stream; the vertex_id-only shape is \
+                 draw_render_pass",
+            ),
+            Self::MissingIndexBuffer => {
+                f.write_str("an indexed draw needs an index buffer bound on this encoder")
+            }
+            Self::IndirectReplayInputConflict {
+                vertex_buffers,
+                index_buffer,
+            } => {
+                write!(
+                    f,
+                    "an indirect replay supplies its own draw input, but the encoder binds \
+                     {vertex_buffers} vertex buffer(s)"
+                )?;
+                if *index_buffer {
+                    f.write_str(" and an index buffer")?;
+                }
+                Ok(())
             }
         }
     }
@@ -453,6 +525,39 @@ struct RenderTarget {
     height: u64,
     clear: [u8; 4],
     present: Option<PresentInitial>,
+    draw: RenderDraw,
+}
+
+/// The draw one recorded render pass replays, in the shape the pass's own
+/// descriptor carries: the counts, plus the identities of the streams and index
+/// buffer — no host view, because the trace resolves those identities through
+/// its own resource pool, exactly as an attachment's do (`research/docs/23`
+/// §3.3).
+#[derive(Clone)]
+struct RenderDraw {
+    /// Vertices of a non-indexed draw, or indices of an indexed one. The
+    /// descriptor carries both in one `u32` field, which is why this one does
+    /// too (`RenderPassDescriptor::vertices`).
+    vertices: u32,
+    /// One binding per bound stream, in binding order: entry `i` is binding `i`
+    /// of the pipeline's vertex layout, the way the descriptor is positional.
+    vertex_buffers: Vec<VertexBufferBinding>,
+    /// The index buffer this draw selects through, or `None` for a non-indexed
+    /// draw.
+    indices: Option<IndexBufferBinding>,
+}
+
+impl RenderDraw {
+    /// The milestone's `vertex_id` draw: three generated vertices, no bound
+    /// stream and no caller-held index buffer. Shared by the direct vertex_id
+    /// pass and by an ICB replay whose command carries the input itself.
+    fn vertex_id() -> Self {
+        Self {
+            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
+            vertex_buffers: Vec::new(),
+            indices: None,
+        }
+    }
 }
 
 impl RenderTarget {
@@ -494,9 +599,9 @@ impl RenderTarget {
                 u32::try_from(self.height)
                     .map_err(|_| ContractError::ArithmeticOverflow("attachment height"))?,
             ],
-            vertices: FULL_SCREEN_TRIANGLE_VERTICES,
-            vertex_buffers: Vec::new(),
-            indices: None,
+            vertices: self.draw.vertices,
+            vertex_buffers: self.draw.vertex_buffers.clone(),
+            indices: self.draw.indices,
             present,
         };
         descriptor.validate()?;
@@ -1179,8 +1284,9 @@ impl CommandBuffer {
     /// Open a render encoder on this command buffer.
     ///
     /// The encoder records the first increment's single render shape: one
-    /// colour attachment, a covering viewport, the three-vertex full-screen
-    /// triangle and, optionally, one present tail action. It shares the command
+    /// colour attachment, a covering viewport, one draw — the three-vertex
+    /// full-screen triangle, a draw over bound vertex streams, or an indexed
+    /// draw — and, optionally, one present tail action. It shares the command
     /// buffer's single open-encoder slot with the compute encoder, so a render
     /// pass can follow the declaring compute passes that reserved its
     /// attachment buffer.
@@ -1199,6 +1305,8 @@ impl CommandBuffer {
             draw_count: 0,
             indirect: false,
             ended: false,
+            vertex_buffers: BTreeMap::new(),
+            index_buffer: None,
         })
     }
 
@@ -1710,7 +1818,7 @@ impl ComputeCommandEncoder {
         }
         if icb.command_kind() != IndirectCommandKind::Dispatch {
             return Err(Error::IndirectKindMismatch {
-                expected: IndirectCommandKind::Dispatch,
+                accepted: &COMPUTE_DISPATCH_KINDS,
                 actual: icb.command_kind(),
             });
         }
@@ -1812,18 +1920,29 @@ impl Drop for ComputeCommandEncoder {
 /// [`RenderCommandEncoder`] is the render sibling of [`ComputeCommandEncoder`]:
 /// it persists a pipeline selection across draws, refuses foreign objects, and
 /// hands the recorded pass to the command buffer's commit-time reservation and
-/// submission exactly as the compute encoder does. One call to
-/// [`RenderCommandEncoder::draw_render_pass`] records one colour-attachment
-/// render pass with the covering viewport, the three-vertex full-screen
-/// triangle and an optional present tail. That present tail executes when the
-/// command is submitted: its acquire/present count and target terminal layout
-/// are not rolled back by a later `cancel` or deadline.
+/// submission exactly as the compute encoder does. One draw records one
+/// colour-attachment render pass with the covering viewport and an optional
+/// present tail. That present tail executes when the command is submitted: its
+/// acquire/present count and target terminal layout are not rolled back by a
+/// later `cancel` or deadline.
+///
+/// The encoder also persists vertex and index bindings the way Metal's
+/// `MTLRenderCommandEncoder` does (`setVertexBuffer(_:offset:index:)` /
+/// `setIndexBuffer`): a direct draw records the bound streams and index buffer
+/// in its pass, and an indirect replay refuses an encoder that bound them,
+/// because the replay reads its draw input from the ICB's own payload.
 pub struct RenderCommandEncoder {
     shared: Arc<CommandShared>,
     pipeline: Option<RenderPipeline>,
     draw_count: usize,
     indirect: bool,
     ended: bool,
+    /// Bound vertex streams by binding index. The map's ascending keys are the
+    /// pass's binding order, which the descriptor makes positional.
+    vertex_buffers: BTreeMap<u32, BufferView>,
+    /// The one index buffer this encoder draws through, with the width of the
+    /// indices it holds.
+    index_buffer: Option<(BufferView, IndexFormat)>,
 }
 impl RenderCommandEncoder {
     pub fn set_render_pipeline_state(&mut self, pipeline: &RenderPipeline) -> Result<(), Error> {
@@ -1833,6 +1952,83 @@ impl RenderCommandEncoder {
         }
         self.pipeline = Some(pipeline.clone());
         Ok(())
+    }
+
+    /// Bind one vertex stream to `index` for the direct draws that follow.
+    ///
+    /// `index` is the binding the pipeline's vertex layout names, and the pass's
+    /// descriptor carries the bound streams in ascending index order
+    /// (`RenderPassDescriptor::vertex_buffers` is positional). The checks run in
+    /// the order a heap placement's do — ownership, then the binding the encoder
+    /// already holds — because each one is answerable here, without a provider
+    /// and without a pass to attach it to: a buffer from another device is
+    /// [`Error::ForeignBuffer`], a repeated index is
+    /// [`Error::VertexBufferAlreadyBound`], and an index at or past
+    /// [`MAX_VERTEX_BUFFERS`] is [`Error::VertexBufferIndexOutOfRange`].
+    ///
+    /// A binding is direct-draw state, so it is refused once an indirect replay
+    /// has been recorded, exactly as [`Self::draw_render_pass`] is.
+    pub fn set_vertex_buffer(&mut self, index: u32, buffer: &BufferView) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if !Arc::ptr_eq(&self.shared.owner, &buffer.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        if self.vertex_buffers.contains_key(&index) {
+            return Err(Error::VertexBufferAlreadyBound { index });
+        }
+        if usize::try_from(index).unwrap_or(usize::MAX) >= MAX_VERTEX_BUFFERS {
+            return Err(Error::VertexBufferIndexOutOfRange {
+                index,
+                maximum: MAX_VERTEX_BUFFERS,
+            });
+        }
+        self.vertex_buffers.insert(index, buffer.clone());
+        Ok(())
+    }
+
+    /// Bind the index buffer the indexed direct draws select through.
+    ///
+    /// One index buffer per encoder, exactly as the pass it records holds one
+    /// `indices` binding: the descriptor carries this view's identity and
+    /// `format`. A buffer from another device is [`Error::ForeignBuffer`] and a
+    /// second binding is [`Error::IndexBufferAlreadyBound`]; like a vertex
+    /// stream, an index buffer is direct-draw state and is refused once an
+    /// indirect replay has been recorded.
+    pub fn set_index_buffer(
+        &mut self,
+        buffer: &BufferView,
+        format: IndexFormat,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if !Arc::ptr_eq(&self.shared.owner, &buffer.buffer.inner.owner) {
+            return Err(Error::ForeignBuffer);
+        }
+        if self.index_buffer.is_some() {
+            return Err(Error::IndexBufferAlreadyBound);
+        }
+        self.index_buffer = Some((buffer.clone(), format));
+        Ok(())
+    }
+
+    /// The bound streams as the pass's own bindings, in binding order.
+    ///
+    /// The map's keys are the binding indices, so iterating them in key order
+    /// yields entry `i` = binding `i` — the positional rule the descriptor
+    /// states, without a second list that could disagree with this one.
+    fn bound_vertex_buffers(&self) -> Vec<VertexBufferBinding> {
+        self.vertex_buffers
+            .values()
+            .map(|view| VertexBufferBinding {
+                view_id: view.view_id(),
+                allocation_id: view.allocation_id(),
+            })
+            .collect()
     }
 
     /// Record the milestone's single render pass.
@@ -1850,6 +2046,12 @@ impl RenderCommandEncoder {
     /// [`CommandBuffer::wait_until_completed`] only makes the attachment
     /// writeback host-visible; [`CommandBuffer::cancel`] or a deadline abandons
     /// that observation without rolling the present action back.
+    ///
+    /// This shape draws from `vertex_id`: it names no stream and no index
+    /// buffer, so the pass the caller records carries neither, whatever the
+    /// encoder holds. A draw whose vertex stage reads bound streams is
+    /// [`Self::draw_primitives`], and one that selects through an index buffer
+    /// is [`Self::draw_indexed_primitives`].
     pub fn draw_render_pass(
         &mut self,
         attachment: &BufferView,
@@ -1863,7 +2065,141 @@ impl RenderCommandEncoder {
         if self.indirect {
             return Err(Error::IndirectDirectConflict);
         }
-        let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
+        self.record_render_pass(
+            attachment,
+            format,
+            width,
+            height,
+            clear,
+            present,
+            RenderDraw::vertex_id(),
+            None,
+        )
+    }
+
+    /// Record the milestone's render pass over the bound vertex streams.
+    ///
+    /// The pass's descriptor carries the bound streams in binding order, so the
+    /// registered pipeline's vertex layout and the pass agree entry by entry
+    /// (that agreement is checked here, not left to admission). At least one
+    /// stream has to be bound: the `vertex_id`-only shape is
+    /// [`Self::draw_render_pass`], and keeping it out of this method leaves each
+    /// shape with exactly one call that records it.
+    ///
+    /// A count below the milestone's three is refused here with the contract's
+    /// own [`ContractError::DrawVertexCountBelowMinimum`], so both direct draw
+    /// shapes report that one refusal instead of the descriptor's two.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        clear: [u8; 4],
+        vertex_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        if vertex_count < FULL_SCREEN_TRIANGLE_VERTICES {
+            return Err(ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: vertex_count,
+            }
+            .into());
+        }
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+        };
+        self.record_render_pass(
+            attachment, format, width, height, clear, present, draw, None,
+        )
+    }
+
+    /// Record the milestone's render pass through the bound index buffer.
+    ///
+    /// `index_count` is the number of indices the draw consumes and is what the
+    /// descriptor's `vertices` field carries, the way the frozen contract
+    /// spells `drawIndexedPrimitives(indexCount:)`. Vertex streams are optional
+    /// here: a draw with none bound selects through `vertex_id`, which the
+    /// contract admits at exactly [`FULL_SCREEN_TRIANGLE_VERTICES`] indices, so
+    /// an index-only pass is the indexed sibling of
+    /// [`Self::draw_render_pass`].
+    ///
+    /// An encoder with no index buffer bound is refused with
+    /// [`Error::MissingIndexBuffer`] before any other shape is looked at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        clear: [u8; 4],
+        index_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        if index_count < FULL_SCREEN_TRIANGLE_VERTICES {
+            return Err(ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: index_count,
+            }
+            .into());
+        }
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(IndexBufferBinding {
+                view_id: index_view.view_id(),
+                allocation_id: index_view.allocation_id(),
+                format: *index_format,
+            }),
+        };
+        self.record_render_pass(
+            attachment, format, width, height, clear, present, draw, None,
+        )
+    }
+
+    /// Land one render pass in the command's pass list.
+    ///
+    /// Every draw above ends here, so the four shapes share one statement of
+    /// what recording a pass means: the attachment belongs to this device and
+    /// has the extent the restated shape implies, the descriptor the pass
+    /// becomes passes the frozen contract's own shape rules, the registered
+    /// pipeline's render contract agrees with that descriptor, the command's
+    /// pass list has room, and the serial-resource budget holds. Only then does
+    /// the pass land. `indirect` carries the ICB a replayed pass inherits, which
+    /// is also the one pass the command may replay: an ICB already recorded is
+    /// [`Error::IndirectAlreadyRecorded`].
+    #[allow(clippy::too_many_arguments)]
+    fn record_render_pass(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        clear: [u8; 4],
+        present: Option<PresentInitial>,
+        draw: RenderDraw,
+        indirect: Option<&IndirectCommandBuffer>,
+    ) -> Result<(), Error> {
+        let pipeline = self.pipeline.clone().ok_or(ApiError::MissingPipeline)?;
         if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
             return Err(Error::ForeignBuffer);
         }
@@ -1887,13 +2223,26 @@ impl RenderCommandEncoder {
             height,
             clear,
             present,
+            draw,
         };
         let pipeline_id = pipeline.metadata().pipeline_id;
         // Validate the descriptor the pass will become, so a wrong viewport,
         // vertex count, attachment shape or present shape is refused before any
-        // resource is reserved.
-        target.descriptor(pipeline_id)?;
+        // resource is reserved; and check the pass against the registered
+        // pipeline's own render contract, which is the one agreement the pass
+        // cannot answer by itself because it carries an id and not the
+        // pipeline's compiled layout.
+        let descriptor = target.descriptor(pipeline_id)?;
+        pipeline
+            .metadata()
+            .render
+            .as_ref()
+            .ok_or(Error::InvalidPipelineMetadata)?
+            .validate_against(&descriptor)?;
         let mut inner = lock(&self.shared.inner, "provider command")?;
+        if indirect.is_some() && inner.indirect.is_some() {
+            return Err(Error::IndirectAlreadyRecorded);
+        }
         let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
             .unwrap_or(usize::MAX)
             .min(8);
@@ -1904,7 +2253,7 @@ impl RenderCommandEncoder {
             });
         }
         let mut unique = recorded_view_ids(&inner.passes);
-        unique.insert(attachment.view_id);
+        unique.insert(target.view.view_id);
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
                 requested: unique.len(),
@@ -1916,6 +2265,12 @@ impl RenderCommandEncoder {
             pipeline: pipeline.clone(),
             target,
         });
+        if let Some(icb) = indirect {
+            inner.indirect = Some(icb.clone());
+        }
+        if indirect.is_some() {
+            self.indirect = true;
+        }
         self.draw_count += 1;
         Ok(())
     }
@@ -1925,6 +2280,19 @@ impl RenderCommandEncoder {
     /// and clear shapes are the direct [`Self::draw_render_pass`] ones; only
     /// the draw command comes from the ICB, so the vertex/instance counts are
     /// the ICB's own.
+    ///
+    /// Both draw kinds an ICB payload can carry are replayed: `Draw` keeps the
+    /// `vertex_id` shape the first increment published, and `DrawIndexed` names
+    /// the ICB's index count in the pass's `vertices` field, which is the shape
+    /// the Vulkan rail replays with its own `[0, 1, 2]` index buffer. Any other
+    /// kind is [`Error::IndirectKindMismatch`], and the refusal names the whole
+    /// accepted set.
+    ///
+    /// An indirect replay reads its draw input from the ICB's payload, so an
+    /// encoder that bound vertex streams or an index buffer is refused with
+    /// [`Error::IndirectReplayInputConflict`]: the replayed draw would never
+    /// read those bindings, and one pass may not carry two answers to what it
+    /// reads.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_indirect(
         &mut self,
@@ -1940,72 +2308,48 @@ impl RenderCommandEncoder {
         if !Arc::ptr_eq(&self.shared.owner, &icb.inner.owner) {
             return Err(Error::ForeignIndirectCommandBuffer);
         }
-        if icb.command_kind() != IndirectCommandKind::Draw {
-            return Err(Error::IndirectKindMismatch {
-                expected: IndirectCommandKind::Draw,
-                actual: icb.command_kind(),
+        let draw = match &icb.payload().command {
+            // The first increment's non-indexed replay: three `vertex_id`
+            // vertices, no caller-held input, exactly as the direct vertex_id
+            // pass spells it. The ICB's own vertex count stays where the rail
+            // reads it — the payload — because the contract's vertex_id shape
+            // fixes the count at three, and carrying the payload's count here
+            // would refuse an ICB the rail executes today.
+            IndirectCommandDescriptor::Draw { .. } => RenderDraw::vertex_id(),
+            // The reviewed indexed replay: the descriptor's `vertices` is the
+            // ICB's index count, and the rail supplies the `[0, 1, 2]` index
+            // buffer the replayed draw selects through.
+            IndirectCommandDescriptor::DrawIndexed { index_count, .. } => RenderDraw {
+                vertices: *index_count,
+                vertex_buffers: Vec::new(),
+                indices: None,
+            },
+            other => {
+                return Err(Error::IndirectKindMismatch {
+                    accepted: &RENDER_DRAW_KINDS,
+                    actual: other.kind(),
+                })
+            }
+        };
+        if !self.vertex_buffers.is_empty() || self.index_buffer.is_some() {
+            return Err(Error::IndirectReplayInputConflict {
+                vertex_buffers: self.vertex_buffers.len(),
+                index_buffer: self.index_buffer.is_some(),
             });
         }
         if self.draw_count > 0 || self.indirect {
             return Err(Error::IndirectDirectConflict);
         }
-        let pipeline = self.pipeline.as_ref().ok_or(ApiError::MissingPipeline)?;
-        if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
-            return Err(Error::ForeignBuffer);
-        }
-        let expected_bytes = width
-            .checked_mul(height)
-            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
-            .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
-        if u64::try_from(attachment.length).unwrap_or(u64::MAX) != expected_bytes {
-            return Err(ContractError::AttachmentExtentMismatch {
-                pass_index: 0,
-                view: attachment.view_id,
-                expected: expected_bytes,
-                declared: u64::try_from(attachment.length).unwrap_or(u64::MAX),
-            }
-            .into());
-        }
-        let target = RenderTarget {
-            view: attachment.clone(),
+        self.record_render_pass(
+            attachment,
             format,
             width,
             height,
             clear,
             present,
-        };
-        let pipeline_id = pipeline.metadata().pipeline_id;
-        target.descriptor(pipeline_id)?;
-        let mut inner = lock(&self.shared.inner, "provider command")?;
-        if inner.indirect.is_some() {
-            return Err(Error::IndirectAlreadyRecorded);
-        }
-        let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
-            .unwrap_or(usize::MAX)
-            .min(8);
-        if inner.passes.len() >= maximum {
-            return Err(Error::PassLimit {
-                requested: inner.passes.len() + 1,
-                maximum,
-            });
-        }
-        let mut unique = recorded_view_ids(&inner.passes);
-        unique.insert(attachment.view_id);
-        if unique.len() > MAX_SERIAL_RESOURCES {
-            return Err(ContractError::SerialResourceLimit {
-                requested: unique.len(),
-                maximum: MAX_SERIAL_RESOURCES,
-            }
-            .into());
-        }
-        inner.passes.push(RecordedPass::Render {
-            pipeline: pipeline.clone(),
-            target,
-        });
-        inner.indirect = Some(icb.clone());
-        self.draw_count += 1;
-        self.indirect = true;
-        Ok(())
+            draw,
+            Some(icb),
+        )
     }
 
     pub fn end_encoding(mut self) -> Result<(), Error> {
