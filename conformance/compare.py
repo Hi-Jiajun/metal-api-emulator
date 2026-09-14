@@ -46,6 +46,13 @@ RenderExpectation = namedtuple(
 PresentExpectation = namedtuple(
     "PresentExpectation", "mode image_count acquire present sentinel")
 
+# One compute case's heap section (`research/docs/25` §4.2, §5.1): the slab
+# size, its storage mode, and the placements the capture has to prove landed in
+# one slab. `placements` is a tuple of `(allocation, offset, byte_size)` in
+# allocation order; `capture_rails` is a separate case-level marker, because a
+# heap case runs only on the rails that declare heap support.
+HeapExpectation = namedtuple("HeapExpectation", "size storage_mode placements")
+
 
 class CaptureError(ValueError):
     """A suite or capture cannot establish the requested comparison."""
@@ -158,6 +165,81 @@ def _present_observation(value, expectation, where):
     _require(present == expectation.present,
              f"{where}: the present count {present} does not match the {expectation.present} "
              "the suite declares")
+
+
+def _heap_observation(value, expectation, where):
+    """Check one case's heap segment against the section its suite declares.
+
+    The segment proves the placements landed in one slab at the declared
+    offsets; the bytes themselves stay with the ordinary writeback comparison
+    (`research/docs/25` §5.1). A provider that echoes the request instead of
+    reporting what it bound cannot be told apart by this check alone, which is
+    why the smoke case asserts the real `vkBind*` result as well.
+    """
+    _object(value, ("heap", "same_slab", "placements"), f"{where}.heap")
+    _require(value["same_slab"] is True,
+             f"{where}.heap: the placements have to share one slab")
+    _integer(value["heap"], f"{where}.heap.heap", 1)
+    entries = _list(value["placements"], f"{where}.heap.placements")
+    observed = []
+    for index, entry in enumerate(entries):
+        entry_where = f"{where}.heap.placements[{index}]"
+        _object(entry, ("allocation", "offset", "byte_size"), entry_where)
+        observed.append((
+            _integer(entry["allocation"], f"{entry_where}.allocation"),
+            _integer(entry["offset"], f"{entry_where}.offset"),
+            _integer(entry["byte_size"], f"{entry_where}.byte_size", 1,
+                     MAX_ALLOCATION_BYTES),
+        ))
+    _require(tuple(observed) == expectation.placements,
+             f"{where}.heap: placements do not match the suite")
+
+
+def _heap_declaration(value, allocations, where):
+    """Parse one compute case's heap section (`research/docs/25` §4.2).
+
+    The section is a whitelist and a falsifiability statement, not a knob: the
+    first heap increment fixes one slab with `allows_aliasing = false`, so any
+    two placements that overlap are refused here rather than left to a driver,
+    and every placement has to cover exactly the allocation it names (the same
+    `allocation_size` the buffer table declares). The capture's heap segment is
+    compared against this expectation field for field.
+    """
+    _object(value, ("size", "storage_mode", "allows_aliasing", "placements"),
+            f"{where}.heap")
+    size = _integer(value["size"], f"{where}.heap.size", 1, MAX_ALLOCATION_BYTES)
+    _require(value["storage_mode"] in ("owned_bytes", "staged_lease", "borrowed_no_copy"),
+             f"{where}.heap: unknown storage mode")
+    _require(value["allows_aliasing"] is False,
+             f"{where}.heap: the first heap increment refuses aliasing")
+    entries = _list(value["placements"], f"{where}.heap.placements")
+    _require(entries, f"{where}.heap: no placements")
+    placements = []
+    covered = []
+    for index, entry in enumerate(entries):
+        entry_where = f"{where}.heap.placements[{index}]"
+        _object(entry, ("allocation", "offset", "byte_size"), entry_where)
+        allocation = _integer(entry["allocation"], f"{entry_where}.allocation")
+        offset = _integer(entry["offset"], f"{entry_where}.offset")
+        byte_size = _integer(entry["byte_size"], f"{entry_where}.byte_size", 1,
+                             MAX_ALLOCATION_BYTES)
+        _require(allocation in allocations,
+                 f"{entry_where}: unknown allocation {allocation}")
+        _require(byte_size == len(allocations[allocation]),
+                 f"{entry_where}: byte_size does not match allocation {allocation}")
+        _require(offset + byte_size <= size,
+                 f"{entry_where}: placement exceeds the heap")
+        end = offset + byte_size
+        for start, other_end in covered:
+            _require(end <= start or offset >= other_end,
+                     f"{where}.heap: placements overlap while aliasing is refused")
+        covered.append((offset, end))
+        placements.append((allocation, offset, byte_size))
+    _require([placement[0] for placement in placements]
+             == sorted(placement[0] for placement in placements),
+             f"{where}.heap: placements must be in allocation order")
+    return HeapExpectation(size=size, storage_mode=value["storage_mode"],
+                           placements=tuple(placements))
 
 
 def _suite_plan(suite):
@@ -381,7 +463,24 @@ def _suite_plan(suite):
             written_views.add(view)
             writes.append((identity, data))
         _require(written_views == writable_views, f"{where}: expected writebacks do not cover writable views")
-        plan[case_id] = (writes, allocations, len(texture_allocations), group_expectations)
+        # A heap-bearing compute case declares which rails owe it, exactly as a
+        # render case does (`research/docs/25` §5.2): only a rail that declares
+        # heap support can report the placement observation, so the marker is
+        # required with the section and refused without it.
+        heap = None
+        rails = None
+        if "heap" in case:
+            heap = _heap_declaration(case["heap"], allocations, where)
+        if "capture_rails" in case:
+            rails = _list(case["capture_rails"], f"{where}.capture_rails")
+            _require(rails and len(set(rails)) == len(rails)
+                     and all(isinstance(rail, str)
+                             and rail in ALLOCATION_OBSERVATIONS for rail in rails),
+                     f"{where}: capture_rails has to name distinct known backends")
+        _require((heap is None) == (rails is None),
+                 f"{where}: capture_rails and a heap section are declared together")
+        plan[case_id] = (writes, allocations, len(texture_allocations),
+                         group_expectations, heap, rails)
     return plan
 
 
@@ -466,7 +565,7 @@ def _render_plan(plan, suite):
         # A render case replays its declaring case's passes before the render
         # pass, so the declaring case has to be one submission with one
         # dispatch.
-        declaring_writes, _, _, group_expectations = plan[declaring]
+        declaring_writes, _, _, group_expectations, _, _ = plan[declaring]
         _require(group_expectations is None,
                  f"{where}: the declaring case must be one submission")
         _require(not any(key in by_id[declaring] for key in ("programs", "dispatches",
@@ -619,10 +718,10 @@ def validate_capture(suite, digest, report, required_backend=None):
         base = {"id", "completion", "writebacks", "allocations"}
         counted = base | {"copy_in", "copy_out"}
         grouped = counted | {"group_counts"}
-        # The present observation is the one key a suite may declare on top of
-        # an otherwise unchanged result shape: it replaces no existing field and
-        # it does not relax the counter-pair rule below.
-        _require(set(result) - {"present"} in (base, counted, grouped),
+        # The present and heap observations are the keys a suite may declare on
+        # top of an otherwise unchanged result shape: they replace no existing
+        # field and they do not relax the counter-pair rule below.
+        _require(set(result) - {"present", "heap"} in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
                  " plus the per-command-buffer group_counts")
@@ -688,11 +787,22 @@ def validate_capture(suite, digest, report, required_backend=None):
                 _require("present" not in result,
                          f"{where}: {report['backend']} must not report the present observation "
                          "of a case its marker does not name")
+            _require("heap" not in result,
+                     f"{where}: a render case carries no heap observation")
         else:
-            expected_writes, expected_allocations, texture_count, group_expectations = plan[case_id]
+            expected_writes, expected_allocations, texture_count, group_expectations, heap, _ = \
+                plan[case_id]
             _compare_observation(result, expected_writes, expected_allocations, where)
             _require("present" not in result,
                      f"{where}: the suite declares no present observation for this case")
+            if heap is None:
+                _require("heap" not in result,
+                         f"{where}: the suite declares no heap section for this case")
+            else:
+                _require("heap" in result,
+                         f"{where}: {report['backend']} has to report the heap placement "
+                         "the suite declares")
+                _heap_observation(result["heap"], heap, where)
 
         if case_id in render_plan:
             if counts[0] is not None:
@@ -761,19 +871,27 @@ def validate_capture(suite, digest, report, required_backend=None):
             _require(counts[1] == expected_out,
                      f"{where}: copy_out {counts[1]} does not match {expected_out} "
                      "written allocations")
-    # Every compute case is required from every rail. A render case is required
-    # only from the rails its own `capture_rails` marker names: the object-API
-    # rails carry no render command encoder and the native provider declares no
-    # render support, so those captures have no attachment observation to
-    # report. A rail that is not named must not report the case either, which is
-    # the same exact-set rule the per-result check applies.
-    required = set(plan) | {case_id for case_id, expectation in render_plan.items()
-                            if report["backend"] in expectation.rails}
+    # A compute case without a heap section is required from every rail. A
+    # compute case with one, and a render case, is required only from the rails
+    # its own `capture_rails` marker names (`research/docs/25` §5.2): a rail
+    # that declares no heap support cannot report a placement observation, and
+    # the object-API rails carry no render command encoder, so those captures
+    # would have nothing to report. A rail that is not named must not report
+    # the case either, which is the same exact-set rule the per-result check
+    # applies.
+    required = {case_id for case_id, expectation in plan.items()
+                if expectation[5] is None or report["backend"] in expectation[5]}
+    required |= {case_id for case_id, expectation in render_plan.items()
+                 if report["backend"] in expectation.rails}
     missing = required - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
     for case_id in sorted(set(render_plan) - required):
         _require(case_id not in seen,
                  f"case {case_id}: {report['backend']} is not a rail this render case runs on")
+    for case_id, expectation in sorted(plan.items()):
+        if expectation[5] is not None and case_id not in required:
+            _require(case_id not in seen,
+                     f"case {case_id}: {report['backend']} is not a rail this heap case runs on")
 
 
 def _unique_object(pairs):
