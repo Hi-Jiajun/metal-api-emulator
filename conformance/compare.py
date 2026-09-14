@@ -37,7 +37,7 @@ ALLOCATION_OBSERVATIONS = {
 # acquire/present counts every rail its marker names has to report
 # (`research/docs/24` §5.3), or `None` when the suite declares none.
 RenderExpectation = namedtuple(
-    "RenderExpectation", "writes allocations touched written rails attachment present",
+    "RenderExpectation", "writes allocations touched written rails attachment present icb",
     defaults=(None,))
 
 # One render case's present section: the target mode and image count the first
@@ -52,6 +52,13 @@ PresentExpectation = namedtuple(
 # allocation order; `capture_rails` is a separate case-level marker, because a
 # heap case runs only on the rails that declare heap support.
 HeapExpectation = namedtuple("HeapExpectation", "size storage_mode placements")
+
+# One case's indirect-command section (`research/docs/25` §4.3, §5.1): the
+# command kind, the buffer's command cap and kind whitelist, and the replayed
+# range. `command` parameters are validated with the section but do not enter
+# the expectation: the capture reports what it replayed, not what it was asked
+# to replay.
+IcbExpectation = namedtuple("IcbExpectation", "kind max_commands kinds start count")
 
 
 class CaptureError(ValueError):
@@ -165,6 +172,69 @@ def _present_observation(value, expectation, where):
     _require(present == expectation.present,
              f"{where}: the present count {present} does not match the {expectation.present} "
              "the suite declares")
+
+
+def _icb_declaration(value, expected_kind, where):
+    """Parse one case's indirect-command section (`research/docs/25` §4.3).
+
+    The first indirect increment replays exactly one command of one kind per
+    case, so the section is a whitelist: the command kind has to be the one the
+    case's execution path can carry (`draw` for a render case, `dispatch` for a
+    compute case), the buffer's kind list has to contain it, the replayed range
+    has to stay inside the buffer, and the command's own counts are validated
+    here so a suite cannot spell a zero-vertex draw.
+    """
+    _object(value, ("kind", "max_commands", "kinds", "range", "command"),
+            f"{where}.icb")
+    kind = value["kind"]
+    _require(kind in ("draw", "dispatch"), f"{where}.icb: unknown command kind")
+    _require(kind == expected_kind,
+             f"{where}.icb: this case's execution path replays a {expected_kind} command")
+    max_commands = _integer(value["max_commands"], f"{where}.icb.max_commands", 1, U32_MAX)
+    kinds = _list(value["kinds"], f"{where}.icb.kinds")
+    _require(kinds and len(set(kinds)) == len(kinds)
+             and all(named in ("draw", "dispatch") for named in kinds),
+             f"{where}.icb: kinds has to name distinct known command kinds")
+    _require(kind in kinds, f"{where}.icb: the buffer does not admit its own command kind")
+    range_ = value["range"]
+    _object(range_, ("start", "count"), f"{where}.icb.range")
+    start = _integer(range_["start"], f"{where}.icb.range.start", 0, U32_MAX)
+    count = _integer(range_["count"], f"{where}.icb.range.count", 1, U32_MAX)
+    _require(start + count <= max_commands,
+             f"{where}.icb: the replayed range exceeds the command buffer")
+    command = value["command"]
+    if kind == "draw":
+        _object(command, ("vertex_count", "instance_count"), f"{where}.icb.command")
+        _integer(command["vertex_count"], f"{where}.icb.command.vertex_count", 1, U32_MAX)
+        _integer(command["instance_count"], f"{where}.icb.command.instance_count", 1, U32_MAX)
+    else:
+        _object(command, ("x", "y", "z"), f"{where}.icb.command")
+        for axis in ("x", "y", "z"):
+            _integer(command[axis], f"{where}.icb.command.{axis}", 1, U32_MAX)
+    return IcbExpectation(kind=kind, max_commands=max_commands, kinds=tuple(kinds),
+                          start=start, count=count)
+
+
+def _icb_observation(value, expectation, where):
+    """Check one case's `icb` segment against the section its suite declares.
+
+    The segment is the provider's own record of the replay — the command kind,
+    the buffer range it replayed and how many commands it encoded — not the
+    suite's request echoed back. The bytes stay with the ordinary attachment or
+    writeback comparison (`research/docs/25` §5.1).
+    """
+    _object(value, ("kind", "start", "count", "commands"), f"{where}.icb")
+    _require(value["kind"] == expectation.kind,
+             f"{where}.icb: the replayed kind does not match the suite")
+    start = _integer(value["start"], f"{where}.icb.start", 0, U32_MAX)
+    count = _integer(value["count"], f"{where}.icb.count", 1, U32_MAX)
+    commands = _integer(value["commands"], f"{where}.icb.commands", 1, U32_MAX)
+    _require((start, count) == (expectation.start, expectation.count),
+             f"{where}.icb: the replayed range does not match the suite")
+    _require(commands == count,
+             f"{where}.icb: replayed {commands} commands for a {count}-command range")
+    _require(commands <= expectation.max_commands,
+             f"{where}.icb: the buffer holds fewer commands than were replayed")
 
 
 def _heap_observation(value, expectation, where):
@@ -468,19 +538,22 @@ def _suite_plan(suite):
         # heap support can report the placement observation, so the marker is
         # required with the section and refused without it.
         heap = None
+        icb = None
         rails = None
         if "heap" in case:
             heap = _heap_declaration(case["heap"], allocations, where)
+        if "icb" in case:
+            icb = _icb_declaration(case["icb"], "dispatch", where)
         if "capture_rails" in case:
             rails = _list(case["capture_rails"], f"{where}.capture_rails")
             _require(rails and len(set(rails)) == len(rails)
                      and all(isinstance(rail, str)
                              and rail in ALLOCATION_OBSERVATIONS for rail in rails),
                      f"{where}: capture_rails has to name distinct known backends")
-        _require((heap is None) == (rails is None),
-                 f"{where}: capture_rails and a heap section are declared together")
+        _require(((heap is None and icb is None) == (rails is None)),
+                 f"{where}: capture_rails and a heap or icb section are declared together")
         plan[case_id] = (writes, allocations, len(texture_allocations),
-                         group_expectations, heap, rails)
+                         group_expectations, heap, icb, rails)
     return plan
 
 
@@ -555,7 +628,7 @@ def _render_plan(plan, suite):
                     "vertices", "viewport", "attachment", "expected_hex", "capture_rails")
         missing = [field for field in required if field not in case]
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
-        unexpected = sorted(set(case) - set(required) - {"present"})
+        unexpected = sorted(set(case) - set(required) - {"present", "icb"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
@@ -565,7 +638,7 @@ def _render_plan(plan, suite):
         # A render case replays its declaring case's passes before the render
         # pass, so the declaring case has to be one submission with one
         # dispatch.
-        declaring_writes, _, _, group_expectations, _, _ = plan[declaring]
+        declaring_writes, _, _, group_expectations, _, _, _ = plan[declaring]
         _require(group_expectations is None,
                  f"{where}: the declaring case must be one submission")
         _require(not any(key in by_id[declaring] for key in ("programs", "dispatches",
@@ -638,6 +711,14 @@ def _render_plan(plan, suite):
         if "present" in case:
             present = _present_declaration(case["present"], texel, where)
 
+        # The indirect section is optional too: a case that carries it replays
+        # its full-screen triangle from one indirect draw command instead of a
+        # direct draw, and a capture that reports bytes without the replay
+        # record cannot prove which path produced them.
+        icb = None
+        if "icb" in case:
+            icb = _icb_declaration(case["icb"], "draw", where)
+
         rails = _list(case["capture_rails"], f"{where}.capture_rails")
         _require(rails and len(set(rails)) == len(rails)
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
@@ -680,7 +761,8 @@ def _render_plan(plan, suite):
             written=written,
             rails=frozenset(rails),
             attachment=(allocation, view, offset, len(expected)),
-            present=present)
+            present=present,
+            icb=icb)
     return render_plan
 
 
@@ -721,7 +803,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         # The present and heap observations are the keys a suite may declare on
         # top of an otherwise unchanged result shape: they replace no existing
         # field and they do not relax the counter-pair rule below.
-        _require(set(result) - {"present", "heap"} in (base, counted, grouped),
+        _require(set(result) - {"present", "heap", "icb"} in (base, counted, grouped),
                  "capture result: expected fields "
                  + ", ".join(sorted(base)) + ", optionally with copy_in and copy_out"
                  " plus the per-command-buffer group_counts")
@@ -789,9 +871,24 @@ def validate_capture(suite, digest, report, required_backend=None):
                          "of a case its marker does not name")
             _require("heap" not in result,
                      f"{where}: a render case carries no heap observation")
+            if expectation.icb is None:
+                _require("icb" not in result,
+                         f"{where}: the suite declares no indirect command for this case")
+            else:
+                _require("icb" in result,
+                         f"{where}: {report['backend']} has to report the replayed indirect "
+                         "command the suite declares")
+                _icb_observation(result["icb"], expectation.icb, where)
         else:
-            expected_writes, expected_allocations, texture_count, group_expectations, heap, _ = \
-                plan[case_id]
+            (expected_writes, expected_allocations, texture_count, group_expectations,
+             heap, icb, case_rails) = plan[case_id]
+            # A marked compute case (heap or indirect) is owed only by the
+            # rails its marker names: a rail that is not named must not report
+            # it at all, which this refuses before the per-observation checks
+            # can read a missing segment as a malformed capture.
+            if case_rails is not None and report["backend"] not in case_rails:
+                raise CaptureError(
+                    f"{where}: {report['backend']} is not a rail this marked case runs on")
             _compare_observation(result, expected_writes, expected_allocations, where)
             _require("present" not in result,
                      f"{where}: the suite declares no present observation for this case")
@@ -803,6 +900,14 @@ def validate_capture(suite, digest, report, required_backend=None):
                          f"{where}: {report['backend']} has to report the heap placement "
                          "the suite declares")
                 _heap_observation(result["heap"], heap, where)
+            if icb is None:
+                _require("icb" not in result,
+                         f"{where}: the suite declares no indirect command for this case")
+            else:
+                _require("icb" in result,
+                         f"{where}: {report['backend']} has to report the replayed indirect "
+                         "command the suite declares")
+                _icb_observation(result["icb"], icb, where)
 
         if case_id in render_plan:
             if counts[0] is not None:
@@ -880,7 +985,7 @@ def validate_capture(suite, digest, report, required_backend=None):
     # the case either, which is the same exact-set rule the per-result check
     # applies.
     required = {case_id for case_id, expectation in plan.items()
-                if expectation[5] is None or report["backend"] in expectation[5]}
+                if expectation[6] is None or report["backend"] in expectation[6]}
     required |= {case_id for case_id, expectation in render_plan.items()
                  if report["backend"] in expectation.rails}
     missing = required - seen
@@ -889,7 +994,7 @@ def validate_capture(suite, digest, report, required_backend=None):
         _require(case_id not in seen,
                  f"case {case_id}: {report['backend']} is not a rail this render case runs on")
     for case_id, expectation in sorted(plan.items()):
-        if expectation[5] is not None and case_id not in required:
+        if expectation[6] is not None and case_id not in required:
             _require(case_id not in seen,
                      f"case {case_id}: {report['backend']} is not a rail this heap case runs on")
 

@@ -13,12 +13,12 @@ use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
     CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
     ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, HeapId,
-    HeapResource, LeaseId, LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract,
-    PipelineId, PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-    RenderAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TracePass,
-    ValidatedComputeTrace, ViewId,
+    HeapResource, IndirectCommandKind, LeaseId, LeaseImporter, LeaseRegistry,
+    PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -45,6 +45,18 @@ pub struct HeapPlacementObservation {
     pub allocation_id: AllocationId,
     pub offset: u64,
     pub byte_size: u64,
+}
+
+/// One indirect replay a provider executed: the command kind, the half-open
+/// range it replayed and how many commands it encoded (`research/docs/25`
+/// §5.1). The capture reports this record, not the suite's request, so a rail
+/// that ran a direct draw cannot claim an indirect replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcbReplayObservation {
+    pub kind: IndirectCommandKind,
+    pub start: u32,
+    pub count: u32,
+    pub commands: u32,
 }
 
 /// The provider-side half of a heap payload's mapping to the trace's owned
@@ -188,6 +200,7 @@ pub struct VulkanComputeProvider {
     present_targets: Mutex<BTreeMap<(AllocationId, ViewId), Arc<render::PresentTargetImage>>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     heap_observations: Mutex<Vec<HeapPlacementObservation>>,
+    icb_observations: Mutex<Vec<IcbReplayObservation>>,
     retire_tx: Mutex<Option<mpsc::Sender<PendingExecution>>>,
     observation_deadline: Duration,
     async_execution: bool,
@@ -243,6 +256,7 @@ impl VulkanComputeProvider {
             present_targets: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             heap_observations: Mutex::new(Vec::new()),
+            icb_observations: Mutex::new(Vec::new()),
             retire_tx: Mutex::new(None),
             observation_deadline: GPU_DEADLINE,
             async_execution: false,
@@ -277,6 +291,16 @@ impl VulkanComputeProvider {
         self.heap_observations
             .lock()
             .expect("heap observation lock poisoned")
+            .clone()
+    }
+
+    /// The indirect replay the provider executed last, if the last submission
+    /// carried one. Like the heap observation, a successful submission replaces
+    /// the vector instead of appending to it.
+    pub fn icb_replay_observations(&self) -> Vec<IcbReplayObservation> {
+        self.icb_observations
+            .lock()
+            .expect("icb observation lock poisoned")
             .clone()
     }
 
@@ -671,12 +695,31 @@ impl VulkanComputeProvider {
                     )?
                 }
                 None => match trace.indirect.as_deref() {
-                    Some(payload) => render::execute_indirect_render_pass(
-                        &self.executor.context,
-                        &planned.stages,
-                        &planned.pass,
-                        &payload.command,
-                    )?,
+                    Some(payload) => {
+                        let texels = render::execute_indirect_render_pass(
+                            &self.executor.context,
+                            &planned.stages,
+                            &planned.pass,
+                            &payload.command,
+                        )?;
+                        // Publish what was actually replayed: the command kind,
+                        // the range and the one command the first increment
+                        // encodes (`research/docs/25` §5.1). Like the heap
+                        // observation, a submission replaces the vector.
+                        let mut observations = self
+                            .icb_observations
+                            .lock()
+                            .expect("icb observation lock poisoned");
+                        observations.clear();
+                        observations.push(IcbReplayObservation {
+                            kind: payload.command.kind(),
+                            start: payload.range.start,
+                            count: payload.range.count,
+                            commands: 1,
+                        });
+                        drop(observations);
+                        texels
+                    }
                     None => render::execute_render_pass(
                         &self.executor.context,
                         &planned.stages,

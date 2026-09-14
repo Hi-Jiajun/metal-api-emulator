@@ -36,7 +36,8 @@ mod provider;
 mod render;
 
 pub use compute_provider::{
-    CompiledComputePipeline, HeapPlacementObservation, RenderPipelineRequest, VulkanComputeProvider,
+    CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
+    VulkanComputeProvider,
 };
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;

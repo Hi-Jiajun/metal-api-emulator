@@ -89,7 +89,7 @@ class HeapDeclarationTests(unittest.TestCase):
         self.assertEqual(case[4].size, 512)
         self.assertEqual(case[4].storage_mode, "owned_bytes")
         self.assertEqual(case[4].placements, ((900, 0, 16), (920, 256, 12)))
-        self.assertEqual(case[5], ["vulkan"])
+        self.assertEqual(case[6], ["vulkan"])
 
     def test_aliasing_is_refused_in_the_first_increment(self):
         heap = copy.deepcopy(HEAP)
@@ -198,7 +198,7 @@ class HeapObservationTests(unittest.TestCase):
         suite, digest = synthetic_suite(rails=("native-metal-provider",))
         report = capture_for(suite, digest)
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "not a rail this heap case runs on"):
+                                    "is not a rail this marked case runs on"):
             compare.validate_capture(suite, digest, report, "vulkan")
 
     def test_a_rail_without_counters_can_report_the_heap_segment(self):
@@ -214,6 +214,185 @@ class HeapObservationTests(unittest.TestCase):
         baseline = compare._suite_plan(suite)["render_declaring_copy_word"]
         planned = compare._suite_plan(self.suite)["render_declaring_copy_word"]
         self.assertEqual(baseline[:4], planned[:4])
+
+
+# The indirect-command section (`research/docs/25` §4.3/§5.1): a render case
+# replays one draw, a compute case one dispatch.
+ICB_DRAW = {
+    "kind": "draw",
+    "max_commands": 1,
+    "kinds": ["draw"],
+    "range": {"start": 0, "count": 1},
+    "command": {"vertex_count": 3, "instance_count": 1},
+}
+ICB_DISPATCH = {
+    "kind": "dispatch",
+    "max_commands": 1,
+    "kinds": ["dispatch"],
+    "range": {"start": 0, "count": 1},
+    "command": {"x": 1, "y": 1, "z": 1},
+}
+ICB_OBSERVATION = {"kind": "draw", "start": 0, "count": 1, "commands": 1}
+
+
+def render_suite_with_icb(icb=ICB_DRAW):
+    suite = json.loads(V13_PATH.read_text(encoding="utf-8"))
+    case = suite["render_cases"][0]
+    if icb is not None:
+        case["icb"] = copy.deepcopy(icb)
+    digest = hashlib.sha256(json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+    return suite, digest
+
+
+def draw_capture(suite, digest, icb=ICB_OBSERVATION, report_icb=True):
+    from test_suite_v13 import synthetic_capture
+
+    report = synthetic_capture(suite, digest, "vulkan")
+    for result in report["results"]:
+        if result["id"] == suite["render_cases"][0]["id"]:
+            if report_icb and icb is not None:
+                result["icb"] = copy.deepcopy(icb)
+    return report
+
+
+class IcbDeclarationTests(unittest.TestCase):
+    """The suite-side indirect section: one command, one kind, one range."""
+
+    def plan(self, icb):
+        suite, _ = render_suite_with_icb(icb)
+        return compare._render_plan(compare._suite_plan(suite), suite)
+
+    def reject(self, icb, message):
+        with self.assertRaisesRegex(compare.CaptureError, message):
+            self.plan(copy.deepcopy(icb))
+
+    def test_draw_section_is_planned(self):
+        plan = self.plan(copy.deepcopy(ICB_DRAW))
+        expectation = next(iter(plan.values())).icb
+        self.assertEqual(expectation.kind, "draw")
+        self.assertEqual((expectation.max_commands, expectation.kinds), (1, ("draw",)))
+        self.assertEqual((expectation.start, expectation.count), (0, 1))
+
+    def test_a_kind_the_case_cannot_replay_is_refused(self):
+        self.reject(ICB_DISPATCH, "replays a draw command")
+
+    def test_a_range_outside_the_buffer_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW)
+        icb["range"]["start"] = 1
+        self.reject(icb, "exceeds the command buffer")
+
+    def test_a_buffer_that_does_not_admit_its_kind_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW)
+        icb["kinds"] = ["dispatch"]
+        self.reject(icb, "does not admit its own command kind")
+
+    def test_an_unknown_kind_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW)
+        icb["kind"] = "mesh"
+        self.reject(icb, "unknown command kind")
+
+    def test_a_zero_vertex_draw_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW)
+        icb["command"]["vertex_count"] = 0
+        self.reject(icb, "expected integer")
+
+    def test_an_unexpected_field_is_refused(self):
+        icb = copy.deepcopy(ICB_DRAW)
+        icb["stride"] = 16
+        self.reject(icb, "expected fields")
+
+
+class IcbObservationTests(unittest.TestCase):
+    """The capture side: the replay record is required where declared, refused elsewhere."""
+
+    def setUp(self):
+        self.suite, self.digest = render_suite_with_icb()
+
+    def validate(self, report, backend="vulkan"):
+        compare.validate_capture(self.suite, self.digest, report, backend)
+
+    def reject(self, report, message, backend="vulkan"):
+        with self.assertRaisesRegex(compare.CaptureError, message):
+            self.validate(report, backend)
+
+    def test_the_named_rail_reports_the_replayed_command(self):
+        self.validate(draw_capture(self.suite, self.digest))
+
+    def test_a_missing_replay_record_is_refused(self):
+        self.reject(draw_capture(self.suite, self.digest, report_icb=False),
+                    "has to report the replayed indirect command")
+
+    def test_a_different_kind_is_refused(self):
+        observation = dict(ICB_OBSERVATION, kind="dispatch")
+        self.reject(draw_capture(self.suite, self.digest, icb=observation),
+                    "replayed kind does not match")
+
+    def test_a_different_range_is_refused(self):
+        observation = dict(ICB_OBSERVATION, count=2, commands=2)
+        self.reject(draw_capture(self.suite, self.digest, icb=observation),
+                    "replayed range does not match")
+
+    def test_a_command_count_that_does_not_match_the_range_is_refused(self):
+        observation = dict(ICB_OBSERVATION, commands=2)
+        self.reject(draw_capture(self.suite, self.digest, icb=observation),
+                    "replayed 2 commands for a 1-command range")
+
+    def test_an_undeclared_replay_record_is_refused(self):
+        suite, digest = render_suite_with_icb(icb=None)
+        report = draw_capture(suite, digest)
+        with self.assertRaisesRegex(compare.CaptureError, "declares no indirect command"):
+            compare.validate_capture(suite, digest, report)
+
+    def test_a_widened_record_is_refused(self):
+        observation = dict(ICB_OBSERVATION, stride=16)
+        self.reject(draw_capture(self.suite, self.digest, icb=observation),
+                    "expected fields")
+
+
+class ComputeIcbDeclarationTests(unittest.TestCase):
+    """A compute case's indirect section replays one dispatch and needs a marker."""
+
+    def suite_with(self, icb=ICB_DISPATCH, rails=("vulkan",)):
+        suite = json.loads(V13_PATH.read_text(encoding="utf-8"))
+        suite.pop("render_cases", None)
+        case = suite["cases"][0]
+        if icb is not None:
+            case["icb"] = copy.deepcopy(icb)
+        if rails is not None:
+            case["capture_rails"] = list(rails)
+        digest = hashlib.sha256(json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+        return suite, digest
+
+    def test_dispatch_section_is_planned_and_marked(self):
+        suite, digest = self.suite_with()
+        plan = compare._suite_plan(suite)["render_declaring_copy_word"]
+        self.assertEqual(plan[5].kind, "dispatch")
+        self.assertEqual(plan[5].count, 1)
+        self.assertEqual(plan[6], ["vulkan"])
+
+    def test_a_draw_command_on_a_compute_case_is_refused(self):
+        suite, _ = self.suite_with(icb=ICB_DRAW)
+        with self.assertRaisesRegex(compare.CaptureError, "replays a dispatch command"):
+            compare._suite_plan(suite)
+
+    def test_a_compute_icb_without_a_marker_is_refused(self):
+        suite, _ = self.suite_with(rails=None)
+        with self.assertRaisesRegex(compare.CaptureError, "declared together"):
+            compare._suite_plan(suite)
+
+    def test_a_named_rail_reports_the_dispatch_record(self):
+        suite, digest = self.suite_with()
+        report = synthetic_report(suite, digest)
+        for result in report["results"]:
+            result["copy_in"], result["copy_out"] = 2, 1
+            result["icb"] = dict(ICB_OBSERVATION, kind="dispatch")
+        compare.validate_capture(suite, digest, report, "vulkan")
+
+    def test_an_unnamed_rail_must_not_report_the_case(self):
+        suite, digest = self.suite_with(rails=("native-metal-provider",))
+        report = synthetic_report(suite, digest)
+        with self.assertRaisesRegex(compare.CaptureError, "is not a rail this marked case runs on"):
+            compare.validate_capture(suite, digest, report, "vulkan")
 
 
 if __name__ == "__main__":

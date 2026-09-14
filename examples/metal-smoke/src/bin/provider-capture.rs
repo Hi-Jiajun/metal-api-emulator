@@ -7,9 +7,11 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, InitialState, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
-    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
+    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
     StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
     VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
@@ -20,7 +22,8 @@ use metal_api_ipc::command::{serve_provider_unix, unix as command_unix, RemotePr
 #[cfg(target_os = "macos")]
 use metal_api_native::{NativeMetalProvider, NativeRenderPipelineRequest};
 use metal_api_vulkan::{
-    HeapPlacementObservation, RenderPipelineRequest, VulkanComputeProvider, VulkanExecutor,
+    HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest, VulkanComputeProvider,
+    VulkanExecutor,
 };
 use metal_smoke::{assemble_owned_air, wrap_air_bitcode};
 use serde::{Deserialize, Serialize};
@@ -176,6 +179,16 @@ impl CopyCounters {
     fn heap_observations(&self) -> Vec<HeapPlacementObservation> {
         match self {
             Self::Vulkan { provider, .. } => provider.heap_placement_observations(),
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => Vec::new(),
+        }
+    }
+
+    /// The indirect replay the provider executed last (`research/docs/25`
+    /// §5.1). The native rail has no indirect execution yet.
+    fn icb_observations(&self) -> Vec<IcbReplayObservation> {
+        match self {
+            Self::Vulkan { provider, .. } => provider.icb_replay_observations(),
             #[cfg(target_os = "macos")]
             Self::Native(_) => Vec::new(),
         }
@@ -915,6 +928,11 @@ struct RenderCase {
     /// checked against the provider's counters when the case runs.
     #[serde(default)]
     present: Option<PresentDefinition>,
+    /// Optional indirect-command section (`research/docs/25` §4.3). A case
+    /// that carries it replays its draw from one encoded command instead of a
+    /// direct draw; only the rails its marker names execute it.
+    #[serde(default)]
+    icb: Option<IcbCase>,
 }
 
 /// The colour attachment a render case draws into. The fields mirror
@@ -1037,6 +1055,43 @@ struct PresentCounts {
     present: u32,
 }
 
+/// The indirect replay a render case declares (`research/docs/25` §4.3): one
+/// command kind, the buffer's command cap and kind whitelist, the replayed
+/// range and the command's own parameters. The capture builds the trace
+/// payload from it; the report's segment comes from the provider's observation
+/// of what it replayed, not from this request.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcbCase {
+    kind: String,
+    max_commands: u32,
+    kinds: Vec<String>,
+    range: IcbRangeCase,
+    command: IcbCommandCase,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcbRangeCase {
+    start: u32,
+    count: u32,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IcbCommandCase {
+    #[serde(default)]
+    vertex_count: Option<u32>,
+    #[serde(default)]
+    instance_count: Option<u32>,
+    #[serde(default)]
+    x: Option<u32>,
+    #[serde(default)]
+    y: Option<u32>,
+    #[serde(default)]
+    z: Option<u32>,
+}
+
 /// The heap placement observation for one compute case, reported when the case
 /// carries a heap section (`research/docs/25` §5.1). The bytes stay with the
 /// ordinary writeback comparison; this segment is what proves the placements
@@ -1053,6 +1108,15 @@ struct HeapPlacementReport {
     allocation: u64,
     offset: u64,
     byte_size: u64,
+}
+
+/// The provider's own record of one indirect replay (`research/docs/25` §5.1).
+#[derive(Serialize)]
+struct IcbSegment {
+    kind: &'static str,
+    start: u32,
+    count: u32,
+    commands: u32,
 }
 
 #[derive(Serialize)]
@@ -1082,6 +1146,10 @@ struct CaseResult {
     /// section.
     #[serde(skip_serializing_if = "Option::is_none")]
     heap: Option<HeapSegment>,
+    /// The indirect replay observation. Absent from cases that carry no
+    /// indirect command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icb: Option<IcbSegment>,
 }
 
 #[derive(Serialize)]
@@ -1417,6 +1485,16 @@ fn main() -> Result<()> {
     let mut render_pipeline: Option<CompiledComputePipeline> = None;
     let mut object_render_pipeline: Option<objects::RenderPipeline> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
+        // A render case is owed only by the rails its marker names: an indirect
+        // case names the rails that declare indirect support, and a rail that
+        // is not named must omit the case rather than run the direct shape.
+        if !case
+            .capture_rails
+            .iter()
+            .any(|rail| rail == backend.report_name(api))
+        {
+            continue;
+        }
         let declaring = suite
             .cases
             .iter()
@@ -1482,6 +1560,9 @@ fn main() -> Result<()> {
                 acquire: u32::try_from(acquires_after - acquires_before)?,
                 present: u32::try_from(presents_after - presents_before)?,
             });
+        }
+        if case.icb.is_some() {
+            result.icb = Some(icb_segment(counters.icb_observations())?);
         }
         results.push(result);
     }
@@ -2566,6 +2647,88 @@ fn case_trace(
 const HEAP_PLACEMENT_ID: HeapId = HeapId::new(61);
 
 /// Translate a suite case's heap section into the trace payload
+/// Translate a render case's indirect section into the trace payload
+/// (`research/docs/25` §4.3). Only the draw kind reaches a render case in the
+/// first increment; the command parameters are required by kind.
+fn render_icb_payload(case: &RenderCase) -> Result<Option<IndirectCommandPayload>> {
+    let Some(icb) = &case.icb else {
+        return Ok(None);
+    };
+    if icb.kind != "draw" {
+        return Err(format!(
+            "render case {}: the first indirect increment replays draws only",
+            case.id
+        )
+        .into());
+    }
+    if !icb.kinds.iter().any(|kind| kind == "draw") {
+        return Err(format!(
+            "render case {}: the indirect buffer does not admit its own command kind",
+            case.id
+        )
+        .into());
+    }
+    let vertex_count = icb.command.vertex_count.ok_or_else(|| -> Box<dyn Error> {
+        format!(
+            "render case {}: the draw command needs vertex_count",
+            case.id
+        )
+        .into()
+    })?;
+    let instance_count = icb
+        .command
+        .instance_count
+        .ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "render case {}: the draw command needs instance_count",
+                case.id
+            )
+            .into()
+        })?;
+    if icb.command.x.is_some() || icb.command.y.is_some() || icb.command.z.is_some() {
+        return Err(format!(
+            "render case {}: a draw command carries no dispatch parameters",
+            case.id
+        )
+        .into());
+    }
+    Ok(Some(IndirectCommandPayload {
+        buffer: IndirectCommandBufferDescriptor {
+            max_commands: icb.max_commands,
+            kinds: vec![IndirectCommandKind::Draw],
+        },
+        command: IndirectCommandDescriptor::Draw {
+            vertex_count,
+            instance_count,
+        },
+        range: IndirectCommandRange {
+            start: icb.range.start,
+            count: icb.range.count,
+        },
+    }))
+}
+
+/// Turn the provider's replay record into the report segment. The record comes
+/// from the execution path that ran, so a rail that fell back to a direct draw
+/// cannot claim an indirect replay (`research/docs/25` §5.1).
+fn icb_segment(observations: Vec<IcbReplayObservation>) -> Result<IcbSegment> {
+    let observation = observations
+        .first()
+        .ok_or("indirect case reported no replay observation")?;
+    let kind = match observation.kind {
+        IndirectCommandKind::Draw => "draw",
+        IndirectCommandKind::DrawIndexed => "draw_indexed",
+        IndirectCommandKind::Dispatch => "dispatch",
+    };
+    Ok(IcbSegment {
+        kind,
+        start: observation.start,
+        count: observation.count,
+        commands: observation.commands,
+    })
+}
+
+/// Translate a suite case's heap section into the trace payload
 /// (`research/docs/25` §4.2). The structural rules (one allocation per
 /// placement, no overlap, placements fit the slab) stay core admission's job;
 /// this only refuses the shapes the suite cannot spell at all.
@@ -2761,6 +2924,12 @@ fn run_render_case(
         &[],
         &dispatch_sequence(declaring),
     )?;
+    // The indirect section replays the render pass's own triangle from one
+    // encoded command (`research/docs/25` §6 Step 4); the attachment shape and
+    // every other validation stay the ones the direct case uses.
+    if let Some(payload) = render_icb_payload(case)? {
+        trace.indirect = Some(Box::new(payload));
+    }
     let clear = unhex(
         attachment
             .clear_hex
@@ -2890,6 +3059,7 @@ fn run_render_case(
         group_counts: None,
         present: None,
         heap: None,
+        icb: None,
     })
 }
 
@@ -3062,6 +3232,7 @@ fn run_object_case(
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
         present: None,
         heap: None,
+        icb: None,
     })
 }
 
@@ -3255,6 +3426,7 @@ fn run_object_render_case(
         group_counts: None,
         present: None,
         heap: None,
+        icb: None,
     })
 }
 
@@ -3537,6 +3709,7 @@ fn run_case(
         group_counts: case.command_buffers.as_ref().map(|_| group_counts),
         present: None,
         heap: None,
+        icb: None,
     })
 }
 
