@@ -1248,9 +1248,10 @@ pub enum LoadOp {
 pub enum StoreOp {
     /// Store the pass's writes. This is what makes the attachment comparable.
     Store,
-    /// Discard the pass's writes. Carried for the wire format's completeness
-    /// and refused by the first render increment (`docs/23` §3.6): a discarded
-    /// attachment must not be able to pass as "landed correctly".
+    /// Discard the pass's writes. Admitted by `docs/23` §3.6's v19 rule: the
+    /// pass must still store at least one attachment, and the discarded
+    /// attachment disappears from the observable surface instead of passing
+    /// as "landed correctly".
     DontCare,
 }
 
@@ -1583,6 +1584,12 @@ impl RenderAttachment {
 
     /// Structural validation only. Capability refusals (whether a device can
     /// render to this format at all) belong to admission in Step 2.
+    ///
+    /// `StoreOp::DontCare` is admitted here (`docs/23` §3.6, v19): the
+    /// pass-level rule in [`RenderPassDescriptor::validate`] still requires at
+    /// least one `Store` attachment, so a trace cannot discard its entire
+    /// observable landing point. `LoadOp::DontCare` stays refused, because it
+    /// would make the compared bytes depend on state no earlier pass defined.
     pub fn validate_shape(&self) -> Result<(), ContractError> {
         if self.view_id.is_zero() {
             return Err(ContractError::InvalidIdentity("attachment view id"));
@@ -1604,9 +1611,6 @@ impl RenderAttachment {
         }
         if matches!(self.load, LoadOp::DontCare) {
             return Err(ContractError::UnsupportedAttachmentLoadOp(self.load));
-        }
-        if matches!(self.store, StoreOp::DontCare) {
-            return Err(ContractError::UnsupportedAttachmentStoreOp(self.store));
         }
         Ok(())
     }
@@ -1692,6 +1696,17 @@ impl RenderPassDescriptor {
         }
         for attachment in &self.color_attachments {
             attachment.validate_shape()?;
+        }
+        // `docs/23` §3.6, v19: a discarded attachment is now a legal shape,
+        // but the pass as a whole still needs one observable landing point.
+        // All-`DontCare` would turn "nothing landed" into a blank proof of
+        // "landed correctly", so it stays a structural refusal.
+        if !self
+            .color_attachments
+            .iter()
+            .any(|attachment| matches!(attachment.store, StoreOp::Store))
+        {
+            return Err(ContractError::AllRenderAttachmentsDiscarded);
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
             return Err(ContractError::VertexBufferLimitExceeded {
@@ -5795,6 +5810,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MissingSnapshotIdentity(_)
         | E::UnknownSnapshotIdentity(_)
         | E::EmptyAttachmentList
+        | E::AllRenderAttachmentsDiscarded
         // Render pipeline, Step 3a: the entry shape and the
         // pipeline/attachment agreement are structural, like the pass rules
         // above. The colour format is not listed here; it reuses
@@ -7045,6 +7061,10 @@ pub enum ContractError {
     UnsupportedAttachmentFormat(AttachmentFormat),
     UnsupportedAttachmentLoadOp(LoadOp),
     UnsupportedAttachmentStoreOp(StoreOp),
+    /// Every attachment's store operation is `DontCare`, so the pass has no
+    /// observable landing point: discarding the whole pass would let "nothing
+    /// landed" pass as "landed correctly" (`docs/23` §3.6, v19).
+    AllRenderAttachmentsDiscarded,
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -7531,6 +7551,9 @@ impl fmt::Display for ContractError {
             Self::UnsupportedAttachmentStoreOp(store) => write!(
                 formatter,
                 "attachment store operation {store:?} is outside the first render increment"
+            ),
+            Self::AllRenderAttachmentsDiscarded => formatter.write_str(
+                "render pass discards every colour attachment, leaving no observable landing point",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -12169,27 +12192,44 @@ mod tests {
     }
 
     #[test]
-    fn render_pass_refuses_undefined_load_and_store_operations() {
+    fn render_pass_refuses_an_undefined_load_operation() {
+        // The v19 increment admits `StoreOp::DontCare` but keeps the load side
+        // narrow: undefined bytes before the pass would make the parity depend
+        // on state no earlier pass defined.
         let mut pass = render_pass();
         pass.color_attachments[0].load = LoadOp::DontCare;
         assert_eq!(
             pass.validate(),
             Err(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
         );
-        pass.color_attachments[0].load = LoadOp::Clear(ClearColor::new([0, 0, 0, 0]));
-        pass.color_attachments[0].store = StoreOp::DontCare;
         assert_eq!(
-            pass.validate(),
-            Err(ContractError::UnsupportedAttachmentStoreOp(
-                StoreOp::DontCare
-            ))
+            contract_error_refusal(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
+                .slug,
+            "attachment_load_op_unsupported"
         );
+    }
 
-        // `Load` is admitted: the compared bytes then depend only on earlier
-        // passes, which the hazard rules already order.
-        pass.color_attachments[0].store = StoreOp::Store;
+    #[test]
+    fn render_pass_admits_a_discarded_attachment_beside_a_stored_one() {
+        // `StoreOp::DontCare` is a legal attachment shape now: location 0
+        // stores, location 1 discards, and the pass as a whole still has one
+        // observable landing point.
+        let mut pass = render_pass();
+        let mut discarded = render_attachment(AttachmentFormat::Bgra8Unorm);
+        discarded.store = StoreOp::DontCare;
+        pass.color_attachments.push(discarded);
+        pass.validate()
+            .expect("one Store attachment keeps the pass observable");
+
+        // `Load` + `Store` stays fully admitted: the compared bytes then
+        // depend only on earlier passes, which the hazard rules already order.
         pass.color_attachments[0].load = LoadOp::Load;
+        pass.color_attachments[0].store = StoreOp::Store;
         pass.validate().expect("Load + Store is admitted");
+
+        // The retained variant keeps its legacy slug even though core no
+        // longer produces it: removing the mapping would churn the published
+        // error surface.
         assert_eq!(
             contract_error_refusal(ContractError::UnsupportedAttachmentStoreOp(
                 StoreOp::DontCare
@@ -12197,11 +12237,35 @@ mod tests {
             .slug,
             "attachment_store_op_unsupported"
         );
+    }
+
+    #[test]
+    fn render_pass_refuses_to_discard_every_attachment() {
+        // A single discarded attachment already leaves the pass with nothing
+        // observable.
+        let mut pass = render_pass();
+        pass.color_attachments[0].store = StoreOp::DontCare;
         assert_eq!(
-            contract_error_refusal(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
-                .slug,
-            "attachment_load_op_unsupported"
+            pass.validate(),
+            Err(ContractError::AllRenderAttachmentsDiscarded)
         );
+
+        // Two discarded attachments are no better than one.
+        let mut pair = render_pass();
+        let mut discarded = render_attachment(AttachmentFormat::Bgra8Unorm);
+        discarded.store = StoreOp::DontCare;
+        pair.color_attachments.push(discarded);
+        pair.color_attachments[0].store = StoreOp::DontCare;
+        assert_eq!(
+            pair.validate(),
+            Err(ContractError::AllRenderAttachmentsDiscarded)
+        );
+
+        // Same class and slug as `EmptyAttachmentList`: it is caller-fixable
+        // trace structure, not a capability narrowing.
+        let refusal = contract_error_refusal(ContractError::AllRenderAttachmentsDiscarded);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
     }
 
     #[test]
