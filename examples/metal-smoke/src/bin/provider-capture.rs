@@ -105,6 +105,15 @@ const QUAD_DUAL_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
     "../../../../crates/metal-api-vulkan/src/render_spv/",
     "solid_unorm8_dual.frag.spv"
 ));
+/// The Vulkan rail's single-channel float stage (`solid_r32f.frag.spv`): a
+/// one-component attachment takes a one-component store, so the UNORM module
+/// the other fixtures use is refused by the rail's own review gate. The bytes
+/// are embedded through `concat!` for the same reason the dual module is: the
+/// v13 coverage test text-scans the four original `include_bytes!` pins.
+const QUAD_R32F_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "solid_r32f.frag.spv"
+));
 /// Vertices the reviewed quad declares, and the number of indices its two
 /// triangles consume.
 const QUAD_VERTICES: u64 = 4;
@@ -839,14 +848,20 @@ fn register_render_pipeline(
             (RENDER_VERTEX_SPV, RENDER_FRAGMENT_SPV),
             VertexLayout::None,
         ),
-        RenderGeometry::IndexedQuad => match attachment_count {
-            1 => (
+        RenderGeometry::IndexedQuad => match (attachment_count, formats) {
+            (1, [AttachmentFormat::R32Float]) => (
+                (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+                (QUAD_VERTEX_SPV, QUAD_R32F_FRAGMENT_SPV),
+                reviewed_quad_layout(),
+            ),
+            (1, _) => (
                 (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
                 (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
                 (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
                 reviewed_quad_layout(),
             ),
-            2 => (
+            (2, _) => (
                 (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
                 (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
                 (QUAD_VERTEX_SPV, QUAD_DUAL_FRAGMENT_SPV),
@@ -1881,6 +1896,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v19") => &["render_declaring_store_and_discard"],
         (1, "compute-buffer-v20") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v21") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v22") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2076,6 +2092,7 @@ fn attachment_format(name: &str) -> Result<AttachmentFormat> {
     match name {
         "rgba8_unorm" => Ok(AttachmentFormat::Rgba8Unorm),
         "bgra8_unorm" => Ok(AttachmentFormat::Bgra8Unorm),
+        "r32float" => Ok(AttachmentFormat::R32Float),
         other => Err(format!("unsupported attachment format {other:?}").into()),
     }
 }
@@ -2354,7 +2371,10 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // the reviewed fragment stage stores the same colour either way, and
         // the attachment's own layout decides which channel lands in which
         // byte.
-        if attachment.format != "rgba8_unorm" && attachment.format != "bgra8_unorm" {
+        if attachment.format != "rgba8_unorm"
+            && attachment.format != "bgra8_unorm"
+            && attachment.format != "r32float"
+        {
             return Err(format!("{where_}: unsupported attachment format").into());
         }
         if attachment.width != 2 || attachment.height != 2 {

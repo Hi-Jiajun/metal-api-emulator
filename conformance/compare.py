@@ -788,7 +788,7 @@ def _render_plan(plan, suite):
             # v21): the shader stores the same colour either way and the memory
             # bytes follow the attachment's channel order, so the fixture's
             # texels pin which layout the comparison is observing.
-            _require(attachment.get("format") in ("rgba8_unorm", "bgra8_unorm"),
+            _require(attachment.get("format") in ("rgba8_unorm", "bgra8_unorm", "r32float"),
                      f"{attachment_where}: unsupported attachment format")
             width = _integer(attachment.get("width"), f"{attachment_where}.width", 1)
             height = _integer(attachment.get("height"), f"{attachment_where}.height", 1)

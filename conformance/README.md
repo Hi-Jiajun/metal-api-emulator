@@ -1,14 +1,15 @@
 # Native Metal reference capture
 
 Current state: the harness covers the compute/alias/texture/command-buffer
-suites `suite.json` through `suite-v21.json`. The render-bearing suites are
+suites `suite.json` through `suite-v22.json`. The render-bearing suites are
 `suite-v13.json` (offscreen 2x2 colour attachment), `suite-v14.json` (the same
 attachment as a surfaceless present target, with `research/docs/24`'s
 acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
 `suite-v17.json` (a loading pass), `suite-v18.json` (one draw writing two
 colour locations), `suite-v19.json` (the same dual draw with the second
 location discarded), `suite-v20.json` (the same quad drawn from undefined
-pre-pass contents) and `suite-v21.json` (a `bgra8_unorm` attachment). The render and present observation rules live in
+pre-pass contents), `suite-v21.json` (a `bgra8_unorm` attachment) and
+`suite-v22.json` (a single-channel `r32float` attachment). The render and present observation rules live in
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
 store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
 rules are exercised by
@@ -411,3 +412,13 @@ The declaring case is the v13 `copy_word` case at `fefefefe`; the count
 contract stays two in and two out. `conformance/test_suite_v21.py` pins the
 fixture, the plan, the marker gates and the "wrong channel order is refused"
 counter-shape.
+
+## Single-channel attachments (r32float)
+
+[suite-v22.json](suite-v22.json) observes the third admitted colour format:
+`r32float` stores one component, and the reviewed fragment stage hands it
+`64/255`, whose little-endian `f32` bytes are `81 80 80 3e`. A capture that
+reports the four-channel UNORM texel is refused, so the fixture pins the
+component shape rather than merely re-reading a familiar byte string.
+`conformance/test_suite_v22.py` pins the fixture, the plan, the marker gates and
+that counter-shape.

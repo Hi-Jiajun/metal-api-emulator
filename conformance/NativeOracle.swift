@@ -1039,8 +1039,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v21":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v22":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v21 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v22 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1373,7 +1375,9 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 "\(definition.id): every colour attachment discards, leaving no observable landing point")
     var validatedAttachments = [ValidatedRenderAttachment]()
     for (index, attachment) in attachments.enumerated() {
-        try require(attachment.format == "rgba8_unorm" || attachment.format == "bgra8_unorm",
+        try require(attachment.format == "rgba8_unorm"
+                    || attachment.format == "bgra8_unorm"
+                    || attachment.format == "r32float",
                     "\(definition.id): unsupported attachment format")
         try require(attachment.width == 2 && attachment.height == 2,
                     "\(definition.id): the first render increment renders into a 2x2 attachment")
@@ -1504,8 +1508,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         default:
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
-        let pixelFormat: MTLPixelFormat =
-            attachment.format == "bgra8_unorm" ? .bgra8Unorm : .rgba8Unorm
+        let pixelFormat: MTLPixelFormat
+        switch attachment.format {
+        case "bgra8_unorm": pixelFormat = .bgra8Unorm
+        case "r32float": pixelFormat = .r32Float
+        default: pixelFormat = .rgba8Unorm
+        }
         validatedAttachments.append(ValidatedRenderAttachment(
             allocation: attachment.allocation, view: attachment.view,
             width: attachment.width, height: attachment.height,
