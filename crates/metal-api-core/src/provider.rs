@@ -1237,9 +1237,10 @@ pub enum LoadOp {
     Clear(ClearColor),
     /// Keep the attachment's previous contents.
     Load,
-    /// Leave the previous contents undefined. Carried so the wire format has a
-    /// fixed field set, but refused by the first render increment: the compared
-    /// bytes would depend on state no earlier pass defined.
+    /// Leave the previous contents undefined. Admitted since v20: the pass
+    /// neither reads nor presets the attachment's pre-pass bytes, so the
+    /// compared bytes come from the draw's own writes and never from state no
+    /// earlier pass defined.
     DontCare,
 }
 
@@ -1588,8 +1589,10 @@ impl RenderAttachment {
     /// `StoreOp::DontCare` is admitted here (`docs/23` §3.6, v19): the
     /// pass-level rule in [`RenderPassDescriptor::validate`] still requires at
     /// least one `Store` attachment, so a trace cannot discard its entire
-    /// observable landing point. `LoadOp::DontCare` stays refused, because it
-    /// would make the compared bytes depend on state no earlier pass defined.
+    /// observable landing point. `LoadOp::DontCare` is admitted since v20: it
+    /// declares the attachment's pre-pass contents undefined, so the pass
+    /// neither reads nor presets those bytes and the observable output is the
+    /// draw's own write.
     pub fn validate_shape(&self) -> Result<(), ContractError> {
         if self.view_id.is_zero() {
             return Err(ContractError::InvalidIdentity("attachment view id"));
@@ -1608,9 +1611,6 @@ impl RenderAttachment {
         self.expected_bytes()?;
         if !self.format.is_admitted_for_color_attachment() {
             return Err(ContractError::UnsupportedAttachmentFormat(self.format));
-        }
-        if matches!(self.load, LoadOp::DontCare) {
-            return Err(ContractError::UnsupportedAttachmentLoadOp(self.load));
         }
         Ok(())
     }
@@ -2038,10 +2038,10 @@ fn validate_vertex_layout(buffers: &[VertexBufferLayout]) -> Result<(), Contract
 /// would first need cross-driver parity evidence (`docs/24` §3.4) and, on the
 /// Apple side, a different vocabulary entirely (`docs/24` §7.5).
 ///
-/// The three non-FIFO variants sit beside `AttachmentFormat::R32Uint` and
-/// `LoadOp::DontCare` as "expressible on the wire, refused by this increment":
-/// they pin the code values Step 2 encodes while keeping the refusal a
-/// deliberate, typed decision.
+/// The three non-FIFO variants sit beside `AttachmentFormat::R32Uint` as
+/// "expressible on the wire, refused by this increment": they pin the code
+/// values Step 2 encodes while keeping the refusal a deliberate, typed
+/// decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentMode {
     /// `VK_PRESENT_MODE_IMMEDIATE_KHR`. Expressible, refused by the first
@@ -12264,16 +12264,27 @@ mod tests {
     }
 
     #[test]
-    fn render_pass_refuses_an_undefined_load_operation() {
-        // The v19 increment admits `StoreOp::DontCare` but keeps the load side
-        // narrow: undefined bytes before the pass would make the parity depend
-        // on state no earlier pass defined.
-        let mut pass = render_pass();
-        pass.color_attachments[0].load = LoadOp::DontCare;
-        assert_eq!(
-            pass.validate(),
-            Err(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
-        );
+    fn render_pass_admits_every_load_operation() {
+        // v20 admits all three load operations: `Clear` writes a fixed value,
+        // `Load` keeps the attachment's previous contents, and `DontCare`
+        // declares the pre-pass contents undefined — the pass neither reads
+        // nor presets them, so the compared bytes come from the draw's own
+        // writes (`research/docs/23` §3.1).
+        for load in [
+            LoadOp::Clear(ClearColor::new([0x40, 0x80, 0xc0, 0xff])),
+            LoadOp::Load,
+            LoadOp::DontCare,
+        ] {
+            let mut pass = render_pass();
+            pass.color_attachments[0].load = load;
+            pass.color_attachments[0].store = StoreOp::Store;
+            pass.validate()
+                .expect("every load operation beside a Store attachment is a legal shape");
+        }
+
+        // The retained variant keeps its legacy slug even though core no
+        // longer produces it: removing the mapping would churn the published
+        // error surface.
         assert_eq!(
             contract_error_refusal(ContractError::UnsupportedAttachmentLoadOp(LoadOp::DontCare))
                 .slug,
