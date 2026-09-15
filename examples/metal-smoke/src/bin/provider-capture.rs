@@ -833,7 +833,7 @@ fn register_render_pipeline(
             contract: RenderPipelineContract {
                 vertex_entry: vulkan_entries.0.to_owned(),
                 fragment_entry: vulkan_entries.1.to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: layout.clone(),
             },
             vertex_spirv: vulkan_stages.0.to_vec(),
@@ -851,7 +851,7 @@ fn register_render_pipeline(
                 contract: RenderPipelineContract {
                     vertex_entry: msl_entries.0.to_owned(),
                     fragment_entry: msl_entries.1.to_owned(),
-                    color_format: AttachmentFormat::Rgba8Unorm,
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: layout.clone(),
                 },
                 logical_digest,

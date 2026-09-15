@@ -156,10 +156,12 @@ pub(crate) fn reviewed_module(layout: &VertexLayout) -> &'static ReviewedModule 
     }
 }
 
-/// Colour attachments the first render increment admits. The same value the
-/// core contract states (`metal_api_core::provider::MAX_COLOR_ATTACHMENTS`); it
-/// is restated here because a capability value has to be spelled by the provider
-/// that declares it (`research/docs/23` §4.2).
+/// Colour attachments this rail executes today: one. The core contract admits
+/// the MRT shape (up to `metal_api_core::provider::MAX_COLOR_ATTACHMENTS`, now
+/// 4) while this rail's capability bit stays at 1 until the multi-attachment
+/// execution lands (wave3 R1; M5 raises it). The value is restated here because
+/// a capability value has to be spelled by the provider that declares it
+/// (`research/docs/23` §4.2).
 pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 1;
 
 /// Vertex streams one render pass may bind. The same value the core contract
@@ -915,6 +917,18 @@ pub(crate) fn plan<'a>(
         .pipeline
         .validate_against(request.pass)
         .map_err(contract_refusal)?;
+    // The MRT contract admits up to four attachments and a matching format
+    // list, but this rail executes one; refuse the wider pass instead of
+    // silently rendering only location 0 (wave3 R1).
+    if request.pass.color_attachments.len() != 1 {
+        return Err(capability_refusal("render_attachment_count_unsupported")
+            .with_field(
+                "attachments",
+                FieldValue::Unsigned(request.pass.color_attachments.len() as u64),
+            )
+            .with_field("maximum", FieldValue::Unsigned(1))
+            .with_detail("this rail executes exactly one colour attachment"));
+    }
     let Some(attachment) = request.pass.color_attachments.first() else {
         return Err(contract_refusal(ContractError::EmptyAttachmentList));
     };
@@ -1886,7 +1900,7 @@ mod tests {
         RenderPipelineContract {
             vertex_entry: VERTEX_ENTRY.to_owned(),
             fragment_entry: FRAGMENT_ENTRY.to_owned(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
         }
     }
@@ -1929,7 +1943,7 @@ mod tests {
         let pipeline = RenderPipelineContract {
             vertex_entry: vertex.to_owned(),
             fragment_entry: fragment.to_owned(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
         };
         let request = OffscreenRenderRequest {
@@ -2106,10 +2120,34 @@ mod tests {
     fn plan_refuses_a_pipeline_whose_format_disagrees_with_the_attachment() {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let mut pipeline = milestone_pipeline();
-        pipeline.color_format = AttachmentFormat::Bgra8Unorm;
+        pipeline.color_formats = vec![AttachmentFormat::Bgra8Unorm];
         let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "trace_contract_invalid");
         assert_eq!(error.class, ProviderErrorClass::Args);
+    }
+
+    /// The MRT contract admits a dual-format pipeline over a dual-attachment
+    /// pass, but this rail executes one attachment: refuse the pass instead of
+    /// silently rendering only location 0 (wave3 R1).
+    #[test]
+    fn plan_refuses_a_pass_with_more_than_one_attachment() {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.color_attachments.push(pass.color_attachments[0]);
+        let mut pipeline = milestone_pipeline();
+        pipeline.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm];
+        pass.validate()
+            .expect("the dual-attachment pass is a legal core shape");
+        pipeline
+            .validate_against(&pass)
+            .expect("the pipeline compiles one format per location");
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_count_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("attachments"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(error.fields.get("maximum"), Some(&FieldValue::Unsigned(1)));
     }
 
     #[test]
@@ -2242,7 +2280,7 @@ mod tests {
             render: Some(RenderPipelineContract {
                 vertex_entry: VERTEX_ENTRY.to_owned(),
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
             }),
         }
@@ -2438,7 +2476,7 @@ mod tests {
         RenderPipelineContract {
             vertex_entry: QUAD_VERTEX_ENTRY.to_owned(),
             fragment_entry: FRAGMENT_ENTRY.to_owned(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
                 stride: 8,
                 attributes: vec![VertexAttribute {
@@ -2722,12 +2760,13 @@ mod tests {
             bits.supported_color_formats,
             SUPPORTED_COLOR_FORMATS.to_vec()
         );
-        // The rail's limits are core's own values, not a second spelling that
-        // could drift from the contract's.
-        assert_eq!(
-            bits.max_color_attachments,
-            u32::try_from(metal_api_core::provider::MAX_COLOR_ATTACHMENTS).unwrap()
-        );
+        // The rail declares one attachment while the core contract admits the
+        // MRT shape: the bit stays at the rail's own execution shape and is
+        // only ever at or below core's cap (wave3 R1).
+        assert_eq!(bits.max_color_attachments, 1);
+        let core_max = u32::try_from(metal_api_core::provider::MAX_COLOR_ATTACHMENTS).unwrap();
+        assert_eq!(core_max, 4);
+        assert!(bits.max_color_attachments <= core_max);
         assert_eq!(
             bits.supported_color_formats,
             AttachmentFormat::ADMITTED.to_vec()

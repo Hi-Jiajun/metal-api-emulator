@@ -70,6 +70,7 @@ pub enum CodecError {
     QueuePriorityCount { count: usize, maximum: usize },
     TracePassCount { count: usize, maximum: usize },
     ColorAttachmentCount { count: usize, maximum: usize },
+    RenderPipelineFormatCount { count: usize, maximum: usize },
     VertexBufferCount { count: usize, maximum: usize },
     VertexAttributeCount { count: usize, maximum: usize },
     SupportedColorFormatCount { count: usize, maximum: usize },
@@ -153,6 +154,10 @@ impl fmt::Display for CodecError {
             Self::ColorAttachmentCount { count, maximum } => write!(
                 formatter,
                 "render pass carries {count} colour attachments, maximum {maximum}"
+            ),
+            Self::RenderPipelineFormatCount { count, maximum } => write!(
+                formatter,
+                "render pipeline contract carries {count} colour formats, maximum {maximum}"
             ),
             Self::VertexBufferCount { count, maximum } => write!(
                 formatter,

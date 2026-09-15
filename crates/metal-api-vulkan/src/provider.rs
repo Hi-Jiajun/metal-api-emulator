@@ -11,8 +11,8 @@ use metal2vulkan::reflect::{
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract, PresentMode,
-    ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
-    MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
+    ProviderCapabilities, SemanticDigest, StorageMode, MAX_PRESENT_IMAGE_COUNT,
+    MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
 
@@ -64,7 +64,10 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // capability snapshot answers which shapes the provider can express,
         // and the device answers which of those it can run.
         supports_render_passes: true,
-        max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
+        // The capability bit stays at 1 while the core contract admits up to 4
+        // MRT attachments: this rail must not overstate the shape it executes
+        // until the multi-attachment execution lands (wave3 R1; M3 raises it).
+        max_color_attachments: 1,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
         // Vertex input is executed (`render.rs` uploads each bound pool view,

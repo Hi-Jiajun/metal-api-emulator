@@ -188,7 +188,7 @@ fn register_render(
         contract: RenderPipelineContract {
             vertex_entry: "vertex_main".to_owned(),
             fragment_entry: "fragment_main".to_owned(),
-            color_format: format,
+            color_formats: vec![format],
             vertex_layout: VertexLayout::None,
         },
         vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
@@ -541,8 +541,8 @@ fn admission_reads_the_render_contract_from_the_registered_entry() {
             registered
                 .render
                 .as_ref()
-                .map(|contract| contract.color_format),
-            Some(format),
+                .map(|contract| contract.color_formats.as_slice()),
+            Some([format].as_slice()),
             "the registration hands the owner the half admission reads"
         );
 
@@ -573,7 +573,7 @@ fn admission_reads_the_render_contract_from_the_registered_entry() {
             .render
             .as_mut()
             .expect("the fixture entry carries the half")
-            .color_format = other;
+            .color_formats = vec![other];
         let refused = admit_error(
             &fixture.provider.capabilities(),
             &retargeted,
@@ -1142,7 +1142,7 @@ fn vertex_input_fixture_with_load(
             contract: RenderPipelineContract {
                 vertex_entry: "vertex_buffer_main".to_owned(),
                 fragment_entry: "fragment_main".to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: quad_layout(),
             },
             vertex_spirv: QUAD_VERT_SPV.to_vec(),

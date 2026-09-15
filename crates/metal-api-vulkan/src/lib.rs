@@ -4821,7 +4821,7 @@ mod tests {
                 contract: RenderPipelineContract {
                     vertex_entry: "vertex_main".to_owned(),
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
-                    color_format: AttachmentFormat::Rgba8Unorm,
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: VertexLayout::None,
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
@@ -4943,7 +4943,7 @@ mod tests {
                 contract: RenderPipelineContract {
                     vertex_entry: "vertex_main".to_owned(),
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
-                    color_format: AttachmentFormat::Rgba8Unorm,
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: VertexLayout::None,
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),

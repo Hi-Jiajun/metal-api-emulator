@@ -937,7 +937,7 @@ pub struct CompiledComputePipeline {
     /// Carrying it in the table entry is what lets core admission compare an
     /// attachment with the pipeline the pass names (review item I3,
     /// 2026-09-14). Before this field existed the trace could not say what a
-    /// render pass would render with, so the `color_format` agreement was
+    /// render pass would render with, so the `color_formats` agreement was
     /// checked by each provider against its own registry — a lookup core cannot
     /// perform for a caller-supplied table.
     ///
@@ -1254,13 +1254,16 @@ pub enum StoreOp {
     DontCare,
 }
 
-/// The colour attachments the first render increment admits. One, because
-/// `docs/23` §3.3 defers multi-target rendering until `render_targets`
-/// locations are mapped; the cap also stops a trace from smuggling an
-/// attachment list past the wire format before that mapping exists. Step 2
-/// grows the matching `ProviderCapabilities::max_color_attachments` field with
-/// this value (`docs/23` §4.2).
-pub const MAX_COLOR_ATTACHMENTS: usize = 1;
+/// The colour attachments a render pass may declare, which is the MRT shape
+/// the render-track increment admits (`research/docs/23` §3.3): up to four
+/// targets per draw. The attachment list's position is its `location` — entry
+/// `i` is the target the fragment stage's output `i` lands in — so the cap
+/// bounds both the list the pass carries and the format list a
+/// [`RenderPipelineContract`] compiles against. A provider's
+/// `ProviderCapabilities::max_color_attachments` bit stays independent of this
+/// value: the core contract admits the shape, while each rail declares how many
+/// of those attachments it can execute today (`docs/23` §4.2).
+pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 
 /// Vertices in the first milestone's single non-indexed draw: the full-screen
 /// triangle generated from `vertex_id` (`research/docs/23` §1.2).
@@ -1609,15 +1612,16 @@ impl RenderAttachment {
     }
 }
 
-/// The first increment's render pass: one colour attachment, one non-indexed
-/// draw, no dynamic state (`research/docs/23` §3.1).
+/// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
+/// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
 /// Deliberately absent fields, i.e. the features `docs/23` §3.3 schedules
-/// later: MSAA (no `sample_count`), depth/stencil attachments, MRT (the
-/// attachment list is capped at [`MAX_COLOR_ATTACHMENTS`] until
-/// `render_targets` locations are mapped), instancing (no instance count, and
-/// the vertex layouts carry no step rate) and dynamic state beyond the explicit
-/// viewport (no scissor, blend, cull or winding).
+/// later: MSAA (no `sample_count`), depth/stencil attachments, instancing (no
+/// instance count, and the vertex layouts carry no step rate) and dynamic state
+/// beyond the explicit viewport (no scissor, blend, cull or winding). MRT is
+/// admitted at contract level: the attachment list carries up to
+/// [`MAX_COLOR_ATTACHMENTS`] entries, its position is the attachment's
+/// `location`, and each rail declares how many of those it can execute today.
 ///
 /// This type is not referenced by [`ComputeTrace`] yet: Step 1 fixes the shape,
 /// Step 2 makes `passes` a tagged union, extends the `MCC1` payload and teaches
@@ -1626,7 +1630,9 @@ impl RenderAttachment {
 pub struct RenderPassDescriptor {
     /// The registered pipeline that supplies the vertex and fragment entries.
     pub pipeline: PipelineId,
-    /// Colour attachments. The first increment admits exactly one.
+    /// Colour attachments, in location order: entry `i` is the target the
+    /// fragment stage's output `i` lands in, up to
+    /// [`MAX_COLOR_ATTACHMENTS`].
     pub color_attachments: Vec<RenderAttachment>,
     /// `[origin_x, origin_y, width, height]`. The first increment accepts only
     /// the attachment-covering default `(0, 0, width, height)`: the viewport is
@@ -1730,14 +1736,16 @@ impl RenderPassDescriptor {
                 origin: [origin_x, origin_y],
             });
         }
-        // The list is non-empty and capped at one, so the first attachment is
-        // the only one to compare the viewport against.
-        let attachment = &self.color_attachments[0];
-        if u64::from(width) != attachment.width || u64::from(height) != attachment.height {
-            return Err(ContractError::ViewportExtentMismatch {
-                viewport: [width, height],
-                attachment: [attachment.width, attachment.height],
-            });
+        // Every attachment renders into the same viewport, so each one's
+        // extent has to match it; the MRT shape makes no exception for
+        // location 0.
+        for attachment in &self.color_attachments {
+            if u64::from(width) != attachment.width || u64::from(height) != attachment.height {
+                return Err(ContractError::ViewportExtentMismatch {
+                    viewport: [width, height],
+                    attachment: [attachment.width, attachment.height],
+                });
+            }
         }
         // The present action is validated by Step 1's own rules, not a second
         // copy of them: `validate_against` is the same entry point the
@@ -1834,10 +1842,13 @@ pub struct RenderPipelineContract {
     pub vertex_entry: String,
     /// Entry point of the fragment-stage build of the module.
     pub fragment_entry: String,
-    /// Colour-attachment format both stages were compiled against. One format,
-    /// because the first increment admits one colour attachment
-    /// ([`MAX_COLOR_ATTACHMENTS`]).
-    pub color_format: AttachmentFormat,
+    /// Colour-attachment formats both stages were compiled against, in
+    /// location order: entry `i` is the format the pipeline compiles for
+    /// `location` `i`, so [`Self::validate_against`] requires the list to agree
+    /// with the pass's attachment list in count and per position. The first
+    /// MRT increment admits up to [`MAX_COLOR_ATTACHMENTS`] entries; each rail
+    /// declares how many of those it can execute today.
+    pub color_formats: Vec<AttachmentFormat>,
     /// The vertex input shape the vertex stage was compiled for.
     pub vertex_layout: VertexLayout,
 }
@@ -1864,14 +1875,17 @@ impl RenderPipelineContract {
                 RenderPipelineStage::Fragment,
             ));
         }
-        if !self.color_format.is_admitted_for_color_attachment() {
-            // The pipeline's format reuses the attachment's variant: an admitted
-            // pipeline format is a subset of an admitted attachment format, so
-            // one message and one capability slug stay correct for both sides
-            // of the pair.
-            return Err(ContractError::UnsupportedAttachmentFormat(
-                self.color_format,
-            ));
+        if self.color_formats.is_empty() {
+            return Err(ContractError::EmptyRenderPipelineColorFormats);
+        }
+        for format in &self.color_formats {
+            if !format.is_admitted_for_color_attachment() {
+                // The pipeline's format reuses the attachment's variant: an
+                // admitted pipeline format is a subset of an admitted
+                // attachment format, so one message and one capability slug
+                // stay correct for both sides of the pair.
+                return Err(ContractError::UnsupportedAttachmentFormat(*format));
+            }
         }
         if let VertexLayout::Buffers(buffers) = &self.vertex_layout {
             validate_vertex_layout(buffers)?;
@@ -1892,10 +1906,16 @@ impl RenderPipelineContract {
         if pass.color_attachments.is_empty() {
             return Err(ContractError::EmptyAttachmentList);
         }
-        for attachment in &pass.color_attachments {
-            if attachment.format != self.color_format {
+        if self.color_formats.len() != pass.color_attachments.len() {
+            return Err(ContractError::RenderPipelineFormatCountMismatch {
+                pipeline: self.color_formats.len(),
+                attachments: pass.color_attachments.len(),
+            });
+        }
+        for (pipeline, attachment) in self.color_formats.iter().zip(&pass.color_attachments) {
+            if *pipeline != attachment.format {
                 return Err(ContractError::RenderPipelineFormatMismatch {
-                    pipeline: self.color_format,
+                    pipeline: *pipeline,
                     attachment: attachment.format,
                 });
             }
@@ -5781,6 +5801,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         // `UnsupportedAttachmentFormat`, which stays a capability refusal.
         | E::EmptyRenderPipelineEntry(_)
         | E::DuplicateRenderPipelineEntry(_)
+        | E::EmptyRenderPipelineColorFormats
+        | E::RenderPipelineFormatCountMismatch { .. }
         | E::RenderPipelineFormatMismatch { .. }
         | E::MissingRenderPipelineContract { .. }
         | E::DispatchKindMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
@@ -7128,6 +7150,15 @@ pub enum ContractError {
     /// The stage whose entry repeats the other stage's entry name. Reported for
     /// the later of the two fields, i.e. always the fragment entry.
     DuplicateRenderPipelineEntry(RenderPipelineStage),
+    /// A render pipeline compiles no colour-attachment format at all, so there
+    /// is no location the fragment stage could write into.
+    EmptyRenderPipelineColorFormats,
+    /// The pipeline's format list and the pass's attachment list have different
+    /// lengths, so `location` `i` has no counterpart on one side of the pair.
+    RenderPipelineFormatCountMismatch {
+        pipeline: usize,
+        attachments: usize,
+    },
     RenderPipelineFormatMismatch {
         pipeline: AttachmentFormat,
         attachment: AttachmentFormat,
@@ -7218,7 +7249,7 @@ pub enum ContractError {
     /// trace cannot say what the pass would render with.
     ///
     /// Kept distinct from [`Self::UnknownPipeline`]: the id exists and the
-    /// entry is well formed, it simply has no `color_format` to agree with, and
+    /// entry is well formed, it simply has no `color_formats` to agree with, and
     /// reusing the unknown-id variant would name a pipeline the trace does
     /// carry.
     MissingRenderPipelineContract {
@@ -7624,6 +7655,16 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render pipeline {} entry repeats the other stage's entry name",
                 stage.name()
+            ),
+            Self::EmptyRenderPipelineColorFormats => {
+                formatter.write_str("render pipeline declares no colour attachment format")
+            }
+            Self::RenderPipelineFormatCountMismatch {
+                pipeline,
+                attachments,
+            } => write!(
+                formatter,
+                "render pipeline compiles {pipeline} colour attachment formats but the pass declares {attachments}"
             ),
             Self::RenderPipelineFormatMismatch {
                 pipeline,
@@ -11976,7 +12017,7 @@ mod tests {
                 .expect("bounded extent"),
             16
         );
-        assert_eq!(MAX_COLOR_ATTACHMENTS, 1);
+        assert_eq!(MAX_COLOR_ATTACHMENTS, 4);
         assert_eq!(FULL_SCREEN_TRIANGLE_VERTICES, 3);
 
         // Every admitted format carries one 4-byte texel, which is what makes
@@ -12062,18 +12103,27 @@ mod tests {
 
     #[test]
     fn render_pass_refuses_more_attachments_than_the_device_admits() {
+        // The MRT cap admits the full four-location shape and refuses the
+        // fifth, so the limit is the shape bound rather than the single-target
+        // narrowing of the first increment.
         let mut pass = render_pass();
+        for _ in 0..MAX_COLOR_ATTACHMENTS - 1 {
+            pass.color_attachments
+                .push(render_attachment(AttachmentFormat::Bgra8Unorm));
+        }
+        pass.validate()
+            .expect("four attachments stay inside the MRT cap");
         pass.color_attachments
-            .push(render_attachment(AttachmentFormat::Bgra8Unorm));
+            .push(render_attachment(AttachmentFormat::Rgba8Unorm));
         assert_eq!(
             pass.validate(),
             Err(ContractError::AttachmentLimitExceeded {
-                requested: 2,
+                requested: MAX_COLOR_ATTACHMENTS + 1,
                 maximum: MAX_COLOR_ATTACHMENTS,
             })
         );
         let refusal = contract_error_refusal(ContractError::AttachmentLimitExceeded {
-            requested: 2,
+            requested: MAX_COLOR_ATTACHMENTS + 1,
             maximum: MAX_COLOR_ATTACHMENTS,
         });
         assert_eq!(refusal.class, ProviderErrorClass::Capability);
@@ -12566,7 +12616,7 @@ mod tests {
         RenderPipelineContract {
             vertex_entry: "full_screen_vertex".to_owned(),
             fragment_entry: "solid_color_fragment".to_owned(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
         }
     }
@@ -12592,7 +12642,7 @@ mod tests {
         // so the two contracts cannot drift apart on the format set.
         for format in AttachmentFormat::ADMITTED {
             let mut admitted = contract.clone();
-            admitted.color_format = format;
+            admitted.color_formats = vec![format];
             admitted.validate().expect("an admitted format compiles");
         }
     }
@@ -13044,7 +13094,7 @@ mod tests {
         );
         // Duplication is checked before the format, so a contract that is wrong
         // twice reports the entry shape a caller can see without a device.
-        contract.color_format = AttachmentFormat::R32Uint;
+        contract.color_formats = vec![AttachmentFormat::R32Uint];
         assert_eq!(
             contract.validate(),
             Err(ContractError::DuplicateRenderPipelineEntry(
@@ -13064,7 +13114,7 @@ mod tests {
         // R32Uint is expressible but outside the first render increment, and the
         // pipeline refuses it with the same variant and slug as the attachment.
         let mut contract = render_pipeline_contract();
-        contract.color_format = AttachmentFormat::R32Uint;
+        contract.color_formats = vec![AttachmentFormat::R32Uint];
         assert_eq!(
             contract.validate(),
             Err(ContractError::UnsupportedAttachmentFormat(
@@ -13086,6 +13136,68 @@ mod tests {
             Err(ContractError::UnsupportedAttachmentFormat(
                 AttachmentFormat::R32Uint
             ))
+        );
+    }
+
+    #[test]
+    fn render_pipeline_contract_refuses_an_empty_color_format_list() {
+        let mut contract = render_pipeline_contract();
+        contract.color_formats.clear();
+        assert_eq!(
+            contract.validate(),
+            Err(ContractError::EmptyRenderPipelineColorFormats)
+        );
+        let refusal = contract_error_refusal(ContractError::EmptyRenderPipelineColorFormats);
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+    }
+
+    #[test]
+    fn a_dual_format_pipeline_agrees_with_a_dual_attachment_pass() {
+        // Two formats and two attachments, one pair per location: the MRT shape
+        // the first increment's contract admits.
+        let mut contract = render_pipeline_contract();
+        contract.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm];
+        let mut pass = render_pass();
+        pass.color_attachments
+            .push(render_attachment(AttachmentFormat::Bgra8Unorm));
+        pass.validate()
+            .expect("the dual-attachment pass is well formed");
+        contract
+            .validate_against(&pass)
+            .expect("the pipeline compiles one format per location");
+
+        // A count disagreement is a caller-fixable structural refusal, not a
+        // capability narrowing.
+        let single = render_pipeline_contract();
+        assert_eq!(
+            single.validate_against(&pass),
+            Err(ContractError::RenderPipelineFormatCountMismatch {
+                pipeline: 1,
+                attachments: 2,
+            })
+        );
+        let refusal = contract_error_refusal(ContractError::RenderPipelineFormatCountMismatch {
+            pipeline: 1,
+            attachments: 2,
+        });
+        assert_eq!(refusal.class, ProviderErrorClass::Args);
+        assert_eq!(refusal.slug, "trace_contract_invalid");
+    }
+
+    #[test]
+    fn a_location_one_format_disagreement_is_refused_even_when_location_zero_matches() {
+        let mut contract = render_pipeline_contract();
+        contract.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm];
+        let mut pass = render_pass();
+        pass.color_attachments
+            .push(render_attachment(AttachmentFormat::Rgba8Unorm));
+        assert_eq!(
+            contract.validate_against(&pass),
+            Err(ContractError::RenderPipelineFormatMismatch {
+                pipeline: AttachmentFormat::Bgra8Unorm,
+                attachment: AttachmentFormat::Rgba8Unorm,
+            })
         );
     }
 
@@ -13431,7 +13543,7 @@ mod tests {
         // for is accepted, for every admitted format.
         for format in AttachmentFormat::ADMITTED {
             let mut contract = render_pipeline_contract();
-            contract.color_format = format;
+            contract.color_formats = vec![format];
             let mut pass = render_pass();
             pass.color_attachments[0].format = format;
             contract

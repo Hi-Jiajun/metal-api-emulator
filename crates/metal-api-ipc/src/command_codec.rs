@@ -1233,9 +1233,20 @@ fn put_render_pipeline_contract(
     encoder: &mut Encoder,
     contract: &RenderPipelineContract,
 ) -> Result<(), CodecError> {
+    // This increment's wire carries one format per contract: the pre-MRT tag
+    // (`PIPELINE_KIND_RENDER`, `0x01`) is followed by exactly one format byte,
+    // and a multi-format list has no encoding yet (the MRT tag lands in the
+    // next increment). Refuse instead of writing a truncated list an older
+    // decoder would misread.
+    let [format] = contract.color_formats.as_slice() else {
+        return Err(CodecError::RenderPipelineFormatCount {
+            count: contract.color_formats.len(),
+            maximum: 1,
+        });
+    };
     encoder.text(&contract.vertex_entry);
     encoder.text(&contract.fragment_entry);
-    put_attachment_format(encoder, contract.color_format);
+    put_attachment_format(encoder, *format);
     put_vertex_layout(encoder, &contract.vertex_layout)
 }
 
@@ -1311,7 +1322,7 @@ fn get_render_pipeline_contract(
     Ok(RenderPipelineContract {
         vertex_entry: decoder.text()?,
         fragment_entry: decoder.text()?,
-        color_format: get_attachment_format(decoder)?,
+        color_formats: vec![get_attachment_format(decoder)?],
         vertex_layout: get_vertex_layout(decoder)?,
     })
 }

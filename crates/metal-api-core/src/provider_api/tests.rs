@@ -1416,7 +1416,7 @@ fn render_metadata(provider: &FakeProvider) -> CompiledComputePipeline {
         render: Some(RenderPipelineContract {
             vertex_entry: "vertex_main".into(),
             fragment_entry: "fragment_main".into(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
         }),
     }
@@ -1914,7 +1914,7 @@ fn render_metadata_with_layout(
     metadata.render = Some(RenderPipelineContract {
         vertex_entry: "vertex_main".into(),
         fragment_entry: "fragment_main".into(),
-        color_format: AttachmentFormat::Rgba8Unorm,
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: layout,
     });
     metadata

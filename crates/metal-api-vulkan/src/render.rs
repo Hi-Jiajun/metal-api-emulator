@@ -279,7 +279,9 @@ impl RenderStages {
         // store is a component-shape mismatch, not a byte-order preference.
         if !fragment_stage_is_reviewed(self) {
             return Err(fragment_stage_mismatch_refusal(
-                self.contract.color_format,
+                // The pre-MRT codec carries exactly one format, and
+                // `contract.validate()` ran above, so the list is non-empty.
+                self.contract.color_formats[0],
                 &self.contract.fragment_entry,
             ));
         }
@@ -295,8 +297,14 @@ impl RenderStages {
 /// once, and execution re-asks it of the value it was handed, so a
 /// directly-constructed [`RenderStages`] cannot skip the registration gate.
 fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
+    // Exactly one compiled format: the pre-MRT increment's codec carries one
+    // format byte, and this rail executes one attachment, so a multi-format
+    // list is not a reviewed pairing.
+    let [format] = stages.contract.color_formats.as_slice() else {
+        return false;
+    };
     stages.contract.fragment_entry == SOLID_FRAGMENT_ENTRY
-        && solid_fragment_spirv(stages.contract.color_format)
+        && solid_fragment_spirv(*format)
             .is_ok_and(|module| module == stages.fragment_spirv.as_slice())
 }
 
@@ -365,24 +373,21 @@ fn prepare_render_request<'a>(
         .contract
         .validate_against(pass)
         .map_err(|error| contract_refusal(&error.to_string()))?;
+    let [attachment] = pass.color_attachments.as_slice() else {
+        return Err(capability_refusal("render_attachment_count_unsupported")
+            .with_field(
+                "attachments",
+                FieldValue::Unsigned(pass.color_attachments.len() as u64),
+            )
+            .with_field("maximum", FieldValue::Unsigned(1))
+            .with_detail("this rail executes exactly one colour attachment"));
+    };
     if !fragment_stage_is_reviewed(stages) {
         return Err(fragment_stage_mismatch_refusal(
-            stages.contract.color_format,
+            stages.contract.color_formats[0],
             &stages.contract.fragment_entry,
         ));
     }
-    let [attachment] = pass.color_attachments.as_slice() else {
-        return Err(capability_refusal("color_attachment_limit")
-            .with_field(
-                "requested",
-                FieldValue::Unsigned(pass.color_attachments.len() as u64),
-            )
-            .with_field(
-                "maximum",
-                FieldValue::Unsigned(metal_api_core::provider::MAX_COLOR_ATTACHMENTS as u64),
-            )
-            .with_detail("this rail executes exactly one colour attachment"));
-    };
     let clear = match attachment.load {
         LoadOp::Clear(clear) => clear,
         LoadOp::Load => {
@@ -2785,7 +2790,7 @@ mod tests {
             contract: RenderPipelineContract {
                 vertex_entry: "vertex_main".to_owned(),
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
-                color_format: format,
+                color_formats: vec![format],
                 vertex_layout: VertexLayout::None,
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
@@ -3378,7 +3383,7 @@ mod tests {
             contract: RenderPipelineContract {
                 vertex_entry: vertex_entry.to_owned(),
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
-                color_format: AttachmentFormat::Rgba8Unorm,
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
             },
             vertex_spirv,
@@ -3416,6 +3421,41 @@ mod tests {
         assert_eq!(
             nul_entry.fields.get("stage"),
             Some(&FieldValue::Text("vertex".to_owned()))
+        );
+    }
+
+    /// The MRT contract admits a dual-format pipeline over a dual-attachment
+    /// pass, but this rail executes one attachment, so the pass is refused
+    /// before any Vulkan object exists rather than silently rendering only
+    /// location 0. Host-side: `prepare_render_request` reads no device.
+    #[test]
+    fn prepare_render_request_refuses_a_pass_with_more_than_one_attachment() {
+        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        stages.contract.color_formats =
+            vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm];
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.color_attachments.push(pass.color_attachments[0]);
+        pass.validate()
+            .expect("the dual-attachment pass is a legal core shape");
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the pipeline compiles one format per location");
+
+        let refused = match prepare_render_request(&stages, &pass, None) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a dual-attachment pass"),
+        };
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_count_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("attachments"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            refused.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(1))
         );
     }
 

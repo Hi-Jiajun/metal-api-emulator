@@ -1573,7 +1573,7 @@ mod tests {
         RenderPipelineContract {
             vertex_entry: "full_screen_vertex".into(),
             fragment_entry: "solid_color_fragment".into(),
-            color_format: AttachmentFormat::Rgba8Unorm,
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
         }
     }
@@ -1829,7 +1829,11 @@ mod tests {
         let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
             panic!("fixture trace carries a render pass");
         };
-        pass.color_attachments.push(render_attachment(2, 2));
+        // The fixture already carries one attachment; four more cross the MRT
+        // cap the encoder shares with the decoder.
+        for _ in 0..MAX_COLOR_ATTACHMENTS {
+            pass.color_attachments.push(render_attachment(2, 2));
+        }
         assert!(matches!(
             CommandCodec::encode_request(&CommandRequest::Submit {
                 trace,
@@ -1838,6 +1842,32 @@ mod tests {
             .unwrap_err(),
             CodecError::ColorAttachmentCount { count, maximum }
                 if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
+    }
+
+    #[test]
+    fn render_contract_encoding_refuses_more_than_one_format() {
+        // The pre-MRT pipeline tag carries exactly one format byte; a contract
+        // with a longer list has no encoding yet and is refused rather than
+        // written truncated.
+        let mut trace = render_only_trace();
+        let Some(entry) = trace.pipelines.first_mut() else {
+            panic!("the fixture trace carries one pipeline entry");
+        };
+        let Some(contract) = entry.render.as_mut() else {
+            panic!("the fixture entry carries a render half");
+        };
+        contract.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm];
+        assert!(matches!(
+            CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .unwrap_err(),
+            CodecError::RenderPipelineFormatCount {
+                count: 2,
+                maximum: 1
+            }
         ));
     }
 
