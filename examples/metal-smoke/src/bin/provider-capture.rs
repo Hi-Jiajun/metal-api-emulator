@@ -4207,6 +4207,7 @@ fn run_object_render_case(
             view,
             format: AttachmentFormat::Rgba8Unorm,
             load: *load,
+            store: StoreOp::Store,
         })
         .collect::<Vec<_>>();
     let present =
