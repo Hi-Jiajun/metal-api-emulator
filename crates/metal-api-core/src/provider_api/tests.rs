@@ -153,7 +153,14 @@ impl ComputeProvider for FakeProvider {
             host_readback: true,
             submit_only: false,
             supports_render_passes: self.render,
-            max_color_attachments: u32::from(self.render),
+            // The fixture provider executes the contract's full attachment
+            // list, so a multi-attachment trace is admitted rather than
+            // refused at the rail's own one-attachment capability.
+            max_color_attachments: if self.render {
+                MAX_COLOR_ATTACHMENTS as u32
+            } else {
+                0
+            },
             max_attachment_dimension: [u64::from(self.render) * 4096; 2],
             supported_color_formats: self
                 .render
@@ -1503,6 +1510,328 @@ fn a_recording_can_load_its_attachment_instead_of_clearing_it() {
 }
 
 #[test]
+fn a_draw_records_two_clear_attachments_in_location_order() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_multi(
+        &provider,
+        vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let first = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let first_view = first.view(0, 16).unwrap();
+    let second = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let second_view = second.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &first_view).unwrap();
+        encoder.set_buffer(1, &second_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_vertex_buffer(0, &stream).unwrap();
+        encoder
+            .draw_primitives_with_attachments(
+                &[
+                    RenderColorAttachment {
+                        view: &first_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Clear([0xa1; 4]),
+                    },
+                    RenderColorAttachment {
+                        view: &second_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Clear([0xb2; 4]),
+                    },
+                ],
+                2,
+                2,
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+    assert_eq!(first.read().unwrap(), [0x40, 0x80, 0xc0, 0xff].repeat(4));
+    assert_eq!(second.read().unwrap(), [0x40, 0x80, 0xc0, 0xff].repeat(4));
+
+    // The pass carries both attachments in list order, which is the location
+    // order the fragment stage's outputs land at, and each one keeps the load
+    // the caller recorded for its own position.
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    let pass = traces[0].render_passes().next().expect("render pass");
+    assert_eq!(pass.color_attachments.len(), 2);
+    assert_eq!(pass.color_attachments[0].view_id, first_view.view_id());
+    assert_eq!(pass.color_attachments[1].view_id, second_view.view_id());
+    assert_eq!(
+        pass.color_attachments[0].load,
+        LoadOp::Clear(ClearColor::new([0xa1; 4]))
+    );
+    assert_eq!(
+        pass.color_attachments[1].load,
+        LoadOp::Clear(ClearColor::new([0xb2; 4]))
+    );
+}
+
+#[test]
+fn two_loading_attachments_keep_their_own_snapshotted_bytes() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    // One declaring compute pass binds both attachment views, so the trace's
+    // own view declarations carry each attachment's bytes for the rail to
+    // upload before the loading pass opens.
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_multi(
+        &provider,
+        vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let first = device.new_buffer_with_bytes(vec![0xaa; 16]).unwrap();
+    let first_view = first.view(0, 16).unwrap();
+    let second = device.new_buffer_with_bytes(vec![0xbb; 16]).unwrap();
+    let second_view = second.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &first_view).unwrap();
+        encoder.set_buffer(1, &second_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_vertex_buffer(0, &stream).unwrap();
+        encoder
+            .draw_primitives_with_attachments(
+                &[
+                    RenderColorAttachment {
+                        view: &first_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Load,
+                    },
+                    RenderColorAttachment {
+                        view: &second_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Load,
+                    },
+                ],
+                2,
+                2,
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(command.status().unwrap(), CommandBufferStatus::Completed);
+
+    let traces = provider.traces.lock().unwrap();
+    assert_eq!(traces.len(), 1);
+    // Each attachment's load reaches the provider as `LoadOp::Load`, never as
+    // a clear the provider would have to reinterpret, and the two views stay
+    // in location order.
+    let pass = traces[0].render_passes().next().expect("render pass");
+    assert_eq!(pass.color_attachments.len(), 2);
+    assert_eq!(pass.color_attachments[0].view_id, first_view.view_id());
+    assert_eq!(pass.color_attachments[0].load, LoadOp::Load);
+    assert_eq!(pass.color_attachments[1].view_id, second_view.view_id());
+    assert_eq!(pass.color_attachments[1].load, LoadOp::Load);
+    // The two declarations snapshot each attachment's own bytes: the values
+    // differ and both are preserved in the trace the provider uploads from.
+    let declaring_pass = traces[0].compute_passes().next().expect("declaring pass");
+    let first_bytes = declaring_pass
+        .buffers
+        .iter()
+        .find(|view| view.view_id == first_view.view_id())
+        .expect("first attachment declaration");
+    let second_bytes = declaring_pass
+        .buffers
+        .iter()
+        .find(|view| view.view_id == second_view.view_id())
+        .expect("second attachment declaration");
+    assert_ne!(first_bytes.source, second_bytes.source);
+    assert_eq!(first_bytes.source, BufferSource::OwnedBytes(vec![0xaa; 16]));
+    assert_eq!(
+        second_bytes.source,
+        BufferSource::OwnedBytes(vec![0xbb; 16])
+    );
+}
+
+#[test]
+fn multi_attachment_draws_refuse_empty_duplicate_and_excess_lists() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let render = render_pipeline_with_layout(
+        &provider,
+        &device,
+        VertexLayout::Buffers(vec![stream_layout(0)]),
+    );
+    let (_, stream) = buffer(&device, 0x11);
+    let pool = device.new_buffer_with_bytes(vec![0xfe; 80]).unwrap();
+    let views = (0..5)
+        .map(|position| pool.view(position * 16, 16).unwrap())
+        .collect::<Vec<_>>();
+
+    let command = device.new_command_queue().command_buffer();
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    let shapes = views
+        .iter()
+        .map(|view| RenderColorAttachment {
+            view,
+            format: AttachmentFormat::Rgba8Unorm,
+            load: RenderAttachmentLoad::Clear([0xfe; 4]),
+        })
+        .collect::<Vec<_>>();
+
+    // An empty attachment list names no target for any fragment output.
+    assert_eq!(
+        encoder.draw_primitives_with_attachments(&[], 2, 2, FULL_SCREEN_TRIANGLE_VERTICES, None,),
+        Err(Error::EmptyRenderAttachmentList)
+    );
+    // The same `(allocation, view)` identity twice would name one target for
+    // two locations.
+    assert_eq!(
+        encoder.draw_primitives_with_attachments(
+            &[shapes[0], shapes[0]],
+            2,
+            2,
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::DuplicateRenderAttachment)
+    );
+    // Five locations exceed the contract's cap; the refusal names both sides.
+    assert_eq!(
+        encoder.draw_primitives_with_attachments(
+            &shapes,
+            2,
+            2,
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            None,
+        ),
+        Err(Error::RenderAttachmentLimitExceeded {
+            requested: 5,
+            maximum: 4,
+        })
+    );
+    // None of the refusals landed a pass, so the encoder can still record a
+    // valid draw and end cleanly.
+    encoder
+        .draw_primitives_with_attachments(&[shapes[0]], 2, 2, FULL_SCREEN_TRIANGLE_VERTICES, None)
+        .unwrap();
+    encoder.end_encoding().unwrap();
+}
+
+#[test]
+fn an_indexed_draw_records_two_attachments_through_the_shared_path() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let mut render_metadata = render_metadata_multi(
+        &provider,
+        vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+    );
+    // The index-only shape binds no stream, so the matching pipeline has no
+    // vertex layout either.
+    if let Some(render) = &mut render_metadata.render {
+        render.vertex_layout = VertexLayout::None;
+    }
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let first = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let first_view = first.view(0, 16).unwrap();
+    let second = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let second_view = second.view(0, 16).unwrap();
+    let index = device.new_buffer_with_bytes(vec![0; 12]).unwrap();
+    let index_view = index.view(0, 12).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &first_view).unwrap();
+        encoder.set_buffer(1, &second_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .set_index_buffer(&index_view, IndexFormat::Uint32)
+            .unwrap();
+        encoder
+            .draw_indexed_primitives_with_attachments(
+                &[
+                    RenderColorAttachment {
+                        view: &first_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Clear([0xa1; 4]),
+                    },
+                    RenderColorAttachment {
+                        view: &second_view,
+                        format: AttachmentFormat::Rgba8Unorm,
+                        load: RenderAttachmentLoad::Clear([0xb2; 4]),
+                    },
+                ],
+                2,
+                2,
+                FULL_SCREEN_TRIANGLE_VERTICES,
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+    assert_eq!(first.read().unwrap(), [0x40, 0x80, 0xc0, 0xff].repeat(4));
+    assert_eq!(second.read().unwrap(), [0x40, 0x80, 0xc0, 0xff].repeat(4));
+
+    let traces = provider.traces.lock().unwrap();
+    let pass = traces[0].render_passes().next().expect("render pass");
+    assert_eq!(pass.color_attachments.len(), 2);
+    assert_eq!(pass.color_attachments[0].view_id, first_view.view_id());
+    assert_eq!(pass.color_attachments[1].view_id, second_view.view_id());
+}
+
+#[test]
 fn render_encoder_refuses_attachment_extent_mismatch_and_missing_pipeline() {
     let (provider, device) = setup();
     let render_pipeline = device.render_pipeline(&render_metadata(&provider)).unwrap();
@@ -1916,6 +2245,24 @@ fn render_metadata_with_layout(
         fragment_entry: "fragment_main".into(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: layout,
+    });
+    metadata
+}
+
+/// The render contract for a multi-attachment draw: one compiled format per
+/// location and one bound stream at binding 0, so a direct draw through vertex
+/// buffers has a matching pipeline and every attachment lands at its own
+/// location.
+fn render_metadata_multi(
+    provider: &FakeProvider,
+    formats: Vec<AttachmentFormat>,
+) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    metadata.render = Some(RenderPipelineContract {
+        vertex_entry: "vertex_main".into(),
+        fragment_entry: "fragment_main".into(),
+        color_formats: formats,
+        vertex_layout: VertexLayout::Buffers(vec![stream_layout(0)]),
     });
     metadata
 }
