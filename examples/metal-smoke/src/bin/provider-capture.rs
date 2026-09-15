@@ -94,6 +94,15 @@ const DUAL_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_dual";
 /// vertex stage, and a stage that writes one component (`research/docs/23`
 /// §3.3, v22).
 const R32F_MSL_FRAGMENT_ENTRY: &str = "render_solid_r32f";
+/// The native rail's MSL fragment entry of the reviewed four-location module
+/// (`conformance/shaders/quad_indexed_2x2_quad.metal`).
+const QUAD_MSL_QUAD_FRAGMENT_ENTRY: &str = "render_solid_rgba8_quad";
+/// The Vulkan rail's four-location stage (`solid_unorm8_quad.frag.spv`); the
+/// bytes are embedded through `concat!` like the dual and r32f modules.
+const QUAD_QUAD_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "solid_unorm8_quad.frag.spv"
+));
 const QUAD_VERTEX_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/quad_indexed.vert.spv");
 const QUAD_FRAGMENT_SPV: &[u8] =
@@ -872,7 +881,13 @@ fn register_render_pipeline(
                 (QUAD_VERTEX_SPV, QUAD_DUAL_FRAGMENT_SPV),
                 reviewed_quad_layout(),
             ),
-            _ => return Err("the reviewed MRT shape is two attachments".into()),
+            (4, _) => (
+                (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_QUAD_FRAGMENT_ENTRY),
+                (QUAD_VERTEX_SPV, QUAD_QUAD_FRAGMENT_SPV),
+                reviewed_quad_layout(),
+            ),
+            _ => return Err("the reviewed MRT shapes are one, two and four attachments".into()),
         },
     };
     let registered = match registrar {
@@ -1902,6 +1917,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v20") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v21") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v22") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v23") => &["render_declaring_four_attachments"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2289,8 +2305,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         );
     }
     let shapes = render_attachment_shapes(case)?;
-    if multiple && shapes.len() != 2 {
-        return Err(format!("{where_}: the reviewed MRT shape is two attachments").into());
+    if multiple && !(2..=metal_api_core::provider::MAX_COLOR_ATTACHMENTS).contains(&shapes.len()) {
+        return Err(format!(
+            "{where_}: the reviewed MRT shapes are two to \
+             {} attachments",
+            metal_api_core::provider::MAX_COLOR_ATTACHMENTS
+        )
+        .into());
     }
     let geometry = render_geometry(case, &where_)?;
     match geometry {
@@ -2354,8 +2375,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             }
             1 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
             2 => (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
+            4 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_QUAD_FRAGMENT_ENTRY),
             _ => {
-                return Err(format!("{where_}: the reviewed MRT shape is two attachments").into());
+                return Err(format!(
+                    "{where_}: the reviewed MRT shapes are one, two and four attachments"
+                )
+                .into());
             }
         },
     };
@@ -2916,6 +2941,15 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/mrt_declare.metal",
             "c6eeddad6686351c7ec616267f0975f7cc559ee85569a3396c83f64407eff689",
         ),
+        // v24: the four-read declaring pass. One submission declares every
+        // attachment view of the four-location fixture (and of any shorter
+        // list that names this case).
+        "mrt_declare4" => (
+            "shaders/mrt_declare4.ll",
+            "5bf093fb4ad3890e7ee513591e6b943755db1c6850f091580b658e52a092ccd9",
+            "shaders/mrt_declare4.metal",
+            "b1c51bdf4817b21c9e476eabc627ecb83e727384e3bf2436ac62377702f50a41",
+        ),
         _ => return Err("unknown shader entry".into()),
     };
     if program.air.path != air_path
@@ -3065,6 +3099,16 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 16), (1, "read", 16), (2, "write", 4)][..],
+        ),
+        // v24: one pass declares up to four attachment views (bindings 0..3,
+        // each one word of a 16-byte view) and writes their xor into its own
+        // output view.
+        "render_declaring_four_attachments" => (
+            "mrt_declare4",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "read", 16), (2, "read", 16), (3, "read", 16),
+              (4, "write", 4)][..],
         ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds

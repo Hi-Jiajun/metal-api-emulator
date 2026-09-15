@@ -124,6 +124,17 @@ pub(crate) const REVIEWED_R32F_SOURCE: &str =
 /// Fragment entry of the reviewed single-channel float module.
 pub(crate) const R32F_FRAGMENT_ENTRY: &str = "render_solid_r32f";
 
+/// The reviewed four-location module: the indexed vertex stage plus a fragment
+/// stage that writes all `MAX_COLOR_ATTACHMENTS` colour locations
+/// (`conformance/shaders/quad_indexed_2x2_quad.metal`). The four texels are
+/// pairwise distinct, so a capture that landed one target twice cannot pass
+/// (`research/docs/23` §3.3, v24).
+pub(crate) const REVIEWED_QUAD_SOURCE: &str =
+    include_str!("../../../conformance/shaders/quad_indexed_2x2_quad.metal");
+
+/// Fragment entry of the reviewed four-location module.
+pub(crate) const QUAD_FRAGMENT_ENTRY: &str = "render_solid_rgba8_quad";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -153,7 +164,7 @@ pub(crate) struct ReviewedModule {
 
 /// The three reviewed modules, one per (vertex-input shape, colour-format
 /// shape) pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 4] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 5] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -180,6 +191,13 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 4] = [
         path: "conformance/shaders/quad_indexed_2x2_r32f.metal",
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: R32F_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
+    ReviewedModule {
+        source: REVIEWED_QUAD_SOURCE,
+        path: "conformance/shaders/quad_indexed_2x2_quad.metal",
+        vertex_entry: QUAD_VERTEX_ENTRY,
+        fragment_entry: QUAD_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
 ];
@@ -211,6 +229,12 @@ pub(crate) fn reviewed_module(
             VertexLayout::Buffers(_),
             [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
         ) => Some(&REVIEWED_MODULES[2]),
+        (VertexLayout::Buffers(_), formats)
+            if formats.len() == usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX)
+                && formats.iter().all(|format| *format == AttachmentFormat::Rgba8Unorm) =>
+        {
+            Some(&REVIEWED_MODULES[4])
+        }
         _ => None,
     }
 }
@@ -222,7 +246,7 @@ pub(crate) fn reviewed_module(
 /// writes three or four, so a pass above two is refused rather than rendered
 /// partially. The value is restated here because a capability value has to be
 /// spelled by the provider that declares it (`research/docs/23` §4.2).
-pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 2;
+pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 4;
 
 /// Vertex streams one render pass may bind. The same value the core contract
 /// states (`metal_api_core::provider::MAX_VERTEX_BUFFERS`), restated for the
@@ -1018,26 +1042,13 @@ pub(crate) fn plan<'a>(
         .pipeline
         .validate_against(request.pass)
         .map_err(contract_refusal)?;
-    // The MRT contract admits up to four attachments and a matching format
-    // list, but this rail executes two — the locations the reviewed dual
-    // module writes. Refuse the wider pass instead of silently rendering only
-    // locations 0 and 1 (wave3 R1).
+    // The MRT contract admits `MAX_COLOR_ATTACHMENTS` attachments and a
+    // matching format list, and this rail's reviewed modules cover one, two and
+    // the full ceiling. A wider pass (reachable only through a
+    // directly-constructed request, since core admission refuses it) is refused
+    // instead of silently rendering only the first few locations (wave3 R1).
     if attachments.len() > usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX) {
-        return Err(
-            capability_refusal("render_mrt_attachment_count_unsupported")
-                .with_field(
-                    "attachments",
-                    FieldValue::Unsigned(attachments.len() as u64),
-                )
-                .with_field(
-                    "maximum",
-                    FieldValue::Unsigned(MAX_COLOR_ATTACHMENTS as u64),
-                )
-                .with_detail(
-                    "the reviewed dual module writes two colour locations; a wider pass \
-                          would silently drop the rest",
-                ),
-        );
+        return Err(mrt_attachment_count_refusal(attachments.len()));
     }
     // A present action hands exactly one attachment on to its target, and the
     // present encoder renders into that one texture: a present pass with a
@@ -1357,6 +1368,26 @@ fn allowlist_refusal(slug: &'static str) -> ProviderError {
 /// `LoadOp::Load` agreement is the rail's to state.
 fn args_refusal(slug: &'static str) -> ProviderError {
     refusal(ProviderPhase::Resolve, ProviderErrorClass::Args, slug)
+}
+
+/// The refusal for a pass whose attachment count this rail cannot execute.
+///
+/// The capability bit reports `MAX_COLOR_ATTACHMENTS`, so a wider pass is
+/// refused here with the rail's own limit instead of silently rendering only
+/// the first few locations. With the reviewed modules covering one, two and the
+/// ceiling, this gate is the fail-closed half for a directly-constructed
+/// request that skipped core admission (wave3 R1, v24).
+fn mrt_attachment_count_refusal(attachments: usize) -> ProviderError {
+    capability_refusal("render_mrt_attachment_count_unsupported")
+        .with_field("attachments", FieldValue::Unsigned(attachments as u64))
+        .with_field(
+            "maximum",
+            FieldValue::Unsigned(MAX_COLOR_ATTACHMENTS as u64),
+        )
+        .with_detail(
+            "the reviewed modules write one, two or MAX_COLOR_ATTACHMENTS colour locations; \
+             a wider pass would silently drop its later locations",
+        )
 }
 
 /// Map a core contract error onto the refusal admission already uses.
@@ -2477,27 +2508,37 @@ mod tests {
         assert_eq!(error.class, ProviderErrorClass::Args);
     }
 
-    /// The MRT contract admits up to four attachments, but the reviewed dual
-    /// module writes two locations: a wider pass is refused instead of being
-    /// rendered partially (wave3 R1).
+    /// The MRT contract admits up to `MAX_COLOR_ATTACHMENTS`, and this rail's
+    /// reviewed modules cover one, two and the ceiling: a wider pass is refused
+    /// instead of being rendered partially (wave3 R1).
     #[test]
-    fn plan_refuses_a_pass_with_more_than_two_attachments() {
+    fn plan_refuses_a_pass_beyond_the_attachment_ceiling() {
+        let maximum = usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap();
         let mut pass = dual_pass();
-        pass.color_attachments.push(pass.color_attachments[0]);
+        for _ in 2..(maximum + 1) {
+            pass.color_attachments.push(pass.color_attachments[0]);
+        }
         let mut pipeline = dual_pipeline();
-        pipeline.color_formats = vec![
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-        ];
+        pipeline.color_formats = vec![AttachmentFormat::Rgba8Unorm; maximum + 1];
         let error = plan(&dual_request(&pass, &pipeline)).unwrap_err();
-        assert_eq!(error.slug, "render_mrt_attachment_count_unsupported");
-        assert_eq!(error.class, ProviderErrorClass::Capability);
+        // Core admission owns the ceiling now that the rail's own maximum is
+        // the contract's: the wider pass is refused as a trace-contract shape
+        // before the rail's gate can see it (`attachment_count_unsupported`).
+        assert_eq!(error.slug, "attachment_count_unsupported");
+        // The rail's own gate stays as the fail-closed half for a directly
+        // constructed request that skipped admission; its shape is asserted
+        // directly so the two gates cannot drift apart.
+        let refusal = mrt_attachment_count_refusal(maximum + 1);
+        assert_eq!(refusal.slug, "render_mrt_attachment_count_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
         assert_eq!(
-            error.fields.get("attachments"),
-            Some(&FieldValue::Unsigned(3))
+            refusal.fields.get("attachments"),
+            Some(&FieldValue::Unsigned((maximum + 1) as u64))
         );
-        assert_eq!(error.fields.get("maximum"), Some(&FieldValue::Unsigned(2)));
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(maximum as u64))
+        );
     }
 
     /// Every colour location renders into the pass's one raster, so two
@@ -3370,13 +3411,12 @@ mod tests {
             bits.supported_color_formats,
             SUPPORTED_COLOR_FORMATS.to_vec()
         );
-        // The rail declares two attachments while the core contract admits the
-        // full MRT shape: the bit stays at the rail's own execution shape —
-        // the two locations the reviewed dual module writes — and is only ever
-        // at or below core's cap (wave3 R1).
-        assert_eq!(bits.max_color_attachments, 2);
+        // The rail declares the full MRT shape now that its reviewed modules
+        // cover one, two and the `MAX_COLOR_ATTACHMENTS` ceiling (v24). The bit
+        // still has to stay at or below core's cap (wave3 R1).
         let core_max = u32::try_from(metal_api_core::provider::MAX_COLOR_ATTACHMENTS).unwrap();
         assert_eq!(core_max, 4);
+        assert_eq!(bits.max_color_attachments, core_max);
         assert!(bits.max_color_attachments <= core_max);
         assert_eq!(
             bits.supported_color_formats,

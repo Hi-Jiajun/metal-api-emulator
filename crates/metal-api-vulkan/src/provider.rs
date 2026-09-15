@@ -11,8 +11,8 @@ use metal2vulkan::reflect::{
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract, PresentMode,
-    ProviderCapabilities, SemanticDigest, StorageMode, MAX_PRESENT_IMAGE_COUNT,
-    MAX_PRESENT_TARGETS,
+    ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
+    MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
 
@@ -69,7 +69,7 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // capability bit reports 2 and the rail typed-refuses a three- or
         // four-attachment pass (`render_mrt_attachment_count_unsupported`)
         // instead of silently rendering the first two locations.
-        max_color_attachments: 2,
+        max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
         // Vertex input is executed (`render.rs` uploads each bound pool view,
@@ -422,7 +422,7 @@ mod tests {
         // The render bits are the rail's own window, not a device limit: up to
         // two 2×2 attachments in every format the render contract admits.
         assert!(capabilities.supports_render_passes);
-        assert_eq!(capabilities.max_color_attachments, 2);
+        assert_eq!(capabilities.max_color_attachments, MAX_COLOR_ATTACHMENTS as u32);
         assert_eq!(capabilities.max_attachment_dimension, [2, 2]);
         assert_eq!(
             capabilities.supported_color_formats,

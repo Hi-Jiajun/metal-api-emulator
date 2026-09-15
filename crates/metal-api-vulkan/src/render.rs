@@ -100,6 +100,14 @@ const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_r32f.frag.sp
 /// discipline, so neither output sits on a half-integer UNORM tie.
 const SOLID_UNORM8_DUAL_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_dual.frag.spv");
 
+/// The reviewed four-output fragment module for the four-attachment ceiling
+/// (`research/docs/23` §3.3, v24).
+///
+/// One module serves the `MAX_COLOR_ATTACHMENTS`-many `[Rgba8Unorm; 4]` list:
+/// its four locations write pairwise-distinct byte strings, so a capture that
+/// landed one target twice cannot pass the comparison.
+const SOLID_UNORM8_QUAD_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_quad.frag.spv");
+
 /// The solid fragment module the offscreen rail builds for a format list.
 ///
 /// The match is exhaustive over [`AttachmentFormat`] and has no default arm: a
@@ -130,7 +138,16 @@ pub(crate) fn solid_fragment_spirv(
             }
         },
         [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => SOLID_UNORM8_DUAL_FRAG_SPV,
-        [first, second] => return Err(mrt_format_combination_refusal(*first, *second)),
+        [
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+        ] => SOLID_UNORM8_QUAD_FRAG_SPV,
+        [first, second] if formats.len() == 2 => {
+            return Err(mrt_format_combination_refusal(*first, *second));
+        }
+        [first, ..] => return Err(mrt_format_combination_refusal(*first, formats[1])),
         _ => return Err(mrt_attachment_count_refusal(formats.len())),
     })
 }
@@ -437,7 +454,7 @@ fn prepare_render_request<'a>(
     // here, fail-closed, instead of silently rendering the first two locations.
     // This replaces the pre-MRT "exactly one" gate rather than layering a
     // second check on top of it.
-    if pass.color_attachments.len() > 2 {
+    if pass.color_attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
         return Err(mrt_attachment_count_refusal(pass.color_attachments.len()));
     }
     if previous.len() != pass.color_attachments.len() {
@@ -943,7 +960,7 @@ pub(crate) fn execute_offscreen_render(
 ) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
-    if request.attachments.len() > 2 {
+    if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
         return Err(mrt_attachment_count_refusal(request.attachments.len()));
     }
     if request.attachments.is_empty() {
@@ -2929,16 +2946,17 @@ fn attachment_format_refusal() -> ProviderError {
 
 /// The refusal for a pass whose attachment count the MRT rail cannot execute.
 ///
-/// The capability bit reports two, so a three- or four-attachment pass is
+/// The capability bit reports `MAX_COLOR_ATTACHMENTS`, so a larger pass is
 /// refused here with the rail's own limit instead of silently rendering the
-/// first two locations. The empty-list arm is the fail-closed half of the same
+/// first few locations. The empty-list arm is the fail-closed half of the same
 /// gate for a directly-constructed request that skipped core admission.
 fn mrt_attachment_count_refusal(attachments: usize) -> ProviderError {
+    let maximum = metal_api_core::provider::MAX_COLOR_ATTACHMENTS as u64;
     capability_refusal("render_mrt_attachment_count_unsupported")
         .with_field("attachments", FieldValue::Unsigned(attachments as u64))
-        .with_field("maximum", FieldValue::Unsigned(2))
+        .with_field("maximum", FieldValue::Unsigned(maximum))
         .with_detail(
-            "the MRT rail executes one or two colour attachments; a larger pass would silently \
+            "the MRT rail executes one to four colour attachments; a larger pass would silently \
              drop its later locations",
         )
 }
@@ -3873,42 +3891,42 @@ mod tests {
         );
     }
 
-    /// The MRT contract admits up to four attachments, but this rail executes
-    /// two, so a three-attachment pass is refused before any Vulkan object
-    /// exists rather than silently rendering only the first two locations.
-    /// Host-side: `prepare_render_request` reads no device.
+    /// The MRT contract admits exactly `MAX_COLOR_ATTACHMENTS` attachments, and
+    /// this rail now executes all of them: a five-attachment pass (which only a
+    /// directly-constructed request can reach, because core admission refuses it
+    /// first) is refused before any Vulkan object exists rather than silently
+    /// rendering the first four locations. Host-side: `prepare_render_request`
+    /// reads no device.
     #[test]
-    fn prepare_render_request_refuses_a_pass_with_more_than_two_attachments() {
+    fn prepare_render_request_refuses_a_pass_beyond_the_attachment_ceiling() {
+        let maximum = metal_api_core::provider::MAX_COLOR_ATTACHMENTS;
         let mut stages = reviewed_dual_stages();
-        stages.contract.color_formats = vec![
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-        ];
+        stages.contract.color_formats =
+            vec![AttachmentFormat::Rgba8Unorm; maximum + 1];
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
-        pass.color_attachments.push(pass.color_attachments[0]);
-        pass.color_attachments.push(pass.color_attachments[0]);
-        pass.validate()
-            .expect("the three-attachment pass is a legal core shape");
+        for _ in 0..maximum {
+            pass.color_attachments.push(pass.color_attachments[0]);
+        }
         stages
             .contract
             .validate_against(&pass)
-            .expect("the pipeline compiles one format per location");
+            .expect("the fixture describes one format per location");
+        let previous = vec![None; maximum + 1];
 
-        let refused = match prepare_render_request(&stages, &pass, &[None, None, None]) {
+        let refused = match prepare_render_request(&stages, &pass, &previous) {
             Err(error) => error,
-            Ok(_) => panic!("the rail must refuse a three-attachment pass"),
+            Ok(_) => panic!("the rail must refuse a pass beyond the ceiling"),
         };
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_mrt_attachment_count_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(
             refused.fields.get("attachments"),
-            Some(&FieldValue::Unsigned(3))
+            Some(&FieldValue::Unsigned((maximum + 1) as u64))
         );
         assert_eq!(
             refused.fields.get("maximum"),
-            Some(&FieldValue::Unsigned(2))
+            Some(&FieldValue::Unsigned(maximum as u64))
         );
     }
 

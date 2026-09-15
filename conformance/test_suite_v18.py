@@ -248,7 +248,7 @@ class DualOutputObservationTests(unittest.TestCase):
         case = broken["render_cases"][0]
         case["attachments"][1]["expected_hex"] = case["attachments"][0]["expected_hex"]
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "the two attachments read back the same texels"):
+                                    "the attachments read back the same texels"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v18_refuses_a_declaring_pass_that_writes_an_attachment_view(self):
