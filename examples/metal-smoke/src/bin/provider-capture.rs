@@ -3107,8 +3107,13 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             "mrt_declare4",
             [1, 1, 1],
             [1, 1, 1],
-            &[(0, "read", 16), (1, "read", 16), (2, "read", 16), (3, "read", 16),
-              (4, "write", 4)][..],
+            &[
+                (0, "read", 16),
+                (1, "read", 16),
+                (2, "read", 16),
+                (3, "read", 16),
+                (4, "write", 4),
+            ][..],
         ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds

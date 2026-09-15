@@ -231,7 +231,9 @@ pub(crate) fn reviewed_module(
         ) => Some(&REVIEWED_MODULES[2]),
         (VertexLayout::Buffers(_), formats)
             if formats.len() == usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX)
-                && formats.iter().all(|format| *format == AttachmentFormat::Rgba8Unorm) =>
+                && formats
+                    .iter()
+                    .all(|format| *format == AttachmentFormat::Rgba8Unorm) =>
         {
             Some(&REVIEWED_MODULES[4])
         }

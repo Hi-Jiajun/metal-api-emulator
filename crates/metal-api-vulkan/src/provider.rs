@@ -422,7 +422,10 @@ mod tests {
         // The render bits are the rail's own window, not a device limit: up to
         // two 2×2 attachments in every format the render contract admits.
         assert!(capabilities.supports_render_passes);
-        assert_eq!(capabilities.max_color_attachments, MAX_COLOR_ATTACHMENTS as u32);
+        assert_eq!(
+            capabilities.max_color_attachments,
+            MAX_COLOR_ATTACHMENTS as u32
+        );
         assert_eq!(capabilities.max_attachment_dimension, [2, 2]);
         assert_eq!(
             capabilities.supported_color_formats,

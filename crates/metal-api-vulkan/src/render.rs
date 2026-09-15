@@ -138,12 +138,9 @@ pub(crate) fn solid_fragment_spirv(
             }
         },
         [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => SOLID_UNORM8_DUAL_FRAG_SPV,
-        [
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-            AttachmentFormat::Rgba8Unorm,
-        ] => SOLID_UNORM8_QUAD_FRAG_SPV,
+        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => {
+            SOLID_UNORM8_QUAD_FRAG_SPV
+        }
         [first, second] if formats.len() == 2 => {
             return Err(mrt_format_combination_refusal(*first, *second));
         }
@@ -3901,8 +3898,7 @@ mod tests {
     fn prepare_render_request_refuses_a_pass_beyond_the_attachment_ceiling() {
         let maximum = metal_api_core::provider::MAX_COLOR_ATTACHMENTS;
         let mut stages = reviewed_dual_stages();
-        stages.contract.color_formats =
-            vec![AttachmentFormat::Rgba8Unorm; maximum + 1];
+        stages.contract.color_formats = vec![AttachmentFormat::Rgba8Unorm; maximum + 1];
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         for _ in 0..maximum {
             pass.color_attachments.push(pass.color_attachments[0]);
