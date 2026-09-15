@@ -113,6 +113,17 @@ pub(crate) const REVIEWED_DUAL_SOURCE: &str =
 /// location 0 the vertex-input texel and location 1 the second MRT texel.
 pub(crate) const DUAL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_dual";
 
+/// The reviewed single-channel float module: the indexed vertex stage plus a
+/// one-component fragment stage (`conformance/shaders/quad_indexed_2x2_r32f.metal`).
+/// An `r32float` attachment takes a one-component store, so the four-component
+/// module the other single-output shapes use cannot stand in for it
+/// (`research/docs/23` §3.3, v22).
+pub(crate) const REVIEWED_R32F_SOURCE: &str =
+    include_str!("../../../conformance/shaders/quad_indexed_2x2_r32f.metal");
+
+/// Fragment entry of the reviewed single-channel float module.
+pub(crate) const R32F_FRAGMENT_ENTRY: &str = "render_solid_r32f";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -142,7 +153,7 @@ pub(crate) struct ReviewedModule {
 
 /// The three reviewed modules, one per (vertex-input shape, colour-format
 /// shape) pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 3] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 4] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -162,6 +173,13 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 3] = [
         path: "conformance/shaders/quad_indexed_2x2_dual.metal",
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: DUAL_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
+    ReviewedModule {
+        source: REVIEWED_R32F_SOURCE,
+        path: "conformance/shaders/quad_indexed_2x2_r32f.metal",
+        vertex_entry: QUAD_VERTEX_ENTRY,
+        fragment_entry: R32F_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
 ];
@@ -185,6 +203,7 @@ pub(crate) fn reviewed_module(
         (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
             Some(&REVIEWED_MODULES[0])
         }
+        (VertexLayout::Buffers(_), [AttachmentFormat::R32Float]) => Some(&REVIEWED_MODULES[3]),
         (VertexLayout::Buffers(_), [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
             Some(&REVIEWED_MODULES[1])
         }

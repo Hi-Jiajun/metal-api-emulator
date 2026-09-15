@@ -33,11 +33,11 @@ DECLARED = "fefefefe"
 TEXELS = "8180803e" * 4
 ALL_RAILS = ("native-metal", "vulkan", "native-metal-provider", "vulkan-objects",
              "native-metal-provider-objects")
-# The rails v22 marks: the two Vulkan rails. The single-channel float stage
-# has a reviewed SPIR-V module on the Vulkan rail, while the native rails still
-# compile the four-component MSL module for every single-output shape, so a
-# native R32F fixture waits for its own reviewed module.
-V22_REPORTING_RAILS = ("vulkan", "vulkan-objects")
+# The rails v22 marks: every rail. The single-channel float stage has a reviewed
+# SPIR-V module on the Vulkan rail and a reviewed MSL sibling
+# (`shaders/quad_indexed_2x2_r32f.metal`) on the native rails, so both halves of
+# the rail set execute the same one-component store.
+V22_REPORTING_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):

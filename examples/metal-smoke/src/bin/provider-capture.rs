@@ -89,6 +89,11 @@ const QUAD_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
 /// indexed vertex stage, and a fragment stage that writes colour locations 0
 /// and 1 (`conformance/shaders/quad_indexed_2x2_dual.metal`).
 const DUAL_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_dual";
+/// The native rail's MSL fragment entry of the reviewed single-channel float
+/// module (`conformance/shaders/quad_indexed_2x2_r32f.metal`): the same indexed
+/// vertex stage, and a stage that writes one component (`research/docs/23`
+/// §3.3, v22).
+const R32F_MSL_FRAGMENT_ENTRY: &str = "render_solid_r32f";
 const QUAD_VERTEX_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/quad_indexed.vert.spv");
 const QUAD_FRAGMENT_SPV: &[u8] =
@@ -851,7 +856,7 @@ fn register_render_pipeline(
         RenderGeometry::IndexedQuad => match (attachment_count, formats) {
             (1, [AttachmentFormat::R32Float]) => (
                 (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
-                (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, R32F_MSL_FRAGMENT_ENTRY),
                 (QUAD_VERTEX_SPV, QUAD_R32F_FRAGMENT_SPV),
                 reviewed_quad_layout(),
             ),
