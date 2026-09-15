@@ -792,9 +792,13 @@ def _render_plan(plan, suite):
                      f"{attachment_where}: unsupported attachment format")
             width = _integer(attachment.get("width"), f"{attachment_where}.width", 1)
             height = _integer(attachment.get("height"), f"{attachment_where}.height", 1)
-            _require((width, height) == (2, 2),
-                     f"{attachment_where}: the first render increment renders into "
-                     "a 2x2 attachment")
+            # The rail executes attachments up to `max_attachment_dimension`
+            # (`research/docs/23` §3.3, v27): the reviewed fragment stages are
+            # extent-independent, so any 1..=4 square or rectangle is a shape a
+            # fixture may pin, as long as every attachment of one pass shares it.
+            _require(1 <= width <= 4 and 1 <= height <= 4,
+                     f"{attachment_where}: the attachment extent is one to four "
+                     "texels per axis")
             viewport = _list(case["viewport"], f"{attachment_where}.viewport")
             _require(viewport == [0, 0, width, height],
                      f"{attachment_where}: the viewport must cover the attachment")
