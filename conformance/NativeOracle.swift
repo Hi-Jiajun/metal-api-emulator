@@ -709,6 +709,16 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         dispatches = [DispatchDefinition(grid: definition.grid, local: definition.local, bindings: nil, program: nil)]
     }
     switch definition.id {
+    case "render_declaring_quad_extent":
+        // v27's declaring case: the reviewed copy_word kernel over a 4x4
+        // attachment view (64 bytes) and a 4-byte output view.
+        try require(definition.entry == "copy_word"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 2, "\(definition.id): expected two buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
+                    "\(definition.id): expected a 64-byte read buffer at 0 and a write buffer at 1")
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
          "alias_disjoint_pair", "alias_disjoint_pair_reversed":
         try require(definition.entry == "copy_word"
@@ -1074,8 +1084,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_three_attachments"]
     case "compute-buffer-v25":
         expectedIDs = ["render_declaring_two_attachments"]
+    case "compute-buffer-v26":
+        expectedIDs = ["render_declaring_quad_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v25 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v26 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1473,8 +1485,9 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     || attachment.format == "bgra8_unorm"
                     || attachment.format == "r32float",
                     "\(definition.id): unsupported attachment format")
-        try require(attachment.width == 2 && attachment.height == 2,
-                    "\(definition.id): the first render increment renders into a 2x2 attachment")
+        try require(attachment.width >= 1 && attachment.width <= 4
+                    && attachment.height >= 1 && attachment.height <= 4,
+                    "\(definition.id): the attachment extent is one to four texels per axis")
         try require(attachment.allocation > 0 && attachment.view > 0,
                     "\(definition.id): zero attachment identity")
         try require(attachment.store == "store" || attachment.store == "dontcare",

@@ -365,8 +365,9 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # attachment-format plan by `test_suite_v21.py`, v22's single-channel
         # float plan by `test_suite_v22.py`, v23's four-location plan by
         # `test_suite_v23.py`, v24's three-location plan by `test_suite_v24.py`
-        # and v25's mixed-layout plan by `test_suite_v25.py`.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 24)
+        # v25's mixed-layout plan by `test_suite_v25.py` and v26's 4x4 extent
+        # plan by `test_suite_v26.py`.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 25)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -377,7 +378,8 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v18", "compute-buffer-v19",
                                       "compute-buffer-v20", "compute-buffer-v21",
                                       "compute-buffer-v22", "compute-buffer-v23",
-                                      "compute-buffer-v24", "compute-buffer-v25"):
+                                      "compute-buffer-v24", "compute-buffer-v25",
+                                      "compute-buffer-v26"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

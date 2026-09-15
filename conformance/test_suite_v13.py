@@ -295,8 +295,10 @@ class RenderObservationTests(unittest.TestCase):
                 compare.validate_capture(suite, self.digest,
                                          synthetic_capture(suite, self.digest))
 
-        rejected(lambda case: case["attachment"].update(width=4, height=4),
-                 "2x2 attachment")
+        # The rail executes extents up to four texels per axis from v27 on; an
+        # eight-texel axis is still an unadmitted shape.
+        rejected(lambda case: case["attachment"].update(width=8, height=8),
+                 "one to four texels per axis")
         # The comparator admits both 8-bit UNORM layouts from v21 on and the
         # single-channel float from v22 (`research/docs/23` §3.3/§15); the
         # integer format is still unadmitted, so it is the probe for "an

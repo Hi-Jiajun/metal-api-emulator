@@ -23,7 +23,7 @@ use metal_api_core::ExecutorError;
 /// keeps a larger attachment out of the rail instead of letting the driver
 /// answer a size the fixture never proved. Widening it is a deliberate change
 /// to the rail's window and to the conformance case that measures it.
-const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [2, 2];
+const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
 
 /// Conservative first-increment heap ceiling (`research/docs/25-heaps与ICB设计.md`
 /// §4.1). The placement rail is proven on a 4096-byte heap; capping admission
@@ -426,7 +426,7 @@ mod tests {
             capabilities.max_color_attachments,
             MAX_COLOR_ATTACHMENTS as u32
         );
-        assert_eq!(capabilities.max_attachment_dimension, [2, 2]);
+        assert_eq!(capabilities.max_attachment_dimension, [4, 4]);
         assert_eq!(
             capabilities.supported_color_formats,
             AttachmentFormat::ADMITTED.to_vec()

@@ -1934,6 +1934,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v23") => &["render_declaring_four_attachments"],
         (1, "compute-buffer-v24") => &["render_declaring_three_attachments"],
         (1, "compute-buffer-v25") => &["render_declaring_two_attachments"],
+        (1, "compute-buffer-v26") => &["render_declaring_quad_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2430,11 +2431,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         {
             return Err(format!("{where_}: unsupported attachment format").into());
         }
-        if attachment.width != 2 || attachment.height != 2 {
-            return Err(format!(
-                "{where_}: the first render increment renders into a 2x2 attachment"
-            )
-            .into());
+        if attachment.width == 0
+            || attachment.height == 0
+            || attachment.width > 4
+            || attachment.height > 4
+        {
+            return Err(
+                format!("{where_}: the attachment extent is one to four texels per axis").into(),
+            );
         }
         if attachment.allocation == 0 || attachment.view == 0 {
             return Err(format!("{where_}: zero attachment identity").into());
@@ -3120,6 +3124,13 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // v24: one pass declares up to four attachment views (bindings 0..3,
         // each one word of a 16-byte view) and writes their xor into its own
         // output view.
+        // v27: the v13 copy_word shape with a 4x4 attachment view (64 bytes).
+        "render_declaring_quad_extent" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 64), (1, "write", 4)][..],
+        ),
         "render_declaring_four_attachments" => (
             "mrt_declare4",
             [1, 1, 1],

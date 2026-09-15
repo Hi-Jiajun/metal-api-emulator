@@ -287,7 +287,7 @@ pub(crate) const MAX_VERTEX_BUFFERS: u32 = metal_api_core::provider::MAX_VERTEX_
 
 /// Largest attachment the first milestone renders into: 2x2, so full coverage
 /// stays distinguishable from "one texel was written" (`research/docs/23` §1.3).
-pub(crate) const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [2, 2];
+pub(crate) const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
 
 /// Colour formats this rail can build an `MTLTexture` and a pipeline state from
 /// — the core contract's admitted set, without `R32Uint` ([`pixel_format`]
@@ -2439,16 +2439,35 @@ mod tests {
     }
 
     #[test]
-    fn plan_refuses_an_attachment_beyond_the_fixed_extent() {
+    fn plan_refuses_an_attachment_beyond_the_declared_extent() {
+        // The rail executes extents up to `MAX_ATTACHMENT_DIMENSION` (four
+        // texels per axis from v27); one axis beyond that is refused rather
+        // than silently clamped.
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.viewport = [0, 0, 5, 5];
+        let attachment = &mut pass.color_attachments[0];
+        attachment.width = 5;
+        attachment.height = 5;
+        let pipeline = milestone_pipeline();
+        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        assert_eq!(error.slug, "attachment_dimension_limit");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+    }
+
+    #[test]
+    fn plan_accepts_a_four_by_four_attachment() {
+        // The extent ceiling the capability reports is executable: a 4x4
+        // attachment plans with sixty-four texel bytes.
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
         pass.viewport = [0, 0, 4, 4];
         let attachment = &mut pass.color_attachments[0];
         attachment.width = 4;
         attachment.height = 4;
         let pipeline = milestone_pipeline();
-        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
-        assert_eq!(error.slug, "attachment_dimension_limit");
-        assert_eq!(error.class, ProviderErrorClass::Capability);
+        let plan = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect("a four-by-four attachment is within the declared extent");
+        assert_eq!(plan.extent, [4, 4]);
+        assert_eq!(plan.texel_bytes, 64);
     }
 
     #[test]
