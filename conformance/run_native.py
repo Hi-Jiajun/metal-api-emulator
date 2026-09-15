@@ -212,6 +212,50 @@ def validate_mrt_selftest(report):
     return [first, second]
 
 
+def validate_store_dontcare_selftest(report):
+    """One store-dontcare self-test report is the reviewed discard fixture's
+    observation (`conformance/RENDER-CAPTURE.md` §11): the fixture id, one
+    writeback and one allocation for the *stored* location (allocation 900 /
+    view 910, four `4080c0ff` texels), and no observation at all for the
+    discarded location (allocation 920 / view 930). A report that reads the
+    discarded attachment back would present "nothing landed" as an
+    observation, which the v19 rule refuses (`research/docs/23` §3.6).
+
+    The fixture id is part of the check rather than decoration: the stored
+    location's bytes are the same four texels the MRT self-test stores, and
+    the id is what says the second location was drawn and then discarded.
+    The CI step reuses this instead of inlining its byte comparison, so the
+    comparison is exercised by `test_run_native.py` on a host without Metal.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("store-dontcare selftest: report is not an object")
+    if report.get("id") != "discard_second_attachment_2x2":
+        raise NativeRunError(
+            "store-dontcare selftest: report id " + repr(report.get("id"))
+            + " is not the reviewed discard fixture"
+        )
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError("store-dontcare selftest: completion is not CompletedVisible")
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    expected = "4080c0ff" * 4
+    expected_writebacks = [
+        {"allocation": 900, "view": 910, "offset": 0, "bytes_hex": expected}
+    ]
+    expected_allocations = [{"allocation": 900, "bytes_hex": expected}]
+    # The shape is part of the claim: the stored location reports exactly one
+    # writeback and one allocation, and the discarded location reports
+    # nothing. Any observation naming allocation 920 or view 930 — or any
+    # other shape that reaches the same bytes by another route — is refused
+    # rather than compared as if it were the same observation.
+    if writebacks != expected_writebacks or allocations != expected_allocations:
+        raise NativeRunError(
+            "store-dontcare selftest: observations do not match the reviewed discard fixture, got "
+            + repr((writebacks, allocations))
+        )
+    return expected
+
+
 def run_capture(oracle, suite_path, output_dir, *, require_metal=False, revision=None,
                 run_command=subprocess.run):
     """Create a new evidence directory. A partial or failed capture cannot pass."""
