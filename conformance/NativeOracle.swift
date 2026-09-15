@@ -1533,10 +1533,38 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             let texel = Data(texels.prefix(4))
             var texelCount = 0
             if attachment.load == "clear" {
+                // A scissored pass covers a known rectangle: inside it every
+                // texel is the fragment output and outside it every texel is the
+                // clear colour (`research/docs/23` §3.3, v29). Both halves have
+                // to appear, or the fixture could not show the clip ran.
+                var scissorClear: Data?
+                var covered = 0
+                if let scissor = definition.scissor {
+                    let clearHex = attachment.clear_hex ?? ""
+                    scissorClear = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+                    _ = scissor
+                }
                 for offset in stride(from: 0, to: texels.count, by: 4) {
+                    if let scissor = definition.scissor, let clearBytes = scissorClear {
+                        let index = offset / 4
+                        let column = UInt64(index % attachment.width)
+                        let row = UInt64(index / attachment.width)
+                        let inside = column >= scissor[0] && column < scissor[0] + scissor[2]
+                            && row >= scissor[1] && row < scissor[1] + scissor[3]
+                        let expected = inside ? texel : clearBytes
+                        try require(Data(texels[offset..<(offset + 4)]) == expected,
+                                    "\(definition.id): texel \(index) has to follow the declared scissor")
+                        covered += inside ? 1 : 0
+                        texelCount += 1
+                        continue
+                    }
                     try require(Data(texels[offset..<(offset + 4)]) == texel,
                                 "\(definition.id): the milestone expects every texel to equal the fragment output")
                     texelCount += 1
+                }
+                if definition.scissor != nil {
+                    try require(covered > 0 && covered < texelCount,
+                                "\(definition.id): the scissor has to clip part of the attachment")
                 }
             } else {
                 texelCount = texels.count / 4
