@@ -751,11 +751,13 @@ Not yet achieved, and therefore still a condition rather than an observation:
   provider's two-attachment encoder body has likewise never executed there
   (`cargo check --target aarch64-apple-darwin` is the compile evidence today,
   not execution evidence);
-* no suite fixture carries the `attachments` list yet: the oracle decodes and
-  validates it, but only the self-test reaches `runRenderCase` with two
-  attachments, and the suite-side wiring (a suite-v18 fixture, `compare.py`'s
-  per-attachment comparison and the suite markers) is the M4/main-agent step,
-  not this rail's;
+* the suite-side wiring has since landed: `suite-v18.json` carries the
+  `attachments` list, `compare.py` plans and compares one writeback and one
+  allocation image per location in location order, and
+  `conformance/test_suite_v18.py` pins the schema, the plan, the 3/3 count
+  contract and the per-rail markers. The Vulkan trace, object and async-object
+  rails execute the case on Lavapipe; the Apple-side capture of that suite is
+  still owed;
 * the flip of `max_color_attachments` to 2 is host-side evidence alone until
   that Apple run is green; before the flip the same two-attachment trace was
   refused by admission, and the unit tests keep that pre-flip snapshot pinned.

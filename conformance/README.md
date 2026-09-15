@@ -1,13 +1,16 @@
 # Native Metal reference capture
 
-Current state: the harness now covers thirteen compute/alias/texture/command-buffer
-suites plus two render-bearing suites — `suite-v13.json` (offscreen 2x2 colour
-attachment) and `suite-v14.json` (the same attachment as a surfaceless present
-target, with `research/docs/24`'s acquire/present counts). The render and present
-observation rules live in [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7; the
-per-suite rules are exercised by `python3 -m unittest discover -s conformance`.
-The v1/v2 description below is the historical starting point and is kept for the
-suite's own record.
+Current state: the harness covers the compute/alias/texture/command-buffer
+suites `suite.json` through `suite-v18.json`. The render-bearing suites are
+`suite-v13.json` (offscreen 2x2 colour attachment), `suite-v14.json` (the same
+attachment as a surfaceless present target, with `research/docs/24`'s
+acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
+`suite-v17.json` (a loading pass) and `suite-v18.json` (one draw writing two
+colour locations). The render and present observation rules live in
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7 and the MRT rules in §10; the
+per-suite rules are exercised by
+`python3 -m unittest discover -s conformance`. The v1/v2 description below is
+the historical starting point and is kept for the suite's own record.
 
 This directory contains the native Metal/Vulkan comparison harness for bounded
 buffer-compute cases. The native runner is a standalone Swift program using
@@ -349,3 +352,16 @@ and `compare.py` requires the attachment exactly from them. §4 of
 RENDER-CAPTURE.md lists what that wiring covers and what only an Apple GPU can
 still confirm; the macOS job's `--render-selftest` step is the one Apple-side
 render run observed so far.
+
+## MRT render capture
+
+[suite-v18.json](suite-v18.json) is the first suite that declares an
+`attachments` list: one draw writes two colour locations, so the render case
+carries one `expected_hex` per attachment and the comparator owes one writeback
+and one allocation image per location, in location order. The declaring case
+runs the reviewed `mrt_declare` xor kernel over both attachment views, so the
+render submission also proves the two views were declared and read.
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §10 describes the reviewed dual MSL/SPIR-V
+pair, the per-rail wiring and the `--mrt-selftest` one-device check; the suite's
+schema, plan and refusals are pinned by
+`conformance/test_suite_v18.py`.

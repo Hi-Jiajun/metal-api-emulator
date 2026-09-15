@@ -359,15 +359,17 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # One suite with a render plan (v13), the committed v14 and v15
         # fixtures, and the twelve suites that carry no render case at all.
         # v16's and v17's plans are pinned by their own test modules, which own
-        # the sections this file predates.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 16)
+        # the sections this file predates; v18's MRT plan is pinned by
+        # `test_suite_v18.py`.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 17)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
             signature = plan_signature(compare._render_plan(compare._suite_plan(suite), suite))
             expected = PINNED_PLANS.get(suite["suite"])
             if expected is None:
-                if suite["suite"] in ("compute-buffer-v16", "compute-buffer-v17"):
+                if suite["suite"] in ("compute-buffer-v16", "compute-buffer-v17",
+                                      "compute-buffer-v18"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})

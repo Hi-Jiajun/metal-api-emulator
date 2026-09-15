@@ -85,10 +85,26 @@ const QUAD_VERTEX_ENTRY: &str = "vertex_buffer_main";
 const QUAD_FRAGMENT_ENTRY: &str = "fragment_main";
 const QUAD_MSL_VERTEX_ENTRY: &str = "render_quad_vertex";
 const QUAD_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8";
+/// The native rail's MSL fragment entry of the reviewed dual module: the same
+/// indexed vertex stage, and a fragment stage that writes colour locations 0
+/// and 1 (`conformance/shaders/quad_indexed_2x2_dual.metal`).
+const DUAL_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_dual";
 const QUAD_VERTEX_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/quad_indexed.vert.spv");
 const QUAD_FRAGMENT_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/solid_unorm8.frag.spv");
+/// The Vulkan rail's half of the reviewed dual-output fixture: the same
+/// `fragment_main` entry as [`QUAD_FRAGMENT_SPV`], but a stage that writes
+/// both colour locations, compiled against a two-entry
+/// `[Rgba8Unorm, Rgba8Unorm]` format list. The bytes are embedded through
+/// `concat!` rather than a bare `include_bytes!` because
+/// `conformance/test_suite_v13.py` text-scans the four `include_bytes!` pins
+/// of the two original stage pairs; the pin stays byte-exact and the Vulkan
+/// rail re-checks it against `solid_fragment_spirv` before compiling.
+const QUAD_DUAL_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "solid_unorm8_dual.frag.spv"
+));
 /// Vertices the reviewed quad declares, and the number of indices its two
 /// triangles consume.
 const QUAD_VERTICES: u64 = 4;
@@ -804,10 +820,11 @@ fn register_render_pipeline(
     registrar: &RenderRegistrar,
     identity: &str,
     geometry: RenderGeometry,
+    attachment_count: usize,
 ) -> Result<CompiledComputePipeline> {
     let logical_digest = SemanticDigest::new(
         "suite-sha256-entry-v1",
-        format!("{identity}:offscreen_render_pipeline").into_bytes(),
+        format!("{identity}:offscreen_render_pipeline:{attachment_count}").into_bytes(),
     )?;
     // The registration names the reviewed pair for the case's geometry: the
     // Vulkan rail compiles the vertex stage's SPIR-V, the native rail its MSL
@@ -821,19 +838,28 @@ fn register_render_pipeline(
             (RENDER_VERTEX_SPV, RENDER_FRAGMENT_SPV),
             VertexLayout::None,
         ),
-        RenderGeometry::IndexedQuad => (
-            (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
-            (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
-            (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
-            reviewed_quad_layout(),
-        ),
+        RenderGeometry::IndexedQuad => match attachment_count {
+            1 => (
+                (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+                (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
+                reviewed_quad_layout(),
+            ),
+            2 => (
+                (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
+                (QUAD_VERTEX_SPV, QUAD_DUAL_FRAGMENT_SPV),
+                reviewed_quad_layout(),
+            ),
+            _ => return Err("the reviewed MRT shape is two attachments".into()),
+        },
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
                 vertex_entry: vulkan_entries.0.to_owned(),
                 fragment_entry: vulkan_entries.1.to_owned(),
-                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                color_formats: vec![AttachmentFormat::Rgba8Unorm; attachment_count],
                 vertex_layout: layout.clone(),
             },
             vertex_spirv: vulkan_stages.0.to_vec(),
@@ -851,7 +877,7 @@ fn register_render_pipeline(
                 contract: RenderPipelineContract {
                     vertex_entry: msl_entries.0.to_owned(),
                     fragment_entry: msl_entries.1.to_owned(),
-                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm; attachment_count],
                     vertex_layout: layout.clone(),
                 },
                 logical_digest,
@@ -983,8 +1009,19 @@ struct RenderCase {
     metal: Source,
     vertices: u64,
     viewport: [u64; 4],
-    attachment: RenderAttachmentDefinition,
-    expected_hex: String,
+    /// The first render increments' single attachment, or `None` for an MRT
+    /// case that declares `attachments` instead. Exactly one of the two forms
+    /// is present, and [`validate_render_case`] pins that before any rail runs.
+    #[serde(default)]
+    attachment: Option<RenderAttachmentDefinition>,
+    /// The MRT case's attachment list, in location order; mutually exclusive
+    /// with `attachment`. Every entry carries its own `expected_hex`.
+    #[serde(default)]
+    attachments: Option<Vec<RenderAttachmentDefinition>>,
+    /// The single-attachment case's expectation. An MRT case leaves this
+    /// absent and spells the expectation on each attachment entry instead.
+    #[serde(default)]
+    expected_hex: Option<String>,
     /// The capture backends this case is executable on. A rail in this list has
     /// to report the case; a rail outside it has to omit it.
     capture_rails: Vec<String>,
@@ -1078,6 +1115,10 @@ struct RenderAttachmentDefinition {
     store: String,
     clear_hex: Option<String>,
     initial_hex: Option<String>,
+    /// The MRT case's per-attachment expectation; absent for the
+    /// single-attachment form, whose expectation is case-level.
+    #[serde(default)]
+    expected_hex: Option<String>,
 }
 
 /// The suite-side shape of a render case's present action (the capture suite's
@@ -1630,8 +1671,13 @@ fn main() -> Result<()> {
     // provider's trace rail (`conformance/RENDER-CAPTURE.md` §4), and both
     // object rails (`research/docs/24` §6 Step 5 plus the native object rail's
     // render entry point added here).
-    let mut render_pipeline: Option<CompiledComputePipeline> = None;
-    let mut object_render_pipeline: Option<objects::RenderPipeline> = None;
+    // The render pipeline registration is keyed by the attachment count: the
+    // dual-output fixture registers the reviewed dual fragment module, while a
+    // single-attachment case keeps the pre-MRT pair. Every committed suite
+    // carries one render shape today, but the cache refuses to reuse a
+    // registration minted for another count rather than guessing.
+    let mut render_pipeline: Option<(usize, CompiledComputePipeline)> = None;
+    let mut object_render_pipeline: Option<(usize, objects::RenderPipeline)> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
         // A render case is owed only by the rails its marker names: an indirect
         // case names the rails that declare indirect support, and a rail that
@@ -1651,6 +1697,7 @@ fn main() -> Result<()> {
         let before = counters.read();
         let (acquires_before, presents_before) = counters.present_counts();
         let geometry = render_geometry(case, &format!("render case {}", case.id))?;
+        let attachment_count = render_case_attachments(case).len();
         let mut result = if let Some(device) = &object_device {
             let object_programs = case_programs(declaring)
                 .iter()
@@ -1659,13 +1706,17 @@ fn main() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let object_pipeline = match &object_render_pipeline {
-                Some(pipeline) => pipeline.clone(),
-                None => {
-                    let registered =
-                        register_render_pipeline(&render_registrar, &identity, geometry)?;
+                Some((count, pipeline)) if *count == attachment_count => pipeline.clone(),
+                _ => {
+                    let registered = register_render_pipeline(
+                        &render_registrar,
+                        &identity,
+                        geometry,
+                        attachment_count,
+                    )?;
                     let wrapped = device.render_pipeline(&registered)?;
-                    render_pipeline = Some(registered);
-                    object_render_pipeline = Some(wrapped.clone());
+                    render_pipeline = Some((attachment_count, registered));
+                    object_render_pipeline = Some((attachment_count, wrapped.clone()));
                     wrapped
                 }
             };
@@ -1684,11 +1735,15 @@ fn main() -> Result<()> {
                 .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
                 .collect::<Vec<_>>();
             let pipeline = match &render_pipeline {
-                Some(pipeline) => pipeline.clone(),
-                None => {
-                    let registered =
-                        register_render_pipeline(&render_registrar, &identity, geometry)?;
-                    render_pipeline = Some(registered.clone());
+                Some((count, pipeline)) if *count == attachment_count => pipeline.clone(),
+                _ => {
+                    let registered = register_render_pipeline(
+                        &render_registrar,
+                        &identity,
+                        geometry,
+                        attachment_count,
+                    )?;
+                    render_pipeline = Some((attachment_count, registered.clone()));
                     registered
                 }
             };
@@ -1724,7 +1779,7 @@ fn main() -> Result<()> {
                 .map_err(|error| format!("release pipeline: {error:?}"))?;
         }
     }
-    if let Some(pipeline) = render_pipeline.as_ref() {
+    if let Some((_, pipeline)) = render_pipeline.as_ref() {
         release_render_pipeline(&render_registrar, pipeline)?;
     }
     let capture = Capture {
@@ -1809,6 +1864,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v15") => &["heap_placement_copy_word", "icb_dispatch_copy_word"],
         (1, "compute-buffer-v16") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v17") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v18") => &["render_declaring_two_attachments"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -1842,7 +1898,8 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     let attachment_views = suite
         .render_cases
         .iter()
-        .map(|case| (case.attachment.allocation, case.attachment.view))
+        .flat_map(render_case_attachments)
+        .map(|attachment| (attachment.allocation, attachment.view))
         .collect::<BTreeSet<_>>();
     for case in &suite.cases {
         validate_case_programs(case)?;
@@ -1975,6 +2032,46 @@ fn validate_suite(suite: &Suite) -> Result<()> {
 enum RenderGeometry {
     Milestone,
     IndexedQuad,
+}
+
+/// The colour attachments a render case declares, in location order: the
+/// single form wrapped in a one-entry list, or the MRT list. Both forms at
+/// once, and neither form, are refused by [`validate_render_case`] before
+/// this runs.
+fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition> {
+    if let Some(attachments) = &case.attachments {
+        return attachments.iter().collect();
+    }
+    case.attachment.iter().collect()
+}
+
+/// The (attachment, expected texel hex) pairs a render case declares, in
+/// location order. The single form wraps its one attachment with the
+/// case-level `expected_hex`; the MRT form spells the expectation on each
+/// attachment entry. [`validate_render_case`] has already refused every shape
+/// this cannot read, so the expectations are present by construction.
+fn render_attachment_shapes(
+    case: &RenderCase,
+) -> Result<Vec<(&RenderAttachmentDefinition, String)>> {
+    if let Some(attachment) = &case.attachment {
+        let expected = case
+            .expected_hex
+            .clone()
+            .ok_or_else(|| format!("render case {}: missing expected_hex", case.id))?;
+        Ok(vec![(attachment, expected)])
+    } else if let Some(attachments) = &case.attachments {
+        attachments
+            .iter()
+            .map(|attachment| {
+                let expected = attachment.expected_hex.clone().ok_or_else(|| {
+                    format!("render case {}: attachment without expected_hex", case.id)
+                })?;
+                Ok((attachment, expected))
+            })
+            .collect()
+    } else {
+        Err(format!("render case {}: no attachment declared", case.id).into())
+    }
 }
 
 /// The reviewed quad layout (`research/docs/23` §3.3): one `float32x2` position
@@ -2138,26 +2235,31 @@ fn render_inputs(
 
 fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     let where_ = format!("render case {}", case.id);
-    let attachment = &case.attachment;
-    if attachment.format != "rgba8_unorm" {
-        return Err(format!("{where_}: unsupported attachment format").into());
-    }
-    if attachment.width != 2 || attachment.height != 2 {
+    // One of two mutually exclusive attachment shapes: the single `attachment`
+    // object plus the case-level `expected_hex`, or the MRT `attachments` list
+    // whose entries each carry their own expectation.
+    let single = case.attachment.is_some() || case.expected_hex.is_some();
+    let multiple = case.attachments.is_some();
+    if single == multiple {
         return Err(
-            format!("{where_}: the first render increment renders into a 2x2 attachment").into(),
+            format!("{where_}: exactly one of attachment and attachments is required").into(),
         );
     }
-    if attachment.allocation == 0 || attachment.view == 0 {
-        return Err(format!("{where_}: zero attachment identity").into());
-    }
-    if attachment.store != "store" {
-        return Err(format!("{where_}: a discarded attachment cannot be compared").into());
+    let shapes = render_attachment_shapes(case)?;
+    if multiple && shapes.len() != 2 {
+        return Err(format!("{where_}: the reviewed MRT shape is two attachments").into());
     }
     let geometry = render_geometry(case, &where_)?;
     match geometry {
         RenderGeometry::Milestone => {
             if case.vertices != 3 {
                 return Err(format!("{where_}: expected the reviewed full-screen triangle").into());
+            }
+            if multiple {
+                return Err(format!(
+                    "{where_}: the milestone vertex_id shape renders one attachment"
+                )
+                .into());
             }
         }
         RenderGeometry::IndexedQuad => {
@@ -2174,9 +2276,6 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
-    }
-    if case.viewport != [0, 0, attachment.width, attachment.height] {
-        return Err(format!("{where_}: the viewport must cover the attachment").into());
     }
     if let Some(present) = &case.present {
         if present.mode != "fifo" {
@@ -2203,7 +2302,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     }
     let reviewed_entries = match geometry {
         RenderGeometry::Milestone => (RENDER_MSL_VERTEX_ENTRY, RENDER_MSL_FRAGMENT_ENTRY),
-        RenderGeometry::IndexedQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+        RenderGeometry::IndexedQuad => match shapes.len() {
+            1 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+            2 => (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
+            _ => {
+                return Err(format!("{where_}: the reviewed MRT shape is two attachments").into());
+            }
+        },
     };
     if (case.vertex_entry.as_str(), case.fragment_entry.as_str()) != reviewed_entries {
         return Err(format!(
@@ -2212,118 +2317,160 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         )
         .into());
     }
-    let texels = unhex(&case.expected_hex)?;
-    let extent = usize::try_from(
-        attachment
-            .width
-            .checked_mul(attachment.height)
-            .and_then(|texels| texels.checked_mul(4))
-            .ok_or("attachment extent overflows")?,
-    )?;
-    if texels.len() != extent {
-        return Err(format!("{where_}: expected texel bytes do not match the attachment").into());
-    }
-    // The uniform-expectation rule belongs to the clearing shape: a `Load` case
-    // deliberately mixes the fragment output with the bytes the load handed it
-    // (`research/docs/23` §3.3).
-    let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
-    match attachment.load.as_str() {
-        "clear" => {
-            if !uniform_texel {
-                return Err(format!(
-                    "{where_}: every texel of a cleared attachment has to be the fragment output"
-                )
-                .into());
-            }
-            let texel = &texels[..4];
-            let clear = unhex(
-                attachment
-                    .clear_hex
-                    .as_deref()
-                    .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
-            )?;
-            if clear.len() != 4 {
-                return Err(format!("{where_}: a clear colour is four bytes").into());
-            }
-            if attachment.initial_hex.is_some() {
-                return Err(
-                    format!("{where_}: a cleared attachment carries no initial bytes").into(),
-                );
-            }
-            if clear == texel {
-                return Err(format!("{where_}: the clear colour equals the expected texel").into());
-            }
+    // One attachment at a time: the single shape is the v13-v17 branch, and
+    // every MRT entry restates the same per-field rules with its own
+    // expectation.
+    let mut parsed = Vec::new();
+    for (attachment, expected_hex) in &shapes {
+        if attachment.format != "rgba8_unorm" {
+            return Err(format!("{where_}: unsupported attachment format").into());
         }
-        "load" => {
-            let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
-                "{where_}: a loaded attachment needs its previous texels"
-            ))?)?;
-            if attachment.clear_hex.is_some() {
-                return Err(
-                    format!("{where_}: a loaded attachment carries no clear colour").into(),
-                );
+        if attachment.width != 2 || attachment.height != 2 {
+            return Err(format!(
+                "{where_}: the first render increment renders into a 2x2 attachment"
+            )
+            .into());
+        }
+        if attachment.allocation == 0 || attachment.view == 0 {
+            return Err(format!("{where_}: zero attachment identity").into());
+        }
+        if attachment.store != "store" {
+            return Err(format!("{where_}: a discarded attachment cannot be compared").into());
+        }
+        if case.viewport != [0, 0, attachment.width, attachment.height] {
+            return Err(format!("{where_}: the viewport must cover the attachment").into());
+        }
+        let texels = unhex(expected_hex)?;
+        let extent = usize::try_from(
+            attachment
+                .width
+                .checked_mul(attachment.height)
+                .and_then(|texels| texels.checked_mul(4))
+                .ok_or("attachment extent overflows")?,
+        )?;
+        if texels.len() != extent {
+            return Err(
+                format!("{where_}: expected texel bytes do not match the attachment").into(),
+            );
+        }
+        // The uniform-expectation rule belongs to the clearing shape: a `Load`
+        // case deliberately mixes the fragment output with the bytes the load
+        // handed it (`research/docs/23` §3.3).
+        let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
+        match attachment.load.as_str() {
+            "clear" => {
+                if !uniform_texel {
+                    return Err(format!(
+                        "{where_}: every texel of a cleared attachment has to be the fragment output"
+                    )
+                    .into());
+                }
+                let texel = &texels[..4];
+                let clear = unhex(
+                    attachment
+                        .clear_hex
+                        .as_deref()
+                        .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
+                )?;
+                if clear.len() != 4 {
+                    return Err(format!("{where_}: a clear colour is four bytes").into());
+                }
+                if attachment.initial_hex.is_some() {
+                    return Err(
+                        format!("{where_}: a cleared attachment carries no initial bytes").into(),
+                    );
+                }
+                if clear == texel {
+                    return Err(
+                        format!("{where_}: the clear colour equals the expected texel").into(),
+                    );
+                }
             }
-            if initial.len() != extent {
-                return Err(format!("{where_}: initial texels do not match the attachment").into());
-            }
-            if initial == texels {
-                return Err(format!("{where_}: the initial texels equal the expectation").into());
-            }
-            // A loading pass uploads the declaring view's own bytes
-            // (`research/docs/23` §3.3), so the case's `initial_hex` has to be
-            // exactly what that case declares: a trace whose declaration and
-            // expectation disagree would report bytes the rail never held.
-            let declared = suite
-                .cases
-                .iter()
-                .find(|declared| declared.id == case.declaring_case)
-                .and_then(|declared| {
-                    declared.buffers.iter().find(|buffer| {
-                        buffer.allocation == attachment.allocation && buffer.view == attachment.view
+            "load" => {
+                let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
+                    "{where_}: a loaded attachment needs its previous texels"
+                ))?)?;
+                if attachment.clear_hex.is_some() {
+                    return Err(
+                        format!("{where_}: a loaded attachment carries no clear colour").into(),
+                    );
+                }
+                if initial.len() != extent {
+                    return Err(
+                        format!("{where_}: initial texels do not match the attachment").into(),
+                    );
+                }
+                if initial == texels {
+                    return Err(
+                        format!("{where_}: the initial texels equal the expectation").into(),
+                    );
+                }
+                // A loading pass uploads the declaring view's own bytes
+                // (`research/docs/23` §3.3), so the case's `initial_hex` has
+                // to be exactly what that case declares: a trace whose
+                // declaration and expectation disagree would report bytes the
+                // rail never held.
+                let declared = suite
+                    .cases
+                    .iter()
+                    .find(|declared| declared.id == case.declaring_case)
+                    .and_then(|declared| {
+                        declared.buffers.iter().find(|buffer| {
+                            buffer.allocation == attachment.allocation
+                                && buffer.view == attachment.view
+                        })
                     })
-                })
-                .ok_or(format!(
-                    "{where_}: the declaring case does not carry the attachment view"
-                ))?;
-            if unhex(&declared.initial_hex)? != initial {
-                return Err(format!(
-                    "{where_}: the declared view's bytes are not the attachment's initial texels"
-                )
-                .into());
-            }
-            // Partial coverage, in both directions: every texel is either the
-            // byte the load handed it or the pass's fragment output, every
-            // drawn texel carries the *same* output, and both halves appear.
-            let mut drawn: Option<&[u8]> = None;
-            let mut drawn_count = 0_usize;
-            let mut kept_count = 0_usize;
-            for (position, texel) in texels.chunks_exact(4).enumerate() {
-                let previous = &initial[position * 4..position * 4 + 4];
-                if texel == previous {
-                    kept_count += 1;
-                    continue;
+                    .ok_or(format!(
+                        "{where_}: the declaring case does not carry the attachment view"
+                    ))?;
+                if unhex(&declared.initial_hex)? != initial {
+                    return Err(format!(
+                        "{where_}: the declared view's bytes are not the attachment's initial texels"
+                    )
+                    .into());
                 }
-                match drawn {
-                    None => drawn = Some(texel),
-                    Some(value) if value == texel => {}
-                    Some(_) => {
-                        return Err(format!(
-                            "{where_}: drawn texels disagree about the fragment output"
-                        )
-                        .into())
+                // Partial coverage, in both directions: every texel is either
+                // the byte the load handed it or the pass's fragment output,
+                // every drawn texel carries the *same* output, and both halves
+                // appear.
+                let mut drawn: Option<&[u8]> = None;
+                let mut drawn_count = 0_usize;
+                let mut kept_count = 0_usize;
+                for (position, texel) in texels.chunks_exact(4).enumerate() {
+                    let previous = &initial[position * 4..position * 4 + 4];
+                    if texel == previous {
+                        kept_count += 1;
+                        continue;
                     }
+                    match drawn {
+                        None => drawn = Some(texel),
+                        Some(value) if value == texel => {}
+                        Some(_) => {
+                            return Err(format!(
+                                "{where_}: drawn texels disagree about the fragment output"
+                            )
+                            .into())
+                        }
+                    }
+                    drawn_count += 1;
                 }
-                drawn_count += 1;
+                if drawn_count == 0 || kept_count == 0 {
+                    return Err(format!(
+                        "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
+                         got {drawn_count} drawn and {kept_count} kept"
+                    )
+                    .into());
+                }
             }
-            if drawn_count == 0 || kept_count == 0 {
-                return Err(format!(
-                    "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
-                     got {drawn_count} drawn and {kept_count} kept"
-                )
-                .into());
-            }
+            other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
         }
-        other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
+        parsed.push((*attachment, texels));
+    }
+    // The two reviewed MRT locations write two different byte strings, so a
+    // dual case whose locations read back the same texels could not show that
+    // both outputs landed (`4080c0ff` vs `ff8040c0`).
+    if multiple && parsed[0].1 == parsed[1].1 {
+        return Err(format!("{where_}: the two locations read back the same texel").into());
     }
     let mut rails = BTreeSet::new();
     for rail in &case.capture_rails {
@@ -2337,11 +2484,11 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     if rails.is_empty() {
         return Err(format!("{where_}: capture_rails cannot be empty").into());
     }
-    // The attachment resolves against the declaring case's own table: one of
+    // Every attachment resolves against the declaring case's own table: one of
     // its declared views has to be the attachment, it has to be read-only (a
     // compute pass that wrote the view the render pass stores would make the
-    // order inexpressible), and its byte range has to agree with the extent the
-    // attachment restates.
+    // order inexpressible), and its byte range has to agree with the extent
+    // the attachment restates.
     let declaring = suite
         .cases
         .iter()
@@ -2359,29 +2506,41 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         )
         .into());
     }
-    let matches = declaring
-        .buffers
-        .iter()
-        .filter(|buffer| {
-            buffer.allocation == attachment.allocation && buffer.view == attachment.view
-        })
-        .collect::<Vec<_>>();
-    if matches.len() != 1 {
-        return Err(format!(
-            "{where_}: the declaring case has to declare exactly the attachment view"
-        )
-        .into());
-    }
-    let declared = matches[0];
-    if declared.access != "read" {
-        return Err(
-            format!("{where_}: the declaring pass must only read the attachment view").into(),
-        );
-    }
-    if declared.length != u64::try_from(texels.len())? {
-        return Err(
-            format!("{where_}: attachment extent disagrees with the declaring view").into(),
-        );
+    let mut seen_identities = BTreeSet::new();
+    let mut seen_allocations = BTreeSet::new();
+    for (attachment, texels) in &parsed {
+        if !seen_identities.insert((attachment.allocation, attachment.view)) {
+            return Err(format!("{where_}: duplicate attachment identity").into());
+        }
+        if !seen_allocations.insert(attachment.allocation) {
+            return Err(
+                format!("{where_}: the attachments have to name distinct allocations").into(),
+            );
+        }
+        let matches = declaring
+            .buffers
+            .iter()
+            .filter(|buffer| {
+                buffer.allocation == attachment.allocation && buffer.view == attachment.view
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "{where_}: the declaring case has to declare exactly the attachment view"
+            )
+            .into());
+        }
+        let declared = matches[0];
+        if declared.access != "read" {
+            return Err(
+                format!("{where_}: the declaring pass must only read the attachment view").into(),
+            );
+        }
+        if declared.length != u64::try_from(texels.len())? {
+            return Err(
+                format!("{where_}: attachment extent disagrees with the declaring view").into(),
+            );
+        }
     }
     Ok(())
 }
@@ -2546,6 +2705,12 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/copy_3d.metal",
             "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f",
         ),
+        "mrt_declare" => (
+            "shaders/mrt_declare.ll",
+            "0a5b6740a2839cc4c47a829a7c9badb1bb7d6557df031620a1bf17d7a04393c9",
+            "shaders/mrt_declare.metal",
+            "c6eeddad6686351c7ec616267f0975f7cc559ee85569a3396c83f64407eff689",
+        ),
         _ => return Err("unknown shader entry".into()),
     };
     if program.air.path != air_path
@@ -2685,6 +2850,15 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 16), (1, "write", 4)][..],
+        ),
+        // v18: the declaring pass reads both attachment allocations and writes
+        // their xor into its own output view, so one submission proves it read
+        // two whole-allocation views the render pass then stores into.
+        "render_declaring_two_attachments" => (
+            "mrt_declare",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16), (1, "read", 16), (2, "write", 4)][..],
         ),
         "copy_word" | "copy_seed_a" | "copy_seed_b" | "copy_pingpong" => copy,
         // v10: two disjoint views of one allocation. The reversed pair binds
@@ -3387,7 +3561,7 @@ fn run_render_case(
     operation: u64,
     guard: u8,
 ) -> Result<CaseResult> {
-    let attachment = &case.attachment;
+    let attachments = render_attachment_shapes(case)?;
     // The declaring pass's own resource table: one backing image and one
     // `AllocationRecord` per allocation (`docs/23` §4.1).
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -3446,14 +3620,27 @@ fn run_render_case(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let declared = views
+    // One declared view per attachment, in location order: every attachment
+    // resolves against that view exactly as `validate_render_case` pinned.
+    let declared_views = attachments
         .iter()
-        .find(|view| {
-            view.view_id == ViewId::new(attachment.view)
-                && view.allocation_id == AllocationId::new(attachment.allocation)
+        .map(|(attachment, _)| {
+            views
+                .iter()
+                .find(|view| {
+                    view.view_id == ViewId::new(attachment.view)
+                        && view.allocation_id == AllocationId::new(attachment.allocation)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "the declaring pass does not declare the attachment view {}",
+                        attachment.view
+                    )
+                    .into()
+                })
         })
-        .ok_or("the declaring pass does not declare the attachment view")?
-        .clone();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut trace = case_trace(
         provider.device_epoch(),
@@ -3475,37 +3662,55 @@ fn run_render_case(
     // reviewed-shape validation already pinned what the draw reads.
     let (vertex_buffers, indices) = render_inputs(case, &format!("render case {}", case.id))?;
     // A clearing pass carries its colour; a loading pass carries nothing and
-    // uploads the declaring view's own bytes (`research/docs/23` §3.3), so the
-    // descriptor's load operation is the fixture's own choice.
-    let load = match attachment.load.as_str() {
-        "clear" => LoadOp::Clear(ClearColor::new(
-            unhex(
-                attachment
-                    .clear_hex
-                    .as_deref()
-                    .ok_or("a clear attachment needs clear_hex")?,
-            )?
-            .try_into()
-            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
-        )),
-        "load" => LoadOp::Load,
-        other => return Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
-    };
-    let present = match &case.present {
-        Some(definition) => Some(PresentDescriptor {
-            target: PresentTarget {
-                allocation_id: AllocationId::new(attachment.allocation),
+    // uploads the declaring view's own bytes (`research/docs/23` §3.3), so
+    // each attachment's load operation is the fixture's own choice.
+    let color_attachments = attachments
+        .iter()
+        .map(|(attachment, _)| {
+            let load = match attachment.load.as_str() {
+                "clear" => LoadOp::Clear(ClearColor::new(
+                    unhex(
+                        attachment
+                            .clear_hex
+                            .as_deref()
+                            .ok_or("a clear attachment needs clear_hex")?,
+                    )?
+                    .try_into()
+                    .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+                )),
+                "load" => LoadOp::Load,
+                other => {
+                    return Err(
+                        format!("render case {}: unknown load op {other:?}", case.id).into(),
+                    );
+                }
+            };
+            Ok(RenderAttachment {
                 view_id: ViewId::new(attachment.view),
+                allocation_id: AllocationId::new(attachment.allocation),
                 format: AttachmentFormat::Rgba8Unorm,
                 width: attachment.width,
                 height: attachment.height,
+                load,
+                store: StoreOp::Store,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let present = match &case.present {
+        Some(definition) => Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(attachments[0].0.allocation),
+                view_id: ViewId::new(attachments[0].0.view),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: attachments[0].0.width,
+                height: attachments[0].0.height,
                 image_count: definition.image_count,
                 initial: match &definition.initial_hex {
                     Some(hex) => InitialState::Sentinel(unhex(hex)?),
                     None => InitialState::Undefined,
                 },
             },
-            source: ViewId::new(attachment.view),
+            source: ViewId::new(attachments[0].0.view),
             mode: PresentMode::Fifo,
             acquire: AcquirePolicy::Blocking,
         }),
@@ -3514,15 +3719,7 @@ fn run_render_case(
     trace.pipelines.push(render_pipeline.clone());
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
-        color_attachments: vec![RenderAttachment {
-            view_id: ViewId::new(attachment.view),
-            allocation_id: AllocationId::new(attachment.allocation),
-            format: AttachmentFormat::Rgba8Unorm,
-            width: attachment.width,
-            height: attachment.height,
-            load,
-            store: StoreOp::Store,
-        }],
+        color_attachments,
         viewport: [
             u32::try_from(case.viewport[0])?,
             u32::try_from(case.viewport[1])?,
@@ -3553,7 +3750,7 @@ fn run_render_case(
     {
         return Err("provider completion observation changed".into());
     }
-    let mut landed = None;
+    let mut landed = BTreeMap::new();
     for write in output.writebacks {
         let (_, backing) = allocations
             .iter_mut()
@@ -3561,52 +3758,78 @@ fn run_render_case(
             .ok_or("unknown writeback allocation")?;
         let start = usize::try_from(write.offset)?;
         backing[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
-        if write.view_id == declared.view_id && write.allocation_id == declared.allocation_id {
-            landed = Some(write);
+        if declared_views
+            .iter()
+            .any(|view| view.view_id == write.view_id && view.allocation_id == write.allocation_id)
+        {
+            landed.insert((write.allocation_id, write.view_id), write);
         }
     }
     provider
         .release_completion(token)
         .map_err(|error| format!("release completion: {error:?}"))?;
-    let landed = landed.ok_or("the render rail landed no attachment writeback")?;
-    // The observation is the attachment's own range: a rail that landed a
-    // different range cannot be reported as this case's texels.
-    if landed.offset != declared.offset || landed.bytes.len() as u64 != declared.length {
-        return Err(format!(
-            "render case {}: the attachment writeback covers {}..{} instead of {}..{}",
-            case.id,
-            landed.offset,
-            landed.offset + landed.bytes.len() as u64,
-            declared.offset,
-            declared.offset + declared.length
-        )
-        .into());
+    // One writeback and one allocation image per attachment, in location
+    // order. Each writeback has to cover the exact range its declaring view
+    // states: a rail that landed a different range cannot be reported as this
+    // case's texels.
+    let mut writebacks = Vec::new();
+    let mut images = Vec::new();
+    for (attachment, _) in &attachments {
+        let declared = declared_views
+            .iter()
+            .find(|view| {
+                view.view_id == ViewId::new(attachment.view)
+                    && view.allocation_id == AllocationId::new(attachment.allocation)
+            })
+            .ok_or("the render rail landed no attachment writeback")?;
+        let write = landed
+            .get(&(
+                AllocationId::new(attachment.allocation),
+                ViewId::new(attachment.view),
+            ))
+            .ok_or("the render rail landed no attachment writeback")?;
+        if write.offset != declared.offset || write.bytes.len() as u64 != declared.length {
+            return Err(format!(
+                "render case {}: the attachment writeback covers {}..{} instead of {}..{}",
+                case.id,
+                write.offset,
+                write.offset + write.bytes.len() as u64,
+                declared.offset,
+                declared.offset + declared.length
+            )
+            .into());
+        }
+        let image = allocations
+            .iter()
+            .find(|(id, _)| *id == attachment.allocation)
+            .ok_or("the attachment allocation is missing")?
+            .1
+            .clone();
+        writebacks.push(Writeback {
+            allocation: attachment.allocation,
+            view: attachment.view,
+            offset: write.offset,
+            bytes_hex: hex(&write.bytes),
+        });
+        images.push(Allocation {
+            allocation: attachment.allocation,
+            bytes_hex: hex(&image),
+        });
     }
-    let image = allocations
-        .iter()
-        .find(|(id, _)| *id == attachment.allocation)
-        .ok_or("the attachment allocation is missing")?
-        .1
-        .clone();
     eprintln!(
-        "render case completed: {} attachment={} bytes={}",
+        "render case completed: {} attachments={} bytes={}",
         case.id,
-        hex(&landed.bytes),
-        landed.bytes.len()
+        attachments.len(),
+        writebacks
+            .iter()
+            .map(|writeback| writeback.bytes_hex.len())
+            .sum::<usize>()
     );
     Ok(CaseResult {
         id: case.id.clone(),
         completion: "CompletedVisible",
-        writebacks: vec![Writeback {
-            allocation: attachment.allocation,
-            view: attachment.view,
-            offset: landed.offset,
-            bytes_hex: hex(&landed.bytes),
-        }],
-        allocations: vec![Allocation {
-            allocation: attachment.allocation,
-            bytes_hex: hex(&image),
-        }],
+        writebacks,
+        allocations: images,
         copy_in: None,
         copy_out: None,
         group_counts: None,
@@ -3854,6 +4077,7 @@ fn run_object_render_case(
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
+    let attachments = render_attachment_shapes(case)?;
     let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &declaring.buffers {
         let size = usize::try_from(definition.allocation_size)?;
@@ -3936,28 +4160,55 @@ fn run_object_render_case(
     }
     compute.end_encoding()?;
 
-    let attachment_view = resources
-        .get(&case.attachment.view)
-        .ok_or("the declaring pass does not declare the attachment view")?
-        .1
-        .clone();
-    // The object rail's attachment shape follows the fixture: a clearing case
-    // carries its colour, a loading case keeps the bytes the attachment view
-    // holds at commit and the rail uploads them (`research/docs/23` §3.3).
-    let load = match case.attachment.load.as_str() {
-        "clear" => objects::RenderAttachmentLoad::Clear(
-            unhex(
-                case.attachment
-                    .clear_hex
-                    .as_deref()
-                    .ok_or("a clear attachment needs clear_hex")?,
-            )?
-            .try_into()
-            .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
-        ),
-        "load" => objects::RenderAttachmentLoad::Load,
-        other => return Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
-    };
+    // One declared view per attachment, in location order, and one load
+    // operation each: the object rail's attachment shape follows the fixture —
+    // a clearing case carries its colour, a loading case keeps the bytes the
+    // attachment view holds at commit and the rail uploads them
+    // (`research/docs/23` §3.3).
+    let attachment_views = attachments
+        .iter()
+        .map(|(attachment, _)| {
+            resources
+                .get(&attachment.view)
+                .ok_or_else(|| {
+                    format!(
+                        "the declaring pass does not declare the attachment view {}",
+                        attachment.view
+                    )
+                    .into()
+                })
+                .map(|(_, view)| view.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let attachment_loads = attachments
+        .iter()
+        .map(|(attachment, _)| match attachment.load.as_str() {
+            "clear" => Ok(objects::RenderAttachmentLoad::Clear(
+                unhex(
+                    attachment
+                        .clear_hex
+                        .as_deref()
+                        .ok_or("a clear attachment needs clear_hex")?,
+                )?
+                .try_into()
+                .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
+            )),
+            "load" => Ok(objects::RenderAttachmentLoad::Load),
+            other => Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // The recorded attachment list is positional: entry `i` is location `i`,
+    // which is the M6 object API's `draw_*_with_attachments` shape.
+    let recorded = attachments
+        .iter()
+        .zip(attachment_views.iter())
+        .zip(attachment_loads.iter())
+        .map(|((_, view), load)| objects::RenderColorAttachment {
+            view,
+            format: AttachmentFormat::Rgba8Unorm,
+            load: *load,
+        })
+        .collect::<Vec<_>>();
     let present =
         match &case.present {
             Some(definition) => Some(match &definition.initial_hex {
@@ -4017,13 +4268,15 @@ fn run_object_render_case(
         None => None,
     };
     if let Some(icb) = &icb {
+        // An indirect draw replays one attachment: the MRT shape and the ICB
+        // shape are mutually exclusive, which `validate_render_case` pins.
         render.draw_indirect(
             icb,
-            &attachment_view,
+            recorded[0].view,
             AttachmentFormat::Rgba8Unorm,
-            case.attachment.width,
-            case.attachment.height,
-            load,
+            attachments[0].0.width,
+            attachments[0].0.height,
+            recorded[0].load,
             present,
         )?;
     } else if let Some((index, format)) = &object_index {
@@ -4031,22 +4284,23 @@ fn run_object_render_case(
             render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
         }
         render.set_index_buffer(index, *format)?;
-        render.draw_indexed_primitives(
-            &attachment_view,
-            AttachmentFormat::Rgba8Unorm,
-            case.attachment.width,
-            case.attachment.height,
-            load,
+        render.draw_indexed_primitives_with_attachments(
+            &recorded,
+            attachments[0].0.width,
+            attachments[0].0.height,
             u32::try_from(case.vertices)?,
             present,
         )?;
     } else {
+        // The milestone's `vertex_id` triangle binds no stream and no index
+        // buffer, so it is the one shape that records through the
+        // single-attachment `draw_render_pass` entry point.
         render.draw_render_pass(
-            &attachment_view,
+            recorded[0].view,
             AttachmentFormat::Rgba8Unorm,
-            case.attachment.width,
-            case.attachment.height,
-            load,
+            attachments[0].0.width,
+            attachments[0].0.height,
+            recorded[0].load,
             present,
         )?;
     }
@@ -4075,37 +4329,68 @@ fn run_object_render_case(
     ) {
         return Err("object render capture requires completed visible results".into());
     }
-    let landed = output
-        .writebacks
-        .iter()
-        .find(|write| {
-            report_ids.get(&(write.allocation_id, write.view_id))
-                == Some(&(case.attachment.allocation, case.attachment.view))
-        })
-        .ok_or("the object render rail landed no attachment writeback")?;
-    let image = allocation_buffers
-        .get(&case.attachment.allocation)
-        .ok_or("the attachment allocation is missing")?
-        .read()?;
+    // One writeback and one allocation image per attachment, in location
+    // order. Each writeback has to cover the exact range its declaring view
+    // states, so a rail that landed a different range cannot be reported as
+    // this case's texels.
+    let mut writebacks = Vec::new();
+    let mut images_report = Vec::new();
+    for (attachment, _) in &attachments {
+        let landed = output
+            .writebacks
+            .iter()
+            .find(|write| {
+                report_ids.get(&(write.allocation_id, write.view_id))
+                    == Some(&(attachment.allocation, attachment.view))
+            })
+            .ok_or("the object render rail landed no attachment writeback")?;
+        let declared = declaring
+            .buffers
+            .iter()
+            .find(|buffer| {
+                buffer.allocation == attachment.allocation && buffer.view == attachment.view
+            })
+            .ok_or("the declaring pass does not declare the attachment view")?;
+        if landed.offset != declared.offset || landed.bytes.len() as u64 != declared.length {
+            return Err(format!(
+                "render case {}: the attachment writeback covers {}..{} instead of {}..{}",
+                case.id,
+                landed.offset,
+                landed.offset + landed.bytes.len() as u64,
+                declared.offset,
+                declared.offset + declared.length
+            )
+            .into());
+        }
+        let image = allocation_buffers
+            .get(&attachment.allocation)
+            .ok_or("the attachment allocation is missing")?
+            .read()?;
+        writebacks.push(Writeback {
+            allocation: attachment.allocation,
+            view: attachment.view,
+            offset: landed.offset,
+            bytes_hex: hex(&landed.bytes),
+        });
+        images_report.push(Allocation {
+            allocation: attachment.allocation,
+            bytes_hex: hex(&image),
+        });
+    }
     eprintln!(
-        "objects render case completed: {} attachment={} bytes={}",
+        "objects render case completed: {} attachments={} bytes={}",
         case.id,
-        hex(&landed.bytes),
-        landed.bytes.len()
+        attachments.len(),
+        writebacks
+            .iter()
+            .map(|writeback| writeback.bytes_hex.len())
+            .sum::<usize>()
     );
     Ok(CaseResult {
         id: case.id.clone(),
         completion: "CompletedVisible",
-        writebacks: vec![Writeback {
-            allocation: case.attachment.allocation,
-            view: case.attachment.view,
-            offset: landed.offset,
-            bytes_hex: hex(&landed.bytes),
-        }],
-        allocations: vec![Allocation {
-            allocation: case.attachment.allocation,
-            bytes_hex: hex(&image),
-        }],
+        writebacks,
+        allocations: images_report,
         copy_in: None,
         copy_out: None,
         group_counts: None,

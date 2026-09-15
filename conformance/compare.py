@@ -32,8 +32,9 @@ ALLOCATION_OBSERVATIONS = {
 # allocations, which the count contract is derived from; `rails` is the set of
 # capture backends a suite declares this case executable on; `attachment` is
 # the `(allocation, view, offset, length)` tuple the render result has to report
-# and nothing else, which is what keeps an attachment from passing as a buffer
-# writeback; and `present` is the case's optional present section, the
+# and nothing else for a single-attachment case, or the tuple list in location
+# order for an MRT case, which is what keeps an attachment from passing as a
+# buffer writeback; and `present` is the case's optional present section, the
 # acquire/present counts every rail its marker names has to report
 # (`research/docs/24` §5.3), or `None` when the suite declares none.
 RenderExpectation = namedtuple(
@@ -697,13 +698,32 @@ def _render_plan(plan, suite):
         # The shape is a whitelist and not a per-case table: `present` is the one
         # field the first present increment adds, and it arrives on the same
         # reviewed shape rather than widening it (`research/docs/24` §5.3).
+        # The attachment section is one of two mutually exclusive shapes: the
+        # single `attachment` object plus the case-level `expected_hex`
+        # (v13-v17), or the MRT `attachments` list whose entries each carry
+        # their own `expected_hex` (v18).
         required = ("id", "declaring_case", "vertex_entry", "fragment_entry", "metal",
-                    "vertices", "viewport", "attachment", "expected_hex", "capture_rails")
+                    "vertices", "viewport", "capture_rails")
         missing = [field for field in required if field not in case]
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
         unexpected = sorted(set(case) - set(required)
-                            - {"present", "icb", "vertex_layout", "vertex_buffers", "indices"})
+                            - {"attachment", "expected_hex", "attachments", "present", "icb",
+                               "vertex_layout", "vertex_buffers", "indices"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
+        single = "attachment" in case
+        multiple = "attachments" in case
+        _require(single != multiple,
+                 f"{where}: exactly one of attachment and attachments is required")
+        if single:
+            _require("expected_hex" in case, f"{where}: missing fields expected_hex")
+        else:
+            _require("expected_hex" not in case,
+                     f"{where}: an attachment list carries its own expected_hex")
+        definitions = [case["attachment"]] if single else \
+            _list(case["attachments"], f"{where}.attachments")
+        if multiple:
+            _require(len(definitions) == 2,
+                     f"{where}: the reviewed MRT shape is two attachments")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
         declaring = _string(case["declaring_case"], f"{where}.declaring_case")
@@ -730,83 +750,119 @@ def _render_plan(plan, suite):
         _require(vertex_entry != fragment_entry,
                  f"{where}: the vertex and fragment entries have to differ")
 
-        attachment = case["attachment"]
-        _require(isinstance(attachment, dict), f"{where}.attachment: expected an object")
-        _require(set(attachment).issubset({"allocation", "view", "format", "width", "height",
-                                          "load", "store", "clear_hex", "initial_hex"}),
-                 f"{where}.attachment: unexpected fields")
-        allocation = _integer(attachment.get("allocation"), f"{where}.attachment.allocation")
-        view = _integer(attachment.get("view"), f"{where}.attachment.view")
-        _require(allocation > 0 and view > 0, f"{where}: zero attachment identity")
-        _require(attachment.get("format") == "rgba8_unorm",
-                 f"{where}: unsupported attachment format")
-        width = _integer(attachment.get("width"), f"{where}.attachment.width", 1)
-        height = _integer(attachment.get("height"), f"{where}.attachment.height", 1)
-        _require((width, height) == (2, 2),
-                 f"{where}: the first render increment renders into a 2x2 attachment")
-        _require(attachment.get("store") == "store",
-                 f"{where}: a discarded attachment cannot be compared")
         vertex_input = _vertex_input_declaration(case, where)
         if vertex_input is None:
             _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
+            _require(not multiple,
+                     f"{where}: the milestone vertex_id shape renders one attachment")
         else:
             _require(case["vertices"] == vertex_input["indices"],
                      f"{where}: the reviewed indexed quad draws {vertex_input['indices']} indices")
             _require("present" not in case and "icb" not in case,
                      f"{where}: a vertex-input case carries neither a present action nor an ICB")
-        viewport = _list(case["viewport"], f"{where}.viewport")
-        _require(viewport == [0, 0, width, height],
-                 f"{where}: the viewport must cover the attachment")
-        expected = _hex(case["expected_hex"], f"{where}.expected_hex")
-        _require(len(expected) == width * height * 4,
-                 f"{where}: expected texel bytes do not match the attachment")
-        texel = expected[:4]
-        texels = [expected[offset:offset + 4] for offset in range(0, len(expected), 4)]
-        # Clearing and loading agree about what a drawn texel is — one fragment
-        # output, repeated — and disagree about the rest: a cleared attachment
-        # has no previous bytes to compare against (`research/docs/23` §1.3),
-        # while a loaded one is expected to keep them where the draw missed
-        # (§3.3). The classification below is the loading rule; the clearing
-        # arm keeps the milestone's stricter one.
-        load = attachment.get("load")
-        if load == "clear":
-            _require(all(chunk == texel for chunk in texels),
-                     f"{where}: every texel of the expectation has to be the fragment output")
-            clear = _hex(attachment.get("clear_hex"), f"{where}.attachment.clear_hex")
-            _require(len(clear) == 4, f"{where}: a clear colour is four bytes")
-            _require("initial_hex" not in attachment,
-                     f"{where}: a cleared attachment carries no initial bytes")
-            _require(clear != texel, f"{where}: the clear colour equals the expected texel")
-        elif load == "load":
-            previous = _hex(attachment.get("initial_hex"), f"{where}.attachment.initial_hex")
-            _require(len(previous) == len(expected),
-                     f"{where}: initial texels do not match the attachment")
-            _require(previous != expected,
-                     f"{where}: the initial texels equal the expectation")
-            _require("clear_hex" not in attachment,
-                     f"{where}: a loaded attachment carries no clear colour")
-            # The loading pass uploads the declaring case's own bytes, so the
-            # case's `initial_hex` has to be exactly what that case declares.
-            declaring_buffers = by_id[declaring]["buffers"]
-            declared_bytes = [buffer for buffer in declaring_buffers
-                              if buffer["allocation"] == allocation and buffer["view"] == view]
-            _require(len(declared_bytes) == 1,
-                     f"{where}: the declaring case has to declare exactly the attachment view")
-            _require(declared_bytes[0].get("initial_hex") == attachment.get("initial_hex"),
-                     f"{where}: the declared view's bytes are not the attachment's initial texels")
-            # Partial coverage, both directions: every texel is either the
-            # fragment output or the byte the load handed it, every drawn texel
-            # carries the same output, and both halves appear.
-            drawn = {chunk for position, chunk in enumerate(texels)
-                     if chunk != previous[position * 4:position * 4 + 4]}
-            kept = sum(1 for position, chunk in enumerate(texels)
-                       if chunk == previous[position * 4:position * 4 + 4])
-            _require(len(drawn) == 1,
-                     f"{where}: drawn texels disagree about the fragment output: {sorted(drawn)}")
-            _require(0 < kept < len(texels),
-                     f"{where}: a loaded attachment needs both drawn and kept texels")
-        else:
-            raise CaptureError(f"{where}: unknown attachment load op {load!r}")
+        # One attachment at a time: the single shape is the v13-v17 branch with
+        # its expectation at the case level, and every MRT entry restates the
+        # same per-field rules with its own expectation.
+        expected_bytes = []
+        parsed = []
+        for position, attachment in enumerate(definitions):
+            attachment_where = (f"{where}.attachment" if single
+                                else f"{where}.attachments[{position}]")
+            _require(isinstance(attachment, dict), f"{attachment_where}: expected an object")
+            allowed = {"allocation", "view", "format", "width", "height",
+                       "load", "store", "clear_hex", "initial_hex"}
+            if multiple:
+                allowed.add("expected_hex")
+            _require(set(attachment).issubset(allowed),
+                     f"{attachment_where}: unexpected fields")
+            allocation = _integer(attachment.get("allocation"),
+                                  f"{attachment_where}.allocation")
+            view = _integer(attachment.get("view"), f"{attachment_where}.view")
+            _require(allocation > 0 and view > 0,
+                     f"{attachment_where}: zero attachment identity")
+            _require(attachment.get("format") == "rgba8_unorm",
+                     f"{attachment_where}: unsupported attachment format")
+            width = _integer(attachment.get("width"), f"{attachment_where}.width", 1)
+            height = _integer(attachment.get("height"), f"{attachment_where}.height", 1)
+            _require((width, height) == (2, 2),
+                     f"{attachment_where}: the first render increment renders into "
+                     "a 2x2 attachment")
+            _require(attachment.get("store") == "store",
+                     f"{attachment_where}: a discarded attachment cannot be compared")
+            viewport = _list(case["viewport"], f"{attachment_where}.viewport")
+            _require(viewport == [0, 0, width, height],
+                     f"{attachment_where}: the viewport must cover the attachment")
+            expected = _hex(case["expected_hex"] if single else attachment.get("expected_hex"),
+                            f"{attachment_where}.expected_hex")
+            _require(len(expected) == width * height * 4,
+                     f"{attachment_where}: expected texel bytes do not match the attachment")
+            texel = expected[:4]
+            texels = [expected[offset:offset + 4] for offset in range(0, len(expected), 4)]
+            # Clearing and loading agree about what a drawn texel is — one
+            # fragment output, repeated — and disagree about the rest: a
+            # cleared attachment has no previous bytes to compare against
+            # (`research/docs/23` §1.3), while a loaded one is expected to keep
+            # them where the draw missed (§3.3). The classification below is
+            # the loading rule; the clearing arm keeps the milestone's
+            # stricter one.
+            load = attachment.get("load")
+            if load == "clear":
+                _require(all(chunk == texel for chunk in texels),
+                         f"{attachment_where}: every texel of the expectation has to be "
+                         "the fragment output")
+                clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
+                _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
+                _require("initial_hex" not in attachment,
+                         f"{attachment_where}: a cleared attachment carries no initial bytes")
+                _require(clear != texel,
+                         f"{attachment_where}: the clear colour equals the expected texel")
+            elif load == "load":
+                previous = _hex(attachment.get("initial_hex"),
+                                f"{attachment_where}.initial_hex")
+                _require(len(previous) == len(expected),
+                         f"{attachment_where}: initial texels do not match the attachment")
+                _require(previous != expected,
+                         f"{attachment_where}: the initial texels equal the expectation")
+                _require("clear_hex" not in attachment,
+                         f"{attachment_where}: a loaded attachment carries no clear colour")
+                # The loading pass uploads the declaring case's own bytes, so
+                # the case's `initial_hex` has to be exactly what that case
+                # declares.
+                declaring_buffers = by_id[declaring]["buffers"]
+                declared_bytes = [buffer for buffer in declaring_buffers
+                                  if buffer["allocation"] == allocation
+                                  and buffer["view"] == view]
+                _require(len(declared_bytes) == 1,
+                         f"{attachment_where}: the declaring case has to declare exactly "
+                         "the attachment view")
+                _require(declared_bytes[0].get("initial_hex")
+                         == attachment.get("initial_hex"),
+                         f"{attachment_where}: the declared view's bytes are not the "
+                         "attachment's initial texels")
+                # Partial coverage, both directions: every texel is either the
+                # fragment output or the byte the load handed it, every drawn
+                # texel carries the same output, and both halves appear.
+                drawn = {chunk for position, chunk in enumerate(texels)
+                         if chunk != previous[position * 4:position * 4 + 4]}
+                kept = sum(1 for position, chunk in enumerate(texels)
+                           if chunk == previous[position * 4:position * 4 + 4])
+                _require(len(drawn) == 1,
+                         f"{attachment_where}: drawn texels disagree about the fragment "
+                         f"output: {sorted(drawn)}")
+                _require(0 < kept < len(texels),
+                         f"{attachment_where}: a loaded attachment needs both drawn and "
+                         "kept texels")
+            else:
+                raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
+            parsed.append((attachment, allocation, view, expected))
+            expected_bytes.append(expected)
+        # The two MRT locations write two different byte strings, so a dual
+        # case whose locations read back the same texels could not show that
+        # both outputs landed (`4080c0ff` vs `ff8040c0`).
+        if multiple:
+            _require(expected_bytes[0] != expected_bytes[1],
+                     f"{where}: the two attachments read back the same texels")
+        texel = expected_bytes[0][:4]
 
         # The present section is optional: a case without it is the v13 case and
         # must not grow a present observation in a capture (the exact-set rule
@@ -829,42 +885,57 @@ def _render_plan(plan, suite):
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
 
-        # The attachment resolves against the declaring case's own table: one of
-        # its declared views has to be the attachment, it has to be read-only
-        # (a compute pass that *wrote* the view the render pass stores would make
-        # the order inexpressible), and its byte range has to agree with the
-        # extent the attachment restates.
+        # Every attachment resolves against the declaring case's own table:
+        # one of its declared views has to be the attachment, it has to be
+        # read-only (a compute pass that *wrote* the view the render pass
+        # stores would make the order inexpressible), and its byte range has to
+        # agree with the extent the attachment restates.
         declaring_buffers = by_id[declaring]["buffers"]
-        declared = [buffer for buffer in declaring_buffers
-                    if buffer["allocation"] == allocation and buffer["view"] == view]
-        _require(len(declared) == 1,
-                 f"{where}: the declaring case has to declare exactly the attachment view")
-        declared = declared[0]
-        _require(declared["access"] == "read",
-                 f"{where}: the declaring pass must only read the attachment view")
-        _require(declared["length"] == len(expected),
-                 f"{where}: attachment extent disagrees with the declaring view")
-        offset = declared["offset"]
-        size = declared["allocation_size"]
-        _require(offset + len(expected) <= size,
-                 f"{where}: the declaring view is outside its allocation")
+        writes = []
+        images = {}
+        identities = []
+        written = {identity[0] for identity, _ in declaring_writes}
+        for position, (attachment, allocation, view, expected) in enumerate(parsed):
+            attachment_where = (f"{where}.attachment" if single
+                                else f"{where}.attachments[{position}]")
+            _require(allocation not in images,
+                     f"{attachment_where}: the attachments have to name distinct allocations")
+            declared = [buffer for buffer in declaring_buffers
+                        if buffer["allocation"] == allocation and buffer["view"] == view]
+            _require(len(declared) == 1,
+                     f"{attachment_where}: the declaring case has to declare exactly "
+                     "the attachment view")
+            declared = declared[0]
+            _require(declared["access"] == "read",
+                     f"{attachment_where}: the declaring pass must only read the "
+                     "attachment view")
+            _require(declared["length"] == len(expected),
+                     f"{attachment_where}: attachment extent disagrees with the "
+                     "declaring view")
+            offset = declared["offset"]
+            size = declared["allocation_size"]
+            _require(offset + len(expected) <= size,
+                     f"{attachment_where}: the declaring view is outside its allocation")
 
-        # The allocation image is the declaring case's own image with the
-        # attachment's landing overlaid: the render result observes the whole
-        # allocation, so a guard byte or an untouched neighbour that the render
-        # pass did not store into stays part of the comparison.
-        image = bytearray(plan[declaring][1][allocation])
-        _require(len(image) == size, f"{where}: inconsistent allocation size")
-        image[offset:offset + len(expected)] = expected
+            # The allocation image is the declaring case's own image with the
+            # attachment's landing overlaid: the render result observes the
+            # whole allocation, so a guard byte or an untouched neighbour that
+            # the render pass did not store into stays part of the comparison.
+            image = bytearray(plan[declaring][1][allocation])
+            _require(len(image) == size, f"{attachment_where}: inconsistent allocation size")
+            image[offset:offset + len(expected)] = expected
+            images[allocation] = bytes(image)
+            writes.append(((allocation, view, offset), expected))
+            identities.append((allocation, view, offset, len(expected)))
+            written.add(allocation)
         touched = set(plan[declaring][1])
-        written = {identity[0] for identity, _ in declaring_writes} | {allocation}
         render_plan[case_id] = RenderExpectation(
-            writes=[((allocation, view, offset), expected)],
-            allocations={allocation: bytes(image)},
+            writes=writes,
+            allocations=images,
             touched=touched,
             written=written,
             rails=frozenset(rails),
-            attachment=(allocation, view, offset, len(expected)),
+            attachment=identities[0] if single else identities,
             present=present,
             icb=icb)
     return render_plan
@@ -923,22 +994,27 @@ def validate_capture(suite, digest, report, required_backend=None):
                  f"{where}: completion must be CompletedVisible, got {result['completion']!r}")
         if case_id in render_plan:
             # A render case reports one observation and one only: the
-            # attachment's own allocation and its writeback. The identity check
-            # below is the attachment-versus-buffer rule — an attachment cannot
-            # be satisfied by a buffer writeback, and a buffer writeback cannot
-            # be reported where the attachment belongs.
+            # attachments' own allocations and their writebacks, one of each
+            # per attachment. The identity check below is the
+            # attachment-versus-buffer rule — an attachment cannot be satisfied
+            # by a buffer writeback, and a buffer writeback cannot be reported
+            # where the attachment belongs.
             expectation = render_plan[case_id]
             _compare_observation(result, expectation.writes, expectation.allocations, where)
-            attachment_allocation, attachment_view, attachment_offset, attachment_length = \
-                expectation.attachment
+            attachments = expectation.attachment
+            if isinstance(attachments, tuple):
+                attachments = [attachments]
             _require({identity for identity, _ in expectation.writes}
-                     == {(attachment_allocation, attachment_view, attachment_offset)},
-                     f"{where}: the attachment plan has to be one writeback")
-            _require(len(expectation.allocations) == 1
-                     and next(iter(expectation.allocations)) == attachment_allocation,
-                     f"{where}: the attachment plan has to be its own allocation")
-            _require(attachment_length == len(expectation.writes[0][1]),
-                     f"{where}: the attachment plan has to cover its own texels")
+                     == {attachment[:3] for attachment in attachments},
+                     f"{where}: the attachment writebacks have to be exactly the "
+                     "declared attachments")
+            _require(set(expectation.allocations)
+                     == {attachment[0] for attachment in attachments},
+                     f"{where}: the attachment allocations have to be exactly the "
+                     "declared attachments")
+            for attachment, (_, expected) in zip(attachments, expectation.writes):
+                _require(attachment[3] == len(expected),
+                         f"{where}: an attachment plan has to cover its own texels")
             if counts[0] is not None and provider_backend:
                 # One submission carries the declaring pass and the render pass.
                 # The declaring pass copies its own allocations in and the ones

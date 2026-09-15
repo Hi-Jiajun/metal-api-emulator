@@ -133,6 +133,9 @@ private struct RenderAttachmentDefinition: Decodable {
     let store: String
     let clear_hex: String?
     let initial_hex: String?
+    /// The MRT case's per-attachment expectation; absent for the
+    /// single-attachment form, whose expectation is case-level.
+    let expected_hex: String?
 }
 
 /// One attribute of a render case's vertex stream.
@@ -214,7 +217,9 @@ private struct RenderCaseDefinition: Decodable {
     /// The MRT case's attachment list, in location order; mutually exclusive
     /// with `attachment`.
     let attachments: [RenderAttachmentDefinition]?
-    let expected_hex: String
+    /// The single-attachment case's expectation. An MRT case leaves this
+    /// absent and spells the expectation on each attachment entry instead.
+    let expected_hex: String?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -702,6 +707,19 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
+    case "render_declaring_two_attachments":
+        // v18's declaring case: the reviewed mrt_declare kernel reads both
+        // attachment views and writes their xor into its own output view, so
+        // one submission proves it read the two views the render pass stores.
+        try require(definition.entry == "mrt_declare"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3,
+                    "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 16 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "read" && $0.length == 16 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "write" && $0.length == 4 },
+                    "\(definition.id): expected two 16-byte read buffers and a 4-byte write buffer")
     case let id where declaringShapeIDs.contains(id):
         // v13's declaring case: the same reviewed copy kernel, but its read
         // view covers the 16 attachment bytes the render case stores into, so
@@ -1001,8 +1019,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v17":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v18":
+        expectedIDs = ["render_declaring_two_attachments"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v17 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v18 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1309,10 +1329,29 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                           + "buffer are declared together")
     }
     let attachments = try colorAttachments(definition)
-    let expected = try decodeHex(definition.expected_hex, context: "\(definition.id) expected texels")
+    // One expectation per attachment, in location order: the single form
+    // carries it at the case level, the MRT form on each attachment entry.
+    let expectedHexes: [String]
+    if definition.attachment != nil {
+        guard let top = definition.expected_hex else {
+            throw OracleError("\(definition.id): a single attachment needs expected_hex")
+        }
+        try require(attachments[0].expected_hex == nil,
+                    "\(definition.id): a single attachment carries no expected_hex")
+        expectedHexes = [top]
+    } else {
+        try require(definition.expected_hex == nil,
+                    "\(definition.id): an attachment list carries its own expected_hex")
+        expectedHexes = try attachments.map { attachment in
+            guard let hex = attachment.expected_hex else {
+                throw OracleError("\(definition.id): attachment \(attachment.view) "
+                                  + "needs expected_hex")
+            }
+            return hex
+        }
+    }
     var validatedAttachments = [ValidatedRenderAttachment]()
-    var expectedOffset = 0
-    for attachment in attachments {
+    for (index, attachment) in attachments.enumerated() {
         try require(attachment.format == "rgba8_unorm",
                     "\(definition.id): unsupported attachment format")
         try require(attachment.width == 2 && attachment.height == 2,
@@ -1324,10 +1363,10 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
                     "\(definition.id): the viewport must cover the attachment")
         let byteCount = attachment.width * attachment.height * 4
-        try require(expectedOffset + byteCount <= expected.count,
-                    "\(definition.id): expected texel bytes do not cover every attachment")
-        let texels = Data(expected[expectedOffset..<(expectedOffset + byteCount)])
-        expectedOffset += byteCount
+        let texels = try decodeHex(expectedHexes[index],
+                                   context: "\(definition.id) expected texels")
+        try require(texels.count == byteCount,
+                    "\(definition.id): expected texel bytes do not match the attachment")
         // What a drawn texel has to be depends on what the pass started from.
         // A clearing pass has nothing to preserve, so every texel has to be the
         // same fragment output (`research/docs/23` §1.3) — a partially covered
@@ -1415,8 +1454,6 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             load: attachment.load, clearComponents: clearComponents,
             initial: initial, expected: texels))
     }
-    try require(expectedOffset == expected.count,
-                "\(definition.id): expected texel bytes exceed the attachments")
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
     // show that both outputs landed (`4080c0ff` vs `ff8040c0`).
@@ -1491,6 +1528,14 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
             sha256: "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f")
         slots = [BufferSlotDefinition(binding: 4, access: "read", length: 120),
                  BufferSlotDefinition(binding: 9, access: "write", length: 120)]
+    case "mrt_declare":
+        air = SourceDefinition(path: "shaders/mrt_declare.ll",
+            sha256: "0a5b6740a2839cc4c47a829a7c9badb1bb7d6557df031620a1bf17d7a04393c9")
+        metal = SourceDefinition(path: "shaders/mrt_declare.metal",
+            sha256: "c6eeddad6686351c7ec616267f0975f7cc559ee85569a3396c83f64407eff689")
+        slots = [BufferSlotDefinition(binding: 0, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 1, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 2, access: "write", length: 4)]
     default:
         throw OracleError("Unsupported entry: \(entry)")
     }
@@ -1954,7 +1999,7 @@ private func renderSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
-            clear_hex: "fefefefe", initial_hex: nil),
+            clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test runs on this rail by construction; the marker is the
@@ -2010,7 +2055,7 @@ private func presentSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "load", store: "store",
-            clear_hex: nil, initial_hex: hex(sentinel)),
+            clear_hex: nil, initial_hex: hex(sentinel), expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test is this rail's own check; it runs directly rather than
@@ -2090,7 +2135,7 @@ private func vertexSelfTest() throws -> CaseResult {
         attachment: RenderAttachmentDefinition(
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
-            clear_hex: "fefefefe", initial_hex: nil),
+            clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test runs on this rail by construction; the marker is the
@@ -2166,16 +2211,17 @@ private func mrtSelfTest() throws -> CaseResult {
             RenderAttachmentDefinition(
                 allocation: 900, view: 910, format: "rgba8_unorm",
                 width: 2, height: 2, load: "clear", store: "store",
-                clear_hex: "fefefefe", initial_hex: nil),
+                clear_hex: "fefefefe", initial_hex: nil,
+                expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff"),
             RenderAttachmentDefinition(
                 allocation: 901, view: 911, format: "rgba8_unorm",
                 width: 2, height: 2, load: "clear", store: "store",
-                clear_hex: "fefefefe", initial_hex: nil),
+                clear_hex: "fefefefe", initial_hex: nil,
+                expected_hex: "ff8040c0ff8040c0ff8040c0ff8040c0"),
         ],
         // Location 0 first, then location 1: the fixture's own byte strings,
-        // spelled the way `validate_mrt_selftest` compares them.
-        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff"
-            + "ff8040c0ff8040c0ff8040c0ff8040c0",
+        // spelled per attachment the way a suite's MRT case does.
+        expected_hex: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
