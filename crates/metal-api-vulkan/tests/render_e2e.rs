@@ -53,6 +53,12 @@ const FULL_SCREEN_TRIANGLE_VERT_SPV: &[u8] =
 /// decision rather than the shader's.
 const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("../src/render_spv/solid_unorm8.frag.spv");
 
+/// The reviewed dual-output fragment stage for the `[Rgba8Unorm, Rgba8Unorm]`
+/// MRT shape: `Location 0` stores `(64/255, 128/255, 192/255, 1)` and
+/// `Location 1` stores `(1, 128/255, 64/255, 192/255)`.
+const SOLID_UNORM8_DUAL_FRAG_SPV: &[u8] =
+    include_bytes!("../src/render_spv/solid_unorm8_dual.frag.spv");
+
 /// The reviewed single-channel float fragment stage: `spirv-as` output of
 /// `render_spv/solid_r32f.frag.spvasm` (entry `fragment_main`).
 const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("../src/render_spv/solid_r32f.frag.spv");
@@ -71,8 +77,12 @@ const ATTACHMENT_WORD: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 
 const ATTACHMENT_VIEW: ViewId = ViewId::new(701);
 const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(801);
+const SECOND_ATTACHMENT_VIEW: ViewId = ViewId::new(703);
+const SECOND_ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(803);
 const SCRATCH_VIEW: ViewId = ViewId::new(702);
 const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(802);
+const SECOND_SCRATCH_VIEW: ViewId = ViewId::new(704);
+const SECOND_SCRATCH_ALLOCATION: AllocationId = AllocationId::new(804);
 
 /// The colour formats this file measures: the contract's admitted set.
 const ADMITTED_FORMATS: [AttachmentFormat; 3] = AttachmentFormat::ADMITTED;
@@ -438,6 +448,205 @@ fn every_admitted_colour_format_lands_its_own_attachment_bytes() {
         let scratch = readback(&writebacks, SCRATCH_VIEW);
         assert_eq!(scratch, ATTACHMENT_WORD.to_vec());
     }
+}
+
+/// The reviewed MRT shape through the whole chain: two 2×2 `Rgba8Unorm`
+/// attachments drawn in one pass, each landing its own location's bytes in its
+/// own view writeback, with `copy_out == 2` (one image→buffer copy per
+/// attachment). Each attachment view needs its own declaring compute pass
+/// (`copy_word` reads binding 0, writes binding 1), so the executor's readback
+/// delta is the render rail's two copies plus two compute scratch copies.
+#[test]
+fn dual_attachments_land_both_locations_through_writeback() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+
+    // The declaring compute pass runs the reviewed kernel; the render pass
+    // names a pipeline registered from the reviewed dual-output module.
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_mrt_compute"))
+        .expect("the compute pipeline registers");
+    let render = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_DUAL_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_mrt_stages"),
+        })
+        .expect("the dual render pipeline registers");
+
+    let attachment = |view: ViewId, allocation: AllocationId| RenderAttachment {
+        view_id: view,
+        allocation_id: allocation,
+        format: AttachmentFormat::Rgba8Unorm,
+        width: 2,
+        height: 2,
+        load: LoadOp::Clear(ClearColor::new(CLEAR_SENTINEL)),
+        store: StoreOp::Store,
+    };
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(12),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            // The reviewed kernel reads binding 0 and writes binding 1, so each
+            // attachment view needs its own declaring compute pass: binding 0
+            // is the only read slot, and core refuses a compute write of
+            // attachment bytes (`AttachmentComputeConflict`). Each pass writes
+            // its own scratch view so both declarations do real work.
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: 16,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: SECOND_ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: SECOND_ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: 16,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                    },
+                    BufferView {
+                        view_id: SECOND_SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SECOND_SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(RenderPassDescriptor {
+                pipeline: render.pipeline_id,
+                color_attachments: vec![
+                    attachment(ATTACHMENT_VIEW, ATTACHMENT_ALLOCATION),
+                    attachment(SECOND_ATTACHMENT_VIEW, SECOND_ATTACHMENT_ALLOCATION),
+                ],
+                viewport: [0, 0, 2, 2],
+                vertices: 3,
+                vertex_buffers: Vec::new(),
+                indices: None,
+                present: None,
+            }),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16),
+        (SECOND_ATTACHMENT_ALLOCATION, 16),
+        (SCRATCH_ALLOCATION, 8),
+        (SECOND_SCRATCH_ALLOCATION, 8),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("attachment allocation");
+    }
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the dual-attachment trace is admitted");
+    let (_, readbacks_before) = executor.buffer_copy_counts();
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    let (_, readbacks_after) = executor.buffer_copy_counts();
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    assert!(matches!(
+        submitted.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ));
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+
+    let first = readback(&writebacks, ATTACHMENT_VIEW);
+    let second = readback(&writebacks, SECOND_ATTACHMENT_VIEW);
+    eprintln!("location 0 readback: {}", hex(&first));
+    eprintln!("location 1 readback: {}", hex(&second));
+    assert_eq!(first, [0x40, 0x80, 0xc0, 0xff].repeat(4));
+    assert_eq!(second, [0xff, 0x80, 0x40, 0xc0].repeat(4));
+
+    // One copy-out per attachment (`copy_out == 2` on the render rail) plus
+    // each declaring compute pass's scratch readback, so the executor's
+    // readback counter advances by exactly four.
+    let scratch = readback(&writebacks, SCRATCH_VIEW);
+    assert_eq!(scratch, ATTACHMENT_WORD.to_vec());
+    let second_scratch = readback(&writebacks, SECOND_SCRATCH_VIEW);
+    assert_eq!(second_scratch, ATTACHMENT_WORD.to_vec());
+    assert_eq!(
+        readbacks_after - readbacks_before,
+        4,
+        "two render attachment copies plus two compute scratch copies"
+    );
 }
 
 /// A registration pairs a compiled fragment stage with a format, and the rail

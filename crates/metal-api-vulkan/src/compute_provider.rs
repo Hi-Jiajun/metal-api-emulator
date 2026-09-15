@@ -660,12 +660,13 @@ impl VulkanComputeProvider {
     /// Execute the planned render passes in trace order, after the compute
     /// sequence, and turn each attachment readback into a buffer writeback.
     ///
-    /// The attachment's bytes leave the rail through the same channel a compute
-    /// pass uses: one [`BufferWriteback`] for the view and allocation the trace
-    /// declared, at the view's own offset inside the allocation, so resource
-    /// admission, lease bookkeeping and readback consumers need no second path.
-    /// An attachment that no buffer view covers has no such landing rail and is
-    /// refused instead of being executed and dropped.
+    /// Every attachment's bytes leave the rail through the same channel a
+    /// compute pass uses: one [`BufferWriteback`] per attachment for the view
+    /// and allocation the trace declared, at the view's own offset inside the
+    /// allocation, so resource admission, lease bookkeeping and readback
+    /// consumers need no second path. An attachment that no buffer view covers
+    /// has no such landing rail and is refused instead of being executed and
+    /// dropped. A presenting pass keeps the pre-MRT single-attachment shape.
     fn execute_render_passes(
         &self,
         trace: &ComputeTrace,
@@ -725,108 +726,178 @@ impl VulkanComputeProvider {
         let host_readback = trace.completion_policy == CompletionPolicy::HostReadback;
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
-            let [attachment] = planned.pass.color_attachments.as_slice() else {
-                return Err(refusal(
-                    ProviderPhase::Resolve,
-                    ProviderErrorClass::Args,
-                    "trace_contract_invalid",
-                )
-                .with_detail("the render rail executes exactly one colour attachment"));
-            };
-            // The declared view serves two purposes: it is the attachment's
-            // landing for the writeback channel, and it is the source of the
-            // previous bytes a `LoadOp::Load` pass uploads before it opens
-            // (`research/docs/23` §3.3). A loading pass therefore needs the
-            // declaration even when the trace asks for no host readback.
-            let declared = pool.iter().find(|view| {
-                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
-            });
-            let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
-            let view = if host_readback || loading {
-                Some(declared.ok_or_else(|| {
-                    refusal(
+            if let Some(present) = &planned.pass.present {
+                // The present rail renders exactly one attachment into the
+                // provider-owned target; the pre-MRT gate stays in place rather
+                // than being widened, so present keeps its single-attachment
+                // byte behaviour (`research/docs/24` §3.5 shape one).
+                let [attachment] = planned.pass.color_attachments.as_slice() else {
+                    return Err(refusal(
                         ProviderPhase::Resolve,
-                        ProviderErrorClass::Capability,
-                        "render_attachment_landing_unsupported",
+                        ProviderErrorClass::Args,
+                        "trace_contract_invalid",
                     )
-                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                    .with_field(
-                        "allocation",
-                        FieldValue::Unsigned(attachment.allocation_id.get()),
-                    )
-                    .with_detail(
-                        "attachment bytes land through the buffer writeback channel and \
-                         `LoadOp::Load` uploads the trace's own bytes, and this trace declares \
-                         no buffer view covering the attachment",
-                    )
-                })?)
-            } else {
-                None
-            };
-            let previous = if loading {
-                match view.map(|view| &view.source) {
-                    Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
-                    _ => {
-                        return Err(refusal(
+                    .with_detail("the present rail executes exactly one colour attachment"));
+                };
+                // The declared view serves two purposes: it is the attachment's
+                // landing for the writeback channel, and it is the source of
+                // the previous bytes a `LoadOp::Load` pass uploads before it
+                // opens (`research/docs/23` §3.3). A loading pass therefore
+                // needs the declaration even when the trace asks for no host
+                // readback.
+                let declared = pool.iter().find(|view| {
+                    view.view_id == attachment.view_id
+                        && view.allocation_id == attachment.allocation_id
+                });
+                let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
+                let view = if host_readback || loading {
+                    Some(declared.ok_or_else(|| {
+                        refusal(
                             ProviderPhase::Resolve,
                             ProviderErrorClass::Capability,
-                            "attachment_load_op_unsupported",
+                            "render_attachment_landing_unsupported",
                         )
-                        .with_field("load_op", FieldValue::Text("load".to_owned()))
+                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(attachment.allocation_id.get()),
+                        )
                         .with_detail(
-                            "the first `LoadOp::Load` increment uploads trace-owned bytes only",
-                        ));
+                            "attachment bytes land through the buffer writeback channel and \
+                             `LoadOp::Load` uploads the trace's own bytes, and this trace \
+                             declares no buffer view covering the attachment",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                let previous = if loading {
+                    match view.map(|view| &view.source) {
+                        Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
+                        _ => {
+                            return Err(refusal(
+                                ProviderPhase::Resolve,
+                                ProviderErrorClass::Capability,
+                                "attachment_load_op_unsupported",
+                            )
+                            .with_field("load_op", FieldValue::Text("load".to_owned()))
+                            .with_detail(
+                                "the first `LoadOp::Load` increment uploads trace-owned bytes only",
+                            ));
+                        }
                     }
+                } else {
+                    None
+                };
+                let target = self.present_target(present, attachment)?;
+                let texels = render::execute_present_render(
+                    &self.executor.context,
+                    &planned.stages,
+                    &planned.pass,
+                    &target,
+                    previous,
+                )?;
+                if let Some(view) = view {
+                    writebacks.push(BufferWriteback {
+                        view_id: view.view_id,
+                        allocation_id: view.allocation_id,
+                        offset: view.offset,
+                        bytes: texels,
+                    });
                 }
-            } else {
-                None
-            };
-            let texels = match &planned.pass.present {
-                Some(present) => {
-                    let target = self.present_target(present, attachment)?;
-                    render::execute_present_render(
-                        &self.executor.context,
-                        &planned.stages,
-                        &planned.pass,
-                        &target,
-                        previous,
-                    )?
-                }
-                None => match trace.indirect.as_deref() {
-                    Some(payload) => {
-                        let texels = render::execute_indirect_render_pass(
-                            &self.executor.context,
-                            &planned.stages,
-                            &planned.pass,
-                            &payload.command,
-                            previous,
-                        )?;
-                        // Publish what was actually replayed: the command kind,
-                        // the range and the one command the first increment
-                        // encodes (`research/docs/25` §5.1).
-                        self.publish_icb_observation(
-                            payload.command.kind(),
-                            payload.range.start,
-                            payload.range.count,
-                            1,
-                        );
-                        texels
-                    }
-                    None => render::execute_render_pass(
-                        &self.executor.context,
-                        &planned.stages,
-                        &planned.pass,
-                        previous,
-                    )?,
-                },
-            };
-            if let Some(view) = view {
-                writebacks.push(BufferWriteback {
-                    view_id: view.view_id,
-                    allocation_id: view.allocation_id,
-                    offset: view.offset,
-                    bytes: texels,
+                continue;
+            }
+
+            // The offscreen shape: resolve one landing view and one
+            // previous-byte source per attachment, in location order, then hand
+            // the render rail the whole list and publish one writeback per
+            // attachment that has a landing.
+            let mut views = Vec::with_capacity(planned.pass.color_attachments.len());
+            let mut previous = Vec::with_capacity(planned.pass.color_attachments.len());
+            for attachment in &planned.pass.color_attachments {
+                let declared = pool.iter().find(|view| {
+                    view.view_id == attachment.view_id
+                        && view.allocation_id == attachment.allocation_id
                 });
+                let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
+                let view = if host_readback || loading {
+                    Some(declared.ok_or_else(|| {
+                        refusal(
+                            ProviderPhase::Resolve,
+                            ProviderErrorClass::Capability,
+                            "render_attachment_landing_unsupported",
+                        )
+                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(attachment.allocation_id.get()),
+                        )
+                        .with_detail(
+                            "attachment bytes land through the buffer writeback channel and \
+                             `LoadOp::Load` uploads the trace's own bytes, and this trace \
+                             declares no buffer view covering the attachment",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                let source = if loading {
+                    match view.map(|view| &view.source) {
+                        Some(BufferSource::OwnedBytes(bytes)) => Some(bytes.as_slice()),
+                        _ => {
+                            return Err(refusal(
+                                ProviderPhase::Resolve,
+                                ProviderErrorClass::Capability,
+                                "attachment_load_op_unsupported",
+                            )
+                            .with_field("load_op", FieldValue::Text("load".to_owned()))
+                            .with_detail(
+                                "the first `LoadOp::Load` increment uploads trace-owned bytes only",
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                previous.push(source);
+                views.push(view);
+            }
+            let texels = match trace.indirect.as_deref() {
+                Some(payload) => {
+                    let texels = render::execute_indirect_render_pass(
+                        &self.executor.context,
+                        &planned.stages,
+                        &planned.pass,
+                        &payload.command,
+                        &previous,
+                    )?;
+                    // Publish what was actually replayed: the command kind,
+                    // the range and the one command the first increment
+                    // encodes (`research/docs/25` §5.1).
+                    self.publish_icb_observation(
+                        payload.command.kind(),
+                        payload.range.start,
+                        payload.range.count,
+                        1,
+                    );
+                    texels
+                }
+                None => render::execute_render_pass(
+                    &self.executor.context,
+                    &planned.stages,
+                    &planned.pass,
+                    &previous,
+                )?,
+            };
+            for (view, bytes) in views.into_iter().zip(texels) {
+                if let Some(view) = view {
+                    writebacks.push(BufferWriteback {
+                        view_id: view.view_id,
+                        allocation_id: view.allocation_id,
+                        offset: view.offset,
+                        bytes,
+                    });
+                }
             }
         }
         Ok(writebacks)

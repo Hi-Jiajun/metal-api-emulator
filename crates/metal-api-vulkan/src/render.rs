@@ -1,15 +1,17 @@
 //! Offscreen render execution rail (`research/docs/23` §6 Step 3b).
 //!
-//! One colour attachment, one full-screen triangle, one `vkCmdDraw`, then
-//! `vkCmdCopyImageToBuffer` back into host-visible memory. The rail answers the
-//! one question this step owns — can the provider build a render pass, a
-//! framebuffer and a graphics pipeline out of two SPIR-V modules and read the
-//! attachment back byte-for-byte — and it fixes the two rules the driver probe
-//! left behind (`/var/tmp/render-probe`, `research/docs/23` §3.5, §9):
+//! One or two colour attachments, one full-screen triangle, one `vkCmdDraw`,
+//! then one `vkCmdCopyImageToBuffer` per attachment back into host-visible
+//! memory. The rail answers the question this step owns — can the provider
+//! build a render pass, a framebuffer and a graphics pipeline out of two
+//! SPIR-V modules and read every attachment back byte-for-byte — and it fixes
+//! the two rules the driver probe left behind (`/var/tmp/render-probe`,
+//! `research/docs/23` §3.5, §9):
 //!
 //! * the attachment is `VK_IMAGE_TILING_OPTIMAL` plus one
-//!   `vkCmdCopyImageToBuffer` (`copy_out = 1`), because the RTX 5060 native
-//!   driver and the dzn/D3D12 backend both refuse a linear colour attachment;
+//!   `vkCmdCopyImageToBuffer` per attachment (`copy_out` = attachment count),
+//!   because the RTX 5060 native driver and the dzn/D3D12 backend both refuse
+//!   a linear colour attachment;
 //! * admission asks for `VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT` on the exact
 //!   format **and** tiling before `vkCreateImage`, because ignoring the bit
 //!   lets `vkCreateImage` and `vkCreateGraphicsPipelines` both succeed and then
@@ -21,7 +23,8 @@
 //! rail to the trace path: [`execute_render_pass`] translates one admitted
 //! `RenderPassDescriptor` into a rail request, and the compute provider's
 //! submit path calls it for every render entry and publishes the readback
-//! through the existing buffer-writeback channel.
+//! through the existing buffer-writeback channel, one writeback per
+//! attachment.
 
 use ash::vk;
 use metal_api_core::provider::{
@@ -48,12 +51,13 @@ const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 
 // The reviewed stage modules of the milestone live in `render_spv/`: a
 // full-screen triangle vertex stage plus one solid fragment stage per admitted
-// colour-attachment format. The vertex stage stays a host registration's value,
-// while the fragment stage is *not*: it is a function of the attachment format
-// (`solid_fragment_spirv`), because a fragment stage built for one format does
-// not describe another one. Pairing the fixed `vec4` store with every format is
-// exactly the "admitted, then read back the wrong bytes" path the 2026-09-14
-// review filed as I2.
+// colour-attachment format, and one reviewed dual-output module for the
+// `[Rgba8Unorm, Rgba8Unorm]` MRT shape. The vertex stage stays a host
+// registration's value, while the fragment stage is *not*: it is a function of
+// the attachment format list (`solid_fragment_spirv`), because a fragment stage
+// built for one format does not describe another one. Pairing the fixed `vec4`
+// store with every format is exactly the "admitted, then read back the wrong
+// bytes" path the 2026-09-14 review filed as I2.
 
 /// Entry point every reviewed solid fragment module declares.
 ///
@@ -83,28 +87,49 @@ const SOLID_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8.fra
 /// half of I2 that is a genuine mismatch rather than a byte-order expectation.
 const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_r32f.frag.spv");
 
-/// The solid fragment module the offscreen rail builds for `format`.
+/// The reviewed solid fragment module for the two-output
+/// `[Rgba8Unorm, Rgba8Unorm]` shape.
+///
+/// The rail's only reviewed MRT fixture (`research/docs/23` v18 Step 3): the
+/// module writes `(64/255, 128/255, 192/255, 1)` to `Location 0` and
+/// `(1, 128/255, 64/255, 192/255)` to `Location 1`, so two 2×2
+/// `R8G8B8A8_UNORM` attachments read back `40 80 c0 ff` and `ff 80 40 c0`
+/// respectively. The constants reuse the single-output module's byte/255
+/// discipline, so neither output sits on a half-integer UNORM tie.
+const SOLID_UNORM8_DUAL_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_dual.frag.spv");
+
+/// The solid fragment module the offscreen rail builds for a format list.
 ///
 /// The match is exhaustive over [`AttachmentFormat`] and has no default arm: a
 /// contract format that gains no arm here is a compile error, which is what
 /// makes "admitted but executed with another format's fragment stage"
-/// unrepresentable instead of merely tested. `R32Uint` is refused with the slug
-/// the contract and the format rail already use for it, so an integer
-/// attachment cannot reach a colour store.
+/// unrepresentable instead of merely tested. A one-format list keeps the
+/// pre-MRT per-format module (byte zero drift); the two-output list is the
+/// reviewed dual module and every other dual combination is refused with
+/// `render_mrt_format_combination_unsupported` before any Vulkan object exists.
+/// `R32Uint` is refused with the slug the contract and the format rail already
+/// use for it, so an integer attachment cannot reach a colour store. An empty
+/// or over-two list is refused as an attachment-count capability fact, so the
+/// map is total over every list shape the frozen core contract can carry.
 pub(crate) fn solid_fragment_spirv(
-    format: AttachmentFormat,
+    formats: &[AttachmentFormat],
 ) -> Result<&'static [u8], ProviderError> {
-    Ok(match format {
-        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
-        AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
-        AttachmentFormat::R32Uint => {
-            return Err(attachment_format_refusal()
-                .with_field(
-                    "format_code",
-                    FieldValue::Unsigned(u64::from(format.code())),
-                )
-                .with_detail("this rail has no colour fragment stage for the format"));
-        }
+    Ok(match formats {
+        [format] => match format {
+            AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
+            AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
+            AttachmentFormat::R32Uint => {
+                return Err(attachment_format_refusal()
+                    .with_field(
+                        "format_code",
+                        FieldValue::Unsigned(u64::from(format.code())),
+                    )
+                    .with_detail("this rail has no colour fragment stage for the format"));
+            }
+        },
+        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => SOLID_UNORM8_DUAL_FRAG_SPV,
+        [first, second] => return Err(mrt_format_combination_refusal(*first, *second)),
+        _ => return Err(mrt_attachment_count_refusal(formats.len())),
     })
 }
 
@@ -118,18 +143,15 @@ pub(crate) fn solid_fragment_spirv(
 /// fragment half is chosen from the format by [`solid_fragment_spirv`], so a
 /// request cannot name a fragment stage the format was not compiled for.
 pub(crate) struct OffscreenRenderRequest<'a> {
-    /// Colour attachment format, in render-contract terms.
-    pub format: AttachmentFormat,
-    /// Attachment extent in texels. The milestone fixes 2×2 (`docs/23` §1.3) so
-    /// full coverage is distinguishable from a single stored texel.
+    /// Colour attachments, in location order: entry `i` is the target the
+    /// fragment stage's output `i` lands in. One or two entries; the rail
+    /// refuses every other count before any Vulkan object exists.
+    pub attachments: Vec<OffscreenColorAttachment<'a>>,
+    /// Attachment extent in texels, shared by every entry of
+    /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
+    /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
+    /// coverage is distinguishable from a single stored texel.
     pub extent: [u32; 2],
-    /// The `LoadOp::Clear` value. Carried as bytes for the same reason the
-    /// contract carries bytes: a float clear is not parity-stable
-    /// (`research/docs/23` §3.5). The bytes are in the attachment format's
-    /// *memory* order; [`clear_value_for`] maps them onto Vulkan's component
-    /// order, which is not the same thing (`Bgra8Unorm` needs a swap, and
-    /// `R32Float` is one component, not four).
-    pub clear: ClearColor,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
     /// The caller-held vertex streams the pass binds, in binding order
@@ -137,11 +159,6 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub vertex_streams: Vec<VertexStream<'a>>,
     /// How the draw issues when [`Self::indirect`] is `None`.
     pub draw: DrawShape,
-    /// The attachment's previous bytes for a `LoadOp::Load` pass
-    /// (`research/docs/23` §3.3). `Some` means the rail uploads them into the
-    /// image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
-    /// `Clear` shape every earlier increment used.
-    pub previous: Option<&'a [u8]>,
     /// The caller-held index buffer, when the draw is indexed.
     pub index_stream: Option<IndexStream<'a>>,
     /// When set, the full-screen triangle is replayed from one CPU-encoded
@@ -151,6 +168,30 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `DrawIndexed` carries its index and instance counts and replays through
     /// the rail's own `[0, 1, 2]` index buffer.
     pub indirect: Option<IndirectReplay>,
+}
+
+/// One colour attachment of an offscreen render request.
+///
+/// Each entry carries its own format, clear value and previous bytes, exactly
+/// like the pass's per-location attachment list: the format list selects the
+/// fragment module ([`solid_fragment_spirv`]), the clear is mapped onto the
+/// format's component order by [`clear_value_for`], and `previous` marks a
+/// `LoadOp::Load` entry whose bytes the rail uploads before the pass opens.
+pub(crate) struct OffscreenColorAttachment<'a> {
+    /// Colour attachment format, in render-contract terms.
+    pub format: AttachmentFormat,
+    /// The `LoadOp::Clear` value. Carried as bytes for the same reason the
+    /// contract carries bytes: a float clear is not parity-stable
+    /// (`research/docs/23` §3.5). The bytes are in the attachment format's
+    /// *memory* order; [`clear_value_for`] maps them onto Vulkan's component
+    /// order, which is not the same thing (`Bgra8Unorm` needs a swap, and
+    /// `R32Float` is one component, not four).
+    pub clear: ClearColor,
+    /// The attachment's previous bytes for a `LoadOp::Load` pass
+    /// (`research/docs/23` §3.3). `Some` means the rail uploads them into the
+    /// image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
+    /// `Clear` shape every earlier increment used.
+    pub previous: Option<&'a [u8]>,
 }
 
 /// One caller-held vertex stream: the layout the pipeline is built from plus
@@ -270,18 +311,18 @@ impl RenderStages {
                 );
             }
         }
-        // The fragment stage has to be the reviewed module for the format this
-        // contract declares. The rail cannot read a module's semantics, so
+        // The fragment stage has to be the reviewed module for the format list
+        // this contract declares. The rail cannot read a module's semantics, so
         // binding the registration to the reviewed set is what refuses "this
-        // format, that format's fragment stage" *before* a submission can read
-        // back bytes the format claim does not cover (review item I2,
+        // format list, that format list's fragment stage" *before* a submission
+        // can read back bytes the format claim does not cover (review item I2,
         // 2026-09-14): an `R32Float` pipeline handed the 8-bit module's `vec4`
-        // store is a component-shape mismatch, not a byte-order preference.
+        // store is a component-shape mismatch, not a byte-order preference, and
+        // a dual-attachment pipeline handed the single-output module would
+        // never store `Location 1`.
         if !fragment_stage_is_reviewed(self) {
             return Err(fragment_stage_mismatch_refusal(
-                // The pre-MRT codec carries exactly one format, and
-                // `contract.validate()` ran above, so the list is non-empty.
-                self.contract.color_formats[0],
+                &self.contract.color_formats,
                 &self.contract.fragment_entry,
             ));
         }
@@ -290,46 +331,54 @@ impl RenderStages {
 }
 
 /// Whether a registration's fragment stage is exactly the module this rail
-/// builds for the contract's colour format, under the entry that module
+/// builds for the contract's colour format list, under the entry that module
 /// declares.
 ///
 /// Both ends of the rail ask this question — registration refuses a pairing
 /// once, and execution re-asks it of the value it was handed, so a
 /// directly-constructed [`RenderStages`] cannot skip the registration gate.
 fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
-    // Exactly one compiled format: the pre-MRT increment's codec carries one
-    // format byte, and this rail executes one attachment, so a multi-format
-    // list is not a reviewed pairing.
-    let [format] = stages.contract.color_formats.as_slice() else {
-        return false;
-    };
     stages.contract.fragment_entry == SOLID_FRAGMENT_ENTRY
-        && solid_fragment_spirv(*format)
+        && solid_fragment_spirv(&stages.contract.color_formats)
             .is_ok_and(|module| module == stages.fragment_spirv.as_slice())
 }
 
 /// The refusal for a fragment stage that is not the reviewed module of the
-/// pipeline's colour format.
+/// pipeline's colour format list.
 ///
 /// A capability fact, like the other stage-module refusals: the rail has one
-/// reviewed fragment stage per admitted format and no second translation path,
-/// so it refuses the pairing instead of executing a module whose semantics it
-/// cannot check.
-fn fragment_stage_mismatch_refusal(format: AttachmentFormat, entry: &str) -> ProviderError {
-    capability_refusal("render_fragment_stage_mismatch")
-        .with_field(
-            "format_code",
-            FieldValue::Unsigned(u64::from(format.code())),
-        )
+/// reviewed fragment stage per admitted format list and no second translation
+/// path, so it refuses the pairing instead of executing a module whose
+/// semantics it cannot check.
+fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) -> ProviderError {
+    let mut refusal = capability_refusal("render_fragment_stage_mismatch")
+        .with_field("format_count", FieldValue::Unsigned(formats.len() as u64))
         .with_field("fragment_entry", FieldValue::Text(entry.to_owned()))
         .with_field(
             "reviewed_entry",
             FieldValue::Text(SOLID_FRAGMENT_ENTRY.to_owned()),
         )
         .with_detail(
-            "the fragment stage is not the module this rail builds for the colour format, so \
-             running it would land bytes the format claim does not cover",
-        )
+            "the fragment stage is not the module this rail builds for the colour format list, \
+             so running it would land bytes the format claim does not cover",
+        );
+    if let [format] = formats {
+        refusal = refusal.with_field(
+            "format_code",
+            FieldValue::Unsigned(u64::from(format.code())),
+        );
+    } else if let [first, second] = formats {
+        refusal = refusal
+            .with_field(
+                "format_code_0",
+                FieldValue::Unsigned(u64::from(first.code())),
+            )
+            .with_field(
+                "format_code_1",
+                FieldValue::Unsigned(u64::from(second.code())),
+            );
+    }
+    refusal
 }
 
 /// Execute one admitted render pass and return the attachment's tightly packed
@@ -341,17 +390,17 @@ fn fragment_stage_mismatch_refusal(format: AttachmentFormat, entry: &str) -> Pro
 /// ([`RenderPipelineContract::validate_against`]) and the two shapes the first
 /// increment cannot execute — a `Load` that would have to carry the
 /// attachment's previous bytes into the image, and a pass whose attachment
-/// list is not the single target the registered pipeline was built for. Both
-/// are refused as capability facts before any Vulkan object exists, never
+/// list or format combination is outside the reviewed set. All of them are
+/// refused as capability facts before any Vulkan object exists, never
 /// downgraded to a clear. The registered fragment stage is re-checked against
-/// the pipeline's declared format in the same place, for the same reason: the
-/// pass is about to be executed with it.
+/// the pipeline's declared format list in the same place, for the same reason:
+/// the pass is about to be executed with it.
 pub(crate) fn execute_render_pass(
     context: &VulkanContext,
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
-    previous: Option<&[u8]>,
-) -> Result<Vec<u8>, ProviderError> {
+    previous: &[Option<&[u8]>],
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     let request = prepare_render_request(stages, pass, previous)?;
     execute_offscreen_render(context, &request)
 }
@@ -367,60 +416,99 @@ pub(crate) fn execute_render_pass(
 fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
-    previous: Option<&'a [u8]>,
+    previous: &'a [Option<&'a [u8]>],
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
         .validate_against(pass)
         .map_err(|error| contract_refusal(&error.to_string()))?;
-    let [attachment] = pass.color_attachments.as_slice() else {
-        return Err(capability_refusal("render_attachment_count_unsupported")
-            .with_field(
-                "attachments",
-                FieldValue::Unsigned(pass.color_attachments.len() as u64),
-            )
-            .with_field("maximum", FieldValue::Unsigned(1))
-            .with_detail("this rail executes exactly one colour attachment"));
-    };
+    // The MRT increment executes one or two attachments; a three- or
+    // four-attachment pass is admitted by the frozen core contract but refused
+    // here, fail-closed, instead of silently rendering the first two locations.
+    // This replaces the pre-MRT "exactly one" gate rather than layering a
+    // second check on top of it.
+    if pass.color_attachments.len() > 2 {
+        return Err(mrt_attachment_count_refusal(pass.color_attachments.len()));
+    }
+    if previous.len() != pass.color_attachments.len() {
+        return Err(contract_refusal(
+            "the previous-byte list must carry one entry per colour attachment",
+        ));
+    }
     if !fragment_stage_is_reviewed(stages) {
         return Err(fragment_stage_mismatch_refusal(
-            stages.contract.color_formats[0],
+            &stages.contract.color_formats,
             &stages.contract.fragment_entry,
         ));
     }
-    let clear = match attachment.load {
-        LoadOp::Clear(clear) => clear,
-        LoadOp::Load => {
-            // The rail uploads the attachment's previous bytes before opening
-            // the render pass (`research/docs/23` §3.3). The caller resolves
-            // them from the trace's own declaration, so a `Load` that carries
-            // no bytes is refused rather than silently executed as a clear.
-            if previous.is_none() {
-                return Err(capability_refusal("attachment_load_op_unsupported")
-                    .with_field("load_op", FieldValue::Text("load".to_owned()))
-                    .with_detail(
-                        "a `LoadOp::Load` pass needs the attachment's previous bytes from \
-                         the trace's own view declaration; this pass resolved none",
-                    ));
+    let mut attachments = Vec::with_capacity(pass.color_attachments.len());
+    let mut extent: Option<[u32; 2]> = None;
+    for (index, (attachment, previous)) in pass.color_attachments.iter().zip(previous).enumerate() {
+        let clear = match attachment.load {
+            LoadOp::Clear(clear) => clear,
+            LoadOp::Load => {
+                // The rail uploads the attachment's previous bytes before
+                // opening the render pass (`research/docs/23` §3.3). The caller
+                // resolves them from the trace's own declaration, so a `Load`
+                // that carries no bytes is refused rather than silently
+                // executed as a clear.
+                if previous.is_none() {
+                    return Err(capability_refusal("attachment_load_op_unsupported")
+                        .with_field("attachment", FieldValue::Unsigned(index as u64))
+                        .with_field("load_op", FieldValue::Text("load".to_owned()))
+                        .with_detail(
+                            "a `LoadOp::Load` pass needs the attachment's previous bytes from \
+                             the trace's own view declaration; this pass resolved none",
+                        ));
+                }
+                ClearColor::new([0; 4])
             }
-            ClearColor::new([0; 4])
+            LoadOp::DontCare => {
+                return Err(capability_refusal("attachment_load_op_unsupported")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
+                    .with_detail("core admission refuses `LoadOp::DontCare` for this increment"));
+            }
+        };
+        match attachment.store {
+            StoreOp::Store => {}
+            StoreOp::DontCare => {
+                return Err(capability_refusal("attachment_store_op_unsupported")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("store_op", FieldValue::Text("dont_care".to_owned()))
+                    .with_detail("core admission refuses `StoreOp::DontCare` for this increment"));
+            }
         }
-        LoadOp::DontCare => {
-            return Err(capability_refusal("attachment_load_op_unsupported")
-                .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
-                .with_detail("core admission refuses `LoadOp::DontCare` for this increment"));
+        let width = narrow_dimension(attachment.width)?;
+        let height = narrow_dimension(attachment.height)?;
+        match extent {
+            None => extent = Some([width, height]),
+            Some([expected_width, expected_height])
+                if [width, height] != [expected_width, expected_height] =>
+            {
+                return Err(capability_refusal("render_attachment_extent_mismatch")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("width", FieldValue::Unsigned(u64::from(width)))
+                    .with_field("height", FieldValue::Unsigned(u64::from(height)))
+                    .with_field(
+                        "expected_width",
+                        FieldValue::Unsigned(u64::from(expected_width)),
+                    )
+                    .with_field(
+                        "expected_height",
+                        FieldValue::Unsigned(u64::from(expected_height)),
+                    )
+                    .with_detail("every colour attachment of one pass shares one extent"));
+            }
+            Some(_) => {}
         }
-    };
-    match attachment.store {
-        StoreOp::Store => {}
-        StoreOp::DontCare => {
-            return Err(capability_refusal("attachment_store_op_unsupported")
-                .with_field("store_op", FieldValue::Text("dont_care".to_owned()))
-                .with_detail("core admission refuses `StoreOp::DontCare` for this increment"));
-        }
+        attachments.push(OffscreenColorAttachment {
+            format: attachment.format,
+            clear,
+            previous: *previous,
+        });
     }
-    let width = narrow_dimension(attachment.width)?;
-    let height = narrow_dimension(attachment.height)?;
+    let extent = extent.expect("core admission refuses an empty attachment list");
     // Vertex input (`research/docs/23` §3.3): every bound stream declares its
     // own bytes, so the rail proves the footprint the draw reads and refuses
     // anything the reviewed shape does not cover.
@@ -507,16 +595,14 @@ fn prepare_render_request<'a>(
         }
     };
     let request = OffscreenRenderRequest {
-        format: attachment.format,
-        extent: [width, height],
-        clear,
+        attachments,
+        extent,
         vertex: OffscreenVertexStage {
             entry: &stages.contract.vertex_entry,
             spirv: &stages.vertex_spirv,
         },
         vertex_streams: streams,
         draw,
-        previous,
         index_stream,
         indirect: None,
     };
@@ -644,8 +730,8 @@ pub(crate) fn execute_indirect_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
-    previous: Option<&[u8]>,
-) -> Result<Vec<u8>, ProviderError> {
+    previous: &[Option<&[u8]>],
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
             vertex_count,
@@ -829,36 +915,81 @@ pub(crate) fn admit_color_attachment(
         .with_detail("vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT bit"))
 }
 
-/// Execute one offscreen render pass and return the attachment's tightly packed
-/// texel bytes (`width * height * 4`).
+/// Execute one offscreen render pass and return each attachment's tightly
+/// packed texel bytes (`width * height * 4`), in location order.
 ///
-/// Contract format admission, the fragment stage the format selects
+/// Contract format admission, the fragment stage the format list selects
 /// ([`solid_fragment_spirv`]), the device's `COLOR_ATTACHMENT` bit and the
 /// `TRANSFER_SRC` bit the readback needs all run before the first
 /// `vkCreateImage`, so an unsupported request is refused instead of being
-/// handed to the driver.
+/// handed to the driver. The attachment-count and format-combination gates are
+/// re-run here for a directly-constructed request, so the fail-closed shape
+/// does not depend on the caller having gone through `prepare_render_request`.
 pub(crate) fn execute_offscreen_render(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
-) -> Result<Vec<u8>, ProviderError> {
-    let format = attachment_vk_format(request.format)?;
-    // The fragment stage is the format's, not the caller's: `request` carries no
-    // fragment module, so this is the only place one is named and there is no
-    // pairing left to get wrong.
-    let fragment_spirv = solid_fragment_spirv(request.format)?;
+) -> Result<Vec<Vec<u8>>, ProviderError> {
+    // The attachment count is the rail's own gate, re-run on the request so a
+    // hand-built request cannot skip `prepare_render_request`'s admission.
+    if request.attachments.len() > 2 {
+        return Err(mrt_attachment_count_refusal(request.attachments.len()));
+    }
+    if request.attachments.is_empty() {
+        return Err(contract_refusal(
+            "render pass declares no colour attachment",
+        ));
+    }
+    let formats = request
+        .attachments
+        .iter()
+        .map(|attachment| attachment.format)
+        .collect::<Vec<_>>();
+    // The fragment stage is the format list's, not the caller's: `request`
+    // carries no fragment module, so this is the only place one is named and
+    // there is no pairing left to get wrong. The refusal covers the
+    // dual-combination and count shapes before any device call.
+    let fragment_spirv = solid_fragment_spirv(&formats)?;
     let tiling = vk::ImageTiling::OPTIMAL;
-    admit_color_attachment(context, format, tiling)?;
-    if !format_features(context, format, tiling).contains(vk::FormatFeatureFlags::TRANSFER_SRC) {
-        return Err(attachment_format_refusal()
-            .with_field("vk_format", FieldValue::Unsigned(format.as_raw() as u64))
-            .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
-            .with_field(
-                "missing_feature",
-                FieldValue::Text("transfer_src".to_owned()),
-            )
-            .with_detail(
-                "the milestone reads the attachment back through vkCmdCopyImageToBuffer",
-            ));
+    let vk_formats = formats
+        .iter()
+        .map(|format| attachment_vk_format(*format))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
+        admit_color_attachment(context, *vk_format, tiling)?;
+        if !format_features(context, *vk_format, tiling)
+            .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+        {
+            return Err(attachment_format_refusal()
+                .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("transfer_src".to_owned()),
+                )
+                .with_detail(
+                    "the milestone reads the attachment back through vkCmdCopyImageToBuffer",
+                ));
+        }
+        // A loading attachment declares its load operation before the image
+        // exists: the transfer-destination usage is only legal on the image
+        // when the rail is actually going to upload into it
+        // (`research/docs/23` §3.3).
+        if attachment.previous.is_some()
+            && !format_features(context, *vk_format, tiling)
+                .contains(vk::FormatFeatureFlags::TRANSFER_DST)
+        {
+            return Err(attachment_format_refusal()
+                .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("transfer_dst".to_owned()),
+                )
+                .with_detail(
+                    "a `LoadOp::Load` pass uploads the attachment's previous bytes with \
+                     vkCmdCopyBufferToImage",
+                ));
+        }
     }
 
     let [width, height] = request.extent;
@@ -880,33 +1011,10 @@ pub(crate) fn execute_offscreen_render(
     let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
     let mut objects = OffscreenObjects::new(context);
-    // A loading pass declares its load operation before the image exists: the
-    // transfer-destination usage is only legal on the image when the rail is
-    // actually going to upload into it (`research/docs/23` §3.3).
-    if request.previous.is_some() {
-        if !format_features(context, format, tiling).contains(vk::FormatFeatureFlags::TRANSFER_DST)
-        {
-            return Err(attachment_format_refusal()
-                .with_field("vk_format", FieldValue::Unsigned(format.as_raw() as u64))
-                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
-                .with_field(
-                    "missing_feature",
-                    FieldValue::Text("transfer_dst".to_owned()),
-                )
-                .with_detail(
-                    "a `LoadOp::Load` pass uploads the attachment's previous bytes with \
-                     vkCmdCopyBufferToImage",
-                ));
-        }
-        objects.load_op = vk::AttachmentLoadOp::LOAD;
-        // The upload leaves the image in the colour-attachment layout, which is
-        // the layout the render pass has to declare as its initial one: an
-        // `UNDEFINED` initial layout would tell the pass it may discard what the
-        // copy just wrote (`research/docs/23` §3.3).
-        objects.initial_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    for (attachment, vk_format) in request.attachments.iter().zip(&vk_formats) {
+        objects.create_attachment(*vk_format, width, height, attachment.previous.is_some())?;
     }
-    objects.create_attachment(format, width, height)?;
-    objects.create_render_pass(format)?;
+    objects.create_render_pass(&vk_formats)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -915,11 +1023,16 @@ pub(crate) fn execute_offscreen_render(
         &fragment_entry,
         &request.vertex_streams,
     )?;
-    let readback_mapping = objects.create_readback(byte_length)?;
+    let mut readback_mappings = Vec::with_capacity(request.attachments.len());
+    for _ in &request.attachments {
+        readback_mappings.push(objects.create_readback(byte_length)?);
+    }
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
-    if let Some(previous) = request.previous {
-        objects.create_previous_bytes(previous)?;
+    for (index, attachment) in request.attachments.iter().enumerate() {
+        if let Some(previous) = attachment.previous {
+            objects.create_previous_bytes(index, previous)?;
+        }
     }
     match request.indirect {
         Some(IndirectReplay::Draw {
@@ -937,15 +1050,22 @@ pub(crate) fn execute_offscreen_render(
         None => {}
     }
     objects.create_command_pool(queue_index)?;
-    objects.record(request.format, request.clear, width, height)?;
+    objects.record(&request.attachments, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
-    let texels = unsafe {
-        std::slice::from_raw_parts(readback_mapping as *const u8, byte_length as usize).to_vec()
-    };
-    context.record_buffer_readback();
-    context.record_buffer_readback_bytes(texels.len());
-    Ok(texels)
+    // One readback record per attachment: `copy_out` equals the attachment
+    // count, so a caller can observe that both locations really left the
+    // device.
+    let mut results = Vec::with_capacity(readback_mappings.len());
+    for mapping in readback_mappings {
+        let texels = unsafe {
+            std::slice::from_raw_parts(mapping as *const u8, byte_length as usize).to_vec()
+        };
+        context.record_buffer_readback();
+        context.record_buffer_readback_bytes(texels.len());
+        results.push(texels);
+    }
+    Ok(results)
 }
 
 /// One provider-owned presentable target image (`research/docs/24` §3.6).
@@ -1311,7 +1431,17 @@ pub(crate) fn execute_present_render(
     target: &PresentTargetImage,
     previous: Option<&[u8]>,
 ) -> Result<Vec<u8>, ProviderError> {
-    let request = prepare_render_request(stages, pass, previous)?;
+    // The present path stays single-attachment: it renders into one
+    // provider-owned target and hands that target on, so a pass whose
+    // attachment list is not exactly one entry is outside this increment's
+    // present shape.
+    let previous = [previous];
+    let request = prepare_render_request(stages, pass, &previous)?;
+    let [attachment] = request.attachments.as_slice() else {
+        return Err(contract_refusal(
+            "the present rail executes exactly one colour attachment",
+        ));
+    };
     let [width, height] = request.extent;
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
@@ -1323,8 +1453,8 @@ pub(crate) fn execute_present_render(
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
-    let fragment_spirv = solid_fragment_spirv(request.format)?;
-    let vk_format = attachment_vk_format(request.format)?;
+    let fragment_spirv = solid_fragment_spirv(&[attachment.format])?;
+    let vk_format = attachment_vk_format(attachment.format)?;
     let vertex_words = spirv_words(request.vertex.spirv)
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
     let fragment_words = spirv_words(fragment_spirv)
@@ -1343,7 +1473,7 @@ pub(crate) fn execute_present_render(
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout);
-    objects.create_render_pass(vk_format)?;
+    objects.create_render_pass(&[vk_format])?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -1356,7 +1486,7 @@ pub(crate) fn execute_present_render(
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
     objects.create_command_pool(queue_index)?;
-    objects.record(request.format, request.clear, width, height)?;
+    objects.record(std::slice::from_ref(attachment), width, height)?;
     objects.submit_and_wait(queue_index)?;
 
     let texels = unsafe {
@@ -1405,32 +1535,27 @@ fn select_graphics_queue(context: &VulkanContext) -> Result<usize, ProviderError
 /// one-shot rail (`research/docs/23` §6 Step 3b).
 struct OffscreenObjects<'a> {
     context: &'a VulkanContext,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    /// Whether this scope created `image`/`memory`/`view` and must destroy them
-    /// on Drop. A present pass borrows the provider-owned [`PresentTargetImage`]
-    /// instead, so its per-pass scope must not destroy the target when it
-    /// finishes (`docs/24` §5.2: the target survives the submission).
-    owns_attachment: bool,
+    /// One entry per colour attachment, in location order.
+    attachments: Vec<AttachmentObjects>,
+    /// Whether this scope created every `attachments` image/memory/view and
+    /// must destroy them on Drop. A present pass borrows the provider-owned
+    /// [`PresentTargetImage`] instead, so its per-pass scope must not destroy
+    /// the target when it finishes (`docs/24` §5.2: the target survives the
+    /// submission).
+    owns_attachments: bool,
     /// Whether this pass hands its attachment on as a present target. When set,
     /// the render pass ends in `COLOR_ATTACHMENT_OPTIMAL` and `record` inserts
     /// the explicit present layout transition before the copy-out
     /// (`docs/24` §3.3 rule 1).
     present: bool,
-    /// The layout `image` is in when the render pass begins. Offscreen
-    /// attachments start `UNDEFINED`; a present target may have been preset
-    /// with a sentinel (→ `COLOR_ATTACHMENT_OPTIMAL`) or already presented once
-    /// (→ `TRANSFER_SRC_OPTIMAL`).
-    initial_layout: vk::ImageLayout,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     pipeline_layout: vk::PipelineLayout,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
-    readback_buffer: vk::Buffer,
-    readback_memory: vk::DeviceMemory,
+    /// One readback per attachment, in location order.
+    readbacks: Vec<ReadbackObjects>,
     /// The host-visible `INDIRECT_BUFFER` an indirect draw replays from. Null
     /// for a direct draw.
     indirect_buffer: vk::Buffer,
@@ -1451,35 +1576,50 @@ struct OffscreenObjects<'a> {
     draw: DrawShape,
     /// Index width of the caller-held index buffer.
     input_index_type: vk::IndexType,
-    /// The host-visible staging buffer holding an attachment's previous bytes
-    /// for a `LoadOp::Load` pass, plus the load operation the render pass opens
-    /// with. Null/`CLEAR` for a clearing pass.
-    previous_buffer: vk::Buffer,
-    previous_memory: vk::DeviceMemory,
-    load_op: vk::AttachmentLoadOp,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+}
+
+/// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
+///
+/// `load_op` and `initial_layout` travel with the attachment because both feed
+/// the render pass's per-attachment description: a loading attachment opens
+/// with `LOAD_OP_LOAD` from `COLOR_ATTACHMENT_OPTIMAL` (the layout the upload
+/// leaves it in), a clearing one with `LOAD_OP_CLEAR` from `UNDEFINED`.
+struct AttachmentObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    load_op: vk::AttachmentLoadOp,
+    initial_layout: vk::ImageLayout,
+    /// The host-visible staging buffer holding this attachment's previous bytes
+    /// for a `LoadOp::Load` pass. Null for a clearing attachment.
+    previous_buffer: vk::Buffer,
+    previous_memory: vk::DeviceMemory,
+}
+
+/// One readback destination: the `TRANSFER_DST` buffer, its host-visible
+/// memory and the mapping the copy-out lands in.
+struct ReadbackObjects {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
 }
 
 impl<'a> OffscreenObjects<'a> {
     fn new(context: &'a VulkanContext) -> Self {
         Self {
             context,
-            image: vk::Image::null(),
-            memory: vk::DeviceMemory::null(),
-            view: vk::ImageView::null(),
-            owns_attachment: true,
+            attachments: Vec::new(),
+            owns_attachments: true,
             present: false,
-            initial_layout: vk::ImageLayout::UNDEFINED,
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             vertex_module: vk::ShaderModule::null(),
             fragment_module: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
-            readback_buffer: vk::Buffer::null(),
-            readback_memory: vk::DeviceMemory::null(),
+            readbacks: Vec::new(),
             indirect_buffer: vk::Buffer::null(),
             indirect_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
@@ -1489,9 +1629,6 @@ impl<'a> OffscreenObjects<'a> {
             input_index_memory: vk::DeviceMemory::null(),
             draw: DrawShape::Milestone,
             input_index_type: vk::IndexType::UINT16,
-            previous_buffer: vk::Buffer::null(),
-            previous_memory: vk::DeviceMemory::null(),
-            load_op: vk::AttachmentLoadOp::CLEAR,
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -1511,11 +1648,17 @@ impl<'a> OffscreenObjects<'a> {
         target: &PresentTargetImage,
         initial_layout: vk::ImageLayout,
     ) {
-        self.image = target.image();
-        self.view = target.view();
-        self.owns_attachment = false;
+        self.attachments.push(AttachmentObjects {
+            image: target.image(),
+            memory: vk::DeviceMemory::null(),
+            view: target.view(),
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            initial_layout,
+            previous_buffer: vk::Buffer::null(),
+            previous_memory: vk::DeviceMemory::null(),
+        });
+        self.owns_attachments = false;
         self.present = true;
-        self.initial_layout = initial_layout;
     }
 
     /// The 2D single-sample optimal-tiling colour attachment.
@@ -1528,6 +1671,7 @@ impl<'a> OffscreenObjects<'a> {
         format: vk::Format,
         width: u32,
         height: u32,
+        loading: bool,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1544,11 +1688,11 @@ impl<'a> OffscreenObjects<'a> {
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::TRANSFER_SRC
-                    // A loading pass receives its previous bytes through
+                    // A loading attachment receives its previous bytes through
                     // `vkCmdCopyBufferToImage`, so the image needs the transfer
                     // destination usage exactly when one is uploaded
                     // (`research/docs/23` §3.3).
-                    | if self.load_op == vk::AttachmentLoadOp::LOAD {
+                    | if loading {
                         vk::ImageUsageFlags::TRANSFER_DST
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -1563,39 +1707,74 @@ impl<'a> OffscreenObjects<'a> {
             "attachment",
         )
         .map_err(|error| execution_refusal("create attachment image", &error.detail))?;
-        self.image = image;
-        self.memory = memory;
-        self.view = crate::create_color_image_view(self.context, image, format, "attachment")
+        let view = crate::create_color_image_view(self.context, image, format, "attachment")
             .map_err(|error| execution_refusal("create attachment view", &error.detail))?;
+        self.attachments.push(AttachmentObjects {
+            image,
+            memory,
+            view,
+            // The upload leaves the image in the colour-attachment layout,
+            // which is the layout the render pass has to declare as its
+            // initial one: an `UNDEFINED` initial layout would tell the pass
+            // it may discard what the copy just wrote (`research/docs/23`
+            // §3.3).
+            load_op: if loading {
+                vk::AttachmentLoadOp::LOAD
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            },
+            initial_layout: if loading {
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            },
+            previous_buffer: vk::Buffer::null(),
+            previous_memory: vk::DeviceMemory::null(),
+        });
         Ok(())
     }
 
-    /// The single-colour-attachment render pass with the probe's dependency
-    /// pair: `EXTERNAL → 0` makes the clear/write visible to colour output, and
-    /// `0 → EXTERNAL` makes the stored texels visible to the copy that reads
-    /// them. An offscreen pass ends directly in
+    /// The render pass over every attachment this scope holds, with the
+    /// probe's dependency pair: `EXTERNAL → 0` makes the clear/write visible to
+    /// colour output, and `0 → EXTERNAL` makes the stored texels visible to the
+    /// copy that reads them. An offscreen pass ends directly in
     /// `finalLayout = TRANSFER_SRC_OPTIMAL` so the copy runs without a further
     /// transition (`research/docs/23` §7.1); a present pass ends in
     /// `COLOR_ATTACHMENT_OPTIMAL` instead, and `record` inserts the explicit
     /// present layout transition before the copy (`docs/24` §3.3).
-    fn create_render_pass(&mut self, format: vk::Format) -> Result<(), ProviderError> {
+    ///
+    /// Each entry of `formats` is the `VkFormat` of the attachment at the same
+    /// location; the per-attachment load operation and initial layout come
+    /// from the scope's own attachment records.
+    fn create_render_pass(&mut self, formats: &[vk::Format]) -> Result<(), ProviderError> {
         let final_layout = if self.present {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
         } else {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         };
-        let attachments = [vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(self.load_op)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(self.initial_layout)
-            .final_layout(final_layout)];
-        let color_refs = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let attachments = self
+            .attachments
+            .iter()
+            .zip(formats)
+            .map(|(attachment, format)| {
+                vk::AttachmentDescription::default()
+                    .format(*format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(attachment.load_op)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(attachment.initial_layout)
+                    .final_layout(final_layout)
+            })
+            .collect::<Vec<_>>();
+        let color_refs = (0..self.attachments.len())
+            .map(|index| {
+                vk::AttachmentReference::default()
+                    .attachment(index as u32)
+                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            })
+            .collect::<Vec<_>>();
         let subpasses = [vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs)];
@@ -1636,7 +1815,11 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     fn create_framebuffer(&mut self, width: u32, height: u32) -> Result<(), ProviderError> {
-        let views = [self.view];
+        let views = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.view)
+            .collect::<Vec<_>>();
         let info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(&views)
@@ -1733,9 +1916,19 @@ impl<'a> OffscreenObjects<'a> {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        // One no-blend, all-writes state per colour attachment: the blend
+        // state is indexed by location exactly like the subpass's attachment
+        // references, so a dual-attachment pipeline declares two states and
+        // lets both fragment outputs land.
+        let blend_attachments = self
+            .attachments
+            .iter()
+            .map(|_| {
+                vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(false)
+                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+            })
+            .collect::<Vec<_>>();
         let blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -1830,16 +2023,16 @@ impl<'a> OffscreenObjects<'a> {
     /// Upload an attachment's previous bytes into a host-visible staging buffer
     /// for the `vkCmdCopyBufferToImage` a `LoadOp::Load` pass issues
     /// (`research/docs/23` §3.3).
-    fn create_previous_bytes(&mut self, bytes: &[u8]) -> Result<(), ProviderError> {
+    fn create_previous_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), ProviderError> {
         let (buffer, memory) = self.create_host_visible_buffer(
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             vk::BufferUsageFlags::TRANSFER_SRC,
             bytes,
             "attachment previous bytes",
         )?;
-        self.previous_buffer = buffer;
-        self.previous_memory = memory;
-        self.load_op = vk::AttachmentLoadOp::LOAD;
+        self.attachments[index].previous_buffer = buffer;
+        self.attachments[index].previous_memory = memory;
+        self.attachments[index].load_op = vk::AttachmentLoadOp::LOAD;
         Ok(())
     }
 
@@ -1907,8 +2100,7 @@ impl<'a> OffscreenObjects<'a> {
                 return Err(execution_refusal("map readback memory", &error.to_string()));
             }
         };
-        self.readback_buffer = buffer;
-        self.readback_memory = memory;
+        self.readbacks.push(ReadbackObjects { buffer, memory });
         Ok(mapping)
     }
 
@@ -2166,15 +2358,17 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
-    /// Record clear → draw → copy-out on the one command buffer.
+    /// Record clear → draw → copy-out on the one command buffer, once per
+    /// attachment.
     ///
     /// The clear value is a function of the attachment format: the contract's
     /// bytes are in the format's memory order, while `VkClearColorValue`
-    /// components follow the format's *component* order.
+    /// components follow the format's *component* order. Each entry of
+    /// `attachments` is the pass's request record at the same location as the
+    /// scope's own attachment objects.
     fn record(
         &mut self,
-        format: AttachmentFormat,
-        clear: ClearColor,
+        attachments: &[OffscreenColorAttachment<'_>],
         width: u32,
         height: u32,
     ) -> Result<(), ProviderError> {
@@ -2187,9 +2381,12 @@ impl<'a> OffscreenObjects<'a> {
         }
         .map_err(|error| execution_refusal("begin command buffer", &error.to_string()))?;
 
-        let clear_value = vk::ClearValue {
-            color: clear_value_for(format, clear),
-        };
+        let clear_values = attachments
+            .iter()
+            .map(|attachment| vk::ClearValue {
+                color: clear_value_for(attachment.format, attachment.clear),
+            })
+            .collect::<Vec<_>>();
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
@@ -2198,7 +2395,7 @@ impl<'a> OffscreenObjects<'a> {
             .render_pass(self.render_pass)
             .framebuffer(self.framebuffer)
             .render_area(render_area)
-            .clear_values(std::slice::from_ref(&clear_value));
+            .clear_values(&clear_values);
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -2211,14 +2408,17 @@ impl<'a> OffscreenObjects<'a> {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
-        // A loading pass fills the image before the render pass opens: the
-        // previous bytes travel through a host-visible staging buffer, land in
-        // the image with `vkCmdCopyBufferToImage`, and the image is then
+        // A loading attachment fills its image before the render pass opens:
+        // the previous bytes travel through a host-visible staging buffer, land
+        // in the image with `vkCmdCopyBufferToImage`, and the image is then
         // transitioned to the colour-attachment layout the render pass declares
         // as its initial layout (`research/docs/23` §3.3). Both barriers run in
         // the same command buffer, so the copy cannot be observed after the
-        // draw.
-        if self.previous_buffer != vk::Buffer::null() {
+        // draw. One round trip per attachment, in location order.
+        for attachment in &self.attachments {
+            if attachment.previous_buffer == vk::Buffer::null() {
+                continue;
+            }
             unsafe {
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
@@ -2232,7 +2432,7 @@ impl<'a> OffscreenObjects<'a> {
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(self.image)
+                        .image(attachment.image)
                         .subresource_range(color_subresource())
                         .src_access_mask(vk::AccessFlags::empty())
                         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
@@ -2255,8 +2455,8 @@ impl<'a> OffscreenObjects<'a> {
                     });
                 self.context.device.cmd_copy_buffer_to_image(
                     self.command,
-                    self.previous_buffer,
-                    self.image,
+                    attachment.previous_buffer,
+                    attachment.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     std::slice::from_ref(&copy),
                 );
@@ -2272,7 +2472,7 @@ impl<'a> OffscreenObjects<'a> {
                         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(self.image)
+                        .image(attachment.image)
                         .subresource_range(color_subresource())
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ)],
@@ -2380,7 +2580,7 @@ impl<'a> OffscreenObjects<'a> {
             // (`docs/24` §3.3 rule 1). The equivalent terminal state is
             // `TRANSFER_SRC_OPTIMAL`, i.e. "readable by the host after `wait`"
             // (`docs/24` §3.6), not a real `VkQueuePresentKHR`.
-            let barrier = present_transition_barrier(self.image);
+            let barrier = present_transition_barrier(self.attachments[0].image);
             unsafe {
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
@@ -2394,30 +2594,35 @@ impl<'a> OffscreenObjects<'a> {
             }
         }
 
-        let copy = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-        unsafe {
-            self.context.device.cmd_copy_image_to_buffer(
-                self.command,
-                self.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.readback_buffer,
-                std::slice::from_ref(&copy),
-            );
+        // One copy per attachment into its own readback buffer, in location
+        // order, so the host side receives the bytes of every location and can
+        // tell them apart.
+        for (attachment, readback) in self.attachments.iter().zip(&self.readbacks) {
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            unsafe {
+                self.context.device.cmd_copy_image_to_buffer(
+                    self.command,
+                    attachment.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    readback.buffer,
+                    std::slice::from_ref(&copy),
+                );
+            }
         }
         unsafe { self.context.device.end_command_buffer(self.command) }
             .map_err(|error| execution_refusal("end command buffer", &error.to_string()))?;
@@ -2505,27 +2710,31 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .destroy_render_pass(self.render_pass, None);
             }
-            if self.owns_attachment {
-                if self.view != vk::ImageView::null() {
-                    self.context.device.destroy_image_view(self.view, None);
-                }
-                if self.image != vk::Image::null() {
-                    self.context.device.destroy_image(self.image, None);
-                }
-                if self.memory != vk::DeviceMemory::null() {
-                    self.context.device.free_memory(self.memory, None);
+            if self.owns_attachments {
+                for attachment in &self.attachments {
+                    if attachment.view != vk::ImageView::null() {
+                        self.context
+                            .device
+                            .destroy_image_view(attachment.view, None);
+                    }
+                    if attachment.image != vk::Image::null() {
+                        self.context.device.destroy_image(attachment.image, None);
+                    }
+                    if attachment.memory != vk::DeviceMemory::null() {
+                        self.context.device.free_memory(attachment.memory, None);
+                    }
                 }
             }
-            if self.readback_memory != vk::DeviceMemory::null() {
-                self.context.device.unmap_memory(self.readback_memory);
-            }
-            if self.readback_buffer != vk::Buffer::null() {
-                self.context
-                    .device
-                    .destroy_buffer(self.readback_buffer, None);
-            }
-            if self.readback_memory != vk::DeviceMemory::null() {
-                self.context.device.free_memory(self.readback_memory, None);
+            for readback in &self.readbacks {
+                if readback.memory != vk::DeviceMemory::null() {
+                    self.context.device.unmap_memory(readback.memory);
+                }
+                if readback.buffer != vk::Buffer::null() {
+                    self.context.device.destroy_buffer(readback.buffer, None);
+                }
+                if readback.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(readback.memory, None);
+                }
             }
             // The indirect buffer is unbound by construction (its memory is
             // freed right after), so destroy before free.
@@ -2565,13 +2774,19 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .device
                     .free_memory(self.input_index_memory, None);
             }
-            if self.previous_buffer != vk::Buffer::null() {
-                self.context
-                    .device
-                    .destroy_buffer(self.previous_buffer, None);
-            }
-            if self.previous_memory != vk::DeviceMemory::null() {
-                self.context.device.free_memory(self.previous_memory, None);
+            // The staging buffer is unbound by construction (its memory is
+            // freed right after), so destroy before free.
+            for attachment in &self.attachments {
+                if attachment.previous_buffer != vk::Buffer::null() {
+                    self.context
+                        .device
+                        .destroy_buffer(attachment.previous_buffer, None);
+                }
+                if attachment.previous_memory != vk::DeviceMemory::null() {
+                    self.context
+                        .device
+                        .free_memory(attachment.previous_memory, None);
+                }
             }
         }
     }
@@ -2610,6 +2825,47 @@ fn tiling_name(tiling: vk::ImageTiling) -> &'static str {
 /// colour-attachment format the device cannot take.
 fn attachment_format_refusal() -> ProviderError {
     capability_refusal("attachment_format_unsupported")
+}
+
+/// The refusal for a pass whose attachment count the MRT rail cannot execute.
+///
+/// The capability bit reports two, so a three- or four-attachment pass is
+/// refused here with the rail's own limit instead of silently rendering the
+/// first two locations. The empty-list arm is the fail-closed half of the same
+/// gate for a directly-constructed request that skipped core admission.
+fn mrt_attachment_count_refusal(attachments: usize) -> ProviderError {
+    capability_refusal("render_mrt_attachment_count_unsupported")
+        .with_field("attachments", FieldValue::Unsigned(attachments as u64))
+        .with_field("maximum", FieldValue::Unsigned(2))
+        .with_detail(
+            "the MRT rail executes one or two colour attachments; a larger pass would silently \
+             drop its later locations",
+        )
+}
+
+/// The refusal for a dual-attachment format combination outside the reviewed
+/// `[Rgba8Unorm, Rgba8Unorm]` shape.
+///
+/// The dual-output fragment module writes exactly the reviewed pair, so any
+/// other two-format list is refused before any Vulkan object exists instead of
+/// running a module whose output locations the format list does not describe.
+fn mrt_format_combination_refusal(
+    first: AttachmentFormat,
+    second: AttachmentFormat,
+) -> ProviderError {
+    capability_refusal("render_mrt_format_combination_unsupported")
+        .with_field(
+            "format_code_0",
+            FieldValue::Unsigned(u64::from(first.code())),
+        )
+        .with_field(
+            "format_code_1",
+            FieldValue::Unsigned(u64::from(second.code())),
+        )
+        .with_detail(
+            "the reviewed dual-output module serves [Rgba8Unorm, Rgba8Unorm] only; this \
+             format pair has no colour fragment stage",
+        )
 }
 
 fn capability_refusal(slug: &'static str) -> ProviderError {
@@ -2739,6 +2995,13 @@ mod tests {
     /// component, `64/255`, as one `float`.
     const SOLID_R32F_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_r32f.frag.spv");
 
+    /// Fragment stage of the reviewed `[Rgba8Unorm, Rgba8Unorm]` dual shape:
+    /// `Location 0` stores `(64/255, 128/255, 192/255, 1)` and `Location 1`
+    /// stores `(1, 128/255, 64/255, 192/255)`, both under the byte/255
+    /// discipline of the single-output module.
+    const SOLID_UNORM8_DUAL_FRAG_SPV: &[u8] =
+        include_bytes!("render_spv/solid_unorm8_dual.frag.spv");
+
     /// The readback a 2×2 `R8G8B8A8_UNORM` attachment must hold when the
     /// fragment shader stores `64/255, 128/255, 192/255, 1`.
     const EXPECTED_RGBA8_TEXELS: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
@@ -2794,9 +3057,28 @@ mod tests {
                 vertex_layout: VertexLayout::None,
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
-            fragment_spirv: solid_fragment_spirv(format)
+            fragment_spirv: solid_fragment_spirv(&[format])
                 .expect("every admitted format has a reviewed stage")
                 .to_vec(),
+        }
+    }
+
+    /// One registration for the reviewed dual `[Rgba8Unorm, Rgba8Unorm]` shape.
+    fn reviewed_dual_stages() -> RenderStages {
+        RenderStages {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: solid_fragment_spirv(&[
+                AttachmentFormat::Rgba8Unorm,
+                AttachmentFormat::Rgba8Unorm,
+            ])
+            .expect("the reviewed dual format list has a stage")
+            .to_vec(),
         }
     }
 
@@ -2932,21 +3214,24 @@ mod tests {
     /// readback, printing the raw bytes so the run's log carries the evidence the
     /// assertions below are about.
     fn offscreen_readback(context: &VulkanContext, format: AttachmentFormat) -> Vec<u8> {
-        let texels = execute_offscreen_render(
+        let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
-                format,
+                attachments: vec![OffscreenColorAttachment {
+                    format,
+                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    previous: None,
+                }],
                 extent: [2, 2],
-                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
-                previous: None,
                 index_stream: None,
                 indirect: None,
             },
         )
         .unwrap_or_else(|error| panic!("the 2x2 {format:?} render pass executes: {error:?}"));
+        let texels = blobs.remove(0);
         eprintln!(
             "{format:?} readback: {} (first texel: {})",
             hex(&texels),
@@ -3000,16 +3285,17 @@ mod tests {
         assert_eq!(r32f[1..], [0.0, 0.0, 0.0]);
     }
 
-    /// The rail's structural guarantee, stated without a device: `format` selects
-    /// the fragment stage, the map is total over the admitted formats, and the one
-    /// format outside the increment has no stage at all.
+    /// The rail's structural guarantee, stated without a device: the format list
+    /// selects the fragment stage, the map is total over the admitted single
+    /// formats and the reviewed dual shape, and the one format outside the
+    /// increment has no stage at all.
     #[test]
     fn every_admitted_format_selects_a_reviewed_fragment_stage() {
         // `solid_fragment_spirv` matches every `AttachmentFormat` variant with no
         // default arm, so "the map covers the contract" is a compile-time fact;
         // what is checked here is the content of each arm.
         for format in AttachmentFormat::ADMITTED {
-            let module = solid_fragment_spirv(format).expect("an admitted format has a stage");
+            let module = solid_fragment_spirv(&[format]).expect("an admitted format has a stage");
             assert!(
                 spirv_words(module).is_some(),
                 "{format:?} must name a whole number of SPIR-V words: {} bytes",
@@ -3017,26 +3303,37 @@ mod tests {
             );
         }
         assert_eq!(
-            solid_fragment_spirv(AttachmentFormat::Rgba8Unorm).expect("admitted"),
+            solid_fragment_spirv(&[AttachmentFormat::Rgba8Unorm]).expect("admitted"),
             SOLID_UNORM8_FRAG_SPV
         );
         // The B,G,R,A layout shares the 8-bit module on purpose: the channel order
         // lives in the image format, so the bytes differ while the stage does not.
         assert_eq!(
-            solid_fragment_spirv(AttachmentFormat::Bgra8Unorm).expect("admitted"),
+            solid_fragment_spirv(&[AttachmentFormat::Bgra8Unorm]).expect("admitted"),
             SOLID_UNORM8_FRAG_SPV
         );
         assert_eq!(
-            solid_fragment_spirv(AttachmentFormat::R32Float).expect("admitted"),
+            solid_fragment_spirv(&[AttachmentFormat::R32Float]).expect("admitted"),
             SOLID_R32F_FRAG_SPV
         );
         // ... and the float stage is a different module: a one-component
         // attachment cannot take the 8-bit module's `vec4` store.
         assert_ne!(SOLID_UNORM8_FRAG_SPV, SOLID_R32F_FRAG_SPV);
+        // The reviewed dual shape selects the dual-output module; every other
+        // two-format list is refused with the MRT combination slug.
+        assert_eq!(
+            solid_fragment_spirv(&[AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm,])
+                .expect("the reviewed dual list has a stage"),
+            SOLID_UNORM8_DUAL_FRAG_SPV
+        );
+        let refused =
+            solid_fragment_spirv(&[AttachmentFormat::Rgba8Unorm, AttachmentFormat::R32Float])
+                .expect_err("an unreviewed dual format list has no stage");
+        assert_eq!(refused.slug, "render_mrt_format_combination_unsupported");
         // `R32Uint` is the contract format outside the increment, refused with the
         // slug the contract and the format rail already use for it.
         let refused =
-            solid_fragment_spirv(AttachmentFormat::R32Uint).expect_err("R32Uint has no stage");
+            solid_fragment_spirv(&[AttachmentFormat::R32Uint]).expect_err("R32Uint has no stage");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_format_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
@@ -3092,6 +3389,35 @@ mod tests {
             .validate()
             .expect_err("the reviewed module declares fragment_main");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+
+        // The reviewed dual shape is accepted under the dual-output module...
+        reviewed_dual_stages()
+            .validate()
+            .expect("the dual format list is a reviewed pairing");
+
+        // ... but registering the dual shape under the single-output module is
+        // refused: that stage never stores `Location 1`, so the second
+        // attachment would read back bytes the format claim does not cover.
+        let mut stages = reviewed_dual_stages();
+        stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
+        let refused = stages
+            .validate()
+            .expect_err("a single-output module cannot describe a dual-attachment pipeline");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_fragment_stage_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("format_code_0"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::Rgba8Unorm.code()
+            )))
+        );
+        assert_eq!(
+            refused.fields.get("format_code_1"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::Rgba8Unorm.code()
+            )))
+        );
     }
 
     #[test]
@@ -3171,13 +3497,15 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
-            format: AttachmentFormat::R32Uint,
+            attachments: vec![OffscreenColorAttachment {
+                format: AttachmentFormat::R32Uint,
+                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                previous: None,
+            }],
             extent: [2, 2],
-            clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
-            previous: None,
             index_stream: None,
             indirect: None,
         };
@@ -3224,21 +3552,24 @@ mod tests {
                 EXPECTED_R32F_TEXEL,
             ),
         ] {
-            let texels = execute_offscreen_render(
+            let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
-                    format,
+                    attachments: vec![OffscreenColorAttachment {
+                        format,
+                        clear,
+                        previous: None,
+                    }],
                     extent: [2, 2],
-                    clear,
                     vertex: single_pixel_vertex(),
                     vertex_streams: Vec::new(),
                     draw: DrawShape::Milestone,
-                    previous: None,
                     index_stream: None,
                     indirect: None,
                 },
             )
             .unwrap_or_else(|error| panic!("the partial {format:?} pass executes: {error:?}"));
+            let texels = blobs.remove(0);
             eprintln!(
                 "{format:?} partial readback: {} (clear {clear_texel:02x?}, stored {stored_texel:02x?})",
                 hex(&texels)
@@ -3359,13 +3690,15 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
-            format: AttachmentFormat::Rgba8Unorm,
+            attachments: vec![OffscreenColorAttachment {
+                format: AttachmentFormat::Rgba8Unorm,
+                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                previous: None,
+            }],
             extent: [2, 0],
-            clear: ClearColor::new([CLEAR_SENTINEL; 4]),
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
-            previous: None,
             index_stream: None,
             indirect: None,
         };
@@ -3424,38 +3757,183 @@ mod tests {
         );
     }
 
-    /// The MRT contract admits a dual-format pipeline over a dual-attachment
-    /// pass, but this rail executes one attachment, so the pass is refused
-    /// before any Vulkan object exists rather than silently rendering only
-    /// location 0. Host-side: `prepare_render_request` reads no device.
+    /// The MRT contract admits up to four attachments, but this rail executes
+    /// two, so a three-attachment pass is refused before any Vulkan object
+    /// exists rather than silently rendering only the first two locations.
+    /// Host-side: `prepare_render_request` reads no device.
     #[test]
-    fn prepare_render_request_refuses_a_pass_with_more_than_one_attachment() {
-        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
-        stages.contract.color_formats =
-            vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm];
+    fn prepare_render_request_refuses_a_pass_with_more_than_two_attachments() {
+        let mut stages = reviewed_dual_stages();
+        stages.contract.color_formats = vec![
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+        ];
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.color_attachments.push(pass.color_attachments[0]);
+        pass.color_attachments.push(pass.color_attachments[0]);
         pass.validate()
-            .expect("the dual-attachment pass is a legal core shape");
+            .expect("the three-attachment pass is a legal core shape");
         stages
             .contract
             .validate_against(&pass)
             .expect("the pipeline compiles one format per location");
 
-        let refused = match prepare_render_request(&stages, &pass, None) {
+        let refused = match prepare_render_request(&stages, &pass, &[None, None, None]) {
             Err(error) => error,
-            Ok(_) => panic!("the rail must refuse a dual-attachment pass"),
+            Ok(_) => panic!("the rail must refuse a three-attachment pass"),
         };
         eprintln!("refused: {refused:?}");
-        assert_eq!(refused.slug, "render_attachment_count_unsupported");
+        assert_eq!(refused.slug, "render_mrt_attachment_count_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(
             refused.fields.get("attachments"),
-            Some(&FieldValue::Unsigned(2))
+            Some(&FieldValue::Unsigned(3))
         );
         assert_eq!(
             refused.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(2))
+        );
+    }
+
+    /// The reviewed dual shape end to end on one draw: both 2×2
+    /// `Rgba8Unorm` attachments read back their own location's bytes, and the
+    /// copy-out counter advances by two (`copy_out == 2`).
+    #[test]
+    fn dual_attachments_read_back_both_locations() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let (uploads_before, readbacks_before) = context.buffer_copy_counts();
+        let blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                attachments: vec![
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: None,
+                    },
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: None,
+                    },
+                ],
+                extent: [2, 2],
+                vertex: milestone_vertex(),
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .expect("the reviewed dual pass executes");
+        let (uploads_after, readbacks_after) = context.buffer_copy_counts();
+
+        assert_eq!(blobs.len(), 2, "one readback per attachment");
+        eprintln!("location 0: {}", hex(&blobs[0]));
+        eprintln!("location 1: {}", hex(&blobs[1]));
+        assert_eq!(blobs[0], EXPECTED_RGBA8_TEXELS.repeat(4));
+        assert_eq!(blobs[1], [0xff, 0x80, 0x40, 0xc0].repeat(4));
+        assert_eq!(
+            uploads_after, uploads_before,
+            "no staging upload for a clear"
+        );
+        assert_eq!(
+            readbacks_after,
+            readbacks_before + 2,
+            "copy_out is one per attachment"
+        );
+    }
+
+    /// A dual-format list outside the reviewed `[Rgba8Unorm, Rgba8Unorm]` shape
+    /// has no fragment stage and is refused before any Vulkan object exists.
+    #[test]
+    fn an_unreviewed_dual_format_combination_is_refused_before_the_device() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let request = OffscreenRenderRequest {
+            attachments: vec![
+                OffscreenColorAttachment {
+                    format: AttachmentFormat::Rgba8Unorm,
+                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    previous: None,
+                },
+                OffscreenColorAttachment {
+                    format: AttachmentFormat::R32Float,
+                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    previous: None,
+                },
+            ],
+            extent: [2, 2],
+            vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            index_stream: None,
+            indirect: None,
+        };
+        let refused = execute_offscreen_render(&context, &request)
+            .expect_err("an unreviewed format combination is refused");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_mrt_format_combination_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("format_code_0"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::Rgba8Unorm.code()
+            )))
+        );
+        assert_eq!(
+            refused.fields.get("format_code_1"),
+            Some(&FieldValue::Unsigned(u64::from(
+                AttachmentFormat::R32Float.code()
+            )))
+        );
+        assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
+    /// Every attachment of one pass shares one extent; a pass whose attachments
+    /// disagree is refused with `render_attachment_extent_mismatch` before any
+    /// Vulkan object exists.
+    #[test]
+    fn prepare_render_request_refuses_attachments_with_mismatched_extents() {
+        let stages = reviewed_dual_stages();
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.color_attachments.push(RenderAttachment {
+            view_id: ViewId::new(22),
+            allocation_id: AllocationId::new(32),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 3,
+            height: 2,
+            load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+            store: StoreOp::Store,
+        });
+        // Core admission refuses this shape (`ViewportExtentMismatch`); the
+        // rail's own check is the second line of defence for a
+        // directly-constructed pass, so the test skips `pass.validate()` on
+        // purpose.
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the pipeline compiles one format per location");
+
+        let refused = match prepare_render_request(&stages, &pass, &[None, None]) {
+            Err(error) => error,
+            Ok(_) => panic!("attachments of one pass share one extent"),
+        };
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_extent_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("attachment"),
             Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(refused.fields.get("width"), Some(&FieldValue::Unsigned(3)));
+        assert_eq!(
+            refused.fields.get("expected_width"),
+            Some(&FieldValue::Unsigned(2))
         );
     }
 
@@ -3471,7 +3949,7 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass, None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None])
             .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
@@ -3492,7 +3970,7 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass, None)
+        let refused = execute_render_pass(&context, &stages, &pass, &[None])
             .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
@@ -3514,7 +3992,7 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass, None)
+        let error = execute_render_pass(&context, &stages, &pass, &[None])
             .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);

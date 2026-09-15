@@ -4825,9 +4825,11 @@ mod tests {
                     vertex_layout: VertexLayout::None,
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
-                fragment_spirv: crate::render::solid_fragment_spirv(AttachmentFormat::Rgba8Unorm)
-                    .expect("reviewed fragment stage")
-                    .to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(&[
+                    AttachmentFormat::Rgba8Unorm,
+                ])
+                .expect("reviewed fragment stage")
+                .to_vec(),
                 logical_digest: SemanticDigest::new(
                     "metal-smoke-fixture-v1",
                     b"object_render_pipeline".to_vec(),
@@ -4947,9 +4949,11 @@ mod tests {
                     vertex_layout: VertexLayout::None,
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
-                fragment_spirv: crate::render::solid_fragment_spirv(AttachmentFormat::Rgba8Unorm)
-                    .expect("reviewed fragment stage")
-                    .to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(&[
+                    AttachmentFormat::Rgba8Unorm,
+                ])
+                .expect("reviewed fragment stage")
+                .to_vec(),
                 logical_digest: SemanticDigest::new(
                     "metal-smoke-fixture-v1",
                     b"object_render_cancel_pipeline".to_vec(),
