@@ -61,10 +61,10 @@
       "id": "r32float_clear_2x2",
       "declaring_case": "render_declaring_copy_word",
       "vertex_entry": "render_quad_vertex",
-      "fragment_entry": "render_solid_rgba8",
+      "fragment_entry": "render_solid_r32f",
       "metal": {
-        "path": "shaders/quad_indexed_2x2.metal",
-        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+        "path": "shaders/quad_indexed_2x2_r32f.metal",
+        "sha256": "2074ee223fe1e472124312b6e1507f383ceddc10a24c3a432e03e61449ed16aa"
       },
       "vertex_layout": {
         "buffers": [
@@ -116,8 +116,11 @@
       },
       "expected_hex": "8180803e8180803e8180803e8180803e",
       "capture_rails": [
+        "native-metal",
         "vulkan",
-        "vulkan-objects"
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ]
     }
   ]

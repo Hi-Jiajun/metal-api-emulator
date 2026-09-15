@@ -1166,6 +1166,23 @@ private func reviewedDualModule() -> ReviewedRenderModule {
                                                           format: "float32x2")])])
 }
 
+/// The reviewed single-channel float fixture (v22): the indexed vertex stage
+/// plus a fragment stage that writes one component, because an `r32float`
+/// attachment takes a one-component store. The Vulkan rail carries the same
+/// shape as `solid_r32f.frag.spv` and refuses the four-component module for
+/// this format; this module is the native half of that review.
+private func reviewedR32fModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_quad_vertex",
+        fragment_entry: "render_solid_r32f",
+        metal: RenderSourcePin(path: "shaders/quad_indexed_2x2_r32f.metal",
+                               sha256: "2074ee223fe1e472124312b6e1507f383ceddc10a24c3a432e03e61449ed16aa"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 8,
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x2")])])
+}
+
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
@@ -1177,6 +1194,8 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
     switch (definition.vertex_layout, attachments.count) {
     case (nil, 1):
         return reviewedRenderModule()
+    case (_?, 1) where attachments[0].format == "r32float":
+        return reviewedR32fModule()
     case (_?, 1):
         return reviewedIndexedModule()
     case (_?, 2) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
