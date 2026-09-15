@@ -718,6 +718,24 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
+    case "render_declaring_four_attachments":
+        // v24's declaring case: the reviewed mrt_declare4 kernel reads one word
+        // from each of the four attachment views and writes their xor into its
+        // own output view, so one submission proves it read every view the
+        // render pass then writes.
+        try require(definition.entry == "mrt_declare4"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 5,
+                    "\(definition.id): expected five buffers")
+        try require((0..<4).allSatisfy { binding in
+            definition.buffers.contains {
+                $0.binding == binding && $0.access == "read" && $0.length == 16
+            }
+        }, "\(definition.id): expected four 16-byte read buffers")
+        try require(definition.buffers.contains {
+            $0.binding == 4 && $0.access == "write" && $0.length == 4
+        }, "\(definition.id): expected a 4-byte write buffer at 4")
     case "render_declaring_two_attachments", "render_declaring_store_and_discard":
         // v18's declaring case and v19's store/discard sibling: the reviewed
         // mrt_declare kernel reads both attachment views and writes their xor
@@ -1041,8 +1059,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v22":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v23":
+        expectedIDs = ["render_declaring_four_attachments"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v22 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v23 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1183,6 +1203,22 @@ private func reviewedR32fModule() -> ReviewedRenderModule {
                                                           format: "float32x2")])])
 }
 
+/// The reviewed four-location fixture (v24): the indexed vertex stage plus a
+/// fragment stage that writes every colour location the contract admits. Its
+/// four texels are pairwise distinct, so a capture that landed one target twice
+/// cannot pass the comparison.
+private func reviewedQuadModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_quad_vertex",
+        fragment_entry: "render_solid_rgba8_quad",
+        metal: RenderSourcePin(path: "shaders/quad_indexed_2x2_quad.metal",
+                               sha256: "883a3234884c32ccd32ca1dfbfc22cdcefbc6c1a6f5047cbf65bd647a79dfb28"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 8,
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x2")])])
+}
+
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
@@ -1200,6 +1236,8 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
         return reviewedIndexedModule()
     case (_?, 2) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
         return reviewedDualModule()
+    case (_?, 4) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+        return reviewedQuadModule()
     default:
         throw OracleError("\(definition.id): no reviewed module carries this "
                           + "vertex-input and colour-format shape")
@@ -1625,6 +1663,16 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
         slots = [BufferSlotDefinition(binding: 0, access: "read", length: 16),
                  BufferSlotDefinition(binding: 1, access: "read", length: 16),
                  BufferSlotDefinition(binding: 2, access: "write", length: 4)]
+    case "mrt_declare4":
+        air = SourceDefinition(path: "shaders/mrt_declare4.ll",
+            sha256: "5bf093fb4ad3890e7ee513591e6b943755db1c6850f091580b658e52a092ccd9")
+        metal = SourceDefinition(path: "shaders/mrt_declare4.metal",
+            sha256: "b1c51bdf4817b21c9e476eabc627ecb83e727384e3bf2436ac62377702f50a41")
+        slots = [BufferSlotDefinition(binding: 0, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 1, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 2, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 3, access: "read", length: 16),
+                 BufferSlotDefinition(binding: 4, access: "write", length: 4)]
     default:
         throw OracleError("Unsupported entry: \(entry)")
     }

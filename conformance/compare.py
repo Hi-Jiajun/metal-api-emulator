@@ -722,8 +722,10 @@ def _render_plan(plan, suite):
         definitions = [case["attachment"]] if single else \
             _list(case["attachments"], f"{where}.attachments")
         if multiple:
-            _require(len(definitions) == 2,
-                     f"{where}: the reviewed MRT shape is two attachments")
+            _require(2 <= len(definitions) <= 4,
+                     f"{where}: the reviewed MRT shapes are two to four attachments")
+            _require(len(definitions) != 3,
+                     f"{where}: three attachments have no reviewed module yet")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
         declaring = _string(case["declaring_case"], f"{where}.declaring_case")
@@ -940,9 +942,9 @@ def _render_plan(plan, suite):
         # dual case whose locations read back the same texels could not show
         # that both outputs landed (`4080c0ff` vs `ff8040c0`). A discarded
         # location has no expectation and takes no part in the comparison.
-        if multiple and len(expected_bytes) == 2:
-            _require(expected_bytes[0] != expected_bytes[1],
-                     f"{where}: the two attachments read back the same texels")
+        if multiple and len(expected_bytes) >= 2:
+            _require(len(set(expected_bytes)) == len(expected_bytes),
+                     f"{where}: the attachments read back the same texels")
         texel = expected_bytes[0][:4]
 
         # The present section is optional: a case without it is the v13 case and

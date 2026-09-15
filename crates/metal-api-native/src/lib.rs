@@ -130,6 +130,12 @@ const READ_TEXTURE_2D_CELL: &str =
 #[cfg(any(target_os = "macos", test))]
 const MRT_DECLARE: &str = include_str!("../../../conformance/shaders/mrt_declare.metal");
 
+/// The v24 four-attachment declaring pass (`research/docs/23` §3.3, v24): the
+/// same shape widened to four reads, so one compute pass declares every
+/// attachment view of the four-location fixture.
+#[cfg(any(target_os = "macos", test))]
+const MRT_DECLARE4: &str = include_str!("../../../conformance/shaders/mrt_declare4.metal");
+
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
 #[cfg(any(target_os = "macos", test))]
@@ -212,6 +218,19 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
                 binding(0, BufferAccess::Read, static_word()),
                 binding(1, BufferAccess::Read, static_word()),
                 binding(2, BufferAccess::Write, static_word()),
+            ],
+        ),
+        // The v24 four-attachment declaring pass: one invocation reads one word
+        // from each of the four attachment views and writes their xor into its
+        // own output view.
+        ("mrt_declare4", MRT_DECLARE4) => (
+            [1, 1, 1],
+            vec![
+                binding(0, BufferAccess::Read, static_word()),
+                binding(1, BufferAccess::Read, static_word()),
+                binding(2, BufferAccess::Read, static_word()),
+                binding(3, BufferAccess::Read, static_word()),
+                binding(4, BufferAccess::Write, static_word()),
             ],
         ),
         // The v11 texture case writes one 64-byte cell per invocation; the
@@ -413,6 +432,7 @@ mod tests {
             ("remap_3d", REMAP),
             ("copy_3d", COPY_3D),
             ("mrt_declare", MRT_DECLARE),
+            ("mrt_declare4", MRT_DECLARE4),
         ] {
             let contract = bounded_contract(&request(entry, source)).unwrap();
             contract.validate().unwrap();
