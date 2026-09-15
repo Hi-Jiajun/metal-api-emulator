@@ -2225,6 +2225,7 @@ private func renderSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         // The `vertex_id` shape: positions come from the vertex index, so the
         // case declares no layout, no stream and no index buffer.
         vertex_layout: nil,
@@ -2281,6 +2282,7 @@ private func presentSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         // The present equivalent replays the `vertex_id` shape, so it declares
         // no vertex input either.
         vertex_layout: nil,
@@ -2353,6 +2355,7 @@ private func vertexSelfTest() throws -> CaseResult {
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         // The stream and index views, spelled exactly as a suite spells them:
         // each view carries its own bytes (`research/docs/23` §3.6), which is
@@ -2429,6 +2432,7 @@ private func mrtSelfTest() throws -> CaseResult {
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
                                                       length: UInt64(vertices.count),
