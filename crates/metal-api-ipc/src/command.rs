@@ -1845,11 +1845,29 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn render_contract_encoding_refuses_more_than_one_format() {
-        // The pre-MRT pipeline tag carries exactly one format byte; a contract
-        // with a longer list has no encoding yet and is refused rather than
-        // written truncated.
+    /// The offset of the pipeline-table entry's kind tag. The frame kind (4),
+    /// the request tag (1), the schema version (4), the epoch (1), the
+    /// operation id (2), the entry count (8), the device epoch (8) and the
+    /// pipeline id (8) precede it.
+    fn pipeline_entry_kind_offset() -> usize {
+        4 + 1 + 4 + 1 + 2 + 8 + 8 + 8
+    }
+
+    /// The offset of the byte behind the fixture's fragment entry name, i.e.
+    /// where the entry's colour-format field starts. Located by its content so
+    /// the assertion does not pin a position another increment could move.
+    fn render_entry_format_offset(frame: &[u8]) -> usize {
+        const FRAGMENT_ENTRY: &[u8] = b"solid_color_fragment";
+        let position = frame
+            .windows(FRAGMENT_ENTRY.len())
+            .position(|window| window == FRAGMENT_ENTRY)
+            .expect("the fixture fragment entry name is on the wire");
+        position + FRAGMENT_ENTRY.len()
+    }
+
+    /// The render-only submit whose single pipeline entry declares `formats`
+    /// in place of the fixture's one format.
+    fn render_submit_with_formats(formats: Vec<AttachmentFormat>) -> CommandRequest {
         let mut trace = render_only_trace();
         let Some(entry) = trace.pipelines.first_mut() else {
             panic!("the fixture trace carries one pipeline entry");
@@ -1857,17 +1875,158 @@ mod tests {
         let Some(contract) = entry.render.as_mut() else {
             panic!("the fixture entry carries a render half");
         };
-        contract.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm];
+        contract.color_formats = formats;
+        CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        }
+    }
+
+    #[test]
+    fn render_contract_encoding_refuses_empty_and_oversize_format_lists() {
+        // No format describes no attachment at all, so it is refused rather
+        // than written as a zero-length list a provider cannot resolve.
         assert!(matches!(
-            CommandCodec::encode_request(&CommandRequest::Submit {
-                trace,
-                resources: resources(),
-            })
+            CommandCodec::encode_request(&render_submit_with_formats(Vec::new())).unwrap_err(),
+            CodecError::RenderPipelineFormatCount { count: 0, maximum }
+                if maximum == MAX_COLOR_ATTACHMENTS
+        ));
+
+        // One past the MRT cap is refused with the count as asked for, exactly
+        // like the render pass's own attachment cap.
+        assert!(matches!(
+            CommandCodec::encode_request(&render_submit_with_formats(vec![
+                AttachmentFormat::Rgba8Unorm;
+                MAX_COLOR_ATTACHMENTS + 1
+            ]))
             .unwrap_err(),
-            CodecError::RenderPipelineFormatCount {
-                count: 2,
-                maximum: 1
-            }
+            CodecError::RenderPipelineFormatCount { count, maximum }
+                if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
+
+        // The cap itself is the last shape the wire admits.
+        CommandCodec::encode_request(&render_submit_with_formats(vec![
+            AttachmentFormat::Rgba8Unorm;
+            MAX_COLOR_ATTACHMENTS
+        ]))
+        .expect("the MRT cap is admitted");
+    }
+
+    #[test]
+    fn single_format_render_contract_keeps_its_pre_mrt_bytes() {
+        let request = render_submit_with_formats(vec![AttachmentFormat::Rgba8Unorm]);
+        let frame = CommandCodec::encode_request(&request).unwrap();
+
+        // The entry wears the pre-MRT tag, and that tag is followed by exactly
+        // one format byte and then the vertex-layout tag: the MRT increment is
+        // additive, so a one-attachment registration pays nothing for it.
+        assert_eq!(
+            frame[pipeline_entry_kind_offset()],
+            0x01,
+            "render entry tag"
+        );
+        let format_offset = render_entry_format_offset(&frame);
+        assert_eq!(frame[format_offset], 0x02, "Rgba8Unorm follows the names");
+        assert_eq!(
+            frame[format_offset + 1],
+            0x00,
+            "the vertex layout follows the single format byte"
+        );
+
+        // And the whole frame is still the frozen pre-present frame for this
+        // fixture, so nothing else in the entry moved either.
+        assert_eq!(frame, LEGACY_RENDER_SUBMIT_FRAME);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+    }
+
+    #[test]
+    fn multi_format_render_contract_round_trips_under_the_mrt_tag() {
+        // A list, in location order, with a format a single-format contract
+        // could not carry: the second entry is BGRA, the fourth repeats RGBA.
+        let formats = vec![
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Bgra8Unorm,
+            AttachmentFormat::R32Float,
+            AttachmentFormat::Rgba8Unorm,
+        ];
+        let request = render_submit_with_formats(formats.clone());
+        let frame = CommandCodec::encode_request(&request).unwrap();
+
+        // The entry wears the MRT tag, and the format field is a big-endian
+        // length prefix followed by one byte per format, in location order.
+        assert_eq!(frame[pipeline_entry_kind_offset()], 0x02, "MRT entry tag");
+        let list_offset = render_entry_format_offset(&frame);
+        assert_eq!(
+            &frame[list_offset..list_offset + 8],
+            (formats.len() as u64).to_be_bytes(),
+            "the list carries its own length"
+        );
+        assert_eq!(
+            &frame[list_offset + 8..list_offset + 8 + formats.len()],
+            [0x02, 0x03, 0x01, 0x02],
+            "one format byte per location"
+        );
+        assert_eq!(
+            frame[list_offset + 8 + formats.len()],
+            0x00,
+            "the vertex layout follows the list"
+        );
+
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, request);
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let Some(contract) = trace
+            .pipelines
+            .first()
+            .and_then(|entry| entry.render.as_ref())
+        else {
+            panic!("the decoded entry carries a render half");
+        };
+        assert_eq!(contract.color_formats, formats);
+    }
+
+    #[test]
+    fn mrt_entries_refuse_format_lists_outside_the_admitted_band() {
+        let request = render_submit_with_formats(vec![
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Bgra8Unorm,
+        ]);
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let list_offset = render_entry_format_offset(&frame);
+
+        // A zero-length list would leave the vertex layout to be read as a
+        // format, so the decoder refuses it where it stands.
+        let mut empty = frame.clone();
+        empty[list_offset..list_offset + 8].copy_from_slice(&0_u64.to_be_bytes());
+        assert!(matches!(
+            CommandCodec::decode_request(&empty).unwrap_err(),
+            CodecError::RenderPipelineFormatCount { count: 0, maximum }
+                if maximum == MAX_COLOR_ATTACHMENTS
+        ));
+
+        // An over-long prefix is refused before a list of that length is
+        // allocated or read.
+        let mut oversize = frame.clone();
+        oversize[list_offset..list_offset + 8]
+            .copy_from_slice(&((MAX_COLOR_ATTACHMENTS + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            CommandCodec::decode_request(&oversize).unwrap_err(),
+            CodecError::RenderPipelineFormatCount { count, maximum }
+                if count == MAX_COLOR_ATTACHMENTS + 1 && maximum == MAX_COLOR_ATTACHMENTS
+        ));
+    }
+
+    #[test]
+    fn pipeline_entries_refuse_an_unknown_tag_next_to_the_mrt_tag() {
+        let request = render_submit_with_formats(vec![AttachmentFormat::Rgba8Unorm]);
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let mut unknown = frame.clone();
+        unknown[pipeline_entry_kind_offset()] = 0x03;
+        assert!(matches!(
+            CommandCodec::decode_request(&unknown).unwrap_err(),
+            CodecError::UnknownPipelineTag(0x03)
         ));
     }
 

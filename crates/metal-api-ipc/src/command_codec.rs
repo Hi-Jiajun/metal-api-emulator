@@ -151,6 +151,17 @@ const VERTEX_LAYOUT_BUFFERS: u8 = 0x01;
 /// `PIPELINE_KIND_COMPUTE` is what an entry in that layout decodes to.
 const PIPELINE_KIND_COMPUTE: u8 = 0x00;
 const PIPELINE_KIND_RENDER: u8 = 0x01;
+/// Render entry whose contract carries one colour format **per attachment**.
+///
+/// `PIPELINE_KIND_RENDER` is followed by exactly one format byte, so a contract
+/// with two or more formats has no single byte to write. This tag replaces
+/// that byte with a length-prefixed list and keeps every other field of the
+/// entry in place, which is what lets the single-format entry keep its exact
+/// pre-MRT bytes: an owner that registers one attachment per pipeline never
+/// writes this tag, and a decoder that predates it answers
+/// [`CodecError::UnknownPipelineTag`] instead of misreading the list as a
+/// vertex layout.
+const PIPELINE_KIND_RENDER_MRT: u8 = 0x02;
 
 /// Maximum number of passes one tagged trace frame may carry.
 ///
@@ -1217,7 +1228,7 @@ fn put_pipeline_tagged(
 ) -> Result<(), CodecError> {
     match &pipeline.render {
         Some(contract) => {
-            encoder.u8(PIPELINE_KIND_RENDER);
+            encoder.u8(render_pipeline_kind(contract)?);
             put_pipeline(encoder, pipeline);
             put_render_pipeline_contract(encoder, contract)?;
         }
@@ -1229,25 +1240,61 @@ fn put_pipeline_tagged(
     Ok(())
 }
 
+/// The pipeline-table tag one render contract wears.
+///
+/// The tag is a function of the format count because that count is what the
+/// pre-MRT body cannot express: one format keeps `PIPELINE_KIND_RENDER` and the
+/// exact bytes it always had, two to [`MAX_COLOR_ATTACHMENTS`] take
+/// `PIPELINE_KIND_RENDER_MRT`. A contract with no format at all, or with more
+/// than the render track admits, is refused here — before the tag is written —
+/// so a refused registration never emits a partial entry.
+fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecError> {
+    match bounded_color_format_count(contract.color_formats.len() as u64)? {
+        1 => Ok(PIPELINE_KIND_RENDER),
+        _ => Ok(PIPELINE_KIND_RENDER_MRT),
+    }
+}
+
 fn put_render_pipeline_contract(
     encoder: &mut Encoder,
     contract: &RenderPipelineContract,
 ) -> Result<(), CodecError> {
-    // This increment's wire carries one format per contract: the pre-MRT tag
-    // (`PIPELINE_KIND_RENDER`, `0x01`) is followed by exactly one format byte,
-    // and a multi-format list has no encoding yet (the MRT tag lands in the
-    // next increment). Refuse instead of writing a truncated list an older
-    // decoder would misread.
-    let [format] = contract.color_formats.as_slice() else {
-        return Err(CodecError::RenderPipelineFormatCount {
-            count: contract.color_formats.len(),
-            maximum: 1,
-        });
-    };
+    // The entry keeps the field order the single-format shape established
+    // (both entry names, then the format, then the vertex layout); only the
+    // format field changes shape, from one byte to a length-prefixed list, and
+    // only when the tag says so.
+    bounded_color_format_count(contract.color_formats.len() as u64)?;
     encoder.text(&contract.vertex_entry);
     encoder.text(&contract.fragment_entry);
-    put_attachment_format(encoder, *format);
+    match contract.color_formats.as_slice() {
+        [format] => put_attachment_format(encoder, *format),
+        formats => {
+            encoder.u64(formats.len() as u64);
+            for format in formats {
+                put_attachment_format(encoder, *format);
+            }
+        }
+    }
     put_vertex_layout(encoder, &contract.vertex_layout)
+}
+
+/// Bound one contract's colour-format list.
+///
+/// The list is read as a length prefix on the wire and as a plain slice when
+/// encoding, so the same bound serves both directions: an empty list describes
+/// no attachment and a list longer than [`MAX_COLOR_ATTACHMENTS`] describes a
+/// pass no render track admits. Both are refused with the count as written, and
+/// on the decode side before a single format byte — or a `Vec` of that length —
+/// is produced.
+fn bounded_color_format_count(value: u64) -> Result<usize, CodecError> {
+    let count = usize::try_from(value).unwrap_or(usize::MAX);
+    if count == 0 || count > MAX_COLOR_ATTACHMENTS {
+        return Err(CodecError::RenderPipelineFormatCount {
+            count,
+            maximum: MAX_COLOR_ATTACHMENTS,
+        });
+    }
+    Ok(count)
 }
 
 /// Encode one vertex layout.
@@ -1310,19 +1357,42 @@ fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipel
     let mut pipeline = get_pipeline(decoder)?;
     pipeline.render = match kind {
         PIPELINE_KIND_COMPUTE => None,
-        PIPELINE_KIND_RENDER => Some(get_render_pipeline_contract(decoder)?),
+        PIPELINE_KIND_RENDER | PIPELINE_KIND_RENDER_MRT => {
+            Some(get_render_pipeline_contract(decoder, kind)?)
+        }
         tag => return Err(CodecError::UnknownPipelineTag(tag)),
     };
     Ok(pipeline)
 }
 
+/// Decode the render half of one pipeline-table entry.
+///
+/// `kind` selects the shape of the format field: `PIPELINE_KIND_RENDER` is a
+/// single byte, `PIPELINE_KIND_RENDER_MRT` a length-prefixed list. A list
+/// length outside `1..=MAX_COLOR_ATTACHMENTS` is refused rather than read as a
+/// shorter or longer entry, so a corrupt prefix cannot shift the vertex layout
+/// that follows it.
 fn get_render_pipeline_contract(
     decoder: &mut Decoder<'_>,
+    kind: u8,
 ) -> Result<RenderPipelineContract, CodecError> {
+    let vertex_entry = decoder.text()?;
+    let fragment_entry = decoder.text()?;
+    let color_formats = match kind {
+        PIPELINE_KIND_RENDER_MRT => {
+            let count = bounded_color_format_count(decoder.u64()?)?;
+            let mut formats = Vec::with_capacity(count);
+            for _ in 0..count {
+                formats.push(get_attachment_format(decoder)?);
+            }
+            formats
+        }
+        _ => vec![get_attachment_format(decoder)?],
+    };
     Ok(RenderPipelineContract {
-        vertex_entry: decoder.text()?,
-        fragment_entry: decoder.text()?,
-        color_formats: vec![get_attachment_format(decoder)?],
+        vertex_entry,
+        fragment_entry,
+        color_formats,
         vertex_layout: get_vertex_layout(decoder)?,
     })
 }
