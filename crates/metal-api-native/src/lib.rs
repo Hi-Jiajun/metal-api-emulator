@@ -127,6 +127,7 @@ const READ_TEXTURE_2D_CELL: &str =
 /// The v18 MRT declaring pass (`research/docs/23` §3.3, wave3): one invocation
 /// xors the two attachment words into a scratch view, which makes both
 /// attachment views read-only declarations of the same compute pass.
+#[cfg(any(target_os = "macos", test))]
 const MRT_DECLARE: &str = include_str!("../../../conformance/shaders/mrt_declare.metal");
 
 /// Exact byte equality is essential: a matching entry name or digest cannot
