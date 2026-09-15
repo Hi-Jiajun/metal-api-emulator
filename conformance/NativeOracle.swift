@@ -294,9 +294,15 @@ private struct ValidatedRenderAttachment {
     let width: Int
     let height: Int
     let load: String
+    /// The contract's store operation: `"store"` keeps the attachment on the
+    /// observable surface, `"dontcare"` discards it (`research/docs/23` §3.6,
+    /// v19).
+    let store: String
     let clearComponents: [Double]
     let initial: Data?
-    let expected: Data
+    /// The reviewed expectation of a stored attachment; `nil` for a discarded
+    /// attachment, which carries no expectation and no observation.
+    let expected: Data?
 }
 
 private struct SuiteDefinition: Decodable {
@@ -1330,8 +1336,11 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     }
     let attachments = try colorAttachments(definition)
     // One expectation per attachment, in location order: the single form
-    // carries it at the case level, the MRT form on each attachment entry.
-    let expectedHexes: [String]
+    // carries it at the case level, the MRT form on each attachment entry. A
+    // discarded attachment carries none at all — its bytes disappear from the
+    // observable surface, so there is nothing to compare (`research/docs/23`
+    // §3.6, v19).
+    let expectedHexes: [String?]
     if definition.attachment != nil {
         guard let top = definition.expected_hex else {
             throw OracleError("\(definition.id): a single attachment needs expected_hex")
@@ -1342,14 +1351,14 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     } else {
         try require(definition.expected_hex == nil,
                     "\(definition.id): an attachment list carries its own expected_hex")
-        expectedHexes = try attachments.map { attachment in
-            guard let hex = attachment.expected_hex else {
-                throw OracleError("\(definition.id): attachment \(attachment.view) "
-                                  + "needs expected_hex")
-            }
-            return hex
-        }
+        expectedHexes = attachments.map { attachment in attachment.expected_hex }
     }
+    // The v19 pass-level rule core admission states as
+    // `AllRenderAttachmentsDiscarded`: at least one attachment has to stay on
+    // the observable surface, or "nothing landed" would pass as "landed
+    // correctly".
+    try require(attachments.contains { $0.store == "store" },
+                "\(definition.id): every colour attachment discards, leaving no observable landing point")
     var validatedAttachments = [ValidatedRenderAttachment]()
     for (index, attachment) in attachments.enumerated() {
         try require(attachment.format == "rgba8_unorm",
@@ -1358,34 +1367,49 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): the first render increment renders into a 2x2 attachment")
         try require(attachment.allocation > 0 && attachment.view > 0,
                     "\(definition.id): zero attachment identity")
-        try require(attachment.store == "store",
-                    "\(definition.id): the attachment has to be stored for a byte comparison")
+        try require(attachment.store == "store" || attachment.store == "dontcare",
+                    "\(definition.id): unsupported attachment store op \(attachment.store)")
+        let stored = attachment.store == "store"
         try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
                     "\(definition.id): the viewport must cover the attachment")
         let byteCount = attachment.width * attachment.height * 4
-        let texels = try decodeHex(expectedHexes[index],
-                                   context: "\(definition.id) expected texels")
-        try require(texels.count == byteCount,
-                    "\(definition.id): expected texel bytes do not match the attachment")
-        // What a drawn texel has to be depends on what the pass started from.
-        // A clearing pass has nothing to preserve, so every texel has to be the
-        // same fragment output (`research/docs/23` §1.3) — a partially covered
-        // attachment cannot be asserted as correct. A loading pass deliberately
-        // keeps the bytes it was handed wherever the draw missed, so its
-        // expectation is classified once the previous bytes are decoded, below.
-        let texel = Data(texels.prefix(4))
-        var texelCount = 0
-        if attachment.load == "clear" {
-            for offset in stride(from: 0, to: texels.count, by: 4) {
-                try require(Data(texels[offset..<(offset + 4)]) == texel,
-                            "\(definition.id): the milestone expects every texel to equal the fragment output")
-                texelCount += 1
+        // A stored attachment carries the whole expectation and the byte-level
+        // review it makes possible; a discarded attachment carries none, and
+        // an expectation arriving for one is refused (`research/docs/23` §3.6,
+        // v19).
+        let expected: Data?
+        if let hex = expectedHexes[index] {
+            try require(stored,
+                        "\(definition.id): a discarded attachment carries no expected_hex")
+            let texels = try decodeHex(hex, context: "\(definition.id) expected texels")
+            try require(texels.count == byteCount,
+                        "\(definition.id): expected texel bytes do not match the attachment")
+            // What a drawn texel has to be depends on what the pass started
+            // from. A clearing pass has nothing to preserve, so every texel
+            // has to be the same fragment output (`research/docs/23` §1.3) —
+            // a partially covered attachment cannot be asserted as correct. A
+            // loading pass deliberately keeps the bytes it was handed wherever
+            // the draw missed, so its expectation is classified once the
+            // previous bytes are decoded, below.
+            let texel = Data(texels.prefix(4))
+            var texelCount = 0
+            if attachment.load == "clear" {
+                for offset in stride(from: 0, to: texels.count, by: 4) {
+                    try require(Data(texels[offset..<(offset + 4)]) == texel,
+                                "\(definition.id): the milestone expects every texel to equal the fragment output")
+                    texelCount += 1
+                }
+            } else {
+                texelCount = texels.count / 4
             }
+            try require(texelCount == attachment.width * attachment.height,
+                        "\(definition.id): attachment texel count mismatch")
+            expected = texels
         } else {
-            texelCount = texels.count / 4
+            try require(!stored,
+                        "\(definition.id): attachment \(attachment.view) needs expected_hex")
+            expected = nil
         }
-        try require(texelCount == attachment.width * attachment.height,
-                    "\(definition.id): attachment texel count mismatch")
         let clearComponents: [Double]
         let initial: Data?
         switch attachment.load {
@@ -1395,14 +1419,18 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             }
             let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
             try require(clearBytes.count == 4, "\(definition.id): a clear colour is four bytes")
-            // The sentinel has to be distinguishable from the fragment output,
-            // or a pass that never ran would satisfy the expectation.
-            try require(clearBytes != texel,
-                        "\(definition.id): the clear colour equals the expected texel")
             try require(attachment.initial_hex == nil,
                         "\(definition.id): a cleared attachment carries no initial bytes")
             clearComponents = [Double(clearBytes[0]) / 255.0, Double(clearBytes[1]) / 255.0,
                                Double(clearBytes[2]) / 255.0, Double(clearBytes[3]) / 255.0]
+            // The sentinel has to be distinguishable from the fragment output,
+            // or a pass that never ran would satisfy the expectation. A
+            // discarded attachment has no expectation, so there is nothing to
+            // distinguish.
+            if let expected {
+                try require(clearBytes != Data(expected.prefix(4)),
+                            "\(definition.id): the clear colour equals the expected texel")
+            }
             initial = nil
         case "load":
             guard let initialHex = attachment.initial_hex else {
@@ -1411,56 +1439,62 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
             try require(previous.count == byteCount,
                         "\(definition.id): initial texels do not match the attachment")
-            try require(previous != texels,
-                        "\(definition.id): the initial texels equal the expectation")
-            // Partial coverage, in both directions: every texel is either the
-            // byte the load handed it or the pass's fragment output, every
-            // drawn texel carries the *same* output, and both halves appear
-            // (`docs/23` §3.3).
-            var drawn: Data? = nil
-            var drawnCount = 0
-            for offset in stride(from: 0, to: texels.count, by: 4) {
-                let chunk = Data(texels[offset..<(offset + 4)])
-                let previousChunk = Data(previous[offset..<(offset + 4)])
-                if chunk == previousChunk {
-                    continue
-                }
-                if let drawn {
-                    try require(chunk == drawn,
-                                "\(definition.id): drawn texels disagree about the fragment output")
-                } else {
-                    drawn = chunk
-                }
-                drawnCount += 1
-            }
-            // The suite comparator additionally requires at least one *kept*
-            // texel, because a loading case whose draw covers everything cannot
-            // show that the load happened (`conformance/compare.py`). This
-            // oracle's own self-test fixtures are deliberately that shape — the
-            // present self-test exists to show the sentinel was replaced, not
-            // to falsify the load — so the oracle only insists that something
-            // was drawn here and leaves the falsifiability rule to the
-            // comparator and to the suite fixtures.
-            try require(drawnCount > 0,
-                        "\(definition.id): a loaded attachment needs at least one drawn texel")
             clearComponents = []
             initial = previous
+            if let expected {
+                try require(previous != expected,
+                            "\(definition.id): the initial texels equal the expectation")
+                // Partial coverage, in both directions: every texel is either
+                // the byte the load handed it or the pass's fragment output,
+                // every drawn texel carries the *same* output, and both halves
+                // appear (`docs/23` §3.3).
+                var drawn: Data? = nil
+                var drawnCount = 0
+                for offset in stride(from: 0, to: expected.count, by: 4) {
+                    let chunk = Data(expected[offset..<(offset + 4)])
+                    let previousChunk = Data(previous[offset..<(offset + 4)])
+                    if chunk == previousChunk {
+                        continue
+                    }
+                    if let drawn {
+                        try require(chunk == drawn,
+                                    "\(definition.id): drawn texels disagree about the fragment output")
+                    } else {
+                        drawn = chunk
+                    }
+                    drawnCount += 1
+                }
+                // The suite comparator additionally requires at least one
+                // *kept* texel, because a loading case whose draw covers
+                // everything cannot show that the load happened
+                // (`conformance/compare.py`). This oracle's own self-test
+                // fixtures are deliberately that shape — the present self-test
+                // exists to show the sentinel was replaced, not to falsify the
+                // load — so the oracle only insists that something was drawn
+                // here and leaves the falsifiability rule to the comparator and
+                // to the suite fixtures.
+                try require(drawnCount > 0,
+                            "\(definition.id): a loaded attachment needs at least one drawn texel")
+            }
         default:
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
         validatedAttachments.append(ValidatedRenderAttachment(
             allocation: attachment.allocation, view: attachment.view,
             width: attachment.width, height: attachment.height,
-            load: attachment.load, clearComponents: clearComponents,
-            initial: initial, expected: texels))
+            load: attachment.load, store: attachment.store,
+            clearComponents: clearComponents, initial: initial, expected: expected))
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
-    // show that both outputs landed (`4080c0ff` vs `ff8040c0`).
-    if validatedAttachments.count > 1
-        && validatedAttachments[0].load == "clear"
-        && validatedAttachments[1].load == "clear"
-        && validatedAttachments[0].expected.prefix(4) == validatedAttachments[1].expected.prefix(4) {
+    // show that both outputs landed (`4080c0ff` vs `ff8040c0`). A discarded
+    // location has no expectation, so it takes no part in the comparison.
+    if validatedAttachments.count > 1,
+       validatedAttachments[0].load == "clear",
+       validatedAttachments[1].load == "clear",
+       let first = validatedAttachments[0].expected,
+       let second = validatedAttachments[1].expected,
+       first.prefix(4) == second.prefix(4) {
         throw OracleError("\(definition.id): the two locations read back the same texel")
     }
     return ValidatedRender(definition: definition, source: source,
@@ -1876,7 +1910,11 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             throw OracleError("\(definition.id): cannot reach colour attachment \(index)")
         }
         color.texture = targets[index]
-        color.storeAction = .store
+        // A discarded attachment still renders, but Metal does not keep its
+        // bytes: `.dontCare` is what makes it disappear from the observable
+        // surface, and the readback below skips it (`research/docs/23` §3.6,
+        // v19).
+        color.storeAction = attachment.store == "store" ? .store : .dontCare
         if attachment.load == "clear" {
             color.loadAction = .clear
             guard attachment.clearComponents.count == 4 else {
@@ -1947,6 +1985,16 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     var writebacks = [Writeback]()
     var allocations = [AllocationResult]()
     for (index, attachment) in fixture.attachments.enumerated() {
+        // A discarded attachment's bytes disappear with the pass: no readback,
+        // no writeback and no allocation observation. Reporting it would
+        // present a comparison the v19 rule does not admit
+        // (`research/docs/23` §3.6).
+        if attachment.store != "store" {
+            continue
+        }
+        guard let expected = attachment.expected else {
+            throw OracleError("\(definition.id): a stored attachment needs an expectation")
+        }
         var observed = Data(count: attachment.width * attachment.height * 4)
         observed.withUnsafeMutableBytes { bytes in
             if let destination = bytes.baseAddress {
@@ -1956,9 +2004,9 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                         mipmapLevel: 0)
             }
         }
-        try require(observed == attachment.expected,
+        try require(observed == expected,
                     "\(definition.id): attachment \(index) bytes \(hex(observed)) do not match "
-                    + "the reviewed expectation \(hex(attachment.expected))")
+                    + "the reviewed expectation \(hex(expected))")
         // One writeback and one allocation per attachment, both the
         // attachment's own texels.
         writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
