@@ -820,8 +820,9 @@ fn register_render_pipeline(
     registrar: &RenderRegistrar,
     identity: &str,
     geometry: RenderGeometry,
-    attachment_count: usize,
+    formats: &[AttachmentFormat],
 ) -> Result<CompiledComputePipeline> {
+    let attachment_count = formats.len();
     let logical_digest = SemanticDigest::new(
         "suite-sha256-entry-v1",
         format!("{identity}:offscreen_render_pipeline:{attachment_count}").into_bytes(),
@@ -859,7 +860,7 @@ fn register_render_pipeline(
             contract: RenderPipelineContract {
                 vertex_entry: vulkan_entries.0.to_owned(),
                 fragment_entry: vulkan_entries.1.to_owned(),
-                color_formats: vec![AttachmentFormat::Rgba8Unorm; attachment_count],
+                color_formats: formats.to_vec(),
                 vertex_layout: layout.clone(),
             },
             vertex_spirv: vulkan_stages.0.to_vec(),
@@ -877,7 +878,7 @@ fn register_render_pipeline(
                 contract: RenderPipelineContract {
                     vertex_entry: msl_entries.0.to_owned(),
                     fragment_entry: msl_entries.1.to_owned(),
-                    color_formats: vec![AttachmentFormat::Rgba8Unorm; attachment_count],
+                    color_formats: formats.to_vec(),
                     vertex_layout: layout.clone(),
                 },
                 logical_digest,
@@ -1685,8 +1686,8 @@ fn main() -> Result<()> {
     // single-attachment case keeps the pre-MRT pair. Every committed suite
     // carries one render shape today, but the cache refuses to reuse a
     // registration minted for another count rather than guessing.
-    let mut render_pipeline: Option<(usize, CompiledComputePipeline)> = None;
-    let mut object_render_pipeline: Option<(usize, objects::RenderPipeline)> = None;
+    let mut render_pipeline: Option<(Vec<AttachmentFormat>, CompiledComputePipeline)> = None;
+    let mut object_render_pipeline: Option<(Vec<AttachmentFormat>, objects::RenderPipeline)> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
         // A render case is owed only by the rails its marker names: an indirect
         // case names the rails that declare indirect support, and a rail that
@@ -1706,7 +1707,10 @@ fn main() -> Result<()> {
         let before = counters.read();
         let (acquires_before, presents_before) = counters.present_counts();
         let geometry = render_geometry(case, &format!("render case {}", case.id))?;
-        let attachment_count = render_case_attachments(case).len();
+        let attachment_formats = render_case_attachments(case)
+            .iter()
+            .map(|attachment| attachment_format(&attachment.format))
+            .collect::<Result<Vec<_>>>()?;
         let mut result = if let Some(device) = &object_device {
             let object_programs = case_programs(declaring)
                 .iter()
@@ -1715,17 +1719,17 @@ fn main() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let object_pipeline = match &object_render_pipeline {
-                Some((count, pipeline)) if *count == attachment_count => pipeline.clone(),
+                Some((formats, pipeline)) if *formats == attachment_formats => pipeline.clone(),
                 _ => {
                     let registered = register_render_pipeline(
                         &render_registrar,
                         &identity,
                         geometry,
-                        attachment_count,
+                        &attachment_formats,
                     )?;
                     let wrapped = device.render_pipeline(&registered)?;
-                    render_pipeline = Some((attachment_count, registered));
-                    object_render_pipeline = Some((attachment_count, wrapped.clone()));
+                    render_pipeline = Some((attachment_formats.clone(), registered));
+                    object_render_pipeline = Some((attachment_formats.clone(), wrapped.clone()));
                     wrapped
                 }
             };
@@ -1744,15 +1748,15 @@ fn main() -> Result<()> {
                 .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
                 .collect::<Vec<_>>();
             let pipeline = match &render_pipeline {
-                Some((count, pipeline)) if *count == attachment_count => pipeline.clone(),
+                Some((formats, pipeline)) if *formats == attachment_formats => pipeline.clone(),
                 _ => {
                     let registered = register_render_pipeline(
                         &render_registrar,
                         &identity,
                         geometry,
-                        attachment_count,
+                        &attachment_formats,
                     )?;
-                    render_pipeline = Some((attachment_count, registered.clone()));
+                    render_pipeline = Some((attachment_formats.clone(), registered.clone()));
                     registered
                 }
             };
@@ -1876,6 +1880,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v18") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v19") => &["render_declaring_store_and_discard"],
         (1, "compute-buffer-v20") => &["render_declaring_copy_word"],
+        (1, "compute-buffer-v21") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2062,6 +2067,19 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
 /// attachment entry; a discarded attachment carries none at all, which is why
 /// the expectation is optional and [`validate_render_case`] is the single
 /// place that pins which attachment may leave it out (`docs/23` §3.6, v19).
+/// The attachment format a render case declares (`research/docs/23` §3.3, v21).
+///
+/// Two 8-bit UNORM layouts are admitted: the reviewed fragment stage stores the
+/// same colour either way, and the attachment's own layout decides which channel
+/// lands in which byte, so the fixture's expected texels pin the layout.
+fn attachment_format(name: &str) -> Result<AttachmentFormat> {
+    match name {
+        "rgba8_unorm" => Ok(AttachmentFormat::Rgba8Unorm),
+        "bgra8_unorm" => Ok(AttachmentFormat::Bgra8Unorm),
+        other => Err(format!("unsupported attachment format {other:?}").into()),
+    }
+}
+
 fn render_attachment_shapes(
     case: &RenderCase,
 ) -> Result<Vec<(&RenderAttachmentDefinition, Option<String>)>> {
@@ -2332,7 +2350,11 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     let mut parsed = Vec::new();
     let mut stored = Vec::new();
     for (attachment, expected_hex) in &shapes {
-        if attachment.format != "rgba8_unorm" {
+        // Both 8-bit UNORM layouts are admitted from v21 on (`docs/23` §3.3):
+        // the reviewed fragment stage stores the same colour either way, and
+        // the attachment's own layout decides which channel lands in which
+        // byte.
+        if attachment.format != "rgba8_unorm" && attachment.format != "bgra8_unorm" {
             return Err(format!("{where_}: unsupported attachment format").into());
         }
         if attachment.width != 2 || attachment.height != 2 {
@@ -3854,7 +3876,7 @@ fn run_render_case(
             Ok(RenderAttachment {
                 view_id: ViewId::new(attachment.view),
                 allocation_id: AllocationId::new(attachment.allocation),
-                format: AttachmentFormat::Rgba8Unorm,
+                format: attachment_format(&attachment.format)?,
                 width: attachment.width,
                 height: attachment.height,
                 load,
@@ -3867,7 +3889,7 @@ fn run_render_case(
             target: PresentTarget {
                 allocation_id: AllocationId::new(attachments[0].0.allocation),
                 view_id: ViewId::new(attachments[0].0.view),
-                format: AttachmentFormat::Rgba8Unorm,
+                format: attachment_format(&attachments[0].0.format)?,
                 width: attachments[0].0.width,
                 height: attachments[0].0.height,
                 image_count: definition.image_count,
@@ -4389,7 +4411,7 @@ fn run_object_render_case(
             };
             Ok(objects::RenderColorAttachment {
                 view,
-                format: AttachmentFormat::Rgba8Unorm,
+                format: attachment_format(&attachment.format)?,
                 load: *load,
                 store,
             })
@@ -4459,7 +4481,7 @@ fn run_object_render_case(
         render.draw_indirect(
             icb,
             recorded[0].view,
-            AttachmentFormat::Rgba8Unorm,
+            recorded[0].format,
             attachments[0].0.width,
             attachments[0].0.height,
             recorded[0].load,
@@ -4483,7 +4505,7 @@ fn run_object_render_case(
         // single-attachment `draw_render_pass` entry point.
         render.draw_render_pass(
             recorded[0].view,
-            AttachmentFormat::Rgba8Unorm,
+            recorded[0].format,
             attachments[0].0.width,
             attachments[0].0.height,
             recorded[0].load,

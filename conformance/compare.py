@@ -784,7 +784,11 @@ def _render_plan(plan, suite):
             view = _integer(attachment.get("view"), f"{attachment_where}.view")
             _require(allocation > 0 and view > 0,
                      f"{attachment_where}: zero attachment identity")
-            _require(attachment.get("format") == "rgba8_unorm",
+            # Both 8-bit UNORM layouts are admitted (`research/docs/23` §3.3,
+            # v21): the shader stores the same colour either way and the memory
+            # bytes follow the attachment's channel order, so the fixture's
+            # texels pin which layout the comparison is observing.
+            _require(attachment.get("format") in ("rgba8_unorm", "bgra8_unorm"),
                      f"{attachment_where}: unsupported attachment format")
             width = _integer(attachment.get("width"), f"{attachment_where}.width", 1)
             height = _integer(attachment.get("height"), f"{attachment_where}.height", 1)
