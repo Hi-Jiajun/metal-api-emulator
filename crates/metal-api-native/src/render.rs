@@ -391,6 +391,11 @@ pub(crate) enum RenderLoadAction {
     Clear([f64; 4]),
     /// Keep the attachment's previous contents.
     Load,
+    /// Leave the attachment's previous contents undefined: the encoder sets
+    /// `MTLLoadAction::DontCare` and presets nothing, so the pass neither
+    /// reads nor overwrites the pre-pass bytes before drawing
+    /// (`research/docs/23` §3.1, v20).
+    DontCare,
 }
 
 /// The store action this rail sets. `Store` lands the attachment's texels on
@@ -471,7 +476,7 @@ pub(crate) fn load_action(
     match load {
         LoadOp::Clear(clear) => Ok(RenderLoadAction::Clear(clear_components(clear, format))),
         LoadOp::Load => Ok(RenderLoadAction::Load),
-        LoadOp::DontCare => Err(capability_refusal("attachment_load_op_unsupported")),
+        LoadOp::DontCare => Ok(RenderLoadAction::DontCare),
     }
 }
 
@@ -1116,6 +1121,7 @@ pub(crate) fn plan<'a>(
         let store = store_action(attachment.store)?;
         let initial = match (load, previous, present) {
             (RenderLoadAction::Clear(_), None, _) => None,
+            (RenderLoadAction::DontCare, None, _) => None,
             (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
             (RenderLoadAction::Load, Some(bytes), _) => {
                 return Err(
@@ -1134,6 +1140,14 @@ pub(crate) fn plan<'a>(
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(
                         "LoadOp::Clear writes every texel, so initial bytes are refused",
+                    ),
+                );
+            }
+            (RenderLoadAction::DontCare, Some(_), _) => {
+                return Err(
+                    args_refusal("render_attachment_initial_mismatch").with_detail(
+                        "LoadOp::DontCare reads and presets no pre-pass bytes, so initial bytes \
+                         are refused",
                     ),
                 );
             }
@@ -1222,6 +1236,9 @@ pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), P
 /// does not hold, and the refusal reuses the slug, class and phase this rail and
 /// the Vulkan rail give an unexecutable load op
 /// (`crates/metal-api-vulkan/src/compute_provider.rs`, the `loading` branch).
+/// `Clear` and `DontCare` resolve no bytes: a clear writes every texel and a
+/// `DontCare` attachment declares its pre-pass contents undefined, so neither
+/// shape presets the attachment (`research/docs/23` §3.1, v20).
 pub(crate) fn previous_bytes(
     load: LoadOp,
     view: &BufferView,
@@ -1728,6 +1745,11 @@ fn encode_into_and_readback(
                 ));
             }
             RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
+            // `MTLLoadAction::DontCare` mirrors the contract: the pre-pass
+            // contents are undefined, the pass neither reads nor presets them,
+            // and the draw alone defines what the attachment stores
+            // (`research/docs/23` §3.1, v20).
+            RenderLoadAction::DontCare => color.set_load_action(MTLLoadAction::DontCare),
         }
         // A discarded attachment still renders, but its bytes are not kept:
         // the store action is what makes the attachment disappear from the
@@ -2304,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_and_load_actions_are_distinct_and_dont_care_is_refused() {
+    fn clear_load_and_dont_care_map_to_distinct_load_actions() {
         assert_eq!(
             load_action(
                 LoadOp::Clear(ClearColor::new([0, 0, 0, 0xff])),
@@ -2317,9 +2339,10 @@ mod tests {
             load_action(LoadOp::Load, RenderPixelFormat::Rgba8Unorm).unwrap(),
             RenderLoadAction::Load
         );
-        let error = load_action(LoadOp::DontCare, RenderPixelFormat::Rgba8Unorm).unwrap_err();
-        assert_eq!(error.slug, "attachment_load_op_unsupported");
-        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            load_action(LoadOp::DontCare, RenderPixelFormat::Rgba8Unorm).unwrap(),
+            RenderLoadAction::DontCare
+        );
     }
 
     #[test]
@@ -2403,6 +2426,22 @@ mod tests {
         assert_eq!(second.store, RenderStoreAction::DontCare);
         assert!(matches!(first.load, RenderLoadAction::Clear(_)));
         assert!(matches!(second.load, RenderLoadAction::Clear(_)));
+    }
+
+    /// The v20 load increment (`research/docs/23` §3.1): a `LoadOp::DontCare`
+    /// attachment plans as `MTLLoadAction::DontCare` with no preset bytes, so
+    /// the encoder neither reads nor overwrites the pre-pass contents.
+    #[test]
+    fn plan_admits_a_dont_care_load_and_presets_nothing() {
+        let pass = milestone_pass(LoadOp::DontCare);
+        let pipeline = milestone_pipeline();
+        let planned = plan(&milestone_request(&pass, &pipeline, None)).unwrap();
+        assert_eq!(planned.attachments.len(), 1);
+        assert_eq!(planned.attachments[0].load, RenderLoadAction::DontCare);
+        assert_eq!(
+            planned.attachments[0].initial, None,
+            "a DontCare attachment carries no pre-pass bytes"
+        );
     }
 
     /// A pass whose only attachment discards is refused by the contract before
@@ -3506,6 +3545,27 @@ mod tests {
         assert_eq!(
             planned.plan.attachments[0].initial,
             Some([0xfe; 16].as_slice())
+        );
+    }
+
+    /// A `DontCare` attachment still needs its landing declaration — the stored
+    /// texels land through the writeback channel — but resolves no previous
+    /// bytes, so the plan carries `DontCare` and presets nothing: the output is
+    /// the draw alone (`research/docs/23` §3.1, v20).
+    #[test]
+    fn plan_trace_plans_a_dont_care_pass_without_declared_bytes() {
+        let (trace, _) = milestone_trace(LoadOp::DontCare);
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("the declaring view lands the writeback; only the bytes are absent");
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        assert_eq!(planned.plan.attachments[0].load, RenderLoadAction::DontCare);
+        assert_eq!(
+            planned.plan.attachments[0].initial, None,
+            "a DontCare attachment presets nothing"
         );
     }
 
