@@ -607,6 +607,11 @@ struct RenderTarget {
     attachments: Vec<RenderTargetAttachment>,
     width: u64,
     height: u64,
+    /// The scissor rectangle the pass clips to, or `None` for the whole
+    /// attachment (`research/docs/23` §3.3, v29/v30). It is encoder state: a
+    /// [`RenderEncoder::set_scissor`] call applies it to every pass recorded
+    /// afterwards, exactly as Metal's `setScissorRect` does.
+    scissor: Option<[u32; 4]>,
     present: Option<PresentInitial>,
     draw: RenderDraw,
 }
@@ -776,9 +781,7 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
-            // The object API's draws do not expose a scissor yet (v30 will); the
-            // pass covers its whole attachment.
-            scissor: None,
+            scissor: self.scissor,
             pipeline: pipeline_id,
             color_attachments,
             viewport: [
@@ -1530,6 +1533,7 @@ impl CommandBuffer {
             draw_count: 0,
             indirect: false,
             ended: false,
+            scissor: None,
             vertex_buffers: BTreeMap::new(),
             index_buffer: None,
         })
@@ -2178,8 +2182,26 @@ pub struct RenderCommandEncoder {
     /// The one index buffer this encoder draws through, with the width of the
     /// indices it holds.
     index_buffer: Option<(BufferView, IndexFormat)>,
+    /// The scissor rectangle every pass recorded afterwards clips to, or `None`
+    /// for the whole attachment (`research/docs/23` §3.3, v29/v30). Like
+    /// Metal's own encoder state it applies to the draws that follow the call.
+    scissor: Option<[u32; 4]>,
 }
 impl RenderCommandEncoder {
+    /// Clip every draw recorded afterwards to `rect` (`[x, y, width, height]`
+    /// in framebuffer coordinates), or clear the clipping with `None`.
+    ///
+    /// The rectangle is encumbrance-free encoder state: it is validated against
+    /// the attachment's extent when the draw is recorded (the contract's
+    /// [`ContractError::ScissorOutOfBounds`]) and then travels into the pass's
+    /// own descriptor, so both rails clip the same rectangle
+    /// (`research/docs/23` §3.3, v29/v30).
+    pub fn set_scissor(&mut self, rect: Option<[u32; 4]>) -> Result<(), Error> {
+        self.ensure_open()?;
+        self.scissor = rect;
+        Ok(())
+    }
+
     pub fn set_render_pipeline_state(&mut self, pipeline: &RenderPipeline) -> Result<(), Error> {
         self.ensure_open()?;
         if !Arc::ptr_eq(&self.shared.owner, &pipeline.inner.owner) {
@@ -2569,6 +2591,7 @@ impl RenderCommandEncoder {
                 .collect(),
             width,
             height,
+            scissor: self.scissor,
             present,
             draw,
         };

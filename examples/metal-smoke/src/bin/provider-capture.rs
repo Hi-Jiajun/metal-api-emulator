@@ -4631,6 +4631,18 @@ fn run_object_render_case(
     };
     let mut render = command.render_command_encoder()?;
     render.set_render_pipeline_state(render_pipeline)?;
+    // The pass's scissor, when the case declares one, is encoder state on this
+    // rail exactly as it is on Metal's (`research/docs/23` §3.3, v30).
+    let scissor = match case.scissor {
+        Some([x, y, width, height]) => Some([
+            u32::try_from(x)?,
+            u32::try_from(y)?,
+            u32::try_from(width)?,
+            u32::try_from(height)?,
+        ]),
+        None => None,
+    };
+    render.set_scissor(scissor)?;
     // The pass's own streams (`research/docs/23` §3.3): the object API binds
     // the views the case declares, and the encoder carries their bytes into the
     // trace at commit. A vertex-input case is a direct indexed draw by

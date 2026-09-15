@@ -32,10 +32,11 @@ SCISSOR = [0, 0, 2, 4]
 OUTPUT = "4080c0ff"
 CLEAR = "11223344"
 EXPECTED = "".join(OUTPUT if (index % 4) < 2 else CLEAR for index in range(16))
-# The two object rails cannot express a scissor yet (their encoder has no field
-# for it), so the fixture names the three trace rails only.
+# Every rail executes the scissor from v30 on: the object API's encoder carries
+# `set_scissor`, so the fixture names all five.
 TRACE_RAILS = ("native-metal", "vulkan", "native-metal-provider")
 OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
+ALL_RAILS = TRACE_RAILS + OBJECT_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -72,7 +73,7 @@ class ScissorObservationTests(unittest.TestCase):
         self.assertEqual(case["scissor"], SCISSOR)
         self.assertEqual(case["attachment"]["clear_hex"], CLEAR)
         self.assertEqual(case["expected_hex"], EXPECTED)
-        self.assertEqual(sorted(case["capture_rails"]), sorted(TRACE_RAILS))
+        self.assertEqual(sorted(case["capture_rails"]), sorted(ALL_RAILS))
 
     def test_v28_plan_knows_the_coverage(self):
         plan = compare._suite_plan(self.suite)
@@ -83,8 +84,8 @@ class ScissorObservationTests(unittest.TestCase):
         self.assertEqual(expectation.touched, {900, 920})
         self.assertEqual(expectation.written, {900, 920})
 
-    def test_v28_clips_on_every_trace_rail(self):
-        for rail in TRACE_RAILS:
+    def test_v28_clips_on_every_rail(self):
+        for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             for case in suite["render_cases"]:
                 case["capture_rails"] = [rail]
@@ -95,16 +96,21 @@ class ScissorObservationTests(unittest.TestCase):
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
-    def test_v28_refuses_an_object_rail_that_reports_the_case(self):
-        # The marker does not name the object rails, so a capture from one of
-        # them that reports the case is refused rather than compared.
-        for rail in OBJECT_RAILS:
-            report = counted_declaring(self.suite, self.digest, rail)
+    def test_v28_refuses_a_rail_whose_marker_does_not_name_it(self):
+        # The marker names every rail, so a capture whose marker omits its own
+        # rail is refused rather than compared.
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            for case in suite["render_cases"]:
+                case["capture_rails"] = [other for other in ALL_RAILS if other != rail]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
             report["results"].append(render_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
-                    compare.validate_capture(self.suite, self.digest, report, rail)
+                    compare.validate_capture(suite, digest, report, rail)
 
     def test_v28_refuses_a_scissor_outside_the_attachment(self):
         broken = copy.deepcopy(self.suite)
