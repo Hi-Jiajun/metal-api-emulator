@@ -124,6 +124,10 @@ const READ_TEXTURE_2D: &str = include_str!("../../../conformance/shaders/read_te
 #[cfg(any(target_os = "macos", test))]
 const READ_TEXTURE_2D_CELL: &str =
     include_str!("../../../conformance/shaders/read_texture_2d_cell.metal");
+/// The v18 MRT declaring pass (`research/docs/23` §3.3, wave3): one invocation
+/// xors the two attachment words into a scratch view, which makes both
+/// attachment views read-only declarations of the same compute pass.
+const MRT_DECLARE: &str = include_str!("../../../conformance/shaders/mrt_declare.metal");
 
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
@@ -197,6 +201,16 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
             vec![
                 binding(4, BufferAccess::Read, affine(&[4, 20, 60])),
                 binding(9, BufferAccess::Write, affine(&[4, 20, 60])),
+            ],
+        ),
+        // The v18 MRT declaring pass: one invocation reads one word from each
+        // attachment view and writes their xor into its own output view.
+        ("mrt_declare", MRT_DECLARE) => (
+            [1, 1, 1],
+            vec![
+                binding(0, BufferAccess::Read, static_word()),
+                binding(1, BufferAccess::Read, static_word()),
+                binding(2, BufferAccess::Write, static_word()),
             ],
         ),
         // The v11 texture case writes one 64-byte cell per invocation; the
@@ -397,6 +411,7 @@ mod tests {
             ("mix_3d", MIX),
             ("remap_3d", REMAP),
             ("copy_3d", COPY_3D),
+            ("mrt_declare", MRT_DECLARE),
         ] {
             let contract = bounded_contract(&request(entry, source)).unwrap();
             contract.validate().unwrap();
