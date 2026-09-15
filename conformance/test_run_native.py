@@ -361,5 +361,139 @@ class VertexSelftestValidationTests(unittest.TestCase):
             run_native.validate_vertex_selftest([])
 
 
+class MrtSelftestValidationTests(unittest.TestCase):
+    """The MRT self-test's byte comparison, exercised without Metal.
+
+    `run_native.validate_mrt_selftest` is the function the CI step reuses, so
+    the sentinel, location-order and observation-shape rules are pinned here
+    rather than only in an inline heredoc. The fixture id and both locations'
+    identities are part of the claim: the dual quad writes the same stream and
+    index buffers as the vertex self-test, so only the id and the per-location
+    bytes separate this observation from the single-output ones.
+    """
+
+    FIRST = "4080c0ff" * 4
+    SECOND = "ff8040c0" * 4
+    SENTINEL = "fefefefe" * 4
+
+    def reviewed_report(self, report_id="mrt_dual_output_2x2",
+                        completion="CompletedVisible", writebacks=None,
+                        allocations=None):
+        if writebacks is None:
+            writebacks = [
+                {"allocation": 900, "view": 910, "offset": 0,
+                 "bytes_hex": self.FIRST},
+                {"allocation": 901, "view": 911, "offset": 0,
+                 "bytes_hex": self.SECOND},
+            ]
+        if allocations is None:
+            allocations = [
+                {"allocation": 900, "bytes_hex": self.FIRST},
+                {"allocation": 901, "bytes_hex": self.SECOND},
+            ]
+        return {"id": report_id, "completion": completion,
+                "writebacks": writebacks, "allocations": allocations}
+
+    def test_accepts_the_reviewed_dual_output_observation(self):
+        report = self.reviewed_report()
+        self.assertEqual(run_native.validate_mrt_selftest(report),
+                         [self.FIRST, self.SECOND])
+
+    def test_rejects_the_sentinel_in_either_location(self):
+        for first, second in (
+            (self.SENTINEL, self.SECOND),
+            (self.FIRST, self.SENTINEL),
+            (self.SENTINEL, self.SENTINEL),
+        ):
+            with self.subTest(first=first, second=second):
+                report = self.reviewed_report(
+                    writebacks=[
+                        {"allocation": 900, "view": 910, "offset": 0,
+                         "bytes_hex": first},
+                        {"allocation": 901, "view": 911, "offset": 0,
+                         "bytes_hex": second},
+                    ],
+                    allocations=[
+                        {"allocation": 900, "bytes_hex": first},
+                        {"allocation": 901, "bytes_hex": second},
+                    ])
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_mrt_selftest(report)
+
+    def test_rejects_swapped_locations(self):
+        report = self.reviewed_report(
+            writebacks=[
+                {"allocation": 900, "view": 910, "offset": 0,
+                 "bytes_hex": self.SECOND},
+                {"allocation": 901, "view": 911, "offset": 0,
+                 "bytes_hex": self.FIRST},
+            ],
+            allocations=[
+                {"allocation": 900, "bytes_hex": self.SECOND},
+                {"allocation": 901, "bytes_hex": self.FIRST},
+            ])
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_mrt_selftest(report)
+
+    def test_rejects_the_plain_render_selftest_report(self):
+        # The single-output self-test reaches the same location-0 bytes, so
+        # only the id and the second location distinguish it; a report from
+        # that self-test must not pass here.
+        report = {
+            "id": "render_offscreen_2x2",
+            "completion": "CompletedVisible",
+            "writebacks": [{"allocation": 900, "view": 910, "offset": 0,
+                            "bytes_hex": self.FIRST}],
+            "allocations": [{"allocation": 900, "bytes_hex": self.FIRST}],
+        }
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_mrt_selftest(report)
+
+    def test_rejects_a_missing_or_extra_observation(self):
+        first_writeback = {"allocation": 900, "view": 910, "offset": 0,
+                           "bytes_hex": self.FIRST}
+        second_writeback = {"allocation": 901, "view": 911, "offset": 0,
+                            "bytes_hex": self.SECOND}
+        first_allocation = {"allocation": 900, "bytes_hex": self.FIRST}
+        second_allocation = {"allocation": 901, "bytes_hex": self.SECOND}
+        for writebacks, allocations in (
+            ([], []),
+            ([first_writeback], []),
+            ([], [first_allocation]),
+            ([first_writeback, second_writeback], [first_allocation]),
+            ([first_writeback], [first_allocation, second_allocation]),
+            ([first_writeback, second_writeback, second_writeback],
+             [first_allocation, second_allocation]),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=allocations):
+                report = self.reviewed_report(writebacks=writebacks,
+                                              allocations=allocations)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_mrt_selftest(report)
+
+    def test_rejects_a_wrong_writeback_identity_or_offset(self):
+        base = [
+            {"allocation": 900, "view": 910, "offset": 0, "bytes_hex": self.FIRST},
+            {"allocation": 901, "view": 911, "offset": 0, "bytes_hex": self.SECOND},
+        ]
+        for index, change in ((0, {"offset": 4}), (0, {"view": 911}),
+                              (1, {"view": 910}), (1, {"allocation": 900})):
+            with self.subTest(index=index, change=change):
+                writebacks = [dict(entry) for entry in base]
+                writebacks[index] = dict(writebacks[index], **change)
+                report = self.reviewed_report(writebacks=writebacks)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_mrt_selftest(report)
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_mrt_selftest(
+                self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_mrt_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()

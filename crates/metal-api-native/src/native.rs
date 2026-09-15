@@ -1751,19 +1751,33 @@ impl NativeMetalProvider {
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
-            let texels = match &planned.present {
-                Some(present) => self.execute_present_render(state, planned, present)?,
-                None if icb_replay.is_some() => render::encode_indirect_offscreen_render(
-                    &state.device,
-                    &state.queue,
-                    &planned.plan,
-                    icb_replay.expect("the indirect draw was planned"),
-                )?,
-                None => {
-                    render::encode_offscreen_render(&state.device, &state.queue, &planned.plan)?
+            match &planned.present {
+                // A present action hands its one attachment on to the target
+                // texture, whose readback is the pass's single writeback.
+                Some(present) => {
+                    let texels = self.execute_present_render(state, planned, present)?;
+                    writebacks.push(planned.writeback(texels));
                 }
-            };
-            writebacks.push(planned.writeback(texels));
+                // An offscreen pass reads every attachment back, one writeback
+                // per landing view in location order.
+                None if icb_replay.is_some() => {
+                    let readbacks = render::encode_indirect_offscreen_render(
+                        &state.device,
+                        &state.queue,
+                        &planned.plan,
+                        icb_replay.expect("the indirect draw was planned"),
+                    )?;
+                    writebacks.extend(planned.writebacks(readbacks));
+                }
+                None => {
+                    let readbacks = render::encode_offscreen_render(
+                        &state.device,
+                        &state.queue,
+                        &planned.plan,
+                    )?;
+                    writebacks.extend(planned.writebacks(readbacks));
+                }
+            }
         }
         Ok(writebacks)
     }
@@ -1788,7 +1802,7 @@ impl NativeMetalProvider {
         } else {
             let texture = render::present_target_texture(
                 &state.device,
-                planned.plan.format,
+                planned.plan.attachments[0].format,
                 planned.plan.extent,
             )?;
             state.present_targets.insert(

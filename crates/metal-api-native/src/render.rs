@@ -104,14 +104,28 @@ pub(crate) const FRAGMENT_ENTRY: &str = "render_solid_rgba8";
 /// `[[stage_in]]`, i.e. through the vertex descriptor the pipeline carries.
 pub(crate) const QUAD_VERTEX_ENTRY: &str = "render_quad_vertex";
 
-/// One reviewed render module and the vertex-input shape it was written for.
+/// The reviewed dual module: the indexed vertex entry once more, but a
+/// fragment stage that writes two colour outputs, one per MRT location.
+pub(crate) const REVIEWED_DUAL_SOURCE: &str =
+    include_str!("../../../conformance/shaders/quad_indexed_2x2_dual.metal");
+
+/// Fragment entry of the reviewed dual module: two `[[color(n)]]` outputs,
+/// location 0 the vertex-input texel and location 1 the second MRT texel.
+pub(crate) const DUAL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_dual";
+
+/// One reviewed render module and the (vertex-input shape, colour-format
+/// shape) pair it was written for.
 ///
-/// The [`VertexLayout`] of a render pipeline selects the entry: a pipeline
-/// whose layout binds streams can only be the module whose vertex stage reads
-/// `[[stage_in]]`, and a `VertexLayout::None` pipeline can only be the module
-/// that derives positions from `vertex_id`. Both the entry pair and the source
-/// bytes of that one module are then the allowlist, so neither a renamed entry
-/// nor an edited file can execute.
+/// The [`VertexLayout`] and the pipeline's [`RenderPipelineContract`]
+/// `color_formats` together select the entry pair: a pipeline whose layout
+/// binds streams and whose format list names one attachment can only be the
+/// module whose vertex stage reads `[[stage_in]]` and whose fragment stage
+/// returns one colour, a `VertexLayout::None` single-output pipeline only the
+/// module that derives positions from `vertex_id`, and an indexed pipeline
+/// whose two formats are both `Rgba8Unorm` only the dual module whose fragment
+/// stage writes both locations. Both the entry pair and the source bytes of
+/// that one module are then the allowlist, so neither a renamed entry nor an
+/// edited file can execute.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReviewedModule {
     /// The exact module bytes this rail compiles.
@@ -126,8 +140,9 @@ pub(crate) struct ReviewedModule {
     pub(crate) binds_buffers: bool,
 }
 
-/// The two reviewed modules, one per vertex-input shape.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 2] = [
+/// The three reviewed modules, one per (vertex-input shape, colour-format
+/// shape) pair this rail executes.
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 3] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -142,27 +157,53 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 2] = [
         fragment_entry: FRAGMENT_ENTRY,
         binds_buffers: true,
     },
+    ReviewedModule {
+        source: REVIEWED_DUAL_SOURCE,
+        path: "conformance/shaders/quad_indexed_2x2_dual.metal",
+        vertex_entry: QUAD_VERTEX_ENTRY,
+        fragment_entry: DUAL_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
 ];
 
-/// The reviewed module a pipeline's vertex-input shape selects.
+/// The reviewed module a pipeline's vertex-input shape and colour-format list
+/// select, or `None` for a shape no module was reviewed for.
 ///
-/// Total by construction: [`VertexLayout`] has exactly two variants and
-/// [`REVIEWED_MODULES`] carries exactly one module per variant, so there is no
-/// layout this rail would compile nothing for.
-pub(crate) fn reviewed_module(layout: &VertexLayout) -> &'static ReviewedModule {
-    match layout {
-        VertexLayout::None => &REVIEWED_MODULES[0],
-        VertexLayout::Buffers(_) => &REVIEWED_MODULES[1],
+/// The single-output modules are format-agnostic: the pipeline's attachment
+/// format is pipeline state, not module source, so one module serves every
+/// admitted single format (`SUPPORTED_COLOR_FORMATS` below). The dual module
+/// is reviewed for exactly two `Rgba8Unorm` locations, because its fragment
+/// stage writes two byte strings that only those two locations decode the
+/// reviewed way; any other two-format list, any list above this rail's cap
+/// and any `vertex_id` pipeline with more than one location has no reviewed
+/// module and is refused by [`review_contract`] and [`plan`].
+pub(crate) fn reviewed_module(
+    layout: &VertexLayout,
+    color_formats: &[AttachmentFormat],
+) -> Option<&'static ReviewedModule> {
+    match (layout, color_formats) {
+        (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
+            Some(&REVIEWED_MODULES[0])
+        }
+        (VertexLayout::Buffers(_), [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
+            Some(&REVIEWED_MODULES[1])
+        }
+        (
+            VertexLayout::Buffers(_),
+            [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+        ) => Some(&REVIEWED_MODULES[2]),
+        _ => None,
     }
 }
 
-/// Colour attachments this rail executes today: one. The core contract admits
-/// the MRT shape (up to `metal_api_core::provider::MAX_COLOR_ATTACHMENTS`, now
-/// 4) while this rail's capability bit stays at 1 until the multi-attachment
-/// execution lands (wave3 R1; M5 raises it). The value is restated here because
-/// a capability value has to be spelled by the provider that declares it
-/// (`research/docs/23` §4.2).
-pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 1;
+/// Colour attachments this rail executes today: two. The core contract admits
+/// the full MRT shape (up to `metal_api_core::provider::MAX_COLOR_ATTACHMENTS`,
+/// now 4) while this rail's capability bit stays at 2: the reviewed dual
+/// module (`REVIEWED_DUAL_SOURCE`) writes exactly two locations, and no module
+/// writes three or four, so a pass above two is refused rather than rendered
+/// partially. The value is restated here because a capability value has to be
+/// spelled by the provider that declares it (`research/docs/23` §4.2).
+pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 2;
 
 /// Vertex streams one render pass may bind. The same value the core contract
 /// states (`metal_api_core::provider::MAX_VERTEX_BUFFERS`), restated for the
@@ -838,20 +879,17 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub(crate) pass: &'a RenderPassDescriptor,
     /// The registered render pipeline the pass names.
     pub(crate) pipeline: &'a RenderPipelineContract,
-    /// The MSL module to compile. The pipeline's [`VertexLayout`] selects which
-    /// reviewed module is the only one accepted here — `vertex_id` positions
-    /// ([`REVIEWED_SOURCE`]) or `[[stage_in]]` positions
-    /// ([`REVIEWED_VERTEX_SOURCE`]) — so a caller cannot pair one shape's
-    /// descriptor with the other shape's module.
+    /// The MSL module to compile. The pipeline's [`VertexLayout`] and
+    /// `color_formats` select which reviewed module is the only one accepted
+    /// here — `vertex_id` positions ([`REVIEWED_SOURCE`]), single-output
+    /// `[[stage_in]]` positions ([`REVIEWED_VERTEX_SOURCE`]) or the dual
+    /// `[[stage_in]]` module ([`REVIEWED_DUAL_SOURCE`]) — so a caller cannot
+    /// pair one shape's descriptor with another shape's module.
     pub(crate) source: &'a str,
-    /// Tightly packed texels the attachment already holds, for [`LoadOp::Load`].
-    /// Required exactly then, refused for a clear.
-    pub(crate) initial: Option<&'a [u8]>,
-    /// Whether the pass hands its attachment on through a present action.
-    /// A present pass's `Load` keeps the present target's initial state — the
-    /// sentinel preset by the present path, or undefined — so no `initial`
-    /// bytes are required here (`research/docs/24` §3.1).
-    pub(crate) present: bool,
+    /// One entry per colour attachment, in location order: the tightly packed
+    /// texels that attachment already holds, for [`LoadOp::Load`]. Required
+    /// exactly then, refused for a clear.
+    pub(crate) initial: Vec<Option<&'a [u8]>>,
 }
 
 /// Everything the encoder needs, decided before the first Metal object exists.
@@ -865,24 +903,44 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) module_path: &'static str,
     pub(crate) vertex_entry: &'a str,
     pub(crate) fragment_entry: &'a str,
-    pub(crate) format: RenderPixelFormat,
+    /// One entry per colour attachment, in location order: the pixel format,
+    /// the load/store actions and the previous bytes the encoder writes into
+    /// each attachment before the pass opens.
+    pub(crate) attachments: Vec<PlannedAttachment<'a>>,
     /// Attachment extent in texels, as `[width, height]`.
     pub(crate) extent: [u32; 2],
     /// `[origin_x, origin_y, width, height]`, copied from the validated pass.
     pub(crate) viewport: [u32; 4],
-    pub(crate) load: RenderLoadAction,
-    pub(crate) store: RenderStoreAction,
     pub(crate) vertices: u32,
     /// One entry per bound vertex stream, in binding order, with the bytes and
     /// footprints [`plan_vertex_input`] proved.
     pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
     /// The index buffer of an indexed draw, resolved from the pass's own view.
     pub(crate) indices: Option<PlannedIndexStream<'a>>,
-    /// Readback length in bytes: the tightly packed texel extent.
+    /// Readback length in bytes of one attachment: the tightly packed texel
+    /// extent. Every admitted colour format stores four bytes per texel and
+    /// every attachment of one pass shares an extent (checked in [`plan`]), so
+    /// one length serves every attachment.
     pub(crate) texel_bytes: usize,
-    /// Bytes per attachment row, which is the tight pitch the contract's bytes
-    /// are written in (`research/docs/23` §3.5).
+    /// Bytes per attachment row of the same shared shape (`research/docs/23`
+    /// §3.5).
     pub(crate) row_pitch: usize,
+}
+
+/// One colour attachment of a planned pass, resolved before any Metal object
+/// exists.
+#[derive(Debug)]
+pub(crate) struct PlannedAttachment<'a> {
+    /// The pixel format this rail builds the attachment's texture and pipeline
+    /// state with.
+    pub(crate) format: RenderPixelFormat,
+    /// The clear value or previous contents the attachment starts from.
+    pub(crate) load: RenderLoadAction,
+    /// The store action: always `Store`, which is what makes the readback a
+    /// landed observation.
+    pub(crate) store: RenderStoreAction,
+    /// The tightly packed texels a [`LoadOp::Load`] uploads before the pass
+    /// opens; `None` for a clear.
     pub(crate) initial: Option<&'a [u8]>,
 }
 
@@ -890,57 +948,117 @@ pub(crate) struct RenderPlan<'a> {
 ///
 /// Runs entirely without a device, so every refusal here is testable on a host
 /// that cannot load Metal. Nothing outside the request is read: the pass carries
-/// its own streams' bytes and its own attachment, so this call answers the same
-/// way for a trace pass and for the device-level helper's trace-less request.
+/// its own streams' bytes and its own attachments, so this call answers the
+/// same way for a trace pass and for the device-level helper's trace-less
+/// request.
 pub(crate) fn plan<'a>(
     request: &OffscreenRenderRequest<'a>,
 ) -> Result<RenderPlan<'a>, ProviderError> {
-    // The pipeline's vertex-input shape selects the one reviewed module this
-    // call may compile; the (module, entry pair) pair is then the whole
-    // allowlist, re-checked by `review_contract` below.
-    let module = reviewed_module(&request.pipeline.vertex_layout);
-    if request.source != module.source {
-        return Err(
-            allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
-                "a {} layout compiles the bytes of `{}` and nothing else",
-                layout_name(&request.pipeline.vertex_layout),
-                module.path
-            )),
-        );
+    let attachments = &request.pass.color_attachments;
+    // The rail's own extent-equality gate comes before the contract's viewport
+    // rule: every colour location renders into the pass's one raster, so two
+    // attachments of different extents cannot both land. The contract would
+    // report the same shape only as a viewport disagreement, which names no
+    // attachment; this refusal names the two extents instead.
+    if let Some(first) = attachments.first() {
+        for (index, other) in attachments.iter().enumerate().skip(1) {
+            if other.width != first.width || other.height != first.height {
+                return Err(args_refusal("render_attachment_extent_mismatch")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64))
+                    .with_field("width", FieldValue::Unsigned(other.width))
+                    .with_field("height", FieldValue::Unsigned(other.height))
+                    .with_field("first_width", FieldValue::Unsigned(first.width))
+                    .with_field("first_height", FieldValue::Unsigned(first.height))
+                    .with_detail("every colour attachment of one render pass shares one extent"));
+            }
+        }
     }
-    review_contract(request.pipeline)?;
-    // Core admission first: the pass's own shape rules and the
-    // pipeline/attachment format agreement belong to the contract
-    // (`research/docs/23` §3.1, §3.2), not to this rail.
+    // The pass's own shape rules and the pipeline/attachment format agreement
+    // belong to the contract (`research/docs/23` §3.1, §3.2), not to this
+    // rail.
     request.pass.validate().map_err(contract_refusal)?;
     request
         .pipeline
         .validate_against(request.pass)
         .map_err(contract_refusal)?;
     // The MRT contract admits up to four attachments and a matching format
-    // list, but this rail executes one; refuse the wider pass instead of
-    // silently rendering only location 0 (wave3 R1).
-    if request.pass.color_attachments.len() != 1 {
+    // list, but this rail executes two — the locations the reviewed dual
+    // module writes. Refuse the wider pass instead of silently rendering only
+    // locations 0 and 1 (wave3 R1).
+    if attachments.len() > usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX) {
+        return Err(
+            capability_refusal("render_mrt_attachment_count_unsupported")
+                .with_field(
+                    "attachments",
+                    FieldValue::Unsigned(attachments.len() as u64),
+                )
+                .with_field(
+                    "maximum",
+                    FieldValue::Unsigned(MAX_COLOR_ATTACHMENTS as u64),
+                )
+                .with_detail(
+                    "the reviewed dual module writes two colour locations; a wider pass \
+                          would silently drop the rest",
+                ),
+        );
+    }
+    // A present action hands exactly one attachment on to its target, and the
+    // present encoder renders into that one texture: a present pass with a
+    // second location would be dropped, so it is refused under the single-
+    // attachment slug instead.
+    let present = request.pass.present.is_some();
+    if present && attachments.len() != 1 {
         return Err(capability_refusal("render_attachment_count_unsupported")
             .with_field(
                 "attachments",
-                FieldValue::Unsigned(request.pass.color_attachments.len() as u64),
+                FieldValue::Unsigned(attachments.len() as u64),
             )
             .with_field("maximum", FieldValue::Unsigned(1))
-            .with_detail("this rail executes exactly one colour attachment"));
+            .with_detail("a present pass hands exactly one colour attachment on to its target"));
     }
-    let Some(attachment) = request.pass.color_attachments.first() else {
+    let Some(attachment) = attachments.first() else {
         return Err(contract_refusal(ContractError::EmptyAttachmentList));
     };
-    if !SUPPORTED_COLOR_FORMATS.contains(&attachment.format) {
-        return Err(
-            capability_refusal("attachment_format_unsupported").with_field(
-                "format",
-                FieldValue::Unsigned(u64::from(attachment.format.code())),
-            ),
-        );
+    // The pipeline's (vertex-input shape, colour-format list) pair selects the
+    // one reviewed module this call may compile; the (module, entry pair) pair
+    // is then the whole allowlist, re-checked by `review_contract` below.
+    let module = reviewed_module(
+        &request.pipeline.vertex_layout,
+        &request.pipeline.color_formats,
+    );
+    match module {
+        Some(module) if request.source == module.source => {}
+        Some(module) => {
+            return Err(
+                allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+                    "a {} layout with {:?} compiles the bytes of `{}` and nothing else",
+                    layout_name(&request.pipeline.vertex_layout),
+                    request.pipeline.color_formats,
+                    module.path
+                )),
+            );
+        }
+        None => {
+            return Err(
+                allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+                    "no reviewed module carries the {:?} shape with a {} layout",
+                    request.pipeline.color_formats,
+                    layout_name(&request.pipeline.vertex_layout)
+                )),
+            );
+        }
     }
-    let format = pixel_format(attachment.format)?;
+    review_contract(request.pipeline)?;
+    for attachment in attachments {
+        if !SUPPORTED_COLOR_FORMATS.contains(&attachment.format) {
+            return Err(
+                capability_refusal("attachment_format_unsupported").with_field(
+                    "format",
+                    FieldValue::Unsigned(u64::from(attachment.format.code())),
+                ),
+            );
+        }
+    }
     if attachment.width > MAX_ATTACHMENT_DIMENSION[0]
         || attachment.height > MAX_ATTACHMENT_DIMENSION[1]
     {
@@ -965,49 +1083,69 @@ pub(crate) fn plan<'a>(
     let row_pitch =
         usize::try_from(u64::from(extent[0]).saturating_mul(attachment.format.bytes_per_texel()))
             .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
-    let load = load_action(attachment.load, format)?;
-    let store = store_action(attachment.store)?;
     // The vertex-input half: the streams with their bytes and their footprints.
     // Planned after the attachment because a stream is the draw's own input,
     // exactly as the attachment is its output.
     let (vertex_streams, indices) = plan_vertex_input(request.pass, request.pipeline)?;
-    let initial = match (load, request.initial, request.present) {
-        (RenderLoadAction::Clear(_), None, _) => None,
-        (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
-        (RenderLoadAction::Load, Some(bytes), _) => {
-            return Err(
-                args_refusal("render_attachment_initial_mismatch").with_detail(format!(
-                    "LoadOp::Load needs {texel_bytes} tightly packed bytes, got {}",
-                    bytes.len()
-                )),
-            );
-        }
-        (RenderLoadAction::Load, None, true) => None,
-        (RenderLoadAction::Load, None, false) => {
-            return Err(args_refusal("render_attachment_initial_mismatch")
-                .with_detail("LoadOp::Load needs the attachment's previous texels"));
-        }
-        (RenderLoadAction::Clear(_), Some(_), _) => {
-            return Err(args_refusal("render_attachment_initial_mismatch")
-                .with_detail("LoadOp::Clear writes every texel, so initial bytes are refused"));
-        }
-    };
+    if request.initial.len() != attachments.len() {
+        return Err(
+            args_refusal("render_attachment_initial_mismatch").with_detail(format!(
+                "{} attachments need one previous-bytes entry each, got {}",
+                attachments.len(),
+                request.initial.len()
+            )),
+        );
+    }
+    let mut planned_attachments = Vec::with_capacity(attachments.len());
+    for (attachment, previous) in attachments.iter().zip(request.initial.iter().copied()) {
+        let format = pixel_format(attachment.format)?;
+        let load = load_action(attachment.load, format)?;
+        let store = store_action(attachment.store)?;
+        let initial = match (load, previous, present) {
+            (RenderLoadAction::Clear(_), None, _) => None,
+            (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
+            (RenderLoadAction::Load, Some(bytes), _) => {
+                return Err(
+                    args_refusal("render_attachment_initial_mismatch").with_detail(format!(
+                        "LoadOp::Load needs {texel_bytes} tightly packed bytes, got {}",
+                        bytes.len()
+                    )),
+                );
+            }
+            (RenderLoadAction::Load, None, true) => None,
+            (RenderLoadAction::Load, None, false) => {
+                return Err(args_refusal("render_attachment_initial_mismatch")
+                    .with_detail("LoadOp::Load needs the attachment's previous texels"));
+            }
+            (RenderLoadAction::Clear(_), Some(_), _) => {
+                return Err(
+                    args_refusal("render_attachment_initial_mismatch").with_detail(
+                        "LoadOp::Clear writes every texel, so initial bytes are refused",
+                    ),
+                );
+            }
+        };
+        planned_attachments.push(PlannedAttachment {
+            format,
+            load,
+            store,
+            initial,
+        });
+    }
+    let module = module.expect("the source check above refused a shape without a module");
     Ok(RenderPlan {
         source: module.source,
         module_path: module.path,
         vertex_entry: request.pipeline.vertex_entry.as_str(),
         fragment_entry: request.pipeline.fragment_entry.as_str(),
-        format,
+        attachments: planned_attachments,
         extent,
         viewport: request.pass.viewport,
-        load,
-        store,
         vertices: request.pass.vertices,
         vertex_streams,
         indices,
         texel_bytes,
         row_pitch,
-        initial,
     })
 }
 
@@ -1022,25 +1160,36 @@ pub(crate) fn layout_name(layout: &VertexLayout) -> &'static str {
 /// The rail's review gate for a render pipeline contract.
 ///
 /// Each reviewed module carries exactly one vertex entry and one fragment entry,
-/// and the contract's [`VertexLayout`] says which module it may be: a contract
-/// whose layout binds streams has to name the `[[stage_in]]` module's entries,
-/// and a `VertexLayout::None` contract the `vertex_id` module's. Anything else
+/// and the contract's [`VertexLayout`] and `color_formats` say which module it
+/// may be: a single-output contract names the module its layout selects, and a
+/// dual-format contract with a stream layout the dual module. A shape no
+/// module was reviewed for — a dual-format `vertex_id` contract, a wider
+/// format list, or a dual format pair that is not two `Rgba8Unorm` locations —
 /// is refused with the same slug, class and phase the compute allowlist gives
 /// an unreviewed kernel (`lib.rs::bounded_contract`,
-/// `native_shader_not_allowlisted`): a matching file name, an edited module or a
-/// recompiled one must not be enough to run different source
+/// `native_shader_not_allowlisted`): a matching file name, an edited module or
+/// a recompiled one must not be enough to run different source
 /// (`research/docs/23` §6 Step 7). Registration
 /// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
 /// so the refusal is reachable before a submission as well as inside one.
 pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
-    let module = reviewed_module(&contract.vertex_layout);
+    let Some(module) = reviewed_module(&contract.vertex_layout, &contract.color_formats) else {
+        return Err(
+            allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
+                "no reviewed module carries the {:?} shape with a {} layout",
+                contract.color_formats,
+                layout_name(&contract.vertex_layout),
+            )),
+        );
+    };
     if contract.vertex_entry != module.vertex_entry
         || contract.fragment_entry != module.fragment_entry
     {
         return Err(
             allowlist_refusal("native_render_source_not_reviewed").with_detail(format!(
-                "a {} layout compiles `{}`, which carries {:?} and {:?}",
+                "a {} layout with {:?} compiles `{}`, which carries {:?} and {:?}",
                 layout_name(&contract.vertex_layout),
+                contract.color_formats,
                 module.path,
                 module.vertex_entry,
                 module.fragment_entry,
@@ -1228,7 +1377,10 @@ fn unknown_render_pipeline(id: PipelineId) -> ProviderError {
 pub(crate) struct TraceRenderPlan<'a> {
     pub(crate) pass: &'a RenderPassDescriptor,
     pub(crate) contract: &'a RenderPipelineContract,
-    pub(crate) landing: &'a BufferView,
+    /// One landing view per colour attachment, in location order: the pool
+    /// view whose identity covers the attachment, which is the writeback
+    /// channel each attachment's texels leave through.
+    pub(crate) landings: Vec<&'a BufferView>,
     pub(crate) plan: RenderPlan<'a>,
     /// The present action hanging off this pass, if any, with its sentinel
     /// already expanded to the target's whole texel extent so the macOS
@@ -1251,17 +1403,33 @@ pub(crate) struct PresentPlan<'a> {
 }
 
 impl TraceRenderPlan<'_> {
-    /// The writeback this pass's texels become.
+    /// The writebacks this pass's per-attachment readbacks become: one
+    /// [`BufferWriteback`] per landing view, in location order.
     ///
-    /// The view identity, allocation and offset are the landing view's own, so
+    /// The view identity, allocation and offset are each landing view's own, so
     /// resource admission, lease bookkeeping and readback consumers need no
-    /// second path: the attachment lands exactly where a compute pass writing
+    /// second path: every attachment lands exactly where a compute pass writing
     /// the same view would (`research/docs/23` §6 Step 7).
+    pub(crate) fn writebacks(&self, texels: Vec<Vec<u8>>) -> Vec<BufferWriteback> {
+        self.landings
+            .iter()
+            .zip(texels)
+            .map(|(landing, bytes)| BufferWriteback {
+                view_id: landing.view_id,
+                allocation_id: landing.allocation_id,
+                offset: landing.offset,
+                bytes,
+            })
+            .collect()
+    }
+
+    /// The single writeback a present pass's one attachment becomes.
     pub(crate) fn writeback(&self, texels: Vec<u8>) -> BufferWriteback {
+        let landing = self.landings[0];
         BufferWriteback {
-            view_id: self.landing.view_id,
-            allocation_id: self.landing.allocation_id,
-            offset: self.landing.offset,
+            view_id: landing.view_id,
+            allocation_id: landing.allocation_id,
+            offset: landing.offset,
             bytes: texels,
         }
     }
@@ -1272,15 +1440,15 @@ impl TraceRenderPlan<'_> {
 /// Four decisions have to be made before the first Metal object exists, and all
 /// of them are answerable from values: the order the rails run in
 /// ([`refuse_reordered_render_reads`], whose rule core admission also states as
-/// part of the contract), the reviewed allowlist, the attachment's landing view,
-/// and the previous bytes a loading pass uploads ([`previous_bytes`]). `pool` is
-/// [`ComputeTrace::serial_resources`], the same pool the encoder binds, and
-/// `contracts` holds the render contracts the provider registered for the
-/// pipeline ids this trace names — a caller-supplied table entry is checked
-/// against those registrations in `native.rs`, where the registry lives. The
-/// pool's only job here is the attachment's landing view: a render input carries
-/// its own bytes, so the streams a draw reads are resolved from the pass itself
-/// ([`plan_vertex_input`]).
+/// part of the contract), the reviewed allowlist, each attachment's landing
+/// view, and the previous bytes a loading pass uploads ([`previous_bytes`]).
+/// `pool` is [`ComputeTrace::serial_resources`], the same pool the encoder
+/// binds, and `contracts` holds the render contracts the provider registered
+/// for the pipeline ids this trace names — a caller-supplied table entry is
+/// checked against those registrations in `native.rs`, where the registry
+/// lives. The pool's only job here is each attachment's landing view: a render
+/// input carries its own bytes, so the streams a draw reads are resolved from
+/// the pass itself ([`plan_vertex_input`]).
 pub(crate) fn plan_trace<'a>(
     trace: &'a ComputeTrace,
     pool: &'a [BufferView],
@@ -1312,46 +1480,50 @@ pub(crate) fn plan_trace<'a>(
                  vertex or index streams is not part of the first indirect increment",
             ));
         }
-        let Some(attachment) = pass.color_attachments.first() else {
-            return Err(contract_refusal(ContractError::EmptyAttachmentList));
-        };
         // An attachment that no buffer view covers has no landing rail: the
         // texels would have nowhere to go, so the pass is refused instead of
-        // being executed and dropped. The declared view is resolved before the
+        // being executed and dropped. Each declared view is resolved before its
         // load op because a loading pass reads its previous bytes from the same
         // declaration (`research/docs/23` §3.3).
-        let landing = pool
-            .iter()
-            .find(|view| {
-                view.view_id == attachment.view_id && view.allocation_id == attachment.allocation_id
-            })
-            .ok_or_else(|| {
-                capability_refusal("render_attachment_landing_unsupported")
-                    .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
-                    .with_field(
-                        "allocation",
-                        FieldValue::Unsigned(attachment.allocation_id.get()),
-                    )
-                    .with_detail(
-                        "attachment bytes land through the buffer writeback channel, \
+        let mut landings = Vec::with_capacity(pass.color_attachments.len());
+        let mut previous = Vec::with_capacity(pass.color_attachments.len());
+        for attachment in &pass.color_attachments {
+            let landing = pool
+                .iter()
+                .find(|view| {
+                    view.view_id == attachment.view_id
+                        && view.allocation_id == attachment.allocation_id
+                })
+                .ok_or_else(|| {
+                    capability_refusal("render_attachment_landing_unsupported")
+                        .with_field("view", FieldValue::Unsigned(attachment.view_id.get()))
+                        .with_field(
+                            "allocation",
+                            FieldValue::Unsigned(attachment.allocation_id.get()),
+                        )
+                        .with_detail(
+                            "attachment bytes land through the buffer writeback channel, \
                          and this trace declares no buffer view covering the attachment",
-                    )
-            })?;
-        // An offscreen `Load` uploads the bytes the declaring view owns before
-        // the pass opens. A present pass's `Load` keeps the target's own initial
-        // state, which the present path supplies, so it resolves no bytes
-        // (`research/docs/24` §3.1).
-        let previous = if pass.present.is_none() {
-            previous_bytes(attachment.load, landing)?
-        } else {
-            None
-        };
+                        )
+                })?;
+            // An offscreen `Load` uploads the bytes the declaring view owns
+            // before the pass opens. A present pass's `Load` keeps the target's
+            // own initial state, which the present path supplies, so it
+            // resolves no bytes (`research/docs/24` §3.1).
+            let bytes = if pass.present.is_none() {
+                previous_bytes(attachment.load, landing)?
+            } else {
+                None
+            };
+            landings.push(landing);
+            previous.push(bytes);
+        }
         let plan_of_pass = plan(&OffscreenRenderRequest {
             pass,
             pipeline: contract,
-            source: reviewed_module(&contract.vertex_layout).source,
+            source: reviewed_module(&contract.vertex_layout, &contract.color_formats)
+                .map_or("", |module| module.source),
             initial: previous,
-            present: pass.present.is_some(),
         })?;
         let present = pass.present.as_ref().map(|descriptor| {
             let sentinel = descriptor.target.initial.sentinel().map(|texel| {
@@ -1370,7 +1542,7 @@ pub(crate) fn plan_trace<'a>(
         planned.push(TraceRenderPlan {
             pass,
             contract,
-            landing,
+            landings,
             plan: plan_of_pass,
             present,
         });
@@ -1399,7 +1571,8 @@ pub(crate) fn merge_writebacks(
     merged.into_values().collect()
 }
 
-/// Execute one offscreen render pass and return its tightly packed texel bytes.
+/// Execute one offscreen render pass and return its tightly packed texel bytes,
+/// one readback per colour attachment in location order.
 ///
 /// Not verified on an Apple GPU: the check that would verify this encoder body
 /// is the Rust provider's own render path in a committed suite, and the macOS
@@ -1417,7 +1590,7 @@ pub(crate) fn execute_offscreen_render(
     device: &Device,
     queue: &CommandQueue,
     request: &OffscreenRenderRequest<'_>,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     let planned = plan(request)?;
     encode_offscreen_render(device, queue, &planned)
 }
@@ -1427,17 +1600,18 @@ pub(crate) fn execute_offscreen_render(
 /// Split from [`execute_offscreen_render`] so the trace path can plan once
 /// ([`plan_trace`], before the compute command buffer is committed) and then
 /// encode that same decision, instead of planning a second, possibly different,
-/// pass. The attachment is fresh per pass: it is created here and dropped with
-/// the readback, which is the offscreen shape (`research/docs/23` §6 Step 7).
+/// pass. The attachments are fresh per pass: they are created here and dropped
+/// with the readbacks, which is the offscreen shape (`research/docs/23` §6
+/// Step 7).
 #[cfg(target_os = "macos")]
 pub(crate) fn encode_offscreen_render(
     device: &Device,
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     objc::rc::autoreleasepool(|| {
-        let attachment = attachment_texture(device, planned)?;
-        encode_into_and_readback(device, queue, planned, &attachment, None)
+        let attachments = attachment_textures(device, planned)?;
+        encode_into_and_readback(device, queue, planned, &attachments, None)
     })
 }
 
@@ -1456,7 +1630,14 @@ pub(crate) fn encode_present_render(
     planned: &RenderPlan<'_>,
     target: &Texture,
 ) -> Result<Vec<u8>, ProviderError> {
-    objc::rc::autoreleasepool(|| encode_into_and_readback(device, queue, planned, target, None))
+    objc::rc::autoreleasepool(|| {
+        let readbacks =
+            encode_into_and_readback(device, queue, planned, std::slice::from_ref(target), None)?;
+        readbacks
+            .into_iter()
+            .next()
+            .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))
+    })
 }
 
 /// Encode, commit and read back one already planned offscreen pass whose
@@ -1474,7 +1655,7 @@ pub(crate) fn encode_indirect_offscreen_render(
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
     replay: &icb::IcbPlan,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     // `plan_trace` refuses an indirect draw whose pass binds streams, because
     // the replay shape this rail builds carries the pipeline state and the draw
     // counts rather than the streams a caller-held layout reads. This is the
@@ -1487,44 +1668,49 @@ pub(crate) fn encode_indirect_offscreen_render(
         ));
     }
     objc::rc::autoreleasepool(|| {
-        let attachment = attachment_texture(device, planned)?;
-        encode_into_and_readback(device, queue, planned, &attachment, Some(*replay))
+        let attachments = attachment_textures(device, planned)?;
+        encode_into_and_readback(device, queue, planned, &attachments, Some(*replay))
     })
 }
 
 /// The shared encoder body of the offscreen and present rails: build the
-/// reviewed pipeline, render the pass into `target`, wait for a terminal
-/// command-buffer status, and read the texels back.
+/// reviewed pipeline, render the pass into `targets`, wait for a terminal
+/// command-buffer status, and read every attachment's texels back.
 #[cfg(target_os = "macos")]
 fn encode_into_and_readback(
     device: &Device,
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
-    target: &Texture,
+    targets: &[Texture],
     indirect: Option<icb::IcbPlan>,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<Vec<Vec<u8>>, ProviderError> {
     let pipeline = render_pipeline_state(device, planned)?;
     // The pass descriptor is autoreleased; it only has to outlive the
     // encoder creation below.
     let pass = MetalRenderPassDescriptor::new();
-    let color = pass
-        .color_attachments()
-        .object_at(0)
-        .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))?;
-    color.set_texture(Some(target));
-    match planned.load {
-        RenderLoadAction::Clear(components) => {
-            color.set_load_action(MTLLoadAction::Clear);
-            color.set_clear_color(MTLClearColor::new(
-                components[0],
-                components[1],
-                components[2],
-                components[3],
-            ));
+    // One descriptor entry per colour location: the pass's `colorAttachments`
+    // array is indexed by location, so entry `i` carries attachment `i`'s
+    // texture and its own load/store actions.
+    for (index, (attachment, target)) in planned.attachments.iter().zip(targets).enumerate() {
+        let color = pass
+            .color_attachments()
+            .object_at(index as u64)
+            .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))?;
+        color.set_texture(Some(target));
+        match attachment.load {
+            RenderLoadAction::Clear(components) => {
+                color.set_load_action(MTLLoadAction::Clear);
+                color.set_clear_color(MTLClearColor::new(
+                    components[0],
+                    components[1],
+                    components[2],
+                    components[3],
+                ));
+            }
+            RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
         }
-        RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
+        color.set_store_action(MTLStoreAction::Store);
     }
-    color.set_store_action(MTLStoreAction::Store);
     // The command buffer and the encoder are autoreleased and the rail is
     // synchronous, so neither has to be retained: nothing here outlives this
     // pool.
@@ -1626,22 +1812,32 @@ fn encode_into_and_readback(
         return Err(resource_refusal("metal_render_command_failed")
             .with_detail(format!("command buffer ended with status {status}")));
     }
-    read_texels(target, planned)
+    targets
+        .iter()
+        .map(|target| read_texels(target, planned))
+        .collect()
 }
 
-/// The colour attachment or present target this rail renders into.
+/// The colour attachments this rail renders into, one texture per location.
 ///
 /// `usage = RenderTarget` states what the texture is for, and the shared storage
 /// mode is what makes the texels CPU-visible for the readback on the
 /// unified-memory device the provider admits — the same reason the sampled
 /// texture rail uses shared storage (`research/docs/16` §4.8).
 #[cfg(target_os = "macos")]
-fn attachment_texture(device: &Device, planned: &RenderPlan<'_>) -> Result<Texture, ProviderError> {
-    let texture = present_target_texture(device, planned.format, planned.extent)?;
-    if let Some(bytes) = planned.initial {
-        upload_texels(&texture, planned, bytes);
+fn attachment_textures(
+    device: &Device,
+    planned: &RenderPlan<'_>,
+) -> Result<Vec<Texture>, ProviderError> {
+    let mut textures = Vec::with_capacity(planned.attachments.len());
+    for attachment in &planned.attachments {
+        let texture = present_target_texture(device, attachment.format, planned.extent)?;
+        if let Some(bytes) = attachment.initial {
+            upload_texels(&texture, planned, bytes);
+        }
+        textures.push(texture);
     }
-    Ok(texture)
+    Ok(textures)
 }
 
 /// One render target texture, built for an offscreen attachment or a present
@@ -1782,14 +1978,17 @@ fn render_pipeline_state(
         }
         descriptor.set_vertex_descriptor(Some(vertex_descriptor));
     }
-    // Attachment 0 is the pass's only colour attachment, and its pixel format is
-    // the one the pipeline is compiled against (`render_targets` locations are
-    // deferred, `research/docs/23` §3.3).
-    let color = descriptor
-        .color_attachments()
-        .object_at(0)
-        .ok_or_else(|| resource_refusal("metal_render_pipeline_attachment_unavailable"))?;
-    color.set_pixel_format(metal_pixel_format(planned.format));
+    // One pipeline attachment per colour location: entry `i` states the pixel
+    // format the reviewed fragment's output `i` is compiled against, which the
+    // plan already forced to agree with the pass's attachment list
+    // (`research/docs/23` §3.3).
+    for (index, attachment) in planned.attachments.iter().enumerate() {
+        let color = descriptor
+            .color_attachments()
+            .object_at(index as u64)
+            .ok_or_else(|| resource_refusal("metal_render_pipeline_attachment_unavailable"))?;
+        color.set_pixel_format(metal_pixel_format(attachment.format));
+    }
     device
         .new_render_pipeline_state(descriptor.as_ref())
         .map_err(|error| compile_refusal("metal_render_pipeline_compile_failed").with_detail(error))
@@ -1921,8 +2120,7 @@ mod tests {
             pass,
             pipeline,
             source: REVIEWED_SOURCE,
-            initial,
-            present: false,
+            initial: vec![initial],
         }
     }
 
@@ -1950,8 +2148,7 @@ mod tests {
             pass: &pass,
             pipeline: &pipeline,
             source,
-            initial: None,
-            present: false,
+            initial: vec![None],
         };
         plan_pass(&request).map(|_| ()).unwrap_err()
     }
@@ -1963,16 +2160,19 @@ mod tests {
         let planned = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap();
         assert_eq!(planned.vertex_entry, VERTEX_ENTRY);
         assert_eq!(planned.fragment_entry, FRAGMENT_ENTRY);
-        assert_eq!(planned.format, RenderPixelFormat::Rgba8Unorm);
         assert_eq!(planned.extent, [2, 2]);
         assert_eq!(planned.viewport, [0, 0, 2, 2]);
         assert_eq!(planned.vertices, 3);
-        assert_eq!(planned.store, RenderStoreAction::Store);
+        let [attachment] = planned.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        assert_eq!(attachment.format, RenderPixelFormat::Rgba8Unorm);
+        assert_eq!(attachment.store, RenderStoreAction::Store);
         // 2x2 texels of a 4-byte format: 16 bytes, two rows of 8.
         assert_eq!(planned.texel_bytes, 16);
         assert_eq!(planned.row_pitch, 8);
-        assert_eq!(planned.initial, None);
-        let RenderLoadAction::Clear(components) = planned.load else {
+        assert_eq!(attachment.initial, None);
+        let RenderLoadAction::Clear(components) = attachment.load else {
             panic!("the milestone clears its attachment");
         };
         assert_eq!(components, [254.0 / 255.0; 4]);
@@ -2126,23 +2326,104 @@ mod tests {
         assert_eq!(error.class, ProviderErrorClass::Args);
     }
 
-    /// The MRT contract admits a dual-format pipeline over a dual-attachment
-    /// pass, but this rail executes one attachment: refuse the pass instead of
-    /// silently rendering only location 0 (wave3 R1).
+    /// The reviewed dual shape plans two attachments, one per colour location,
+    /// with the second location's texel distinct from the first's.
     #[test]
-    fn plan_refuses_a_pass_with_more_than_one_attachment() {
-        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+    fn plan_accepts_the_dual_shape_and_plans_two_attachments() {
+        let pass = dual_pass();
+        let pipeline = dual_pipeline();
+        let planned = plan(&dual_request(&pass, &pipeline)).unwrap();
+        assert_eq!(
+            planned.module_path,
+            "conformance/shaders/quad_indexed_2x2_dual.metal"
+        );
+        assert_eq!(planned.vertex_entry, QUAD_VERTEX_ENTRY);
+        assert_eq!(planned.fragment_entry, DUAL_FRAGMENT_ENTRY);
+        assert_eq!(planned.extent, [2, 2]);
+        assert_eq!(planned.vertices, 6);
+        let [first, second] = planned.attachments.as_slice() else {
+            panic!("the dual shape renders two attachments");
+        };
+        assert_eq!(first.format, RenderPixelFormat::Rgba8Unorm);
+        assert_eq!(second.format, RenderPixelFormat::Rgba8Unorm);
+        assert!(matches!(first.load, RenderLoadAction::Clear(_)));
+        assert!(matches!(second.load, RenderLoadAction::Clear(_)));
+        assert_eq!(first.store, RenderStoreAction::Store);
+        assert_eq!(second.store, RenderStoreAction::Store);
+        assert_eq!(first.initial, None);
+        assert_eq!(second.initial, None);
+        assert_eq!(planned.texel_bytes, 16);
+        assert_eq!(planned.row_pitch, 8);
+    }
+
+    /// The MRT contract admits up to four attachments, but the reviewed dual
+    /// module writes two locations: a wider pass is refused instead of being
+    /// rendered partially (wave3 R1).
+    #[test]
+    fn plan_refuses_a_pass_with_more_than_two_attachments() {
+        let mut pass = dual_pass();
         pass.color_attachments.push(pass.color_attachments[0]);
-        let mut pipeline = milestone_pipeline();
-        pipeline.color_formats = vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm];
-        pass.validate()
-            .expect("the dual-attachment pass is a legal core shape");
-        pipeline
-            .validate_against(&pass)
-            .expect("the pipeline compiles one format per location");
-        let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
-        assert_eq!(error.slug, "render_attachment_count_unsupported");
+        let mut pipeline = dual_pipeline();
+        pipeline.color_formats = vec![
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+            AttachmentFormat::Rgba8Unorm,
+        ];
+        let error = plan(&dual_request(&pass, &pipeline)).unwrap_err();
+        assert_eq!(error.slug, "render_mrt_attachment_count_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("attachments"),
+            Some(&FieldValue::Unsigned(3))
+        );
+        assert_eq!(error.fields.get("maximum"), Some(&FieldValue::Unsigned(2)));
+    }
+
+    /// Every colour location renders into the pass's one raster, so two
+    /// attachments of different extents are refused by name before the
+    /// contract's viewport rule reports the same shape as a viewport
+    /// disagreement.
+    #[test]
+    fn plan_refuses_attachments_that_disagree_about_the_extent() {
+        let mut pass = dual_pass();
+        pass.color_attachments[1].height = 1;
+        let error = plan(&dual_request(&pass, &dual_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_extent_mismatch");
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(error.fields.get("width"), Some(&FieldValue::Unsigned(2)));
+        assert_eq!(error.fields.get("height"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(
+            error.fields.get("first_height"),
+            Some(&FieldValue::Unsigned(2))
+        );
+    }
+
+    /// A present action hands its one attachment on to the target texture, so a
+    /// present pass with a second location is refused under the
+    /// single-attachment slug instead of having location 1 dropped.
+    #[test]
+    fn plan_refuses_a_present_pass_with_two_attachments() {
+        let mut pass = dual_pass();
+        pass.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(9),
+                view_id: ViewId::new(7),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: ViewId::new(7),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        let error = plan(&dual_request(&pass, &dual_pipeline())).unwrap_err();
+        assert_eq!(error.slug, "render_attachment_count_unsupported");
         assert_eq!(
             error.fields.get("attachments"),
             Some(&FieldValue::Unsigned(2))
@@ -2170,8 +2451,11 @@ mod tests {
 
         let previous = [0x11_u8; 16];
         let planned = plan_pass(&milestone_request(&pass, &pipeline, Some(&previous))).unwrap();
-        assert_eq!(planned.load, RenderLoadAction::Load);
-        assert_eq!(planned.initial, Some(previous.as_slice()));
+        let [attachment] = planned.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        assert_eq!(attachment.load, RenderLoadAction::Load);
+        assert_eq!(attachment.initial, Some(previous.as_slice()));
 
         let short = [0x11_u8; 15];
         let error = plan_pass(&milestone_request(&pass, &pipeline, Some(&short))).unwrap_err();
@@ -2190,7 +2474,7 @@ mod tests {
         let pass = milestone_pass(LoadOp::Clear(sentinel()));
         let pipeline = milestone_pipeline();
         let planned = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap();
-        let RenderLoadAction::Clear(components) = planned.load else {
+        let RenderLoadAction::Clear(components) = planned.attachments[0].load else {
             panic!("the milestone clears its attachment");
         };
         for channel in 0..4 {
@@ -2412,6 +2696,8 @@ mod tests {
     /// The reviewed quad pipeline's id: one counter with the render rail's other
     /// registration, so 3 stays the milestone's triangle.
     const QUAD_PIPELINE: PipelineId = PipelineId::new(4);
+    /// The reviewed dual pipeline's id, one counter further.
+    const DUAL_PIPELINE: PipelineId = PipelineId::new(5);
 
     /// The four NDC corners of the reviewed quad, as the 32 little-endian
     /// `float32x2` bytes the stream holds.
@@ -2673,9 +2959,212 @@ mod tests {
             pass,
             pipeline,
             source: REVIEWED_VERTEX_SOURCE,
-            initial: None,
-            present: false,
+            initial: vec![None],
         }
+    }
+
+    /// The reviewed dual pipeline contract: the indexed vertex stage plus the
+    /// two-location fragment stage, compiled against two `rgba8_unorm`
+    /// attachments.
+    fn dual_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: QUAD_VERTEX_ENTRY.to_owned(),
+            fragment_entry: DUAL_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                stride: 8,
+                attributes: vec![VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            }]),
+        }
+    }
+
+    /// The reviewed dual pass: the indexed quad's vertex stream and index
+    /// buffer, drawn into two 2x2 `rgba8_unorm` attachments.
+    fn dual_pass() -> RenderPassDescriptor {
+        let mut pass = quad_pass();
+        pass.pipeline = DUAL_PIPELINE;
+        pass.color_attachments.push(RenderAttachment {
+            view_id: ViewId::new(8),
+            allocation_id: AllocationId::new(10),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            load: LoadOp::Clear(sentinel()),
+            store: StoreOp::Store,
+        });
+        pass
+    }
+
+    /// The request the trace path builds for the reviewed dual pass.
+    fn dual_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_DUAL_SOURCE,
+            initial: vec![None, None],
+        }
+    }
+
+    /// The compute pass that declares both attachment views and both streams.
+    ///
+    /// Each attachment lands through its own view (7 in allocation 9, 8 in
+    /// allocation 10), which only a compute declaration puts into the serial
+    /// pool, so this pass is what makes both landing rails real. The two
+    /// streams are declared here as well, the same shape the quad fixture
+    /// uses.
+    fn dual_declaration_pass() -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(11),
+            buffers: vec![
+                BufferView {
+                    view_id: ViewId::new(7),
+                    metal_binding: 0,
+                    allocation_id: AllocationId::new(9),
+                    offset: 0,
+                    length: 16,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xfe; 16]),
+                },
+                BufferView {
+                    view_id: ViewId::new(8),
+                    metal_binding: 1,
+                    allocation_id: AllocationId::new(10),
+                    offset: 0,
+                    length: 16,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xfd; 16]),
+                },
+                BufferView {
+                    metal_binding: 2,
+                    ..quad_vertex_view()
+                },
+                BufferView {
+                    metal_binding: 3,
+                    ..quad_index_view()
+                },
+            ],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The dual declaration pass's compute registration: four read-only
+    /// bindings whose static footprints are exactly the views' own lengths.
+    fn dual_declaration_pipeline() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(11),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-mrt-fixture", vec![11]).unwrap(),
+                entry_name: "declares_the_render_views".to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: PipelineContract {
+                dispatch_kind: DispatchKind::ThreadsExact,
+                required_local_size: None,
+                fixed_grid: None,
+                push_constant_offset: 0,
+                push_constant_bytes: 0,
+                buffer_bindings: vec![
+                    BufferBindingContract {
+                        metal_binding: 0,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 16 },
+                    },
+                    BufferBindingContract {
+                        metal_binding: 1,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 16 },
+                    },
+                    BufferBindingContract {
+                        metal_binding: 2,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 32 },
+                    },
+                    BufferBindingContract {
+                        metal_binding: 3,
+                        access: BufferAccess::Read,
+                        footprint: FootprintProof::Static { max_bytes: 12 },
+                    },
+                ],
+                shader_capabilities: Vec::new(),
+                translator_revision: None,
+            },
+            render: None,
+        }
+    }
+
+    /// The trace-table entry of the dual registration, minted the way
+    /// `NativeMetalProvider::register_render_pipeline` mints it.
+    fn dual_table_entry() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: DUAL_PIPELINE,
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-mrt-fixture", vec![5]).unwrap(),
+                entry_name: QUAD_VERTEX_ENTRY.to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: render_table_contract(),
+            render: Some(dual_pipeline()),
+        }
+    }
+
+    /// The dual fixture's trace and resource namespace: the declaration pass,
+    /// then the dual render pass with the requested load op.
+    fn dual_trace(load: LoadOp) -> (ComputeTrace, ResourceTableSnapshot) {
+        let mut pass = dual_pass();
+        for attachment in &mut pass.color_attachments {
+            attachment.load = load;
+        }
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(3),
+            pipelines: vec![dual_declaration_pipeline(), dual_table_entry()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(dual_declaration_pass()),
+                TracePass::Render(pass),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        for (allocation, size) in [
+            (AllocationId::new(9), 16),
+            (AllocationId::new(10), 16),
+            (QUAD_VERTEX_ALLOCATION, 32),
+            (QUAD_INDEX_ALLOCATION, 12),
+        ] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(3),
+                    size,
+                })
+                .unwrap();
+        }
+        (trace, resources)
+    }
+
+    /// The registrations `plan_trace` resolves the dual trace against.
+    fn dual_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
+        BTreeMap::from([(DUAL_PIPELINE, dual_pipeline())])
     }
 
     /// Shrink a declared stream to `length` bytes, keeping the view's shape
@@ -2760,10 +3249,11 @@ mod tests {
             bits.supported_color_formats,
             SUPPORTED_COLOR_FORMATS.to_vec()
         );
-        // The rail declares one attachment while the core contract admits the
-        // MRT shape: the bit stays at the rail's own execution shape and is
-        // only ever at or below core's cap (wave3 R1).
-        assert_eq!(bits.max_color_attachments, 1);
+        // The rail declares two attachments while the core contract admits the
+        // full MRT shape: the bit stays at the rail's own execution shape —
+        // the two locations the reviewed dual module writes — and is only ever
+        // at or below core's cap (wave3 R1).
+        assert_eq!(bits.max_color_attachments, 2);
         let core_max = u32::try_from(metal_api_core::provider::MAX_COLOR_ATTACHMENTS).unwrap();
         assert_eq!(core_max, 4);
         assert!(bits.max_color_attachments <= core_max);
@@ -2879,7 +3369,10 @@ mod tests {
         );
         // The present pass keeps the target's sentinel through a `Load`, which
         // is the load op the present path can honour (`research/docs/24` §3.1).
-        assert!(matches!(planned.plan.load, RenderLoadAction::Load));
+        assert!(matches!(
+            planned.plan.attachments[0].load,
+            RenderLoadAction::Load
+        ));
     }
 
     /// The host-side half of the trace path: the plan a device-free host can
@@ -2899,15 +3392,21 @@ mod tests {
         assert_eq!(planned.plan.extent, [2, 2]);
         assert_eq!(planned.plan.texel_bytes, 16);
         assert_eq!(planned.plan.row_pitch, 8);
-        assert_eq!(planned.plan.format, RenderPixelFormat::Rgba8Unorm);
+        assert_eq!(
+            planned.plan.attachments[0].format,
+            RenderPixelFormat::Rgba8Unorm
+        );
         assert_eq!(planned.plan.vertices, 3);
-        assert_eq!(planned.plan.initial, None);
+        assert_eq!(planned.plan.attachments[0].initial, None);
         // The landing view is the declaration's own identity and range, so the
         // writeback is the one the trace asked for and no second channel is
         // invented.
-        assert_eq!(planned.landing.view_id, ViewId::new(7));
-        assert_eq!(planned.landing.allocation_id, AllocationId::new(9));
-        let writeback = planned.writeback(EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
+        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
+        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        let [writeback] = writebacks.as_slice() else {
+            panic!("the milestone attachment becomes one writeback");
+        };
         assert_eq!(writeback.view_id, ViewId::new(7));
         assert_eq!(writeback.allocation_id, AllocationId::new(9));
         assert_eq!(writeback.offset, 0);
@@ -2938,10 +3437,13 @@ mod tests {
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
         };
-        assert_eq!(planned.plan.load, RenderLoadAction::Load);
+        assert_eq!(planned.plan.attachments[0].load, RenderLoadAction::Load);
         // The declaration's 16-byte range is the tightly packed 2x2 rgba8
         // texels, so the plan carries exactly those bytes.
-        assert_eq!(planned.plan.initial, Some([0xfe; 16].as_slice()));
+        assert_eq!(
+            planned.plan.attachments[0].initial,
+            Some([0xfe; 16].as_slice())
+        );
     }
 
     /// A lease-backed declaration carries bytes this rail does not hold, so a
@@ -3412,11 +3914,95 @@ mod tests {
                 .map(|indices| indices.index_count),
             Some(6)
         );
-        assert_eq!(planned.landing.view_id, ViewId::new(7));
-        assert_eq!(planned.landing.allocation_id, AllocationId::new(9));
-        let writeback = planned.writeback(EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
+        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
+        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        let [writeback] = writebacks.as_slice() else {
+            panic!("the indexed attachment becomes one writeback");
+        };
         assert_eq!(writeback.view_id, ViewId::new(7));
         assert_eq!(writeback.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+    }
+
+    /// The trace path over the dual fixture: one landing view per colour
+    /// location, resolved from the serial pool in location order, and one
+    /// writeback per landing view when the encoder's per-attachment readbacks
+    /// come back.
+    #[test]
+    fn plan_trace_plans_the_dual_pass_with_a_landing_per_location() {
+        let (trace, _) = dual_trace(LoadOp::Clear(sentinel()));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = dual_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed dual pass plans");
+        let [planned] = planned.as_slice() else {
+            panic!("the dual trace carries one render pass");
+        };
+        assert_eq!(planned.contract, &dual_pipeline());
+        assert_eq!(planned.plan.attachments.len(), 2);
+        assert_eq!(planned.landings[0].view_id, ViewId::new(7));
+        assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
+        assert_eq!(planned.landings[1].view_id, ViewId::new(8));
+        assert_eq!(planned.landings[1].allocation_id, AllocationId::new(10));
+        let writebacks = planned.writebacks(vec![
+            EXPECTED_TEXEL_BYTES.repeat(4),
+            [0xff, 0x80, 0x40, 0xc0].repeat(4),
+        ]);
+        assert_eq!(writebacks.len(), 2);
+        assert_eq!(writebacks[0].view_id, ViewId::new(7));
+        assert_eq!(writebacks[0].bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(writebacks[1].view_id, ViewId::new(8));
+        assert_eq!(writebacks[1].bytes, [0xff, 0x80, 0x40, 0xc0].repeat(4));
+    }
+
+    /// A loading dual pass uploads each attachment's own declaring bytes: the
+    /// plan resolves the two previous-bytes entries independently, location 0
+    /// from view 7 and location 1 from view 8.
+    #[test]
+    fn plan_trace_resolves_the_previous_bytes_per_location() {
+        let (trace, _) = dual_trace(LoadOp::Load);
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = dual_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("each declaring view's own bytes are what a load uploads");
+        let [planned] = planned.as_slice() else {
+            panic!("the dual trace carries one render pass");
+        };
+        assert_eq!(planned.plan.attachments[0].load, RenderLoadAction::Load);
+        assert_eq!(
+            planned.plan.attachments[0].initial,
+            Some([0xfe; 16].as_slice())
+        );
+        assert_eq!(planned.plan.attachments[1].load, RenderLoadAction::Load);
+        assert_eq!(
+            planned.plan.attachments[1].initial,
+            Some([0xfd; 16].as_slice())
+        );
+    }
+
+    /// The lease refusal reuses `previous_bytes` per location: a lease-backed
+    /// second declaration is refused with the same slug, class and phase a
+    /// single attachment gets, naming the storage mode rather than executing
+    /// location 1 as a clear.
+    #[test]
+    fn plan_trace_refuses_a_leased_second_attachment_load() {
+        let (trace, _) = dual_trace(LoadOp::Load);
+        let mut pool = trace.serial_resources().expect("admitted serial pool");
+        let view = pool
+            .iter_mut()
+            .find(|view| {
+                view.view_id == ViewId::new(8) && view.allocation_id == AllocationId::new(10)
+            })
+            .expect("the dual trace declares the second attachment view");
+        view.source = BufferSource::StagedLease(LeaseId::new(5));
+        let contracts = dual_contracts();
+        let error = plan_trace(&trace, &pool, &contracts).unwrap_err();
+        assert_eq!(error.slug, "attachment_load_op_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
     }
 
     /// A render input carries its own bytes, so the trace does not have to
@@ -3488,28 +4074,63 @@ mod tests {
         assert_eq!(error.phase, ProviderPhase::Resolve);
     }
 
-    /// The reviewed allowlist is a pair of (module, layout): a layout that binds
-    /// streams may only compile the `[[stage_in]]` module, and a `vertex_id`
-    /// pipeline only the module whose vertex stage reads no stream. A caller
-    /// cannot pair one shape's descriptor with the other shape's source.
+    /// The reviewed allowlist is a (module, layout, colour-format list) triple:
+    /// a layout that binds streams may only compile the `[[stage_in]]` module
+    /// for one location, a `vertex_id` pipeline only the module whose vertex
+    /// stage reads no stream, and an indexed pipeline with two `rgba8_unorm`
+    /// locations only the dual module. A caller cannot pair one shape's
+    /// descriptor with another shape's source.
     #[test]
     fn a_vertex_layout_selects_the_reviewed_module() {
         let pass = quad_pass();
         let pipeline = quad_pipeline();
+        let single = [AttachmentFormat::Rgba8Unorm];
+        let dual = [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm];
 
-        assert_eq!(reviewed_module(&VertexLayout::None).source, REVIEWED_SOURCE);
         assert_eq!(
-            reviewed_module(&pipeline.vertex_layout).source,
-            REVIEWED_VERTEX_SOURCE
+            reviewed_module(&VertexLayout::None, &single).map(|module| module.source),
+            Some(REVIEWED_SOURCE)
         );
-        assert!(!reviewed_module(&VertexLayout::None).binds_buffers);
-        assert!(reviewed_module(&pipeline.vertex_layout).binds_buffers);
+        assert_eq!(
+            reviewed_module(&pipeline.vertex_layout, &single).map(|module| module.source),
+            Some(REVIEWED_VERTEX_SOURCE)
+        );
+        assert_eq!(
+            reviewed_module(&pipeline.vertex_layout, &dual).map(|module| module.source),
+            Some(REVIEWED_DUAL_SOURCE)
+        );
+        assert!(
+            !reviewed_module(&VertexLayout::None, &single)
+                .expect("the vertex_id shape is reviewed")
+                .binds_buffers
+        );
+        assert!(
+            reviewed_module(&pipeline.vertex_layout, &single)
+                .expect("the single-output stream shape is reviewed")
+                .binds_buffers
+        );
+        // A dual-format `vertex_id` contract and an indexed contract whose two
+        // formats are not both `rgba8_unorm` have no reviewed module.
+        assert!(reviewed_module(&VertexLayout::None, &dual).is_none());
+        assert!(reviewed_module(
+            &pipeline.vertex_layout,
+            &[AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm]
+        )
+        .is_none());
         assert_eq!(layout_name(&VertexLayout::None), "vertex_id");
         assert_eq!(layout_name(&pipeline.vertex_layout), "vertex-buffer");
 
-        // The reviewed contract is accepted, and so is the milestone's.
+        // The reviewed contracts are accepted, and so is the milestone's.
         assert_eq!(review_contract(&pipeline), Ok(()));
         assert_eq!(review_contract(&quad_pipeline()), Ok(()));
+        assert_eq!(review_contract(&dual_pipeline()), Ok(()));
+
+        // A dual-format `vertex_id` contract is refused by name: no reviewed
+        // module derives positions from `vertex_id` and writes two locations.
+        let mut wider = milestone_pipeline();
+        wider.color_formats = dual.to_vec();
+        let error = review_contract(&wider).unwrap_err();
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
 
         // A stream layout with the `vertex_id` module's bytes, and the reverse.
         let crossed = OffscreenRenderRequest {
@@ -3592,13 +4213,49 @@ mod tests {
             "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
         );
         assert_eq!(hex(&quad_index_bytes()), "000001000200020001000300");
-        // The two modules share one fragment entry, which is what keeps a
-        // capture from telling the draws apart by their colour.
+        // The two single-output modules share one fragment entry, which is what
+        // keeps a capture from telling the draws apart by their colour.
         assert_eq!(
             REVIEWED_MODULES[0].fragment_entry,
             REVIEWED_MODULES[1].fragment_entry
         );
         assert_eq!(REVIEWED_MODULES[0].vertex_entry, VERTEX_ENTRY);
         assert_eq!(REVIEWED_MODULES[1].vertex_entry, QUAD_VERTEX_ENTRY);
+    }
+
+    /// The dual fixture is held to the same falsifiability rules: its two
+    /// fragment outputs are byte/255 constants with no half-integer tie, and
+    /// the module carries exactly the reviewed entry pair.
+    #[test]
+    fn reviewed_dual_fixture_matches_the_expected_texel_bytes() {
+        for literal in [
+            "64.0 / 255.0",
+            "128.0 / 255.0",
+            "192.0 / 255.0",
+            "255.0 / 255.0",
+        ] {
+            assert!(
+                REVIEWED_DUAL_SOURCE.contains(literal),
+                "the dual fixture no longer writes {literal}"
+            );
+        }
+        assert!(
+            !REVIEWED_DUAL_SOURCE.contains("0.5"),
+            "the dual fixture must not carry a half-integer tie constant"
+        );
+        for entry in [QUAD_VERTEX_ENTRY, DUAL_FRAGMENT_ENTRY] {
+            assert!(
+                REVIEWED_DUAL_SOURCE.contains(entry),
+                "the dual fixture no longer carries {entry}"
+            );
+        }
+        assert!(REVIEWED_DUAL_SOURCE.contains("[[color(0)]]"));
+        assert!(REVIEWED_DUAL_SOURCE.contains("[[color(1)]]"));
+        assert_eq!(REVIEWED_MODULES[2].vertex_entry, QUAD_VERTEX_ENTRY);
+        assert_eq!(REVIEWED_MODULES[2].fragment_entry, DUAL_FRAGMENT_ENTRY);
+        assert_eq!(
+            REVIEWED_MODULES[2].path,
+            "conformance/shaders/quad_indexed_2x2_dual.metal"
+        );
     }
 }

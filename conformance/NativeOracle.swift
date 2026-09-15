@@ -207,7 +207,13 @@ private struct RenderCaseDefinition: Decodable {
     let vertex_layout: RenderVertexLayoutDefinition?
     let vertex_buffers: [RenderVertexBufferDefinition]?
     let indices: RenderIndexBufferDefinition?
-    let attachment: RenderAttachmentDefinition
+    /// The first render increments' single attachment, or `nil` for an MRT
+    /// case that declares `attachments` instead. Exactly one of the two
+    /// fields is present.
+    let attachment: RenderAttachmentDefinition?
+    /// The MRT case's attachment list, in location order; mutually exclusive
+    /// with `attachment`.
+    let attachments: [RenderAttachmentDefinition]?
     let expected_hex: String
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
@@ -221,7 +227,8 @@ private struct RenderCaseDefinition: Decodable {
 private struct ValidatedRender {
     let definition: RenderCaseDefinition
     let source: String
-    let attachment: ValidatedRenderAttachment
+    /// One entry per colour attachment, in location order.
+    let attachments: [ValidatedRenderAttachment]
     /// One entry per bound vertex stream, in binding order, with the bytes the
     /// case's own views carry. Empty for the `vertex_id` shape.
     let vertexStreams: [ValidatedVertexStream]
@@ -394,6 +401,7 @@ private struct Options {
     let renderSelfTest: Bool
     let presentSelfTest: Bool
     let vertexSelfTest: Bool
+    let mrtSelfTest: Bool
     let heapSelfTest: Bool
 }
 
@@ -404,6 +412,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --render-selftest
        native-metal-oracle --present-selftest
        native-metal-oracle --vertex-selftest
+       native-metal-oracle --mrt-selftest
        native-metal-oracle --heap-selftest
        native-metal-oracle --help
 
@@ -432,6 +441,12 @@ buffer are bound through an MTLVertexDescriptor and drawn with
 drawIndexedPrimitives, and the report fails unless all four texels read back as
 the reviewed fragment output rather than the clear sentinel. It cannot be
 combined with other options.
+--mrt-selftest needs no suite: it captures the reviewed dual-output 2x2 quad,
+resolving the dual module (shaders/quad_indexed_2x2_dual.metal) relative to the
+current working directory. The same stream and index buffer as --vertex-selftest
+are drawn into two colour attachments, and the report fails unless location 0
+reads back 4080c0ff and location 1 ff8040c0, never the clear sentinel. It cannot
+be combined with other options.
 --heap-selftest needs no suite: it allocates two reviewed heap buffers from one
 MTLHeap, records their heap offsets, runs the reviewed copy_word kernel across
 the pair, and reports the copied bytes. It fails unless both buffers are in the
@@ -449,6 +464,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var renderSelfTest = false
     var presentSelfTest = false
     var vertexSelfTest = false
+    var mrtSelfTest = false
     var heapSelfTest = false
     var index = 0
     while index < arguments.count {
@@ -487,6 +503,10 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!vertexSelfTest, "Duplicate --vertex-selftest option")
             vertexSelfTest = true
             index += 1
+        case "--mrt-selftest":
+            try require(!mrtSelfTest, "Duplicate --mrt-selftest option")
+            mrtSelfTest = true
+            index += 1
         case "--heap-selftest":
             try require(!heapSelfTest, "Duplicate --heap-selftest option")
             heapSelfTest = true
@@ -496,39 +516,46 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !heapSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !heapSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, --mrt-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: true, presentSelfTest: false, vertexSelfTest: false,
-                       heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !heapSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, --mrt-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: true, vertexSelfTest: false,
-                       heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false)
     }
     if vertexSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
-                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !mrtSelfTest && !heapSelfTest,
+                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, --mrt-selftest, or --heap-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: true,
-                       heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false)
+    }
+    if mrtSelfTest {
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
+                    "--mrt-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       mrtSelfTest: true, heapSelfTest: false)
     }
     if heapSelfTest {
         try require(suite == nil && output == nil && !validateOnly,
                     "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       heapSelfTest: true)
+                       mrtSelfTest: false, heapSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -538,7 +565,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
                    renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                   heapSelfTest: false)
+                   mrtSelfTest: false, heapSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -1082,11 +1109,58 @@ private func reviewedIndexedModule() -> ReviewedRenderModule {
                                                           format: "float32x2")])])
 }
 
-/// The reviewed module a render case's vertex-input shape selects, mirroring
-/// `crates/metal-api-native/src/render.rs::reviewed_module`: a `vertex_id` case
-/// draws the triangle module, a case that carries a layout the indexed one.
-private func reviewedModule(for definition: RenderCaseDefinition) -> ReviewedRenderModule {
-    definition.vertex_layout == nil ? reviewedRenderModule() : reviewedIndexedModule()
+/// The reviewed dual MRT fixture (wave3 R1): the indexed vertex stage plus a
+/// fragment stage that writes two colour outputs, compiled against two 2x2
+/// `rgba8_unorm` attachments. The second output's texel `ff 80 40 c0` is
+/// deliberately the single-output texel with its byte order reversed, so a
+/// capture that swapped the two locations reads the wrong bytes.
+private func reviewedDualModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_quad_vertex",
+        fragment_entry: "render_solid_rgba8_dual",
+        metal: RenderSourcePin(path: "shaders/quad_indexed_2x2_dual.metal",
+                               sha256: "5afc95dd177ba64e3d2e115ab84805fad2b56a7450914a0ab6f8572f26ba7eba"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 8,
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x2")])])
+}
+
+/// The reviewed module a render case's vertex-input and colour-format shapes
+/// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
+/// a `vertex_id` single-attachment case draws the triangle module, a
+/// single-attachment case with a layout the indexed one, and an indexed case
+/// with two `rgba8_unorm` attachments the dual one. A shape no module was
+/// reviewed for is refused instead of matched approximately.
+private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
+    let attachments = try colorAttachments(definition)
+    switch (definition.vertex_layout, attachments.count) {
+    case (nil, 1):
+        return reviewedRenderModule()
+    case (_?, 1):
+        return reviewedIndexedModule()
+    case (_?, 2) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+        return reviewedDualModule()
+    default:
+        throw OracleError("\(definition.id): no reviewed module carries this "
+                          + "vertex-input and colour-format shape")
+    }
+}
+
+/// The colour attachments a render case declares: the single `attachment`
+/// field or the MRT `attachments` list, never both and never neither.
+private func colorAttachments(_ definition: RenderCaseDefinition) throws -> [RenderAttachmentDefinition] {
+    switch (definition.attachment, definition.attachments) {
+    case (let single?, nil):
+        return [single]
+    case (nil, let many?):
+        try require(!many.isEmpty, "\(definition.id): the attachment list is empty")
+        return many
+    case (nil, nil):
+        throw OracleError("\(definition.id): exactly one of attachment and attachments is required")
+    case (_?, _?):
+        throw OracleError("\(definition.id): attachment and attachments are mutually exclusive")
+    }
 }
 
 /// The `MTLVertexFormat` one contract format spelling names
@@ -1138,7 +1212,7 @@ private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [Val
 @available(macOS 11.0, *)
 private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 root: URL) throws -> ValidatedRender {
-    let reviewed = reviewedModule(for: definition)
+    let reviewed = try reviewedModule(for: definition)
     try require(definition.vertex_entry == reviewed.vertex_entry
                 && definition.fragment_entry == reviewed.fragment_entry
                 && definition.metal == reviewed.metal,
@@ -1234,109 +1308,126 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         throw OracleError("\(definition.id): a vertex layout, its bindings and the index "
                           + "buffer are declared together")
     }
-    let attachment = definition.attachment
-    try require(attachment.format == "rgba8_unorm",
-                "\(definition.id): unsupported attachment format")
-    try require(attachment.width == 2 && attachment.height == 2,
-                "\(definition.id): the first render increment renders into a 2x2 attachment")
-    try require(attachment.allocation > 0 && attachment.view > 0,
-                "\(definition.id): zero attachment identity")
-    try require(attachment.store == "store",
-                "\(definition.id): the attachment has to be stored for a byte comparison")
-    try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
-                "\(definition.id): the viewport must cover the attachment")
-    let byteCount = attachment.width * attachment.height * 4
+    let attachments = try colorAttachments(definition)
     let expected = try decodeHex(definition.expected_hex, context: "\(definition.id) expected texels")
-    try require(expected.count == byteCount,
-                "\(definition.id): expected texel bytes do not match the attachment")
-    // What a drawn texel has to be depends on what the pass started from. A
-    // clearing pass has nothing to preserve, so every texel has to be the same
-    // fragment output (`research/docs/23` §1.3) — a partially covered
-    // attachment cannot be asserted as correct. A loading pass deliberately
-    // keeps the bytes it was handed wherever the draw missed, so its
-    // expectation is classified once the previous bytes are decoded, below.
-    let texel = Data(expected.prefix(4))
-    var texels = 0
-    if attachment.load == "clear" {
-        for offset in stride(from: 0, to: expected.count, by: 4) {
-            try require(Data(expected[offset..<(offset + 4)]) == texel,
-                        "\(definition.id): the milestone expects every texel to equal the fragment output")
-            texels += 1
+    var validatedAttachments = [ValidatedRenderAttachment]()
+    var expectedOffset = 0
+    for attachment in attachments {
+        try require(attachment.format == "rgba8_unorm",
+                    "\(definition.id): unsupported attachment format")
+        try require(attachment.width == 2 && attachment.height == 2,
+                    "\(definition.id): the first render increment renders into a 2x2 attachment")
+        try require(attachment.allocation > 0 && attachment.view > 0,
+                    "\(definition.id): zero attachment identity")
+        try require(attachment.store == "store",
+                    "\(definition.id): the attachment has to be stored for a byte comparison")
+        try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
+                    "\(definition.id): the viewport must cover the attachment")
+        let byteCount = attachment.width * attachment.height * 4
+        try require(expectedOffset + byteCount <= expected.count,
+                    "\(definition.id): expected texel bytes do not cover every attachment")
+        let texels = Data(expected[expectedOffset..<(expectedOffset + byteCount)])
+        expectedOffset += byteCount
+        // What a drawn texel has to be depends on what the pass started from.
+        // A clearing pass has nothing to preserve, so every texel has to be the
+        // same fragment output (`research/docs/23` §1.3) — a partially covered
+        // attachment cannot be asserted as correct. A loading pass deliberately
+        // keeps the bytes it was handed wherever the draw missed, so its
+        // expectation is classified once the previous bytes are decoded, below.
+        let texel = Data(texels.prefix(4))
+        var texelCount = 0
+        if attachment.load == "clear" {
+            for offset in stride(from: 0, to: texels.count, by: 4) {
+                try require(Data(texels[offset..<(offset + 4)]) == texel,
+                            "\(definition.id): the milestone expects every texel to equal the fragment output")
+                texelCount += 1
+            }
+        } else {
+            texelCount = texels.count / 4
         }
-    } else {
-        texels = expected.count / 4
+        try require(texelCount == attachment.width * attachment.height,
+                    "\(definition.id): attachment texel count mismatch")
+        let clearComponents: [Double]
+        let initial: Data?
+        switch attachment.load {
+        case "clear":
+            guard let clearHex = attachment.clear_hex else {
+                throw OracleError("\(definition.id): a clear attachment needs clear_hex")
+            }
+            let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+            try require(clearBytes.count == 4, "\(definition.id): a clear colour is four bytes")
+            // The sentinel has to be distinguishable from the fragment output,
+            // or a pass that never ran would satisfy the expectation.
+            try require(clearBytes != texel,
+                        "\(definition.id): the clear colour equals the expected texel")
+            try require(attachment.initial_hex == nil,
+                        "\(definition.id): a cleared attachment carries no initial bytes")
+            clearComponents = [Double(clearBytes[0]) / 255.0, Double(clearBytes[1]) / 255.0,
+                               Double(clearBytes[2]) / 255.0, Double(clearBytes[3]) / 255.0]
+            initial = nil
+        case "load":
+            guard let initialHex = attachment.initial_hex else {
+                throw OracleError("\(definition.id): a loaded attachment needs its previous texels")
+            }
+            let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
+            try require(previous.count == byteCount,
+                        "\(definition.id): initial texels do not match the attachment")
+            try require(previous != texels,
+                        "\(definition.id): the initial texels equal the expectation")
+            // Partial coverage, in both directions: every texel is either the
+            // byte the load handed it or the pass's fragment output, every
+            // drawn texel carries the *same* output, and both halves appear
+            // (`docs/23` §3.3).
+            var drawn: Data? = nil
+            var drawnCount = 0
+            for offset in stride(from: 0, to: texels.count, by: 4) {
+                let chunk = Data(texels[offset..<(offset + 4)])
+                let previousChunk = Data(previous[offset..<(offset + 4)])
+                if chunk == previousChunk {
+                    continue
+                }
+                if let drawn {
+                    try require(chunk == drawn,
+                                "\(definition.id): drawn texels disagree about the fragment output")
+                } else {
+                    drawn = chunk
+                }
+                drawnCount += 1
+            }
+            // The suite comparator additionally requires at least one *kept*
+            // texel, because a loading case whose draw covers everything cannot
+            // show that the load happened (`conformance/compare.py`). This
+            // oracle's own self-test fixtures are deliberately that shape — the
+            // present self-test exists to show the sentinel was replaced, not
+            // to falsify the load — so the oracle only insists that something
+            // was drawn here and leaves the falsifiability rule to the
+            // comparator and to the suite fixtures.
+            try require(drawnCount > 0,
+                        "\(definition.id): a loaded attachment needs at least one drawn texel")
+            clearComponents = []
+            initial = previous
+        default:
+            throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
+        }
+        validatedAttachments.append(ValidatedRenderAttachment(
+            allocation: attachment.allocation, view: attachment.view,
+            width: attachment.width, height: attachment.height,
+            load: attachment.load, clearComponents: clearComponents,
+            initial: initial, expected: texels))
     }
-    try require(texels == attachment.width * attachment.height,
-                "\(definition.id): attachment texel count mismatch")
-    let clearComponents: [Double]
-    let initial: Data?
-    switch attachment.load {
-    case "clear":
-        guard let clearHex = attachment.clear_hex else {
-            throw OracleError("\(definition.id): a clear attachment needs clear_hex")
-        }
-        let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
-        try require(clearBytes.count == 4, "\(definition.id): a clear colour is four bytes")
-        // The sentinel has to be distinguishable from the fragment output, or a
-        // pass that never ran would satisfy the expectation.
-        try require(clearBytes != texel,
-                    "\(definition.id): the clear colour equals the expected texel")
-        try require(attachment.initial_hex == nil,
-                    "\(definition.id): a cleared attachment carries no initial bytes")
-        clearComponents = [Double(clearBytes[0]) / 255.0, Double(clearBytes[1]) / 255.0,
-                           Double(clearBytes[2]) / 255.0, Double(clearBytes[3]) / 255.0]
-        initial = nil
-    case "load":
-        guard let initialHex = attachment.initial_hex else {
-            throw OracleError("\(definition.id): a loaded attachment needs its previous texels")
-        }
-        let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
-        try require(previous.count == byteCount,
-                    "\(definition.id): initial texels do not match the attachment")
-        try require(previous != expected,
-                    "\(definition.id): the initial texels equal the expectation")
-        // Partial coverage, in both directions: every texel is either the byte
-        // the load handed it or the pass's fragment output, every drawn texel
-        // carries the *same* output, and both halves appear (`docs/23` §3.3).
-        var drawn: Data? = nil
-        var drawnCount = 0
-        var keptCount = 0
-        for offset in stride(from: 0, to: expected.count, by: 4) {
-            let chunk = Data(expected[offset..<(offset + 4)])
-            let previousChunk = Data(previous[offset..<(offset + 4)])
-            if chunk == previousChunk {
-                keptCount += 1
-                continue
-            }
-            if let drawn {
-                try require(chunk == drawn,
-                            "\(definition.id): drawn texels disagree about the fragment output")
-            } else {
-                drawn = chunk
-            }
-            drawnCount += 1
-        }
-        // The suite comparator additionally requires at least one *kept* texel,
-        // because a loading case whose draw covers everything cannot show that
-        // the load happened (`conformance/compare.py`). This oracle's own
-        // self-test fixtures are deliberately that shape — the present
-        // self-test exists to show the sentinel was replaced, not to falsify
-        // the load — so the oracle only insists that something was drawn here
-        // and leaves the falsifiability rule to the comparator and to the
-        // suite fixtures.
-        try require(drawnCount > 0,
-                    "\(definition.id): a loaded attachment needs at least one drawn texel")
-        clearComponents = []
-        initial = previous
-    default:
-        throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
+    try require(expectedOffset == expected.count,
+                "\(definition.id): expected texel bytes exceed the attachments")
+    // The two reviewed MRT locations write two different byte strings, so a
+    // cleared dual case whose locations read back the same texel could not
+    // show that both outputs landed (`4080c0ff` vs `ff8040c0`).
+    if validatedAttachments.count > 1
+        && validatedAttachments[0].load == "clear"
+        && validatedAttachments[1].load == "clear"
+        && validatedAttachments[0].expected.prefix(4) == validatedAttachments[1].expected.prefix(4) {
+        throw OracleError("\(definition.id): the two locations read back the same texel")
     }
     return ValidatedRender(definition: definition, source: source,
-                           attachment: ValidatedRenderAttachment(
-                               allocation: attachment.allocation, view: attachment.view,
-                               width: attachment.width, height: attachment.height,
-                               load: attachment.load, clearComponents: clearComponents,
-                               initial: initial, expected: expected),
+                           attachments: validatedAttachments,
                            vertexStreams: vertexStreams, indexStream: indexStream)
 }
 
@@ -1641,31 +1732,35 @@ private func makeStreamBuffer(device: MTLDevice, id: String,
 private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                            queue: MTLCommandQueue) throws -> CaseResult {
     let definition = fixture.definition
-    let attachment = fixture.attachment
-    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .rgba8Unorm,
-        width: attachment.width,
-        height: attachment.height,
-        mipmapped: false)
-    // The attachment is a render target, not a sampled source. Shared storage is
-    // what makes its texels CPU-visible for the readback on the unified-memory
-    // device this oracle requires, the same reason the sampled texture rail uses
-    // it (`research/docs/16` §4.8).
-    descriptor.usage = .renderTarget
-    descriptor.storageMode = .shared
-    guard let target = device.makeTexture(descriptor: descriptor) else {
-        throw OracleError("\(definition.id): cannot allocate the colour attachment")
-    }
-    target.label = "native oracle: \(definition.id)"
-    if let initial = attachment.initial {
-        initial.withUnsafeBytes { bytes in
-            if let source = bytes.baseAddress {
-                target.replace(region: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
-                               mipmapLevel: 0,
-                               withBytes: source,
-                               bytesPerRow: attachment.width * 4)
+    // One texture per colour attachment, in location order. The attachments are
+    // render targets, not sampled sources. Shared storage is what makes their
+    // texels CPU-visible for the readback on the unified-memory device this
+    // oracle requires, the same reason the sampled texture rail uses it
+    // (`research/docs/16` §4.8).
+    var targets = [MTLTexture]()
+    for attachment in fixture.attachments {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: attachment.width,
+            height: attachment.height,
+            mipmapped: false)
+        descriptor.usage = .renderTarget
+        descriptor.storageMode = .shared
+        guard let target = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the colour attachment")
+        }
+        target.label = "native oracle: \(definition.id)"
+        if let initial = attachment.initial {
+            initial.withUnsafeBytes { bytes in
+                if let source = bytes.baseAddress {
+                    target.replace(region: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
+                                   mipmapLevel: 0,
+                                   withBytes: source,
+                                   bytesPerRow: attachment.width * 4)
+                }
             }
         }
+        targets.append(target)
     }
     // The two stage entries come from the one reviewed module; `loadSuite`
     // already proved the identity, so only the lookup can still fail.
@@ -1719,31 +1814,36 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         pipelineDescriptor.vertexDescriptor = vertexDescriptor
     }
-    // Attachment 0 is the only colour attachment the first increment admits, and
-    // its pixel format is the one the reviewed fragment was written for.
-    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+    // One pipeline attachment per colour location: entry `i` states the pixel
+    // format the reviewed fragment's output `i` is compiled against, which the
+    // validation above already forced to agree with the case's attachment list.
+    for index in 0..<fixture.attachments.count {
+        pipelineDescriptor.colorAttachments[index].pixelFormat = .rgba8Unorm
+    }
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
     let pass = MTLRenderPassDescriptor()
-    // `colorAttachments[0]` is an implicitly unwrapped optional on the Swift
+    // `colorAttachments[i]` is an implicitly unwrapped optional on the Swift
     // side of Metal, but referencing a member before unwrapping is a compile
-    // error under `-warnings-as-errors`; unwrap it once, explicitly.
-    guard let color = pass.colorAttachments[0] else {
-        throw OracleError("\(definition.id): cannot reach the colour attachment descriptor")
-    }
-    color.texture = target
-    color.storeAction = .store
-    if attachment.load == "clear" {
-        color.loadAction = .clear
-        guard attachment.clearComponents.count == 4 else {
-            throw OracleError("\(definition.id): a clear colour is four components")
+    // error under `-warnings-as-errors`; unwrap each entry explicitly.
+    for (index, attachment) in fixture.attachments.enumerated() {
+        guard let color = pass.colorAttachments[index] else {
+            throw OracleError("\(definition.id): cannot reach colour attachment \(index)")
         }
-        color.clearColor = MTLClearColor(red: attachment.clearComponents[0],
-                                         green: attachment.clearComponents[1],
-                                         blue: attachment.clearComponents[2],
-                                         alpha: attachment.clearComponents[3])
-    } else {
-        color.loadAction = .load
+        color.texture = targets[index]
+        color.storeAction = .store
+        if attachment.load == "clear" {
+            color.loadAction = .clear
+            guard attachment.clearComponents.count == 4 else {
+                throw OracleError("\(definition.id): a clear colour is four components")
+            }
+            color.clearColor = MTLClearColor(red: attachment.clearComponents[0],
+                                             green: attachment.clearComponents[1],
+                                             blue: attachment.clearComponents[2],
+                                             alpha: attachment.clearComponents[3])
+        } else {
+            color.loadAction = .load
+        }
     }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
@@ -1758,8 +1858,8 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // The viewport is explicit because the contract carries it, even though the
     // first increment only accepts the attachment-covering default.
     encoder.setViewport(MTLViewport(originX: 0, originY: 0,
-                                    width: Double(attachment.width),
-                                    height: Double(attachment.height),
+                                    width: Double(fixture.attachments[0].width),
+                                    height: Double(fixture.attachments[0].height),
                                     znear: 0, zfar: 1))
     // The streams are bound at the same indices the descriptor names, and they
     // stay alive until the command buffer has completed (the buffers array is
@@ -1799,23 +1899,30 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     try require(commandBuffer.status == .completed && commandBuffer.error == nil,
                 "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
 
-    var observed = Data(count: attachment.width * attachment.height * 4)
-    observed.withUnsafeMutableBytes { bytes in
-        if let destination = bytes.baseAddress {
-            target.getBytes(destination,
-                            bytesPerRow: attachment.width * 4,
-                            from: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
-                            mipmapLevel: 0)
+    var writebacks = [Writeback]()
+    var allocations = [AllocationResult]()
+    for (index, attachment) in fixture.attachments.enumerated() {
+        var observed = Data(count: attachment.width * attachment.height * 4)
+        observed.withUnsafeMutableBytes { bytes in
+            if let destination = bytes.baseAddress {
+                targets[index].getBytes(destination,
+                                        bytesPerRow: attachment.width * 4,
+                                        from: MTLRegionMake2D(0, 0, attachment.width, attachment.height),
+                                        mipmapLevel: 0)
+            }
         }
+        try require(observed == attachment.expected,
+                    "\(definition.id): attachment \(index) bytes \(hex(observed)) do not match "
+                    + "the reviewed expectation \(hex(attachment.expected))")
+        // One writeback and one allocation per attachment, both the
+        // attachment's own texels.
+        writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
+                                    offset: 0, bytes_hex: hex(observed)))
+        allocations.append(AllocationResult(allocation: attachment.allocation,
+                                             bytes_hex: hex(observed)))
     }
-    try require(observed == attachment.expected,
-                "\(definition.id): attachment bytes \(hex(observed)) do not match the reviewed expectation \(hex(attachment.expected))")
-    // One allocation, one writeback: the attachment's own texels.
     return CaseResult(id: definition.id, completion: "CompletedVisible",
-                      writebacks: [Writeback(allocation: attachment.allocation, view: attachment.view,
-                                             offset: 0, bytes_hex: hex(observed))],
-                      allocations: [AllocationResult(allocation: attachment.allocation,
-                                                     bytes_hex: hex(observed))])
+                      writebacks: writebacks, allocations: allocations)
 }
 
 /// The milestone's own render fixture, constructed in code.
@@ -1848,6 +1955,7 @@ private func renderSelfTest() throws -> CaseResult {
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
             clear_hex: "fefefefe", initial_hex: nil),
+        attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
@@ -1903,6 +2011,7 @@ private func presentSelfTest() throws -> CaseResult {
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "load", store: "store",
             clear_hex: nil, initial_hex: hex(sentinel)),
+        attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
@@ -1982,6 +2091,7 @@ private func vertexSelfTest() throws -> CaseResult {
             allocation: 900, view: 910, format: "rgba8_unorm",
             width: 2, height: 2, load: "clear", store: "store",
             clear_hex: "fefefefe", initial_hex: nil),
+        attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
@@ -1998,6 +2108,89 @@ private func vertexSelfTest() throws -> CaseResult {
         throw OracleError("Cannot create a Metal command queue")
     }
     diagnostic("native vertex self-test: device=\(device.name) platform=\(eligibility.platform)")
+    return try runRenderCase(fixture, device: device, queue: queue)
+}
+
+/// The MRT milestone's own fixture, constructed in code.
+///
+/// This is the one-device check the native provider's dual-output bits point at
+/// (`conformance/RENDER-CAPTURE.md` §10): the reviewed dual module, the same
+/// indexed quad's `float32x2` stream and `uint16` indices as `--vertex-selftest`,
+/// drawn through an `MTLRenderPassDescriptor` whose `colorAttachments[0..2]`
+/// each carry their own 2x2 `rgba8Unorm` texture and clear/store actions. The
+/// fragment writes `4080c0ff` to location 0 and `ff8040c0` to location 1, and
+/// the report fails unless each attachment reads back its own texel instead of
+/// the `fefefefe` clear sentinel. The pass counts as observed only once a runner
+/// reusing `conformance/run_native.py::validate_mrt_selftest` prints
+/// `mrt_selftest: PASS (4080c0ff ff8040c0)`.
+@available(macOS 11.0, *)
+private func mrtSelfTest() throws -> CaseResult {
+    let reviewed = reviewedDualModule()
+    // The four NDC corners, `float32x2` little-endian: (-1,-1), (1,-1), (-1,1),
+    // (1,1). The same 32 bytes the vertex self-test and `render.rs`'s fixture
+    // build.
+    let vertices = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+    ])
+    // The six `uint16` indices (0,1,2) and (2,1,3): the two triangles that
+    // cover the whole square, 12 bytes.
+    let indices = Data([
+        0x00, 0x00, 0x01, 0x00, 0x02, 0x00,
+        0x02, 0x00, 0x01, 0x00, 0x03, 0x00,
+    ])
+    let definition = RenderCaseDefinition(
+        id: "mrt_dual_output_2x2",
+        declaring_case: "",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        // `vertices` is the index count in the indexed shape.
+        vertices: 6,
+        viewport: [0, 0, 2, 2],
+        vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
+        vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
+                                                      length: UInt64(vertices.count),
+                                                      initial_hex: hex(vertices))],
+        indices: RenderIndexBufferDefinition(allocation: 960, view: 970, offset: 0,
+                                             length: UInt64(indices.count),
+                                             initial_hex: hex(indices),
+                                             format: "uint16"),
+        attachment: nil,
+        // Two attachments, in location order: allocation 900/view 910 is
+        // location 0, allocation 901/view 911 is location 1. Both are cleared
+        // with the sentinel, which neither location's texel equals.
+        attachments: [
+            RenderAttachmentDefinition(
+                allocation: 900, view: 910, format: "rgba8_unorm",
+                width: 2, height: 2, load: "clear", store: "store",
+                clear_hex: "fefefefe", initial_hex: nil),
+            RenderAttachmentDefinition(
+                allocation: 901, view: 911, format: "rgba8_unorm",
+                width: 2, height: 2, load: "clear", store: "store",
+                clear_hex: "fefefefe", initial_hex: nil),
+        ],
+        // Location 0 first, then location 1: the fixture's own byte strings,
+        // spelled the way `validate_mrt_selftest` compares them.
+        expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff"
+            + "ff8040c0ff8040c0ff8040c0ff8040c0",
+        // The self-test runs on this rail by construction; the marker is the
+        // same one a suite would name for it.
+        capture_rails: ["native-metal"])
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fixture = try validateRenderCase(definition, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the MRT self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native MRT self-test: device=\(device.name) platform=\(eligibility.platform)")
     return try runRenderCase(fixture, device: device, queue: queue)
 }
 
@@ -2246,6 +2439,15 @@ do {
         // own vertex stream and index buffer instead of `vertex_id`, never the
         // `fe` clear sentinel (`research/docs/23` §6 Step 3.3).
         let result = try vertexSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.mrtSelfTest {
+        // The MRT milestone's one-device check: the reported bytes are the
+        // evidence, location 0's four `40 80 c0 ff` texels and location 1's
+        // four `ff 80 40 c0` texels, never the `fe` clear sentinel
+        // (`conformance/RENDER-CAPTURE.md` §10).
+        let result = try mrtSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

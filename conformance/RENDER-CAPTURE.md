@@ -678,3 +678,84 @@ offscreen loading capture of its own has not been run there yet. That is the
 half the increment still owes: the Rust provider executes an offscreen loading
 pass end to end once a trace declares `Load` with a view whose bytes it owns,
 but no committed suite or self-test captures that shape on an Apple GPU today.
+
+## 10. The MRT milestone (`--mrt-selftest`, dual colour outputs)
+
+The MRT increment (wave3 R1) lets one render pass carry two colour attachments
+whose texels come from two `[[color(n)]]` outputs of one reviewed fragment
+stage. The core contract already carried the shape (`color_formats` is a list,
+`MAX_COLOR_ATTACHMENTS` is 4); what this increment adds on the native rail is
+the execution of two of those locations and the capability bit that admits
+exactly that.
+
+The reviewed fixture is `conformance/shaders/quad_indexed_2x2_dual.metal`
+(SHA-256 `5afc95dd177ba64e3d2e115ab84805fad2b56a7450914a0ab6f8572f26ba7eba`):
+the same `render_quad_vertex` vertex stage as `quad_indexed_2x2.metal`, and a
+fragment stage `render_solid_rgba8_dual` that returns a two-member struct,
+`[[color(0)]]` the vertex-input texel and `[[color(1)]]` the byte-reversed
+texel. Both are byte/255 constants, so an 8-bit UNORM attachment stores
+location 0 as `4080c0ff` and location 1 as `ff8040c0`, and neither equals the
+`fefefefe` clear sentinel. The pin is byte-exact in both
+`crates/metal-api-native/src/render.rs` (`REVIEWED_DUAL_SOURCE`) and
+`conformance/NativeOracle.swift` (`reviewedDualModule()`).
+
+What the host-side plan pins, before a device exists:
+
+* module selection is now the `(VertexLayout, color_formats)` pair, not the
+  layout alone. A single output keeps the two pre-existing modules byte for
+  byte, so the earlier milestones' captures cannot drift; an indexed pipeline
+  with `[Rgba8Unorm, Rgba8Unorm]` selects only the dual module; every other
+  two-format list, a `vertex_id` pipeline with two locations and any wider
+  list have no reviewed module and are refused with
+  `native_render_source_not_reviewed`;
+* `MAX_COLOR_ATTACHMENTS` is 2 and `capability_bits()` publishes it, so core
+  admission admits a two-attachment pass and refuses a wider one with
+  `color_attachment_limit`. The rail's own `plan` keeps the same boundary as
+  defense in depth: three or more attachments are
+  `render_mrt_attachment_count_unsupported` (Capability, Resolve), with the
+  fields `attachments` and `maximum: 2`, instead of rendering two locations
+  and dropping the rest;
+* every attachment of one pass has to share an extent, because Metal renders
+  all locations into one raster. A disagreement is refused before the
+  contract's viewport rule (which would report the same shape only as a
+  viewport mismatch) with `render_attachment_extent_mismatch` (Args, Resolve),
+  naming the attachment index and both extents;
+* `plan_trace` resolves one landing view and one previous-bytes entry per
+  attachment, reusing `previous_bytes` unchanged, so a loading dual pass
+  uploads each attachment's own declaring view and a lease-backed declaration
+  is refused per location with `attachment_load_op_unsupported`. A present
+  pass still hands exactly one attachment to its target, so a present action
+  with two locations is refused with `render_attachment_count_unsupported`;
+* the macOS encoder body sets `colorAttachments[0..N]` with one texture and
+  one load/store pair per location, compiles one pipeline attachment per
+  location, and after `wait` reads every attachment back through the existing
+  `read_texels` path — the returned `copy_out` count equals the attachment
+  count — and `TraceRenderPlan::writebacks` turns each readback into the
+  writeback of that attachment's own landing view.
+
+The one-device check is `--mrt-selftest`: fixture id `mrt_dual_output_2x2`,
+the vertex self-test's stream and six `uint16` indices, two 2x2 `rgba8_unorm`
+attachments (allocation 900/view 910 and allocation 901/view 911), both
+cleared with `fefefefe`. The report has to be `CompletedVisible` with one
+writeback and one allocation per location, location 0 `4080c0ff` four times
+and location 1 `ff8040c0` four times. The comparison lives in
+`conformance/run_native.py::validate_mrt_selftest` — the function the CI step
+reuses — and `test_run_native.py` pins it on a host without Metal, including
+the negative case that the plain `--render-selftest` report (same location-0
+bytes, no second location) must not pass.
+
+Not yet achieved, and therefore still a condition rather than an observation:
+
+* no Apple CI run of `--mrt-selftest` has been committed yet, so the dual
+  fragment module has not been compiled or drawn on an Apple GPU; the Rust
+  provider's two-attachment encoder body has likewise never executed there
+  (`cargo check --target aarch64-apple-darwin` is the compile evidence today,
+  not execution evidence);
+* no suite fixture carries the `attachments` list yet: the oracle decodes and
+  validates it, but only the self-test reaches `runRenderCase` with two
+  attachments, and the suite-side wiring (a suite-v18 fixture, `compare.py`'s
+  per-attachment comparison and the suite markers) is the M4/main-agent step,
+  not this rail's;
+* the flip of `max_color_attachments` to 2 is host-side evidence alone until
+  that Apple run is green; before the flip the same two-attachment trace was
+  refused by admission, and the unit tests keep that pre-flip snapshot pinned.
