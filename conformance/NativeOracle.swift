@@ -202,6 +202,9 @@ private struct RenderCaseDefinition: Decodable {
     let metal: RenderSourcePin
     let vertices: UInt64
     let viewport: [UInt64]
+    /// The pass's scissor rectangle in framebuffer coordinates, or `nil` for the
+    /// whole attachment (`research/docs/23` §3.3, v29).
+    let scissor: [UInt64]?
     /// The vertex-input half, absent for the `vertex_id` shape
     /// (`research/docs/23` §3.3). A case that carries a layout draws the
     /// indexed reviewed module instead: the layout, its bindings and the index
@@ -1088,8 +1091,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_quad_extent"]
     case "compute-buffer-v27":
         expectedIDs = ["render_declaring_two_attachments"]
+    case "compute-buffer-v28":
+        expectedIDs = ["render_declaring_quad_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v27 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1497,6 +1502,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         let stored = attachment.store == "store"
         try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
                     "\(definition.id): the viewport must cover the attachment")
+        if let scissor = definition.scissor {
+            try require(scissor.count == 4,
+                        "\(definition.id): a scissor is four numbers")
+            try require(scissor[2] > 0 && scissor[3] > 0
+                        && scissor[0] + scissor[2] <= UInt64(attachment.width)
+                        && scissor[1] + scissor[3] <= UInt64(attachment.height),
+                        "\(definition.id): a scissor has to be a non-empty rectangle "
+                        + "inside the attachment")
+        }
         let byteCount = attachment.width * attachment.height * 4
         // A stored attachment carries the whole expectation and the byte-level
         // review it makes possible; a discarded attachment carries none, and
@@ -2109,6 +2123,13 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                     width: Double(fixture.attachments[0].width),
                                     height: Double(fixture.attachments[0].height),
                                     znear: 0, zfar: 1))
+    // The scissor is the pass's own rectangle when it declares one; both rails
+    // state it in framebuffer coordinates with the origin at the render area's
+    // top-left (`research/docs/23` §3.3, v29).
+    if let scissor = definition.scissor {
+        encoder.setScissorRect(MTLScissorRect(x: Int(scissor[0]), y: Int(scissor[1]),
+                                              width: Int(scissor[2]), height: Int(scissor[3])))
+    }
     // The streams are bound at the same indices the descriptor names, and they
     // stay alive until the command buffer has completed (the buffers array is
     // released after the readback below).

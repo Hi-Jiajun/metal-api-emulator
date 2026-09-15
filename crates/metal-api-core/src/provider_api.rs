@@ -776,6 +776,9 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
+            // The object API's draws do not expose a scissor yet (v30 will); the
+            // pass covers its whole attachment.
+            scissor: None,
             pipeline: pipeline_id,
             color_attachments,
             viewport: [

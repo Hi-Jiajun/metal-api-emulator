@@ -130,9 +130,13 @@ const PASS_KIND_RENDER_EXT: u8 = 0x10;
 /// Feature bits carried by [`PASS_KIND_RENDER_EXT`].
 const RENDER_FEATURE_VERTEX_INPUT: u8 = 0x01;
 const RENDER_FEATURE_PRESENT: u8 = 0x02;
+/// The scissor block (`research/docs/23` §3.3, v29): four `u32`s
+/// `[x, y, width, height]` after the base payload.
+const RENDER_FEATURE_SCISSOR: u8 = 0x04;
 /// Every bit this version knows. An unknown bit is a decoder refusal rather
 /// than a silently skipped section.
-const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT | RENDER_FEATURE_PRESENT;
+const RENDER_FEATURE_KNOWN: u8 =
+    RENDER_FEATURE_VERTEX_INPUT | RENDER_FEATURE_PRESENT | RENDER_FEATURE_SCISSOR;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1839,17 +1843,31 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // (`docs/23` §3.3). Its present half travels as a feature bit,
                 // so the pair stays orthogonal.
                 let has_vertex_input = !pass.vertex_buffers.is_empty() || pass.indices.is_some();
-                if has_vertex_input {
+                if has_vertex_input || pass.scissor.is_some() {
                     encoder.u8(PASS_KIND_RENDER_EXT);
-                    let mut features = RENDER_FEATURE_VERTEX_INPUT;
+                    let mut features = if has_vertex_input {
+                        RENDER_FEATURE_VERTEX_INPUT
+                    } else {
+                        0
+                    };
                     if pass.present.is_some() {
                         features |= RENDER_FEATURE_PRESENT;
                     }
+                    if pass.scissor.is_some() {
+                        features |= RENDER_FEATURE_SCISSOR;
+                    }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
-                    put_vertex_input(encoder, pass)?;
+                    if has_vertex_input {
+                        put_vertex_input(encoder, pass)?;
+                    }
                     if let Some(present) = &pass.present {
                         put_present_descriptor(encoder, present)?;
+                    }
+                    if let Some([x, y, width, height]) = pass.scissor {
+                        for dimension in [x, y, width, height] {
+                            encoder.u32(dimension);
+                        }
                     }
                     continue;
                 }
@@ -2226,6 +2244,14 @@ fn get_trace_tagged(
                 if features & RENDER_FEATURE_PRESENT != 0 {
                     pass.present = Some(get_present_descriptor(decoder)?);
                 }
+                if features & RENDER_FEATURE_SCISSOR != 0 {
+                    pass.scissor = Some([
+                        decoder.u32()?,
+                        decoder.u32()?,
+                        decoder.u32()?,
+                        decoder.u32()?,
+                    ]);
+                }
                 TracePass::Render(pass)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
@@ -2313,6 +2339,7 @@ fn get_render_pass(
         pipeline,
         color_attachments,
         viewport,
+        scissor: None,
         vertices,
         vertex_buffers: Vec::new(),
         indices: None,

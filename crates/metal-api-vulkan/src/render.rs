@@ -183,9 +183,12 @@ pub(crate) fn solid_fragment_spirv(
 /// request cannot name a fragment stage the format was not compiled for.
 pub(crate) struct OffscreenRenderRequest<'a> {
     /// Colour attachments, in location order: entry `i` is the target the
-    /// fragment stage's output `i` lands in. One or two entries; the rail
+    /// fragment stage's output `i` lands in. One to four entries; the rail
     /// refuses every other count before any Vulkan object exists.
     pub attachments: Vec<OffscreenColorAttachment<'a>>,
+    /// The pass's scissor rectangle, or `None` for the whole render area
+    /// (`research/docs/23` §3.3, v29).
+    pub scissor: Option<[u32; 4]>,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -643,6 +646,7 @@ fn prepare_render_request<'a>(
     };
     let request = OffscreenRenderRequest {
         attachments,
+        scissor: pass.scissor,
         extent,
         vertex: OffscreenVertexStage {
             entry: &stages.contract.vertex_entry,
@@ -1127,7 +1131,7 @@ pub(crate) fn execute_offscreen_render(
         None => {}
     }
     objects.create_command_pool(queue_index)?;
-    objects.record(&request.attachments, width, height)?;
+    objects.record(&request.attachments, request.scissor, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
     // One readback record per stored attachment: `copy_out` equals the stored
@@ -1577,7 +1581,7 @@ pub(crate) fn execute_present_render(
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
     objects.create_command_pool(queue_index)?;
-    objects.record(std::slice::from_ref(attachment), width, height)?;
+    objects.record(std::slice::from_ref(attachment), None, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
     let texels = unsafe {
@@ -2490,6 +2494,7 @@ impl<'a> OffscreenObjects<'a> {
     fn record(
         &mut self,
         attachments: &[OffscreenColorAttachment<'_>],
+        scissor: Option<[u32; 4]>,
         width: u32,
         height: u32,
     ) -> Result<(), ProviderError> {
@@ -2534,9 +2539,22 @@ impl<'a> OffscreenObjects<'a> {
             min_depth: 0.0,
             max_depth: 1.0,
         };
+        // The scissor is dynamic pipeline state, so the pass's own rectangle (or
+        // the whole render area for a pass that declares none) is recorded here
+        // (`research/docs/23` §3.3, v29).
+        let [scissor_x, scissor_y, scissor_width, scissor_height] =
+            scissor.unwrap_or([0, 0, width, height]);
         let scissor = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width, height },
+            offset: vk::Offset2D {
+                x: i32::try_from(scissor_x)
+                    .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
+                y: i32::try_from(scissor_y)
+                    .map_err(|_| contract_refusal("render scissor origin reaches beyond i32"))?,
+            },
+            extent: vk::Extent2D {
+                width: scissor_width,
+                height: scissor_height,
+            },
         };
         // A loading attachment fills its image before the render pass opens:
         // the previous bytes travel through a host-visible staging buffer, land
@@ -3247,6 +3265,7 @@ mod tests {
                 store: StoreOp::Store,
             }],
             viewport: [0, 0, 2, 2],
+            scissor: None,
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
@@ -3367,6 +3386,7 @@ mod tests {
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
+                scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format,
                     store: StoreOp::Store,
@@ -3648,6 +3668,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::R32Uint,
                 store: StoreOp::Store,
@@ -3707,6 +3728,7 @@ mod tests {
             let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
+                    scissor: None,
                     attachments: vec![OffscreenColorAttachment {
                         format,
                         store: StoreOp::Store,
@@ -3843,6 +3865,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::Store,
@@ -3961,6 +3984,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
@@ -4021,6 +4045,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
@@ -4078,6 +4103,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
@@ -4121,6 +4147,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::DontCare,
@@ -4151,6 +4178,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            scissor: None,
             attachments: vec![
                 OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,
@@ -4290,6 +4318,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,
                     store: StoreOp::Store,

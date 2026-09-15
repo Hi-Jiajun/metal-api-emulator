@@ -1587,6 +1587,7 @@ mod tests {
             pipeline: compiled.pipeline_id,
             color_attachments: vec![render_attachment(width, height)],
             viewport: [0, 0, width as u32, height as u32],
+            scissor: None,
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
