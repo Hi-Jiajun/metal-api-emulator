@@ -713,10 +713,11 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
-    case "render_declaring_two_attachments":
-        // v18's declaring case: the reviewed mrt_declare kernel reads both
-        // attachment views and writes their xor into its own output view, so
-        // one submission proves it read the two views the render pass stores.
+    case "render_declaring_two_attachments", "render_declaring_store_and_discard":
+        // v18's declaring case and v19's store/discard sibling: the reviewed
+        // mrt_declare kernel reads both attachment views and writes their xor
+        // into its own output view, so one submission proves it read the two
+        // views the render pass names (stored or discarded).
         try require(definition.entry == "mrt_declare"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "\(definition.id): unsupported entry or dispatch shape")
