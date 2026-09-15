@@ -1,14 +1,15 @@
 # Native Metal reference capture
 
 Current state: the harness covers the compute/alias/texture/command-buffer
-suites `suite.json` through `suite-v18.json`. The render-bearing suites are
+suites `suite.json` through `suite-v19.json`. The render-bearing suites are
 `suite-v13.json` (offscreen 2x2 colour attachment), `suite-v14.json` (the same
 attachment as a surfaceless present target, with `research/docs/24`'s
 acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
 `suite-v17.json` (a loading pass) and `suite-v18.json` (one draw writing two
-colour locations). The render and present observation rules live in
-[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7 and the MRT rules in §10; the
-per-suite rules are exercised by
+colour locations) and `suite-v19.json` (the same dual draw with the second
+location discarded). The render and present observation rules live in
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10 and the
+store/dontcare rules in §11; the per-suite rules are exercised by
 `python3 -m unittest discover -s conformance`. The v1/v2 description below is
 the historical starting point and is kept for the suite's own record.
 
@@ -365,3 +366,18 @@ render submission also proves the two views were declared and read.
 pair, the per-rail wiring and the `--mrt-selftest` one-device check; the suite's
 schema, plan and refusals are pinned by
 `conformance/test_suite_v18.py`.
+
+## Store/dontcare render capture
+
+[suite-v19.json](suite-v19.json) reuses the reviewed dual-output fixture and
+discards its second colour location: attachment 900/910 stays `store` with the
+`4080c0ff` expectation, and attachment 920/930 is `dontcare` with no
+`expected_hex`. The comparator owes exactly one writeback and one allocation
+image — the stored location only — and refuses any observation naming the
+discarded allocation; the count contract is three uploads (`copy_in == 3`, the
+two attachment views plus the probe) and two readbacks (`copy_out == 2`, the
+probe plus the stored attachment). A case whose every attachment discards is
+refused, mirroring core's `AllRenderAttachmentsDiscarded` admission rule.
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §11 describes the native/Swift execution
+and the `validate_store_dontcare_selftest` comparison; the suite's schema, plan,
+marker gates and refusals are pinned by `conformance/test_suite_v19.py`.

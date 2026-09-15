@@ -1,17 +1,19 @@
 //! Offscreen render execution rail (`research/docs/23` §6 Step 3b).
 //!
 //! One or two colour attachments, one full-screen triangle, one `vkCmdDraw`,
-//! then one `vkCmdCopyImageToBuffer` per attachment back into host-visible
-//! memory. The rail answers the question this step owns — can the provider
-//! build a render pass, a framebuffer and a graphics pipeline out of two
-//! SPIR-V modules and read every attachment back byte-for-byte — and it fixes
-//! the two rules the driver probe left behind (`/var/tmp/render-probe`,
+//! then one `vkCmdCopyImageToBuffer` per *stored* attachment back into
+//! host-visible memory. The rail answers the question this step owns — can the
+//! provider build a render pass, a framebuffer and a graphics pipeline out of
+//! two SPIR-V modules and read every stored attachment back byte-for-byte — and
+//! it fixes the two rules the driver probe left behind (`/var/tmp/render-probe`,
 //! `research/docs/23` §3.5, §9):
 //!
 //! * the attachment is `VK_IMAGE_TILING_OPTIMAL` plus one
-//!   `vkCmdCopyImageToBuffer` per attachment (`copy_out` = attachment count),
-//!   because the RTX 5060 native driver and the dzn/D3D12 backend both refuse
-//!   a linear colour attachment;
+//!   `vkCmdCopyImageToBuffer` per stored attachment (`copy_out` = declaring
+//!   write allocations ∪ stored attachment allocations; a `StoreOp::DontCare`
+//!   attachment gets `VK_ATTACHMENT_STORE_OP_DONT_CARE` and no readback at
+//!   all), because the RTX 5060 native driver and the dzn/D3D12 backend both
+//!   refuse a linear colour attachment;
 //! * admission asks for `VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT` on the exact
 //!   format **and** tiling before `vkCreateImage`, because ignoring the bit
 //!   lets `vkCreateImage` and `vkCreateGraphicsPipelines` both succeed and then
@@ -180,6 +182,12 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 pub(crate) struct OffscreenColorAttachment<'a> {
     /// Colour attachment format, in render-contract terms.
     pub format: AttachmentFormat,
+    /// The attachment's store operation (`docs/23` §3.6, v19). `Store` reads
+    /// the attachment back into the writeback channel; `DontCare` marks the
+    /// attachment's store with `VK_ATTACHMENT_STORE_OP_DONT_CARE` and gives it
+    /// no readback, so the discarded attachment disappears from the observable
+    /// surface instead of passing as "landed correctly".
+    pub store: StoreOp,
     /// The `LoadOp::Clear` value. Carried as bytes for the same reason the
     /// contract carries bytes: a float clear is not parity-stable
     /// (`research/docs/23` §3.5). The bytes are in the attachment format's
@@ -381,8 +389,8 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
     refusal
 }
 
-/// Execute one admitted render pass and return the attachment's tightly packed
-/// texel bytes.
+/// Execute one admitted render pass and return, in location order, each stored
+/// attachment's tightly packed texel bytes and `None` for each discarded one.
 ///
 /// This is the trace-side entry point of the rail: the pass's shape rules were
 /// already checked by core admission, so what is left here is the agreement
@@ -400,7 +408,7 @@ pub(crate) fn execute_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     previous: &[Option<&[u8]>],
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
     let request = prepare_render_request(stages, pass, previous)?;
     execute_offscreen_render(context, &request)
 }
@@ -470,15 +478,6 @@ fn prepare_render_request<'a>(
                     .with_detail("core admission refuses `LoadOp::DontCare` for this increment"));
             }
         };
-        match attachment.store {
-            StoreOp::Store => {}
-            StoreOp::DontCare => {
-                return Err(capability_refusal("attachment_store_op_unsupported")
-                    .with_field("attachment", FieldValue::Unsigned(index as u64))
-                    .with_field("store_op", FieldValue::Text("dont_care".to_owned()))
-                    .with_detail("core admission refuses `StoreOp::DontCare` for this increment"));
-            }
-        }
         let width = narrow_dimension(attachment.width)?;
         let height = narrow_dimension(attachment.height)?;
         match extent {
@@ -504,6 +503,7 @@ fn prepare_render_request<'a>(
         }
         attachments.push(OffscreenColorAttachment {
             format: attachment.format,
+            store: attachment.store,
             clear,
             previous: *previous,
         });
@@ -731,7 +731,7 @@ pub(crate) fn execute_indirect_render_pass(
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
     previous: &[Option<&[u8]>],
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
             vertex_count,
@@ -915,20 +915,22 @@ pub(crate) fn admit_color_attachment(
         .with_detail("vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT bit"))
 }
 
-/// Execute one offscreen render pass and return each attachment's tightly
-/// packed texel bytes (`width * height * 4`), in location order.
+/// Execute one offscreen render pass and return, in location order, `Some` of
+/// each stored attachment's tightly packed texel bytes (`width * height * 4`)
+/// and `None` for each discarded attachment.
 ///
 /// Contract format admission, the fragment stage the format list selects
 /// ([`solid_fragment_spirv`]), the device's `COLOR_ATTACHMENT` bit and the
-/// `TRANSFER_SRC` bit the readback needs all run before the first
-/// `vkCreateImage`, so an unsupported request is refused instead of being
-/// handed to the driver. The attachment-count and format-combination gates are
-/// re-run here for a directly-constructed request, so the fail-closed shape
-/// does not depend on the caller having gone through `prepare_render_request`.
+/// `TRANSFER_SRC` bit a stored attachment's readback needs all run before the
+/// first `vkCreateImage`, so an unsupported request is refused instead of being
+/// handed to the driver. The attachment-count, format-combination and
+/// at-least-one-store gates are re-run here for a directly-constructed request,
+/// so the fail-closed shape does not depend on the caller having gone through
+/// `prepare_render_request`.
 pub(crate) fn execute_offscreen_render(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
     if request.attachments.len() > 2 {
@@ -938,6 +940,18 @@ pub(crate) fn execute_offscreen_render(
         return Err(contract_refusal(
             "render pass declares no colour attachment",
         ));
+    }
+    // `docs/23` §3.6, v19: core admission refuses an all-discarded pass as
+    // `AllRenderAttachmentsDiscarded`, and the rail re-asserts the same
+    // at-least-one-store rule for a directly-constructed request. Discarding
+    // every attachment would turn "nothing landed" into a blank proof of
+    // "landed correctly".
+    if request
+        .attachments
+        .iter()
+        .all(|attachment| attachment.store == StoreOp::DontCare)
+    {
+        return Err(render_all_attachments_discarded_refusal());
     }
     let formats = request
         .attachments
@@ -956,8 +970,13 @@ pub(crate) fn execute_offscreen_render(
         .collect::<Result<Vec<_>, _>>()?;
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
         admit_color_attachment(context, *vk_format, tiling)?;
-        if !format_features(context, *vk_format, tiling)
-            .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+        // Only a stored attachment is read back, so `TRANSFER_SRC` is asked of
+        // stored attachments alone (`docs/23` §3.6, v19): a discarded
+        // attachment is not copied out and must not be refused for a feature
+        // its execution never needs.
+        if attachment.store == StoreOp::Store
+            && !format_features(context, *vk_format, tiling)
+                .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
         {
             return Err(attachment_format_refusal()
                 .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
@@ -1012,7 +1031,13 @@ pub(crate) fn execute_offscreen_render(
 
     let mut objects = OffscreenObjects::new(context);
     for (attachment, vk_format) in request.attachments.iter().zip(&vk_formats) {
-        objects.create_attachment(*vk_format, width, height, attachment.previous.is_some())?;
+        objects.create_attachment(
+            *vk_format,
+            width,
+            height,
+            attachment.previous.is_some(),
+            attachment.store == StoreOp::Store,
+        )?;
     }
     objects.create_render_pass(&vk_formats)?;
     objects.create_framebuffer(width, height)?;
@@ -1023,9 +1048,14 @@ pub(crate) fn execute_offscreen_render(
         &fragment_entry,
         &request.vertex_streams,
     )?;
+    // One readback destination per stored attachment; a discarded attachment
+    // creates none, because its bytes leave no observable surface to land in
+    // (`docs/23` §3.6, v19).
     let mut readback_mappings = Vec::with_capacity(request.attachments.len());
-    for _ in &request.attachments {
-        readback_mappings.push(objects.create_readback(byte_length)?);
+    for attachment in &request.attachments {
+        if attachment.store == StoreOp::Store {
+            readback_mappings.push(objects.create_readback(byte_length)?);
+        }
     }
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
@@ -1053,17 +1083,23 @@ pub(crate) fn execute_offscreen_render(
     objects.record(&request.attachments, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
-    // One readback record per attachment: `copy_out` equals the attachment
-    // count, so a caller can observe that both locations really left the
-    // device.
-    let mut results = Vec::with_capacity(readback_mappings.len());
-    for mapping in readback_mappings {
-        let texels = unsafe {
-            std::slice::from_raw_parts(mapping as *const u8, byte_length as usize).to_vec()
-        };
-        context.record_buffer_readback();
-        context.record_buffer_readback_bytes(texels.len());
-        results.push(texels);
+    // One readback record per stored attachment: `copy_out` equals the stored
+    // attachment count, so a caller can observe that a stored location really
+    // left the device and that a discarded one produced no bytes at all.
+    let mut results = Vec::with_capacity(request.attachments.len());
+    let mut mappings = readback_mappings.into_iter();
+    for attachment in &request.attachments {
+        if attachment.store == StoreOp::Store {
+            let mapping = mappings.next().expect("one readback per stored attachment");
+            let texels = unsafe {
+                std::slice::from_raw_parts(mapping as *const u8, byte_length as usize).to_vec()
+            };
+            context.record_buffer_readback();
+            context.record_buffer_readback_bytes(texels.len());
+            results.push(Some(texels));
+        } else {
+            results.push(None);
+        }
     }
     Ok(results)
 }
@@ -1442,6 +1478,14 @@ pub(crate) fn execute_present_render(
             "the present rail executes exactly one colour attachment",
         ));
     };
+    // A present attachment is the pass's only observable landing point, so a
+    // `StoreOp::DontCare` present pass is the all-discarded shape the rail
+    // refuses for an offscreen request (`docs/23` §3.6, v19). Core admission
+    // already refused it as `AllRenderAttachmentsDiscarded`; this is the
+    // value-level second line of defence.
+    if attachment.store == StoreOp::DontCare {
+        return Err(render_all_attachments_discarded_refusal());
+    }
     let [width, height] = request.extent;
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
@@ -1592,6 +1636,10 @@ struct AttachmentObjects {
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     load_op: vk::AttachmentLoadOp,
+    /// The attachment's store operation: `STORE` keeps the rendered bytes for
+    /// the copy-out, `DONT_CARE` discards them so no readback exists
+    /// (`docs/23` §3.6, v19).
+    store_op: vk::AttachmentStoreOp,
     initial_layout: vk::ImageLayout,
     /// The host-visible staging buffer holding this attachment's previous bytes
     /// for a `LoadOp::Load` pass. Null for a clearing attachment.
@@ -1653,6 +1701,10 @@ impl<'a> OffscreenObjects<'a> {
             memory: vk::DeviceMemory::null(),
             view: target.view(),
             load_op: vk::AttachmentLoadOp::CLEAR,
+            // A present target is the observable landing of the pass, so its
+            // store is always `STORE`; `execute_present_render` refuses a
+            // `StoreOp::DontCare` present attachment before this runs.
+            store_op: vk::AttachmentStoreOp::STORE,
             initial_layout,
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
@@ -1663,15 +1715,18 @@ impl<'a> OffscreenObjects<'a> {
 
     /// The 2D single-sample optimal-tiling colour attachment.
     ///
-    /// `TRANSFER_SRC` is part of the usage because the readback copies the
-    /// attachment out; `DEVICE_LOCAL` is the memory class the probe used for
-    /// every optimal-tiling candidate.
+    /// `TRANSFER_SRC` is part of the usage exactly when the attachment is
+    /// stored, because the readback copies the stored attachment out and a
+    /// discarded attachment is never read back (`docs/23` §3.6, v19);
+    /// `DEVICE_LOCAL` is the memory class the probe used for every
+    /// optimal-tiling candidate.
     fn create_attachment(
         &mut self,
         format: vk::Format,
         width: u32,
         height: u32,
         loading: bool,
+        storing: bool,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1687,7 +1742,11 @@ impl<'a> OffscreenObjects<'a> {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | if storing {
+                        vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    }
                     // A loading attachment receives its previous bytes through
                     // `vkCmdCopyBufferToImage`, so the image needs the transfer
                     // destination usage exactly when one is uploaded
@@ -1723,6 +1782,11 @@ impl<'a> OffscreenObjects<'a> {
             } else {
                 vk::AttachmentLoadOp::CLEAR
             },
+            store_op: if storing {
+                vk::AttachmentStoreOp::STORE
+            } else {
+                vk::AttachmentStoreOp::DONT_CARE
+            },
             initial_layout: if loading {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             } else {
@@ -1737,31 +1801,35 @@ impl<'a> OffscreenObjects<'a> {
     /// The render pass over every attachment this scope holds, with the
     /// probe's dependency pair: `EXTERNAL → 0` makes the clear/write visible to
     /// colour output, and `0 → EXTERNAL` makes the stored texels visible to the
-    /// copy that reads them. An offscreen pass ends directly in
+    /// copy that reads them. A stored offscreen attachment ends in
     /// `finalLayout = TRANSFER_SRC_OPTIMAL` so the copy runs without a further
-    /// transition (`research/docs/23` §7.1); a present pass ends in
-    /// `COLOR_ATTACHMENT_OPTIMAL` instead, and `record` inserts the explicit
-    /// present layout transition before the copy (`docs/24` §3.3).
+    /// transition (`research/docs/23` §7.1); a discarded attachment ends in
+    /// `COLOR_ATTACHMENT_OPTIMAL`, since nothing reads it after the pass
+    /// (`docs/23` §3.6, v19). A present pass ends in `COLOR_ATTACHMENT_OPTIMAL`
+    /// instead, and `record` inserts the explicit present layout transition
+    /// before the copy (`docs/24` §3.3).
     ///
     /// Each entry of `formats` is the `VkFormat` of the attachment at the same
     /// location; the per-attachment load operation and initial layout come
     /// from the scope's own attachment records.
     fn create_render_pass(&mut self, formats: &[vk::Format]) -> Result<(), ProviderError> {
-        let final_layout = if self.present {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        } else {
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-        };
         let attachments = self
             .attachments
             .iter()
             .zip(formats)
             .map(|(attachment, format)| {
+                let final_layout = if self.present {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                } else if attachment.store_op == vk::AttachmentStoreOp::STORE {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                };
                 vk::AttachmentDescription::default()
                     .format(*format)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .load_op(attachment.load_op)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .store_op(attachment.store_op)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(attachment.initial_layout)
@@ -2594,10 +2662,17 @@ impl<'a> OffscreenObjects<'a> {
             }
         }
 
-        // One copy per attachment into its own readback buffer, in location
-        // order, so the host side receives the bytes of every location and can
-        // tell them apart.
-        for (attachment, readback) in self.attachments.iter().zip(&self.readbacks) {
+        // One copy per stored attachment into its own readback buffer, in
+        // location order, so the host side receives the bytes of every stored
+        // location and can tell them apart. A discarded attachment has no
+        // readback buffer and is left out of the copy entirely (`docs/23`
+        // §3.6, v19).
+        for (attachment, readback) in self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.store_op == vk::AttachmentStoreOp::STORE)
+            .zip(&self.readbacks)
+        {
             let copy = vk::BufferImageCopy::default()
                 .buffer_offset(0)
                 .buffer_row_length(0)
@@ -2866,6 +2941,18 @@ fn mrt_format_combination_refusal(
             "the reviewed dual-output module serves [Rgba8Unorm, Rgba8Unorm] only; this \
              format pair has no colour fragment stage",
         )
+}
+
+/// The rail's value-level refusal for a pass whose every attachment discards
+/// (`docs/23` §3.6, v19). Core admission refuses the same shape as
+/// `AllRenderAttachmentsDiscarded` → `trace_contract_invalid`; a
+/// directly-constructed request skips that gate, so the rail spells its own
+/// capability slug instead of executing a pass that lands nothing.
+fn render_all_attachments_discarded_refusal() -> ProviderError {
+    capability_refusal("render_all_attachments_discarded").with_detail(
+        "every colour attachment's store operation is `DontCare`, so the pass would leave no \
+             observable landing point",
+    )
 }
 
 fn capability_refusal(slug: &'static str) -> ProviderError {
@@ -3219,6 +3306,7 @@ mod tests {
             &OffscreenRenderRequest {
                 attachments: vec![OffscreenColorAttachment {
                     format,
+                    store: StoreOp::Store,
                     clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                     previous: None,
                 }],
@@ -3231,7 +3319,7 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("the 2x2 {format:?} render pass executes: {error:?}"));
-        let texels = blobs.remove(0);
+        let texels = blobs.remove(0).expect("a stored attachment reads back");
         eprintln!(
             "{format:?} readback: {} (first texel: {})",
             hex(&texels),
@@ -3499,6 +3587,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::R32Uint,
+                store: StoreOp::Store,
                 clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                 previous: None,
             }],
@@ -3557,6 +3646,7 @@ mod tests {
                 &OffscreenRenderRequest {
                     attachments: vec![OffscreenColorAttachment {
                         format,
+                        store: StoreOp::Store,
                         clear,
                         previous: None,
                     }],
@@ -3569,7 +3659,7 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("the partial {format:?} pass executes: {error:?}"));
-            let texels = blobs.remove(0);
+            let texels = blobs.remove(0).expect("a stored attachment reads back");
             eprintln!(
                 "{format:?} partial readback: {} (clear {clear_texel:02x?}, stored {stored_texel:02x?})",
                 hex(&texels)
@@ -3692,6 +3782,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
+                store: StoreOp::Store,
                 clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                 previous: None,
             }],
@@ -3811,11 +3902,13 @@ mod tests {
                 attachments: vec![
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::Store,
                         clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                         previous: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::Store,
                         clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                         previous: None,
                     },
@@ -3832,10 +3925,16 @@ mod tests {
         let (uploads_after, readbacks_after) = context.buffer_copy_counts();
 
         assert_eq!(blobs.len(), 2, "one readback per attachment");
-        eprintln!("location 0: {}", hex(&blobs[0]));
-        eprintln!("location 1: {}", hex(&blobs[1]));
-        assert_eq!(blobs[0], EXPECTED_RGBA8_TEXELS.repeat(4));
-        assert_eq!(blobs[1], [0xff, 0x80, 0x40, 0xc0].repeat(4));
+        let location_0 = blobs[0]
+            .as_ref()
+            .expect("location 0 is stored and reads back");
+        let location_1 = blobs[1]
+            .as_ref()
+            .expect("location 1 is stored and reads back");
+        eprintln!("location 0: {}", hex(location_0));
+        eprintln!("location 1: {}", hex(location_1));
+        assert_eq!(*location_0, EXPECTED_RGBA8_TEXELS.repeat(4));
+        assert_eq!(*location_1, [0xff, 0x80, 0x40, 0xc0].repeat(4));
         assert_eq!(
             uploads_after, uploads_before,
             "no staging upload for a clear"
@@ -3845,6 +3944,141 @@ mod tests {
             readbacks_before + 2,
             "copy_out is one per attachment"
         );
+    }
+
+    /// The v19 discard shape (`docs/23` §3.6): location 0 stores, location 1
+    /// is `DontCare`, so only the stored location reads back — `Some` bytes in
+    /// location order, `None` for the discarded location — and the copy-out
+    /// counter advances by one rather than two.
+    #[test]
+    fn dual_attachments_discard_one_location_reads_back_only_the_stored_one() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let (uploads_before, readbacks_before) = context.buffer_copy_counts();
+        let blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                attachments: vec![
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::Store,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: None,
+                    },
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::DontCare,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: None,
+                    },
+                ],
+                extent: [2, 2],
+                vertex: milestone_vertex(),
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .expect("the reviewed store-plus-discard pass executes");
+        let (uploads_after, readbacks_after) = context.buffer_copy_counts();
+
+        assert_eq!(blobs.len(), 2, "one result entry per attachment");
+        let stored = blobs[0]
+            .as_ref()
+            .expect("location 0 is stored and reads back");
+        assert_eq!(blobs[1], None, "the discarded location reads back nothing");
+        eprintln!("stored location: {}", hex(stored));
+        assert_eq!(*stored, EXPECTED_RGBA8_TEXELS.repeat(4));
+        assert_eq!(
+            uploads_after, uploads_before,
+            "no staging upload for a clear pass"
+        );
+        assert_eq!(
+            readbacks_after,
+            readbacks_before + 1,
+            "copy_out counts the stored attachment only"
+        );
+    }
+
+    /// The discard removes only the store side: a `DontCare` attachment that
+    /// loads is still admitted and its previous bytes are still uploaded
+    /// through `vkCmdCopyBufferToImage` before the pass opens
+    /// (`research/docs/23` §3.3) — the discard removes the readback, not the
+    /// load upload — while the stored location keeps landing its own bytes.
+    #[test]
+    fn a_discarded_attachment_still_receives_its_previous_bytes() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let previous: [u8; 16] = [0x11; 16];
+        let blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                attachments: vec![
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::Store,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: None,
+                    },
+                    OffscreenColorAttachment {
+                        format: AttachmentFormat::Rgba8Unorm,
+                        store: StoreOp::DontCare,
+                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        previous: Some(&previous),
+                    },
+                ],
+                extent: [2, 2],
+                vertex: milestone_vertex(),
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .expect("the load-plus-discard pass executes");
+
+        let stored = blobs[0]
+            .as_ref()
+            .expect("location 0 is stored and reads back");
+        assert_eq!(*stored, EXPECTED_RGBA8_TEXELS.repeat(4));
+        assert_eq!(
+            blobs[1], None,
+            "the loaded location is discarded after the draw"
+        );
+    }
+
+    /// A directly-constructed request that discards every attachment skips core
+    /// admission, so the rail refuses it itself with the fail-closed slug
+    /// rather than executing a pass that lands nothing (`docs/23` §3.6, v19).
+    #[test]
+    fn an_all_discarded_request_is_refused_before_any_device_work() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let request = OffscreenRenderRequest {
+            attachments: vec![OffscreenColorAttachment {
+                format: AttachmentFormat::Rgba8Unorm,
+                store: StoreOp::DontCare,
+                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                previous: None,
+            }],
+            extent: [2, 2],
+            vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            index_stream: None,
+            indirect: None,
+        };
+        let refused = execute_offscreen_render(&context, &request)
+            .expect_err("an all-discarded request is refused");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_all_attachments_discarded");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        // The refusal precedes every Vulkan object and every copy.
+        assert_eq!(context.buffer_copy_counts(), (0, 0));
     }
 
     /// A dual-format list outside the reviewed `[Rgba8Unorm, Rgba8Unorm]` shape
@@ -3858,11 +4092,13 @@ mod tests {
             attachments: vec![
                 OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,
+                    store: StoreOp::Store,
                     clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                     previous: None,
                 },
                 OffscreenColorAttachment {
                     format: AttachmentFormat::R32Float,
+                    store: StoreOp::Store,
                     clear: ClearColor::new([CLEAR_SENTINEL; 4]),
                     previous: None,
                 },

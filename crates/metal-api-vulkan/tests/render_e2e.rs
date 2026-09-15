@@ -649,6 +649,199 @@ fn dual_attachments_land_both_locations_through_writeback() {
     );
 }
 
+/// The v19 discard shape through the whole chain (`docs/23` §3.6): location 0
+/// stores, location 1 is `DontCare`, so only location 0 lands a writeback and
+/// the readback counter advances by the one stored attachment instead of two.
+/// The declaring compute passes still touch both attachment views, so the
+/// upload counter keeps covering both (`copy_in` unchanged), while `copy_out`
+/// is the two declaring scratch writes plus the one stored attachment.
+#[test]
+fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
+    let Some(executor) = executor() else {
+        return;
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider context");
+    let digest =
+        |case: &[u8]| SemanticDigest::new("metal-smoke-fixture-v1", case.to_vec()).expect("digest");
+
+    let function = device
+        .new_library_with_air(COPY_WORD_AIR)
+        .expect("the fixture library loads")
+        .function("copy_word")
+        .expect("the fixture entry exists");
+    let compute = provider
+        .compile_pipeline(&function, digest(b"render_e2e_discard_compute"))
+        .expect("the compute pipeline registers");
+    let render = provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_DUAL_FRAG_SPV.to_vec(),
+            logical_digest: digest(b"render_e2e_discard_stages"),
+        })
+        .expect("the dual render pipeline registers");
+
+    let attachment = |view: ViewId, allocation: AllocationId, store: StoreOp| RenderAttachment {
+        view_id: view,
+        allocation_id: allocation,
+        format: AttachmentFormat::Rgba8Unorm,
+        width: 2,
+        height: 2,
+        load: LoadOp::Clear(ClearColor::new(CLEAR_SENTINEL)),
+        store,
+    };
+    let declaring = |attachment_view: ViewId,
+                     attachment_allocation: AllocationId,
+                     scratch_view: ViewId,
+                     scratch_allocation: AllocationId| {
+        ComputePass {
+            pipeline: compute.pipeline_id,
+            buffers: vec![
+                BufferView {
+                    view_id: attachment_view,
+                    metal_binding: 0,
+                    allocation_id: attachment_allocation,
+                    offset: 0,
+                    length: 16,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                },
+                BufferView {
+                    view_id: scratch_view,
+                    metal_binding: 1,
+                    allocation_id: scratch_allocation,
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                },
+            ],
+            textures: Vec::new(),
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+        }
+    };
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(13),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(declaring(
+                ATTACHMENT_VIEW,
+                ATTACHMENT_ALLOCATION,
+                SCRATCH_VIEW,
+                SCRATCH_ALLOCATION,
+            )),
+            TracePass::Compute(declaring(
+                SECOND_ATTACHMENT_VIEW,
+                SECOND_ATTACHMENT_ALLOCATION,
+                SECOND_SCRATCH_VIEW,
+                SECOND_SCRATCH_ALLOCATION,
+            )),
+            TracePass::Render(RenderPassDescriptor {
+                pipeline: render.pipeline_id,
+                color_attachments: vec![
+                    attachment(ATTACHMENT_VIEW, ATTACHMENT_ALLOCATION, StoreOp::Store),
+                    attachment(
+                        SECOND_ATTACHMENT_VIEW,
+                        SECOND_ATTACHMENT_ALLOCATION,
+                        StoreOp::DontCare,
+                    ),
+                ],
+                viewport: [0, 0, 2, 2],
+                vertices: 3,
+                vertex_buffers: Vec::new(),
+                indices: None,
+                present: None,
+            }),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16),
+        (SECOND_ATTACHMENT_ALLOCATION, 16),
+        (SCRATCH_ALLOCATION, 8),
+        (SECOND_SCRATCH_ALLOCATION, 8),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("attachment allocation");
+    }
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .expect("the store-plus-discard trace is admitted");
+    let (uploads_before, readbacks_before) = executor.buffer_copy_counts();
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    let (uploads_after, readbacks_after) = executor.buffer_copy_counts();
+    submitted
+        .validate()
+        .expect("the writeback list is well formed");
+    assert!(matches!(
+        submitted.completion,
+        CompletionDisposition::CompletedVisible { .. }
+    ));
+    let writebacks = submitted
+        .writebacks
+        .into_iter()
+        .map(|writeback| (writeback.view_id, writeback.bytes))
+        .collect::<Vec<_>>();
+
+    let stored = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("stored location readback: {}", hex(&stored));
+    assert_eq!(stored, [0x40, 0x80, 0xc0, 0xff].repeat(4));
+    assert!(
+        !writebacks
+            .iter()
+            .any(|(view, _)| *view == SECOND_ATTACHMENT_VIEW),
+        "the discarded location disappears from the observable surface"
+    );
+
+    // Both declaring passes still do their own work and upload their two
+    // owned views each — the attachment view and the scratch view — exactly as
+    // the dual-`Store` baseline does, so `copy_in` covers both attachments and
+    // the discard changes nothing on the upload side (`touched` counts
+    // everything). `copy_out` is the two scratch writebacks plus the one
+    // stored attachment copy.
+    let scratch = readback(&writebacks, SCRATCH_VIEW);
+    assert_eq!(scratch, ATTACHMENT_WORD.to_vec());
+    let second_scratch = readback(&writebacks, SECOND_SCRATCH_VIEW);
+    assert_eq!(second_scratch, ATTACHMENT_WORD.to_vec());
+    assert_eq!(
+        uploads_after - uploads_before,
+        4,
+        "two declaring passes upload two owned views each, unchanged by the discard"
+    );
+    assert_eq!(
+        readbacks_after - readbacks_before,
+        3,
+        "one stored attachment copy plus two compute scratch copies"
+    );
+}
+
 /// A registration pairs a compiled fragment stage with a format, and the rail
 /// refuses a pairing that is not the format's own stage. This is the end-to-end
 /// witness that the fragment stage really is a function of the format: the

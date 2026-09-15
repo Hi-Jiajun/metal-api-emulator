@@ -495,5 +495,107 @@ class MrtSelftestValidationTests(unittest.TestCase):
             run_native.validate_mrt_selftest([])
 
 
+class StoreDontCareSelftestValidationTests(unittest.TestCase):
+    """The store-dontcare self-test's byte comparison, exercised without Metal.
+
+    `run_native.validate_store_dontcare_selftest` is the function the CI step
+    reuses, so the observation-shape rule — the stored location reports, the
+    discarded location disappears — is pinned here rather than only in an
+    inline heredoc. The fixture id is part of the claim: the stored location's
+    bytes are the same four texels the MRT self-test stores at location 0, so
+    only the id and the absence of location 1's observation separate the two.
+    """
+
+    TARGET = "4080c0ff" * 4
+    DISCARDED = "ff8040c0" * 4
+
+    STORED_WRITEBACK = {"allocation": 900, "view": 910, "offset": 0,
+                        "bytes_hex": TARGET}
+    STORED_ALLOCATION = {"allocation": 900, "bytes_hex": TARGET}
+    DISCARDED_WRITEBACK = {"allocation": 920, "view": 930, "offset": 0,
+                           "bytes_hex": DISCARDED}
+    DISCARDED_ALLOCATION = {"allocation": 920, "bytes_hex": DISCARDED}
+
+    def reviewed_report(self, report_id="discard_second_attachment_2x2",
+                        completion="CompletedVisible", writebacks=None,
+                        allocations=None):
+        if writebacks is None:
+            writebacks = [dict(self.STORED_WRITEBACK)]
+        if allocations is None:
+            allocations = [dict(self.STORED_ALLOCATION)]
+        return {"id": report_id, "completion": completion,
+                "writebacks": writebacks, "allocations": allocations}
+
+    def test_accepts_the_reviewed_discard_observation(self):
+        report = self.reviewed_report()
+        self.assertEqual(run_native.validate_store_dontcare_selftest(report),
+                         self.TARGET)
+
+    def test_rejects_a_reported_discarded_attachment(self):
+        # The falsifiability point of the increment: a report that reads the
+        # discarded location back must not pass. Allocation 920/view 930 has
+        # to disappear from the observation, in either channel
+        # (`research/docs/23` §3.6, v19).
+        for writebacks, allocations in (
+            ([dict(self.STORED_WRITEBACK), dict(self.DISCARDED_WRITEBACK)],
+             [dict(self.STORED_ALLOCATION)]),
+            ([dict(self.STORED_WRITEBACK)],
+             [dict(self.STORED_ALLOCATION), dict(self.DISCARDED_ALLOCATION)]),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=allocations):
+                report = self.reviewed_report(writebacks=writebacks,
+                                              allocations=allocations)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_store_dontcare_selftest(report)
+
+    def test_rejects_the_mrt_selftest_report(self):
+        # The MRT report stores the same location-0 bytes and also reports
+        # location 1, so only the id distinguishes the two; a report from that
+        # self-test must not pass here.
+        report = {
+            "id": "mrt_dual_output_2x2",
+            "completion": "CompletedVisible",
+            "writebacks": [dict(self.STORED_WRITEBACK),
+                           dict(self.DISCARDED_WRITEBACK)],
+            "allocations": [dict(self.STORED_ALLOCATION),
+                            dict(self.DISCARDED_ALLOCATION)],
+        }
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_store_dontcare_selftest(report)
+
+    def test_rejects_a_missing_or_extra_observation(self):
+        stored_writeback = dict(self.STORED_WRITEBACK)
+        stored_allocation = dict(self.STORED_ALLOCATION)
+        for writebacks, allocations in (
+            ([], []),
+            ([stored_writeback], []),
+            ([], [stored_allocation]),
+            ([stored_writeback, stored_writeback], [stored_allocation]),
+            ([stored_writeback], [stored_allocation, stored_allocation]),
+        ):
+            with self.subTest(writebacks=writebacks, allocations=allocations):
+                report = self.reviewed_report(writebacks=writebacks,
+                                              allocations=allocations)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_store_dontcare_selftest(report)
+
+    def test_rejects_a_wrong_writeback_identity_or_offset(self):
+        for change in ({"offset": 4}, {"view": 911}, {"allocation": 901}):
+            with self.subTest(change=change):
+                writeback = [dict(self.STORED_WRITEBACK, **change)]
+                report = self.reviewed_report(writebacks=writeback)
+                with self.assertRaises(run_native.NativeRunError):
+                    run_native.validate_store_dontcare_selftest(report)
+
+    def test_rejects_a_non_visible_completion(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_store_dontcare_selftest(
+                self.reviewed_report(completion="Submitted"))
+
+    def test_rejects_a_non_object_report(self):
+        with self.assertRaises(run_native.NativeRunError):
+            run_native.validate_store_dontcare_selftest([])
+
+
 if __name__ == "__main__":
     unittest.main()

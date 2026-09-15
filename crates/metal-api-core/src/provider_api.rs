@@ -572,6 +572,13 @@ pub struct RenderColorAttachment<'a> {
     pub format: AttachmentFormat,
     /// How the pass establishes this attachment's contents.
     pub load: RenderAttachmentLoad,
+    /// How the pass hands this attachment on: `Store` keeps the pass's writes
+    /// observable, `DontCare` makes the attachment disappear from the
+    /// observable surface instead of passing as "landed correctly". The pass
+    /// still has to store at least one attachment — an all-`DontCare` list is
+    /// [`ContractError::AllRenderAttachmentsDiscarded`] — so the caller spells
+    /// one store decision per location.
+    pub store: StoreOp,
 }
 
 /// One recorded colour attachment: the buffer view that carries the attachment
@@ -585,6 +592,7 @@ struct RenderTargetAttachment {
     view: BufferView,
     format: AttachmentFormat,
     load: RenderAttachmentLoad,
+    store: StoreOp,
 }
 
 /// The colour attachments one recorded render pass stores into, plus the
@@ -722,7 +730,7 @@ impl RenderTarget {
                     RenderAttachmentLoad::Clear(bytes) => LoadOp::Clear(ClearColor::new(bytes)),
                     RenderAttachmentLoad::Load => LoadOp::Load,
                 },
-                store: StoreOp::Store,
+                store: attachment.store,
             })
             .collect();
         // The present tail hands on the location-0 attachment, which is the
@@ -2280,6 +2288,11 @@ impl RenderCommandEncoder {
     /// encoder holds. A draw whose vertex stage reads bound streams is
     /// [`Self::draw_primitives`], and one that selects through an index buffer
     /// is [`Self::draw_indexed_primitives`].
+    ///
+    /// The single-attachment shape this call publishes fixes
+    /// [`StoreOp::Store`]: a per-attachment store decision needs a
+    /// multi-attachment call, [`Self::draw_primitives_with_attachments`] or
+    /// [`Self::draw_indexed_primitives_with_attachments`].
     pub fn draw_render_pass(
         &mut self,
         attachment: &BufferView,
@@ -2298,6 +2311,7 @@ impl RenderCommandEncoder {
                 view: attachment,
                 format,
                 load,
+                store: StoreOp::Store,
             }],
             width,
             height,
@@ -2319,6 +2333,11 @@ impl RenderCommandEncoder {
     /// A count below the milestone's three is refused here with the contract's
     /// own [`ContractError::DrawVertexCountBelowMinimum`], so both direct draw
     /// shapes report that one refusal instead of the descriptor's two.
+    ///
+    /// The single-attachment shape this call publishes fixes
+    /// [`StoreOp::Store`], exactly as [`Self::draw_render_pass`] does; the
+    /// multi-attachment shape that spells one store per location is
+    /// [`Self::draw_primitives_with_attachments`].
     #[allow(clippy::too_many_arguments)]
     pub fn draw_primitives(
         &mut self,
@@ -2335,6 +2354,7 @@ impl RenderCommandEncoder {
                 view: attachment,
                 format,
                 load,
+                store: StoreOp::Store,
             }],
             width,
             height,
@@ -2355,6 +2375,8 @@ impl RenderCommandEncoder {
     /// [`MAX_COLOR_ATTACHMENTS`] entries is
     /// [`Error::RenderAttachmentLimitExceeded`], and one `(allocation, view)`
     /// identity recorded twice is [`Error::DuplicateRenderAttachment`].
+    /// Each entry's `store` reaches the pass at its own location, and an
+    /// all-`DontCare` list is [`ContractError::AllRenderAttachmentsDiscarded`].
     #[allow(clippy::too_many_arguments)]
     pub fn draw_primitives_with_attachments(
         &mut self,
@@ -2398,6 +2420,10 @@ impl RenderCommandEncoder {
     ///
     /// An encoder with no index buffer bound is refused with
     /// [`Error::MissingIndexBuffer`] before any other shape is looked at.
+    ///
+    /// The single-attachment shape this call publishes fixes
+    /// [`StoreOp::Store`]; the multi-attachment shape that spells one store per
+    /// location is [`Self::draw_indexed_primitives_with_attachments`].
     #[allow(clippy::too_many_arguments)]
     pub fn draw_indexed_primitives(
         &mut self,
@@ -2414,6 +2440,7 @@ impl RenderCommandEncoder {
                 view: attachment,
                 format,
                 load,
+                store: StoreOp::Store,
             }],
             width,
             height,
@@ -2431,7 +2458,8 @@ impl RenderCommandEncoder {
     /// spells `drawIndexedPrimitives(indexCount:)`; vertex streams are optional
     /// exactly as they are for the single-attachment shape. The attachment
     /// list's refusals are the ones
-    /// [`Self::draw_primitives_with_attachments`] states.
+    /// [`Self::draw_primitives_with_attachments`] states, including the
+    /// all-`DontCare` [`ContractError::AllRenderAttachmentsDiscarded`].
     #[allow(clippy::too_many_arguments)]
     pub fn draw_indexed_primitives_with_attachments(
         &mut self,
@@ -2528,6 +2556,7 @@ impl RenderCommandEncoder {
                     view: attachment.view.clone(),
                     format: attachment.format,
                     load: attachment.load,
+                    store: attachment.store,
                 })
                 .collect(),
             width,
@@ -2609,6 +2638,10 @@ impl RenderCommandEncoder {
     /// [`Error::IndirectReplayInputConflict`]: the replayed draw would never
     /// read those bindings, and one pass may not carry two answers to what it
     /// reads.
+    ///
+    /// The single-attachment shape this call publishes fixes
+    /// [`StoreOp::Store`], exactly as the direct [`Self::draw_render_pass`]
+    /// shape it restates does.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_indirect(
         &mut self,
@@ -2661,6 +2694,7 @@ impl RenderCommandEncoder {
                 view: attachment,
                 format,
                 load,
+                store: StoreOp::Store,
             }],
             width,
             height,

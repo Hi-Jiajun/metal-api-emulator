@@ -761,3 +761,81 @@ Not yet achieved, and therefore still a condition rather than an observation:
 * the flip of `max_color_attachments` to 2 is host-side evidence alone until
   that Apple run is green; before the flip the same two-attachment trace was
   refused by admission, and the unit tests keep that pre-flip snapshot pinned.
+
+## 11. The store-dontcare milestone (`StoreOp::DontCare`, v19)
+
+The v19 increment admits `StoreOp::DontCare` on a per-attachment basis. Its
+semantic is that a discarded attachment must *disappear from the observable
+surface*: the pass still renders into it, but its bytes are neither read back
+nor reported, so a discarded attachment can never pass as "landed correctly"
+(`research/docs/23` §3.6). Core admission states the companion rule — a pass
+whose every attachment discards is refused with
+`AllRenderAttachmentsDiscarded`, classified like `EmptyAttachmentList` as Args
+/ `trace_contract_invalid` — so one `Store` action always keeps the pass
+observable. `LoadOp::DontCare` stays refused: it would make the compared bytes
+depend on state no earlier pass defined.
+
+What the native rail does:
+
+* `RenderStoreAction` gains a `DontCare` variant and
+  `render::store_action(StoreOp::DontCare)` returns it instead of the old
+  `attachment_store_op_unsupported` refusal. That slug stays alive for the
+  contract mirror and the core legacy mapping, but no store operation reaches
+  it on this rail anymore;
+* the plan keeps one `PlannedAttachment` per colour location with its own
+  `store` action; the previous-bytes / load resolution is unchanged per
+  attachment, so a discarded attachment with `LoadOp::Load` still uploads the
+  bytes its declaring view owns;
+* the macOS encoder body sets `colorAttachments[i].storeAction` to
+  `.dontCare` for a discarded attachment and, after `wait`, reads back only
+  the stored attachments. `TraceRenderPlan::writebacks` filters its landing
+  views the same way, so a discarded attachment produces neither a readback
+  nor a writeback;
+* `plan` re-runs core's pass validation, so the all-discarded pass is refused
+  before any Metal object exists. The unit tests pin the `DontCare` mapping,
+  the dual `Store` + `DontCare` plan (one writeback, location 0 only), and the
+  all-discarded refusal.
+
+What the Swift oracle does, for a suite render case:
+
+* an attachment's `store` decodes as `"store"` or `"dontcare"`; a `dontcare`
+  attachment must not carry `expected_hex`, and a stored attachment must.
+  `validateRenderCase` also refuses a case whose every attachment discards,
+  mirroring core's pass-level rule;
+* the expectation is optional per attachment, so the byte-level review only
+  runs where an observation exists. The load-side rules (`clear_hex`,
+  `initial_hex` and their length checks) stay per attachment unchanged;
+* `runRenderCase` sets `MTLRenderPassDescriptor` store actions to `.dontCare`
+  for discarded attachments and, after completion, reads back only the stored
+  ones; the resulting `writebacks`/`allocations` contain only the stored
+  attachment's observation. A discarded attachment's view still takes part in
+  the declaring-case validation, just not in the observation set.
+
+The one-device check is the frozen v19 fixture, id
+`discard_second_attachment_2x2`: the dual module's indexed quad, two 2x2
+`rgba8_unorm` attachments cleared with `00000000`, location 0
+`allocation: 900, view: 910, store: "store"` (expectation `4080c0ff` four
+times) and location 1 `allocation: 920, view: 930, store: "dontcare"` with no
+expectation. The report has to be `CompletedVisible` with exactly one
+writeback and one allocation, both allocation 900 — any observation naming
+the discarded allocation 920 or view 930 is refused. The comparison lives in
+`conformance/run_native.py::validate_store_dontcare_selftest` — the function
+the CI step reuses — and `test_run_native.py` pins it on a host without
+Metal, including the negative case that a report carrying the discarded
+attachment must not pass, and that the MRT self-test report (same location-0
+bytes, but location 1 also reported) must not pass either.
+
+Not yet achieved, and therefore still a condition rather than an observation:
+
+* no Apple CI run of the v19 fixture has been committed yet, so the
+  `.dontCare` store action and the skipped readback have not executed on an
+  Apple GPU; `cargo check --target aarch64-apple-darwin` is compile evidence
+  today, not execution evidence;
+* the suite-side wiring has since landed: `suite-v19.json` freezes the fixture,
+  `compare.py` owes one writeback/allocation to the stored attachment and
+  refuses an observation of the discarded one, `provider-capture.rs` carries
+  the store op through the Vulkan trace and object rails, `NativeOracle.swift`
+  accepts v19 in `loadSuite`, `test_suite_v19.py` pins the schema/plan/marker
+  gates and refusals, and `ci.yml` names the suite on all four capture rails
+  and all four object-API version loops. The Apple capture of that suite is
+  still the observation that closes this section.

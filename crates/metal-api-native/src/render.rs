@@ -393,13 +393,20 @@ pub(crate) enum RenderLoadAction {
     Load,
 }
 
-/// The store action this rail sets. One value, because the contract's
-/// `RenderAttachment::validate_shape` refuses `StoreOp::DontCare`: a discarded
-/// attachment must not be able to pass as "landed correctly"
-/// (`research/docs/23` §3.6).
+/// The store action this rail sets. `Store` lands the attachment's texels on
+/// the observable surface through the readback; `DontCare` is the contract's
+/// `StoreOp::DontCare` (`research/docs/23` §3.6, v19): the attachment still
+/// renders, but its bytes disappear from the observable surface — the encoder
+/// sets `MTLStoreAction::DontCare` and reads nothing back, so a discarded
+/// attachment cannot pass as "landed correctly". Core admission still refuses
+/// a pass whose every attachment discards, so one `Store` action always keeps
+/// the pass observable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RenderStoreAction {
     Store,
+    /// Discard the attachment's writes; no readback and no writeback leave this
+    /// attachment's location.
+    DontCare,
 }
 
 /// Map an admitted attachment format onto the pixel format this rail builds.
@@ -469,11 +476,17 @@ pub(crate) fn load_action(
 }
 
 /// The store action an encoder has to set for this pass.
+///
+/// Both contract variants are admitted now (`research/docs/23` §3.6, v19):
+/// core admission refuses the all-discarded pass before a plan is built, so
+/// any pass that reaches this function still stores at least one attachment.
+/// The retained `Result` spells that this is the mapping the encoder depends
+/// on, not a second policy.
 pub(crate) fn store_action(store: StoreOp) -> Result<RenderStoreAction, ProviderError> {
-    match store {
-        StoreOp::Store => Ok(RenderStoreAction::Store),
-        StoreOp::DontCare => Err(capability_refusal("attachment_store_op_unsupported")),
-    }
+    Ok(match store {
+        StoreOp::Store => RenderStoreAction::Store,
+        StoreOp::DontCare => RenderStoreAction::DontCare,
+    })
 }
 
 /// The vertex format this rail hands its `MTLVertexAttributeDescriptor`.
@@ -936,8 +949,8 @@ pub(crate) struct PlannedAttachment<'a> {
     pub(crate) format: RenderPixelFormat,
     /// The clear value or previous contents the attachment starts from.
     pub(crate) load: RenderLoadAction,
-    /// The store action: always `Store`, which is what makes the readback a
-    /// landed observation.
+    /// The store action: `Store` makes the readback a landed observation;
+    /// `DontCare` discards the attachment and yields no readback.
     pub(crate) store: RenderStoreAction,
     /// The tightly packed texels a [`LoadOp::Load`] uploads before the pass
     /// opens; `None` for a clear.
@@ -1404,17 +1417,24 @@ pub(crate) struct PresentPlan<'a> {
 
 impl TraceRenderPlan<'_> {
     /// The writebacks this pass's per-attachment readbacks become: one
-    /// [`BufferWriteback`] per landing view, in location order.
+    /// [`BufferWriteback`] per *stored* landing view, in location order.
     ///
     /// The view identity, allocation and offset are each landing view's own, so
     /// resource admission, lease bookkeeping and readback consumers need no
     /// second path: every attachment lands exactly where a compute pass writing
-    /// the same view would (`research/docs/23` §6 Step 7).
+    /// the same view would (`research/docs/23` §6 Step 7). A discarded
+    /// attachment has no readback and no writeback: its landing view stays in
+    /// the plan for the load-side resolution, but its bytes never leave the
+    /// pass, so it cannot present a blank readback as "landed correctly"
+    /// (`research/docs/23` §3.6, v19). The caller's `texels` therefore carries
+    /// one entry per stored attachment, matching the filtered landings.
     pub(crate) fn writebacks(&self, texels: Vec<Vec<u8>>) -> Vec<BufferWriteback> {
         self.landings
             .iter()
+            .zip(&self.plan.attachments)
+            .filter(|(_, attachment)| attachment.store == RenderStoreAction::Store)
             .zip(texels)
-            .map(|(landing, bytes)| BufferWriteback {
+            .map(|((landing, _), bytes)| BufferWriteback {
                 view_id: landing.view_id,
                 allocation_id: landing.allocation_id,
                 offset: landing.offset,
@@ -1709,7 +1729,14 @@ fn encode_into_and_readback(
             }
             RenderLoadAction::Load => color.set_load_action(MTLLoadAction::Load),
         }
-        color.set_store_action(MTLStoreAction::Store);
+        // A discarded attachment still renders, but its bytes are not kept:
+        // the store action is what makes the attachment disappear from the
+        // observable surface, and the readback below skips it
+        // (`research/docs/23` §3.6, v19).
+        match attachment.store {
+            RenderStoreAction::Store => color.set_store_action(MTLStoreAction::Store),
+            RenderStoreAction::DontCare => color.set_store_action(MTLStoreAction::DontCare),
+        }
     }
     // The command buffer and the encoder are autoreleased and the rail is
     // synchronous, so neither has to be retained: nothing here outlives this
@@ -1812,9 +1839,12 @@ fn encode_into_and_readback(
         return Err(resource_refusal("metal_render_command_failed")
             .with_detail(format!("command buffer ended with status {status}")));
     }
-    targets
+    planned
+        .attachments
         .iter()
-        .map(|target| read_texels(target, planned))
+        .zip(targets)
+        .filter(|(attachment, _)| attachment.store == RenderStoreAction::Store)
+        .map(|(_, target)| read_texels(target, planned))
         .collect()
 }
 
@@ -2293,14 +2323,15 @@ mod tests {
     }
 
     #[test]
-    fn store_dont_care_is_refused() {
+    fn store_dont_care_is_admitted() {
         assert_eq!(
             store_action(StoreOp::Store).unwrap(),
             RenderStoreAction::Store
         );
-        let error = store_action(StoreOp::DontCare).unwrap_err();
-        assert_eq!(error.slug, "attachment_store_op_unsupported");
-        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            store_action(StoreOp::DontCare).unwrap(),
+            RenderStoreAction::DontCare
+        );
     }
 
     #[test]
@@ -2354,6 +2385,38 @@ mod tests {
         assert_eq!(second.initial, None);
         assert_eq!(planned.texel_bytes, 16);
         assert_eq!(planned.row_pitch, 8);
+    }
+
+    /// The v19 store increment: the same dual shape with location 1 discarded
+    /// plans both attachments, but the discarded one carries `DontCare` rather
+    /// than a landing observation.
+    #[test]
+    fn plan_admits_a_discarded_attachment_beside_a_stored_one() {
+        let mut pass = dual_pass();
+        pass.color_attachments[1].store = StoreOp::DontCare;
+        let pipeline = dual_pipeline();
+        let planned = plan(&dual_request(&pass, &pipeline)).unwrap();
+        let [first, second] = planned.attachments.as_slice() else {
+            panic!("the dual shape renders two attachments");
+        };
+        assert_eq!(first.store, RenderStoreAction::Store);
+        assert_eq!(second.store, RenderStoreAction::DontCare);
+        assert!(matches!(first.load, RenderLoadAction::Clear(_)));
+        assert!(matches!(second.load, RenderLoadAction::Clear(_)));
+    }
+
+    /// A pass whose only attachment discards is refused by the contract before
+    /// this rail plans anything: core admission's `AllRenderAttachmentsDiscarded`
+    /// reaches `plan` as `trace_contract_invalid`, so a discarded pass can never
+    /// present a blank readback as "landed correctly" (`research/docs/23` §3.6).
+    #[test]
+    fn plan_refuses_a_pass_whose_only_attachment_discards() {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.color_attachments[0].store = StoreOp::DontCare;
+        let pipeline = milestone_pipeline();
+        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        assert_eq!(error.slug, "trace_contract_invalid");
+        assert_eq!(error.class, ProviderErrorClass::Args);
     }
 
     /// The MRT contract admits up to four attachments, but the reviewed dual
@@ -3952,6 +4015,40 @@ mod tests {
         assert_eq!(writebacks[0].bytes, EXPECTED_TEXEL_BYTES.repeat(4));
         assert_eq!(writebacks[1].view_id, ViewId::new(8));
         assert_eq!(writebacks[1].bytes, [0xff, 0x80, 0x40, 0xc0].repeat(4));
+    }
+
+    /// The v19 store increment over the trace path: location 1 discards, so
+    /// its landing view stays resolved for the load side but produces no
+    /// writeback — only the stored attachment's texels leave the pass
+    /// (`research/docs/23` §3.6).
+    #[test]
+    fn plan_trace_drops_a_discarded_attachment_from_the_writebacks() {
+        let (mut trace, _) = dual_trace(LoadOp::Clear(sentinel()));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the dual fixture ends with its render pass");
+        };
+        pass.color_attachments[1].store = StoreOp::DontCare;
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = dual_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed dual pass plans");
+        let [planned] = planned.as_slice() else {
+            panic!("the dual trace carries one render pass");
+        };
+        assert_eq!(planned.plan.attachments[0].store, RenderStoreAction::Store);
+        assert_eq!(
+            planned.plan.attachments[1].store,
+            RenderStoreAction::DontCare
+        );
+        // Both landings are still resolved — the discarded attachment keeps its
+        // declaring view for the load-side resolution — but only the stored
+        // attachment's readback becomes a writeback.
+        assert_eq!(planned.landings.len(), 2);
+        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        assert_eq!(writebacks.len(), 1);
+        assert_eq!(writebacks[0].view_id, ViewId::new(7));
+        assert_eq!(writebacks[0].allocation_id, AllocationId::new(9));
+        assert_eq!(writebacks[0].offset, 0);
+        assert_eq!(writebacks[0].bytes, EXPECTED_TEXEL_BYTES.repeat(4));
     }
 
     /// A loading dual pass uploads each attachment's own declaring bytes: the

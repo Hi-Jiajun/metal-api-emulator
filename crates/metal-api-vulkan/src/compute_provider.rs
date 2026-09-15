@@ -658,7 +658,10 @@ impl VulkanComputeProvider {
     }
 
     /// Execute the planned render passes in trace order, after the compute
-    /// sequence, and turn each attachment readback into a buffer writeback.
+    /// sequence, and turn each stored attachment readback into a buffer
+    /// writeback. A `StoreOp::DontCare` attachment lands no writeback: its
+    /// bytes are discarded by the pass, so they disappear from the observable
+    /// surface instead of being published (`docs/23` §3.6, v19).
     ///
     /// Every attachment's bytes leave the rail through the same channel a
     /// compute pass uses: one [`BufferWriteback`] per attachment for the view
@@ -750,7 +753,14 @@ impl VulkanComputeProvider {
                         && view.allocation_id == attachment.allocation_id
                 });
                 let loading = matches!(attachment.load, metal_api_core::provider::LoadOp::Load);
-                let view = if host_readback || loading {
+                let storing = matches!(attachment.store, metal_api_core::provider::StoreOp::Store);
+                // A stored attachment's bytes land through the writeback
+                // channel and a loading attachment uploads the trace's own
+                // bytes, so either needs the declaring view. A discarded
+                // attachment needs no landing declaration — unless it also
+                // loads, whose previous bytes still come from the declaration
+                // (`docs/23` §3.6, v19).
+                let view = if (host_readback && storing) || loading {
                     Some(declared.ok_or_else(|| {
                         refusal(
                             ProviderPhase::Resolve,
@@ -889,7 +899,11 @@ impl VulkanComputeProvider {
                     &previous,
                 )?,
             };
-            for (view, bytes) in views.into_iter().zip(texels) {
+            for (view, texels) in views.into_iter().zip(texels) {
+                // `None` is the discarded attachment: no bytes, no writeback,
+                // whatever the view resolution above produced (`docs/23`
+                // §3.6, v19).
+                let Some(bytes) = texels else { continue };
                 if let Some(view) = view {
                     writebacks.push(BufferWriteback {
                         view_id: view.view_id,

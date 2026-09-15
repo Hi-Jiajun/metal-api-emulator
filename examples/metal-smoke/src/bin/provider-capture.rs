@@ -1112,6 +1112,11 @@ struct RenderAttachmentDefinition {
     width: u64,
     height: u64,
     load: String,
+    /// The attachment's store operation: `"store"` keeps the pass's writes on
+    /// the observable surface, `"dontcare"` discards them (`docs/23` §3.6,
+    /// v19). Defaults to `"store"` so the v13-v18 fixtures that predate the
+    /// field deserialize unchanged.
+    #[serde(default = "default_attachment_store")]
     store: String,
     clear_hex: Option<String>,
     initial_hex: Option<String>,
@@ -1119,6 +1124,10 @@ struct RenderAttachmentDefinition {
     /// single-attachment form, whose expectation is case-level.
     #[serde(default)]
     expected_hex: Option<String>,
+}
+
+fn default_attachment_store() -> String {
+    "store".to_owned()
 }
 
 /// The suite-side shape of a render case's present action (the capture suite's
@@ -1865,6 +1874,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v16") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v17") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v18") => &["render_declaring_two_attachments"],
+        (1, "compute-buffer-v19") => &["render_declaring_store_and_discard"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2048,26 +2058,18 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
 /// The (attachment, expected texel hex) pairs a render case declares, in
 /// location order. The single form wraps its one attachment with the
 /// case-level `expected_hex`; the MRT form spells the expectation on each
-/// attachment entry. [`validate_render_case`] has already refused every shape
-/// this cannot read, so the expectations are present by construction.
+/// attachment entry; a discarded attachment carries none at all, which is why
+/// the expectation is optional and [`validate_render_case`] is the single
+/// place that pins which attachment may leave it out (`docs/23` §3.6, v19).
 fn render_attachment_shapes(
     case: &RenderCase,
-) -> Result<Vec<(&RenderAttachmentDefinition, String)>> {
+) -> Result<Vec<(&RenderAttachmentDefinition, Option<String>)>> {
     if let Some(attachment) = &case.attachment {
-        let expected = case
-            .expected_hex
-            .clone()
-            .ok_or_else(|| format!("render case {}: missing expected_hex", case.id))?;
-        Ok(vec![(attachment, expected)])
+        Ok(vec![(attachment, case.expected_hex.clone())])
     } else if let Some(attachments) = &case.attachments {
         attachments
             .iter()
-            .map(|attachment| {
-                let expected = attachment.expected_hex.clone().ok_or_else(|| {
-                    format!("render case {}: attachment without expected_hex", case.id)
-                })?;
-                Ok((attachment, expected))
-            })
+            .map(|attachment| Ok((attachment, attachment.expected_hex.clone())))
             .collect()
     } else {
         Err(format!("render case {}: no attachment declared", case.id).into())
@@ -2319,8 +2321,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     }
     // One attachment at a time: the single shape is the v13-v17 branch, and
     // every MRT entry restates the same per-field rules with its own
-    // expectation.
+    // expectation. The v19 increment adds the store operation: a `dontcare`
+    // attachment still renders and still resolves against its declaring view,
+    // but it carries no expectation and no observation, and at least one
+    // attachment has to stay stored (`docs/23` §3.6).
     let mut parsed = Vec::new();
+    let mut stored = Vec::new();
     for (attachment, expected_hex) in &shapes {
         if attachment.format != "rgba8_unorm" {
             return Err(format!("{where_}: unsupported attachment format").into());
@@ -2334,13 +2340,9 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         if attachment.allocation == 0 || attachment.view == 0 {
             return Err(format!("{where_}: zero attachment identity").into());
         }
-        if attachment.store != "store" {
-            return Err(format!("{where_}: a discarded attachment cannot be compared").into());
-        }
         if case.viewport != [0, 0, attachment.width, attachment.height] {
             return Err(format!("{where_}: the viewport must cover the attachment").into());
         }
-        let texels = unhex(expected_hex)?;
         let extent = usize::try_from(
             attachment
                 .width
@@ -2348,127 +2350,208 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .and_then(|texels| texels.checked_mul(4))
                 .ok_or("attachment extent overflows")?,
         )?;
-        if texels.len() != extent {
-            return Err(
-                format!("{where_}: expected texel bytes do not match the attachment").into(),
-            );
-        }
-        // The uniform-expectation rule belongs to the clearing shape: a `Load`
-        // case deliberately mixes the fragment output with the bytes the load
-        // handed it (`research/docs/23` §3.3).
-        let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
-        match attachment.load.as_str() {
-            "clear" => {
-                if !uniform_texel {
+        match attachment.store.as_str() {
+            "store" => {
+                let expected_hex = expected_hex
+                    .as_deref()
+                    .ok_or(format!("{where_}: a stored attachment needs expected_hex"))?;
+                let texels = unhex(expected_hex)?;
+                if texels.len() != extent {
                     return Err(format!(
-                        "{where_}: every texel of a cleared attachment has to be the fragment output"
+                        "{where_}: expected texel bytes do not match the attachment"
                     )
                     .into());
                 }
-                let texel = &texels[..4];
-                let clear = unhex(
-                    attachment
-                        .clear_hex
-                        .as_deref()
-                        .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
-                )?;
-                if clear.len() != 4 {
-                    return Err(format!("{where_}: a clear colour is four bytes").into());
-                }
-                if attachment.initial_hex.is_some() {
-                    return Err(
-                        format!("{where_}: a cleared attachment carries no initial bytes").into(),
-                    );
-                }
-                if clear == texel {
-                    return Err(
-                        format!("{where_}: the clear colour equals the expected texel").into(),
-                    );
-                }
-            }
-            "load" => {
-                let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
-                    "{where_}: a loaded attachment needs its previous texels"
-                ))?)?;
-                if attachment.clear_hex.is_some() {
-                    return Err(
-                        format!("{where_}: a loaded attachment carries no clear colour").into(),
-                    );
-                }
-                if initial.len() != extent {
-                    return Err(
-                        format!("{where_}: initial texels do not match the attachment").into(),
-                    );
-                }
-                if initial == texels {
-                    return Err(
-                        format!("{where_}: the initial texels equal the expectation").into(),
-                    );
-                }
-                // A loading pass uploads the declaring view's own bytes
-                // (`research/docs/23` §3.3), so the case's `initial_hex` has
-                // to be exactly what that case declares: a trace whose
-                // declaration and expectation disagree would report bytes the
-                // rail never held.
-                let declared = suite
-                    .cases
-                    .iter()
-                    .find(|declared| declared.id == case.declaring_case)
-                    .and_then(|declared| {
-                        declared.buffers.iter().find(|buffer| {
-                            buffer.allocation == attachment.allocation
-                                && buffer.view == attachment.view
-                        })
-                    })
-                    .ok_or(format!(
-                        "{where_}: the declaring case does not carry the attachment view"
-                    ))?;
-                if unhex(&declared.initial_hex)? != initial {
-                    return Err(format!(
-                        "{where_}: the declared view's bytes are not the attachment's initial texels"
-                    )
-                    .into());
-                }
-                // Partial coverage, in both directions: every texel is either
-                // the byte the load handed it or the pass's fragment output,
-                // every drawn texel carries the *same* output, and both halves
-                // appear.
-                let mut drawn: Option<&[u8]> = None;
-                let mut drawn_count = 0_usize;
-                let mut kept_count = 0_usize;
-                for (position, texel) in texels.chunks_exact(4).enumerate() {
-                    let previous = &initial[position * 4..position * 4 + 4];
-                    if texel == previous {
-                        kept_count += 1;
-                        continue;
-                    }
-                    match drawn {
-                        None => drawn = Some(texel),
-                        Some(value) if value == texel => {}
-                        Some(_) => {
+                // The uniform-expectation rule belongs to the clearing shape:
+                // a `Load` case deliberately mixes the fragment output with
+                // the bytes the load handed it (`research/docs/23` §3.3).
+                let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
+                match attachment.load.as_str() {
+                    "clear" => {
+                        if !uniform_texel {
                             return Err(format!(
-                                "{where_}: drawn texels disagree about the fragment output"
+                                "{where_}: every texel of a cleared attachment has to be the fragment output"
                             )
-                            .into())
+                            .into());
+                        }
+                        let texel = &texels[..4];
+                        let clear = unhex(
+                            attachment
+                                .clear_hex
+                                .as_deref()
+                                .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
+                        )?;
+                        if clear.len() != 4 {
+                            return Err(format!("{where_}: a clear colour is four bytes").into());
+                        }
+                        if attachment.initial_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a cleared attachment carries no initial bytes"
+                            )
+                            .into());
+                        }
+                        if clear == texel {
+                            return Err(format!(
+                                "{where_}: the clear colour equals the expected texel"
+                            )
+                            .into());
                         }
                     }
-                    drawn_count += 1;
+                    "load" => {
+                        let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
+                            "{where_}: a loaded attachment needs its previous texels"
+                        ))?)?;
+                        if attachment.clear_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a loaded attachment carries no clear colour"
+                            )
+                            .into());
+                        }
+                        if initial.len() != extent {
+                            return Err(format!(
+                                "{where_}: initial texels do not match the attachment"
+                            )
+                            .into());
+                        }
+                        if initial == texels {
+                            return Err(format!(
+                                "{where_}: the initial texels equal the expectation"
+                            )
+                            .into());
+                        }
+                        // A loading pass uploads the declaring view's own bytes
+                        // (`research/docs/23` §3.3), so the case's `initial_hex`
+                        // has to be exactly what that case declares: a trace
+                        // whose declaration and expectation disagree would
+                        // report bytes the rail never held.
+                        let declared = suite
+                            .cases
+                            .iter()
+                            .find(|declared| declared.id == case.declaring_case)
+                            .and_then(|declared| {
+                                declared.buffers.iter().find(|buffer| {
+                                    buffer.allocation == attachment.allocation
+                                        && buffer.view == attachment.view
+                                })
+                            })
+                            .ok_or(format!(
+                                "{where_}: the declaring case does not carry the attachment view"
+                            ))?;
+                        if unhex(&declared.initial_hex)? != initial {
+                            return Err(format!(
+                                "{where_}: the declared view's bytes are not the attachment's initial texels"
+                            )
+                            .into());
+                        }
+                        // Partial coverage, in both directions: every texel is
+                        // either the byte the load handed it or the pass's
+                        // fragment output, every drawn texel carries the *same*
+                        // output, and both halves appear.
+                        let mut drawn: Option<&[u8]> = None;
+                        let mut drawn_count = 0_usize;
+                        let mut kept_count = 0_usize;
+                        for (position, texel) in texels.chunks_exact(4).enumerate() {
+                            let previous = &initial[position * 4..position * 4 + 4];
+                            if texel == previous {
+                                kept_count += 1;
+                                continue;
+                            }
+                            match drawn {
+                                None => drawn = Some(texel),
+                                Some(value) if value == texel => {}
+                                Some(_) => {
+                                    return Err(format!(
+                                        "{where_}: drawn texels disagree about the fragment output"
+                                    )
+                                    .into())
+                                }
+                            }
+                            drawn_count += 1;
+                        }
+                        if drawn_count == 0 || kept_count == 0 {
+                            return Err(format!(
+                                "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
+                                 got {drawn_count} drawn and {kept_count} kept"
+                            )
+                            .into());
+                        }
+                    }
+                    other => {
+                        return Err(format!("{where_}: unknown attachment load op {other:?}").into())
+                    }
                 }
-                if drawn_count == 0 || kept_count == 0 {
+                stored.push(*attachment);
+                parsed.push((*attachment, Some(texels)));
+            }
+            "dontcare" => {
+                if expected_hex.is_some() {
                     return Err(format!(
-                        "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
-                         got {drawn_count} drawn and {kept_count} kept"
+                        "{where_}: a discarded attachment carries no expected_hex"
                     )
                     .into());
                 }
+                // The pass still performs the load, so the load's own shape
+                // stays pinned even though there is no expectation to compare.
+                match attachment.load.as_str() {
+                    "clear" => {
+                        let clear = unhex(
+                            attachment
+                                .clear_hex
+                                .as_deref()
+                                .ok_or(format!("{where_}: a clear attachment needs clear_hex"))?,
+                        )?;
+                        if clear.len() != 4 {
+                            return Err(format!("{where_}: a clear colour is four bytes").into());
+                        }
+                        if attachment.initial_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a cleared attachment carries no initial bytes"
+                            )
+                            .into());
+                        }
+                    }
+                    "load" => {
+                        let initial = unhex(attachment.initial_hex.as_deref().ok_or(format!(
+                            "{where_}: a loaded attachment needs its previous texels"
+                        ))?)?;
+                        if attachment.clear_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a loaded attachment carries no clear colour"
+                            )
+                            .into());
+                        }
+                        if initial.len() != extent {
+                            return Err(format!(
+                                "{where_}: initial texels do not match the attachment"
+                            )
+                            .into());
+                        }
+                    }
+                    other => {
+                        return Err(format!("{where_}: unknown attachment load op {other:?}").into())
+                    }
+                }
+                parsed.push((*attachment, None));
             }
-            other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
+            _other => {
+                return Err(format!("{where_}: a discarded attachment cannot be compared").into());
+            }
         }
-        parsed.push((*attachment, texels));
+    }
+    // Core admission refuses an all-discarded pass
+    // (`AllRenderAttachmentsDiscarded`), so the suite has to keep at least one
+    // attachment on the observable surface or "nothing landed" would pass as
+    // "landed correctly".
+    if stored.is_empty() {
+        return Err(format!(
+            "{where_}: every colour attachment discards, leaving no observable landing point"
+        )
+        .into());
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // dual case whose locations read back the same texels could not show that
-    // both outputs landed (`4080c0ff` vs `ff8040c0`).
+    // both outputs landed (`4080c0ff` vs `ff8040c0`). A discarded location
+    // carries no expectation, so it takes no part in the comparison.
     if multiple && parsed[0].1 == parsed[1].1 {
         return Err(format!("{where_}: the two locations read back the same texel").into());
     }
@@ -2508,7 +2591,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     }
     let mut seen_identities = BTreeSet::new();
     let mut seen_allocations = BTreeSet::new();
-    for (attachment, texels) in &parsed {
+    for (attachment, _texels) in &parsed {
         if !seen_identities.insert((attachment.allocation, attachment.view)) {
             return Err(format!("{where_}: duplicate attachment identity").into());
         }
@@ -2536,7 +2619,10 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 format!("{where_}: the declaring pass must only read the attachment view").into(),
             );
         }
-        if declared.length != u64::try_from(texels.len())? {
+        // A discarded attachment's declaring view is pinned by the extent the
+        // attachment restates; a stored one has already proved its expectation
+        // covers exactly that extent.
+        if declared.length != attachment.width * attachment.height * 4 {
             return Err(
                 format!("{where_}: attachment extent disagrees with the declaring view").into(),
             );
@@ -2851,10 +2937,11 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             &[(0, "read", 16), (1, "write", 4)][..],
         ),
-        // v18: the declaring pass reads both attachment allocations and writes
-        // their xor into its own output view, so one submission proves it read
-        // two whole-allocation views the render pass then stores into.
-        "render_declaring_two_attachments" => (
+        // v18/v19: the declaring pass reads both attachment allocations and
+        // writes their xor into its own output view, so one submission proves
+        // it read two whole-allocation views the render pass then stores into
+        // (v19 stores one and discards the other).
+        "render_declaring_two_attachments" | "render_declaring_store_and_discard" => (
             "mrt_declare",
             [1, 1, 1],
             [1, 1, 1],
@@ -3685,6 +3772,18 @@ fn run_render_case(
                     );
                 }
             };
+            // The fixture's store operation travels with the attachment: a
+            // `dontcare` entry renders but its writes are discarded by the
+            // provider (`docs/23` §3.6, v19).
+            let store = match attachment.store.as_str() {
+                "store" => StoreOp::Store,
+                "dontcare" => StoreOp::DontCare,
+                other => {
+                    return Err(
+                        format!("render case {}: unsupported store op {other:?}", case.id).into(),
+                    );
+                }
+            };
             Ok(RenderAttachment {
                 view_id: ViewId::new(attachment.view),
                 allocation_id: AllocationId::new(attachment.allocation),
@@ -3692,7 +3791,7 @@ fn run_render_case(
                 width: attachment.width,
                 height: attachment.height,
                 load,
-                store: StoreOp::Store,
+                store,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3771,10 +3870,15 @@ fn run_render_case(
     // One writeback and one allocation image per attachment, in location
     // order. Each writeback has to cover the exact range its declaring view
     // states: a rail that landed a different range cannot be reported as this
-    // case's texels.
+    // case's texels. A discarded attachment's bytes disappear with the pass,
+    // so no writeback and no allocation image are owed for it
+    // (`docs/23` §3.6, v19).
     let mut writebacks = Vec::new();
     let mut images = Vec::new();
     for (attachment, _) in &attachments {
+        if attachment.store != "store" {
+            continue;
+        }
         let declared = declared_views
             .iter()
             .find(|view| {
@@ -4198,17 +4302,31 @@ fn run_object_render_case(
         })
         .collect::<Result<Vec<_>>>()?;
     // The recorded attachment list is positional: entry `i` is location `i`,
-    // which is the M6 object API's `draw_*_with_attachments` shape.
+    // which is the M6 object API's `draw_*_with_attachments` shape. The
+    // fixture's store operation travels with each entry the same way the trace
+    // rail carries it (`docs/23` §3.6, v19).
     let recorded = attachments
         .iter()
         .zip(attachment_views.iter())
         .zip(attachment_loads.iter())
-        .map(|((_, view), load)| objects::RenderColorAttachment {
-            view,
-            format: AttachmentFormat::Rgba8Unorm,
-            load: *load,
+        .map(|(((attachment, _), view), load)| {
+            let store = match attachment.store.as_str() {
+                "store" => StoreOp::Store,
+                "dontcare" => StoreOp::DontCare,
+                other => {
+                    return Err(
+                        format!("render case {}: unsupported store op {other:?}", case.id).into(),
+                    );
+                }
+            };
+            Ok(objects::RenderColorAttachment {
+                view,
+                format: AttachmentFormat::Rgba8Unorm,
+                load: *load,
+                store,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let present =
         match &case.present {
             Some(definition) => Some(match &definition.initial_hex {
@@ -4332,10 +4450,15 @@ fn run_object_render_case(
     // One writeback and one allocation image per attachment, in location
     // order. Each writeback has to cover the exact range its declaring view
     // states, so a rail that landed a different range cannot be reported as
-    // this case's texels.
+    // this case's texels. A discarded attachment's bytes disappear with the
+    // pass, so no writeback and no allocation image are owed for it
+    // (`docs/23` §3.6, v19).
     let mut writebacks = Vec::new();
     let mut images_report = Vec::new();
     for (attachment, _) in &attachments {
+        if attachment.store != "store" {
+            continue;
+        }
         let landed = output
             .writebacks
             .iter()
