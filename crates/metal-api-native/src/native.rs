@@ -1439,7 +1439,12 @@ impl NativeMetalProvider {
         let render_writebacks =
             self.execute_render_passes(state, &render_plan, icb_replay.as_ref())?;
         let writebacks = render::merge_writebacks(
-            collect_writebacks(&pool, &resources.buffers, &self.counters),
+            collect_writebacks(
+                &pool,
+                &resources.buffers,
+                &self.counters,
+                &discarded_only_attachments(trace),
+            ),
             render_writebacks,
         );
         let submission = ProviderSubmission {
@@ -1465,14 +1470,47 @@ impl NativeMetalProvider {
     }
 }
 
+/// The `(allocation, view)` identities a trace discards and never stores.
+///
+/// Core's resource table marks every attachment view writable, because the
+/// render pass is what writes it; a discarded-only attachment is the one case
+/// where no bytes ever leave the rail for that view (`research/docs/23` §3.6,
+/// v19). The compute-side collect has to skip those views: reading them back
+/// would both fabricate a pre-render writeback and charge a copy-out the pass
+/// never performs. A view that any pass stores stays in the collect, so a mixed
+/// store/discard identity cannot slip out of the count.
+fn discarded_only_attachments(trace: &ComputeTrace) -> BTreeSet<(AllocationId, ViewId)> {
+    let mut stored = BTreeSet::new();
+    let mut discarded = BTreeSet::new();
+    for attachment in trace
+        .render_passes()
+        .flat_map(|pass| pass.color_attachments.iter())
+    {
+        let identity = (attachment.allocation_id, attachment.view_id);
+        match attachment.store {
+            StoreOp::Store => {
+                stored.insert(identity);
+            }
+            StoreOp::DontCare => {
+                discarded.insert(identity);
+            }
+        }
+    }
+    discarded.difference(&stored).copied().collect()
+}
+
 fn collect_writebacks(
     pool: &[BufferView],
     buffers: &[BoundBuffer],
     counters: &CopyCounters,
+    discarded: &BTreeSet<(AllocationId, ViewId)>,
 ) -> Vec<BufferWriteback> {
     let mut read_buffers = BTreeSet::<usize>::new();
     let mut writebacks = Vec::new();
     for (view, bound) in pool.iter().zip(buffers) {
+        if discarded.contains(&(view.allocation_id, view.view_id)) {
+            continue;
+        }
         if view.access.is_writable() {
             read_buffers.insert(bound.buffer.as_ptr() as usize);
             let bytes = unsafe {
@@ -1917,7 +1955,12 @@ impl NativeMetalProvider {
                     }));
                 }
             }
-            let compute_writebacks = collect_writebacks(&pool, &resources.buffers, &self.counters);
+            let compute_writebacks = collect_writebacks(
+                &pool,
+                &resources.buffers,
+                &self.counters,
+                &discarded_only_attachments(trace),
+            );
             let merged = render::merge_writebacks(compute_writebacks, render_writebacks);
             let record = self.running_record(token);
             self.completions()?.insert(
@@ -1968,6 +2011,9 @@ impl NativeMetalProvider {
         let counters = Arc::clone(&self.counters);
         let heap_observations_arc = Arc::clone(&self.heap_observations);
         let icb_observations_arc = Arc::clone(&self.icb_observations);
+        // The handler outlives this call, so the discarded-only identity set is
+        // computed here and moved into the block rather than borrowed.
+        let discarded_only = discarded_only_attachments(trace);
         let handler = ConcreteBlock::new(move |command: &CommandBufferRef| {
             // Retain the device, queue and compiled pipelines for the whole
             // device execution; the block itself is retained by the command
@@ -1981,9 +2027,12 @@ impl NativeMetalProvider {
             );
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 objc::rc::autoreleasepool(|| match command.status() {
-                    MTLCommandBufferStatus::Completed => {
-                        Ok(collect_writebacks(&pool, &buffers, &counters))
-                    }
+                    MTLCommandBufferStatus::Completed => Ok(collect_writebacks(
+                        &pool,
+                        &buffers,
+                        &counters,
+                        &discarded_only,
+                    )),
                     MTLCommandBufferStatus::Error => {
                         let (detail, code) = unsafe {
                             let error: *mut Object = msg_send![command, error];
