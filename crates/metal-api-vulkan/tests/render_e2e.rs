@@ -907,12 +907,15 @@ fn the_same_trace_is_refused_when_the_provider_declares_no_render_support() {
     assert_eq!(refused.slug, "render_passes_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 
-    // The dimension bit is load-bearing as well: 3×3 is outside the rail's
-    // window, and that refusal comes before the extent agreement behind it.
+    // The dimension bit is load-bearing as well: the probe trace's 3×3
+    // attachment outgrows the declaring view's 16 bytes, so admission refuses
+    // the extent agreement. (The rail executes up to four texels per axis from
+    // v27 on, so the dimension ceiling itself is no longer what this probe
+    // trips; the extent/view agreement is.)
     let oversized = oversized_trace(&fixture);
     let refused = admit_error(&declared, &oversized, &fixture.resources);
     eprintln!("3x3 attachment: refused: {refused:?}");
-    assert_eq!(refused.slug, "attachment_dimension_limit");
+    assert_eq!(refused.slug, "attachment_extent_mismatch");
 }
 
 /// The registered entry is what core admission reads (review item I3,
