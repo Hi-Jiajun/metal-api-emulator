@@ -234,27 +234,35 @@ pub(crate) fn reviewed_module(
     layout: &VertexLayout,
     color_formats: &[AttachmentFormat],
 ) -> Option<&'static ReviewedModule> {
+    // The 8-bit UNORM modules are layout-agnostic — the same store lands in
+    // whichever channel order each attachment declares — so any mix of the two
+    // 8-bit formats is served by the module of its attachment count
+    // (`research/docs/23` §3.3, v26). The single-channel float module is the one
+    // format-specific stage; every shape that fits no reviewed module is
+    // refused rather than matched approximately.
+    let unorm8 = |format: &AttachmentFormat| {
+        matches!(
+            format,
+            AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+        )
+    };
     match (layout, color_formats) {
         (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
             Some(&REVIEWED_MODULES[0])
         }
         (VertexLayout::Buffers(_), [AttachmentFormat::R32Float]) => Some(&REVIEWED_MODULES[3]),
-        (VertexLayout::Buffers(_), [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
-            Some(&REVIEWED_MODULES[1])
+        (VertexLayout::Buffers(_), [single]) if unorm8(single) => Some(&REVIEWED_MODULES[1]),
+        (VertexLayout::Buffers(_), [first, second]) if unorm8(first) && unorm8(second) => {
+            Some(&REVIEWED_MODULES[2])
         }
-        (
-            VertexLayout::Buffers(_),
-            [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
-        ) => Some(&REVIEWED_MODULES[2]),
-        (
-            VertexLayout::Buffers(_),
-            [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
-        ) => Some(&REVIEWED_MODULES[5]),
+        (VertexLayout::Buffers(_), [first, second, third])
+            if unorm8(first) && unorm8(second) && unorm8(third) =>
+        {
+            Some(&REVIEWED_MODULES[5])
+        }
         (VertexLayout::Buffers(_), formats)
             if formats.len() == usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX)
-                && formats
-                    .iter()
-                    .all(|format| *format == AttachmentFormat::Rgba8Unorm) =>
+                && formats.iter().all(unorm8) =>
         {
             Some(&REVIEWED_MODULES[4])
         }
@@ -4348,12 +4356,21 @@ mod tests {
                 .expect("the single-output stream shape is reviewed")
                 .binds_buffers
         );
-        // A dual-format `vertex_id` contract and an indexed contract whose two
-        // formats are not both `rgba8_unorm` have no reviewed module.
+        // A dual-format `vertex_id` contract has no reviewed module, and the
+        // two-attachment stream shape now accepts any mix of the two 8-bit
+        // layouts (v26) while refusing a list the modules cannot serve.
         assert!(reviewed_module(&VertexLayout::None, &dual).is_none());
+        assert_eq!(
+            reviewed_module(
+                &pipeline.vertex_layout,
+                &[AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm]
+            )
+            .map(|module| module.fragment_entry),
+            Some(DUAL_FRAGMENT_ENTRY)
+        );
         assert!(reviewed_module(
             &pipeline.vertex_layout,
-            &[AttachmentFormat::Rgba8Unorm, AttachmentFormat::Bgra8Unorm]
+            &[AttachmentFormat::Rgba8Unorm, AttachmentFormat::R32Float]
         )
         .is_none());
         assert_eq!(layout_name(&VertexLayout::None), "vertex_id");

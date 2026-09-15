@@ -1072,8 +1072,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_four_attachments"]
     case "compute-buffer-v24":
         expectedIDs = ["render_declaring_three_attachments"]
+    case "compute-buffer-v25":
+        expectedIDs = ["render_declaring_two_attachments"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v24 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v25 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1253,18 +1255,25 @@ private func reviewedTripleModule() -> ReviewedRenderModule {
 /// reviewed for is refused instead of matched approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
     let attachments = try colorAttachments(definition)
+    // The 8-bit UNORM modules are layout-agnostic: the same store lands in
+    // whichever channel order each attachment declares, so any mix of the two
+    // 8-bit formats is served by the module of its attachment count
+    // (`research/docs/23` §3.3, v26).
+    let unorm8 = { (format: String) in
+        format == "rgba8_unorm" || format == "bgra8_unorm"
+    }
     switch (definition.vertex_layout, attachments.count) {
     case (nil, 1):
         return reviewedRenderModule()
     case (_?, 1) where attachments[0].format == "r32float":
         return reviewedR32fModule()
-    case (_?, 1):
+    case (_?, 1) where unorm8(attachments[0].format):
         return reviewedIndexedModule()
-    case (_?, 2) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+    case (_?, 2) where attachments.allSatisfy({ unorm8($0.format) }):
         return reviewedDualModule()
-    case (_?, 3) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+    case (_?, 3) where attachments.allSatisfy({ unorm8($0.format) }):
         return reviewedTripleModule()
-    case (_?, 4) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+    case (_?, 4) where attachments.allSatisfy({ unorm8($0.format) }):
         return reviewedQuadModule()
     default:
         throw OracleError("\(definition.id): no reviewed module carries this "

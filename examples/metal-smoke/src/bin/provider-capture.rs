@@ -1933,6 +1933,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v22") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v23") => &["render_declaring_four_attachments"],
         (1, "compute-buffer-v24") => &["render_declaring_three_attachments"],
+        (1, "compute-buffer-v25") => &["render_declaring_two_attachments"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()

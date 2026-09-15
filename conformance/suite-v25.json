@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v25",
+  "guard_byte": 0,
+  "cases": [
+    {
+      "id": "render_declaring_two_attachments",
+      "entry": "mrt_declare",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "shaders/mrt_declare.ll",
+        "sha256": "0a5b6740a2839cc4c47a829a7c9badb1bb7d6557df031620a1bf17d7a04393c9"
+      },
+      "metal": {
+        "path": "shaders/mrt_declare.metal",
+        "sha256": "c6eeddad6686351c7ec616267f0975f7cc559ee85569a3396c83f64407eff689"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "fefefefefefefefefefefefefefefefe"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 0,
+          "length": 16,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "01010101010101010101010101010101"
+        },
+        {
+          "binding": 2,
+          "allocation": 940,
+          "view": 950,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "cdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 940,
+          "view": 950,
+          "offset": 4,
+          "bytes_hex": "ffffffff"
+        }
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "mixed_layout_dual_2x2",
+      "declaring_case": "render_declaring_two_attachments",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8_dual",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2_dual.metal",
+        "sha256": "5afc95dd177ba64e3d2e115ab84805fad2b56a7450914a0ab6f8572f26ba7eba"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1020,
+        "view": 1030,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
+      "attachments": [
+        {
+          "allocation": 900,
+          "view": 910,
+          "format": "rgba8_unorm",
+          "width": 2,
+          "height": 2,
+          "load": "clear",
+          "clear_hex": "00000000",
+          "store": "store",
+          "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff"
+        },
+        {
+          "allocation": 920,
+          "view": 930,
+          "format": "bgra8_unorm",
+          "width": 2,
+          "height": 2,
+          "load": "clear",
+          "clear_hex": "00000000",
+          "store": "store",
+          "expected_hex": "4080ffc04080ffc04080ffc04080ffc0"
+        }
+      ],
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
+    }
+  ]
+}
