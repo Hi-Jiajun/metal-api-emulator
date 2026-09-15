@@ -1875,6 +1875,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v17") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v18") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v19") => &["render_declaring_store_and_discard"],
+        (1, "compute-buffer-v20") => &["render_declaring_copy_word"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2324,7 +2325,10 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     // expectation. The v19 increment adds the store operation: a `dontcare`
     // attachment still renders and still resolves against its declaring view,
     // but it carries no expectation and no observation, and at least one
-    // attachment has to stay stored (`docs/23` §3.6).
+    // attachment has to stay stored (`docs/23` §3.6). The v20 increment adds
+    // the undefined load: a `dontcare` load carries no clear colour and no
+    // initial bytes, and its expectation still has to differ from the bytes
+    // the declaring case pins for the same view (`docs/23` §13).
     let mut parsed = Vec::new();
     let mut stored = Vec::new();
     for (attachment, expected_hex) in &shapes {
@@ -2476,6 +2480,54 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             .into());
                         }
                     }
+                    "dontcare" => {
+                        // Undefined pre-pass contents (`docs/23` §13, v20):
+                        // the pass starts from nothing, so every texel has to
+                        // be the fragment output and neither a clear colour
+                        // nor initial bytes may travel with the attachment.
+                        if !uniform_texel {
+                            return Err(format!(
+                                "{where_}: every texel of a dontcare load has to be the fragment output"
+                            )
+                            .into());
+                        }
+                        if attachment.clear_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a dontcare load carries no clear colour"
+                            )
+                            .into());
+                        }
+                        if attachment.initial_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a dontcare load carries no initial bytes"
+                            )
+                            .into());
+                        }
+                        // The declaring case still pins the view's bytes, but
+                        // a dontcare load never hands them to the pass, so
+                        // they must differ from the expectation: that is what
+                        // shows the undefined contents never entered the
+                        // observation.
+                        let declared = suite
+                            .cases
+                            .iter()
+                            .find(|declared| declared.id == case.declaring_case)
+                            .and_then(|declared| {
+                                declared.buffers.iter().find(|buffer| {
+                                    buffer.allocation == attachment.allocation
+                                        && buffer.view == attachment.view
+                                })
+                            })
+                            .ok_or(format!(
+                                "{where_}: the declaring case does not carry the attachment view"
+                            ))?;
+                        if unhex(&declared.initial_hex)? == texels {
+                            return Err(format!(
+                                "{where_}: the declared view's bytes equal the expectation"
+                            )
+                            .into());
+                        }
+                    }
                     other => {
                         return Err(format!("{where_}: unknown attachment load op {other:?}").into())
                     }
@@ -2523,6 +2575,20 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         if initial.len() != extent {
                             return Err(format!(
                                 "{where_}: initial texels do not match the attachment"
+                            )
+                            .into());
+                        }
+                    }
+                    "dontcare" => {
+                        if attachment.clear_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a dontcare load carries no clear colour"
+                            )
+                            .into());
+                        }
+                        if attachment.initial_hex.is_some() {
+                            return Err(format!(
+                                "{where_}: a dontcare load carries no initial bytes"
                             )
                             .into());
                         }
@@ -3766,6 +3832,7 @@ fn run_render_case(
                     .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
                 )),
                 "load" => LoadOp::Load,
+                "dontcare" => LoadOp::DontCare,
                 other => {
                     return Err(
                         format!("render case {}: unknown load op {other:?}", case.id).into(),
@@ -4298,6 +4365,7 @@ fn run_object_render_case(
                 .map_err(|_| -> Box<dyn Error> { "a clear colour is four bytes".into() })?,
             )),
             "load" => Ok(objects::RenderAttachmentLoad::Load),
+            "dontcare" => Ok(objects::RenderAttachmentLoad::DontCare),
             other => Err(format!("render case {}: unknown load op {other:?}", case.id).into()),
         })
         .collect::<Result<Vec<_>>>()?;

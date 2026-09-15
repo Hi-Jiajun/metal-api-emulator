@@ -1030,8 +1030,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v19":
         expectedIDs = ["render_declaring_store_and_discard"]
+    case "compute-buffer-v20":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v19 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v20 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1479,6 +1481,19 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 try require(drawnCount > 0,
                             "\(definition.id): a loaded attachment needs at least one drawn texel")
             }
+        case "dontcare":
+            // Undefined pre-pass contents (`docs/23` §13, v20): the pass
+            // starts from nothing, so neither a clear colour nor initial bytes
+            // travel with the attachment, and the texture below is created
+            // without any pre-seed. The byte-level "the declared view's bytes
+            // differ from the expectation" rule is the suite comparator's; the
+            // oracle only has to refuse the two carried-value spellings.
+            try require(attachment.clear_hex == nil,
+                        "\(definition.id): a dontcare load carries no clear colour")
+            try require(attachment.initial_hex == nil,
+                        "\(definition.id): a dontcare load carries no initial bytes")
+            clearComponents = []
+            initial = nil
         default:
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
@@ -1918,7 +1933,8 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         // surface, and the readback below skips it (`research/docs/23` §3.6,
         // v19).
         color.storeAction = attachment.store == "store" ? .store : .dontCare
-        if attachment.load == "clear" {
+        switch attachment.load {
+        case "clear":
             color.loadAction = .clear
             guard attachment.clearComponents.count == 4 else {
                 throw OracleError("\(definition.id): a clear colour is four components")
@@ -1927,8 +1943,16 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                              green: attachment.clearComponents[1],
                                              blue: attachment.clearComponents[2],
                                              alpha: attachment.clearComponents[3])
-        } else {
+        case "load":
             color.loadAction = .load
+        case "dontcare":
+            // Undefined pre-pass contents (`docs/23` §13, v20): the pass opens
+            // the attachment from nothing, exactly as `LoadOp::DontCare` does
+            // on the provider rails, and the shared texture above was created
+            // without any pre-seed.
+            color.loadAction = .dontCare
+        default:
+            throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
     }
     guard let commandBuffer = queue.makeCommandBuffer() else {

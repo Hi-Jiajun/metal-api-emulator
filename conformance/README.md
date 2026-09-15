@@ -1,15 +1,17 @@
 # Native Metal reference capture
 
 Current state: the harness covers the compute/alias/texture/command-buffer
-suites `suite.json` through `suite-v19.json`. The render-bearing suites are
+suites `suite.json` through `suite-v20.json`. The render-bearing suites are
 `suite-v13.json` (offscreen 2x2 colour attachment), `suite-v14.json` (the same
 attachment as a surfaceless present target, with `research/docs/24`'s
 acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
-`suite-v17.json` (a loading pass) and `suite-v18.json` (one draw writing two
-colour locations) and `suite-v19.json` (the same dual draw with the second
-location discarded). The render and present observation rules live in
-[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10 and the
-store/dontcare rules in §11; the per-suite rules are exercised by
+`suite-v17.json` (a loading pass), `suite-v18.json` (one draw writing two
+colour locations), `suite-v19.json` (the same dual draw with the second
+location discarded) and `suite-v20.json` (the same quad drawn from undefined
+pre-pass contents). The render and present observation rules live in
+[RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
+store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
+rules are exercised by
 `python3 -m unittest discover -s conformance`. The v1/v2 description below is
 the historical starting point and is kept for the suite's own record.
 
@@ -381,3 +383,18 @@ refused, mirroring core's `AllRenderAttachmentsDiscarded` admission rule.
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §11 describes the native/Swift execution
 and the `validate_store_dontcare_selftest` comparison; the suite's schema, plan,
 marker gates and refusals are pinned by `conformance/test_suite_v19.py`.
+
+## Undefined-load (dontcare) render capture
+
+[suite-v20.json](suite-v20.json) reuses the reviewed indexed quad but starts its
+single attachment from undefined pre-pass contents: attachment 900/910 is
+`load: "dontcare"` with `store: "store"`, carries neither `clear_hex` nor
+`initial_hex`, and expects the uniform `4080c0ff` fragment output. The declaring
+case still pins the same view at `cdcdcdcd`, but the dontcare load never hands
+those bytes to the pass — so the comparator refuses a fixture whose expectation
+equals the declared bytes, exactly as a clear case refuses a clear colour equal
+to the texel. The count contract is two uploads (`copy_in == 2`, the attachment
+view plus the probe) and two readbacks (`copy_out == 2`, the probe plus the
+stored attachment). [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §12 describes the
+`LoadOp::DontCare` / `MTLLoadAction::DontCare` wiring; the suite's schema, plan,
+marker gates and refusals are pinned by `conformance/test_suite_v20.py`.
