@@ -61,7 +61,7 @@
       "id": "r32float_clear_2x2",
       "declaring_case": "render_declaring_copy_word",
       "vertex_entry": "render_quad_vertex",
-      "fragment_entry": "render_solid_rgba8",
+      "fragment_entry": "render_solid_r32f",
       "metal": {
         "path": "shaders/quad_indexed_2x2_r32f.metal",
         "sha256": "2074ee223fe1e472124312b6e1507f383ceddc10a24c3a432e03e61449ed16aa"

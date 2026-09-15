@@ -2346,6 +2346,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     let reviewed_entries = match geometry {
         RenderGeometry::Milestone => (RENDER_MSL_VERTEX_ENTRY, RENDER_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
+            // A single `r32float` attachment takes the reviewed one-component
+            // MSL stage; every other single-output shape takes the
+            // four-component one (`research/docs/23` §3.3, v22).
+            1 if shapes[0].0.format == "r32float" => {
+                (QUAD_MSL_VERTEX_ENTRY, R32F_MSL_FRAGMENT_ENTRY)
+            }
             1 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
             2 => (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
             _ => {
