@@ -718,7 +718,7 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 4 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "copy_word: expected a 4-byte read buffer at 0 and write buffer at 1")
-    case "render_declaring_four_attachments":
+    case "render_declaring_three_attachments", "render_declaring_four_attachments":
         // v24's declaring case: the reviewed mrt_declare4 kernel reads one word
         // from each of the four attachment views and writes their xor into its
         // own output view, so one submission proves it read every view the
@@ -728,11 +728,20 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     "\(definition.id): unsupported entry or dispatch shape")
         try require(definition.buffers.count == 5,
                     "\(definition.id): expected five buffers")
-        try require((0..<4).allSatisfy { binding in
+        // The three-attachment sibling keeps only three attachment views; its
+        // fourth read is a 4-byte scratch view, because a view the render pass
+        // does not attach has to keep its guard bytes.
+        let attachmentReads = definition.id == "render_declaring_three_attachments" ? 3 : 4
+        try require((0..<attachmentReads).allSatisfy { binding in
             definition.buffers.contains {
                 $0.binding == binding && $0.access == "read" && $0.length == 16
             }
-        }, "\(definition.id): expected four 16-byte read buffers")
+        }, "\(definition.id): expected 16-byte attachment read buffers")
+        if attachmentReads == 3 {
+            try require(definition.buffers.contains {
+                $0.binding == 3 && $0.access == "read" && $0.length == 4
+            }, "\(definition.id): expected a 4-byte scratch read buffer at 3")
+        }
         try require(definition.buffers.contains {
             $0.binding == 4 && $0.access == "write" && $0.length == 4
         }, "\(definition.id): expected a 4-byte write buffer at 4")
@@ -1061,8 +1070,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v23":
         expectedIDs = ["render_declaring_four_attachments"]
+    case "compute-buffer-v24":
+        expectedIDs = ["render_declaring_three_attachments"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v23 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v24 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1219,6 +1230,21 @@ private func reviewedQuadModule() -> ReviewedRenderModule {
                                                           format: "float32x2")])])
 }
 
+/// The reviewed three-location fixture (v25): the indexed vertex stage plus a
+/// fragment stage that writes three colour locations. Three is not the ceiling,
+/// so the four-location module cannot stand in for it.
+private func reviewedTripleModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_quad_vertex",
+        fragment_entry: "render_solid_rgba8_triple",
+        metal: RenderSourcePin(path: "shaders/quad_indexed_2x2_triple.metal",
+                               sha256: "edfdc95fe3336fb457e71379ed64b358a5cb4f007d9ad93c75d7727e62338d26"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 8,
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x2")])])
+}
+
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
@@ -1236,6 +1262,8 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
         return reviewedIndexedModule()
     case (_?, 2) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
         return reviewedDualModule()
+    case (_?, 3) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
+        return reviewedTripleModule()
     case (_?, 4) where attachments.allSatisfy({ $0.format == "rgba8_unorm" }):
         return reviewedQuadModule()
     default:

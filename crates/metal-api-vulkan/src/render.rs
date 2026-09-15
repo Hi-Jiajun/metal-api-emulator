@@ -108,6 +108,14 @@ const SOLID_UNORM8_DUAL_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm
 /// landed one target twice cannot pass the comparison.
 const SOLID_UNORM8_QUAD_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_quad.frag.spv");
 
+/// The reviewed three-output fragment module (`research/docs/23` §3.3, v25).
+///
+/// Three locations are not the ceiling, but they are their own shape: the
+/// four-output module cannot stand in for it, because a fragment that writes a
+/// location with no attachment beside it is undefined.
+const SOLID_UNORM8_TRIPLE_FRAG_SPV: &[u8] =
+    include_bytes!("render_spv/solid_unorm8_triple.frag.spv");
+
 /// The solid fragment module the offscreen rail builds for a format list.
 ///
 /// The match is exhaustive over [`AttachmentFormat`] and has no default arm: a
@@ -138,6 +146,9 @@ pub(crate) fn solid_fragment_spirv(
             }
         },
         [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => SOLID_UNORM8_DUAL_FRAG_SPV,
+        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => {
+            SOLID_UNORM8_TRIPLE_FRAG_SPV
+        }
         [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => {
             SOLID_UNORM8_QUAD_FRAG_SPV
         }

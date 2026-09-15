@@ -103,6 +103,14 @@ const QUAD_QUAD_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
     "../../../../crates/metal-api-vulkan/src/render_spv/",
     "solid_unorm8_quad.frag.spv"
 ));
+/// The native rail's MSL fragment entry of the reviewed three-location module
+/// (`conformance/shaders/quad_indexed_2x2_triple.metal`).
+const TRIPLE_MSL_FRAGMENT_ENTRY: &str = "render_solid_rgba8_triple";
+/// The Vulkan rail's three-location stage (`solid_unorm8_triple.frag.spv`).
+const QUAD_TRIPLE_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "solid_unorm8_triple.frag.spv"
+));
 const QUAD_VERTEX_SPV: &[u8] =
     include_bytes!("../../../../crates/metal-api-vulkan/src/render_spv/quad_indexed.vert.spv");
 const QUAD_FRAGMENT_SPV: &[u8] =
@@ -879,6 +887,12 @@ fn register_render_pipeline(
                 (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
                 (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
                 (QUAD_VERTEX_SPV, QUAD_DUAL_FRAGMENT_SPV),
+                reviewed_quad_layout(),
+            ),
+            (3, _) => (
+                (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+                (QUAD_MSL_VERTEX_ENTRY, TRIPLE_MSL_FRAGMENT_ENTRY),
+                (QUAD_VERTEX_SPV, QUAD_TRIPLE_FRAGMENT_SPV),
                 reviewed_quad_layout(),
             ),
             (4, _) => (
@@ -1918,6 +1932,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v21") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v22") => &["render_declaring_copy_word"],
         (1, "compute-buffer-v23") => &["render_declaring_four_attachments"],
+        (1, "compute-buffer-v24") => &["render_declaring_three_attachments"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2375,10 +2390,11 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             }
             1 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
             2 => (QUAD_MSL_VERTEX_ENTRY, DUAL_MSL_FRAGMENT_ENTRY),
+            3 => (QUAD_MSL_VERTEX_ENTRY, TRIPLE_MSL_FRAGMENT_ENTRY),
             4 => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_QUAD_FRAGMENT_ENTRY),
             _ => {
                 return Err(format!(
-                    "{where_}: the reviewed MRT shapes are one, two and four attachments"
+                    "{where_}: the reviewed MRT shapes are one to four attachments"
                 )
                 .into());
             }
@@ -3112,6 +3128,21 @@ fn case_shape(id: &str) -> Result<CaseShape> {
                 (1, "read", 16),
                 (2, "read", 16),
                 (3, "read", 16),
+                (4, "write", 4),
+            ][..],
+        ),
+        // v25: the same four-read kernel with only three attachment views; the
+        // fourth read is a 4-byte scratch view, because a declared view the
+        // render pass does not attach has to keep its guard bytes.
+        "render_declaring_three_attachments" => (
+            "mrt_declare4",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[
+                (0, "read", 16),
+                (1, "read", 16),
+                (2, "read", 16),
+                (3, "read", 4),
                 (4, "write", 4),
             ][..],
         ),
