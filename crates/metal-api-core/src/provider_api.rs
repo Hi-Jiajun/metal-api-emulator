@@ -546,13 +546,17 @@ pub enum PresentInitial {
 /// attachment keeps what it already holds: the encoder snapshots the
 /// attachment view's bytes at commit and the trace's own view declaration
 /// carries them, so the provider uploads them before the render pass opens
-/// (`research/docs/23` §3.3).
+/// (`research/docs/23` §3.3). `DontCare` declares the pre-pass contents
+/// undefined: the pass neither reads nor presets them, and the draw alone
+/// defines what the attachment stores (`research/docs/23` §3.1, v20).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderAttachmentLoad {
     /// Fill every texel with this colour before drawing.
     Clear([u8; 4]),
     /// Keep the attachment's current contents.
     Load,
+    /// Leave the attachment's current contents undefined.
+    DontCare,
 }
 
 /// One colour attachment a multi-attachment draw records.
@@ -729,6 +733,7 @@ impl RenderTarget {
                 load: match attachment.load {
                     RenderAttachmentLoad::Clear(bytes) => LoadOp::Clear(ClearColor::new(bytes)),
                     RenderAttachmentLoad::Load => LoadOp::Load,
+                    RenderAttachmentLoad::DontCare => LoadOp::DontCare,
                 },
                 store: attachment.store,
             })
@@ -1070,13 +1075,13 @@ fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
 
 /// Reserve every range every recorded pass touches, in identity order.
 ///
-/// A render pass reserves a `Clear` attachment as a write (the pass lands
-/// texels there without reading the old ones) and a `Load` attachment as a
-/// read: a load snapshots the attachment's current bytes at commit, exactly as
-/// the draw inputs do, and a read range only excludes a conflicting write
-/// (`research/docs/14` §3.2), so a CPU reader is not made to wait out the whole
-/// window. Each stream and index buffer a pass draws through is reserved as a
-/// read for the same reason.
+/// A render pass reserves a `Clear` or `DontCare` attachment as a write (the
+/// pass lands texels there without reading the old ones) and a `Load`
+/// attachment as a read: a load snapshots the attachment's current bytes at
+/// commit, exactly as the draw inputs do, and a read range only excludes a
+/// conflicting write (`research/docs/14` §3.2), so a CPU reader is not made to
+/// wait out the whole window. Each stream and index buffer a pass draws through
+/// is reserved as a read for the same reason.
 fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
     let mut by_allocation =
         BTreeMap::<AllocationId, (&Buffer, BTreeMap<(usize, usize), bool>)>::new();
