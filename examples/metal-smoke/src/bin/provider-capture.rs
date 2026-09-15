@@ -1935,6 +1935,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v24") => &["render_declaring_three_attachments"],
         (1, "compute-buffer-v25") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v26") => &["render_declaring_quad_extent"],
+        (1, "compute-buffer-v27") => &["render_declaring_two_attachments"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
