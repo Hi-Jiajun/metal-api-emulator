@@ -132,30 +132,42 @@ const SOLID_UNORM8_TRIPLE_FRAG_SPV: &[u8] =
 pub(crate) fn solid_fragment_spirv(
     formats: &[AttachmentFormat],
 ) -> Result<&'static [u8], ProviderError> {
+    // The reviewed 8-bit UNORM modules are layout-agnostic: the same store
+    // lands in whichever channel order each attachment declares, so any mix of
+    // the two 8-bit formats is served by the module of its attachment count
+    // (`research/docs/23` §3.3, v26). The single-channel float module is the
+    // one format-specific stage, and an empty or over-long list is refused as
+    // a count question.
+    let unorm8 = |format: AttachmentFormat| {
+        matches!(
+            format,
+            AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+        )
+    };
     Ok(match formats {
-        [format] => match format {
-            AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => SOLID_UNORM8_FRAG_SPV,
-            AttachmentFormat::R32Float => SOLID_R32F_FRAG_SPV,
-            AttachmentFormat::R32Uint => {
-                return Err(attachment_format_refusal()
-                    .with_field(
-                        "format_code",
-                        FieldValue::Unsigned(u64::from(format.code())),
-                    )
-                    .with_detail("this rail has no colour fragment stage for the format"));
-            }
-        },
-        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => SOLID_UNORM8_DUAL_FRAG_SPV,
-        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => {
-            SOLID_UNORM8_TRIPLE_FRAG_SPV
+        [AttachmentFormat::R32Float] => SOLID_R32F_FRAG_SPV,
+        [format] if unorm8(*format) => SOLID_UNORM8_FRAG_SPV,
+        [format] => {
+            return Err(attachment_format_refusal().with_field(
+                "format_code",
+                FieldValue::Unsigned(u64::from(format.code())),
+            ))
         }
-        [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm] => {
-            SOLID_UNORM8_QUAD_FRAG_SPV
-        }
-        [first, second] if formats.len() == 2 => {
+        [first, second] if unorm8(*first) && unorm8(*second) => SOLID_UNORM8_DUAL_FRAG_SPV,
+        [first, second] => {
             return Err(mrt_format_combination_refusal(*first, *second));
         }
-        [first, ..] => return Err(mrt_format_combination_refusal(*first, formats[1])),
+        [first, second, third] if unorm8(*first) && unorm8(*second) && unorm8(*third) => {
+            SOLID_UNORM8_TRIPLE_FRAG_SPV
+        }
+        [first, second, third, fourth]
+            if unorm8(*first) && unorm8(*second) && unorm8(*third) && unorm8(*fourth) =>
+        {
+            SOLID_UNORM8_QUAD_FRAG_SPV
+        }
+        [first, second, ..] => {
+            return Err(mrt_format_combination_refusal(*first, *second));
+        }
         _ => return Err(mrt_attachment_count_refusal(formats.len())),
     })
 }
