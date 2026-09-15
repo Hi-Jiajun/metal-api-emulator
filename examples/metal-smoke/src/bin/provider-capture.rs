@@ -1059,6 +1059,10 @@ struct RenderCase {
     metal: Source,
     vertices: u64,
     viewport: [u64; 4],
+    /// The scissor rectangle the pass clips to, in `[x, y, width, height]`, or
+    /// absent for "the whole viewport" (`research/docs/23` §3.3, v29).
+    #[serde(default)]
+    scissor: Option<[u64; 4]>,
     /// The first render increments' single attachment, or `None` for an MRT
     /// case that declares `attachments` instead. Exactly one of the two forms
     /// is present, and [`validate_render_case`] pins that before any rail runs.
@@ -1936,6 +1940,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v25") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v26") => &["render_declaring_quad_extent"],
         (1, "compute-buffer-v27") => &["render_declaring_two_attachments"],
+        (1, "compute-buffer-v28") => &["render_declaring_quad_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2472,13 +2477,60 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 let uniform_texel = texels.chunks_exact(4).all(|chunk| chunk == &texels[..4]);
                 match attachment.load.as_str() {
                     "clear" => {
-                        if !uniform_texel {
+                        let texel = &texels[..4];
+                        // A scissored pass covers a known rectangle: inside it
+                        // the texels are the fragment output and outside it the
+                        // clear colour, which is exactly what the comparator
+                        // checks. Without a scissor the milestone's stricter
+                        // rule stays: every texel is the output
+                        // (`research/docs/23` §3.3, v29).
+                        if let Some([x, y, scissor_width, scissor_height]) = case.scissor {
+                            let texel_bytes = [texel[0], texel[1], texel[2], texel[3]];
+                            let clear_bytes =
+                                unhex(attachment.clear_hex.as_deref().ok_or(format!(
+                                    "{where_}: a clear attachment needs clear_hex"
+                                ))?)?;
+                            if clear_bytes.len() != 4 {
+                                return Err(
+                                    format!("{where_}: a clear colour is four bytes").into()
+                                );
+                            }
+                            let mut covered = 0;
+                            for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                let column = index as u64 % attachment.width;
+                                let row = index as u64 / attachment.width;
+                                let inside = column >= x
+                                    && column < x + scissor_width
+                                    && row >= y
+                                    && row < y + scissor_height;
+                                let expected_chunk = if inside {
+                                    &texel_bytes
+                                } else {
+                                    clear_bytes.as_slice().try_into().map_err(|_| {
+                                        format!("{where_}: a clear colour is four bytes")
+                                    })?
+                                };
+                                if chunk != expected_chunk {
+                                    return Err(format!(
+                                        "{where_}: texel {index} does not match the declared scissor"
+                                    )
+                                    .into());
+                                }
+                                covered += usize::from(inside);
+                            }
+                            let total = texels.chunks_exact(4).count();
+                            if covered == 0 || covered == total {
+                                return Err(format!(
+                                    "{where_}: the scissor has to clip part of the attachment"
+                                )
+                                .into());
+                            }
+                        } else if !uniform_texel {
                             return Err(format!(
                                 "{where_}: every texel of a cleared attachment has to be the fragment output"
                             )
                             .into());
                         }
-                        let texel = &texels[..4];
                         let clear = unhex(
                             attachment
                                 .clear_hex
@@ -4029,6 +4081,15 @@ fn run_render_case(
         None => None,
     };
     trace.pipelines.push(render_pipeline.clone());
+    let scissor = match case.scissor {
+        Some([x, y, width, height]) => Some([
+            u32::try_from(x)?,
+            u32::try_from(y)?,
+            u32::try_from(width)?,
+            u32::try_from(height)?,
+        ]),
+        None => None,
+    };
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
@@ -4038,6 +4099,7 @@ fn run_render_case(
             u32::try_from(case.viewport[2])?,
             u32::try_from(case.viewport[3])?,
         ],
+        scissor,
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,

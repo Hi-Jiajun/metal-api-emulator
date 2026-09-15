@@ -202,6 +202,9 @@ private struct RenderCaseDefinition: Decodable {
     let metal: RenderSourcePin
     let vertices: UInt64
     let viewport: [UInt64]
+    /// The pass's scissor rectangle in framebuffer coordinates, or `nil` for the
+    /// whole attachment (`research/docs/23` §3.3, v29).
+    let scissor: [UInt64]?
     /// The vertex-input half, absent for the `vertex_id` shape
     /// (`research/docs/23` §3.3). A case that carries a layout draws the
     /// indexed reviewed module instead: the layout, its bindings and the index
@@ -1088,8 +1091,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_quad_extent"]
     case "compute-buffer-v27":
         expectedIDs = ["render_declaring_two_attachments"]
+    case "compute-buffer-v28":
+        expectedIDs = ["render_declaring_quad_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v27 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1497,6 +1502,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         let stored = attachment.store == "store"
         try require(definition.viewport == [0, 0, UInt64(attachment.width), UInt64(attachment.height)],
                     "\(definition.id): the viewport must cover the attachment")
+        if let scissor = definition.scissor {
+            try require(scissor.count == 4,
+                        "\(definition.id): a scissor is four numbers")
+            try require(scissor[2] > 0 && scissor[3] > 0
+                        && scissor[0] + scissor[2] <= UInt64(attachment.width)
+                        && scissor[1] + scissor[3] <= UInt64(attachment.height),
+                        "\(definition.id): a scissor has to be a non-empty rectangle "
+                        + "inside the attachment")
+        }
         let byteCount = attachment.width * attachment.height * 4
         // A stored attachment carries the whole expectation and the byte-level
         // review it makes possible; a discarded attachment carries none, and
@@ -1519,10 +1533,38 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             let texel = Data(texels.prefix(4))
             var texelCount = 0
             if attachment.load == "clear" {
+                // A scissored pass covers a known rectangle: inside it every
+                // texel is the fragment output and outside it every texel is the
+                // clear colour (`research/docs/23` §3.3, v29). Both halves have
+                // to appear, or the fixture could not show the clip ran.
+                var scissorClear: Data?
+                var covered = 0
+                if let scissor = definition.scissor {
+                    let clearHex = attachment.clear_hex ?? ""
+                    scissorClear = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+                    _ = scissor
+                }
                 for offset in stride(from: 0, to: texels.count, by: 4) {
+                    if let scissor = definition.scissor, let clearBytes = scissorClear {
+                        let index = offset / 4
+                        let column = UInt64(index % attachment.width)
+                        let row = UInt64(index / attachment.width)
+                        let inside = column >= scissor[0] && column < scissor[0] + scissor[2]
+                            && row >= scissor[1] && row < scissor[1] + scissor[3]
+                        let expected = inside ? texel : clearBytes
+                        try require(Data(texels[offset..<(offset + 4)]) == expected,
+                                    "\(definition.id): texel \(index) has to follow the declared scissor")
+                        covered += inside ? 1 : 0
+                        texelCount += 1
+                        continue
+                    }
                     try require(Data(texels[offset..<(offset + 4)]) == texel,
                                 "\(definition.id): the milestone expects every texel to equal the fragment output")
                     texelCount += 1
+                }
+                if definition.scissor != nil {
+                    try require(covered > 0 && covered < texelCount,
+                                "\(definition.id): the scissor has to clip part of the attachment")
                 }
             } else {
                 texelCount = texels.count / 4
@@ -2109,6 +2151,13 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                     width: Double(fixture.attachments[0].width),
                                     height: Double(fixture.attachments[0].height),
                                     znear: 0, zfar: 1))
+    // The scissor is the pass's own rectangle when it declares one; both rails
+    // state it in framebuffer coordinates with the origin at the render area's
+    // top-left (`research/docs/23` §3.3, v29).
+    if let scissor = definition.scissor {
+        encoder.setScissorRect(MTLScissorRect(x: Int(scissor[0]), y: Int(scissor[1]),
+                                              width: Int(scissor[2]), height: Int(scissor[3])))
+    }
     // The streams are bound at the same indices the descriptor names, and they
     // stay alive until the command buffer has completed (the buffers array is
     // released after the readback below).
@@ -2204,6 +2253,7 @@ private func renderSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         // The `vertex_id` shape: positions come from the vertex index, so the
         // case declares no layout, no stream and no index buffer.
         vertex_layout: nil,
@@ -2260,6 +2310,7 @@ private func presentSelfTest() throws -> CaseResult {
         metal: reviewed.metal,
         vertices: 3,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         // The present equivalent replays the `vertex_id` shape, so it declares
         // no vertex input either.
         vertex_layout: nil,
@@ -2332,6 +2383,7 @@ private func vertexSelfTest() throws -> CaseResult {
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         // The stream and index views, spelled exactly as a suite spells them:
         // each view carries its own bytes (`research/docs/23` §3.6), which is
@@ -2408,6 +2460,7 @@ private func mrtSelfTest() throws -> CaseResult {
         // `vertices` is the index count in the indexed shape.
         vertices: 6,
         viewport: [0, 0, 2, 2],
+        scissor: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
                                                       length: UInt64(vertices.count),

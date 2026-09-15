@@ -1644,6 +1644,17 @@ pub struct RenderPassDescriptor {
     /// not set, and so a later dynamic-viewport extension is a deliberate
     /// change (`docs/23` §3.1).
     pub viewport: [u32; 4],
+    /// The scissor rectangle `[x, y, width, height]` the draw is clipped to, or
+    /// `None` for "the whole viewport".
+    ///
+    /// The viewport (above) says how NDC maps to the attachment; the scissor is
+    /// the conservative clip that keeps fragments outside it from being
+    /// written. Both rails execute it (Vulkan bakes it into the pipeline's
+    /// viewport state, Metal sets it on the encoder), so a trace that scisses
+    /// gets the same bytes on every rail: the covered texels carry the fragment
+    /// output and the rest keep whatever the load op gave them
+    /// (`research/docs/23` §3.3, v29).
+    pub scissor: Option<[u32; 4]>,
     /// Vertices of the single non-indexed draw. The first milestone draws
     /// [`FULL_SCREEN_TRIANGLE_VERTICES`].
     ///
@@ -1759,6 +1770,24 @@ impl RenderPassDescriptor {
                 return Err(ContractError::ViewportExtentMismatch {
                     viewport: [width, height],
                     attachment: [attachment.width, attachment.height],
+                });
+            }
+        }
+        // The scissor, when present, has to stay inside the viewport and be
+        // non-empty: a zero-area scissor would make "nothing landed" look like
+        // a pass that ran, exactly the shape `StoreOp::DontCare` refuses on the
+        // store side.
+        if let Some([x, y, scissor_width, scissor_height]) = self.scissor {
+            let inside = u64::from(x)
+                .checked_add(u64::from(scissor_width))
+                .is_some_and(|end| end <= u64::from(width))
+                && u64::from(y)
+                    .checked_add(u64::from(scissor_height))
+                    .is_some_and(|end| end <= u64::from(height));
+            if scissor_width == 0 || scissor_height == 0 || !inside {
+                return Err(ContractError::ScissorOutOfBounds {
+                    scissor: [x, y, scissor_width, scissor_height],
+                    viewport: [width, height],
                 });
             }
         }
@@ -5678,7 +5707,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Args,
             "trace_contract_invalid",
         ),
-        E::ViewportExtentMismatch { .. } => (ProviderErrorClass::Args, "trace_contract_invalid"),
+        E::ViewportExtentMismatch { .. } | E::ScissorOutOfBounds { .. } => {
+            (ProviderErrorClass::Args, "trace_contract_invalid")
+        }
         // Presentation contract, Step 1. The three first-increment narrowings
         // are capability refusals for the same reason the render track's are:
         // the request is well formed and simply wider than this increment. The
@@ -7095,6 +7126,11 @@ pub enum ContractError {
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
+    /// The pass's scissor rectangle is empty or reaches outside the viewport.
+    ScissorOutOfBounds {
+        scissor: [u32; 4],
+        viewport: [u32; 2],
+    },
     ViewportExtentMismatch {
         viewport: [u32; 2],
         attachment: [u64; 2],
@@ -7585,6 +7621,10 @@ impl fmt::Display for ContractError {
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
                 "viewport origin {origin:?} is outside the first render increment's (0, 0)"
+            ),
+            Self::ScissorOutOfBounds { scissor, viewport } => write!(
+                formatter,
+                "the scissor {scissor:?} is empty or reaches outside the viewport {viewport:?}"
             ),
             Self::ViewportExtentMismatch {
                 viewport,
@@ -8865,6 +8905,7 @@ mod tests {
                 store: StoreOp::Store,
             }],
             viewport: [0, 0, width as u32, height as u32],
+            scissor: None,
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
@@ -12094,6 +12135,7 @@ mod tests {
             pipeline: PipelineId::new(5),
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
             viewport: [0, 0, 2, 2],
+            scissor: None,
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
@@ -12818,6 +12860,7 @@ mod tests {
         TracePass::Render(RenderPassDescriptor {
             pipeline: PipelineId::new(4),
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],
+            scissor: None,
             color_attachments: vec![attachment],
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),

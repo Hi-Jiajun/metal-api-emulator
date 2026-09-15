@@ -1003,6 +1003,9 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) extent: [u32; 2],
     /// `[origin_x, origin_y, width, height]`, copied from the validated pass.
     pub(crate) viewport: [u32; 4],
+    /// The pass's scissor rectangle, or `None` for the whole viewport
+    /// (`research/docs/23` §3.3, v29).
+    pub(crate) scissor: Option<[u32; 4]>,
     pub(crate) vertices: u32,
     /// One entry per bound vertex stream, in binding order, with the bytes and
     /// footprints [`plan_vertex_input`] proved.
@@ -1229,6 +1232,7 @@ pub(crate) fn plan<'a>(
         attachments: planned_attachments,
         extent,
         viewport: request.pass.viewport,
+        scissor: request.pass.scissor,
         vertices: request.pass.vertices,
         vertex_streams,
         indices,
@@ -1863,7 +1867,9 @@ fn encode_into_and_readback(
         stream_buffers.push(buffer);
     }
     // The viewport is explicit because the contract carries it, even though
-    // the first increment only accepts the attachment-covering default.
+    // the first increment only accepts the attachment-covering default. The
+    // scissor below it is the pass's own rectangle when it declares one
+    // (`research/docs/23` §3.3, v29).
     encoder.set_viewport(MTLViewport {
         originX: f64::from(planned.viewport[0]),
         originY: f64::from(planned.viewport[1]),
@@ -1871,6 +1877,16 @@ fn encode_into_and_readback(
         height: f64::from(planned.viewport[3]),
         znear: 0.0,
         zfar: 1.0,
+    });
+    let [scissor_x, scissor_y, scissor_width, scissor_height] =
+        planned
+            .scissor
+            .unwrap_or([0, 0, planned.extent[0], planned.extent[1]]);
+    encoder.set_scissor_rect(metal::MTLScissorRect {
+        x: metal::NSUInteger::from(scissor_x),
+        y: metal::NSUInteger::from(scissor_y),
+        width: metal::NSUInteger::from(scissor_width),
+        height: metal::NSUInteger::from(scissor_height),
     });
     match indirect {
         None => match &planned.indices {
@@ -2221,6 +2237,7 @@ mod tests {
                 store: StoreOp::Store,
             }],
             viewport: [0, 0, 2, 2],
+            scissor: None,
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
@@ -3001,6 +3018,7 @@ mod tests {
                 store: StoreOp::Store,
             }],
             viewport: [0, 0, 2, 2],
+            scissor: None,
             vertices: 6,
             vertex_buffers: vec![quad_vertex_view()],
             indices: Some(IndexBufferBinding {

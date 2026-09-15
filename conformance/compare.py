@@ -670,6 +670,19 @@ def _vertex_input_declaration(case, where):
     return {"vertices": quad_vertices, "indices": quad_indices}
 
 
+def _inside_scissor(index, width, scissor):
+    """Whether the row-major texel `index` falls inside a `[x, y, w, h]` scissor.
+
+    Both rails state the rectangle in framebuffer coordinates with the origin at
+    the render area's top-left, which is the same corner the fixture's expected
+    texels start from (`research/docs/23` §3.3, v29).
+    """
+    x, y, scissor_width, scissor_height = scissor
+    column = index % width
+    row = index // width
+    return x <= column < x + scissor_width and y <= row < y + scissor_height
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -708,7 +721,7 @@ def _render_plan(plan, suite):
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
-                               "vertex_layout", "vertex_buffers", "indices"})
+                               "vertex_layout", "vertex_buffers", "indices", "scissor"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -767,6 +780,18 @@ def _render_plan(plan, suite):
         # resolves against its declaring view, but its bytes disappear from the
         # observable surface, so it carries no expectation and no observation
         # (`research/docs/23` §3.6).
+        # The pass's scissor, when it declares one, makes the coverage of every
+        # attachment exact: texels inside the rectangle carry the fragment
+        # output and the rest keep whatever the load op handed the pass
+        # (`research/docs/23` §3.3, v29). Both rails put the rectangle in
+        # framebuffer coordinates, so the comparison can reason about it
+        # directly instead of asking "both halves have to appear".
+        scissor = case.get("scissor")
+        if scissor is not None:
+            scissor = _list(scissor, f"{where}.scissor")
+            _require(len(scissor) == 4, f"{where}: a scissor is four numbers")
+            scissor = [_integer(value, f"{where}.scissor[{index}]")
+                       for index, value in enumerate(scissor)]
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):
@@ -802,6 +827,12 @@ def _render_plan(plan, suite):
             viewport = _list(case["viewport"], f"{attachment_where}.viewport")
             _require(viewport == [0, 0, width, height],
                      f"{attachment_where}: the viewport must cover the attachment")
+            if scissor is not None:
+                x, y, scissor_width, scissor_height = scissor
+                _require(scissor_width > 0 and scissor_height > 0
+                         and x + scissor_width <= width and y + scissor_height <= height,
+                         f"{where}: a scissor has to be a non-empty rectangle inside "
+                         "the attachment")
             store = attachment.get("store", "store")
             _require(store in ("store", "dontcare"),
                      f"{attachment_where}: a discarded attachment cannot be compared")
@@ -863,15 +894,29 @@ def _render_plan(plan, suite):
             # and dontcare arms keep the milestone's stricter one.
             load = attachment.get("load")
             if load == "clear":
-                _require(all(chunk == texel for chunk in texels),
-                         f"{attachment_where}: every texel of the expectation has to be "
-                         "the fragment output")
                 clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
                 _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
                 _require("initial_hex" not in attachment,
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
+                if scissor is None:
+                    _require(all(chunk == texel for chunk in texels),
+                             f"{attachment_where}: every texel of the expectation has to be "
+                             "the fragment output")
+                else:
+                    covered = 0
+                    for index, chunk in enumerate(texels):
+                        inside = _inside_scissor(index, width, scissor)
+                        expected_chunk = texel if inside else clear
+                        _require(chunk == expected_chunk,
+                                 f"{attachment_where}: texel {index} has to be "
+                                 + ("the fragment output" if inside else "the clear colour")
+                                 + " under the declared scissor")
+                        covered += 1 if inside else 0
+                    _require(0 < covered < len(texels),
+                             f"{attachment_where}: the scissor has to clip part of the "
+                             "attachment, or the fixture cannot show it ran")
             elif load == "load":
                 previous = _hex(attachment.get("initial_hex"),
                                 f"{attachment_where}.initial_hex")

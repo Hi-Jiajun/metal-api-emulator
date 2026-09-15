@@ -319,6 +319,7 @@ mod tests {
                 store: StoreOp::Store,
             }],
             viewport: [0, 0, 2, 2],
+            scissor: None,
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
