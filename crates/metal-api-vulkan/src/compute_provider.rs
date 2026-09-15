@@ -12,14 +12,13 @@ pub use metal_api_core::provider::CompiledComputePipeline;
 use metal_api_core::provider::{
     allocate_device_epoch, AliasMode, AllocationId, BufferSource, BufferView, BufferWriteback,
     CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputeProvider,
-    ComputeTrace, ContractError, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity,
-    FunctionSource, HeapId, HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId,
-    LeaseImporter, LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId,
-    PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TracePass,
-    ValidatedComputeTrace, ViewId,
+    ComputeTrace, DeviceEpoch, DispatchKind, FieldValue, FunctionIdentity, FunctionSource, HeapId,
+    HeapResource, IndirectCommandDescriptor, IndirectCommandKind, LeaseId, LeaseImporter,
+    LeaseRegistry, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
+    PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
+    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -1843,7 +1842,7 @@ impl ComputeProvider for VulkanComputeProvider {
                 completion: CompletionDisposition::CompletedVisible { token },
                 writebacks,
             };
-            validate_submission_output(&output, trace).map_err(|error| {
+            output.validate_for_trace(trace).map_err(|error| {
                 output_error(token, "writeback_contract_invalid").with_detail(error.to_string())
             })?;
             Ok(output)
@@ -2097,64 +2096,6 @@ fn map_writebacks(
     }
     writebacks.sort_by_key(|w| (w.allocation_id, w.view_id));
     Ok(writebacks)
-}
-
-/// Validate a completed submission against the exact trace with the v19
-/// discard rule applied (`docs/23` §3.6).
-///
-/// Core's [`ProviderSubmission::validate_for_trace`] predates
-/// `StoreOp::DontCare` and reports a discarded attachment's legitimate absence
-/// as `MissingWriteback`. Every other failure — epoch, policy, per-writeback
-/// identity and range, and any other missing writeback — stays exactly the
-/// core rule. Only a `MissingWriteback` is re-checked, and the re-check excuses
-/// a view that some pass discards and no pass stores; every other writable
-/// view still needs its writeback, so forgiving the discard can never mask a
-/// missing writeback somewhere else.
-fn validate_submission_output(
-    output: &ProviderSubmission,
-    trace: &ComputeTrace,
-) -> Result<(), ContractError> {
-    match output.validate_for_trace(trace) {
-        Ok(()) => Ok(()),
-        Err(ContractError::MissingWriteback { .. }) => {
-            let resources = trace.serial_resources()?;
-            for view in resources.iter().filter(|view| view.access.is_writable()) {
-                // The view is excused exactly when it is discarded by some
-                // attachment and stored by none: a view any pass stores must
-                // still land a writeback, so a mixed store/discard identity
-                // cannot hide behind the discard.
-                let mut stored = false;
-                let mut discarded = false;
-                for attachment in trace
-                    .render_passes()
-                    .flat_map(|pass| pass.color_attachments.iter())
-                    .filter(|attachment| {
-                        attachment.view_id == view.view_id
-                            && attachment.allocation_id == view.allocation_id
-                    })
-                {
-                    match attachment.store {
-                        StoreOp::Store => stored = true,
-                        StoreOp::DontCare => discarded = true,
-                    }
-                }
-                if stored || !discarded {
-                    let covered = output.writebacks.iter().any(|writeback| {
-                        writeback.allocation_id == view.allocation_id
-                            && writeback.view_id == view.view_id
-                    });
-                    if !covered {
-                        return Err(ContractError::MissingWriteback {
-                            allocation: view.allocation_id,
-                            view: view.view_id,
-                        });
-                    }
-                }
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }
 
 /// Serialize device work on the selected queue with the standalone executor,

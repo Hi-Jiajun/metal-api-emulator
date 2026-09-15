@@ -4643,14 +4643,41 @@ fn validate_writebacks_for_trace(
         && matches!(completion, CompletionDisposition::CompletedVisible { .. })
     {
         for view in resources.iter().filter(|view| view.access.is_writable()) {
-            if !writebacks.iter().any(|writeback| {
+            let covered = writebacks.iter().any(|writeback| {
                 writeback.allocation_id == view.allocation_id && writeback.view_id == view.view_id
-            }) {
-                return Err(ContractError::MissingWriteback {
-                    allocation: view.allocation_id,
-                    view: view.view_id,
-                });
+            });
+            if covered {
+                continue;
             }
+            // A render pass may discard an attachment instead of storing it
+            // (`StoreOp::DontCare`, `research/docs/23` §13): the view is still
+            // writable by the pass, but the rail is allowed to leave it
+            // unread. The view is excused exactly when it is discarded by some
+            // attachment and stored by none — a view any pass stores must still
+            // land a writeback, so a mixed store/discard identity cannot hide
+            // behind the discard.
+            let mut stored = false;
+            let mut discarded = false;
+            for attachment in trace
+                .render_passes()
+                .flat_map(|pass| pass.color_attachments.iter())
+                .filter(|attachment| {
+                    attachment.view_id == view.view_id
+                        && attachment.allocation_id == view.allocation_id
+                })
+            {
+                match attachment.store {
+                    StoreOp::Store => stored = true,
+                    StoreOp::DontCare => discarded = true,
+                }
+            }
+            if discarded && !stored {
+                continue;
+            }
+            return Err(ContractError::MissingWriteback {
+                allocation: view.allocation_id,
+                view: view.view_id,
+            });
         }
     }
     Ok(())
@@ -11321,6 +11348,51 @@ mod tests {
             Err(ContractError::MissingWriteback {
                 allocation: AllocationId::new(9),
                 view: ViewId::new(8),
+            })
+        );
+    }
+
+    #[test]
+    fn a_discarded_attachment_is_excused_from_the_writeback_requirement() {
+        // Two attachments: view 7/9 is discarded, view 8/10 is stored. The
+        // second attachment's view is declared by the same compute pass, the
+        // way a declaring case declares every attachment view.
+        let mut discarded = attachment_into(7, 9);
+        discarded.store = StoreOp::DontCare;
+        let mut trace = attachment_trace(landing_view(7, 9), discarded);
+        let mut second_view = landing_view(8, 10);
+        second_view.metal_binding = 1;
+        compute_pass_mut(&mut trace, 0).buffers.push(second_view);
+        let contract = &mut trace.pipelines[0].contract;
+        contract
+            .buffer_bindings
+            .push(contract.buffer_bindings[0].clone());
+        contract.buffer_bindings[1].metal_binding = 1;
+        render_entry(&mut trace)
+            .color_attachments
+            .push(attachment_into(8, 10));
+
+        let mut submission = completed_submission(&trace);
+        submission.writebacks = vec![BufferWriteback {
+            view_id: ViewId::new(8),
+            allocation_id: AllocationId::new(10),
+            offset: 0,
+            bytes: vec![0x5a; 16],
+        }];
+        // The increment: a view that is discarded and never stored owes no
+        // writeback, so the stored attachment's own landing is enough
+        // (`StoreOp::DontCare`, `research/docs/23` §13).
+        submission
+            .validate_for_trace(&trace)
+            .expect("a discarded-only attachment owes no writeback");
+        // Control: a stored attachment owes one like any other writable view,
+        // so a mixed store/discard identity cannot hide behind the discard.
+        render_entry(&mut trace).color_attachments[0].store = StoreOp::Store;
+        assert_eq!(
+            submission.validate_for_trace(&trace),
+            Err(ContractError::MissingWriteback {
+                allocation: AllocationId::new(9),
+                view: ViewId::new(7),
             })
         );
     }

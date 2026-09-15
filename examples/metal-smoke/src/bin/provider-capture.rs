@@ -6,16 +6,16 @@ use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    ComputePass, ComputeTrace, ContractError, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
-    FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
-    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
-    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
-    PresentTarget, ProviderSubmission, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    ViewId, PROVIDER_SCHEMA_VERSION,
+    ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
+    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
+    StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -3627,62 +3627,6 @@ fn heap_segment(
     })
 }
 
-/// Validate a completed render submission against its exact trace with the v19
-/// discard rule applied (`docs/23` §3.6).
-///
-/// Core's `ProviderSubmission::validate_for_trace` predates
-/// `StoreOp::DontCare` and reports a discarded attachment's legitimate absence
-/// as `MissingWriteback`; the capture tool's own defense-in-depth call needs
-/// the same exemption the Vulkan rail applies inside `submit`
-/// (`metal-api-vulkan::compute_provider`). Only a `MissingWriteback` is
-/// re-checked, and the view is excused exactly when some attachment discards
-/// it and none stores it: a mixed store/discard identity still has to land a
-/// writeback, and every other failure stays the core rule, so forgiving the
-/// discard can never mask a missing writeback somewhere else.
-fn validate_render_submission_output(
-    output: &ProviderSubmission,
-    trace: &ComputeTrace,
-) -> Result<()> {
-    match output.validate_for_trace(trace) {
-        Ok(()) => Ok(()),
-        Err(ContractError::MissingWriteback { .. }) => {
-            let resources = trace.serial_resources()?;
-            for view in resources.iter().filter(|view| view.access.is_writable()) {
-                let mut stored = false;
-                let mut discarded = false;
-                for attachment in trace
-                    .render_passes()
-                    .flat_map(|pass| pass.color_attachments.iter())
-                    .filter(|attachment| {
-                        attachment.view_id == view.view_id
-                            && attachment.allocation_id == view.allocation_id
-                    })
-                {
-                    match attachment.store {
-                        StoreOp::Store => stored = true,
-                        StoreOp::DontCare => discarded = true,
-                    }
-                }
-                if stored || !discarded {
-                    let covered = output.writebacks.iter().any(|writeback| {
-                        writeback.allocation_id == view.allocation_id
-                            && writeback.view_id == view.view_id
-                    });
-                    if !covered {
-                        return Err(ContractError::MissingWriteback {
-                            allocation: view.allocation_id,
-                            view: view.view_id,
-                        }
-                        .into());
-                    }
-                }
-            }
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// Execute one render case on the Vulkan trace rail.
 ///
 /// The trace is the declaring case's own pass followed by the render pass, i.e.
@@ -3894,7 +3838,7 @@ fn run_render_case(
     let output = provider
         .submit(admitted)
         .map_err(|error| format!("submit {}: {error:?}", case.id))?;
-    validate_render_submission_output(&output, &trace)?;
+    output.validate_for_trace(&trace)?;
     let CompletionDisposition::CompletedVisible { token } = output.completion else {
         return Err("render capture requires completed visible results".into());
     };
