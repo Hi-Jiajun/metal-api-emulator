@@ -303,6 +303,11 @@ private struct ValidatedRenderAttachment {
     /// The reviewed expectation of a stored attachment; `nil` for a discarded
     /// attachment, which carries no expectation and no observation.
     let expected: Data?
+    /// The ``MTLPixelFormat`` the case's declared attachment format names
+    /// (`research/docs/23` §3.3, v21): the texture and the pipeline attachment
+    /// both take it, so the case's expected texels pin which channel order the
+    /// attachment is observing.
+    let pixelFormat: MTLPixelFormat
 }
 
 private struct SuiteDefinition: Decodable {
@@ -1032,8 +1037,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_store_and_discard"]
     case "compute-buffer-v20":
         expectedIDs = ["render_declaring_copy_word"]
+    case "compute-buffer-v21":
+        expectedIDs = ["render_declaring_copy_word"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v20 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v21 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -1366,7 +1373,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 "\(definition.id): every colour attachment discards, leaving no observable landing point")
     var validatedAttachments = [ValidatedRenderAttachment]()
     for (index, attachment) in attachments.enumerated() {
-        try require(attachment.format == "rgba8_unorm",
+        try require(attachment.format == "rgba8_unorm" || attachment.format == "bgra8_unorm",
                     "\(definition.id): unsupported attachment format")
         try require(attachment.width == 2 && attachment.height == 2,
                     "\(definition.id): the first render increment renders into a 2x2 attachment")
@@ -1497,11 +1504,14 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         default:
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
+        let pixelFormat: MTLPixelFormat =
+            attachment.format == "bgra8_unorm" ? .bgra8Unorm : .rgba8Unorm
         validatedAttachments.append(ValidatedRenderAttachment(
             allocation: attachment.allocation, view: attachment.view,
             width: attachment.width, height: attachment.height,
             load: attachment.load, store: attachment.store,
-            clearComponents: clearComponents, initial: initial, expected: expected))
+            clearComponents: clearComponents, initial: initial, expected: expected,
+            pixelFormat: pixelFormat))
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
@@ -1837,7 +1847,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     var targets = [MTLTexture]()
     for attachment in fixture.attachments {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm,
+            pixelFormat: attachment.pixelFormat,
             width: attachment.width,
             height: attachment.height,
             mipmapped: false)
@@ -1915,7 +1925,8 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // format the reviewed fragment's output `i` is compiled against, which the
     // validation above already forced to agree with the case's attachment list.
     for index in 0..<fixture.attachments.count {
-        pipelineDescriptor.colorAttachments[index].pixelFormat = .rgba8Unorm
+        pipelineDescriptor.colorAttachments[index].pixelFormat =
+            fixture.attachments[index].pixelFormat
     }
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 

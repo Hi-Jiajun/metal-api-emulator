@@ -297,7 +297,10 @@ class RenderObservationTests(unittest.TestCase):
 
         rejected(lambda case: case["attachment"].update(width=4, height=4),
                  "2x2 attachment")
-        rejected(lambda case: case["attachment"].update(format="bgra8_unorm"),
+        # The comparator admits both 8-bit UNORM layouts from v21 on
+        # (`research/docs/23` §3.3); `R32Float` is still an unadmitted shape
+        # here, so it stays the probe for "an unsupported format is refused".
+        rejected(lambda case: case["attachment"].update(format="r32float"),
                  "unsupported attachment format")
         rejected(lambda case: case["attachment"].update(store="discard"),
                  "cannot be compared")

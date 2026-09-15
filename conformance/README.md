@@ -1,14 +1,14 @@
 # Native Metal reference capture
 
 Current state: the harness covers the compute/alias/texture/command-buffer
-suites `suite.json` through `suite-v20.json`. The render-bearing suites are
+suites `suite.json` through `suite-v21.json`. The render-bearing suites are
 `suite-v13.json` (offscreen 2x2 colour attachment), `suite-v14.json` (the same
 attachment as a surfaceless present target, with `research/docs/24`'s
 acquire/present counts), `suite-v16.json` (the indexed vertex-input quad),
 `suite-v17.json` (a loading pass), `suite-v18.json` (one draw writing two
 colour locations), `suite-v19.json` (the same dual draw with the second
-location discarded) and `suite-v20.json` (the same quad drawn from undefined
-pre-pass contents). The render and present observation rules live in
+location discarded), `suite-v20.json` (the same quad drawn from undefined
+pre-pass contents) and `suite-v21.json` (a `bgra8_unorm` attachment). The render and present observation rules live in
 [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §6-§7, the MRT rules in §10, the
 store/dontcare rules in §11 and the undefined-load rules in §12; the per-suite
 rules are exercised by
@@ -398,3 +398,16 @@ view plus the probe) and two readbacks (`copy_out == 2`, the probe plus the
 stored attachment). [RENDER-CAPTURE.md](RENDER-CAPTURE.md) §12 describes the
 `LoadOp::DontCare` / `MTLLoadAction::DontCare` wiring; the suite's schema, plan,
 marker gates and refusals are pinned by `conformance/test_suite_v20.py`.
+
+## Attachment formats (bgra8_unorm)
+
+[suite-v21.json](suite-v21.json) reuses the v13 render shape with a
+`bgra8_unorm` attachment: the reviewed fragment stage stores the same colour as
+every other fixture, but a B8G8R8A8 layout puts blue in the first byte, so the
+expected texel is `c08040ff`. The comparator admits both 8-bit UNORM layouts
+(`rgba8_unorm` keeps every earlier suite's bytes) and keeps refusing
+`r32float`, whose component shape the observation surface does not pin yet.
+The declaring case is the v13 `copy_word` case at `fefefefe`; the count
+contract stays two in and two out. `conformance/test_suite_v21.py` pins the
+fixture, the plan, the marker gates and the "wrong channel order is refused"
+counter-shape.
