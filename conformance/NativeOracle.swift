@@ -1027,8 +1027,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_copy_word"]
     case "compute-buffer-v18":
         expectedIDs = ["render_declaring_two_attachments"]
+    case "compute-buffer-v19":
+        expectedIDs = ["render_declaring_store_and_discard"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v18 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v19 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

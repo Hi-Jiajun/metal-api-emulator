@@ -831,7 +831,11 @@ Not yet achieved, and therefore still a condition rather than an observation:
   `.dontCare` store action and the skipped readback have not executed on an
   Apple GPU; `cargo check --target aarch64-apple-darwin` is compile evidence
   today, not execution evidence;
-* the suite-side wiring belongs to the conformance step of this increment:
-  `suite-v19.json`, the `compare.py` discarded-attachment rule, the
-  `provider-capture` plumbing and the CI capture rows are owed, and the Apple
-  capture of that suite will be the observation that closes this section.
+* the suite-side wiring has since landed: `suite-v19.json` freezes the fixture,
+  `compare.py` owes one writeback/allocation to the stored attachment and
+  refuses an observation of the discarded one, `provider-capture.rs` carries
+  the store op through the Vulkan trace and object rails, `NativeOracle.swift`
+  accepts v19 in `loadSuite`, `test_suite_v19.py` pins the schema/plan/marker
+  gates and refusals, and `ci.yml` names the suite on all four capture rails
+  and all four object-API version loops. The Apple capture of that suite is
+  still the observation that closes this section.

@@ -762,7 +762,11 @@ def _render_plan(plan, suite):
                      f"{where}: a vertex-input case carries neither a present action nor an ICB")
         # One attachment at a time: the single shape is the v13-v17 branch with
         # its expectation at the case level, and every MRT entry restates the
-        # same per-field rules with its own expectation.
+        # same per-field rules with its own expectation. The v19 increment adds
+        # the store operation: a `dontcare` attachment still renders and still
+        # resolves against its declaring view, but its bytes disappear from the
+        # observable surface, so it carries no expectation and no observation
+        # (`research/docs/23` §3.6).
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):
@@ -787,14 +791,49 @@ def _render_plan(plan, suite):
             _require((width, height) == (2, 2),
                      f"{attachment_where}: the first render increment renders into "
                      "a 2x2 attachment")
-            _require(attachment.get("store") == "store",
-                     f"{attachment_where}: a discarded attachment cannot be compared")
             viewport = _list(case["viewport"], f"{attachment_where}.viewport")
             _require(viewport == [0, 0, width, height],
                      f"{attachment_where}: the viewport must cover the attachment")
+            store = attachment.get("store", "store")
+            _require(store in ("store", "dontcare"),
+                     f"{attachment_where}: a discarded attachment cannot be compared")
+            extent = width * height * 4
+            # A discarded attachment carries no expectation and no observation:
+            # the single-attachment form spells its expectation at the case
+            # level, so a discard cannot be expressed there, and an expectation
+            # arriving for a discarded entry is refused. Its load shape stays
+            # pinned — the pass still performs the load — only the byte
+            # comparison disappears.
+            if store == "dontcare":
+                _require(not single,
+                         f"{attachment_where}: a discarded attachment carries no expectation")
+                _require("expected_hex" not in attachment,
+                         f"{attachment_where}: a discarded attachment carries no expected_hex")
+                load = attachment.get("load")
+                if load == "clear":
+                    clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
+                    _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
+                    _require("initial_hex" not in attachment,
+                             f"{attachment_where}: a cleared attachment carries no initial bytes")
+                elif load == "load":
+                    previous = _hex(attachment.get("initial_hex"),
+                                    f"{attachment_where}.initial_hex")
+                    _require(len(previous) == extent,
+                             f"{attachment_where}: initial texels do not match the attachment")
+                    _require("clear_hex" not in attachment,
+                             f"{attachment_where}: a loaded attachment carries no clear colour")
+                else:
+                    raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
+                parsed.append((attachment, allocation, view, None))
+                continue
+            # The stored arm keeps the v13-v18 shape: its expectation is the
+            # whole reason the attachment is comparable.
+            if multiple:
+                _require("expected_hex" in attachment,
+                         f"{attachment_where}: a stored attachment needs expected_hex")
             expected = _hex(case["expected_hex"] if single else attachment.get("expected_hex"),
                             f"{attachment_where}.expected_hex")
-            _require(len(expected) == width * height * 4,
+            _require(len(expected) == extent,
                      f"{attachment_where}: expected texel bytes do not match the attachment")
             texel = expected[:4]
             texels = [expected[offset:offset + 4] for offset in range(0, len(expected), 4)]
@@ -856,10 +895,17 @@ def _render_plan(plan, suite):
                 raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
             parsed.append((attachment, allocation, view, expected))
             expected_bytes.append(expected)
-        # The two MRT locations write two different byte strings, so a dual
-        # case whose locations read back the same texels could not show that
-        # both outputs landed (`4080c0ff` vs `ff8040c0`).
-        if multiple:
+        # Core admission refuses an all-discarded pass
+        # (`AllRenderAttachmentsDiscarded`), so the suite has to keep at least
+        # one attachment on the observable surface or "nothing landed" would
+        # pass as "landed correctly".
+        _require(expected_bytes,
+                 f"{where}: every colour attachment discards, leaving no observable landing point")
+        # The two reviewed MRT locations write two different byte strings, so a
+        # dual case whose locations read back the same texels could not show
+        # that both outputs landed (`4080c0ff` vs `ff8040c0`). A discarded
+        # location has no expectation and takes no part in the comparison.
+        if multiple and len(expected_bytes) == 2:
             _require(expected_bytes[0] != expected_bytes[1],
                      f"{where}: the two attachments read back the same texels")
         texel = expected_bytes[0][:4]
@@ -894,12 +940,14 @@ def _render_plan(plan, suite):
         writes = []
         images = {}
         identities = []
+        seen_allocations = set()
         written = {identity[0] for identity, _ in declaring_writes}
         for position, (attachment, allocation, view, expected) in enumerate(parsed):
             attachment_where = (f"{where}.attachment" if single
                                 else f"{where}.attachments[{position}]")
-            _require(allocation not in images,
+            _require(allocation not in seen_allocations,
                      f"{attachment_where}: the attachments have to name distinct allocations")
+            seen_allocations.add(allocation)
             declared = [buffer for buffer in declaring_buffers
                         if buffer["allocation"] == allocation and buffer["view"] == view]
             _require(len(declared) == 1,
@@ -909,13 +957,20 @@ def _render_plan(plan, suite):
             _require(declared["access"] == "read",
                      f"{attachment_where}: the declaring pass must only read the "
                      "attachment view")
-            _require(declared["length"] == len(expected),
+            extent = attachment["width"] * attachment["height"] * 4
+            _require(declared["length"] == extent,
                      f"{attachment_where}: attachment extent disagrees with the "
                      "declaring view")
             offset = declared["offset"]
             size = declared["allocation_size"]
-            _require(offset + len(expected) <= size,
+            _require(offset + extent <= size,
                      f"{attachment_where}: the declaring view is outside its allocation")
+            # A discarded attachment's declaring view still takes part in the
+            # touched count and in the declaration resolution, but its landing
+            # never enters the observation surface: no writeback and no
+            # allocation image are owed for it (`research/docs/23` §3.6, v19).
+            if expected is None:
+                continue
 
             # The allocation image is the declaring case's own image with the
             # attachment's landing overlaid: the render result observes the
