@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v1",
+  "guard_byte": 90,
+  "cases": [
+    {
+      "id": "copy_word",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 100,
+          "view": 200,
+          "offset": 16,
+          "length": 4,
+          "allocation_size": 36,
+          "access": "read",
+          "initial_hex": "01234567"
+        },
+        {
+          "binding": 1,
+          "allocation": 101,
+          "view": 201,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "write",
+          "initial_hex": "abababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 101,
+          "view": 201,
+          "offset": 32,
+          "bytes_hex": "01234567"
+        }
+      ]
+    },
+    {
+      "id": "indexed_boundary",
+      "entry": "kernel_dispatch_threads_boundary_barrier",
+      "grid": [
+        10,
+        3,
+        1
+      ],
+      "local": [
+        8,
+        2,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
+        "sha256": "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945"
+      },
+      "metal": {
+        "path": "shaders/indexed_boundary.metal",
+        "sha256": "7684e493a8704127e39dace5476a006fac564224909c667a57fb5ac9d8291b06"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 100,
+          "view": 200,
+          "offset": 32,
+          "length": 120,
+          "allocation_size": 168,
+          "access": "write",
+          "initial_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 100,
+          "view": 200,
+          "offset": 32,
+          "bytes_hex": "d0000000d0000000d0000000d0000000d0000000d0000000d0000000d0000000ca000000ca000000d0000000d0000000d0000000d0000000d0000000d0000000d0000000d0000000ca000000ca0000006c0000006c0000006c0000006c0000006c0000006c0000006c0000006c0000006600000066000000"
+        }
+      ]
+    }
+  ]
+}

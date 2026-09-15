@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v12",
+  "guard_byte": 0,
+  "cases": [
+    {
+      "id": "texture_cell_local_4x4",
+      "entry": "read_texture_2d_cell",
+      "grid": [
+        4,
+        4,
+        1
+      ],
+      "local": [
+        4,
+        4,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_read_texture_2d_cell.ll",
+        "sha256": "80fe6866bac049de9c1c2b33d9f15a3a133b68c321dfdb16721c991f8dfc23c9"
+      },
+      "metal": {
+        "path": "shaders/read_texture_2d_cell.metal",
+        "sha256": "6517da4354381bb46706ec3395d3e449ff08499df37c0c1f2a620a0c04161237"
+      },
+      "textures": [
+        {
+          "binding": 0,
+          "allocation": 700,
+          "view": 710,
+          "width": 4,
+          "height": 4,
+          "format": "r32_uint",
+          "access": "sampled",
+          "initial_hex": "000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000"
+        }
+      ],
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "length": 64,
+          "allocation_size": 72,
+          "access": "write",
+          "initial_hex": "ffffffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "bytes_hex": "6400000065000000660000006700000068000000690000006a0000006b0000006c0000006d0000006e0000006f00000070000000710000007200000073000000"
+        }
+      ]
+    },
+    {
+      "id": "texture_cell_local_1x1",
+      "entry": "read_texture_2d_cell",
+      "grid": [
+        4,
+        4,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_read_texture_2d_cell.ll",
+        "sha256": "80fe6866bac049de9c1c2b33d9f15a3a133b68c321dfdb16721c991f8dfc23c9"
+      },
+      "metal": {
+        "path": "shaders/read_texture_2d_cell.metal",
+        "sha256": "6517da4354381bb46706ec3395d3e449ff08499df37c0c1f2a620a0c04161237"
+      },
+      "textures": [
+        {
+          "binding": 0,
+          "allocation": 700,
+          "view": 710,
+          "width": 4,
+          "height": 4,
+          "format": "r32_uint",
+          "access": "sampled",
+          "initial_hex": "000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000"
+        }
+      ],
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "length": 64,
+          "allocation_size": 72,
+          "access": "write",
+          "initial_hex": "ffffffff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 800,
+          "view": 810,
+          "offset": 4,
+          "bytes_hex": "6400000065000000660000006700000068000000690000006a0000006b0000006c0000006d0000006e0000006f00000070000000710000007200000073000000"
+        }
+      ]
+    }
+  ]
+}

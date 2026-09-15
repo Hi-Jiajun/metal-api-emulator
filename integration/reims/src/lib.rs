@@ -17,8 +17,9 @@ use metal_api_core::{
 use metal_api_vulkan::TranslatedComputePipeline;
 use reims_vgpu::backend::vulkan::engine::{
     execute_compute_request_sync, ComputeBufferOutput, ComputeBufferResource, ComputeDispatch,
-    ComputeRequest,
+    ComputeDispatchRegion, ComputeRequest,
 };
+use reims_vgpu::model::{DeviceId, DeviceState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -29,12 +30,14 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 /// Source-level executor backed by reims-vgpu's process-global Vulkan engine.
 pub struct ReimsVulkanExecutor {
     identity: Arc<()>,
+    state: Arc<DeviceState>,
 }
 
 impl ReimsVulkanExecutor {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             identity: Arc::new(()),
+            state: Arc::new(DeviceState::new(DeviceId(1), 12)),
         })
     }
 
@@ -80,8 +83,7 @@ impl ComputeExecutor for ReimsVulkanExecutor {
                 "translated kernel returned unexpected dispatch contract {contract:?}"
             )));
         }
-        let dispatch = ComputeDispatch::exact_threads(contract, local, grid)
-            .map_err(|error| failure(format!("plan exact dispatch: {error}")))?;
+        let dispatch = exact_threads_dispatch(contract, local, grid)?;
 
         let supplied = submission
             .buffers
@@ -134,7 +136,7 @@ impl ComputeExecutor for ReimsVulkanExecutor {
             storage_buffers,
             ..ComputeRequest::default()
         };
-        let output = execute_compute_request_sync(&request)
+        let output = execute_compute_request_sync(&self.state, &request)
             .map_err(|error| failure(format!("reims Vulkan compute: {error}")))?;
         if !output.images.is_empty() {
             return Err(failure(
@@ -144,6 +146,42 @@ impl ComputeExecutor for ReimsVulkanExecutor {
 
         map_buffer_updates(output.buffers, &descriptor_contracts, &expected_writable)
     }
+}
+
+/// Bridge this adapter's current metal2vulkan reflection to the vendored reims
+/// engine, which still depends on the previous translator revision.
+///
+/// The exact-thread region plan and 48-byte push-constant payload ABI are
+/// identical across the two revisions. Constructing `ComputeDispatch::Regions`
+/// here avoids requiring a second, incompatible `KernelDispatch` type in the
+/// adapter while the reims pin remains on the older translator.
+fn exact_threads_dispatch(
+    contract: KernelDispatch,
+    local: [u32; 3],
+    grid: [u32; 3],
+) -> Result<ComputeDispatch, ExecutorError> {
+    contract
+        .validate()
+        .map_err(|error| failure(format!("dispatch contract invalid: {error}")))?;
+    let range = contract
+        .push_constant_range()
+        .ok_or_else(|| failure("translated kernel has no dispatch push-constant range"))?;
+    let plan = contract
+        .plan(local, Some(grid))
+        .map_err(|error| failure(format!("plan exact dispatch: {error}")))?;
+    Ok(ComputeDispatch::Regions {
+        push_offset: range.offset,
+        threadgroups_per_grid: plan.threadgroups_per_grid,
+        regions: plan
+            .regions
+            .iter()
+            .map(|region| ComputeDispatchRegion {
+                local_size: region.local_size,
+                group_count: region.group_count,
+                push_constants: plan.push_constants(*region),
+            })
+            .collect(),
+    })
 }
 
 type BufferOutputContract = (u32, bool, usize);

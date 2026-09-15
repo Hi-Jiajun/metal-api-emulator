@@ -1,0 +1,523 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v5",
+  "guard_byte": 90,
+  "cases": [
+    {
+      "id": "pipeline_chain_two",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "3f0ff0f0180ff0f0e50ef0f0be0ef0f08b0ef0f0340ef0f0010ef0f0da10f0f0a710f0f08010f0f04d10f0f02610f0f0f30ff0f09c0ff0f06912f0f04212f0f00f12f0f0e811f0f0b511f0f08e11f0f05b11f0f00411f0f0d113f0f0aa13f0f07713f0f05013f0f01d13f0f0f612f0f0c312f0f06c09f0f0"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "7f3f1001583f1001253f1001fe3e1001cb3e1001743e1001413e10011a411001e7401001c04010018d4010016640100133401001dc3f1001a9421001824210014f42100128421001f5411001ce4110019b4110014441100111441001ea431001b7431001904310015d4310013643100103431001ac391001"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          }
+        },
+        {
+          "entry": "mix_3d",
+          "air": {
+            "path": "shaders/mix_3d.ll",
+            "sha256": "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f"
+          },
+          "metal": {
+            "path": "shaders/mix_3d.metal",
+            "sha256": "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipeline_chain_three",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "f865b5a42165b5a41265b5a47b65b5a4b464b5a4cd64b5a43e64b5a4671bb5a4501bb5a4b91ab5a4ea1ab5a4d31ab5a40c1ab5a4a565b5a49618b5a4ff18b5a42818b5a41118b5a44218b5a4ab1bb5a4e41bb5a43d1bb5a46e1eb5a4571eb5a48019b5a4e919b5a4da19b5a40319b5a47c19b5a49563b5a4"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "a23f10017b3f1001483f1001213f1001ee3e1001973e1001643e10013d4110010a411001e3401001b04010018940100156401001ff3f1001cc421001a5421001724210014b42100118421001f1411001be41100167411001344410010d441001da431001b3431001804310015943100126431001cf391001"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          }
+        },
+        {
+          "entry": "mix_3d",
+          "air": {
+            "path": "shaders/mix_3d.ll",
+            "sha256": "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f"
+          },
+          "metal": {
+            "path": "shaders/mix_3d.metal",
+            "sha256": "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "pipeline_chain_eight",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "542c4093ad313f9366523e938f8e3f9388353f93314e3e937a5c3e93d3a901965ca20196b5af01966ed0009697c800969056e395392f4093825be395db62e3956449e395bd68e3957652e3959faa019698b7019641cd00968aec0196e3ff01966cf5e395c5f9e3957e56e395a76fe395a0fde39549443f93"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "945c60a3ed615fa3a6825ea3cfbe5fa3c8655fa3717e5ea3ba8c5ea313da21a69cd221a6f5df21a6ae0021a6d7f820a6d08603a6795f60a3c28b03a61b9303a6a47903a6fd9803a6b68203a6dfda21a6d8e721a681fd20a6ca1c22a6233022a6ac2504a6052a04a6be8603a6e79f03a6e02d04a689745fa3"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          }
+        },
+        {
+          "entry": "mix_3d",
+          "air": {
+            "path": "shaders/mix_3d.ll",
+            "sha256": "cccc601c6f14d5c76808f927118d77cdcb9e4824591c0492faf735197afaf95f"
+          },
+          "metal": {
+            "path": "shaders/mix_3d.metal",
+            "sha256": "e3fa76b0027e6d20e4649fb6e7c07c0ca1618a9ae88fa13815337d2aa7c99bf5"
+          }
+        }
+      ]
+    }
+  ]
+}

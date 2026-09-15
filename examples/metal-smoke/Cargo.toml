@@ -1,11 +1,19 @@
 [package]
 name = "metal-smoke"
+default-run = "metal-smoke"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Offline buffer-compute smoke fixtures"
 
 [dependencies]
 metal-api-core = { path = "../../crates/metal-api-core" }
-metal-api-reims-vulkan = { path = "../../crates/metal-api-reims-vulkan" }
+metal-api-ipc = { path = "../../crates/metal-api-ipc" }
+metal-api-native = { path = "../../crates/metal-api-native" }
 metal-api-vulkan = { path = "../../crates/metal-api-vulkan" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

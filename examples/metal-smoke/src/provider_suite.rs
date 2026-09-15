@@ -1,0 +1,3827 @@
+//! Live checks of canonical provider submission against the snapshot executor.
+
+use super::{
+    assemble_owned_air, execute_copy_word, execute_indexed_boundary_dispatch,
+    indexed_boundary_golden, wrap_air_bitcode,
+};
+use metal_api_core::completion::wire::MirrorOutcome;
+use metal_api_core::completion::wire::{
+    CompletionMessage, CompletionOutbox, CompletionSink, CompletionUpdate,
+};
+use metal_api_core::provider::{
+    disposition_retires_resources, AllocationId, AllocationRecord, BorrowedLease, BufferAccess,
+    BufferLease, BufferSource, BufferView, CompletionDisposition, CompletionPolicy,
+    CompletionToken, ComputePass, ComputeProvider, ComputeTrace, ContractError, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FieldValue, FootprintProof, GuestWindow, GuestWindows,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, HostRegion, LeaseId,
+    LeaseImporter, LeaseLedger, LeaseObservation, LeaseReservation, NoCopyLeaseImporter,
+    OperationId, PipelineCompileRequest, PipelineProvider, ProviderError, ProviderHealth,
+    ProviderSubmission, ResourceTableSnapshot, SemanticDigest, ShaderSource, StagedLease,
+    StorageMode, SubmissionId, TracePass, ViewId, PROVIDER_SCHEMA_VERSION,
+};
+#[cfg(unix)]
+use metal_api_core::provider::{ProviderErrorClass, Retryability};
+use metal_api_core::{ApiError, ComputeExecutor, Device, Library};
+use metal_api_ipc::command::{serve_provider_named, tcp as command_tcp, RemoteProvider};
+#[cfg(unix)]
+use metal_api_ipc::command::{serve_provider_unix, unix as command_unix};
+use metal_api_ipc::receiver::CompletionReceiver;
+use metal_api_ipc::sender::spawn_writer;
+use metal_api_ipc::shared;
+use metal_api_ipc::transport::tcp;
+#[cfg(unix)]
+use metal_api_ipc::unix;
+use metal_api_vulkan::{CompiledComputePipeline, VulkanComputeProvider, VulkanExecutor};
+use std::error::Error;
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{BufRead, BufReader};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const BORROWED_SHARED_LEASE_ID: u64 = 99;
+const BORROWED_SHARED_ALLOCATION_ID: u64 = 298;
+const BORROWED_SHARED_LENGTH: u64 = 64;
+const BORROWED_SHARED_SIZE: usize = 4096;
+const BORROWED_SHARED_OWNER_WORD: u32 = 0xaaaa_aaaa;
+const BORROWED_SHARED_GPU_WORD: u32 = 0x1234_5678;
+
+#[derive(Default)]
+struct RecordingSink {
+    messages: Mutex<Vec<CompletionMessage>>,
+}
+
+impl CompletionSink for RecordingSink {
+    fn deliver(&self, message: CompletionMessage) {
+        self.messages
+            .lock()
+            .expect("recording completion sink")
+            .push(message);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_completion_child(_socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --completion-child requires Unix domain sockets".into())
+}
+
+#[cfg(not(unix))]
+pub fn run_provider_command_child(
+    _command_socket: &std::ffi::OsStr,
+    _completion_socket: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --command-child requires Unix domain sockets".into())
+}
+
+#[cfg(not(unix))]
+pub fn run_borrowed_shared_child(_socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    Err("provider-smoke --borrowed-shared-child requires Unix domain sockets".into())
+}
+
+/// Exercise provider admission, GPU execution, writeback identity, and completion.
+/// Both paths share one Vulkan executor but compile and submit independently.
+pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    println!("Metal API provider: standalone Vulkan");
+    println!("Metal API Vulkan device: {}", executor.device_name());
+    let provider =
+        VulkanComputeProvider::with_executor(executor.clone()).map_err(provider_error)?;
+    let peer = VulkanComputeProvider::with_executor(executor.clone()).map_err(provider_error)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let source = include_str!("../shaders/kernel_copy_word.ll");
+    run_copy(
+        &provider,
+        &device,
+        device.new_library_with_air(source)?,
+        "textual",
+        1,
+    )?;
+    let raw = assemble_owned_air(source)?;
+    let wrapped = wrap_air_bitcode(&raw)?;
+    for (index, (encoding, air)) in [("raw", raw), ("wrapped", wrapped)].into_iter().enumerate() {
+        run_copy(
+            &provider,
+            &device,
+            device.new_library_with_binary_air(air)?,
+            encoding,
+            index as u64 + 2,
+        )?;
+    }
+    run_indexed_and_refusals(&provider, &peer, &device)?;
+    run_timeout_reclamation(Arc::clone(&executor))?;
+    run_cancellation(Arc::clone(&executor))?;
+    #[cfg(unix)]
+    run_completion_ipc(Arc::clone(&executor))?;
+    #[cfg(unix)]
+    run_completion_ipc_process()?;
+    #[cfg(unix)]
+    run_remote_provider_process()?;
+    #[cfg(unix)]
+    run_remote_provider_disconnect_process()?;
+    #[cfg(unix)]
+    run_borrowed_shared_process()?;
+    run_named_provider_process()?;
+    #[cfg(not(unix))]
+    println!("SKIP provider_ipc_process cases transport=unix reason=platform");
+    run_staged_lease(Arc::clone(&executor))?;
+    run_borrowed_lease(Arc::clone(&executor))?;
+    run_host_region_window(Arc::clone(&executor))?;
+    run_object_queue_ordering()?;
+    run_object_disjoint_views()?;
+    run_sampled_texture_read(Arc::clone(&executor))?;
+    run_multi_invocation_texture_read(Arc::clone(&executor))?;
+    run_object_sampled_texture()?;
+    run_object_parallel_commands()?;
+    run_object_same_allocation_parallel()?;
+    run_object_serial_dependency()?;
+    run_object_concurrent_enqueue()?;
+    run_device_lifecycle()?;
+    run_heap_placement(Arc::clone(&executor))?;
+    let unknown_token = CompletionToken {
+        submission_id: SubmissionId::new(u64::MAX),
+        device_epoch: provider.device_epoch(),
+    };
+    expect_unknown_completion(provider.wait(unknown_token, Duration::ZERO), unknown_token)?;
+    println!("PASS provider_refusal slug=unknown_completion");
+    println!("PASS suite provider=standalone Vulkan snapshot_parity=4");
+    Ok(())
+}
+
+fn provider_error(error: ProviderError) -> Box<dyn Error> {
+    format!("provider failure: {error:?}").into()
+}
+
+fn run_copy(
+    provider: &VulkanComputeProvider,
+    device: &Device,
+    library: Library,
+    encoding: &str,
+    operation: u64,
+) -> Result<(), Box<dyn Error>> {
+    let function = library.function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"copy_word".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        operation,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let result = submit_and_wait(provider, &trace)?;
+    let expected = 0x6745_2301_u32.to_le_bytes();
+    check_writeback(&trace, &result, 1, &expected)?;
+    let reference = execute_copy_word(device, library)?;
+    if reference.to_le_bytes() != expected {
+        return Err("copy_word snapshot executor disagrees with the provider golden".into());
+    }
+    release_case(provider, &pipeline, &result)?;
+    println!(
+        "PASS provider_copy_word encoding={encoding} output={reference:#010x} writeback_offset=16 snapshot_parity=exact"
+    );
+    Ok(())
+}
+
+/// A submission whose observation deadline expires must be handed to the
+/// shared retirement thread, not dropped in place: dropping an in-flight
+/// `PendingExecution` poisons the whole Vulkan context. The second provider
+/// below shares the same executor and proves the context is still usable.
+fn run_timeout_reclamation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let expiring = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(provider_error)?
+        .with_async_execution(true)
+        .with_observation_deadline(Duration::ZERO);
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let digest = || SemanticDigest::new("metal-smoke-fixture-v1", b"timeout_reclamation".to_vec());
+    let pipeline = expiring
+        .compile_pipeline(&function, digest()?)
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 90, dispatch, bindings())?;
+    let admitted = expiring
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = expiring.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("timed-out submission has no token")?;
+    match expiring.wait(token, Duration::ZERO) {
+        Err(error)
+            if error.slug == "vulkan-completion-unknown"
+                && error.completion
+                    == (CompletionDisposition::SubmittedUnknown { token: Some(token) }) => {}
+        other => {
+            return Err(
+                format!("zero deadline did not publish unknown completion: {other:?}").into(),
+            )
+        }
+    }
+    expiring.release_completion(token).map_err(provider_error)?;
+
+    let recovery =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let pipeline = recovery
+        .compile_pipeline(&function, digest()?)
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 91, dispatch, bindings())?;
+    let result = submit_and_wait(&recovery, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    release_case(&recovery, &pipeline, &result)?;
+    println!("PASS provider_timeout_reclamation deadline=0 context_usable=true writeback=exact");
+    Ok(())
+}
+
+/// Explicit cancellation releases the observation slot without claiming device
+/// retirement: `wait` keeps reporting `Cancelled`, `readback` refuses, and the
+/// same provider must still accept new work once the retired submission's
+/// fence signals.
+fn run_cancellation(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let sink = Arc::new(RecordingSink::default());
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        sink.clone(),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"cancellation".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let trace = make_trace(&pipeline, 92, dispatch, bindings())?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let cancelled_token = submitted
+        .completion
+        .token()
+        .ok_or("cancelled submission has no token")?;
+    match provider.cancel(cancelled_token).map_err(provider_error)? {
+        CompletionDisposition::Cancelled { token: cancelled } if cancelled == cancelled_token => {}
+        other => return Err(format!("cancel did not release the slot: {other:?}").into()),
+    }
+    match provider
+        .wait(cancelled_token, Duration::ZERO)
+        .map_err(provider_error)?
+    {
+        CompletionDisposition::Cancelled { token: waited } if waited == cancelled_token => {}
+        other => return Err(format!("cancelled wait changed disposition: {other:?}").into()),
+    }
+    match provider.readback(cancelled_token) {
+        Err(error)
+            if error.slug == "completion_cancelled"
+                && error.completion
+                    == (CompletionDisposition::Cancelled {
+                        token: cancelled_token,
+                    }) => {}
+        other => return Err(format!("cancelled readback was not refused: {other:?}").into()),
+    }
+    provider
+        .release_completion(cancelled_token)
+        .map_err(provider_error)?;
+
+    // The cancelled submission was retired, not dropped in place: the provider
+    // must still execute and read back new work.
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let post_cancel_token = submitted
+        .completion
+        .token()
+        .ok_or("post-cancel submission has no token")?;
+    let observed = provider
+        .wait(post_cancel_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed
+        != (CompletionDisposition::CompletedVisible {
+            token: post_cancel_token,
+        })
+    {
+        return Err(format!("post-cancel submission did not complete: {observed:?}").into());
+    }
+    let readback = provider
+        .readback(post_cancel_token)
+        .map_err(provider_error)?;
+    readback.validate_for_trace(&trace)?;
+    let [writeback] = readback.writebacks.as_slice() else {
+        return Err("post-cancel readback must contain exactly one writeback".into());
+    };
+    if writeback.bytes != 0x6745_2301_u32.to_le_bytes() {
+        return Err("post-cancel readback bytes changed".into());
+    }
+    provider
+        .release_completion(post_cancel_token)
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+
+    let observed = sink
+        .messages
+        .lock()
+        .expect("recording completion sink")
+        .iter()
+        .filter_map(|message| match message {
+            CompletionMessage::Token(update) => {
+                Some((update.token, update.sequence.get(), update.update.clone()))
+            }
+            CompletionMessage::Device(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        (cancelled_token, 1, CompletionUpdate::Submitted),
+        (cancelled_token, 2, CompletionUpdate::Cancelled),
+        (post_cancel_token, 1, CompletionUpdate::Submitted),
+        (post_cancel_token, 2, CompletionUpdate::CompletedVisible),
+    ];
+    if observed != expected {
+        return Err(format!("completion outbox stream changed: {observed:?}").into());
+    }
+    println!(
+        "PASS provider_cancellation slot_released=true context_usable=true readback=refused completion_outbox=Submitted,Cancelled,Submitted,CompletedVisible"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_completion_ipc(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let (owner_transport, provider_transport) = unix::pair()?;
+    let (sender, writer) = spawn_writer(provider_transport)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut receiver = CompletionReceiver::new(owner_transport, provider.device_epoch())?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"completion_ipc".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        95,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("ipc submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("ipc receiver did not apply admission".into());
+    }
+    let observed = provider
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("ipc submission did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("ipc receiver did not apply completion".into());
+    }
+
+    let lease_id = LeaseId::new(95);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(95),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 64,
+    })?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("ipc completion did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("ipc lease was not release-ready".into());
+    }
+
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    drop(receiver);
+    writer.join().map_err(|_| "ipc writer panicked")??;
+    println!(
+        "PASS provider_completion_ipc transport=unix outbox=Submitted,CompletedVisible lease=retired"
+    );
+    Ok(())
+}
+
+/// Provider half of the two-process completion test.
+///
+/// The child owns the Vulkan device, connects to the owner's listener and
+/// publishes admission and the terminal transition through the real outbox and
+/// writer thread. The handshake line tells the owner which device epoch and
+/// submission identity to mirror before any frame is applied.
+#[cfg(unix)]
+pub fn run_completion_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let transport = unix::connect(socket)?;
+    let (sender, writer) = spawn_writer(transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"completion_ipc_process".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        96,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ],
+    )?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    let submitted = provider.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("completion child submission has no token")?;
+    println!(
+        "handshake epoch={} submission={}",
+        token.device_epoch.get(),
+        token.submission_id.get()
+    );
+    std::io::stdout().flush()?;
+
+    let observed = provider
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("completion child submission did not complete: {observed:?}").into());
+    }
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "completion child writer panicked")??;
+    println!(
+        "PASS completion_child epoch={} submission={} completed=true",
+        token.device_epoch.get(),
+        token.submission_id.get()
+    );
+    Ok(())
+}
+
+/// Provider half of the owner-command test.
+///
+/// The child owns the Vulkan device, serves owner commands on the command
+/// socket and publishes admission and terminal notifications on the
+/// completion socket. It never submits work on its own: every compile,
+/// submit, wait and readback below is initiated by the owner process.
+#[cfg(unix)]
+pub fn run_provider_command_child(
+    command_socket: &std::ffi::OsStr,
+    completion_socket: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let epoch = provider.device_epoch();
+    let completion_transport = unix::connect(completion_socket)?;
+    let (sender, writer) = spawn_writer(completion_transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(epoch, Arc::new(sender))?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut transport = command_unix::connect(command_socket)?;
+    // Chunk responses too, so readbacks travel through the chunk path.
+    transport.set_max_frame(1024);
+    serve_provider_unix(&provider, &mut transport)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "provider command writer panicked")??;
+    println!("PASS command_child epoch={} served=true", epoch.get());
+    Ok(())
+}
+
+/// Provider half of the two-process named-mapping test.
+///
+/// The child owns the Vulkan device and serves owner commands over TCP. It
+/// opens the named owner mapping and imports it as a no-copy lease, so the GPU
+/// writes through the owner's pages. This is the Windows command-channel path;
+/// the Linux CI runs the same code.
+pub fn run_named_command_child(
+    command_addr: &std::ffi::OsStr,
+    completion_addr: &std::ffi::OsStr,
+) -> Result<(), Box<dyn Error>> {
+    let command_addr = command_addr.to_string_lossy();
+    let completion_addr = completion_addr.to_string_lossy();
+    let completion_transport = tcp::connect(completion_addr.as_ref())?;
+    let executor = VulkanExecutor::new()?;
+    let provider = VulkanComputeProvider::with_executor(executor)
+        .map_err(provider_error)?
+        .with_async_execution(true);
+    let epoch = provider.device_epoch();
+    let (sender, writer) = spawn_writer(completion_transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(epoch, Arc::new(sender))?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+    let mut transport = command_tcp::connect(command_addr.as_ref())?;
+    transport.set_max_frame(1024);
+    serve_provider_named(&provider, &mut transport)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "named command writer panicked")??;
+    println!("PASS named_command_child epoch={} served=true", epoch.get());
+    Ok(())
+}
+
+/// Owner half of the two-process completion test.
+///
+/// The parent process owns no provider in this case: it listens on a Unix
+/// socket, spawns the provider child and retires a lease from the mirrored
+/// completion stream alone.
+#[cfg(unix)]
+fn run_completion_ipc_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "metal-smoke-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let listener = unix::UnixListenerTransport::bind(&path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--completion-child")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("completion child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let handshake = lines
+        .next()
+        .ok_or("completion child exited before its handshake")??;
+    let (device_epoch, token) = parse_handshake(&handshake)?;
+
+    let transport = listener.accept()?;
+    transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut receiver = CompletionReceiver::new(transport, device_epoch)?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("completion process receiver did not apply admission".into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("completion process receiver did not apply completion".into());
+    }
+    if receiver.applied() != 2 || receiver.ignored() != 0 {
+        return Err(format!(
+            "completion process mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+
+    let lease_id = LeaseId::new(96);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(96),
+            owner_epoch: device_epoch,
+        },
+        offset: 0,
+        length: 64,
+    })?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("completion process did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("completion process lease was not release-ready".into());
+    }
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err(format!("completion child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_completion_ipc_process owner=parent provider=child transport=unix outbox=Submitted,CompletedVisible lease=retired"
+    );
+    Ok(())
+}
+
+/// Owner half of the owner-command test.
+///
+/// The parent owns no provider. It compiles a reviewed shader on the provider
+/// child through the command channel, builds and submits the trace itself,
+/// mirrors the provider's completion stream on a second connection, and reads
+/// the result back over the command channel. The child never submits on its
+/// own, so this proves the owner can remotely drive a provider.
+#[cfg(unix)]
+fn run_remote_provider_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let command_path = std::env::temp_dir().join(format!(
+        "metal-smoke-command-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let completion_path = std::env::temp_dir().join(format!(
+        "metal-smoke-command-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let command_listener = command_unix::UnixListenerCommandTransport::bind(&command_path)?;
+    let completion_listener = unix::UnixListenerTransport::bind(&completion_path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--command-child")
+        .arg(&command_path)
+        .arg(&completion_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("provider command child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Exercise the chunked request path on the same connection: every request
+    // below is larger than this frame limit.
+    command_transport.set_max_frame(1024);
+    let completion_transport = completion_listener.accept()?;
+    completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    let epoch = remote.device_epoch();
+    let mut receiver = CompletionReceiver::new(completion_transport, epoch)?;
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"remote_provider_command".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let pipeline = remote.compile(compile).map_err(provider_error)?;
+    if remote.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "remote provider health is not usable: {:?}",
+            remote.health()
+        )
+        .into());
+    }
+    let lease_id = LeaseId::new(96);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(100),
+            owner_epoch: epoch,
+        },
+        offset: 8,
+        length: 4,
+    };
+    let word = 0x6745_2301_u32.to_le_bytes().to_vec();
+    remote
+        .import_staged_lease(StagedLease::new(reservation, word.clone())?)
+        .map_err(provider_error)?;
+    let mut trace = make_trace(
+        &pipeline,
+        501,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        },
+        vec![(0, 8, word.clone()), (1, 16, vec![0; 4])],
+    )?;
+    trace.passes[0]
+        .as_compute_mut()
+        .expect("fixture pass is a compute pass")
+        .buffers[0]
+        .source = BufferSource::StagedLease(lease_id);
+    let mut resources = resources_for_trace(&trace)?;
+    resources.insert_lease(reservation)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("remote command submission has no token")?;
+    if !matches!(
+        submitted.completion,
+        CompletionDisposition::Submitted { .. }
+    ) {
+        return Err(format!(
+            "remote provider did not acknowledge submission: {:?}",
+            submitted.completion
+        )
+        .into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply admission".into());
+    }
+    let observed = remote
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("remote provider did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply completion".into());
+    }
+    let readback = remote.readback(token).map_err(provider_error)?;
+    let result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    result.validate_for_trace(&trace)?;
+    check_writeback(&trace, &result, 1, &word)?;
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("remote command completion did not retire the staged lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("remote command staged lease was not release-ready".into());
+    }
+    remote.release_completion(token).map_err(provider_error)?;
+    remote
+        .release_staged_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(
+            format!("remote provider did not refuse the released lease: {refused:?}").into(),
+        );
+    }
+
+    // Descriptor-backed no-copy lease over the same command connection.
+    let mut mapping = shared::SharedMemory::create(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    let borrowed_lease_id = LeaseId::new(95);
+    let borrowed_reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: borrowed_lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    remote
+        .import_borrowed_lease(borrowed_reservation, &mapping)
+        .map_err(provider_error)?;
+    let borrowed_trace = borrowed_lease_trace(
+        epoch,
+        &pipeline,
+        borrowed_lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        601,
+        602,
+    );
+    let borrowed_resources = borrowed_lease_resources(epoch, borrowed_reservation)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(borrowed_trace.clone(), borrowed_resources.clone())
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let borrowed_token = submitted
+        .completion
+        .token()
+        .ok_or("remote borrowed submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply borrowed admission".into());
+    }
+    let observed = remote
+        .wait(borrowed_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed
+        != (CompletionDisposition::CompletedVisible {
+            token: borrowed_token,
+        })
+    {
+        return Err(format!("remote borrowed lease did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("remote command receiver did not apply borrowed completion".into());
+    }
+    let readback = remote.readback(borrowed_token).map_err(provider_error)?;
+    let borrowed_result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    borrowed_result.validate_for_trace(&borrowed_trace)?;
+    check_writeback(
+        &borrowed_trace,
+        &borrowed_result,
+        1,
+        &BORROWED_SHARED_GPU_WORD.to_le_bytes(),
+    )?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "remote borrowed mapping did not observe the GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("remote borrowed mapping guards changed".into());
+    }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(borrowed_reservation)?;
+    ledger.bind(borrowed_lease_id, borrowed_token)?;
+    if receiver.observe_into(&mut ledger, borrowed_token)? != LeaseObservation::Retired {
+        return Err("remote command completion did not retire the borrowed lease".into());
+    }
+    if !ledger.release_ready(borrowed_lease_id) {
+        return Err("remote command borrowed lease was not release-ready".into());
+    }
+    remote
+        .release_completion(borrowed_token)
+        .map_err(provider_error)?;
+    remote
+        .release_borrowed_lease(borrowed_lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(borrowed_trace.clone(), borrowed_resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(format!(
+            "remote provider did not refuse the released borrowed lease: {refused:?}"
+        )
+        .into());
+    }
+    if receiver.applied() != 4 || receiver.ignored() != 0 {
+        return Err(format!(
+            "remote command mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+    remote.release_pipeline(&pipeline).map_err(provider_error)?;
+    drop(remote);
+
+    let status = child.wait()?;
+    for line in &mut lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&command_path);
+    let _ = std::fs::remove_file(&completion_path);
+    if !status.success() {
+        return Err(format!("provider command child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_command_process owner=parent provider=child transport=unix commands=health,compile,import_lease,import_borrowed,submit,wait,readback,release completion=mirrored writeback=exact lease=retired,refused borrowed=retired,in_place chunked=1024"
+    );
+    Ok(())
+}
+
+/// Owner half of the command-channel failure test.
+///
+/// The child owns a real Vulkan device and serves the command channel. The
+/// owner connects, confirms `Usable` health, kills the child process, then
+/// observes `Exhausted` health and a structured `provider_unavailable`
+/// refusal on the next operation.
+#[cfg(unix)]
+fn run_remote_provider_disconnect_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let command_path = std::env::temp_dir().join(format!(
+        "metal-smoke-disconnect-command-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let completion_path = std::env::temp_dir().join(format!(
+        "metal-smoke-disconnect-completion-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let command_listener = command_unix::UnixListenerCommandTransport::bind(&command_path)?;
+    let completion_listener = unix::UnixListenerTransport::bind(&completion_path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--command-child")
+        .arg(&command_path)
+        .arg(&completion_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let _completion_transport = completion_listener.accept()?;
+    _completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    if remote.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "disconnect provider health is not usable: {:?}",
+            remote.health()
+        )
+        .into());
+    }
+    child.kill()?;
+    let status = child.wait()?;
+    if remote.health() != ProviderHealth::Exhausted {
+        return Err(format!(
+            "disconnect provider health is {:?}, expected Exhausted",
+            remote.health()
+        )
+        .into());
+    }
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"remote_provider_disconnect".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let error = remote.compile(compile).map(|_| ()).unwrap_err();
+    if error.class != ProviderErrorClass::Resource
+        || error.slug != "provider_unavailable"
+        || error.retryability != Retryability::RetryAfterRecreate
+    {
+        return Err(format!(
+            "disconnect refusal was not provider_unavailable/RetryAfterRecreate: {error:?}"
+        )
+        .into());
+    }
+    drop(remote);
+    let _ = std::fs::remove_file(&command_path);
+    let _ = std::fs::remove_file(&completion_path);
+    println!(
+        "PASS provider_disconnect_process transport=unix health=Exhausted refusal=provider_unavailable retry=RetryAfterRecreate killed={}",
+        !status.success()
+    );
+    Ok(())
+}
+
+/// Owner half of the two-process named-mapping test.
+///
+/// This is the portable counterpart of `run_remote_provider_process`: the
+/// command and completion channels are TCP and the no-copy lease travels as a
+/// named mapping instead of an `SCM_RIGHTS` descriptor. It runs on Windows,
+/// where the Unix descriptor path is unavailable, and on Linux so CI exercises
+/// the same code.
+fn run_named_provider_process() -> Result<(), Box<dyn Error>> {
+    let command_listener = command_tcp::TcpListenerCommandTransport::bind("127.0.0.1:0")?;
+    let completion_listener = tcp::TcpListenerTransport::bind("127.0.0.1:0")?;
+    let command_addr = command_listener.local_addr()?.to_string();
+    let completion_addr = completion_listener.local_addr()?.to_string();
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--named-command-child")
+        .arg(&command_addr)
+        .arg(&completion_addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("named command child stdout was not piped")?;
+    let lines = BufReader::new(stdout).lines();
+
+    let mut command_transport = command_listener.accept()?;
+    command_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Exercise the chunked request path on the same connection.
+    command_transport.set_max_frame(1024);
+    let completion_transport = completion_listener.accept()?;
+    completion_transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+    let remote = RemoteProvider::connect(command_transport)?;
+    let epoch = remote.device_epoch();
+    let mut receiver = CompletionReceiver::new(completion_transport, epoch)?;
+    let compile = PipelineCompileRequest {
+        entry_name: "copy_word".into(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"named_provider_command".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_copy_word.ll").to_string(),
+        ),
+    };
+    let pipeline = remote.compile(compile).map_err(provider_error)?;
+
+    let (mut mapping, _name) = shared::SharedMemory::create_named(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    mapping.as_mut_slice()[..4].copy_from_slice(&BORROWED_SHARED_OWNER_WORD.to_le_bytes());
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    remote
+        .import_named_borrowed_lease(reservation, &mapping)
+        .map_err(provider_error)?;
+    // The duplicate request must consume its mapping name before the refusal,
+    // so the connection stays framed for the submission below.
+    let duplicate = remote
+        .import_named_borrowed_lease(reservation, &mapping)
+        .unwrap_err();
+    if duplicate.slug != "lease_already_imported" {
+        return Err(
+            format!("named borrowed duplicate import was not refused: {duplicate:?}").into(),
+        );
+    }
+    if remote.health() != ProviderHealth::Usable {
+        return Err("named command channel lost framing after a duplicate import".into());
+    }
+
+    let trace = borrowed_lease_trace(
+        epoch,
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        701,
+        702,
+    );
+    let resources = borrowed_lease_resources(epoch, reservation)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(provider_error)?;
+    let submitted = remote.submit(admitted).map_err(provider_error)?;
+    let token = submitted
+        .completion
+        .token()
+        .ok_or("named borrowed submission has no token")?;
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("named command receiver did not apply borrowed admission".into());
+    }
+    let observed = remote
+        .wait(token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("named borrowed lease did not complete: {observed:?}").into());
+    }
+    if receiver.recv()? != MirrorOutcome::Applied {
+        return Err("named command receiver did not apply borrowed completion".into());
+    }
+    let readback = remote.readback(token).map_err(provider_error)?;
+    let result = ProviderSubmission {
+        completion: readback.completion,
+        writebacks: readback.writebacks,
+    };
+    result.validate_for_trace(&trace)?;
+    check_writeback(&trace, &result, 1, &BORROWED_SHARED_GPU_WORD.to_le_bytes())?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "named owner mapping did not observe the provider GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("named owner mapping guards changed".into());
+    }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if receiver.observe_into(&mut ledger, token)? != LeaseObservation::Retired {
+        return Err("named command completion did not retire the borrowed lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("named command borrowed lease was not release-ready".into());
+    }
+    remote.release_completion(token).map_err(provider_error)?;
+    remote
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = remote
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let refused = remote.submit(admitted).unwrap_err();
+    if refused.slug != "lease_not_imported" {
+        return Err(format!(
+            "named provider did not refuse the released borrowed lease: {refused:?}"
+        )
+        .into());
+    }
+    if receiver.applied() != 2 || receiver.ignored() != 0 {
+        return Err(format!(
+            "named command mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+    remote.release_pipeline(&pipeline).map_err(provider_error)?;
+    drop(remote);
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    if !status.success() {
+        return Err(format!("named command child exited with {status}").into());
+    }
+    println!(
+        "PASS provider_named_command_process owner=parent provider=child transport=tcp mapping=named commands=compile,import_named,submit,wait,readback,release completion=mirrored writeback=exact borrowed=retired,in_place duplicate=refused chunked=1024"
+    );
+    Ok(())
+}
+
+/// Provider half of the two-process borrowed no-copy test.
+///
+/// The child receives an owner mapping over `SCM_RIGHTS`, imports the same
+/// physical pages as a borrowed lease and submits one read and one write
+/// through them. The owner proves the write landed in its own mapping without
+/// any writeback copy.
+#[cfg(unix)]
+pub fn run_borrowed_shared_child(socket: &std::ffi::OsStr) -> Result<(), Box<dyn Error>> {
+    let stream = UnixStream::connect(socket)?;
+    let descriptor = shared::recv_fd(&stream)?;
+    let mapping = shared::SharedMemory::from_owned_fd(descriptor)?;
+    let transport = unix::from_stream(stream)?;
+
+    let executor = VulkanExecutor::new()?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err(
+            "borrowed shared child: provider does not advertise VK_EXT_external_memory_host".into(),
+        );
+    }
+    if !provider
+        .capabilities()
+        .storage_modes
+        .contains(&StorageMode::BorrowedNoCopy)
+    {
+        return Err("borrowed shared child: provider does not advertise BorrowedNoCopy".into());
+    }
+    if !(mapping.as_ptr() as usize).is_multiple_of(alignment as usize) {
+        return Err(format!(
+            "borrowed shared child: mapping {:p} is not aligned to {alignment}",
+            mapping.as_ptr()
+        )
+        .into());
+    }
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    };
+    // SAFETY: `mapping` outlives the import and stays mapped until the lease
+    // is released below.
+    unsafe {
+        provider
+            .import_borrowed_lease(BorrowedLease::new(reservation, mapping.as_ptr() as usize)?)
+            .map_err(provider_error)?;
+    }
+
+    let (sender, writer) = spawn_writer(transport)?;
+    let outbox = Arc::new(CompletionOutbox::new(
+        provider.device_epoch(),
+        Arc::new(sender),
+    )?);
+    let provider = provider
+        .with_completion_outbox(outbox)
+        .map_err(provider_error)?;
+
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"borrowed_shared".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let read_trace = borrowed_lease_trace(
+        provider.device_epoch(),
+        &pipeline,
+        lease_id,
+        BufferAccess::Read,
+        BufferSource::OwnedBytes(vec![0; 4]),
+        497,
+        498,
+    );
+    let read_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(read_trace.clone(), read_resources)
+        .map_err(provider_error)?;
+    let read_result = provider.submit(admitted).map_err(provider_error)?;
+    read_result.validate_for_trace(&read_trace)?;
+    let read_token = read_result
+        .completion
+        .token()
+        .ok_or("borrowed shared read has no token")?;
+
+    let write_trace = borrowed_lease_trace(
+        provider.device_epoch(),
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(BORROWED_SHARED_GPU_WORD.to_le_bytes().to_vec()),
+        499,
+        500,
+    );
+    let write_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources)
+        .map_err(provider_error)?;
+    let write_result = provider.submit(admitted).map_err(provider_error)?;
+    write_result.validate_for_trace(&write_trace)?;
+    let write_token = write_result
+        .completion
+        .token()
+        .ok_or("borrowed shared write has no token")?;
+
+    for token in [read_token, write_token] {
+        println!(
+            "handshake epoch={} submission={}",
+            token.device_epoch.get(),
+            token.submission_id.get()
+        );
+    }
+    std::io::stdout().flush()?;
+
+    let observed = provider
+        .wait(read_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token: read_token }) {
+        return Err(format!("borrowed shared read did not complete: {observed:?}").into());
+    }
+    check_writeback(
+        &read_trace,
+        &read_result,
+        1,
+        &BORROWED_SHARED_OWNER_WORD.to_le_bytes(),
+    )?;
+
+    let observed = provider
+        .wait(write_token, Duration::from_secs(10))
+        .map_err(provider_error)?;
+    if observed != (CompletionDisposition::CompletedVisible { token: write_token }) {
+        return Err(format!("borrowed shared write did not complete: {observed:?}").into());
+    }
+    check_writeback(
+        &write_trace,
+        &write_result,
+        1,
+        &BORROWED_SHARED_GPU_WORD.to_le_bytes(),
+    )?;
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "borrowed shared child mapping did not observe the GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    for token in [read_token, write_token] {
+        ledger.bind(lease_id, token)?;
+        if ledger.observe(token, CompletionDisposition::CompletedVisible { token })?
+            != LeaseObservation::Retired
+        {
+            return Err("borrowed shared completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed shared lease was not release-ready".into());
+    }
+    provider
+        .release_completion(read_token)
+        .map_err(provider_error)?;
+    provider
+        .release_completion(write_token)
+        .map_err(provider_error)?;
+    provider
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    drop(provider);
+    writer
+        .join()
+        .map_err(|_| "borrowed shared child writer panicked")??;
+    println!(
+        "PASS borrowed_shared_child lease={BORROWED_SHARED_LEASE_ID} copy_in=owner_visible copy_out=in_place retired=true"
+    );
+    Ok(())
+}
+
+/// Owner half of the two-process borrowed no-copy test.
+///
+/// The parent keeps no Vulkan provider. It creates the mapping, passes the
+/// descriptor with `SCM_RIGHTS`, mirrors the completion stream and then reads
+/// its own pages to prove the child's GPU write happened in place.
+#[cfg(unix)]
+fn run_borrowed_shared_process() -> Result<(), Box<dyn Error>> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "metal-smoke-borrowed-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let listener = unix::UnixListenerTransport::bind(&path)?;
+    let mut mapping = shared::SharedMemory::create(BORROWED_SHARED_SIZE)?;
+    mapping.as_mut_slice().fill(0xcd);
+    mapping.as_mut_slice()[..4].copy_from_slice(&BORROWED_SHARED_OWNER_WORD.to_le_bytes());
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--borrowed-shared-child")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("borrowed shared child stdout was not piped")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let transport = listener.accept()?;
+    transport.set_read_timeout(Some(Duration::from_secs(30)))?;
+    shared::send_fd(transport.writer(), mapping.descriptor())?;
+
+    let mut device_epoch = None;
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let line = lines
+            .next()
+            .ok_or("borrowed shared child exited before its handshake")??;
+        let (epoch, token) = parse_handshake(&line)?;
+        match device_epoch {
+            None => device_epoch = Some(epoch),
+            Some(expected) if expected != epoch => {
+                return Err("borrowed shared child changed its device epoch".into())
+            }
+            Some(_) => {}
+        }
+        tokens.push(token);
+    }
+    let device_epoch = device_epoch.ok_or("borrowed shared child produced no handshake")?;
+
+    let mut receiver = CompletionReceiver::new(transport, device_epoch)?;
+    for _ in 0..4 {
+        if receiver.recv()? != MirrorOutcome::Applied {
+            return Err("borrowed shared receiver did not apply a completion frame".into());
+        }
+    }
+    if receiver.applied() != 4 || receiver.ignored() != 0 {
+        return Err(format!(
+            "borrowed shared mirror counted applied={} ignored={}",
+            receiver.applied(),
+            receiver.ignored()
+        )
+        .into());
+    }
+
+    let lease_id = LeaseId::new(BORROWED_SHARED_LEASE_ID);
+    let mut ledger = LeaseLedger::new();
+    ledger.register(LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(BORROWED_SHARED_ALLOCATION_ID),
+            owner_epoch: device_epoch,
+        },
+        offset: 0,
+        length: BORROWED_SHARED_LENGTH,
+    })?;
+    for token in &tokens {
+        ledger.bind(lease_id, *token)?;
+        if receiver.observe_into(&mut ledger, *token)? != LeaseObservation::Retired {
+            return Err("borrowed shared completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed shared lease was not release-ready".into());
+    }
+
+    let status = child.wait()?;
+    for line in lines {
+        println!("child: {}", line?);
+    }
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err(format!("borrowed shared child exited with {status}").into());
+    }
+    if mapping.as_slice()[..4] != BORROWED_SHARED_GPU_WORD.to_le_bytes() {
+        return Err(format!(
+            "owner mapping did not observe the child GPU write: {:02x?}",
+            &mapping.as_slice()[..4]
+        )
+        .into());
+    }
+    if mapping.as_slice()[4..].iter().any(|byte| *byte != 0xcd) {
+        return Err("owner mapping guards changed".into());
+    }
+    println!(
+        "PASS provider_borrowed_shared_process owner=parent provider=child transport=scm_rights copy_in=owner_visible copy_out=in_place retired=true"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parse_handshake(line: &str) -> Result<(DeviceEpoch, CompletionToken), Box<dyn Error>> {
+    let mut epoch = None;
+    let mut submission = None;
+    for field in line.split_whitespace() {
+        if let Some(value) = field.strip_prefix("epoch=") {
+            epoch = Some(value.parse::<u64>()?);
+        } else if let Some(value) = field.strip_prefix("submission=") {
+            submission = Some(value.parse::<u64>()?);
+        }
+    }
+    let device_epoch = DeviceEpoch::new(epoch.ok_or("completion handshake is missing epoch")?);
+    let submission_id =
+        SubmissionId::new(submission.ok_or("completion handshake is missing submission")?);
+    Ok((
+        device_epoch,
+        CompletionToken {
+            device_epoch,
+            submission_id,
+        },
+    ))
+}
+
+/// Import owner-issued bytes for one lease, execute a view backed by that
+/// lease, retire it through the owner ledger and refuse it after release.
+fn run_staged_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"staged_lease".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let lease_id = LeaseId::new(97);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(197),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 8,
+    };
+    let mut input = 0x6745_2301_u32.to_le_bytes().to_vec();
+    input.extend_from_slice(&[0_u8; 4]);
+    provider
+        .import_staged_lease(StagedLease::new(reservation, input)?)
+        .map_err(provider_error)?;
+
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(97),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers: vec![
+                BufferView {
+                    view_id: ViewId::new(297),
+                    metal_binding: 0,
+                    allocation_id: AllocationId::new(197),
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::StagedLease(lease_id),
+                },
+                BufferView {
+                    view_id: ViewId::new(298),
+                    metal_binding: 1,
+                    allocation_id: AllocationId::new(198),
+                    offset: 0,
+                    length: 4,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                },
+            ],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        })],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(197),
+        owner_epoch: provider.device_epoch(),
+        size: 16,
+    })?;
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(198),
+        owner_epoch: provider.device_epoch(),
+        size: 32,
+    })?;
+    resources.insert_lease(reservation)?;
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources.clone())
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!(
+            "staged lease submission did not complete: {:?}",
+            result.completion
+        )
+        .into());
+    };
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    ledger.bind(lease_id, token)?;
+    if ledger.observe(token, result.completion)? != LeaseObservation::Retired {
+        return Err("staged lease completion did not retire the lease".into());
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("staged lease was not release-ready".into());
+    }
+
+    provider
+        .release_staged_lease(lease_id)
+        .map_err(provider_error)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let error = provider
+        .submit(admitted)
+        .expect_err("released staged lease must be refused");
+    if error.slug != "lease_not_imported" {
+        return Err(format!("released staged lease refused with {}", error.slug).into());
+    }
+
+    provider.release_completion(token).map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    println!(
+        "PASS provider_staged_lease lease=97 writeback=exact retired=true refusal=lease_not_imported"
+    );
+    Ok(())
+}
+
+/// Owner host memory imported without copying, driven end to end from the
+/// registration granularity the backend reports. Guest memory step 2
+/// (`research/docs/19`): the owner registers one host address range, derives a
+/// page-aligned window from it, imports the window without copying, writes
+/// through it on the device, observes the change in place and only then
+/// releases the lease. The same case walks the alignment matrix and the
+/// retirement chain of `research/docs/20` §3.5: illegal windows are refused by
+/// the owner type with a nameable error, and the registration cannot be
+/// reclaimed before the completion that retired the GPU work.
+fn run_host_region_window(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    // The window granularity is the backend's measured
+    // `minImportedHostPointerAlignment`, never an assumed page size: a region
+    // registered finer than the backend requires would hand a provider host
+    // memory it cannot import.
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err("provider does not advertise VK_EXT_external_memory_host".into());
+    }
+    let page = alignment;
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"host_region_window".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    // The "guest RAM" registration: eight pages of host memory aligned to twice
+    // the granularity the backend reports, so the same mapping can also carry
+    // the coarser registration derived below.
+    let page_bytes = usize::try_from(page)?;
+    let mut owner = AlignedBuffer::new(8 * page_bytes, 2 * page_bytes)?;
+    owner.as_mut_slice().fill(0xcd);
+    let region = HostRegion {
+        lease_id: LeaseId::new(120),
+        owner_epoch: provider.device_epoch(),
+        host_pointer: owner.as_ptr() as usize,
+        length: 8 * page,
+        page_size: page,
+    };
+    region.validate()?;
+
+    // Three illegal windows must each be refused by the owner type, with the
+    // failing field and the granularity still visible, before any provider sees
+    // a pointer.
+    let refusals = [
+        (
+            "unaligned_offset",
+            borrowed_window_refusal(&region, 320, 1, page)?,
+        ),
+        (
+            "unaligned_length",
+            borrowed_window_refusal(&region, 320, page, page + 1)?,
+        ),
+        (
+            "out_of_bounds",
+            borrowed_window_refusal(&region, 320, page, 8 * page)?,
+        ),
+    ];
+    for (expected, refusal) in &refusals {
+        if !refusal.starts_with(expected) {
+            return Err(format!("window refusal {expected} arrived as {refusal}").into());
+        }
+    }
+    let refusal_detail = refusals
+        .iter()
+        .map(|(_, refusal)| refusal.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    // The registration's own granularity is what gates a window: the same range
+    // registered at twice the measured granularity refuses an offset that is
+    // page-aligned but not registration-aligned, and still accepts one that is.
+    // Without this the case would keep passing on a backend that happens to
+    // report 4096 no matter which page size the owner really used.
+    let coarse = HostRegion {
+        page_size: 2 * page,
+        ..region
+    };
+    coarse.validate()?;
+    let coarse_refusal = borrowed_window_refusal(&coarse, 320, page, 2 * page)?;
+    if !coarse_refusal.starts_with("unaligned_offset") {
+        return Err(
+            format!("coarser registration accepted a finer offset: {coarse_refusal}").into(),
+        );
+    }
+    let coarse_pointer = coarse
+        .borrowed_window(AllocationId::new(320), 2 * page, 2 * page)?
+        .host_pointer;
+    if coarse_pointer != owner.as_ptr() as usize + 2 * page_bytes {
+        return Err("registration-aligned window does not name the registration base".into());
+    }
+
+    // One lease window inside the registration, at an offset that is not the
+    // registration base. The owner registers the window before its lease is
+    // imported and reclaims it only after the completion retires the GPU work.
+    let window_offset = 3 * page;
+    let window_length = 2 * page;
+    let borrowed = region.borrowed_window(AllocationId::new(320), window_offset, window_length)?;
+    if borrowed.host_pointer != owner.as_ptr() as usize + usize::try_from(window_offset)? {
+        return Err("window pointer does not name the registration offset".into());
+    }
+    let mut ledger = LeaseLedger::new();
+    ledger.register(borrowed.reservation)?;
+    let mut windows = GuestWindows::new();
+    let window = GuestWindow {
+        lease: region.lease_id,
+        allocation_id: AllocationId::new(320),
+        offset: window_offset,
+        length: window_length,
+    };
+    windows.register(window)?;
+
+    // SAFETY: `owner` outlives the import and the submission below, and the
+    // window was validated against the registration above.
+    unsafe {
+        provider
+            .import_borrowed_lease(borrowed)
+            .map_err(provider_error)?;
+    }
+
+    let word = 0xfeed_face_u32;
+    let trace = borrowed_lease_trace_for(
+        provider.device_epoch(),
+        &pipeline,
+        region.lease_id,
+        window_offset,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(word.to_le_bytes().to_vec()),
+        401,
+        402,
+        320,
+    );
+    // The lease reservation is region-relative (`HostRegion::borrowed_window`
+    // derives `host_pointer + offset`), so the allocation the resource table
+    // describes is the whole registration, not the window inside it.
+    let resources = borrowed_lease_resources_for(
+        provider.device_epoch(),
+        borrowed.reservation,
+        320,
+        region.length,
+    )?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!(
+            "host region window submission did not complete: {:?}",
+            result.completion
+        )
+        .into());
+    };
+
+    // The device wrote into the owner mapping itself: the window's first word
+    // carries the GPU value and no byte outside the window moved.
+    let start = usize::try_from(window_offset)?;
+    let end = start + usize::try_from(window_length)?;
+    let observed = &owner.as_slice()[start..start + 4];
+    if observed != word.to_le_bytes() {
+        return Err(format!("guest window was not written in place: {observed:02x?}").into());
+    }
+    let untouched = owner.as_slice()[..start].iter().all(|byte| *byte == 0xcd)
+        && owner.as_slice()[end..].iter().all(|byte| *byte == 0xcd);
+    if !untouched {
+        return Err("device writeback escaped the registered window".into());
+    }
+
+    // Retirement chain (`research/docs/20` §3.4): the completion is the
+    // evidence, not the submission. Until the owner observes it the window is
+    // active, so reclaim is refused and the backing is not releasable.
+    ledger.bind(region.lease_id, token)?;
+    if ledger.release_ready(region.lease_id) {
+        return Err("lease became releasable before its token retired".into());
+    }
+    if windows.is_reclaimable(region.lease_id) {
+        return Err("active window already reports reclaimable".into());
+    }
+    let active_refusal = reclaim_refusal(&mut windows, region.lease_id)?;
+    if active_refusal != "guest_window_still_active" {
+        return Err(format!("active window reclaim refused with {active_refusal}").into());
+    }
+    if !disposition_retires_resources(result.completion) {
+        return Err(format!(
+            "completion {:?} is not retirement evidence",
+            result.completion
+        )
+        .into());
+    }
+    if ledger.observe(token, result.completion)? != LeaseObservation::Retired {
+        return Err("observing the completion did not retire the lease".into());
+    }
+    windows.retire(region.lease_id)?;
+    if !windows.is_reclaimable(region.lease_id) {
+        return Err("retired window is not reclaimable".into());
+    }
+    let reclaimed = windows.reclaim(region.lease_id)?;
+    if reclaimed != window {
+        return Err(format!("reclaim returned {reclaimed:?} instead of {window:?}").into());
+    }
+    if !ledger.release_ready(region.lease_id) {
+        return Err("retired lease is still held by a token".into());
+    }
+    if !windows.is_empty() {
+        return Err("reclaimed window is still registered".into());
+    }
+    provider
+        .release_borrowed_lease(region.lease_id)
+        .map_err(provider_error)?;
+
+    println!(
+        "PASS provider_host_region_window page_size={page} page_source=backend_measured \
+         window_offset={window_offset} window_length={window_length} \
+         refusals=unaligned_offset|unaligned_length|out_of_bounds|granularity \
+         refusal_detail=[{refusal_detail}] import=no-copy write=in-place \
+         granularity_gate=[{coarse_refusal}] outside_window=untouched release=ok"
+    );
+    println!(
+        "PASS provider_guest_window_reclaim lease={} retired=false reclaimable=false \
+         refusal={active_refusal} outstanding=1 release_ready=false",
+        region.lease_id.get()
+    );
+    println!(
+        "PASS provider_guest_window_reclaim lease={} retired=true reclaimable=true \
+         reclaimed=true release_ready=true release=ok",
+        region.lease_id.get()
+    );
+    Ok(())
+}
+
+/// Derive one window that must be refused, and report the refusal as a
+/// nameable kind. A refused window must not produce a lease at all.
+fn borrowed_window_refusal(
+    region: &HostRegion,
+    allocation_id: u64,
+    offset: u64,
+    length: u64,
+) -> Result<String, Box<dyn Error>> {
+    match region.borrowed_window(AllocationId::new(allocation_id), offset, length) {
+        Ok(borrowed) => Err(format!(
+            "window offset={offset} length={length} must be refused, derived {borrowed:?}"
+        )
+        .into()),
+        Err(error) => Ok(host_region_refusal_kind(&error)),
+    }
+}
+
+/// The identifiable kind of an owner-side window refusal. `research/docs/20`
+/// §3.5 maps these contract errors to the `host_region_invalid` provider slug,
+/// so the failing field and the granularity must survive into the message
+/// instead of collapsing into one opaque failure.
+fn host_region_refusal_kind(error: &ContractError) -> String {
+    use ContractError as E;
+    match error {
+        E::UnalignedHostRegion {
+            field,
+            value,
+            page_size,
+        } => format!("unaligned_{field} value={value} page_size={page_size}"),
+        E::HostRegionWindowOutOfBounds { end, region_length } => {
+            format!("out_of_bounds end={end} region_length={region_length}")
+        }
+        E::InvalidHostRegionPageSize(page_size) => {
+            format!("invalid_page_size value={page_size}")
+        }
+        other => format!("unexpected {other}"),
+    }
+}
+
+/// Reclaim one window that must still be active, reported with the slug the
+/// provider layer uses for the same contract error.
+fn reclaim_refusal(windows: &mut GuestWindows, lease: LeaseId) -> Result<String, Box<dyn Error>> {
+    match windows.reclaim(lease) {
+        Ok(window) => Err(format!("active window {window:?} was reclaimed").into()),
+        Err(ContractError::GuestWindowStillActive(_)) => {
+            Ok("guest_window_still_active".to_string())
+        }
+        Err(other) => Ok(format!("unexpected {other}")),
+    }
+}
+
+fn run_borrowed_lease(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let provider = VulkanComputeProvider::with_executor(executor).map_err(provider_error)?;
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        return Err("provider does not advertise VK_EXT_external_memory_host".into());
+    }
+    if !provider
+        .capabilities()
+        .storage_modes
+        .contains(&StorageMode::BorrowedNoCopy)
+    {
+        return Err("provider does not advertise the borrowed no-copy storage mode".into());
+    }
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"borrowed_lease".to_vec())?,
+        )
+        .map_err(provider_error)?;
+
+    let lease_id = LeaseId::new(98);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id,
+            allocation_id: AllocationId::new(298),
+            owner_epoch: provider.device_epoch(),
+        },
+        offset: 0,
+        length: 64,
+    };
+    let mut owner = AlignedBuffer::new(64, alignment as usize)?;
+    owner.as_mut_slice().fill(0xcd);
+    owner.as_mut_slice()[..4].copy_from_slice(&0xaaaa_aaaa_u32.to_le_bytes());
+    // A misaligned owner pointer must be refused before any Vulkan import.
+    let misaligned = unsafe {
+        provider.import_borrowed_lease(BorrowedLease::new(
+            reservation,
+            owner.as_ptr() as usize + 1,
+        )?)
+    }
+    .expect_err("misaligned borrowed lease must be refused");
+    if misaligned.slug != "lease_alignment_unsupported" {
+        return Err(format!("misaligned borrowed lease refused with {}", misaligned.slug).into());
+    }
+    // SAFETY: `owner` stays alive until both submissions retire and the
+    // provider releases the import below.
+    unsafe {
+        provider
+            .import_borrowed_lease(BorrowedLease::new(reservation, owner.as_ptr() as usize)?)
+            .map_err(provider_error)?;
+    }
+
+    // The owner may change its mapping after import. A provider that had
+    // snapshotted the bytes would observe the old word.
+    owner.as_mut_slice()[..4].copy_from_slice(&0xbbbb_bbbb_u32.to_le_bytes());
+    let read_trace = borrowed_lease_trace(
+        provider.device_epoch(),
+        &pipeline,
+        lease_id,
+        BufferAccess::Read,
+        BufferSource::OwnedBytes(vec![0; 4]),
+        397,
+        398,
+    );
+    let read_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(read_trace.clone(), read_resources.clone())
+        .map_err(provider_error)?;
+    let read_result = provider.submit(admitted).map_err(provider_error)?;
+    read_result.validate_for_trace(&read_trace)?;
+    let CompletionDisposition::CompletedVisible { token: read_token } = read_result.completion
+    else {
+        return Err(format!(
+            "borrowed lease read submission did not complete: {:?}",
+            read_result.completion
+        )
+        .into());
+    };
+    check_writeback(&read_trace, &read_result, 1, &0xbbbb_bbbb_u32.to_le_bytes())?;
+
+    let word = 0x1234_5678_u32;
+    let write_trace = borrowed_lease_trace(
+        provider.device_epoch(),
+        &pipeline,
+        lease_id,
+        BufferAccess::Write,
+        BufferSource::OwnedBytes(word.to_le_bytes().to_vec()),
+        399,
+        400,
+    );
+    let write_resources = borrowed_lease_resources(provider.device_epoch(), reservation)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources.clone())
+        .map_err(provider_error)?;
+    let write_result = provider.submit(admitted).map_err(provider_error)?;
+    write_result.validate_for_trace(&write_trace)?;
+    let CompletionDisposition::CompletedVisible { token: write_token } = write_result.completion
+    else {
+        return Err(format!(
+            "borrowed lease write submission did not complete: {:?}",
+            write_result.completion
+        )
+        .into());
+    };
+    // The GPU wrote through the import; no writeback was applied to `owner`.
+    if owner.as_slice()[..4] != word.to_le_bytes() {
+        return Err(format!(
+            "borrowed lease did not write in place: {:02x?}",
+            &owner.as_slice()[..4]
+        )
+        .into());
+    }
+    check_writeback(&write_trace, &write_result, 1, &word.to_le_bytes())?;
+
+    let mut ledger = LeaseLedger::new();
+    ledger.register(reservation)?;
+    for token in [read_token, write_token] {
+        ledger.bind(lease_id, token)?;
+        if ledger.observe(token, CompletionDisposition::CompletedVisible { token })?
+            != LeaseObservation::Retired
+        {
+            return Err("borrowed lease completion did not retire the lease".into());
+        }
+    }
+    if !ledger.release_ready(lease_id) {
+        return Err("borrowed lease was not release-ready".into());
+    }
+    if provider.borrowed_registry().outstanding(lease_id) != Some(0) {
+        return Err("borrowed lease retains were not retired".into());
+    }
+    provider
+        .release_borrowed_lease(lease_id)
+        .map_err(provider_error)?;
+
+    let admitted = provider
+        .capabilities()
+        .validate_trace(write_trace.clone(), write_resources)
+        .map_err(provider_error)?;
+    let error = provider
+        .submit(admitted)
+        .expect_err("released borrowed lease must be refused");
+    if error.slug != "lease_not_imported" {
+        return Err(format!("released borrowed lease refused with {}", error.slug).into());
+    }
+
+    provider
+        .release_completion(read_token)
+        .map_err(provider_error)?;
+    provider
+        .release_completion(write_token)
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(&pipeline)
+        .map_err(provider_error)?;
+    println!(
+        "PASS provider_borrowed_lease lease=98 alignment={alignment} copy_in=live copy_out=in_place retired=true refusal=lease_not_imported"
+    );
+    Ok(())
+}
+
+/// Two command buffers on one object-API queue with a data dependency: the
+/// first copies the input word into `middle`, the second copies `middle` into
+/// the destination. The second commit blocks on the shared `middle`
+/// reservation until the first command completes, so the destination can only
+/// hold the input word when the queue preserves commit order. This is a
+/// host-reservation ordering check, not concurrent GPU execution.
+fn run_object_queue_ordering() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_queue_ordering".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile queue fixture: {error:?}"))?;
+    let input = device.new_buffer_with_bytes(0x6745_2301_u32.to_le_bytes().to_vec())?;
+    let middle = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let destination = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let input_view = input.view(0, 4)?;
+    let middle_read = middle.view(0, 4)?;
+    let middle_write = middle.view(0, 4)?;
+    let destination_view = destination.view(0, 4)?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_view)?;
+        encoder.set_buffer(1, &middle_write)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &middle_read)?;
+        encoder.set_buffer(1, &destination_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    first.commit()?;
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second commit: {error:?}"))?;
+        Ok::<_, String>(second)
+    });
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "queue-ordering commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    let expected = 0x6745_2301_u32.to_le_bytes();
+    if middle.read()? != expected {
+        return Err("first command did not copy the input word into the middle buffer".into());
+    }
+    if destination.read()? != expected {
+        return Err("second command did not observe the first command's write".into());
+    }
+    println!(
+        "PASS provider_object_queue_ordering command_buffers=2 dependency=chained ordering=commit_reservation async=true writeback=exact"
+    );
+    Ok(())
+}
+
+/// The same texel read through the object API: Device::new_texture_with_bytes,
+/// encoder.set_texture, commit/wait/readback. This is the path v11's texture
+/// case will use, so it must pass on both drivers (`research/docs/16` §4.8).
+fn run_object_sampled_texture() -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        PipelineCompileRequest, SemanticDigest, ShaderSource, TextureFormat,
+    };
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+    let pipeline = device.compile_pipeline(PipelineCompileRequest {
+        entry_name: "read_texture_2d".to_owned(),
+        logical_digest: SemanticDigest::new(
+            "metal-smoke-fixture-v1",
+            b"object_sampled_texture".to_vec(),
+        )?,
+        source: ShaderSource::SanitizedLl(
+            include_str!("../shaders/kernel_read_texture_2d.ll").to_owned(),
+        ),
+    })?;
+    let mut texels = Vec::with_capacity(64);
+    for value in 0..16_u32 {
+        texels.extend_from_slice(&value.to_le_bytes());
+    }
+    let texture = device.new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)?;
+    let output = device.new_buffer_with_bytes(vec![0_u8; 64])?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_texture(0, &texture)?;
+        encoder.set_buffer(0, &output.view(0, 64)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    command.commit()?;
+    command.wait_until_completed()?;
+    let observed = output.read()?;
+    if observed[..4] != 0_u32.to_le_bytes() {
+        return Err(format!("object texture read landed {:02x?}", &observed[..4]).into());
+    }
+    println!("PASS provider_object_sampled_texture texture=4x4-r32uint texel=(0,0) value=0");
+    Ok(())
+}
+
+/// Read one R32Uint texel through the sampled-texture path. This is the first
+/// provider-level texture case that runs on both Lavapipe and the RTX 5060.
+/// It reads only texel (0, 0), so it cannot see a row stride at all; the
+/// multi-invocation companion below is the case that can.
+fn run_sampled_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let library = device
+        .new_library_with_air(include_str!("../shaders/kernel_read_texture_2d.ll").to_owned())?;
+    let function = library.function("read_texture_2d")?;
+    let pipeline = executor.new_compute_pipeline(&function)?;
+    let mut texels = Vec::with_capacity(64);
+    for value in 0..16_u32 {
+        texels.extend_from_slice(&value.to_le_bytes());
+    }
+    let texture = TextureView {
+        view_id: ViewId::new(900),
+        metal_binding: 0,
+        allocation_id: AllocationId::new(901),
+        texture_type: TextureType::D2,
+        format: TextureFormat::R32Uint,
+        width: 4,
+        height: 4,
+        depth: 1,
+        array_length: 1,
+        sample_count: 1,
+        access: TextureAccess::Sampled,
+        source: TextureSource::OwnedBytes(texels),
+    };
+    let submission = metal_api_core::ComputeSubmission {
+        pipeline,
+        buffers: vec![metal_api_core::BufferBinding {
+            index: 0,
+            bytes: vec![0_u8; 64],
+        }],
+        textures: vec![texture],
+        threads_per_grid: metal_api_core::Size::new(1, 1, 1)?,
+        threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1)?,
+    };
+    let updates = executor
+        .execute(submission)
+        .map_err(|error| format!("sampled texture read failed: {}", error.message()))?;
+    let update = updates
+        .iter()
+        .find(|update| update.index == 0)
+        .ok_or("sampled texture read returned no writeback")?;
+    let word = update
+        .bytes
+        .get(..4)
+        .ok_or("sampled texture writeback is shorter than one word")?;
+    if word != 0_u32.to_le_bytes() {
+        return Err(format!(
+            "sampled texture read landed {:02x?}, expected texel 0",
+            word
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_sampled_texture_read texture=4x4-r32uint texel=(0,0) value=0 copy_in=1"
+    );
+    Ok(())
+}
+
+/// Read every cell of a 4x4 R32Uint texture holding 0..15, once as a single
+/// 4x4 group and once as sixteen 1x1 groups. Both forms must land [100..115].
+///
+/// A host-side upload that assumes tightly packed linear rows puts every row
+/// after the first in bytes the driver never reads, so both forms then return
+/// [100, 101, 102, 103, 100, ...]: only the V = 0 row survives. That is a
+/// provider defect, not a translated-coordinate one — a single invocation with
+/// constant coordinates reproduced it before the fix
+/// (`evidence/upstream-issue-metal2vulkan-2026-09-14/`).
+fn run_multi_invocation_texture_read(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    use metal_api_core::provider::{
+        AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, ViewId,
+    };
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let expected = (100_u32..116).collect::<Vec<_>>();
+    for (form, threadgroup) in [
+        ("local_4x4", (4_u32, 4_u32, 1_u32)),
+        ("local_1x1", (1, 1, 1)),
+    ] {
+        let library = device.new_library_with_air(
+            include_str!("../shaders/kernel_read_texture_2d_cell.ll").to_owned(),
+        )?;
+        let function = library.function("read_texture_2d_cell")?;
+        let pipeline = executor.new_compute_pipeline(&function)?;
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = TextureView {
+            view_id: ViewId::new(910),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(911),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(texels),
+        };
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 64],
+            }],
+            textures: vec![texture],
+            threads_per_grid: metal_api_core::Size::new(4, 4, 1)?,
+            threads_per_threadgroup: metal_api_core::Size::new(
+                threadgroup.0,
+                threadgroup.1,
+                threadgroup.2,
+            )?,
+        };
+        let updates = executor.execute(submission).map_err(|error| {
+            format!(
+                "multi invocation texture read ({form}) failed: {}",
+                error.message()
+            )
+        })?;
+        let update = updates
+            .iter()
+            .find(|update| update.index == 0)
+            .ok_or("multi invocation texture read returned no writeback")?;
+        let observed = update
+            .bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("chunk is four bytes")))
+            .collect::<Vec<_>>();
+        if observed != expected {
+            return Err(format!(
+                "multi invocation texture read ({form}) landed {observed:?}, expected {expected:?}"
+            )
+            .into());
+        }
+        println!(
+            "PASS provider_multi_invocation_texture_read form={form} grid=4x4x1 threadgroup={}x{}x{} cells=100..115",
+            threadgroup.0, threadgroup.1, threadgroup.2
+        );
+    }
+    Ok(())
+}
+
+/// One allocation carrying two disjoint views. This is the real-provider
+/// proof for ranged aliasing: the Vulkan provider must admit both views,
+/// execute the copy across them, and land the writeback at the destination
+/// view's own allocation offset. An overlapping pair keeps the refusal.
+/// Disjoint ranges cannot exchange data through one allocation because each
+/// view's footprint proof bounds its accesses inside its own half-open range.
+fn run_object_disjoint_views() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_disjoint_views".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile disjoint-view fixture: {error:?}"))?;
+    let word = 0x6745_2301_u32.to_le_bytes();
+    let shared = device.new_buffer_with_bytes([word.as_slice(), &[0_u8; 4]].concat())?;
+    let source = shared.view(0, 4)?;
+    let destination = shared.view(4, 4)?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source)?;
+        encoder.set_buffer(1, &destination)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    // The judge for a shared device buffer (research/docs/15 §3.3): two views
+    // of one allocation must cost one copy in and one copy out, not two.
+    let (uploads_before, readbacks_before) = executor.buffer_copy_counts();
+    let (upload_bytes_before, readback_bytes_before) = executor.buffer_copy_bytes();
+    command.commit()?;
+    command.wait_until_completed()?;
+    let (uploads, readbacks) = executor.buffer_copy_counts();
+    let uploads = uploads - uploads_before;
+    let readbacks = readbacks - readbacks_before;
+    if uploads != 1 || readbacks != 1 {
+        return Err(format!(
+            "two views of one allocation copied in {uploads} and out {readbacks} times, expected 1 and 1"
+        )
+        .into());
+    }
+    // Step 4: the read-only view copies exactly its 4 bytes in and the
+    // write-only view copies nothing in; one writable view copies 4 bytes out.
+    let (upload_bytes, readback_bytes) = executor.buffer_copy_bytes();
+    let upload_bytes = upload_bytes - upload_bytes_before;
+    let readback_bytes = readback_bytes - readback_bytes_before;
+    if upload_bytes != 4 || readback_bytes != 4 {
+        return Err(format!(
+            "partially transferred disjoint views copied in {upload_bytes} bytes and out {readback_bytes} bytes, expected 4 and 4"
+        )
+        .into());
+    }
+    let observed = shared.read()?;
+    if observed[..4] != word {
+        return Err("disjoint views: the source range was not preserved".into());
+    }
+    if observed[4..] != word {
+        return Err(format!(
+            "disjoint views: destination range holds {:02x?}, expected {word:02x?}",
+            &observed[4..]
+        )
+        .into());
+    }
+    // A pair whose allocation ranges overlap must still be refused.
+    let overlapping = device.new_buffer_with_bytes(vec![0_u8; 8])?;
+    let low = overlapping.view(0, 4)?;
+    let high = overlapping.view(2, 4)?;
+    let refused = {
+        let command = queue.command_buffer();
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &low)?;
+        encoder.set_buffer(1, &high)
+    };
+    match refused {
+        Err(metal_api_core::provider_api::Error::Api(ApiError::AliasedBufferBindings {
+            ..
+        })) => {}
+        Err(other) => {
+            return Err(format!("overlapping views refused with unexpected error {other:?}").into())
+        }
+        Ok(()) => return Err("overlapping views of one allocation were admitted".into()),
+    }
+    println!(
+        "PASS provider_object_disjoint_views allocation=1 views=2 execute=copy writeback=exact overlap=refused copy_in={uploads} copy_out={readbacks} copy_in_bytes={upload_bytes} copy_out_bytes={readback_bytes}"
+    );
+    Ok(())
+}
+
+/// Two independent command buffers with disjoint buffer reservations: the
+/// second commit must not wait for the first command to complete, so both
+/// submissions stay in flight at once. The test is a host-reservation
+/// granularity check; it does not claim overlapping GPU execution or
+/// multi-queue scheduling.
+/// Two command buffers whose ranges are disjoint but live in the same
+/// allocation must both be in flight. Under whole-allocation reservations the
+/// second commit stays parked until the first completes, and the receive
+/// timeout below reports that instead of hanging.
+fn run_object_same_allocation_parallel() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_same_allocation_parallel".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile same-allocation fixture: {error:?}"))?;
+    let word_a = 0x3333_3333_u32.to_le_bytes();
+    let word_b = 0x4444_4444_u32.to_le_bytes();
+    // One 16-byte allocation carries two independent source/target pairs, so
+    // both commands reserve ranges of the same allocation.
+    let mut image = vec![0_u8; 16];
+    image[0..4].copy_from_slice(&word_a);
+    image[8..12].copy_from_slice(&word_b);
+    let shared = device.new_buffer_with_bytes(image)?;
+    let source_a = shared.view(0, 4)?;
+    let target_a = shared.view(4, 4)?;
+    let source_b = shared.view(8, 4)?;
+    let target_b = shared.view(12, 4)?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source_a)?;
+        encoder.set_buffer(1, &target_a)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &source_b)?;
+        encoder.set_buffer(1, &target_b)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let (upload_bytes_before, readback_bytes_before) = executor.buffer_copy_bytes();
+    first.commit()?;
+    let (committed, wait_for_commit) = std::sync::mpsc::channel();
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second same-allocation commit: {error:?}"))?;
+        committed
+            .send(())
+            .map_err(|_| "same-allocation commit signal receiver dropped".to_string())?;
+        Ok::<_, String>(second)
+    });
+    wait_for_commit
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "a disjoint range of one allocation blocked on the first reservation")?;
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "same-allocation commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    let observed = shared.read()?;
+    if observed[0..4] != word_a
+        || observed[4..8] != word_a
+        || observed[8..12] != word_b
+        || observed[12..16] != word_b
+    {
+        return Err(format!("same-allocation writebacks differ: {observed:02x?}").into());
+    }
+    // Two substitutions, each touching one read-only source and one
+    // write-only target: 4 bytes copied in and 4 bytes copied out per command.
+    let (upload_bytes, readback_bytes) = executor.buffer_copy_bytes();
+    let upload_bytes = upload_bytes - upload_bytes_before;
+    let readback_bytes = readback_bytes - readback_bytes_before;
+    if upload_bytes != 8 || readback_bytes != 8 {
+        return Err(format!(
+            "two same-allocation commands copied in {upload_bytes} bytes and out {readback_bytes} bytes, expected 8 and 8"
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_same_allocation_parallel command_buffers=2 allocation=1 views=4 in_flight=2 writeback=exact copy_in_bytes={upload_bytes} copy_out_bytes={readback_bytes}"
+    );
+    Ok(())
+}
+fn run_object_parallel_commands() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_parallel_commands".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile parallel fixture: {error:?}"))?;
+    let word_a = 0x1111_1111_u32.to_le_bytes().to_vec();
+    let word_b = 0x2222_2222_u32.to_le_bytes().to_vec();
+    let input_a = device.new_buffer_with_bytes(word_a.clone())?;
+    let input_b = device.new_buffer_with_bytes(word_b.clone())?;
+    let output_a = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let output_b = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let queue = device.new_command_queue();
+    let first = queue.command_buffer();
+    {
+        let mut encoder = first.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_a.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_a.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    let second = queue.command_buffer();
+    {
+        let mut encoder = second.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_b.view(0, 4)?)?;
+        encoder.set_buffer(1, &output_b.view(0, 4)?)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    first.commit()?;
+    let (committed, wait_for_commit) = std::sync::mpsc::channel();
+    let queued = std::thread::spawn(move || {
+        second
+            .commit()
+            .map_err(|error| format!("second parallel commit: {error:?}"))?;
+        committed
+            .send(())
+            .map_err(|_| "parallel commit signal receiver dropped".to_string())?;
+        Ok::<_, String>(second)
+    });
+    wait_for_commit
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "second disjoint commit blocked on the first reservation")?;
+    first.wait_until_completed()?;
+    let second = queued
+        .join()
+        .map_err(|_| "parallel commit thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    second.wait_until_completed()?;
+    if output_a.read()? != word_a || output_b.read()? != word_b {
+        return Err(format!(
+            "parallel writebacks differ: a={:02x?} b={:02x?}",
+            output_a.read()?,
+            output_b.read()?
+        )
+        .into());
+    }
+    let queues = executor.queue_count();
+    let families = executor.queue_family_count();
+    let counts = executor.queue_submission_counts();
+    let submissions: usize = counts.iter().sum();
+    if submissions != 2 {
+        return Err(
+            format!("parallel queue recorded {submissions} submissions, expected 2").into(),
+        );
+    }
+    let distributed = queues > 1 && counts.iter().filter(|count| **count > 0).count() >= 2;
+    if queues > 1 && !distributed {
+        return Err(format!(
+            "multi-queue device did not distribute independent submissions: queues={queues} counts={counts:?}"
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_parallel_commands command_buffers=2 dependency=independent in_flight=2 queues={queues} families={families} distributed={distributed} writeback=exact"
+    );
+    Ok(())
+}
+
+/// Two dispatches in one command buffer with a data dependency: the first
+/// copies the input word into `middle`, the second copies `middle` into the
+/// destination. The second pass can only observe the first pass's write if the
+/// encoder's inter-pass compute barrier is correct. This is the single-queue
+/// dependency path, so Lavapipe can exercise it in CI.
+fn run_object_serial_dependency() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?,
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_serial_dependency".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile serial-dependency fixture: {error:?}"))?;
+    let expected = 0x5a5a_1234_u32.to_le_bytes().to_vec();
+    let input = device.new_buffer_with_bytes(expected.clone())?;
+    let middle = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let destination = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+    let input_view = input.view(0, 4)?;
+    let middle_view = middle.view(0, 4)?;
+    let destination_view = destination.view(0, 4)?;
+    let queue = device.new_command_queue();
+    let command = queue.command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder()?;
+        encoder.set_compute_pipeline_state(&pipeline)?;
+        encoder.set_buffer(0, &input_view)?;
+        encoder.set_buffer(1, &middle_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.clear_buffers()?;
+        encoder.set_buffer(0, &middle_view)?;
+        encoder.set_buffer(1, &destination_view)?;
+        encoder.dispatch_threads(
+            metal_api_core::Size::new(1, 1, 1)?,
+            metal_api_core::Size::new(1, 1, 1)?,
+        )?;
+        encoder.end_encoding()?;
+    }
+    command.commit()?;
+    command.wait_until_completed()?;
+    if middle.read()? != expected || destination.read()? != expected {
+        return Err(format!(
+            "serial dependency writebacks differ: middle={:02x?} destination={:02x?}",
+            middle.read()?,
+            destination.read()?
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_serial_dependency passes=2 barrier=compute_shader writeback=exact"
+    );
+    Ok(())
+}
+
+/// Two independent submissions must be able to hold different device-queue
+/// enqueue locks at the same time. The probe blocks inside the host enqueue
+/// section until both submissions have entered it, so a single global lock
+/// would time out instead of observing two distinct queue indices.
+/// Single-queue devices skip the case: Vulkan requires those submissions to
+/// serialize on the one queue handle.
+fn run_object_concurrent_enqueue() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let queues = executor.queue_count();
+    if queues < 2 {
+        println!("SKIP provider_object_concurrent_enqueue reason=single_queue queues={queues}");
+        return Ok(());
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let probe_release = Arc::clone(&release);
+    executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+        let _ = entered_tx.send(queue);
+        let (lock, condvar) = &*probe_release;
+        let mut released = lock.lock().expect("enqueue probe mutex");
+        while !*released {
+            released = condvar.wait(released).expect("enqueue probe condvar");
+        }
+    }));
+    let result = run_object_concurrent_enqueue_inner(&executor, queues, &entered_rx, &release);
+    executor.clear_enqueue_probe_for_test();
+    result
+}
+
+fn run_object_concurrent_enqueue_inner(
+    executor: &Arc<VulkanExecutor>,
+    queues: usize,
+    entered_rx: &std::sync::mpsc::Receiver<usize>,
+    release: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+) -> Result<(), Box<dyn Error>> {
+    let families = executor.queue_family_count();
+    let release_probe = || {
+        let (lock, condvar) = &**release;
+        *lock.lock().expect("enqueue probe mutex") = true;
+        condvar.notify_all();
+    };
+    let provider = Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(executor))
+            .map_err(provider_error)?
+            .with_async_execution(true),
+    );
+    let device = metal_api_core::provider_api::Device::new(provider);
+    let pipeline = device
+        .compile_pipeline(PipelineCompileRequest {
+            entry_name: "copy_word".to_owned(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"object_concurrent_enqueue".to_vec(),
+            )?,
+            source: ShaderSource::SanitizedLl(
+                include_str!("../shaders/kernel_copy_word.ll").to_owned(),
+            ),
+        })
+        .map_err(|error| format!("compile concurrent-enqueue fixture: {error:?}"))?;
+    let queue = device.new_command_queue();
+    let mut words = Vec::new();
+    let mut outputs = Vec::new();
+    let mut commands = Vec::new();
+    for index in 0..queues {
+        let word = (0x1000_0000_u32 | index as u32).to_le_bytes().to_vec();
+        let input = device.new_buffer_with_bytes(word.clone())?;
+        let output = device.new_buffer_with_bytes(vec![0_u8; 4])?;
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder()?;
+            encoder.set_compute_pipeline_state(&pipeline)?;
+            encoder.set_buffer(0, &input.view(0, 4)?)?;
+            encoder.set_buffer(1, &output.view(0, 4)?)?;
+            encoder.dispatch_threads(
+                metal_api_core::Size::new(1, 1, 1)?,
+                metal_api_core::Size::new(1, 1, 1)?,
+            )?;
+            encoder.end_encoding()?;
+        }
+        words.push(word);
+        outputs.push(output);
+        commands.push(command);
+    }
+    let mut threads = Vec::new();
+    for command in commands {
+        threads.push(std::thread::spawn(move || -> Result<_, String> {
+            command
+                .commit()
+                .map_err(|error| format!("concurrent commit: {error:?}"))?;
+            Ok(command)
+        }));
+    }
+    let mut entered = Vec::new();
+    let mut failure = None;
+    for position in 0..queues {
+        match entered_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(queue) => entered.push(queue),
+            Err(error) => {
+                failure = Some(format!(
+                    "enqueue {}/{queues} did not enter the probe: {error}",
+                    position + 1
+                ));
+                break;
+            }
+        }
+    }
+    release_probe();
+    let mut completed = Vec::new();
+    for thread in threads {
+        match thread.join() {
+            Ok(Ok(command)) => completed.push(command),
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+            Err(_) => {
+                if failure.is_none() {
+                    failure = Some("concurrent commit thread panicked".to_owned());
+                }
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    for command in &completed {
+        command.wait_until_completed()?;
+    }
+    for (index, (output, word)) in outputs.iter().zip(&words).enumerate() {
+        let observed = output.read()?;
+        if observed.as_slice() != word.as_slice() {
+            return Err(format!(
+                "submission {index} writeback differs: {observed:02x?} != {word:02x?}"
+            )
+            .into());
+        }
+    }
+    let distinct = entered
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() != queues {
+        return Err(format!(
+            "enqueue probes entered {} distinct queues, expected {queues}: {entered:?}",
+            distinct.len()
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_object_concurrent_enqueue submissions={queues} queues={queues} families={families} distinct={} host_enqueue=concurrent writeback=exact",
+        distinct.len()
+    );
+    Ok(())
+}
+
+/// A confirmed device loss is terminal for the lost context: health reports
+/// `DeviceLost`, new work is refused with `RetryAfterRecreate`, and a fresh
+/// executor/provider pair must resume normal work. CI cannot produce a
+/// deterministic `VK_ERROR_DEVICE_LOST`, so the loss is injected through the
+/// executor's test hook and this case is a lifecycle check, not a real
+/// device-loss reproduction; the handle-destruction path still needs a real
+/// lost device or an in-flight resource at the moment of loss.
+fn run_device_lifecycle() -> Result<(), Box<dyn Error>> {
+    let executor = VulkanExecutor::new()?;
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let bindings = || {
+        vec![
+            (0, 8, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1, 16, 0xabab_abab_u32.to_le_bytes().to_vec()),
+        ]
+    };
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"device_lifecycle".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 92, dispatch, bindings())?;
+    let result = submit_and_wait(&provider, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    if provider.health() != ProviderHealth::Usable {
+        return Err(format!("fresh provider is not usable: {:?}", provider.health()).into());
+    }
+    release_case(&provider, &pipeline, &result)?;
+
+    executor.inject_device_loss_for_test();
+    if provider.health() != ProviderHealth::DeviceLost {
+        return Err(format!(
+            "injected loss did not report DeviceLost: {:?}",
+            provider.health()
+        )
+        .into());
+    }
+    let refusal = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"device_lifecycle_refused".to_vec(),
+            )?,
+        )
+        .expect_err("lost provider admitted a new pipeline");
+    if refusal.class != metal_api_core::provider::ProviderErrorClass::DeviceLost
+        || refusal.slug != "device_lost"
+        || refusal.retryability != metal_api_core::provider::Retryability::RetryAfterRecreate
+        || refusal.completion != (CompletionDisposition::DeviceLost { token: None })
+    {
+        return Err(format!("lost provider refused with the wrong error: {refusal:?}").into());
+    }
+    // The refusal is the core lifecycle's, field included: the provider does
+    // not re-spell `terminal` on its side of the boundary.
+    if refusal.fields.get("terminal") != Some(&FieldValue::Text("device_lost".to_owned())) {
+        return Err(format!("lost provider refusal lost its terminal field: {refusal:?}").into());
+    }
+    let lost_object = metal_api_core::provider_api::Device::new(Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?,
+    ));
+    if lost_object.health() != ProviderHealth::DeviceLost {
+        return Err(format!(
+            "object API did not expose the lost health: {:?}",
+            lost_object.health()
+        )
+        .into());
+    }
+    drop(provider);
+
+    let recovered_executor = VulkanExecutor::new()?;
+    let recovered = VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+        .map_err(provider_error)?;
+    let recovered_device =
+        Device::new(Arc::clone(&recovered_executor) as Arc<dyn metal_api_core::ComputeExecutor>);
+    let function = recovered_device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = recovered
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"device_lifecycle_recovered".to_vec(),
+            )?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(&pipeline, 93, dispatch, bindings())?;
+    let result = submit_and_wait(&recovered, &trace)?;
+    check_writeback(&trace, &result, 1, &0x6745_2301_u32.to_le_bytes())?;
+    release_case(&recovered, &pipeline, &result)?;
+    let recovered_object = metal_api_core::provider_api::Device::new(Arc::new(
+        VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+            .map_err(provider_error)?,
+    ));
+    if recovered_object.health() != ProviderHealth::Usable {
+        return Err(format!(
+            "object API did not expose the recovered health: {:?}",
+            recovered_object.health()
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_device_lifecycle injected=simulated health=DeviceLost refusal=device_lost terminal=device_lost retry=RetryAfterRecreate object_health=exposed recreated=true writeback=exact"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_lease_trace(
+    epoch: DeviceEpoch,
+    pipeline: &CompiledComputePipeline,
+    lease_id: LeaseId,
+    lease_access: BufferAccess,
+    owned: BufferSource,
+    lease_view_id: u64,
+    owned_view_id: u64,
+) -> ComputeTrace {
+    borrowed_lease_trace_for(
+        epoch,
+        pipeline,
+        lease_id,
+        // The default fixture borrows a window that starts at the allocation
+        // base, so its views carry the allocation's own offsets.
+        0,
+        lease_access,
+        owned,
+        lease_view_id,
+        owned_view_id,
+        298,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_lease_trace_for(
+    epoch: DeviceEpoch,
+    pipeline: &CompiledComputePipeline,
+    lease_id: LeaseId,
+    lease_offset: u64,
+    lease_access: BufferAccess,
+    owned: BufferSource,
+    lease_view_id: u64,
+    owned_view_id: u64,
+    lease_allocation: u64,
+) -> ComputeTrace {
+    let owned_access = match lease_access {
+        BufferAccess::Read => BufferAccess::Write,
+        BufferAccess::Write => BufferAccess::Read,
+        other => panic!("borrowed lease fixture cannot use {other:?}"),
+    };
+    let lease_view = |metal_binding| BufferView {
+        view_id: ViewId::new(lease_view_id),
+        metal_binding,
+        allocation_id: AllocationId::new(lease_allocation),
+        // Views are allocation-relative, so a window that starts inside the
+        // registration names its own offset here; the reservation bounds
+        // admission check against it (`LeaseRangeOutOfBounds`).
+        offset: lease_offset,
+        length: 4,
+        access: lease_access,
+        attribute_stride: None,
+        source: BufferSource::BorrowedNoCopy(lease_id),
+    };
+    let owned_view = |metal_binding| BufferView {
+        view_id: ViewId::new(owned_view_id),
+        metal_binding,
+        allocation_id: AllocationId::new(299),
+        offset: 0,
+        length: 4,
+        access: owned_access,
+        attribute_stride: None,
+        source: owned.clone(),
+    };
+    let buffers = match lease_access {
+        BufferAccess::Read => vec![lease_view(0), owned_view(1)],
+        BufferAccess::Write => vec![owned_view(0), lease_view(1)],
+        other => panic!("borrowed lease fixture cannot use {other:?}"),
+    };
+    ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: epoch,
+        operation_id: OperationId::new(lease_view_id),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        })],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    }
+}
+
+fn borrowed_lease_resources(
+    epoch: DeviceEpoch,
+    reservation: LeaseReservation,
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    borrowed_lease_resources_for(epoch, reservation, 298, 64)
+}
+
+fn borrowed_lease_resources_for(
+    epoch: DeviceEpoch,
+    reservation: LeaseReservation,
+    lease_allocation: u64,
+    lease_size: u64,
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    let mut resources = ResourceTableSnapshot::new();
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(lease_allocation),
+        owner_epoch: epoch,
+        size: lease_size,
+    })?;
+    resources.insert_allocation(AllocationRecord {
+        allocation_id: AllocationId::new(299),
+        owner_epoch: epoch,
+        size: 32,
+    })?;
+    resources.insert_lease(reservation)?;
+    Ok(resources)
+}
+
+/// Page-aligned owner allocation for `VK_EXT_external_memory_host` imports.
+struct AlignedBuffer {
+    pointer: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, alignment: usize) -> Result<Self, Box<dyn Error>> {
+        let layout = std::alloc::Layout::from_size_align(len, alignment)?;
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        let pointer = std::ptr::NonNull::new(pointer).ok_or("aligned allocation failed")?;
+        Ok(Self { pointer, layout })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.pointer.as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.layout.size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), self.layout) };
+    }
+}
+
+fn run_indexed_and_refusals(
+    provider: &VulkanComputeProvider,
+    peer: &VulkanComputeProvider,
+    device: &Device,
+) -> Result<(), Box<dyn Error>> {
+    let library = device.new_library_with_air(include_str!(
+        "../shaders/kernel_dispatch_threads_boundary_barrier.ll"
+    ))?;
+    let function = library.function("kernel_dispatch_threads_boundary_barrier")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"indexed_boundary".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let trace = make_trace(
+        &pipeline,
+        4,
+        Dispatch {
+            kind: DispatchKind::ThreadsExact,
+            grid: [10, 3, 1],
+            threads_per_threadgroup: [8, 2, 1],
+        },
+        vec![(0, 32, vec![0xaa; 30 * size_of::<u32>()])],
+    )?;
+    let result = submit_and_wait(provider, &trace)?;
+    let expected = indexed_boundary_golden();
+    check_writeback(&trace, &result, 0, &expected)?;
+    if execute_indexed_boundary_dispatch(device)? != expected {
+        return Err("indexed snapshot executor disagrees with the provider golden".into());
+    }
+    println!(
+        "PASS provider_indexed_boundary_dispatch words=30 regions=4 writeback_offset=32 snapshot_parity=exact"
+    );
+
+    // Admission can verify an internally consistent proof but cannot establish
+    // that it belongs to the compiled pipeline. The provider must check that.
+    let mut forged = trace.clone();
+    let FootprintProof::Affine { accesses } =
+        &mut forged.pipelines[0].contract.buffer_bindings[0].footprint
+    else {
+        return Err("indexed provider fixture must carry an affine footprint proof".into());
+    };
+    for access in accesses {
+        access.base_offset = 0;
+        access.access_size = 1;
+        access.terms.clear();
+    }
+    if forged.pipelines[0].contract == trace.pipelines[0].contract {
+        return Err("forged fixture failed to change the pipeline contract".into());
+    }
+    let admitted = provider
+        .capabilities()
+        .validate_trace(forged.clone(), resources_for_trace(&forged)?)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "pipeline_contract_mismatch")?;
+    println!("PASS provider_refusal slug=pipeline_contract_mismatch admitted_forgery=true");
+
+    let admitted = peer
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    expect_refusal(peer.submit(admitted), "device_epoch_mismatch")?;
+    let token = result
+        .completion
+        .token()
+        .ok_or("completed result has no token")?;
+    expect_refusal(peer.wait(token, Duration::ZERO), "device_epoch_mismatch")?;
+    println!("PASS provider_refusal slug=device_epoch_mismatch shared_executor=trace_and_token");
+    // Compilation and release must carry owner identity through the shared API.
+    expect_refusal(
+        PipelineProvider::release_pipeline(peer, &pipeline),
+        "device_epoch_mismatch",
+    )?;
+    let mut changed_pipeline = pipeline.clone();
+    changed_pipeline.function.entry_name = "forged".into();
+    expect_refusal(
+        PipelineProvider::release_pipeline(provider, &changed_pipeline),
+        "pipeline_identity_mismatch",
+    )?;
+    expect_refusal(
+        PipelineProvider::compile(
+            provider,
+            PipelineCompileRequest {
+                entry_name: "unsupported_msl".into(),
+                logical_digest: SemanticDigest::new("fixture", vec![1])?,
+                source: ShaderSource::MetalSource("kernel void unsupported_msl() {}".into()),
+            },
+        ),
+        "shader_source_unsupported",
+    )?;
+    println!("PASS shared_compile_refusals foreign_release=checked metadata=checked msl=refused");
+
+    release_case(provider, &pipeline, &result)?;
+    expect_unknown_completion(provider.wait(token, Duration::ZERO), token)?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(&trace)?)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "unknown_pipeline")?;
+    println!("PASS provider_release completion=unknown_completion pipeline=unknown_pipeline");
+    Ok(())
+}
+
+/// Build a compute trace whose owned buffers are placed in one heap. Every
+/// fixture binding is a single owned view at allocation offset zero, so its
+/// allocation size equals the view byte length and the heap placement's
+/// `byte_size` can be asserted one-to-one against it.
+fn make_heap_trace(
+    pipeline: &CompiledComputePipeline,
+    operation: u64,
+    dispatch: Dispatch,
+    heap: HeapPayload,
+    bindings: Vec<(u32, Vec<u8>)>,
+) -> Result<ComputeTrace, Box<dyn Error>> {
+    let mut buffers = Vec::with_capacity(bindings.len());
+    for (index, bytes) in bindings {
+        let access = pipeline
+            .contract
+            .buffer_bindings
+            .iter()
+            .find(|binding| binding.metal_binding == index)
+            .ok_or("fixture binding is missing from pipeline reflection")?
+            .access;
+        buffers.push(BufferView {
+            view_id: ViewId::new(200 + u64::from(index)),
+            metal_binding: index,
+            allocation_id: AllocationId::new(100 + u64::from(index)),
+            offset: 0,
+            length: u64::try_from(bytes.len())?,
+            access,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        });
+    }
+    Ok(ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: pipeline.device_epoch,
+        operation_id: OperationId::new(operation),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch,
+            textures: Vec::new(),
+        })],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: Some(Box::new(heap)),
+        indirect: None,
+    })
+}
+
+/// One allocation per fixture binding, sized exactly as `sizes` describes so
+/// the heap mapping can be validated against it.
+fn heap_resources(
+    trace: &ComputeTrace,
+    sizes: &[u64],
+) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    let mut resources = ResourceTableSnapshot::new();
+    for (view, size) in trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+        .iter()
+        .zip(sizes)
+    {
+        resources.insert_allocation(AllocationRecord {
+            allocation_id: view.allocation_id,
+            owner_epoch: trace.device_epoch,
+            size: *size,
+        })?;
+    }
+    Ok(resources)
+}
+
+fn run_heap_placement(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let provider =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = Device::new(executor);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_word.ll"))?
+        .function("copy_word")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"heap_placement".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [1, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+    let input = 0x6745_2301u32.to_le_bytes().to_vec();
+    let output = 0xabab_ababu32.to_le_bytes().to_vec();
+    let heap_id = HeapId::new(61);
+
+    let heap = |placements: Vec<HeapPlacement>| HeapPayload {
+        descriptor: HeapDescriptor {
+            size: 4096,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: false,
+        },
+        placements,
+    };
+
+    // Success: two 4-byte buffers placed at 0 and 256 in one slab; the copy
+    // kernel writes the input bytes into the output buffer.
+    let trace = make_heap_trace(
+        &pipeline,
+        700,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 256,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let resources = heap_resources(&trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(&trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!("heap placement did not complete: {:?}", result.completion).into());
+    };
+    if provider
+        .wait(token, Duration::ZERO)
+        .map_err(provider_error)?
+        != (CompletionDisposition::CompletedVisible { token })
+    {
+        return Err("heap placement token did not stay visible".into());
+    }
+    let output_view = trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+        .iter()
+        .find(|view| view.metal_binding == 1)
+        .ok_or("output binding is missing from heap fixture")?;
+    let [writeback] = result.writebacks.as_slice() else {
+        return Err("heap fixture requires exactly one writable view".into());
+    };
+    if writeback.allocation_id != output_view.allocation_id
+        || writeback.view_id != output_view.view_id
+        || writeback.offset != 0
+        || writeback.bytes != input
+    {
+        return Err(format!("heap placement writeback mismatch: {writeback:?}").into());
+    }
+    let observations = provider.heap_placement_observations();
+    let [first, second] = observations.as_slice() else {
+        return Err(format!(
+            "heap placement reported {} observations, expected 2",
+            observations.len()
+        )
+        .into());
+    };
+    if first.heap_id != heap_id
+        || first.allocation_id != AllocationId::new(100)
+        || first.offset != 0
+        || first.byte_size != 4
+    {
+        return Err(format!("first heap placement observation is wrong: {first:?}").into());
+    }
+    if second.heap_id != heap_id
+        || second.allocation_id != AllocationId::new(101)
+        || second.offset != 256
+        || second.byte_size != 4
+    {
+        return Err(format!("second heap placement observation is wrong: {second:?}").into());
+    }
+    println!(
+        "PASS provider_heap_placement heap=61 same_slab=true offsets=0,256 writeback=exact observations=2"
+    );
+
+    // Provider-side count mismatch: one placement against two owned allocations.
+    let count_trace = make_heap_trace(
+        &pipeline,
+        701,
+        dispatch,
+        heap(vec![HeapPlacement {
+            heap_id,
+            offset: 0,
+            resource: HeapResource::Buffer { byte_size: 4 },
+        }]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let count_resources = heap_resources(&count_trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(count_trace.clone(), count_resources)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "heap_placement_mismatch")?;
+
+    // Provider-side size mismatch: placement byte size disagrees with the
+    // allocation it maps to.
+    let size_trace = make_heap_trace(
+        &pipeline,
+        702,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 8 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 256,
+                resource: HeapResource::Buffer { byte_size: 8 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let size_resources = heap_resources(&size_trace, &[4, 4])?;
+    let admitted = provider
+        .capabilities()
+        .validate_trace(size_trace.clone(), size_resources)
+        .map_err(provider_error)?;
+    expect_refusal(provider.submit(admitted), "heap_placement_mismatch")?;
+
+    // Neutral overflow refusal, caught before provider mapping.
+    let overflow_trace = make_heap_trace(
+        &pipeline,
+        703,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 4096,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let overflow_resources = heap_resources(&overflow_trace, &[4, 4])?;
+    expect_refusal(
+        provider
+            .capabilities()
+            .validate_trace(overflow_trace, overflow_resources),
+        "heap_placement_overflow",
+    )?;
+
+    // Neutral overlap refusal: aliasing is not part of the first increment.
+    let overlap_trace = make_heap_trace(
+        &pipeline,
+        704,
+        dispatch,
+        heap(vec![
+            HeapPlacement {
+                heap_id,
+                offset: 0,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+            HeapPlacement {
+                heap_id,
+                offset: 2,
+                resource: HeapResource::Buffer { byte_size: 4 },
+            },
+        ]),
+        vec![(0, input.clone()), (1, output.clone())],
+    )?;
+    let overlap_resources = heap_resources(&overlap_trace, &[4, 4])?;
+    expect_refusal(
+        provider
+            .capabilities()
+            .validate_trace(overlap_trace, overlap_resources),
+        "heap_alias_unsupported",
+    )?;
+    println!("PASS provider_heap_refusals count=heap_placement_mismatch size=heap_placement_mismatch overflow=heap_placement_overflow overlap=heap_alias_unsupported");
+    release_case(&provider, &pipeline, &result)?;
+    Ok(())
+}
+
+fn make_trace(
+    pipeline: &CompiledComputePipeline,
+    operation: u64,
+    dispatch: Dispatch,
+    bindings: Vec<(u32, u64, Vec<u8>)>,
+) -> Result<ComputeTrace, Box<dyn Error>> {
+    let mut buffers = Vec::with_capacity(bindings.len());
+    for (index, offset, bytes) in bindings {
+        let access = pipeline
+            .contract
+            .buffer_bindings
+            .iter()
+            .find(|binding| binding.metal_binding == index)
+            .ok_or("fixture binding is missing from pipeline reflection")?
+            .access;
+        buffers.push(BufferView {
+            view_id: ViewId::new(200 + u64::from(index)),
+            metal_binding: index,
+            allocation_id: AllocationId::new(100 + u64::from(index)),
+            offset,
+            length: u64::try_from(bytes.len())?,
+            access,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes),
+        });
+    }
+    Ok(ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: pipeline.device_epoch,
+        operation_id: OperationId::new(operation),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch,
+            textures: Vec::new(),
+        })],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    })
+}
+
+fn resources_for_trace(trace: &ComputeTrace) -> Result<ResourceTableSnapshot, Box<dyn Error>> {
+    let mut resources = ResourceTableSnapshot::new();
+    for view in &trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+    {
+        resources.insert_allocation(AllocationRecord {
+            allocation_id: view.allocation_id,
+            owner_epoch: trace.device_epoch,
+            size: view.offset + view.length + 8,
+        })?;
+    }
+    Ok(resources)
+}
+
+fn submit_and_wait(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+) -> Result<ProviderSubmission, Box<dyn Error>> {
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources_for_trace(trace)?)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!("host readback did not complete: {:?}", result.completion).into());
+    };
+    let waited = provider
+        .wait(token, Duration::ZERO)
+        .map_err(provider_error)?;
+    if waited != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("completed token did not stay visible: {waited:?}").into());
+    }
+    Ok(result)
+}
+
+fn check_writeback(
+    trace: &ComputeTrace,
+    result: &ProviderSubmission,
+    binding: u32,
+    expected: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let view = trace.passes[0]
+        .as_compute()
+        .expect("fixture pass is a compute pass")
+        .buffers
+        .iter()
+        .find(|view| view.metal_binding == binding)
+        .ok_or("output binding is missing from fixture")?;
+    let [writeback] = result.writebacks.as_slice() else {
+        return Err("provider fixture requires exactly one writable view".into());
+    };
+    if writeback.allocation_id != view.allocation_id
+        || writeback.view_id != view.view_id
+        || writeback.offset != view.offset
+        || writeback.bytes != expected
+    {
+        return Err(
+            format!("provider writeback did not match binding {binding}: {writeback:?}").into(),
+        );
+    }
+    // Land the returned bytes using their allocation-relative offset and
+    // compare the entire backing, including guards outside the view.
+    let start = usize::try_from(view.offset)?;
+    let end = start + expected.len();
+    let mut actual_allocation = vec![0x5a; end + 8];
+    let mut expected_allocation = actual_allocation.clone();
+    expected_allocation[start..end].copy_from_slice(expected);
+    let write_start = usize::try_from(writeback.offset)?;
+    actual_allocation[write_start..write_start + writeback.bytes.len()]
+        .copy_from_slice(&writeback.bytes);
+    if actual_allocation != expected_allocation {
+        return Err("provider writeback changed bytes outside its allocation view".into());
+    }
+    Ok(())
+}
+
+fn release_case(
+    provider: &VulkanComputeProvider,
+    pipeline: &CompiledComputePipeline,
+    result: &ProviderSubmission,
+) -> Result<(), Box<dyn Error>> {
+    provider
+        .release_completion(
+            result
+                .completion
+                .token()
+                .ok_or("completed result has no token")?,
+        )
+        .map_err(provider_error)?;
+    provider
+        .release_pipeline(pipeline)
+        .map_err(provider_error)?;
+    Ok(())
+}
+
+fn expect_unknown_completion(
+    result: Result<CompletionDisposition, ProviderError>,
+    token: CompletionToken,
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        Err(error)
+            if error.slug == "unknown_completion"
+                && error.completion
+                    == (CompletionDisposition::SubmittedUnknown { token: Some(token) }) =>
+        {
+            Ok(())
+        }
+        other => {
+            Err(format!("unknown token should preserve uncertain completion: {other:?}").into())
+        }
+    }
+}
+
+fn expect_refusal<T>(result: Result<T, ProviderError>, slug: &str) -> Result<(), Box<dyn Error>> {
+    match result {
+        Err(error)
+            if error.slug == slug && error.completion == CompletionDisposition::NotSubmitted =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("expected pre-submit refusal {slug}, got {error:?}").into()),
+        Ok(_) => Err(format!("provider accepted fixture requiring refusal {slug}").into()),
+    }
+}

@@ -5,29 +5,266 @@
 //! as the dispatch contract; unsupported resources fail before any Vulkan work
 //! is submitted.
 
+use ash::ext::{device_fault, external_memory_host};
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
-    BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, ResourceAccess, ResourceKind,
-    ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
+    BufferExtent, BufferFootprint, BufferIndexSource, KernelDispatch, KernelDispatchPlan,
+    ResourceAccess, ResourceKind, ShaderReflection, ShaderStage, KERNEL_LOCAL_SIZE_SPEC_IDS,
+};
+use metal_api_core::completion::AbandonmentOutcome;
+use metal_api_core::provider::{
+    BorrowedLeaseRegistry, CompletionDisposition, FieldValue, LeaseId, PipelineContract,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderLifecycle,
+    ProviderPhase, QueuePriority, QueueSchedulingPolicy, Retryability, SemanticDigest,
+    TerminalRefusal, MAX_SERIAL_RESOURCES,
 };
 use metal_api_core::{
-    BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError, Function,
-    PipelineArtifact,
+    AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
+    Function, PipelineArtifact,
 };
 use spirv::{Capability, Op};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+mod compute_provider;
+mod provider;
+mod render;
+
+pub use compute_provider::{
+    CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
+    VulkanComputeProvider,
+};
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
+const MAX_SERIAL_DISPATCHES: usize = 8;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+type EnqueueProbe = Arc<dyn Fn(usize) + Send + Sync>;
 
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
+}
+
+/// Admit one submission against a provider lifecycle and return the refusal
+/// the provider boundary reports.
+///
+/// This is the whole mapping between the two crates. The core
+/// [`ProviderLifecycle`] owns the terminal state and spells its refusal once
+/// (`provider_unavailable` or `device_lost`, the `terminal` field, the
+/// abandoned counters and `RetryAfterRecreate`); unwrapping it here keeps the
+/// Vulkan side from re-encoding a slug, a field or a retryability that could
+/// then drift from the contract. Nothing matches on message text.
+fn terminal_refusal(lifecycle: &ProviderLifecycle) -> Result<(), ProviderError> {
+    lifecycle.admit().map_err(TerminalRefusal::into_error)
+}
+
+/// Device queues created per selected queue family.
+///
+/// Four queues are enough to demonstrate independent in-flight work without
+/// over-subscribing drivers whose family reports many queues. A family with a
+/// single queue (Lavapipe) keeps the previous single-queue behaviour.
+const MAX_QUEUES_PER_FAMILY: usize = 4;
+
+/// Total device queues created across the primary and dedicated compute
+/// families. Compute-only queues can overlap with graphics work on drivers
+/// that expose a separate family, so the scheduler may use up to two families.
+const MAX_DEVICE_QUEUES: usize = 8;
+
+/// Abandonment budget of one Vulkan device.
+///
+/// The direct executor and the provider share one context, so they share one
+/// bound: the first submission whose completion can no longer be observed ends
+/// the instance, which then has to be recreated (`docs/PROVIDER-B1.md` §7).
+const ABANDONMENT_BUDGET_SUBMISSIONS: u64 = 1;
+
+/// Byte bound of the same budget. Bytes are accounted but never refunded,
+/// because abandoned device memory cannot be returned safely.
+const ABANDONMENT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A driver boundary whose answer a test may substitute.
+///
+/// Production reaches both points through `VulkanContext::submit_commands` and
+/// `VulkanContext::wait_for_fence`, and both answer a
+/// `VK_ERROR_DEVICE_LOST` the same way: the loss goes through the core
+/// `ProviderLifecycle`. CI cannot make a live driver lose its device, so the
+/// substitution replaces the driver's answer at exactly one of those two
+/// boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceLossPoint {
+    /// `vkQueueSubmit` answers `VK_ERROR_DEVICE_LOST`.
+    Submit,
+    /// `vkWaitForFences` answers `VK_ERROR_DEVICE_LOST`.
+    Wait,
+}
+
+/// One `VkDeviceFaultAddressInfoEXT` record.
+///
+/// [`address_type`](Self::address_type) keeps the raw
+/// `VK_DEVICE_FAULT_ADDRESS_TYPE_*` value; the provider error spells the same
+/// enum as a name (`READ_INVALID`, `WRITE_INVALID`, ...) so a caller can read
+/// the fault without matching Vulkan enums.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceFaultAddress {
+    pub address_type: i32,
+    pub reported_address: u64,
+    pub address_precision: u64,
+}
+
+/// Diagnostic snapshot of one `VK_EXT_device_fault` query.
+///
+/// The extension is optional and the record is evidence, never a gate: a
+/// device that does not advertise it answers
+/// `extension_present == false` with no addresses, and a device that does but
+/// refuses the query answers the same way. Neither case changes the loss
+/// itself, which the provider reports through the core lifecycle regardless.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceFaultSnapshot {
+    /// Whether the physical device advertised `VK_EXT_device_fault`.
+    pub extension_present: bool,
+    /// Driver-supplied fault description, when the driver wrote one.
+    pub description: Option<String>,
+    /// Addresses the driver reported, in the order it returned them.
+    pub addresses: Vec<DeviceFaultAddress>,
+    /// Number of vendor fault records the driver reported.
+    pub vendor_info_count: u32,
+    /// Size in bytes of the vendor fault binary the driver can return.
+    pub vendor_binary_size: u64,
+}
+
+impl DeviceFaultSnapshot {
+    /// The record for a device that could not answer the fault query.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            extension_present: false,
+            description: None,
+            addresses: Vec::new(),
+            vendor_info_count: 0,
+            vendor_binary_size: 0,
+        }
+    }
+
+    /// The structured fields a device-loss error carries for this record.
+    ///
+    /// Addresses are capped at [`DEVICE_FAULT_ADDRESS_FIELDS`]; the count
+    /// field always reports how many the driver returned, so a truncated
+    /// listing is never mistaken for a complete one.
+    pub(crate) fn evidence_fields(&self) -> Vec<(String, FieldValue)> {
+        let mut fields = Vec::with_capacity(5 + 3 * DEVICE_FAULT_ADDRESS_FIELDS);
+        fields.push((
+            "device_fault_extension".to_owned(),
+            FieldValue::Bool(self.extension_present),
+        ));
+        if let Some(description) = &self.description {
+            fields.push((
+                "device_fault_description".to_owned(),
+                FieldValue::Text(description.clone()),
+            ));
+        }
+        fields.push((
+            "device_fault_addresses".to_owned(),
+            FieldValue::Unsigned(self.addresses.len() as u64),
+        ));
+        for (index, address) in self
+            .addresses
+            .iter()
+            .take(DEVICE_FAULT_ADDRESS_FIELDS)
+            .enumerate()
+        {
+            fields.push((
+                format!("device_fault_address_type_{index}"),
+                FieldValue::Text(device_fault_address_type_name(address.address_type).to_owned()),
+            ));
+            fields.push((
+                format!("device_fault_address_{index}"),
+                FieldValue::Unsigned(address.reported_address),
+            ));
+            fields.push((
+                format!("device_fault_address_precision_{index}"),
+                FieldValue::Unsigned(address.address_precision),
+            ));
+        }
+        fields.push((
+            "device_fault_vendor_infos".to_owned(),
+            FieldValue::Unsigned(u64::from(self.vendor_info_count)),
+        ));
+        fields.push((
+            "device_fault_vendor_binary_size".to_owned(),
+            FieldValue::Unsigned(self.vendor_binary_size),
+        ));
+        fields
+    }
+}
+
+/// Upper bound of fault addresses copied into one provider error.
+const DEVICE_FAULT_ADDRESS_FIELDS: usize = 4;
+
+/// Vulkan name of one `VkDeviceFaultAddressTypeEXT` value.
+fn device_fault_address_type_name(address_type: i32) -> &'static str {
+    match vk::DeviceFaultAddressTypeEXT::from_raw(address_type) {
+        vk::DeviceFaultAddressTypeEXT::NONE => "NONE",
+        vk::DeviceFaultAddressTypeEXT::READ_INVALID => "READ_INVALID",
+        vk::DeviceFaultAddressTypeEXT::WRITE_INVALID => "WRITE_INVALID",
+        vk::DeviceFaultAddressTypeEXT::EXECUTE_INVALID => "EXECUTE_INVALID",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_UNKNOWN => "INSTRUCTION_POINTER_UNKNOWN",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_INVALID => "INSTRUCTION_POINTER_INVALID",
+        vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_FAULT => "INSTRUCTION_POINTER_FAULT",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Vulkan name of one raw result, for the `vk_result` evidence field.
+fn vk_result_name(result: vk::Result) -> String {
+    match result {
+        vk::Result::SUCCESS => "VK_SUCCESS".to_owned(),
+        vk::Result::NOT_READY => "VK_NOT_READY".to_owned(),
+        vk::Result::TIMEOUT => "VK_TIMEOUT".to_owned(),
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY => "VK_ERROR_OUT_OF_HOST_MEMORY".to_owned(),
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => "VK_ERROR_OUT_OF_DEVICE_MEMORY".to_owned(),
+        vk::Result::ERROR_DEVICE_LOST => "VK_ERROR_DEVICE_LOST".to_owned(),
+        vk::Result::ERROR_UNKNOWN => "VK_ERROR_UNKNOWN".to_owned(),
+        other => format!("VK_RESULT_{}", other.as_raw()),
+    }
+}
+
+/// Attach a `VK_EXT_device_fault` record to a device-loss error.
+pub(crate) fn with_device_fault_evidence(
+    mut error: ProviderError,
+    fault: &DeviceFaultSnapshot,
+) -> ProviderError {
+    for (key, value) in fault.evidence_fields() {
+        error = error.with_field(key, value);
+    }
+    error
+}
+
+/// Structured provider error for a `VK_ERROR_DEVICE_LOST` observed at a driver
+/// boundary.
+///
+/// Every rail that enqueues through `VulkanContext::submit_commands` or waits
+/// through `VulkanContext::wait_for_fence` reports a loss through here,
+/// so no boundary can answer a lost device as an ordinary execution failure:
+/// the core lifecycle is marked lost (leases included) and the error carries
+/// the raw result plus the `VK_EXT_device_fault` record. `slug` stays the
+/// boundary's own, so a caller can still tell which step reported the loss.
+pub(crate) fn device_loss_refusal(
+    context: &VulkanContext,
+    phase: ProviderPhase,
+    slug: &'static str,
+    step: &str,
+) -> ProviderError {
+    let result = vk::Result::ERROR_DEVICE_LOST;
+    let error = ExecutionFailure::vulkan(result, format!("{step}: {result}")).into_provider(
+        phase,
+        ProviderErrorClass::Execute,
+        slug,
+        CompletionDisposition::DeviceLost { token: None },
+    );
+    with_device_fault_evidence(error, &context.observe_device_loss())
 }
 
 /// Native Vulkan implementation of the Phase 1 compute subset.
@@ -45,9 +282,137 @@ impl VulkanExecutor {
     pub fn device_name(&self) -> &str {
         &self.context.device_name
     }
+
+    /// Report the selected Vulkan device as neutral provider capabilities.
+    ///
+    /// The snapshot executor exposes owned host bytes and synchronous
+    /// readback. `VulkanComputeProvider` adds staged and, when
+    /// `VK_EXT_external_memory_host` is present, borrowed no-copy leases.
+    pub fn provider_capabilities(&self) -> ProviderCapabilities {
+        provider::capabilities_from_limits(&self.context.properties.limits)
+    }
+
+    /// Simulate a confirmed device loss for lifecycle tests.
+    ///
+    /// CI cannot produce a deterministic `VK_ERROR_DEVICE_LOST`, so this hook
+    /// marks the shared context lost: `health` becomes `DeviceLost`, new work
+    /// is refused with `RetryAfterRecreate`, and still-submitted resources are
+    /// destroyed instead of retained. It does not replace a real device-loss
+    /// run and must not be used outside tests.
+    #[doc(hidden)]
+    pub fn inject_device_loss_for_test(&self) {
+        self.context.mark_device_lost();
+    }
+
+    /// Substitute the next driver answer at one queue boundary with
+    /// `VK_ERROR_DEVICE_LOST`.
+    ///
+    /// Unlike [`Self::inject_device_loss_for_test`], which marks the lifecycle
+    /// directly, this hook does not touch the lifecycle at all: the context
+    /// reaches `DeviceLost` only through the path a real driver answer takes,
+    /// so the test observes the provider's reaction (`vk::Result` evidence,
+    /// `VK_EXT_device_fault` query, terminal transition, lease retirement and
+    /// the refusal on later submissions) rather than its own setup. Tests only.
+    #[doc(hidden)]
+    pub fn inject_driver_device_loss_for_test(&self, point: DeviceLossPoint) {
+        self.context.arm_driver_loss_injection(point);
+    }
+
+    /// Diagnostic `VK_EXT_device_fault` record of the last observed device
+    /// loss.
+    ///
+    /// `None` until a loss is observed. A device without the extension still
+    /// answers a snapshot, with `extension_present == false`.
+    #[doc(hidden)]
+    pub fn last_device_fault(&self) -> Option<DeviceFaultSnapshot> {
+        self.context.last_device_fault()
+    }
+
+    /// Number of device queues created across the primary and dedicated
+    /// compute families.
+    pub fn queue_count(&self) -> usize {
+        self.context.queue_count()
+    }
+
+    /// Host-side scheduling tier installed on each device queue.
+    ///
+    /// The tier is a provider scheduling attribute, not a
+    /// `VkDeviceQueueCreateInfo::pQueuePriorities` value: Vulkan fixes queue
+    /// priorities at device creation, so the provider expresses priority in its
+    /// own scheduler (`research/docs/21` §2). Every queue starts at
+    /// [`QueuePriority::Default`].
+    pub fn queue_priorities(&self) -> Vec<QueuePriority> {
+        self.context.queue_priorities()
+    }
+
+    /// Mark each device queue with a host-side scheduling tier.
+    ///
+    /// `tiers[i]` is the tier of device queue `i`, so the slice must have
+    /// exactly [`Self::queue_count`] entries: a differently sized table is
+    /// refused rather than padded, which keeps "queue `i` has tier
+    /// `tiers[i]`" true for every later submission. The table is read on each
+    /// queue selection, and with every queue at [`QueuePriority::Default`] that
+    /// selection is the previous least-loaded rule. Installing a tier only
+    /// changes which device queue carries the submission: dependency order,
+    /// reservations and writeback results are unaffected.
+    pub fn set_queue_priorities(&self, tiers: &[QueuePriority]) -> Result<(), ExecutorError> {
+        self.context.set_queue_priorities(tiers).map_err(failure)
+    }
+
+    /// Number of distinct device queue families used by the scheduler.
+    #[doc(hidden)]
+    pub fn queue_family_count(&self) -> usize {
+        self.context.queue_family_count()
+    }
+
+    /// Cumulative device-buffer copy-in / copy-out operations. Smoke tests use
+    /// it to prove that several views of one allocation share one copy.
+    #[doc(hidden)]
+    pub fn buffer_copy_counts(&self) -> (usize, usize) {
+        self.context.buffer_copy_counts()
+    }
+
+    /// Cumulative device-buffer copy-in / copy-out bytes. Smoke tests use it
+    /// to prove that a view that cannot read copies nothing in
+    /// (`research/docs/15` step 4).
+    #[doc(hidden)]
+    pub fn buffer_copy_bytes(&self) -> (usize, usize) {
+        self.context.buffer_copy_bytes()
+    }
+
+    /// Cumulative present acquire / present completions of the presentation
+    /// rail. Smoke tests use it to prove a presenting case reports one of each.
+    #[doc(hidden)]
+    pub fn present_counts(&self) -> (usize, usize) {
+        self.context.present_counts()
+    }
+
+    /// Successful submissions recorded per device queue.
+    #[doc(hidden)]
+    pub fn queue_submission_counts(&self) -> Vec<usize> {
+        self.context.queue_submission_counts()
+    }
+
+    /// Install a probe called with the selected queue index while that queue's
+    /// host enqueue lock is held. Smoke tests use it to prove that independent
+    /// queues enqueue concurrently; production callers leave it unset.
+    #[doc(hidden)]
+    pub fn set_enqueue_probe_for_test(&self, probe: EnqueueProbe) {
+        if let Ok(mut slot) = self.context.enqueue_probe.lock() {
+            *slot = Some(probe);
+        }
+    }
+
+    /// Remove a probe installed by [`Self::set_enqueue_probe_for_test`].
+    #[doc(hidden)]
+    pub fn clear_enqueue_probe_for_test(&self) {
+        if let Ok(mut slot) = self.context.enqueue_probe.lock() {
+            *slot = None;
+        }
+    }
 }
 
-struct VulkanPipelineArtifact {
+pub(crate) struct VulkanPipelineArtifact {
     context: Arc<VulkanContext>,
     translated: TranslatedComputePipeline,
 }
@@ -71,13 +436,34 @@ impl TranslatedComputePipeline {
             ..TransformOptions::default()
         };
         let scratch = ScratchDir::new()?;
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            function.air(),
-            Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .map_err(|error| failure(format!("translate {}: {error}", function.name())))?;
+        let translated = match function.air_source() {
+            AirSource::SanitizedLl(source) => metal2vulkan::translate_sanitized_native_reflected(
+                source,
+                Stage::Kernel,
+                scratch.path(),
+                options,
+            ),
+            AirSource::Binary(source) => {
+                let input = scratch.path().join("input.air");
+                std::fs::write(&input, source).map_err(|error| {
+                    failure(format!(
+                        "write binary AIR scratch {}: {error}",
+                        input.display()
+                    ))
+                })?;
+                let input = input
+                    .to_str()
+                    .ok_or_else(|| failure("binary AIR scratch path is not valid UTF-8"))?;
+                metal2vulkan::translate_reflected_with_options(
+                    input,
+                    Stage::Kernel,
+                    scratch.path(),
+                    options,
+                )
+            }
+        };
+        let (spv, reflection) = translated
+            .map_err(|error| failure(format!("translate {}: {error}", function.name())))?;
         validate_spirv_capabilities(&spv)?;
         validate_pipeline_reflection(function.name(), &reflection)?;
         Ok(Self { spv, reflection })
@@ -96,7 +482,22 @@ impl TranslatedComputePipeline {
         buffers: &[BufferBinding],
         threads_per_grid: [u32; 3],
     ) -> Result<(), ExecutorError> {
-        validate_bound_buffers(&self.reflection, buffers, threads_per_grid)
+        let widths = buffers
+            .iter()
+            .map(|binding| (binding.index, binding.bytes.len()))
+            .collect::<Vec<_>>();
+        self.validate_binding_widths(&widths, threads_per_grid)
+    }
+
+    /// Validate `(Metal binding index, byte length)` pairs. No-copy bindings
+    /// have a host pointer instead of owned bytes, so width is the only
+    /// property shared with `BufferBinding`.
+    pub(crate) fn validate_binding_widths(
+        &self,
+        widths: &[(u32, usize)],
+        threads_per_grid: [u32; 3],
+    ) -> Result<(), ExecutorError> {
+        validate_bound_buffers(&self.reflection, widths, threads_per_grid)
     }
 
     pub fn validate_threadgroup(&self, local_size: [u32; 3]) -> Result<(), ExecutorError> {
@@ -112,6 +513,15 @@ impl TranslatedComputePipeline {
             }
         }
         Ok(())
+    }
+
+    /// Map this translated kernel to the neutral provider contract. Vulkan
+    /// descriptor locations and exact-thread regions stay implementation-only.
+    pub fn provider_contract(
+        &self,
+        translator_revision: Option<SemanticDigest>,
+    ) -> Result<PipelineContract, ExecutorError> {
+        provider::pipeline_contract(&self.reflection, translator_revision)
     }
 }
 
@@ -135,28 +545,129 @@ impl ComputeExecutor for VulkanExecutor {
                 "pipeline artifact belongs to another Vulkan device",
             ));
         }
+        // The synchronous path selects through the same priority/fairness
+        // policy as the deferred object path (`research/docs/21` §4). A
+        // single-queue device still answers zero, so this changes nothing on a
+        // one-queue family like Lavapipe.
+        let queue_index = self.context.pick_queue();
         let _execution = self
             .context
-            .execution_lock
-            .lock()
-            .map_err(|_| failure("Vulkan execution lock is poisoned"))?;
+            .lock_queue(queue_index)
+            .map_err(|_| failure("Vulkan queue lock is poisoned"))?;
         self.context.ensure_usable()?;
-        execute_submission(&self.context, artifact, submission)
+        execute_submission(&self.context, artifact, submission, queue_index)
     }
 }
 
-struct VulkanContext {
+/// Pre-priority queue choice: the least-loaded queue, breaking ties from
+/// `round_robin_start`.
+///
+/// This is the implementation the live path used before the core policy was
+/// wired in, kept as the oracle for the equivalence test below
+/// (`queue_priority_policy_reduces_to_select_queue_on_one_tier`). The live path
+/// is [`VulkanContext::pick_queue`] and always goes through the core policy.
+#[cfg(test)]
+fn select_queue(in_flight: &[usize], round_robin_start: usize) -> usize {
+    if in_flight.is_empty() {
+        return 0;
+    }
+    let start = round_robin_start % in_flight.len();
+    let mut best = start;
+    let mut best_load = in_flight[start];
+    for step in 1..in_flight.len() {
+        let index = (start + step) % in_flight.len();
+        if in_flight[index] < best_load {
+            best = index;
+            best_load = in_flight[index];
+        }
+    }
+    best
+}
+
+/// Queue choice for one submission: the whole live view of the core policy.
+///
+/// `cursor` is the provider's monotonic selection counter, not a value already
+/// folded by the queue count: the policy takes the tie-break cursor from
+/// `cursor % queues` itself, and folding the counter first would alias the
+/// window phase with the queue count (8 queues, a 7-slot window). The tests
+/// below call this function with the same cursor the live path passes.
+fn select_queue_for_submission(
+    in_flight: &[usize],
+    tiers: &[QueuePriority],
+    cursor: usize,
+) -> usize {
+    metal_api_core::provider::select_queue_with_priority(
+        in_flight,
+        tiers,
+        cursor,
+        QueueSchedulingPolicy::default(),
+    )
+}
+
+pub(crate) struct VulkanContext {
     entry: ManuallyDrop<Entry>,
     instance: Instance,
+    /// The physical device `device` was created from. Kept so the render rail
+    /// can query format and queue-family properties without a second
+    /// enumeration (`research/docs/23` §6 Step 3b).
+    physical: vk::PhysicalDevice,
     device: AshDevice,
-    queue_family: u32,
-    queue: vk::Queue,
+    external_memory_host: Option<ExternalMemoryHost>,
+    /// `VK_EXT_device_fault` entry points, loaded only when the device
+    /// advertises the extension.
+    device_fault: Option<device_fault::Device>,
+    /// Diagnostic record of the last observed device loss, if any.
+    device_fault_record: Mutex<Option<DeviceFaultSnapshot>>,
+    /// Test-only substitution of the next driver answer at one queue boundary.
+    driver_loss_injection: Mutex<Option<DeviceLossPoint>>,
+    queue_families: Vec<u32>,
+    queues: Vec<vk::Queue>,
+    next_queue: AtomicUsize,
+    queue_submissions: Vec<AtomicUsize>,
+    queue_in_flight: Vec<AtomicUsize>,
     properties: vk::PhysicalDeviceProperties,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
-    execution_lock: Mutex<()>,
-    poisoned: AtomicBool,
-    abandoned: AtomicBool,
+    queue_locks: Vec<Mutex<()>>,
+    enqueue_probe: Mutex<Option<EnqueueProbe>>,
+    /// The single admission and terminal-state authority for this device.
+    ///
+    /// Admission, health and the abandonment counters all come from this
+    /// `metal_api_core` lifecycle, so the executor cannot report one state
+    /// while refusing on another. The lifecycle owns the budget, the ledger
+    /// and the spelling of a terminal refusal; this crate never keeps a second
+    /// copy of that state.
+    lifecycle: Mutex<ProviderLifecycle>,
+    /// Host-side scheduling tier of each device queue, read by every queue
+    /// selection. A provider-owned attribute, not a
+    /// `VkDeviceQueueCreateInfo::pQueuePriorities` value (`research/docs/21`
+    /// §2); every queue starts at [`QueuePriority::Default`], which is what
+    /// keeps the pre-priority choice the default.
+    queue_priorities: Mutex<Vec<QueuePriority>>,
+    /// Device-buffer copy-in and copy-out operations. One of each per touched
+    /// allocation, not per view: several views of one allocation share one
+    /// device buffer (`research/docs/15` §3.3).
+    buffer_uploads: AtomicUsize,
+    buffer_readbacks: AtomicUsize,
+    /// Bytes actually copied in or out. A write-only view copies nothing in,
+    /// which is the observable form of the footprint-bounded transfer
+    /// (`research/docs/15` step 4).
+    buffer_upload_bytes: AtomicUsize,
+    buffer_readback_bytes: AtomicUsize,
+    /// Presentation completions of the first present increment
+    /// (`research/docs/24` §3.3, §5.3): one acquire when the provider takes
+    /// ownership of a present target for a pass, one present when the target's
+    /// terminal transition and readback complete. Both count per present
+    /// action, so a case with one present reports `1/1`.
+    present_acquires: AtomicUsize,
+    present_presents: AtomicUsize,
+}
+
+/// Loaded `VK_EXT_external_memory_host` entry points and the alignment the
+/// device requires for imported host pointers.
+struct ExternalMemoryHost {
+    device: external_memory_host::Device,
+    min_alignment: u64,
 }
 
 impl VulkanContext {
@@ -175,21 +686,88 @@ impl VulkanContext {
             .map_err(|error| failure(format!("create Vulkan instance: {error}")))?;
 
         let selection = select_physical_device(&instance);
-        let (physical, queue_family) = match selection {
+        let (physical, queue_family, shader_int8) = match selection {
             Ok(selection) => selection,
             Err(error) => {
                 unsafe { instance.destroy_instance(None) };
                 return Err(error);
             }
         };
-        let priorities = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
+        let queue_family_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let primary_queues = queue_family_properties
+            .get(queue_family as usize)
+            .map(|family| family.queue_count as usize)
+            .unwrap_or(1)
+            .clamp(1, MAX_QUEUES_PER_FAMILY);
+        let mut family_plans = vec![(queue_family, primary_queues)];
+        let dedicated_compute = queue_family_properties
+            .iter()
+            .enumerate()
+            .filter(|(index, family)| {
+                *index as u32 != queue_family
+                    && family.queue_count > 0
+                    && family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                    && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            })
+            .max_by_key(|(_, family)| family.queue_count)
+            .map(|(index, family)| {
+                (
+                    index as u32,
+                    (family.queue_count as usize).clamp(1, MAX_QUEUES_PER_FAMILY),
+                )
+            });
+        if let Some(plan) = dedicated_compute {
+            family_plans.push(plan);
+        }
+        let priority_sets = family_plans
+            .iter()
+            .map(|(_, count)| vec![1.0_f32; *count])
+            .collect::<Vec<_>>();
+        let queue_infos = family_plans
+            .iter()
+            .zip(&priority_sets)
+            .map(|((family, count), priorities)| {
+                let mut info = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(*family)
+                    .queue_priorities(priorities);
+                info.queue_count = *count as u32;
+                info
+            })
+            .collect::<Vec<_>>();
+        let extensions = match unsafe { instance.enumerate_device_extension_properties(physical) } {
+            Ok(extensions) => extensions,
+            Err(error) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(failure(format!(
+                    "enumerate Vulkan device extensions: {error}"
+                )));
+            }
+        };
+        let has_external_memory_host = extensions.iter().any(|extension| {
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|name| name == external_memory_host::NAME)
+        });
+        let has_device_fault = extensions.iter().any(|extension| {
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|name| name == device_fault::NAME)
+        });
+        let enabled_extensions = if has_external_memory_host {
+            vec![external_memory_host::NAME.as_ptr()]
+        } else {
+            Vec::new()
+        };
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
+        let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().shader_int8(shader_int8);
+        let physical_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
         let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_info)
-            .push_next(&mut vulkan13);
+            .queue_create_infos(&queue_infos)
+            .enabled_extension_names(&enabled_extensions)
+            .enabled_features(&physical_features)
+            .push_next(&mut vulkan13)
+            .push_next(&mut vulkan12);
         let device = match unsafe { instance.create_device(physical, &device_info, None) } {
             Ok(device) => device,
             Err(error) => {
@@ -197,41 +775,473 @@ impl VulkanContext {
                 return Err(failure(format!("create Vulkan device: {error}")));
             }
         };
-        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let mut queues = Vec::new();
+        let mut queue_families = Vec::new();
+        for (family, count) in &family_plans {
+            for index in 0..*count {
+                queues.push(unsafe { device.get_device_queue(*family, index as u32) });
+                queue_families.push(*family);
+            }
+        }
+        let queue_count = queues.len();
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let external_memory_host = has_external_memory_host.then(|| {
+            let mut host_properties = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut properties2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut host_properties);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties2) };
+            ExternalMemoryHost {
+                device: external_memory_host::Device::new(&instance, &device),
+                min_alignment: host_properties.min_imported_host_pointer_alignment,
+            }
+        });
+        // The fault query is diagnostic evidence, so the entry points are only
+        // loaded for a device that advertises the extension; an absent
+        // extension never fails device creation.
+        let device_fault = has_device_fault.then(|| device_fault::Device::new(&instance, &device));
 
         Ok(Self {
             entry: ManuallyDrop::new(entry),
             instance,
+            physical,
             device,
-            queue_family,
-            queue,
+            external_memory_host,
+            device_fault,
+            device_fault_record: Mutex::new(None),
+            driver_loss_injection: Mutex::new(None),
+            queue_families,
+            queues,
+            next_queue: AtomicUsize::new(0),
+            queue_submissions: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
+            buffer_uploads: AtomicUsize::new(0),
+            buffer_readbacks: AtomicUsize::new(0),
+            buffer_upload_bytes: AtomicUsize::new(0),
+            buffer_readback_bytes: AtomicUsize::new(0),
+            present_acquires: AtomicUsize::new(0),
+            present_presents: AtomicUsize::new(0),
+            queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             memory,
             device_name,
-            execution_lock: Mutex::new(()),
-            poisoned: AtomicBool::new(false),
-            abandoned: AtomicBool::new(false),
+            queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
+            enqueue_probe: Mutex::new(None),
+            lifecycle: Mutex::new(ProviderLifecycle::new(
+                ABANDONMENT_BUDGET_SUBMISSIONS,
+                ABANDONMENT_BUDGET_BYTES,
+            )),
+            queue_priorities: Mutex::new(vec![QueuePriority::Default; queue_count]),
         })
     }
 
+    /// Lock the lifecycle for one transition or query.
+    ///
+    /// Terminal states are monotonic and admission never unwinds through this
+    /// mutex, so a poison left by an unrelated panic still protects the last
+    /// admitted state; recovering the guard keeps refusal available instead of
+    /// turning one panic into a second, unrelated failure.
+    fn lock_lifecycle(&self) -> MutexGuard<'_, ProviderLifecycle> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Admit one new submission against the lifecycle.
+    ///
+    /// The core refusal is returned unchanged, so the slug, class, phase,
+    /// `terminal` field, abandoned counters and retryability the provider
+    /// boundary reports are exactly the contract's.
+    pub(crate) fn admit(&self) -> Result<(), ProviderError> {
+        terminal_refusal(&self.lock_lifecycle())
+    }
+
+    /// Provider health, straight from the lifecycle.
+    pub(crate) fn health(&self) -> ProviderHealth {
+        self.lock_lifecycle().health()
+    }
+
+    /// Refuse new work on a terminal context for the direct `ComputeExecutor`
+    /// API, which can only carry a message.
+    ///
+    /// The structured refusal is not lost — it is what [`VulkanContext::admit`]
+    /// returns — and the message is derived from it instead of from a second
+    /// state check, so both APIs always agree on why work was refused.
     fn ensure_usable(&self) -> Result<(), ExecutorError> {
-        if self.poisoned.load(Ordering::Acquire) {
-            Err(failure(
-                "Vulkan executor is poisoned after an incomplete submission",
+        self.admit().map_err(|error| {
+            failure(format!(
+                "Vulkan executor is unavailable: {} ({:?})",
+                error.slug, error.retryability
             ))
-        } else {
-            Ok(())
+        })
+    }
+
+    /// Device queue for the next independent submission.
+    ///
+    /// The choice is the core priority/fairness policy (`research/docs/21` §4)
+    /// applied to the tiers installed by [`Self::set_queue_priorities`]: an idle
+    /// queue still beats a busy one whatever the tiers, and among equally loaded
+    /// queues the rotation window nominates a tier, breaking ties from the
+    /// selection cursor. Every queue a provider creates starts at
+    /// [`QueuePriority::Default`], where the policy is the previous least-loaded
+    /// rule for every load vector — the equivalence test in this module pins
+    /// that. A single-queue family always returns zero, preserving the previous
+    /// behaviour on devices such as Lavapipe.
+    pub(crate) fn pick_queue(&self) -> usize {
+        let len = self.queues.len();
+        if len == 0 {
+            return 0;
+        }
+        // Both the window phase and the tie-break cursor come from the
+        // monotonic selection counter. Folding it by the queue count *before*
+        // the policy would alias the two: with 8 queues and a 7-slot window,
+        // cursors 7 and 8 would nominate the same slot and let the high tier
+        // run longer than its weight.
+        let cursor = self.next_queue.fetch_add(1, Ordering::Relaxed);
+        let mut loads = [0_usize; MAX_DEVICE_QUEUES];
+        for (slot, counter) in loads.iter_mut().zip(&self.queue_in_flight) {
+            *slot = counter.load(Ordering::Relaxed);
+        }
+        let tiers = self
+            .queue_priorities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A table shorter than the device is not an error here: the core policy
+        // reads missing entries as `Default`. `set_queue_priorities` refuses
+        // that shape, so it only happens if a device grows queues later.
+        let ranked = tiers.len().min(len);
+        select_queue_for_submission(&loads[..len], &tiers[..ranked], cursor)
+    }
+
+    /// Install the scheduling tier of every device queue.
+    ///
+    /// The table is read on each queue selection, so the slice must describe
+    /// the device exactly: a differently sized table is refused instead of
+    /// silently padded.
+    pub(crate) fn set_queue_priorities(&self, tiers: &[QueuePriority]) -> Result<(), &'static str> {
+        let mut installed = self
+            .queue_priorities
+            .lock()
+            .map_err(|_| "Vulkan queue priority table is poisoned")?;
+        if tiers.len() != installed.len() {
+            return Err("Vulkan queue priority table size mismatch");
+        }
+        installed.copy_from_slice(tiers);
+        Ok(())
+    }
+
+    /// Snapshot of the tiers currently installed on the device queues.
+    pub(crate) fn queue_priorities(&self) -> Vec<QueuePriority> {
+        self.queue_priorities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Report one enqueue on the selected device queue to the installed probe.
+    ///
+    /// Every submit path calls this while it holds that queue's host enqueue
+    /// lock, so the probe observes the same sequence the device does, whichever
+    /// path (synchronous or deferred) enqueued the command buffer. Production
+    /// callers leave the probe unset and this is a lock-and-drop of an `Option`.
+    pub(crate) fn notify_enqueue(&self, index: usize) {
+        if let Some(probe) = self
+            .enqueue_probe
+            .lock()
+            .ok()
+            .and_then(|probe| probe.clone())
+        {
+            probe(index);
         }
     }
 
+    /// Lock the host-side enqueue section of one device queue.
+    ///
+    /// Vulkan requires host access to a `VkQueue` to be externally
+    /// synchronized. Per-queue locks let independent queues enqueue
+    /// concurrently while submissions to the same queue stay serialized.
+    pub(crate) fn lock_queue(&self, index: usize) -> Result<MutexGuard<'_, ()>, &'static str> {
+        self.queue_locks
+            .get(index)
+            .ok_or("Vulkan queue index out of range")?
+            .lock()
+            .map_err(|_| "Vulkan queue lock is poisoned")
+    }
+
+    pub(crate) fn record_queue_submission(&self, index: usize) {
+        if let Some(counter) = self.queue_submissions.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.queue_in_flight.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_queue_retirement(&self, index: usize) {
+        if let Some(counter) = self.queue_in_flight.get(index) {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
+        }
+    }
+
+    pub(crate) fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
+    pub(crate) fn queue_family_count(&self) -> usize {
+        let mut families = self.queue_families.clone();
+        families.sort_unstable();
+        families.dedup();
+        families.len()
+    }
+
+    pub(crate) fn record_buffer_upload(&self) {
+        self.buffer_uploads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffer_upload_bytes(&self, bytes: usize) {
+        self.buffer_upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffer_readback(&self) {
+        self.buffer_readbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffer_readback_bytes(&self, bytes: usize) {
+        self.buffer_readback_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn buffer_copy_counts(&self) -> (usize, usize) {
+        (
+            self.buffer_uploads.load(Ordering::Relaxed),
+            self.buffer_readbacks.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one acquire of a present target. Counted once per present action,
+    /// before the pass that renders into the target runs (`docs/24` §3.6).
+    pub(crate) fn record_present_acquire(&self) {
+        self.present_acquires.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed present. Counted once per present action, after the
+    /// target's terminal transition and readback have landed (`docs/24` §3.6).
+    pub(crate) fn record_present(&self) {
+        self.present_presents.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative (acquire, present) completions of the presentation rail.
+    pub(crate) fn present_counts(&self) -> (usize, usize) {
+        (
+            self.present_acquires.load(Ordering::Relaxed),
+            self.present_presents.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn buffer_copy_bytes(&self) -> (usize, usize) {
+        (
+            self.buffer_upload_bytes.load(Ordering::Relaxed),
+            self.buffer_readback_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn queue_submission_counts(&self) -> Vec<usize> {
+        self.queue_submissions
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Record one submission whose completion can no longer be observed.
+    ///
+    /// The lifecycle charges the budget, so the returned outcome is what tells
+    /// a caller whether it may keep the context in service or whether this
+    /// abandonment already ended it.
+    pub(crate) fn record_abandonment(&self, bytes: u64) -> AbandonmentOutcome {
+        self.lock_lifecycle().record_abandonment(bytes)
+    }
+
+    /// Report `(abandoned submissions, abandoned bytes)` recorded so far.
+    pub(crate) fn abandonment_stats(&self) -> (u64, u64) {
+        self.lock_lifecycle().abandonment()
+    }
+
+    /// Fail the context closed for a submission whose completion can no longer
+    /// be observed, without charging the budget.
+    ///
+    /// The queue-refused and post-retirement classification paths report here:
+    /// the submission is not abandoned GPU work (so the counters stay honest),
+    /// but the context stops trusting the device and refuses new work.
+    pub(crate) fn mark_unobservable_submission(&self) {
+        self.lock_lifecycle().mark_unobservable_submission();
+    }
+
+    pub(crate) fn mark_device_lost(&self) {
+        self.lock_lifecycle().mark_device_lost();
+    }
+
+    /// Diagnostic `VK_EXT_device_fault` record of the last observed loss.
+    ///
+    /// `None` until a loss is observed on this context.
+    pub(crate) fn last_device_fault(&self) -> Option<DeviceFaultSnapshot> {
+        self.device_fault_record
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Query `VK_EXT_device_fault` for the fault the driver last reported.
+    ///
+    /// The record is diagnostic evidence and never a gate. A device that does
+    /// not advertise the extension answers
+    /// [`DeviceFaultSnapshot::unavailable`]; a driver that does but refuses the
+    /// query answers the same shape with `extension_present == true` and no
+    /// addresses. Refusing a loss report because the diagnostics were
+    /// unavailable would throw away the loss itself.
+    fn query_device_fault(&self) -> DeviceFaultSnapshot {
+        let Some(loader) = self.device_fault.as_ref() else {
+            return DeviceFaultSnapshot::unavailable();
+        };
+        let mut snapshot = DeviceFaultSnapshot {
+            extension_present: true,
+            ..DeviceFaultSnapshot::unavailable()
+        };
+        // The driver reports the counts it wants to write first; the second
+        // call fills the arrays sized from that answer. `vendorBinarySize` is
+        // recorded but the binary itself is never requested: this is a
+        // diagnostic snapshot, not a crash dump.
+        let entry = loader.fp().get_device_fault_info_ext;
+        let mut counts = vk::DeviceFaultCountsEXT::default();
+        if unsafe { entry(loader.device(), &mut counts, std::ptr::null_mut()) }
+            != vk::Result::SUCCESS
+        {
+            return snapshot;
+        }
+        let mut addresses =
+            vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+        let mut vendor_infos =
+            vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+        let mut info = vk::DeviceFaultInfoEXT::<'_> {
+            p_address_infos: addresses.as_mut_ptr(),
+            p_vendor_infos: vendor_infos.as_mut_ptr(),
+            ..Default::default()
+        };
+        counts.address_info_count = addresses.len() as u32;
+        counts.vendor_info_count = vendor_infos.len() as u32;
+        if unsafe { entry(loader.device(), &mut counts, &mut info) } != vk::Result::SUCCESS {
+            return snapshot;
+        }
+        snapshot.description = info
+            .description_as_c_str()
+            .ok()
+            .map(|description| description.to_string_lossy().into_owned())
+            .filter(|description| !description.is_empty());
+        snapshot.addresses = addresses
+            .iter()
+            .take(counts.address_info_count as usize)
+            .map(|address| DeviceFaultAddress {
+                address_type: address.address_type.as_raw(),
+                reported_address: address.reported_address,
+                address_precision: address.address_precision,
+            })
+            .collect();
+        snapshot.vendor_info_count = counts.vendor_info_count;
+        snapshot.vendor_binary_size = counts.vendor_binary_size;
+        snapshot
+    }
+
+    /// Record one device loss observed at a driver boundary.
+    ///
+    /// This is the only bridge from a raw `VK_ERROR_DEVICE_LOST` into the core
+    /// lifecycle: the terminal state comes from
+    /// [`ProviderLifecycle::mark_device_lost`], so the instance stops admitting
+    /// work through the documented `device_lost` refusal and every lease in the
+    /// lifecycle ledger retires as a teardown guarantee. The returned record is
+    /// the evidence the caller attaches to its error.
+    pub(crate) fn observe_device_loss(&self) -> DeviceFaultSnapshot {
+        let fault = self.query_device_fault();
+        if let Ok(mut record) = self.device_fault_record.lock() {
+            *record = Some(fault.clone());
+        }
+        self.mark_device_lost();
+        fault
+    }
+
+    /// Arm the test-only driver-answer substitution at one queue boundary.
+    fn arm_driver_loss_injection(&self, point: DeviceLossPoint) {
+        if let Ok(mut slot) = self.driver_loss_injection.lock() {
+            *slot = Some(point);
+        }
+    }
+
+    /// Consume the substitution armed for `point`, if any.
+    fn take_driver_loss_injection(&self, point: DeviceLossPoint) -> bool {
+        let Ok(mut slot) = self.driver_loss_injection.lock() else {
+            return false;
+        };
+        if *slot == Some(point) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `vkQueueSubmit` on one selected device queue.
+    ///
+    /// Every submission in this crate enqueues here, so the substitution sits
+    /// exactly where the driver's answer would arrive. An armed substitution
+    /// skips the call instead of overwriting a successful one: a device that
+    /// answers `VK_ERROR_DEVICE_LOST` has not executed the submission, and a
+    /// test that enqueued it anyway would leave real work in flight on a device
+    /// the provider is about to treat as gone.
+    pub(crate) fn submit_commands(
+        &self,
+        queue_index: usize,
+        submits: &[vk::SubmitInfo],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        if self.take_driver_loss_injection(DeviceLossPoint::Submit) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        let queue = *self
+            .queues
+            .get(queue_index)
+            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+        unsafe { self.device.queue_submit(queue, submits, fence) }
+    }
+
+    /// `vkWaitForFences` on one completion fence.
+    ///
+    /// A driver answer of `VK_ERROR_DEVICE_LOST` says nothing about whether the
+    /// fence was reached, so an armed substitution may only replace an answer
+    /// that observed completion: the real wait runs first, and a wait that
+    /// timed out keeps the substitution armed and reports the timeout it really
+    /// received. That is what lets the provider destroy the handles of a
+    /// waiting submission without leaving in-flight work behind.
+    pub(crate) fn wait_for_fence(
+        &self,
+        fence: vk::Fence,
+        timeout_ns: u64,
+    ) -> Result<(), vk::Result> {
+        let wait = unsafe { self.device.wait_for_fences(&[fence], true, timeout_ns) };
+        if wait.is_ok() && self.take_driver_loss_injection(DeviceLossPoint::Wait) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        wait
+    }
+
     fn abandon(self: &Arc<Self>, resources: ExecutionResources) {
-        self.poisoned.store(true, Ordering::Release);
-        self.abandoned.store(true, Ordering::Release);
+        let _ = self.record_abandonment(resources.owned_bytes());
+        // A queue that never told us whether it accepted the submission leaves
+        // the context terminal even when the budget still has room: the
+        // submission below is leaked rather than retired, and no caller can
+        // prove the device state afterwards.
+        self.mark_unobservable_submission();
         // The queue may still access every handle in `resources`. Keep both it
         // and one context reference alive until process exit; destroying either
         // after a host timeout would violate Vulkan object lifetime rules.
@@ -257,13 +1267,28 @@ impl VulkanContext {
                 ))
             })
     }
+
+    /// Alignment required for `VK_EXT_external_memory_host` imports, or zero
+    /// when the extension is unavailable.
+    pub(crate) fn external_memory_host_alignment(&self) -> u64 {
+        self.external_memory_host
+            .as_ref()
+            .map_or(0, |host| host.min_alignment)
+    }
 }
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
-        if self.abandoned.load(Ordering::Acquire) {
+        let lifecycle = self.lock_lifecycle();
+        let abandoned = lifecycle.abandonment().0 > 0;
+        let device_lost = lifecycle.ended_by_device_loss();
+        drop(lifecycle);
+        if abandoned && !device_lost {
+            // A recorded abandonment may still be executing on the queue.
             // Timeout paths leak an extra Arc, so this arm is defensive rather
             // than expected. Never unload the Vulkan loader under pending work.
+            // A lost device is the other case: nothing can be observed
+            // anymore, so the device objects are destroyed without waiting.
             return;
         }
         unsafe {
@@ -275,7 +1300,9 @@ impl Drop for VulkanContext {
     }
 }
 
-fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u32), ExecutorError> {
+fn select_physical_device(
+    instance: &Instance,
+) -> Result<(vk::PhysicalDevice, u32, bool), ExecutorError> {
     let physicals = unsafe { instance.enumerate_physical_devices() }
         .map_err(|error| failure(format!("enumerate Vulkan physical devices: {error}")))?;
     physicals
@@ -288,7 +1315,21 @@ fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u3
             let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan13);
             unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            let shader_int64 = features.features.shader_int64 == vk::TRUE;
+            let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features12 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan12);
+            unsafe { instance.get_physical_device_features2(physical, &mut features12) };
             if vulkan13.maintenance4 != vk::TRUE {
+                return None;
+            }
+            // The reviewed texture fixtures return an i8 status beside the
+            // texel, so the shader declares Int8. Vulkan exposes that through
+            // the shaderInt8 feature; a device without it cannot execute the
+            // same SPIR-V.
+            if vulkan12.shader_int8 != vk::TRUE {
+                return None;
+            }
+            if !shader_int64 {
                 return None;
             }
             let queues = unsafe { instance.get_physical_device_queue_family_properties(physical) };
@@ -313,9 +1354,11 @@ fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u3
                 .max_by_key(|(score, _, _)| *score)
         })
         .max_by_key(|(score, _, _)| *score)
-        .map(|(_, physical, family)| (physical, family))
+        .map(|(_, physical, family)| (physical, family, true))
         .ok_or_else(|| {
-            failure("no Vulkan 1.3 physical device with maintenance4 exposes a compute queue")
+            failure(
+                "no Vulkan 1.3 physical device with maintenance4, shaderInt8 and a compute queue",
+            )
         })
 }
 
@@ -357,49 +1400,622 @@ fn execute_submission(
     context: &Arc<VulkanContext>,
     artifact: Arc<VulkanPipelineArtifact>,
     submission: ComputeSubmission,
+    queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ExecutorError> {
-    let grid = submission.threads_per_grid.dimensions();
-    let local = submission.threads_per_threadgroup.dimensions();
-    validate_local_size(context, local)?;
-    let reflection = artifact.translated.reflection();
-    artifact
-        .translated
-        .validate_buffers(&submission.buffers, grid)?;
-    artifact.translated.validate_threadgroup(local)?;
-    let reflected_contract = reflection
-        .kernel_dispatch
-        .ok_or_else(|| failure("translated kernel has no dispatch contract"))?;
-    if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
-        return Err(failure(format!(
-            "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
-        )));
-    }
-    let plan = reflected_contract
-        .plan(local, Some(grid))
-        .map_err(|error| failure(format!("plan exact dispatch: {error}")))?;
-    validate_dispatch_plan(context, reflected_contract, &plan)?;
-    if plan.regions.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut resources = ExecutionResources::new(Arc::clone(context));
-    resources.create_pipeline_objects(artifact.translated.spirv(), reflection, &plan)?;
-    resources.create_buffers(reflection, &submission.buffers)?;
-    resources.create_descriptors(reflection)?;
-    resources.record(reflection, reflected_contract, &plan)?;
-    match resources.submit_and_wait() {
-        Ok(()) => {}
-        Err(SubmissionFailure::Safe(error)) => return Err(error),
-        Err(SubmissionFailure::Pending(error)) => {
-            context.abandon(resources);
-            return Err(error);
-        }
-    }
-    resources.read_updates(reflection)
+    execute_submission_with_status(context, artifact, submission, queue_index)
+        .map_err(|error| failure(error.detail.unwrap_or(error.slug)))
 }
 
-fn validate_local_size(context: &VulkanContext, local: [u32; 3]) -> Result<(), ExecutorError> {
-    let limits = context.properties.limits;
+/// Execute while preserving the phase and queue disposition for provider callers.
+/// The caller owns serialization: it holds the host enqueue lock of the queue
+/// it selected with `VulkanContext::pick_queue` and passes that index, so the
+/// device enqueue and the lock always describe the same queue. It supplies its
+/// token after observing the result.
+pub(crate) fn execute_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    submission: ComputeSubmission,
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let dispatch = (
+        submission.threads_per_grid.dimensions(),
+        submission.threads_per_threadgroup.dimensions(),
+    );
+    execute_serial_submission_with_status(context, artifact, submission, &[dispatch], queue_index)
+}
+
+/// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
+/// A Metal argument index is not unique across resource kinds: the translator
+/// reports a sampled texture and a buffer under the same index, so the pool key
+/// carries the kind as well (`research/docs/16` §4.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum PoolKind {
+    Buffer,
+    Texture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PoolKey {
+    pub kind: PoolKind,
+    pub index: u32,
+}
+
+impl PoolKey {
+    pub(crate) const fn buffer(index: u32) -> Self {
+        Self {
+            kind: PoolKind::Buffer,
+            index,
+        }
+    }
+}
+
+/// One Metal binding: the argument index plus the pool resource it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Binding {
+    pub metal_index: u32,
+    pub key: PoolKey,
+    /// The binding width the planner validates: the pool window in bytes for a
+    /// buffer, the tightly packed extent for a texture.
+    pub width: usize,
+}
+
+/// One ordered dispatch, mapping Metal binding indices to uploaded pool keys.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundDispatch {
+    pub grid: [u32; 3],
+    pub local: [u32; 3],
+    pub bindings: Vec<Binding>,
+}
+
+/// Execute one to eight ordered dispatches with one pipeline and buffer set.
+/// Tuples contain (grid, local size); the first must match the submission sizes.
+/// `queue_index` is the queue the caller selected and locked.
+pub(crate) fn execute_serial_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    submission: ComputeSubmission,
+    dispatches: &[([u32; 3], [u32; 3])],
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    validate_serial_dispatches(
+        (
+            submission.threads_per_grid.dimensions(),
+            submission.threads_per_threadgroup.dimensions(),
+        ),
+        dispatches,
+    )?;
+    let textures = submission.textures.clone();
+    let bound = identity_dispatches(&submission.buffers, &textures, dispatches);
+    execute_rebound_submission_with_status(
+        context,
+        artifact,
+        submission.buffers,
+        &bound,
+        &textures,
+        queue_index,
+    )
+}
+
+/// Execute one pipeline against a selected subset of uploaded buffers per pass.
+/// The caller owns serialization. All passes are validated before creating
+/// request resources, and share one upload, command buffer, fence, and readback.
+/// Updates identify pool keys and include each buffer writable in any pass once.
+pub(crate) fn execute_rebound_submission_with_status(
+    context: &Arc<VulkanContext>,
+    artifact: Arc<VulkanPipelineArtifact>,
+    buffers: Vec<BufferBinding>,
+    dispatches: &[BoundDispatch],
+    textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let artifacts = vec![artifact; dispatches.len()];
+    execute_pipeline_sequence_with_status(
+        context,
+        &artifacts,
+        buffers,
+        dispatches,
+        textures,
+        queue_index,
+    )
+}
+
+/// Execute one to eight ordered pipeline dispatches over one uploaded pool.
+/// Each pass owns its shader, descriptor layout, specialization, and binding
+/// map, while the sequence shares one command buffer, fence, and final readback.
+pub(crate) fn execute_pipeline_sequence_with_status(
+    context: &Arc<VulkanContext>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: Vec<BufferBinding>,
+    dispatches: &[BoundDispatch],
+    textures: &[metal_api_core::provider::TextureView],
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let buffers = buffers
+        .into_iter()
+        .map(PoolBinding::Owned)
+        .collect::<Vec<_>>();
+    execute_pool_sequence_with_status(
+        context,
+        artifacts,
+        &buffers,
+        dispatches,
+        SequenceTail {
+            borrowed: None,
+            textures,
+            indirect_dispatch: None,
+        },
+        queue_index,
+    )
+}
+
+/// The trailing inputs a pool-sequence submission carries beyond the core
+/// pipeline/buffer/dispatch arguments. Grouped so the executor entry points
+/// stay under the project's seven-argument ceiling while the provider still
+/// passes borrowed leases, sampled textures, and the optional indirect
+/// dispatch as one unit.
+pub(crate) struct SequenceTail<'a> {
+    pub borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    pub textures: &'a [metal_api_core::provider::TextureView],
+    pub indirect_dispatch: Option<[u32; 3]>,
+}
+
+/// Execute a pool whose bindings are either provider-owned copies or owner
+/// host mappings imported without copying. `borrowed` carries the registry and
+/// the leases retained for this submission; their Drop retires every retain.
+/// `queue_index` is the queue the caller selected with
+/// `VulkanContext::pick_queue` and locked; the device enqueue uses that index,
+/// so the lock and the enqueue can never describe different queues.
+pub(crate) fn execute_pool_sequence_with_status(
+    context: &Arc<VulkanContext>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: &[PoolBinding],
+    dispatches: &[BoundDispatch],
+    tail: SequenceTail<'_>,
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    for artifact in artifacts {
+        if !Arc::ptr_eq(context, &artifact.context) {
+            return Err(dispatch_args_error(failure(
+                "pipeline artifact belongs to another Vulkan device",
+            )));
+        }
+    }
+    let result =
+        execute_submission_stages(context, artifacts, buffers, dispatches, tail, queue_index);
+    if result
+        .as_ref()
+        .is_err_and(|error| error.class == ProviderErrorClass::DeviceLost)
+    {
+        // Every `DeviceLost`-class error is produced where a driver answer was
+        // observed, and that site already routed the loss through the core
+        // lifecycle. This is the fail-closed net: a loss-class error must never
+        // leave the instance admitting work, whatever path produced it.
+        context.mark_device_lost();
+    }
+    result
+}
+
+fn execute_submission_stages(
+    context: &Arc<VulkanContext>,
+    artifacts: &[Arc<VulkanPipelineArtifact>],
+    buffers: &[PoolBinding],
+    dispatches: &[BoundDispatch],
+    tail: SequenceTail<'_>,
+    queue_index: usize,
+) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let mut pending =
+        PendingExecution::submit(context, queue_index, artifacts, buffers, dispatches, tail)?;
+    if !pending.wait(FENCE_TIMEOUT_NS)? {
+        context.mark_unobservable_submission();
+        return Err(ExecutionFailure::vulkan(
+            vk::Result::TIMEOUT,
+            "compute completion timed out after 20 seconds",
+        )
+        .into_provider(
+            ProviderPhase::Wait,
+            ProviderErrorClass::Execute,
+            "vulkan-wait",
+            CompletionDisposition::SubmittedUnknown { token: None },
+        ));
+    }
+    pending.read_updates()
+}
+
+/// A recorded and queue-submitted sequence whose completion fence is pending.
+///
+/// `submit` performs planning, resource creation, recording and `queue_submit`;
+/// the caller must hold the selected queue's host lock. `wait` observes the
+/// device fence and may run on any thread without that lock, so an asynchronous
+/// provider no longer needs a worker per submission. Dropping a still-pending
+/// value poisons the context and retains every in-flight handle until process
+/// exit, matching `ExecutionResources`' unknown-retirement policy.
+pub(crate) struct PendingExecution {
+    resources: ExecutionResources,
+    writable_pool_keys: BTreeSet<u32>,
+}
+
+impl PendingExecution {
+    pub(crate) fn submit(
+        context: &Arc<VulkanContext>,
+        queue_index: usize,
+        artifacts: &[Arc<VulkanPipelineArtifact>],
+        buffers: &[PoolBinding],
+        dispatches: &[BoundDispatch],
+        tail: SequenceTail<'_>,
+    ) -> Result<Self, ProviderError> {
+        let mut resources = ExecutionResources::new(Arc::clone(context));
+        resources.set_borrowed_leases(tail.borrowed);
+        let translated = artifacts
+            .iter()
+            .map(|artifact| &artifact.translated)
+            .collect::<Vec<_>>();
+        let planned =
+            plan_pipeline_sequence(&translated, buffers, &context.properties.limits, dispatches)?;
+        let plans = &planned.plans;
+        if let Some(threadgroups) = tail.indirect_dispatch {
+            // One indirect command replays exactly one full-workgroup region:
+            // a single `vkCmdDispatchIndirect` launches one workgroup count at
+            // one local size, so a plan split into partial-tail regions (or
+            // spread over several compute passes) has no faithful indirect
+            // equivalent. The encoded threadgroups must also equal the planned
+            // count, otherwise the footprint proof would describe a different
+            // launch than the one the rail replays.
+            let [plan] = plans.as_slice() else {
+                return Err(indirect_command_refusal(
+                    "an indirect dispatch replays exactly one compute pass",
+                ));
+            };
+            let [region] = plan.regions.as_slice() else {
+                return Err(indirect_command_refusal(
+                    "an indirect dispatch replays a single full-workgroup region",
+                ));
+            };
+            if region.group_count != threadgroups {
+                return Err(indirect_command_refusal(format!(
+                    "indirect dispatch threadgroups {threadgroups:?} disagree with the planned group count {:?}",
+                    region.group_count
+                )));
+            }
+        }
+        if plans.iter().all(|plan| plan.regions.is_empty()) {
+            return Ok(Self {
+                resources,
+                writable_pool_keys: BTreeSet::new(),
+            });
+        }
+        resources
+            .create_pipeline_objects(&translated, plans)
+            .map_err(|error| {
+                error.into_provider(
+                    ProviderPhase::Compile,
+                    ProviderErrorClass::Compile,
+                    "vulkan-pipeline-create",
+                    CompletionDisposition::NotSubmitted,
+                )
+            })?;
+        let encode_error = |error: ExecutionFailure| {
+            error.into_provider(
+                ProviderPhase::Encode,
+                ProviderErrorClass::Resource,
+                "vulkan-encode",
+                CompletionDisposition::NotSubmitted,
+            )
+        };
+        resources.create_buffers(buffers).map_err(encode_error)?;
+        resources
+            .create_textures(tail.textures, dispatches)
+            .map_err(encode_error)?;
+        resources
+            .create_descriptors(&translated, dispatches)
+            .map_err(encode_error)?;
+        if let Some(threadgroups) = tail.indirect_dispatch {
+            resources
+                .create_indirect_dispatch(threadgroups)
+                .map_err(encode_error)?;
+        }
+        resources
+            .record(&translated, plans, queue_index)
+            .map_err(encode_error)?;
+        if let Err(failure) = resources.submit(queue_index) {
+            // The provider error is built while `resources` is still owned, so
+            // the fault record observed at the driver boundary is attached
+            // before an abandonment hands the resources to the context.
+            let abandon = failure.is_pending() && !failure.is_device_lost();
+            let error = resources.attach_device_loss_fault(failure.into_provider());
+            // `ExecutionResources::submit` already routed a driver-reported
+            // device loss through the core lifecycle and marked its own
+            // handles for destruction. Only an unobservable submission that is
+            // *not* a loss is abandoned, which retains its handles.
+            if abandon {
+                context.abandon(resources);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            resources,
+            writable_pool_keys: planned.writable_pool_keys,
+        })
+    }
+
+    /// Wait for the completion fence. `Ok(true)` means the queue retired the
+    /// work; `Ok(false)` means the timeout elapsed and the caller may retry.
+    pub(crate) fn wait(&mut self, timeout_ns: u64) -> Result<bool, ProviderError> {
+        if !self.resources.submitted {
+            self.resources.completed = true;
+            return Ok(true);
+        }
+        match self.resources.wait(timeout_ns) {
+            Ok(retired) => Ok(retired),
+            Err(failure) => Err(self
+                .resources
+                .attach_device_loss_fault(failure.into_provider())),
+        }
+    }
+
+    pub(crate) fn read_updates(&self) -> Result<Vec<BufferUpdate>, ProviderError> {
+        self.resources
+            .read_updates(&self.writable_pool_keys)
+            .map_err(ExecutionFailure::into_readback_provider)
+    }
+
+    pub(crate) fn owned_bytes(&self) -> u64 {
+        self.resources.owned_bytes()
+    }
+
+    pub(crate) fn mark_device_lost(&mut self) {
+        self.resources.mark_device_lost();
+    }
+
+    pub(crate) fn retain_after_budgeted_abandon(&mut self) {
+        self.resources.retain_after_budgeted_abandon();
+    }
+}
+
+fn dispatch_args_error(error: ExecutorError) -> ProviderError {
+    ExecutionFailure::from(error).into_provider(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Args,
+        "vulkan-dispatch-args",
+        CompletionDisposition::NotSubmitted,
+    )
+}
+
+/// The capability refusal the compute rail publishes when an indirect dispatch
+/// cannot be faithfully replayed (`research/docs/25` §4.3). It mirrors the
+/// render rail's `icb_command_unsupported` so both rails name the same slug for
+/// the same "well-formed but wider than this increment" class.
+fn indirect_command_refusal(detail: impl Into<String>) -> ProviderError {
+    let mut error = ProviderError::new(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "icb_command_unsupported",
+    )
+    .expect("static provider refusal slug");
+    error.retryability = Retryability::Never;
+    error.with_detail(detail.into())
+}
+
+fn validate_serial_dispatches(
+    first_dispatch: ([u32; 3], [u32; 3]),
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Result<(), ProviderError> {
+    validate_dispatch_count(dispatches.len())?;
+    if dispatches[0] != first_dispatch {
+        return Err(dispatch_args_error(failure(
+            "first serial dispatch sizes differ from the submission sizes",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dispatch_count(count: usize) -> Result<(), ProviderError> {
+    if !(1..=MAX_SERIAL_DISPATCHES).contains(&count) {
+        return Err(dispatch_args_error(failure(format!(
+            "serial submission requires 1..={MAX_SERIAL_DISPATCHES} dispatches, got {count}",
+        ))));
+    }
+    Ok(())
+}
+
+fn identity_dispatches<T: PoolWidth>(
+    buffers: &[T],
+    textures: &[metal_api_core::provider::TextureView],
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Vec<BoundDispatch> {
+    // Textures share the Metal argument index space with buffers (a fixture
+    // reports texture 0 and buffer 0), so their pool keys are offset into a
+    // separate range and the kind is carried explicitly.
+    let texture_base = u32::try_from(buffers.len()).unwrap_or(u32::MAX);
+    dispatches
+        .iter()
+        .map(|&(grid, local)| BoundDispatch {
+            grid,
+            local,
+            bindings: buffers
+                .iter()
+                .map(|buffer| Binding {
+                    metal_index: buffer.pool_index(),
+                    key: PoolKey::buffer(buffer.pool_index()),
+                    width: buffer.pool_len(),
+                })
+                .chain(textures.iter().map(|texture| Binding {
+                    metal_index: texture.metal_binding,
+                    key: PoolKey {
+                        kind: PoolKind::Texture,
+                        index: texture_base + texture.metal_binding,
+                    },
+                    width: usize::try_from(texture.expected_bytes().unwrap_or(0)).unwrap_or(0),
+                }))
+                .collect(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn plan_serial_submission<T: PoolWidth>(
+    translated: &TranslatedComputePipeline,
+    buffers: &[T],
+    limits: &vk::PhysicalDeviceLimits,
+    first_dispatch: ([u32; 3], [u32; 3]),
+    dispatches: &[([u32; 3], [u32; 3])],
+) -> Result<Vec<KernelDispatchPlan>, ProviderError> {
+    validate_serial_dispatches(first_dispatch, dispatches)?;
+    let bound = identity_dispatches(buffers, &[], dispatches);
+    Ok(plan_rebound_submission(translated, buffers, limits, &bound)?.plans)
+}
+
+#[derive(Debug)]
+struct ReboundSubmissionPlan {
+    plans: Vec<KernelDispatchPlan>,
+    writable_pool_keys: BTreeSet<u32>,
+}
+
+#[cfg(test)]
+fn plan_rebound_submission<T: PoolWidth>(
+    translated: &TranslatedComputePipeline,
+    buffers: &[T],
+    limits: &vk::PhysicalDeviceLimits,
+    dispatches: &[BoundDispatch],
+) -> Result<ReboundSubmissionPlan, ProviderError> {
+    let translated = vec![translated; dispatches.len()];
+    plan_pipeline_sequence(&translated, buffers, limits, dispatches)
+}
+
+/// Pure preflight: no request-specific Vulkan objects exist until this returns.
+/// Each pass uniquely maps its reflected Metal slots into the shared pool.
+/// Every uploaded resource must be used by at least one pass in the sequence.
+fn plan_pipeline_sequence<T: PoolWidth>(
+    translated: &[&TranslatedComputePipeline],
+    buffers: &[T],
+    limits: &vk::PhysicalDeviceLimits,
+    dispatches: &[BoundDispatch],
+) -> Result<ReboundSubmissionPlan, ProviderError> {
+    let resolve_capability = |error| {
+        ExecutionFailure::from(error).into_provider(
+            ProviderPhase::Resolve,
+            ProviderErrorClass::Capability,
+            "vulkan-dispatch-capability",
+            CompletionDisposition::NotSubmitted,
+        )
+    };
+    validate_dispatch_count(dispatches.len())?;
+    if translated.len() != dispatches.len() {
+        return Err(dispatch_args_error(failure(
+            "pipeline artifact count must match dispatch count",
+        )));
+    }
+    if buffers.len() > MAX_SERIAL_RESOURCES {
+        return Err(resolve_capability(failure(format!(
+            "buffer pool exceeds serial resource limit {MAX_SERIAL_RESOURCES}",
+        ))));
+    }
+    let mut pool = BTreeMap::new();
+    for buffer in buffers {
+        if pool.insert(buffer.pool_index(), buffer).is_some() {
+            return Err(dispatch_args_error(failure(format!(
+                "buffer pool key {} occurs more than once",
+                buffer.pool_index()
+            ))));
+        }
+    }
+    let mut plans = Vec::with_capacity(dispatches.len());
+    let mut used_pool_keys = BTreeSet::new();
+    let mut writable_pool_keys = BTreeSet::new();
+    let mut descriptor_count = 0_u32;
+    for (translated, dispatch) in translated.iter().zip(dispatches) {
+        let reflection = translated.reflection();
+        let reflected_contract = reflection.kernel_dispatch.ok_or_else(|| {
+            resolve_capability(failure("translated kernel has no dispatch contract"))
+        })?;
+        if !matches!(reflected_contract, KernelDispatch::ThreadsDynamic { .. }) {
+            return Err(resolve_capability(failure(format!(
+                "translated kernel returned unexpected dispatch contract {reflected_contract:?}"
+            ))));
+        }
+        let mut pass_pool_keys = BTreeSet::new();
+        let mut widths = Vec::with_capacity(dispatch.bindings.len());
+        for binding in &dispatch.bindings {
+            if binding.key.kind == PoolKind::Buffer && !pool.contains_key(&binding.key.index) {
+                return Err(dispatch_args_error(failure(format!(
+                    "unknown buffer pool key {}",
+                    binding.key.index
+                ))));
+            }
+            if !pass_pool_keys.insert(binding.key) {
+                return Err(dispatch_args_error(failure(format!(
+                    "pool key {binding:?} is bound more than once in one pass",
+                ))));
+            }
+            // Buffer width validation speaks about buffer bindings only; a
+            // texture binding shares the Metal index space and is checked by
+            // `create_textures` instead.
+            if binding.key.kind == PoolKind::Buffer {
+                widths.push((binding.metal_index, binding.width));
+            }
+        }
+        validate_local_size(limits, dispatch.local).map_err(resolve_capability)?;
+        translated
+            .validate_binding_widths(&widths, dispatch.grid)
+            .map_err(dispatch_args_error)?;
+        used_pool_keys.extend(pass_pool_keys);
+        for binding in &dispatch.bindings {
+            let reflected = reflection
+                .bindings
+                .iter()
+                .find(|reflected| reflected.metal_index == binding.metal_index)
+                .expect("validated reflected binding");
+            if binding.key.kind == PoolKind::Buffer
+                && !matches!(
+                    reflected.access,
+                    Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
+                )
+            {
+                writable_pool_keys.insert(binding.key.index);
+            }
+        }
+        translated
+            .validate_threadgroup(dispatch.local)
+            .map_err(resolve_capability)?;
+        let plan = reflected_contract
+            .plan(dispatch.local, Some(dispatch.grid))
+            .map_err(|error| {
+                dispatch_args_error(failure(format!("plan exact dispatch: {error}")))
+            })?;
+        validate_dispatch_plan(limits, reflected_contract, &plan).map_err(resolve_capability)?;
+        validate_descriptor_limits(limits, reflection).map_err(resolve_capability)?;
+        // This sum sizes the pool; descriptor device limits apply to each pass.
+        descriptor_count = u32::try_from(reflection.bindings.len())
+            .ok()
+            .and_then(|count| descriptor_count.checked_add(count))
+            .ok_or_else(|| resolve_capability(failure("descriptor pool count overflows u32")))?;
+        plans.push(plan);
+    }
+    let used_buffers = used_pool_keys
+        .iter()
+        .filter(|key| key.kind == PoolKind::Buffer)
+        .count();
+    if used_buffers != pool.len() {
+        return Err(dispatch_args_error(failure(
+            "every uploaded buffer pool resource must be bound in at least one pass",
+        )));
+    }
+    for buffer in buffers {
+        validate_storage_buffer_size(limits, buffer.pool_index(), buffer.pool_len())
+            .map_err(resolve_capability)?;
+    }
+    Ok(ReboundSubmissionPlan {
+        plans,
+        writable_pool_keys,
+    })
+}
+
+fn validate_local_size(
+    limits: &vk::PhysicalDeviceLimits,
+    local: [u32; 3],
+) -> Result<(), ExecutorError> {
+    if local.contains(&0) {
+        return Err(failure("threadgroup dimensions must be nonzero"));
+    }
     for (dimension, &size) in local.iter().enumerate() {
         if size > limits.max_compute_work_group_size[dimension] {
             return Err(failure(format!(
@@ -422,11 +2038,10 @@ fn validate_local_size(context: &VulkanContext, local: [u32; 3]) -> Result<(), E
 }
 
 fn validate_dispatch_plan(
-    context: &VulkanContext,
+    limits: &vk::PhysicalDeviceLimits,
     contract: KernelDispatch,
-    plan: &metal2vulkan::reflect::KernelDispatchPlan,
+    plan: &KernelDispatchPlan,
 ) -> Result<(), ExecutorError> {
-    let limits = context.properties.limits;
     let range = contract
         .push_constant_range()
         .ok_or_else(|| failure("exact dispatch has no push-constant range"))?;
@@ -441,7 +2056,7 @@ fn validate_dispatch_plan(
         )));
     }
     for region in &plan.regions {
-        validate_local_size(context, region.local_size)?;
+        validate_local_size(limits, region.local_size)?;
         for (dimension, &count) in region.group_count.iter().enumerate() {
             if count > limits.max_compute_work_group_count[dimension] {
                 return Err(failure(format!(
@@ -450,6 +2065,78 @@ fn validate_dispatch_plan(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_descriptor_limits(
+    limits: &vk::PhysicalDeviceLimits,
+    reflection: &ShaderReflection,
+) -> Result<(), ExecutorError> {
+    let buffer_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::Buffer)
+            .count(),
+    )
+    .map_err(|_| failure("reflected buffer count overflows u32"))?;
+    // Sampled textures bind as combined image samplers: one sampled image and
+    // one sampler per binding.
+    let sampled_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, ResourceKind::Texture))
+            .count(),
+    )
+    .map_err(|_| failure("reflected texture count overflows u32"))?;
+    if limits.max_bound_descriptor_sets == 0
+        || buffer_count > limits.max_per_stage_descriptor_storage_buffers
+        || buffer_count > limits.max_descriptor_set_storage_buffers
+        || sampled_count > limits.max_per_stage_descriptor_sampled_images
+        || sampled_count > limits.max_descriptor_set_sampled_images
+        || sampled_count > limits.max_per_stage_descriptor_samplers
+        || sampled_count > limits.max_descriptor_set_samplers
+        || buffer_count.saturating_add(sampled_count) > limits.max_per_stage_resources
+    {
+        return Err(failure(format!(
+            "{buffer_count} storage buffers and {sampled_count} sampled textures exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
+            limits.max_per_stage_descriptor_storage_buffers,
+            limits.max_descriptor_set_storage_buffers,
+            limits.max_per_stage_descriptor_sampled_images,
+            limits.max_per_stage_descriptor_samplers,
+            limits.max_per_stage_resources,
+            limits.max_bound_descriptor_sets
+        )));
+    }
+    Ok(())
+}
+
+/// Descriptor type one reflected binding needs. Sampled textures use a
+/// combined image sampler because the translator synthesizes the sampler and
+/// the provider supplies one per sampled image (`research/docs/16` §4.3).
+fn descriptor_type_for_binding(
+    binding: &metal2vulkan::reflect::ResourceBinding,
+) -> vk::DescriptorType {
+    match binding.kind {
+        ResourceKind::Texture => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        _ => vk::DescriptorType::STORAGE_BUFFER,
+    }
+}
+
+fn validate_storage_buffer_size(
+    limits: &vk::PhysicalDeviceLimits,
+    index: u32,
+    len: usize,
+) -> Result<(), ExecutorError> {
+    let size =
+        u64::try_from(len).map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+    if size > u64::from(limits.max_storage_buffer_range) {
+        return Err(failure(format!(
+            "buffer {index} length {size} exceeds maxStorageBufferRange {}",
+            limits.max_storage_buffer_range
+        )));
     }
     Ok(())
 }
@@ -483,7 +2170,24 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
                 return Err(failure("SPIR-V OpCapability has invalid length"));
             }
             let capability = words[cursor + 1];
-            if capability != Capability::Shader as u32 {
+            // Vulkan 1.0 core capabilities: Shader is required by every
+            // module, ImageQuery by texture size/level queries, and
+            // Sampled1D/SampledBuffer cover the linear and buffer texture
+            // shapes the reviewed fixtures use. Everything else stays
+            // refused until a capability gate admits a provider feature.
+            if !matches!(
+                capability,
+                value if value == Capability::Shader as u32
+                    || value == Capability::ImageQuery as u32
+                    // The reviewed texture fixtures return an i8 status
+                    // beside the texel; the device enables shaderInt8.
+                    || value == Capability::Int8 as u32
+                    // Index arithmetic in the reviewed fixtures widens to
+                    // i64; the device enables shaderInt64.
+                    || value == Capability::Int64 as u32
+                    || value == Capability::Sampled1D as u32
+                    || value == Capability::SampledBuffer as u32
+            ) {
                 return Err(failure(format!(
                     "SPIR-V capability {capability} requires a Vulkan feature outside the Phase 1 subset"
                 )));
@@ -496,6 +2200,86 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
         cursor = end;
     }
     Ok(())
+}
+
+/// Create a `VkImage` and bind allocated memory of a requested property class.
+///
+/// The sampled-texture rail and the render-attachment rail need the same four
+/// steps (create image, read its memory requirements, pick a satisfying type,
+/// allocate and bind); only the `VkImageCreateInfo` and the property class
+/// differ. Keeping the sequence in one place means a new image-backed resource
+/// cannot forget the memory-type check or leave a half-created image behind on
+/// failure (`research/docs/23` §6 Step 3b).
+///
+/// On failure the image and memory created so far are destroyed here, so a
+/// caller only has to clean up what it created before this call.
+fn allocate_image_backing(
+    context: &VulkanContext,
+    info: &vk::ImageCreateInfo,
+    properties: vk::MemoryPropertyFlags,
+    what: &str,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::MemoryRequirements), ExecutionFailure> {
+    let image = unsafe { context.device.create_image(info, None) }.map_err(|error| {
+        ExecutionFailure::vulkan(error, format!("create {what} image: {error}"))
+    })?;
+    let requirements = unsafe { context.device.get_image_memory_requirements(image) };
+    let memory_type = match context.memory_type(requirements.memory_type_bits, properties) {
+        Ok(index) => index,
+        Err(error) => {
+            unsafe { context.device.destroy_image(image, None) };
+            return Err(error.into());
+        }
+    };
+    let allocation = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { context.device.destroy_image(image, None) };
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("allocate {what} memory: {error}"),
+            ));
+        }
+    };
+    if let Err(error) = unsafe { context.device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            context.device.destroy_image(image, None);
+            context.device.free_memory(memory, None);
+        }
+        return Err(ExecutionFailure::vulkan(
+            error,
+            format!("bind {what} memory: {error}"),
+        ));
+    }
+    Ok((image, memory, requirements))
+}
+
+/// Create the single-mip, single-layer 2D colour view over `image`.
+///
+/// Shared by the sampled-texture rail and the render-attachment rail; the
+/// aspect mask is `COLOR` for both because neither admits a depth/stencil or
+/// plane-disjoint format (`research/docs/23` §3.3).
+fn create_color_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { context.device.create_image_view(&info, None) }
+        .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
 }
 
 fn validate_pipeline_reflection(
@@ -542,30 +2326,30 @@ fn validate_pipeline_reflection(
             "pipeline uses Metal resources or specialization state outside the Phase 1 buffer-compute subset",
         ));
     }
-    let mut metal_indices = BTreeSet::new();
     let mut descriptor_bindings = BTreeSet::new();
     for binding in &reflection.bindings {
-        if binding.kind != ResourceKind::Buffer {
+        if binding.kind != ResourceKind::Buffer && binding.kind != ResourceKind::Texture {
             return Err(failure(format!(
-                "Phase 1 supports only Metal buffers, not {:?}",
+                "Phase 1 supports only Metal buffers and sampled textures, not {:?}",
                 binding.kind
             )));
         }
-        if !metal_indices.insert(binding.metal_index) {
-            return Err(failure(format!(
-                "duplicate reflected Metal buffer index {}",
-                binding.metal_index
-            )));
-        }
+        // A texture and a buffer may share the Metal argument index; the
+        // Vulkan descriptor binding is the unique key (checked below).
+        let what = if binding.kind == ResourceKind::Buffer {
+            "buffer"
+        } else {
+            "texture"
+        };
         let descriptor = binding.descriptor.ok_or_else(|| {
             failure(format!(
-                "Metal buffer {} has no Vulkan descriptor",
+                "Metal {what} {} has no Vulkan descriptor",
                 binding.metal_index
             ))
         })?;
         if descriptor.set != 0 || descriptor.count != 1 {
             return Err(failure(format!(
-                "Metal buffer {} uses unsupported descriptor set={} count={}",
+                "Metal {what} {} uses unsupported descriptor set={} count={}",
                 binding.metal_index, descriptor.set, descriptor.count
             )));
         }
@@ -574,6 +2358,21 @@ fn validate_pipeline_reflection(
                 "duplicate Vulkan descriptor binding {}",
                 descriptor.binding
             )));
+        }
+        if binding.kind == ResourceKind::Texture {
+            if binding.access != Some(ResourceAccess::Sampled) {
+                return Err(failure(format!(
+                    "Metal texture {} is not a sampled read ({:?})",
+                    binding.metal_index, binding.access
+                )));
+            }
+            if binding.texture_shape.is_none() {
+                return Err(failure(format!(
+                    "Metal texture {} has no reflected shape",
+                    binding.metal_index
+                )));
+            }
+            continue;
         }
         if binding.extent.is_none() {
             return Err(failure(format!(
@@ -628,7 +2427,7 @@ fn validate_pipeline_reflection(
 
 fn validate_bound_buffers(
     reflection: &ShaderReflection,
-    buffers: &[BufferBinding],
+    buffers: &[(u32, usize)],
     grid: [u32; 3],
 ) -> Result<(), ExecutorError> {
     let metal_indices = reflection
@@ -637,24 +2436,20 @@ fn validate_bound_buffers(
         .map(|binding| binding.metal_index)
         .collect::<BTreeSet<_>>();
     let mut supplied = BTreeSet::new();
-    for binding in buffers {
-        if binding.bytes.is_empty() {
-            return Err(failure(format!(
-                "buffer {} has an empty bound range",
-                binding.index
-            )));
+    for &(index, len) in buffers {
+        if len == 0 {
+            return Err(failure(format!("buffer {index} has an empty bound range")));
         }
-        if !supplied.insert(binding.index) {
-            return Err(failure(format!(
-                "buffer {} is bound more than once",
-                binding.index
-            )));
+        if !supplied.insert(index) {
+            return Err(failure(format!("buffer {index} is bound more than once")));
         }
         let reflected = reflection
             .bindings
             .iter()
-            .find(|candidate| candidate.metal_index == binding.index)
-            .ok_or_else(|| failure(format!("buffer {} is not reflected", binding.index)))?;
+            .find(|candidate| {
+                candidate.metal_index == index && candidate.kind == ResourceKind::Buffer
+            })
+            .ok_or_else(|| failure(format!("buffer {index} is not reflected")))?;
         let mut required = u64::from(reflected.declared_size.unwrap_or(0));
         if let Some(BufferExtent::Object { bytes }) = reflected.extent {
             required = required.max(u64::from(bytes));
@@ -664,18 +2459,19 @@ fn validate_bound_buffers(
             .as_ref()
             .expect("pipeline validation requires a footprint");
         for range in &footprint.static_ranges {
-            let end = range.offset.checked_add(range.size).ok_or_else(|| {
-                failure(format!("buffer {} footprint overflows u64", binding.index))
-            })?;
+            let end = range
+                .offset
+                .checked_add(range.size)
+                .ok_or_else(|| failure(format!("buffer {index} footprint overflows u64")))?;
             required = required.max(end);
         }
         required = required.max(
             strided_footprint_reach(footprint, grid)
-                .map_err(|error| failure(format!("buffer {} {error}", binding.index)))?,
+                .map_err(|error| failure(format!("buffer {index} {error}")))?,
         );
-        let supplied_len = u64::try_from(binding.bytes.len())
-            .map_err(|_| failure(format!("buffer {} length overflows u64", binding.index)))?;
-        ensure_buffer_reach(binding.index, supplied_len, required)?;
+        let supplied_len = u64::try_from(len)
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+        ensure_buffer_reach(index, supplied_len, required)?;
     }
     if supplied != metal_indices {
         return Err(failure(format!(
@@ -728,38 +2524,378 @@ fn strided_footprint_reach(
     Ok(required)
 }
 
-struct GpuBuffer {
-    index: u32,
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    len: usize,
+/// One execution buffer, either copied into provider memory or imported from
+/// an owner host mapping.
+#[derive(Debug)]
+pub(crate) enum PoolBinding {
+    Owned(BufferBinding),
+    /// One device buffer per allocation, shared by every owned view of it.
+    ///
+    /// `index` stays the pool key (the view), so the pool key space, the
+    /// planner, the writable-key set and the writeback mapping are unchanged.
+    /// `allocation` identifies the shared device buffer, and the view is its
+    /// `[offset, offset + length)` window. Only the first entry of an allocation
+    /// carries `bytes`; the image is uploaded once. `research/docs/15` §3.
+    SharedOwned {
+        index: u32,
+        allocation: u64,
+        offset: usize,
+        length: usize,
+        /// Whether the view can read. A write-only view uploads nothing.
+        access: metal_api_core::provider::BufferAccess,
+        bytes: Vec<u8>,
+    },
+    /// One device buffer bound at a placement offset inside a heap slab.
+    ///
+    /// `index`/`allocation`/`offset`/`length` keep the same meaning as
+    /// [`Self::SharedOwned`]: the pool key is the view, the allocation
+    /// identifies the buffer, and the view is its `[offset, offset + length)`
+    /// window. `heap_offset` is the buffer's base inside the slab and
+    /// `heap_size` is the total slab byte size; both come straight from the
+    /// trace's heap payload (`research/docs/25-heaps与ICB设计.md` §6 Step 3).
+    /// `allocation_size` is the allocation's full byte size from its
+    /// `AllocationRecord`: the device buffer spans exactly this many bytes so
+    /// the buffer extent and the placement's `byte_size` stay equal even when
+    /// a view addresses only a prefix of the allocation.
+    HeapOwned {
+        index: u32,
+        allocation: u64,
+        offset: usize,
+        length: usize,
+        access: metal_api_core::provider::BufferAccess,
+        bytes: Vec<u8>,
+        allocation_size: usize,
+        heap_offset: usize,
+        heap_size: usize,
+    },
+    Imported {
+        index: u32,
+        pointer: usize,
+        len: usize,
+        capacity: usize,
+    },
 }
 
-struct ExecutionResources {
+impl PoolBinding {
+    pub(crate) fn index(&self) -> u32 {
+        match self {
+            Self::Owned(binding) => binding.index,
+            Self::SharedOwned { index, .. }
+            | Self::HeapOwned { index, .. }
+            | Self::Imported { index, .. } => *index,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(binding) => binding.bytes.len(),
+            // The reflected binding width is the view, not the shared backing.
+            Self::SharedOwned { length, .. } | Self::HeapOwned { length, .. } => *length,
+            Self::Imported { len, .. } => *len,
+        }
+    }
+}
+
+/// Where one pool key lives inside a device buffer: the shared backing plus the
+/// view's window inside it. A per-view binding is the same shape with offset
+/// zero and the whole buffer as its window.
+struct ViewWindow {
+    buffer_key: u64,
+    offset: usize,
+    length: usize,
+}
+
+/// Width view shared by owned bindings and no-copy pool bindings.
+trait PoolWidth {
+    fn pool_index(&self) -> u32;
+    fn pool_len(&self) -> usize;
+}
+
+impl PoolWidth for BufferBinding {
+    fn pool_index(&self) -> u32 {
+        self.index
+    }
+
+    fn pool_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl PoolWidth for PoolBinding {
+    fn pool_index(&self) -> u32 {
+        self.index()
+    }
+
+    fn pool_len(&self) -> usize {
+        self.len()
+    }
+}
+
+struct GpuBuffer {
+    index: u64,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// Byte offset of `buffer` within `memory`. Owned and imported backings
+    /// bind at zero; a heap-placed buffer is bound at its placement offset
+    /// inside the shared slab, so `buffer` and `memory` no longer share a
+    /// base address.
+    bind_offset: usize,
+    len: usize,
+    /// Borrowed mappings are the owner's pointer; owned mappings are the
+    /// device mapping made at creation time and kept for sparse uploads.
+    host_pointer: Option<usize>,
+    mapping: Option<usize>,
+    /// Byte ranges already copied into this backing, keyed by their view
+    /// offset. A write-only view copies nothing in and leaves no entry.
+    uploaded_ranges: BTreeMap<usize, usize>,
+}
+
+/// One sampled texture owned by an execution: a host-visible `VkImage` and the
+/// sampler the provider supplies for it, because the translator synthesizes
+/// the sampler (`research/docs/16` §4.3). Only R32Uint/D2 is admitted.
+struct GpuTexture {
+    index: u64,
+    /// The descriptor writer resolves the texture through the pass binding
+    /// map, so the pool key is stored with the image.
+    pool_key: PoolKey,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+/// A pass owns every object derived from its shader's reflection. Keeping this
+/// ownership separate prevents using one shader's layout for a later shader.
+struct PipelineObjects {
     context: Arc<VulkanContext>,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     shader: vk::ShaderModule,
     pipelines: BTreeMap<[u32; 3], vk::Pipeline>,
+}
+
+struct ExecutionResources {
+    context: Arc<VulkanContext>,
+    pipeline_objects: Vec<PipelineObjects>,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     command_pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+    queue_index: usize,
     submitted: bool,
     completed: bool,
+    device_lost: bool,
+    /// `VK_EXT_device_fault` record of the loss this submission observed.
+    device_loss_fault: Option<DeviceFaultSnapshot>,
+    leak_is_budgeted: bool,
     buffers: Vec<GpuBuffer>,
+    /// The single heap slab backing every heap-placed buffer in this
+    /// submission. Allocated once, mapped once and freed once at `Drop`;
+    /// heap-placed `GpuBuffer`s carry `memory == null()` so their `Drop` pass
+    /// never double-frees the slab (`research/docs/25-heaps与ICB设计.md` §6
+    /// Step 3).
+    heap_memory: Option<vk::DeviceMemory>,
+    /// Byte size of `heap_memory`, for the abandonment budget.
+    heap_bytes: Option<u64>,
+    /// Sampled textures addressed by their Metal argument index.
+    textures: Vec<GpuTexture>,
+    /// Pool key to its window in `buffers`. `research/docs/15` §3.
+    /// Pool key (kind plus index) to its window in `buffers` or `textures`.
+    view_windows: BTreeMap<PoolKey, ViewWindow>,
+    /// The host-visible `INDIRECT_BUFFER` an indirect dispatch replays from.
+    /// Null when this submission dispatches directly (`research/docs/25` §6
+    /// Step 4).
+    indirect_buffer: vk::Buffer,
+    indirect_memory: vk::DeviceMemory,
+    borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+}
+
+/// How `ExecutionResources::drop` must treat still-submitted handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceDropPolicy {
+    Destroy,
+    Retain,
+}
+
+fn resource_drop_policy(submitted: bool, completed: bool, device_lost: bool) -> ResourceDropPolicy {
+    if submitted && !completed && !device_lost {
+        ResourceDropPolicy::Retain
+    } else {
+        ResourceDropPolicy::Destroy
+    }
+}
+
+/// One teardown step for an interrupted heap-slab bind.
+///
+/// Vulkan requires every `VkBuffer` bound to a `VkDeviceMemory` be destroyed
+/// before that memory is freed, so the order below is load-bearing.
+#[derive(Debug, Eq, PartialEq)]
+enum HeapSlabCleanup {
+    Destroy(vk::Buffer),
+    Free,
+}
+
+/// Compute the teardown order for a heap slab whose `failing` buffer could not
+/// be bound: the failing buffer, then every buffer already bound by earlier
+/// iterations, and only then `Free`. Extracted as a pure function so a unit
+/// test can pin "free last" without a device.
+fn heap_slab_bind_failure_cleanup(
+    failing: vk::Buffer,
+    already_bound: &[vk::Buffer],
+) -> Vec<HeapSlabCleanup> {
+    let mut steps = Vec::with_capacity(already_bound.len() + 2);
+    steps.push(HeapSlabCleanup::Destroy(failing));
+    steps.extend(already_bound.iter().copied().map(HeapSlabCleanup::Destroy));
+    steps.push(HeapSlabCleanup::Free);
+    steps
+}
+
+struct ExecutionFailure {
+    result: Option<vk::Result>,
+    detail: String,
+}
+
+impl ExecutionFailure {
+    fn vulkan(result: vk::Result, detail: impl Into<String>) -> Self {
+        Self {
+            result: Some(result),
+            detail: detail.into(),
+        }
+    }
+
+    fn into_provider(
+        self,
+        phase: ProviderPhase,
+        class: ProviderErrorClass,
+        slug: &'static str,
+        completion: CompletionDisposition,
+    ) -> ProviderError {
+        let device_lost = self.result == Some(vk::Result::ERROR_DEVICE_LOST);
+        let class = if device_lost {
+            ProviderErrorClass::DeviceLost
+        } else {
+            class
+        };
+        let completion = if device_lost
+            && matches!(completion, CompletionDisposition::SubmittedUnknown { .. })
+        {
+            CompletionDisposition::DeviceLost { token: None }
+        } else {
+            completion
+        };
+        let mut error = ProviderError::new(phase, class, slug)
+            .expect("static Vulkan error slug")
+            .with_completion(completion)
+            .with_detail(self.detail);
+        if device_lost {
+            // The driver's own answer is the evidence for a loss, and the
+            // documented recovery is the same one the core refusal spells:
+            // recreate the provider. Other failures keep the caller's class and
+            // retryability and carry the driver text in `detail` only.
+            error.retryability = Retryability::RetryAfterRecreate;
+            error = error
+                .with_field(
+                    "vk_result",
+                    FieldValue::Text(vk_result_name(vk::Result::ERROR_DEVICE_LOST)),
+                )
+                .with_field(
+                    "vk_result_raw",
+                    FieldValue::Signed(i64::from(vk::Result::ERROR_DEVICE_LOST.as_raw())),
+                );
+        }
+        error
+    }
+
+    fn into_readback_provider(self) -> ProviderError {
+        self.into_provider(
+            ProviderPhase::Readback,
+            ProviderErrorClass::Execute,
+            "vulkan-readback",
+            CompletionDisposition::Failed { token: None },
+        )
+    }
+}
+
+impl From<ExecutorError> for ExecutionFailure {
+    fn from(error: ExecutorError) -> Self {
+        Self {
+            result: None,
+            detail: error.to_string(),
+        }
+    }
 }
 
 enum SubmissionFailure {
     /// Nothing reached the queue, so ordinary RAII cleanup is valid.
-    Safe(ExecutorError),
-    /// Queue submission succeeded but completion is unknown. Handles must stay
+    Safe {
+        phase: ProviderPhase,
+        error: ExecutionFailure,
+    },
+    /// Queue acceptance or completion is unknown. Handles must stay
     /// alive until process exit or an out-of-band reaper proves completion.
-    Pending(ExecutorError),
+    Pending {
+        phase: ProviderPhase,
+        error: ExecutionFailure,
+    },
 }
 
-impl ExecutionResources {
+impl SubmissionFailure {
+    fn from_queue_submit(error: ExecutionFailure) -> Self {
+        // Vulkan guarantees an unsuccessful allocation leaves referenced
+        // resources unaffected. Other failures do not prove queue rejection.
+        if matches!(
+            error.result,
+            Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        ) {
+            Self::Safe {
+                phase: ProviderPhase::Submit,
+                error,
+            }
+        } else {
+            Self::Pending {
+                phase: ProviderPhase::Submit,
+                error,
+            }
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    fn is_device_lost(&self) -> bool {
+        let error = match self {
+            Self::Safe { error, .. } | Self::Pending { error, .. } => error,
+        };
+        error.result == Some(vk::Result::ERROR_DEVICE_LOST)
+    }
+
+    fn into_provider(self) -> ProviderError {
+        match self {
+            Self::Safe { phase, error } => error.into_provider(
+                phase,
+                ProviderErrorClass::Execute,
+                match phase {
+                    ProviderPhase::Encode => "vulkan-fence-create",
+                    _ => "vulkan-queue-submit",
+                },
+                CompletionDisposition::NotSubmitted,
+            ),
+            Self::Pending { phase, error } => error.into_provider(
+                phase,
+                ProviderErrorClass::Execute,
+                match phase {
+                    ProviderPhase::Submit => "vulkan-queue-submit",
+                    _ => "vulkan-wait",
+                },
+                CompletionDisposition::SubmittedUnknown { token: None },
+            ),
+        }
+    }
+}
+
+impl PipelineObjects {
     fn new(context: Arc<VulkanContext>) -> Self {
         Self {
             context,
@@ -767,41 +2903,17 @@ impl ExecutionResources {
             pipeline_layout: vk::PipelineLayout::null(),
             shader: vk::ShaderModule::null(),
             pipelines: BTreeMap::new(),
-            descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_set: vk::DescriptorSet::null(),
-            command_pool: vk::CommandPool::null(),
-            command: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
-            submitted: false,
-            completed: false,
-            buffers: Vec::new(),
         }
     }
 
-    fn create_pipeline_objects(
+    fn create(
         &mut self,
         spv: &[u8],
         reflection: &ShaderReflection,
-        plan: &metal2vulkan::reflect::KernelDispatchPlan,
-    ) -> Result<(), ExecutorError> {
+        plans: &[KernelDispatchPlan],
+    ) -> Result<(), ExecutionFailure> {
         if !spv.len().is_multiple_of(4) {
-            return Err(failure("translated SPIR-V is not word aligned"));
-        }
-        let buffer_count = u32::try_from(reflection.bindings.len())
-            .map_err(|_| failure("reflected buffer count overflows u32"))?;
-        let limits = self.context.properties.limits;
-        if limits.max_bound_descriptor_sets == 0
-            || buffer_count > limits.max_per_stage_descriptor_storage_buffers
-            || buffer_count > limits.max_descriptor_set_storage_buffers
-            || buffer_count > limits.max_per_stage_resources
-        {
-            return Err(failure(format!(
-                "{buffer_count} storage buffers exceed Vulkan descriptor limits per-stage={} per-set={} all-resources={} bound-sets={}",
-                limits.max_per_stage_descriptor_storage_buffers,
-                limits.max_descriptor_set_storage_buffers,
-                limits.max_per_stage_resources,
-                limits.max_bound_descriptor_sets
-            )));
+            return Err(failure("translated SPIR-V is not word aligned").into());
         }
         let words = spv
             .chunks_exact(4)
@@ -809,7 +2921,9 @@ impl ExecutionResources {
             .collect::<Vec<_>>();
         let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
         self.shader = unsafe { self.context.device.create_shader_module(&shader_info, None) }
-            .map_err(|error| failure(format!("create shader module: {error}")))?;
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create shader module: {error}"))
+            })?;
 
         let mut layout_bindings = reflection
             .bindings
@@ -818,7 +2932,7 @@ impl ExecutionResources {
                 let descriptor = binding.descriptor.expect("validated descriptor");
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(descriptor.binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_type(descriptor_type_for_binding(binding))
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
             })
@@ -831,7 +2945,9 @@ impl ExecutionResources {
                 .device
                 .create_descriptor_set_layout(&set_layout_info, None)
         }
-        .map_err(|error| failure(format!("create descriptor-set layout: {error}")))?;
+        .map_err(|error| {
+            ExecutionFailure::vulkan(error, format!("create descriptor-set layout: {error}"))
+        })?;
 
         let set_layouts = [self.set_layout];
         let contract = reflection
@@ -852,9 +2968,11 @@ impl ExecutionResources {
                 .device
                 .create_pipeline_layout(&pipeline_layout_info, None)
         }
-        .map_err(|error| failure(format!("create pipeline layout: {error}")))?;
+        .map_err(|error| {
+            ExecutionFailure::vulkan(error, format!("create pipeline layout: {error}"))
+        })?;
 
-        for region in &plan.regions {
+        for region in plans.iter().flat_map(|plan| &plan.regions) {
             if self.pipelines.contains_key(&region.local_size) {
                 continue;
             }
@@ -864,7 +2982,10 @@ impl ExecutionResources {
         Ok(())
     }
 
-    fn create_compute_pipeline(&self, local_size: [u32; 3]) -> Result<vk::Pipeline, ExecutorError> {
+    fn create_compute_pipeline(
+        &self,
+        local_size: [u32; 3],
+    ) -> Result<vk::Pipeline, ExecutionFailure> {
         let main = CString::new("main").expect("static entry name");
         let entries: [vk::SpecializationMapEntry; 3] =
             std::array::from_fn(|index| vk::SpecializationMapEntry {
@@ -876,6 +2997,11 @@ impl ExecutionResources {
             .into_iter()
             .flat_map(u32::to_ne_bytes)
             .collect::<Vec<_>>();
+        if std::env::var_os("METAL_API_DEBUG_DISPATCH").is_some() {
+            eprintln!(
+                "PIPELINE local={local_size:?} spec_ids={KERNEL_LOCAL_SIZE_SPEC_IDS:?} data={data:?}"
+            );
+        }
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
@@ -897,338 +3023,18 @@ impl ExecutionResources {
                 for pipeline in partial {
                     unsafe { self.context.device.destroy_pipeline(pipeline, None) };
                 }
-                Err(failure(format!("create compute pipeline: {error}")))
+                Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("create compute pipeline: {error}"),
+                ))
             }
         }
-    }
-
-    fn create_buffers(
-        &mut self,
-        reflection: &ShaderReflection,
-        bindings: &[BufferBinding],
-    ) -> Result<(), ExecutorError> {
-        for reflected in &reflection.bindings {
-            let supplied = bindings
-                .iter()
-                .find(|binding| binding.index == reflected.metal_index)
-                .expect("validated buffer binding");
-            self.create_buffer(supplied)?;
-        }
-        self.buffers.sort_by_key(|buffer| buffer.index);
-        Ok(())
-    }
-
-    fn create_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutorError> {
-        let size = u64::try_from(supplied.bytes.len())
-            .map_err(|_| failure(format!("buffer {} length overflows u64", supplied.index)))?;
-        if size > self.context.properties.limits.max_storage_buffer_range as u64 {
-            return Err(failure(format!(
-                "buffer {} length {size} exceeds maxStorageBufferRange {}",
-                supplied.index, self.context.properties.limits.max_storage_buffer_range
-            )));
-        }
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { self.context.device.create_buffer(&buffer_info, None) }
-            .map_err(|error| failure(format!("create buffer {}: {error}", supplied.index)))?;
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(error);
-            }
-        };
-        let allocation = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
-                return Err(failure(format!(
-                    "allocate buffer {} memory: {error}",
-                    supplied.index
-                )));
-            }
-        };
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
-            }
-            return Err(failure(format!(
-                "bind buffer {} memory: {error}",
-                supplied.index
-            )));
-        }
-        let mapped = match unsafe {
-            self.context
-                .device
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                unsafe {
-                    self.context.device.destroy_buffer(buffer, None);
-                    self.context.device.free_memory(memory, None);
-                }
-                return Err(failure(format!("map buffer {}: {error}", supplied.index)));
-            }
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                supplied.bytes.as_ptr(),
-                mapped.cast::<u8>(),
-                supplied.bytes.len(),
-            );
-            self.context.device.unmap_memory(memory);
-        }
-        self.buffers.push(GpuBuffer {
-            index: supplied.index,
-            buffer,
-            memory,
-            len: supplied.bytes.len(),
-        });
-        Ok(())
-    }
-
-    fn create_descriptors(&mut self, reflection: &ShaderReflection) -> Result<(), ExecutorError> {
-        let count = u32::try_from(self.buffers.len())
-            .map_err(|_| failure("descriptor count overflows u32"))?;
-        let sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: count,
-        }];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
-            .pool_sizes(&sizes);
-        self.descriptor_pool =
-            unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }
-                .map_err(|error| failure(format!("create descriptor pool: {error}")))?;
-        let layouts = [self.set_layout];
-        let allocation = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        self.descriptor_set = unsafe { self.context.device.allocate_descriptor_sets(&allocation) }
-            .map_err(|error| failure(format!("allocate descriptor set: {error}")))?[0];
-
-        let infos = reflection
-            .bindings
-            .iter()
-            .map(|binding| {
-                let gpu = self
-                    .buffers
-                    .iter()
-                    .find(|buffer| buffer.index == binding.metal_index)
-                    .expect("validated GPU buffer");
-                vk::DescriptorBufferInfo::default()
-                    .buffer(gpu.buffer)
-                    .offset(0)
-                    .range(gpu.len as u64)
-            })
-            .collect::<Vec<_>>();
-        let writes = reflection
-            .bindings
-            .iter()
-            .zip(&infos)
-            .map(|(binding, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_set)
-                    .dst_binding(binding.descriptor.expect("validated descriptor").binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect::<Vec<_>>();
-        unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
-        Ok(())
-    }
-
-    fn record(
-        &mut self,
-        reflection: &ShaderReflection,
-        contract: KernelDispatch,
-        plan: &metal2vulkan::reflect::KernelDispatchPlan,
-    ) -> Result<(), ExecutorError> {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(self.context.queue_family)
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
-        self.command_pool = unsafe { self.context.device.create_command_pool(&pool_info, None) }
-            .map_err(|error| failure(format!("create command pool: {error}")))?;
-        let allocation = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        self.command = unsafe { self.context.device.allocate_command_buffers(&allocation) }
-            .map_err(|error| failure(format!("allocate command buffer: {error}")))?[0];
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            self.context
-                .device
-                .begin_command_buffer(self.command, &begin)
-                .map_err(|error| failure(format!("begin command buffer: {error}")))?;
-            self.context.device.cmd_bind_descriptor_sets(
-                self.command,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
-                reflection.descriptor_layout.set,
-                &[self.descriptor_set],
-                &[],
-            );
-            let offset = contract
-                .push_constant_range()
-                .expect("validated exact range")
-                .offset;
-            for region in &plan.regions {
-                let pipeline = self.pipelines[&region.local_size];
-                self.context.device.cmd_bind_pipeline(
-                    self.command,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline,
-                );
-                let words = plan.push_constants(*region);
-                let bytes = words
-                    .into_iter()
-                    .flat_map(u32::to_ne_bytes)
-                    .collect::<Vec<_>>();
-                self.context.device.cmd_push_constants(
-                    self.command,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    offset,
-                    &bytes,
-                );
-                self.context.device.cmd_dispatch(
-                    self.command,
-                    region.group_count[0],
-                    region.group_count[1],
-                    region.group_count[2],
-                );
-            }
-            self.context
-                .device
-                .end_command_buffer(self.command)
-                .map_err(|error| failure(format!("end command buffer: {error}")))?;
-        }
-        Ok(())
-    }
-
-    fn submit_and_wait(&mut self) -> Result<(), SubmissionFailure> {
-        self.fence = unsafe {
-            self.context
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-        }
-        .map_err(|error| {
-            SubmissionFailure::Safe(failure(format!("create completion fence: {error}")))
-        })?;
-        let commands = [self.command];
-        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        if let Err(error) = unsafe {
-            self.context
-                .device
-                .queue_submit(self.context.queue, &submits, self.fence)
-        } {
-            self.context.poisoned.store(true, Ordering::Release);
-            return Err(SubmissionFailure::Safe(failure(format!(
-                "submit compute command buffer: {error}"
-            ))));
-        }
-        self.submitted = true;
-        let wait = unsafe {
-            self.context
-                .device
-                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
-        };
-        match wait {
-            Ok(()) => {
-                self.completed = true;
-                Ok(())
-            }
-            Err(error) => {
-                self.context.poisoned.store(true, Ordering::Release);
-                let message = if error == vk::Result::TIMEOUT {
-                    "compute completion timed out after 20 seconds".to_string()
-                } else {
-                    format!("wait for compute completion failed: {error}")
-                };
-                Err(SubmissionFailure::Pending(failure(message)))
-            }
-        }
-    }
-
-    fn read_updates(
-        &self,
-        reflection: &ShaderReflection,
-    ) -> Result<Vec<BufferUpdate>, ExecutorError> {
-        let mut updates = Vec::new();
-        for reflected in &reflection.bindings {
-            if matches!(
-                reflected.access,
-                Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
-            ) {
-                continue;
-            }
-            let gpu = self
-                .buffers
-                .iter()
-                .find(|buffer| buffer.index == reflected.metal_index)
-                .expect("validated GPU buffer");
-            let mapped = unsafe {
-                self.context.device.map_memory(
-                    gpu.memory,
-                    0,
-                    gpu.len as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|error| failure(format!("map buffer {} for readback: {error}", gpu.index)))?;
-            let bytes =
-                unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), gpu.len).to_vec() };
-            unsafe { self.context.device.unmap_memory(gpu.memory) };
-            updates.push(BufferUpdate {
-                index: gpu.index,
-                offset: 0,
-                bytes,
-            });
-        }
-        updates.sort_by_key(|update| update.index);
-        Ok(updates)
     }
 }
 
-impl Drop for ExecutionResources {
+impl Drop for PipelineObjects {
     fn drop(&mut self) {
-        if self.submitted && !self.completed {
-            self.context.poisoned.store(true, Ordering::Release);
-            self.context.abandoned.store(true, Ordering::Release);
-            // A panic between queue submission and the explicit wait outcome
-            // cannot unwind into destruction of in-flight handles. Raw Vulkan
-            // handles below are intentionally left live, and this strong
-            // context reference keeps the loader/device live until process exit.
-            let _ = Arc::into_raw(Arc::clone(&self.context));
-            return;
-        }
         unsafe {
-            if self.fence != vk::Fence::null() {
-                self.context.device.destroy_fence(self.fence, None);
-            }
-            if self.command_pool != vk::CommandPool::null() {
-                self.context
-                    .device
-                    .destroy_command_pool(self.command_pool, None);
-            }
-            if self.descriptor_pool != vk::DescriptorPool::null() {
-                self.context
-                    .device
-                    .destroy_descriptor_pool(self.descriptor_pool, None);
-            }
             for pipeline in self.pipelines.values().copied() {
                 self.context.device.destroy_pipeline(pipeline, None);
             }
@@ -1245,9 +3051,1559 @@ impl Drop for ExecutionResources {
             if self.shader != vk::ShaderModule::null() {
                 self.context.device.destroy_shader_module(self.shader, None);
             }
+        }
+    }
+}
+
+impl ExecutionResources {
+    fn new(context: Arc<VulkanContext>) -> Self {
+        Self {
+            context,
+            pipeline_objects: Vec::new(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
+            command_pool: vk::CommandPool::null(),
+            command: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            queue_index: 0,
+            submitted: false,
+            completed: false,
+            device_lost: false,
+            device_loss_fault: None,
+            leak_is_budgeted: false,
+            buffers: Vec::new(),
+            heap_memory: None,
+            heap_bytes: None,
+            textures: Vec::new(),
+            view_windows: BTreeMap::new(),
+            indirect_buffer: vk::Buffer::null(),
+            indirect_memory: vk::DeviceMemory::null(),
+            borrowed: None,
+        }
+    }
+
+    fn owned_bytes(&self) -> u64 {
+        let heap_bytes = self.heap_bytes.unwrap_or(0);
+        let buffers = self.buffers.iter().fold(0_u64, |total, buffer| {
+            if buffer.host_pointer.is_some() || buffer.memory == vk::DeviceMemory::null() {
+                return total;
+            }
+            total.saturating_add(u64::try_from(buffer.len).unwrap_or(u64::MAX))
+        });
+        heap_bytes.saturating_add(buffers)
+    }
+
+    fn set_borrowed_leases(
+        &mut self,
+        borrowed: Option<(Arc<BorrowedLeaseRegistry>, Vec<LeaseId>)>,
+    ) {
+        self.borrowed = borrowed;
+    }
+
+    fn mark_device_lost(&mut self) {
+        self.device_lost = true;
+    }
+
+    /// Attach the fault record of this submission's device loss, if it
+    /// observed one, and hand the provider error on unchanged otherwise.
+    fn attach_device_loss_fault(&mut self, error: ProviderError) -> ProviderError {
+        match self.device_loss_fault.take() {
+            Some(fault) => with_device_fault_evidence(error, &fault),
+            None => error,
+        }
+    }
+
+    fn retain_after_budgeted_abandon(&mut self) {
+        self.leak_is_budgeted = true;
+    }
+
+    fn create_pipeline_objects(
+        &mut self,
+        translated: &[&TranslatedComputePipeline],
+        plans: &[KernelDispatchPlan],
+    ) -> Result<(), ExecutionFailure> {
+        for (translated, plan) in translated.iter().zip(plans) {
+            let mut objects = PipelineObjects::new(Arc::clone(&self.context));
+            objects.create(
+                translated.spirv(),
+                translated.reflection(),
+                std::slice::from_ref(plan),
+            )?;
+            self.pipeline_objects.push(objects);
+        }
+        Ok(())
+    }
+
+    fn create_buffers(&mut self, bindings: &[PoolBinding]) -> Result<(), ExecutionFailure> {
+        // Every shared backing must be sized before any of them is created:
+        // the first view of an allocation may not be its largest end offset.
+        let mut shared_sizes = BTreeMap::<u64, usize>::new();
+        // Heap placements are one buffer per allocation inside a single slab:
+        // `heap_sizes` is each allocation's device buffer size (its largest
+        // view end), `heap_offsets` its binding offset inside the slab, and
+        // `heap_slab_size` the slab's total byte size from the trace payload.
+        let mut heap_sizes = BTreeMap::<u64, usize>::new();
+        let mut heap_offsets = BTreeMap::<u64, usize>::new();
+        let mut heap_slab_size: Option<usize> = None;
+        for supplied in bindings {
+            match supplied {
+                PoolBinding::SharedOwned {
+                    allocation,
+                    offset,
+                    length,
+                    ..
+                } => {
+                    let end = offset.checked_add(*length).ok_or_else(|| {
+                        failure(format!(
+                            "shared buffer {allocation} view range overflows usize"
+                        ))
+                    })?;
+                    shared_sizes
+                        .entry(*allocation)
+                        .and_modify(|size| *size = (*size).max(end))
+                        .or_insert(end);
+                }
+                PoolBinding::HeapOwned {
+                    allocation,
+                    offset,
+                    length,
+                    allocation_size,
+                    heap_offset,
+                    heap_size,
+                    ..
+                } => {
+                    let end = offset.checked_add(*length).ok_or_else(|| {
+                        failure(format!(
+                            "heap buffer {allocation} view range overflows usize"
+                        ))
+                    })?;
+                    // The device buffer spans the allocation's full byte size
+                    // (`allocation_size`), not the largest view end, so the
+                    // buffer extent and the placement's `byte_size` agree
+                    // (`research/docs/25` §6 Step 3). Every view window is
+                    // already bounded by the allocation, but the check stays
+                    // here to keep the invariant local.
+                    if end > *allocation_size {
+                        return Err(failure(format!(
+                            "heap buffer {allocation} view ends at {end}, beyond its {allocation_size}-byte allocation"
+                        ))
+                        .into());
+                    }
+                    match heap_sizes.get(allocation) {
+                        Some(existing) if *existing != *allocation_size => {
+                            return Err(failure(format!(
+                                "heap allocation {allocation} has conflicting sizes {existing} and {allocation_size}"
+                            ))
+                            .into());
+                        }
+                        _ => {
+                            heap_sizes.insert(*allocation, *allocation_size);
+                        }
+                    }
+                    match heap_offsets.get(allocation) {
+                        Some(existing) if *existing != *heap_offset => {
+                            return Err(failure(format!(
+                                "heap allocation {allocation} has conflicting offsets {existing} and {heap_offset}"
+                            ))
+                            .into());
+                        }
+                        _ => {
+                            heap_offsets.insert(*allocation, *heap_offset);
+                        }
+                    }
+                    match heap_slab_size {
+                        Some(existing) if existing != *heap_size => {
+                            return Err(failure(format!(
+                                "heap slab size disagrees across placements: {existing} and {heap_size}"
+                            ))
+                            .into());
+                        }
+                        _ => heap_slab_size = Some(*heap_size),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(slab_size) = heap_slab_size {
+            self.create_heap_buffers(&heap_sizes, &heap_offsets, slab_size)?;
+        }
+        for supplied in bindings {
+            match supplied {
+                PoolBinding::Owned(binding) => {
+                    let index = binding.index;
+                    let length = binding.bytes.len();
+                    self.create_owned_buffer(binding)?;
+                    self.register_view(PoolKey::buffer(index), u64::from(index), 0, length)?;
+                }
+                PoolBinding::SharedOwned {
+                    index,
+                    allocation,
+                    offset,
+                    length,
+                    access,
+                    bytes,
+                } => {
+                    // A shared backing is created once per allocation and
+                    // covers the largest end offset of its views. Only the
+                    // view's own bytes are ever copied in, at the view's own
+                    // offset: a write-only view carries no snapshot and its
+                    // upload region stays undefined, which the footprint
+                    // proof allows because nothing reads outside a view's own
+                    // accesses (`research/docs/15` step 4).
+                    if bytes.len() != *length {
+                        return Err(failure(format!(
+                            "shared buffer {allocation} view has {} bytes, expected {length}",
+                            bytes.len()
+                        ))
+                        .into());
+                    }
+                    if self
+                        .buffers
+                        .iter()
+                        .all(|buffer| buffer.index != *allocation)
+                    {
+                        let size = *shared_sizes
+                            .get(allocation)
+                            .expect("shared view sizing pass covered every allocation");
+                        self.create_owned_backing(*allocation, size, &[])?;
+                    }
+                    let gpu = self
+                        .buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.index == *allocation)
+                        .expect("shared backing was just created");
+                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
+                        &bytes[..0]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    if !upload.is_empty() {
+                        if gpu.uploaded_ranges.contains_key(offset) {
+                            return Err(failure(format!(
+                                "shared buffer {allocation} already uploaded bytes at offset {offset}"
+                            ))
+                            .into());
+                        }
+                        let mapping = gpu
+                            .host_pointer
+                            .unwrap_or_else(|| gpu.mapping.expect("created backing is mapped"));
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                upload.as_ptr(),
+                                (mapping as *mut u8).add(*offset),
+                                upload.len(),
+                            );
+                        }
+                        gpu.uploaded_ranges.insert(*offset, upload.len());
+                        self.context.record_buffer_upload_bytes(upload.len());
+                    }
+                    self.register_view(PoolKey::buffer(*index), *allocation, *offset, *length)?;
+                }
+                PoolBinding::HeapOwned {
+                    index,
+                    allocation,
+                    offset,
+                    length,
+                    access,
+                    bytes,
+                    ..
+                } => {
+                    // The slab and the allocation's buffer already exist;
+                    // only the view's own bytes are uploaded at its window
+                    // inside the buffer (`research/docs/25` §6 Step 3). A
+                    // write-only view uploads nothing.
+                    if bytes.len() != *length {
+                        return Err(failure(format!(
+                            "heap buffer {allocation} view has {} bytes, expected {length}",
+                            bytes.len()
+                        ))
+                        .into());
+                    }
+                    let gpu = self
+                        .buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.index == *allocation)
+                        .expect("heap buffer was just created");
+                    let upload = if *access == metal_api_core::provider::BufferAccess::Write {
+                        &bytes[..0]
+                    } else {
+                        bytes.as_slice()
+                    };
+                    if !upload.is_empty() {
+                        if gpu.uploaded_ranges.contains_key(offset) {
+                            return Err(failure(format!(
+                                "heap buffer {allocation} already uploaded bytes at offset {offset}"
+                            ))
+                            .into());
+                        }
+                        let mapping = gpu
+                            .host_pointer
+                            .unwrap_or_else(|| gpu.mapping.expect("heap slab is mapped"));
+                        let host_offset =
+                            gpu.bind_offset.checked_add(*offset).ok_or_else(|| {
+                                failure(format!(
+                                    "heap buffer {allocation} host offset overflows usize"
+                                ))
+                            })?;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                upload.as_ptr(),
+                                (mapping as *mut u8).add(host_offset),
+                                upload.len(),
+                            );
+                        }
+                        gpu.uploaded_ranges.insert(*offset, upload.len());
+                        self.context.record_buffer_upload_bytes(upload.len());
+                    }
+                    self.register_view(PoolKey::buffer(*index), *allocation, *offset, *length)?;
+                }
+                PoolBinding::Imported {
+                    index,
+                    pointer,
+                    len,
+                    capacity,
+                } => {
+                    let length = *len;
+                    self.import_host_buffer(*index, *pointer, *len, *capacity)?;
+                    self.register_view(PoolKey::buffer(*index), u64::from(*index), 0, length)?;
+                }
+            }
+        }
+        self.buffers.sort_by_key(|buffer| buffer.index);
+        Ok(())
+    }
+
+    /// Create one heap slab and one `VkBuffer` per heap placement, bound at
+    /// the placement offset inside the slab (`research/docs/25-heaps与ICB设计.md`
+    /// §6 Step 3). The slab is a single `VkDeviceMemory` allocation selected
+    /// from the intersection of every buffer's `VkMemoryRequirements`, mapped
+    /// once for upload/readback, and freed once at `Drop`.
+    fn create_heap_buffers(
+        &mut self,
+        heap_sizes: &BTreeMap<u64, usize>,
+        heap_offsets: &BTreeMap<u64, usize>,
+        slab_size: usize,
+    ) -> Result<(), ExecutionFailure> {
+        struct PendingHeapBuffer {
+            allocation: u64,
+            buffer: vk::Buffer,
+            requirements: vk::MemoryRequirements,
+            offset: usize,
+            size: usize,
+        }
+
+        // Buffers are created first so the slab memory type can be chosen from
+        // the intersection of every buffer's requirements instead of assuming
+        // one representative allocation is representative.
+        let mut pending = Vec::<PendingHeapBuffer>::new();
+        for (allocation, size) in heap_sizes {
+            let offset = *heap_offsets
+                .get(allocation)
+                .expect("heap offset pass covered every allocation");
+            let size_u64 =
+                u64::try_from(*size).map_err(|_| failure("heap buffer size overflows u64"))?;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size_u64)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(
+                |error| {
+                    ExecutionFailure::vulkan(
+                        error,
+                        format!("create heap buffer {allocation}: {error}"),
+                    )
+                },
+            )?;
+            let requirements =
+                unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+            let alignment = usize::try_from(requirements.alignment).unwrap_or(usize::MAX);
+            if alignment == 0 || !offset.is_multiple_of(alignment) {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(failure(format!(
+                    "heap buffer {allocation} offset {offset} is not a multiple of its {alignment}-byte alignment"
+                ))
+                .into());
+            }
+            pending.push(PendingHeapBuffer {
+                allocation: *allocation,
+                buffer,
+                requirements,
+                offset,
+                size: *size,
+            });
+        }
+
+        let mut type_bits = pending
+            .first()
+            .map_or(0, |head| head.requirements.memory_type_bits);
+        for head in &pending[1..] {
+            type_bits &= head.requirements.memory_type_bits;
+        }
+        let memory_type = match self.context.memory_type(
+            type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                return Err(error.into());
+            }
+        };
+        let slab_size =
+            u64::try_from(slab_size).map_err(|_| failure("heap slab size overflows u64"))?;
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(slab_size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate heap slab memory: {error}"),
+                ));
+            }
+        };
+        let mapped = match unsafe {
+            self.context
+                .device
+                .map_memory(memory, 0, slab_size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                for head in &pending {
+                    unsafe { self.context.device.destroy_buffer(head.buffer, None) };
+                }
+                unsafe { self.context.device.free_memory(memory, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map heap slab: {error}"),
+                ));
+            }
+        };
+        self.heap_memory = Some(memory);
+        self.heap_bytes = Some(slab_size);
+        let mut bound = Vec::<GpuBuffer>::with_capacity(pending.len());
+        let mut bound_buffers = Vec::<vk::Buffer>::with_capacity(pending.len());
+        for head in pending {
+            if let Err(error) = unsafe {
+                self.context
+                    .device
+                    .bind_buffer_memory(head.buffer, memory, head.offset as u64)
+            } {
+                // Vulkan requires every buffer bound to this slab to be
+                // destroyed before the slab memory is freed. The earlier
+                // iterations' buffers are not in `self.buffers` yet, so the
+                // helper destroys them here, together with the buffer whose
+                // bind just failed, before freeing the slab.
+                for step in heap_slab_bind_failure_cleanup(head.buffer, &bound_buffers) {
+                    match step {
+                        HeapSlabCleanup::Destroy(buffer) => unsafe {
+                            self.context.device.destroy_buffer(buffer, None)
+                        },
+                        HeapSlabCleanup::Free => unsafe {
+                            self.context.device.free_memory(memory, None)
+                        },
+                    }
+                }
+                self.heap_memory = None;
+                self.heap_bytes = None;
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!(
+                        "bind heap buffer {} at offset {}: {error}",
+                        head.allocation, head.offset
+                    ),
+                ));
+            }
+            self.context.record_buffer_upload();
+            bound_buffers.push(head.buffer);
+            bound.push(GpuBuffer {
+                index: head.allocation,
+                buffer: head.buffer,
+                memory: vk::DeviceMemory::null(),
+                bind_offset: head.offset,
+                len: head.size,
+                host_pointer: None,
+                mapping: Some(mapped as usize),
+                uploaded_ranges: BTreeMap::new(),
+            });
+        }
+        self.buffers.extend(bound);
+        Ok(())
+    }
+
+    /// Upload the submission's sampled textures. Only the first increment's
+    /// shape is admitted: a D2, single-sample R32Uint texture with an owned
+    /// byte source. The provider creates the image, its view and the sampler
+    /// the translator expects at the texture binding; the descriptor write
+    /// happens in `create_descriptors`.
+    fn create_textures(
+        &mut self,
+        textures: &[metal_api_core::provider::TextureView],
+        dispatches: &[BoundDispatch],
+    ) -> Result<(), ExecutionFailure> {
+        use metal_api_core::provider::{TextureAccess, TextureFormat, TextureSource, TextureType};
+        for texture in textures {
+            texture
+                .validate_shape()
+                .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            let byte_length = texture
+                .expected_bytes()
+                .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            if texture.texture_type != TextureType::D2
+                || texture.format != TextureFormat::R32Uint
+                || texture.sample_count != 1
+                || texture.depth != 1
+                || texture.array_length != 1
+                || texture.access != TextureAccess::Sampled
+            {
+                return Err(failure(format!(
+                    "texture {} needs a D2 single-sample R32Uint sampled texture",
+                    texture.metal_binding
+                ))
+                .into());
+            }
+            let TextureSource::OwnedBytes(bytes) = &texture.source else {
+                return Err(failure(format!(
+                    "texture {} needs an owned byte source in the first increment",
+                    texture.metal_binding
+                ))
+                .into());
+            };
+            let index = u64::from(texture.metal_binding);
+            if self.textures.iter().any(|existing| existing.index == index) {
+                return Err(failure(format!(
+                    "texture {} occurs more than once",
+                    texture.metal_binding
+                ))
+                .into());
+            }
+            let extent = vk::Extent3D {
+                width: u32::try_from(texture.width)
+                    .map_err(|_| failure("texture width overflows u32"))?,
+                height: u32::try_from(texture.height)
+                    .map_err(|_| failure("texture height overflows u32"))?,
+                depth: 1,
+            };
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R32_UINT)
+                .extent(extent)
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            let (image, memory, requirements) = allocate_image_backing(
+                &self.context,
+                &image_info,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                "texture",
+            )?;
+            let mapped = match unsafe {
+                self.context.device.map_memory(
+                    memory,
+                    0,
+                    requirements.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+            } {
+                Ok(mapped) => mapped,
+                Err(error) => {
+                    unsafe {
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("map texture memory: {error}"),
+                    ));
+                }
+            };
+            // The owned bytes are tightly packed `width * 4` byte rows, but a
+            // linear image's rows are only *at least* that far apart: the
+            // driver chooses `VkSubresourceLayout.rowPitch`, and Lavapipe
+            // returns 64 bytes for a 4x4 R32Uint image whose rows hold 16.
+            // Writing row `r` at `r * width * 4` then lands every row after the
+            // first in bytes the driver never reads, so `texture.read(x, y)`
+            // reports 0 for every V != 0 texel while V == 0 still looks right.
+            // Ask the driver for the layout instead of inferring the stride
+            // from the extent.
+            let tight_row_bytes = usize::try_from(texture.width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| failure("texture row pitch overflows usize"))?;
+            let (base_offset, row_pitch, depth_pitch) = if texture.height == 1 && texture.depth == 1
+            {
+                // A single row (down to a single texel) carries no row distance
+                // to get wrong, so its tightly packed copy stays byte-for-byte
+                // the previous behaviour and skips the layout query.
+                (0, tight_row_bytes, 0)
+            } else {
+                let subresource = vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    array_layer: 0,
+                };
+                let layout = unsafe {
+                    self.context
+                        .device
+                        .get_image_subresource_layout(image, subresource)
+                };
+                (
+                    usize::try_from(layout.offset)
+                        .map_err(|_| failure("texture row offset overflows usize"))?,
+                    usize::try_from(layout.row_pitch)
+                        .map_err(|_| failure("texture device row pitch overflows usize"))?,
+                    // Only D2 depth-1 images are admitted today, so the depth
+                    // pitch stays zero; consuming it anyway keeps a future
+                    // depth > 1 shape from silently assuming tight slices.
+                    usize::try_from(layout.depth_pitch)
+                        .map_err(|_| failure("texture device depth pitch overflows usize"))?,
+                )
+            };
+            let rows_per_slice = usize::try_from(texture.height)
+                .map_err(|_| failure("texture height overflows usize"))?;
+            for (row, chunk) in bytes.chunks(tight_row_bytes).enumerate() {
+                let destination = base_offset
+                    + (row / rows_per_slice) * depth_pitch
+                    + (row % rows_per_slice) * row_pitch;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.as_ptr(),
+                        (mapped.cast::<u8>()).add(destination),
+                        chunk.len(),
+                    );
+                }
+            }
+            unsafe { self.context.device.unmap_memory(memory) };
+            let view = match create_color_image_view(
+                &self.context,
+                image,
+                vk::Format::R32_UINT,
+                "texture",
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    unsafe {
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(error);
+                }
+            };
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            let sampler = match unsafe { self.context.device.create_sampler(&sampler_info, None) } {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    unsafe {
+                        self.context.device.destroy_image_view(view, None);
+                        self.context.device.destroy_image(image, None);
+                        self.context.device.free_memory(memory, None);
+                    }
+                    return Err(ExecutionFailure::vulkan(
+                        error,
+                        format!("create texture sampler: {error}"),
+                    ));
+                }
+            };
+            self.context.record_buffer_upload();
+            self.context.record_buffer_upload_bytes(bytes.len());
+            // The descriptor writer resolves a sampled texture through the
+            // pass binding map, so the Metal argument index needs a pool key.
+            let pool_key = dispatches
+                .iter()
+                .flat_map(|dispatch| dispatch.bindings.iter())
+                .find(|binding| {
+                    binding.metal_index == texture.metal_binding
+                        && binding.key.kind == PoolKind::Texture
+                })
+                .map(|binding| binding.key)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "Metal texture {} is not bound in any dispatch",
+                        texture.metal_binding
+                    ))
+                })?;
+            self.register_view(
+                pool_key,
+                index,
+                0,
+                usize::try_from(byte_length).map_err(|_| {
+                    failure(format!(
+                        "texture {} length overflows usize",
+                        texture.metal_binding
+                    ))
+                })?,
+            )?;
+            self.textures.push(GpuTexture {
+                index,
+                pool_key,
+                image,
+                memory,
+                view,
+                sampler,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record where one pool key lives inside a device buffer.
+    fn register_view(
+        &mut self,
+        pool_key: PoolKey,
+        buffer_key: u64,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), ExecutionFailure> {
+        if self
+            .view_windows
+            .insert(
+                pool_key,
+                ViewWindow {
+                    buffer_key,
+                    offset,
+                    length,
+                },
+            )
+            .is_some()
+        {
+            return Err(failure(format!("pool key {pool_key:?} occurs more than once")).into());
+        }
+        Ok(())
+    }
+
+    /// The device buffer a window names.
+    fn gpu_buffer(&self, key: u64) -> &GpuBuffer {
+        self.buffers
+            .iter()
+            .find(|buffer| buffer.index == key)
+            .expect("validated GPU buffer pool key")
+    }
+
+    /// The window of one pool key.
+    fn view_window(&self, pool_key: PoolKey) -> &ViewWindow {
+        self.view_windows
+            .get(&pool_key)
+            .expect("validated GPU buffer view window")
+    }
+
+    fn create_owned_buffer(&mut self, supplied: &BufferBinding) -> Result<(), ExecutionFailure> {
+        self.create_owned_backing(
+            u64::from(supplied.index),
+            supplied.bytes.len(),
+            &supplied.bytes,
+        )
+    }
+
+    /// One host-visible device buffer, uploaded once from `bytes`. A shared view
+    /// names it by its allocation identity instead of by its pool key.
+    fn create_owned_backing(
+        &mut self,
+        index: u64,
+        size: usize,
+        upload: &[u8],
+    ) -> Result<(), ExecutionFailure> {
+        // The device buffer spans every byte any of the allocation's views can
+        // address; the bytes actually copied in cover only the views that can
+        // read (`research/docs/15` step 4).
+        let size = u64::try_from(size)
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create buffer {}: {error}", index))
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate buffer {} memory: {error}", index),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind buffer {} memory: {error}", index),
+            ));
+        }
+        let mapped = match unsafe {
+            self.context
+                .device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map buffer {}: {error}", index),
+                ));
+            }
+        };
+        unsafe {
+            if !upload.is_empty() {
+                std::ptr::copy_nonoverlapping(upload.as_ptr(), mapped.cast::<u8>(), upload.len());
+            }
+        }
+        self.context.record_buffer_upload();
+        self.context.record_buffer_upload_bytes(upload.len());
+        self.buffers.push(GpuBuffer {
+            index,
+            buffer,
+            memory,
+            bind_offset: 0,
+            len: usize::try_from(size).unwrap_or(usize::MAX),
+            host_pointer: None,
+            mapping: Some(mapped as usize),
+            uploaded_ranges: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Import the owner's host mapping for `pointer` without copying. The
+    /// buffer covers `len` bytes; the imported allocation may be larger, and
+    /// `capacity` is the number of valid bytes the owner reserved after
+    /// `pointer`.
+    fn import_host_buffer(
+        &mut self,
+        index: u32,
+        pointer: usize,
+        len: usize,
+        capacity: usize,
+    ) -> Result<(), ExecutionFailure> {
+        let Some(host) = self.context.external_memory_host.as_ref() else {
+            return Err(failure(format!(
+                "buffer {index} needs VK_EXT_external_memory_host, which is unavailable"
+            ))
+            .into());
+        };
+        let size = u64::try_from(len)
+            .map_err(|_| failure(format!("buffer {index} length overflows u64")))?;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&buffer_info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create buffer {index}: {error}"))
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let capacity = u64::try_from(capacity).unwrap_or(u64::MAX);
+        if requirements.size > capacity {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(failure(format!(
+                "buffer {index} needs {} imported bytes but the lease reserves {capacity}",
+                requirements.size
+            ))
+            .into());
+        }
+        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (host.device.fp().get_memory_host_pointer_properties_ext)(
+                host.device.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                pointer as *const std::ffi::c_void,
+                &mut properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(ExecutionFailure::vulkan(
+                result,
+                format!("query buffer {index} host pointer: {result}"),
+            ));
+        }
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits & properties.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+            .host_pointer(pointer as *mut std::ffi::c_void);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut import);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("import buffer {index} host memory: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind buffer {index} imported memory: {error}"),
+            ));
+        }
+        self.buffers.push(GpuBuffer {
+            index: u64::from(index),
+            buffer,
+            memory,
+            bind_offset: 0,
+            len,
+            host_pointer: Some(pointer),
+            mapping: None,
+            uploaded_ranges: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    fn create_descriptors(
+        &mut self,
+        translated: &[&TranslatedComputePipeline],
+        dispatches: &[BoundDispatch],
+    ) -> Result<(), ExecutionFailure> {
+        let pass_count = u32::try_from(dispatches.len())
+            .map_err(|_| failure("descriptor set count overflows u32"))?;
+        let mut storage_buffer_count = 0_u32;
+        let mut sampled_image_count = 0_u32;
+        for pipeline in translated {
+            for binding in &pipeline.reflection().bindings {
+                let counter = match descriptor_type_for_binding(binding) {
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER => &mut sampled_image_count,
+                    _ => &mut storage_buffer_count,
+                };
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
+            }
+        }
+        let mut sizes = Vec::with_capacity(2);
+        if storage_buffer_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: storage_buffer_count,
+            });
+        }
+        if sampled_image_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: sampled_image_count,
+            });
+        }
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(pass_count)
+            .pool_sizes(&sizes);
+        self.descriptor_pool =
+            unsafe { self.context.device.create_descriptor_pool(&pool_info, None) }.map_err(
+                |error| ExecutionFailure::vulkan(error, format!("create descriptor pool: {error}")),
+            )?;
+        let layouts = self
+            .pipeline_objects
+            .iter()
+            .map(|objects| objects.set_layout)
+            .collect::<Vec<_>>();
+        let allocation = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        self.descriptor_sets = unsafe { self.context.device.allocate_descriptor_sets(&allocation) }
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("allocate descriptor sets: {error}"))
+            })?;
+
+        // Each recorded pass owns a distinct immutable set. Updating a single
+        // shared set here would make every dispatch observe the last mapping.
+        for ((dispatch, &set), translated) in
+            dispatches.iter().zip(&self.descriptor_sets).zip(translated)
+        {
+            let reflection = translated.reflection();
+            let mut writes = Vec::with_capacity(reflection.bindings.len());
+            let mut buffer_infos = Vec::with_capacity(reflection.bindings.len());
+            let mut image_infos = Vec::with_capacity(reflection.bindings.len());
+            for binding in &reflection.bindings {
+                if binding.kind == ResourceKind::Texture {
+                    let pool_key = dispatch
+                        .bindings
+                        .iter()
+                        .find(|candidate| {
+                            candidate.metal_index == binding.metal_index
+                                && candidate.key.kind == PoolKind::Texture
+                        })
+                        .map(|candidate| candidate.key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "pass binds no texture at Metal index {}; bindings={:?}",
+                                binding.metal_index, dispatch.bindings
+                            ))
+                        })?;
+                    let texture = self
+                        .textures
+                        .iter()
+                        .find(|texture| texture.pool_key == pool_key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "Metal texture {} was not uploaded for this submission",
+                                binding.metal_index
+                            ))
+                        })?;
+                    let info = vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_view(texture.view)
+                        .sampler(texture.sampler);
+                    image_infos.push(info);
+                    writes.push(vk::WriteDescriptorSet::default());
+                    continue;
+                }
+                let pool_key = dispatch
+                    .bindings
+                    .iter()
+                    .find(|candidate| {
+                        candidate.metal_index == binding.metal_index
+                            && candidate.key.kind == PoolKind::Buffer
+                    })
+                    .expect("validated pass binding")
+                    .key;
+                let window = self.view_window(pool_key);
+                let gpu = self.gpu_buffer(window.buffer_key);
+                let info = vk::DescriptorBufferInfo::default()
+                    .buffer(gpu.buffer)
+                    .offset(window.offset as u64)
+                    .range(window.length as u64);
+                buffer_infos.push(info);
+                writes.push(vk::WriteDescriptorSet::default());
+            }
+            // Attach the collected infos once all pushes are done: the
+            // descriptor writes borrow the vectors, so the slices stay valid
+            // until `update_descriptor_sets` returns.
+            let mut image_cursor = 0;
+            let mut buffer_cursor = 0;
+            let writes = writes
+                .into_iter()
+                .zip(&reflection.bindings)
+                .map(|(write, binding)| {
+                    let descriptor = binding.descriptor.expect("validated descriptor");
+                    let write = write.dst_set(set).dst_binding(descriptor.binding);
+                    if binding.kind == ResourceKind::Texture {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(std::slice::from_ref(&image_infos[image_cursor]));
+                        image_cursor += 1;
+                        write
+                    } else {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&buffer_infos[buffer_cursor]));
+                        buffer_cursor += 1;
+                        write
+                    }
+                })
+                .collect::<Vec<_>>();
+            unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
+        }
+        Ok(())
+    }
+
+    /// Encode one `VkDispatchIndirectCommand` into a host-visible
+    /// `INDIRECT_BUFFER` the compute rail replays with `vkCmdDispatchIndirect`
+    /// (`research/docs/25` §6 Step 4). The command is written by the CPU once
+    /// and unmapped, mirroring `render::create_indirect_draw`: this is the ICB
+    /// *equivalent*, not a `VK_EXT_device_generated_commands` device command.
+    fn create_indirect_dispatch(&mut self, threadgroups: [u32; 3]) -> Result<(), ExecutionFailure> {
+        let command = vk::DispatchIndirectCommand {
+            x: threadgroups[0],
+            y: threadgroups[1],
+            z: threadgroups[2],
+        };
+        let byte_length = std::mem::size_of::<vk::DispatchIndirectCommand>() as u64;
+        let info = vk::BufferCreateInfo::default()
+            .size(byte_length)
+            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create indirect buffer: {error}"))
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate indirect memory: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind indirect memory: {error}"),
+            ));
+        }
+        let mapping = match unsafe {
+            self.context.device.map_memory(
+                memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map indirect memory: {error}"),
+                ));
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &command as *const vk::DispatchIndirectCommand as *const u8,
+                mapping.cast::<u8>(),
+                byte_length as usize,
+            );
+            self.context.device.unmap_memory(memory);
+        }
+        self.indirect_buffer = buffer;
+        self.indirect_memory = memory;
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        translated: &[&TranslatedComputePipeline],
+        plans: &[KernelDispatchPlan],
+        queue_index: usize,
+    ) -> Result<(), ExecutionFailure> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(self.context.queue_families[queue_index])
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        self.command_pool = unsafe { self.context.device.create_command_pool(&pool_info, None) }
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("create command pool: {error}"))
+            })?;
+        let allocation = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        self.command = unsafe { self.context.device.allocate_command_buffers(&allocation) }
+            .map_err(|error| {
+                ExecutionFailure::vulkan(error, format!("allocate command buffer: {error}"))
+            })?[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.context
+                .device
+                .begin_command_buffer(self.command, &begin)
+                .map_err(|error| {
+                    ExecutionFailure::vulkan(error, format!("begin command buffer: {error}"))
+                })?;
+            // Host-visible linear images are uploaded in PREINITIALIZED and the
+            // sampled descriptor binds them in GENERAL, so the first transition
+            // needs only the new layout, not an access scope.
+            for texture in &self.textures {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::PREINITIALIZED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+            for (pass_index, plan) in plans.iter().enumerate() {
+                let objects = &self.pipeline_objects[pass_index];
+                let reflection = translated[pass_index].reflection();
+                let offset = reflection
+                    .kernel_dispatch
+                    .expect("validated kernel dispatch")
+                    .push_constant_range()
+                    .expect("validated exact range")
+                    .offset;
+                self.context.device.cmd_bind_descriptor_sets(
+                    self.command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    objects.pipeline_layout,
+                    reflection.descriptor_layout.set,
+                    &[self.descriptor_sets[pass_index]],
+                    &[],
+                );
+                if pass_index != 0 {
+                    // Order all earlier compute accesses and make their writes
+                    // visible to the next pass's reads and writes (RAW/WAW).
+                    // The execution dependency also covers WAR hazards.
+                    // Khronos legacy compute-to-compute synchronization:
+                    // https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples-(Legacy-synchronization-APIs)
+                    let barriers = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    self.context.device.cmd_pipeline_barrier(
+                        self.command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barriers,
+                        &[],
+                        &[],
+                    );
+                }
+                for region in &plan.regions {
+                    let pipeline = objects.pipelines[&region.local_size];
+                    self.context.device.cmd_bind_pipeline(
+                        self.command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline,
+                    );
+                    let words = plan.push_constants(*region);
+                    let bytes = words
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect::<Vec<_>>();
+                    self.context.device.cmd_push_constants(
+                        self.command,
+                        objects.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        offset,
+                        &bytes,
+                    );
+                    if std::env::var_os("METAL_API_DEBUG_DISPATCH").is_some() {
+                        eprintln!(
+                            "DISPATCH region local={:?} groups={:?} threads_base={:?}",
+                            region.local_size, region.group_count, region.thread_base
+                        );
+                    }
+                    if self.indirect_buffer == vk::Buffer::null() {
+                        self.context.device.cmd_dispatch(
+                            self.command,
+                            region.group_count[0],
+                            region.group_count[1],
+                            region.group_count[2],
+                        );
+                    } else {
+                        // The indirect replay reads the workgroup count the CPU
+                        // encoded above from the host-visible `INDIRECT_BUFFER`.
+                        self.context.device.cmd_dispatch_indirect(
+                            self.command,
+                            self.indirect_buffer,
+                            0,
+                        );
+                    }
+                }
+            }
+            // Fence retirement establishes execution completion; this barrier
+            // makes compute writes available to coherent host readback.
+            let readback_barriers = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            self.context.device.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &readback_barriers,
+                &[],
+                &[],
+            );
+            self.context
+                .device
+                .end_command_buffer(self.command)
+                .map_err(|error| {
+                    ExecutionFailure::vulkan(error, format!("end command buffer: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, queue_index: usize) -> Result<(), SubmissionFailure> {
+        self.queue_index = queue_index;
+        self.context.notify_enqueue(queue_index);
+        self.fence = unsafe {
+            self.context
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| SubmissionFailure::Safe {
+            phase: ProviderPhase::Encode,
+            error: ExecutionFailure::vulkan(error, format!("create completion fence: {error}")),
+        })?;
+        let commands = [self.command];
+        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+        if let Err(result) = self
+            .context
+            .submit_commands(queue_index, &submits, self.fence)
+        {
+            let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                result,
+                format!("submit compute command buffer: {result}"),
+            ));
+            if failure.is_device_lost() {
+                // A driver-reported loss is a terminal device event, not an
+                // execution failure: the queue never confirmed the submission,
+                // and the device is gone, so these handles are destroyed
+                // instead of retained (`resource_drop_policy`).
+                self.mark_device_lost();
+                self.device_loss_fault = Some(self.context.observe_device_loss());
+            } else {
+                // The queue did not confirm the submission, so nothing about
+                // this context may be reused: the outcome of the fence is
+                // unknown.
+                self.context.mark_unobservable_submission();
+            }
+            self.submitted = failure.is_pending();
+            return Err(failure);
+        }
+        self.context.record_queue_submission(queue_index);
+        self.submitted = true;
+        Ok(())
+    }
+
+    fn wait(&mut self, timeout_ns: u64) -> Result<bool, SubmissionFailure> {
+        let wait = self.context.wait_for_fence(self.fence, timeout_ns);
+        match wait {
+            Ok(()) => {
+                if !self.completed {
+                    self.completed = true;
+                    self.context.record_queue_retirement(self.queue_index);
+                }
+                Ok(true)
+            }
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(false),
+            Err(result) if result == vk::Result::ERROR_DEVICE_LOST => {
+                // The loss is observed while waiting, so the submission
+                // reached the queue and its handles are still unknowns: the
+                // resources stay submitted and are destroyed by the device
+                // loss, and the context stops admitting work through the core
+                // lifecycle.
+                self.mark_device_lost();
+                self.device_loss_fault = Some(self.context.observe_device_loss());
+                Err(SubmissionFailure::Pending {
+                    phase: ProviderPhase::Wait,
+                    error: ExecutionFailure::vulkan(
+                        result,
+                        format!("wait for compute completion failed: {result}"),
+                    ),
+                })
+            }
+            Err(result) => {
+                self.context.mark_unobservable_submission();
+                Err(SubmissionFailure::Pending {
+                    phase: ProviderPhase::Wait,
+                    error: ExecutionFailure::vulkan(
+                        result,
+                        format!("wait for compute completion failed: {result}"),
+                    ),
+                })
+            }
+        }
+    }
+
+    fn read_updates(
+        &self,
+        writable_pool_keys: &BTreeSet<u32>,
+    ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
+        let mut updates = Vec::new();
+        // One readback operation per distinct device buffer, then one slice per
+        // writable view: a shared backing is read once even when several of its
+        // views are writable.
+        let mut read_buffers = BTreeSet::<u64>::new();
+        for &pool_key in writable_pool_keys {
+            let window = self.view_window(PoolKey::buffer(pool_key));
+            let gpu = self.gpu_buffer(window.buffer_key);
+            // Owned backings were mapped once at creation and are unmapped only
+            // when the execution resources are destroyed; imported backings are
+            // the owner's own mapping.
+            let mapping = gpu
+                .host_pointer
+                .or(gpu.mapping)
+                .ok_or_else(|| failure(format!("buffer {} is not mapped", gpu.index)))?;
+            if read_buffers.insert(window.buffer_key) {
+                self.context.record_buffer_readback();
+            }
+            let end = window.offset + window.length;
+            if end > gpu.len {
+                return Err(failure(format!(
+                    "buffer pool key {pool_key} window ends at {end}, beyond its backing"
+                ))
+                .into());
+            }
+            let host_offset = gpu.bind_offset.checked_add(window.offset).ok_or_else(|| {
+                failure(format!(
+                    "buffer pool key {pool_key} host offset overflows usize"
+                ))
+            })?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts((mapping as *const u8).add(host_offset), window.length)
+            };
+            let bytes = bytes.to_vec();
+            if !bytes.is_empty() {
+                self.context.record_buffer_readback_bytes(bytes.len());
+            }
+            updates.push(BufferUpdate {
+                index: pool_key,
+                offset: 0,
+                bytes,
+            });
+        }
+        updates.sort_by_key(|update| update.index);
+        Ok(updates)
+    }
+}
+
+impl Drop for ExecutionResources {
+    fn drop(&mut self) {
+        // A retained in-flight submission may still read or write borrowed
+        // owner memory, so only a destroying drop retires its retains.
+        if resource_drop_policy(self.submitted, self.completed, self.device_lost)
+            == ResourceDropPolicy::Retain
+        {
+            if !self.leak_is_budgeted {
+                // Retaining an unretirable submission is exactly what the
+                // bounded abandonment budget accounts for: recording it ends
+                // the context in the same transition that counts it.
+                self.context.record_abandonment(self.owned_bytes());
+            }
+            // A panic between queue submission and the explicit wait outcome
+            // cannot unwind into destruction of in-flight handles. Raw Vulkan
+            // handles below are intentionally left live, and this strong
+            // context reference keeps the loader/device live until process exit.
+            let _ = Arc::into_raw(Arc::clone(&self.context));
+            // Rust still drops fields after this Drop returns. Explicitly retain
+            // child RAII owners as well as the raw execution handles.
+            for objects in self.pipeline_objects.drain(..) {
+                std::mem::forget(objects);
+            }
+            return;
+        }
+        if self.submitted && !self.completed {
+            self.context.record_queue_retirement(self.queue_index);
+        }
+        if let Some((registry, lease_ids)) = self.borrowed.take() {
+            registry.retire_all(&lease_ids);
+        }
+        unsafe {
+            if self.fence != vk::Fence::null() {
+                self.context.device.destroy_fence(self.fence, None);
+            }
+            if self.command_pool != vk::CommandPool::null() {
+                self.context
+                    .device
+                    .destroy_command_pool(self.command_pool, None);
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.context
+                    .device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            self.pipeline_objects.clear();
             for buffer in &self.buffers {
                 self.context.device.destroy_buffer(buffer.buffer, None);
-                self.context.device.free_memory(buffer.memory, None);
+                if buffer.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(buffer.memory, None);
+                }
+            }
+            if let Some(memory) = self.heap_memory {
+                self.context.device.free_memory(memory, None);
+            }
+            for texture in &self.textures {
+                self.context.device.destroy_sampler(texture.sampler, None);
+                self.context.device.destroy_image_view(texture.view, None);
+                self.context.device.destroy_image(texture.image, None);
+                self.context.device.free_memory(texture.memory, None);
+            }
+            // The indirect buffer is unbound by construction (its memory is
+            // freed right after), so destroy before free, matching the render
+            // rail's `create_indirect_draw` teardown.
+            if self.indirect_buffer != vk::Buffer::null() {
+                self.context
+                    .device
+                    .destroy_buffer(self.indirect_buffer, None);
+            }
+            if self.indirect_memory != vk::DeviceMemory::null() {
+                self.context.device.free_memory(self.indirect_memory, None);
             }
         }
     }
@@ -1256,7 +4612,1753 @@ impl Drop for ExecutionResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle;
+    use metal_api_core::provider::{FieldValue, Retryability};
+
+    #[test]
+    fn heap_bind_failure_frees_memory_after_every_buffer_is_destroyed() {
+        let failing = vk::Buffer::from_raw(3);
+        let bound = [vk::Buffer::from_raw(1), vk::Buffer::from_raw(2)];
+        let steps = heap_slab_bind_failure_cleanup(failing, &bound);
+        // The slab memory may only be freed after every buffer bound to it has
+        // been destroyed; `Free` must therefore be the final step.
+        assert_eq!(
+            steps,
+            vec![
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(3)),
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(1)),
+                HeapSlabCleanup::Destroy(vk::Buffer::from_raw(2)),
+                HeapSlabCleanup::Free,
+            ]
+        );
+        assert!(matches!(steps.last(), Some(HeapSlabCleanup::Free)));
+    }
+
+    /// Test-only helper: turn (metal_index, pool index) pairs into bindings,
+    /// taking each binding's width from the pool it names.
+    fn test_bindings(pairs: &[(u32, u32)], pool: &[BufferBinding]) -> Vec<Binding> {
+        pairs
+            .iter()
+            .map(|&(metal_index, index)| Binding {
+                metal_index,
+                key: PoolKey::buffer(index),
+                width: pool
+                    .iter()
+                    .find(|buffer| buffer.index == index)
+                    .map(|buffer| buffer.bytes.len())
+                    .unwrap_or(0),
+            })
+            .collect()
+    }
+
+    fn test_pool_width(pool: &[BufferBinding], index: u32) -> usize {
+        pool.iter()
+            .find(|buffer| buffer.index == index)
+            .map(|buffer| buffer.bytes.len())
+            .unwrap_or(0)
+    }
+
+    use metal2vulkan::meta::{KernMeta, KernRole};
     use metal2vulkan::reflect::{BufferStrideTerm, BufferStridedAccess};
+
+    #[test]
+    fn texture_fixture_translates_and_reflects_a_sampled_binding() {
+        let source =
+            include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll");
+        let options = TransformOptions {
+            kernel_local_size: [1, 1, 1],
+            kernel_dispatch: Some(KernelDispatch::safe_default()),
+            ..TransformOptions::default()
+        };
+        let scratch = ScratchDir::new().expect("scratch directory");
+        let (spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            source,
+            Stage::Kernel,
+            &scratch.path,
+            options,
+        )
+        .expect("the texture fixture translates");
+        assert!(!spirv.is_empty());
+        let texture = reflection
+            .bindings
+            .iter()
+            .find(|binding| binding.texture_shape.is_some())
+            .expect("the fixture reflects a texture binding");
+        assert_eq!(texture.access, Some(ResourceAccess::Sampled));
+    }
+
+    #[test]
+    fn texture_fixture_creates_a_compute_pipeline_on_the_selected_device() {
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let device = metal_api_core::Device::new(executor);
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        // The pipeline creates once reflection admits a sampled texture: the
+        // descriptor-set layout carries a combined image sampler for it. The
+        // execution path still has to create the image, sampler and descriptor
+        // write (`research/docs/16` §4.3).
+        device
+            .new_compute_pipeline_state(&function)
+            .expect("a texture-reading pipeline creates its descriptor layout");
+    }
+
+    #[test]
+    fn object_api_binds_and_executes_a_sampled_texture() {
+        use metal_api_core::provider::TextureFormat;
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+        let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = device
+            .compile_pipeline(metal_api_core::provider::PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_sampled_texture".to_vec(),
+                )
+                .expect("digest"),
+                source: metal_api_core::provider::ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = device
+            .new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)
+            .expect("texture object");
+        let output = device
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("encoder");
+            encoder
+                .set_compute_pipeline_state(&pipeline)
+                .expect("pipeline state");
+            encoder.set_texture(0, &texture).expect("texture binding");
+            encoder
+                .set_buffer(0, &output.view(0, 64).unwrap())
+                .expect("buffer binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end encoding");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        let observed = output.read().expect("readback");
+        assert_eq!(observed[..4], 0_u32.to_le_bytes());
+    }
+
+    /// The object API now owns a render command encoder, so one command buffer
+    /// can run the declaring compute pass and then render (and present) into
+    /// the attachment buffer the compute pass declared. This is the object-rail
+    /// sibling of the trace rail's render+present round trip.
+    #[test]
+    fn object_api_executes_render_and_present_on_the_selected_device() {
+        use metal_api_core::provider::{
+            AttachmentFormat, PipelineCompileRequest, RenderPipelineContract, SemanticDigest,
+            ShaderSource, VertexLayout,
+        };
+        use metal_api_core::provider_api::{self as objects, RenderAttachmentLoad};
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider = Arc::new(
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider"),
+        );
+        let device = objects::Device::new(
+            Arc::clone(&provider) as Arc<dyn metal_api_core::provider::PipelineProvider>
+        );
+
+        let copy = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "copy_word".to_owned(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_declaring".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("compute pipeline");
+        let render_metadata = provider
+            .register_render_pipeline(RenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: "vertex_main".to_owned(),
+                    fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                    vertex_layout: VertexLayout::None,
+                },
+                vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(&[
+                    AttachmentFormat::Rgba8Unorm,
+                ])
+                .expect("reviewed fragment stage")
+                .to_vec(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_pipeline".to_vec(),
+                )
+                .expect("digest"),
+            })
+            .expect("render pipeline registration");
+        let render = device
+            .render_pipeline(&render_metadata)
+            .expect("render handle");
+
+        let attachment = device
+            .new_buffer_with_bytes(vec![0xfe; 16])
+            .expect("attachment buffer");
+        let attachment_view = attachment.view(0, 16).expect("attachment view");
+        let output = device
+            .new_buffer_with_bytes(vec![0xff; 4])
+            .expect("output buffer");
+        let output_view = output.view(0, 4).expect("output view");
+
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("compute encoder");
+            encoder
+                .set_compute_pipeline_state(&copy)
+                .expect("compute pipeline");
+            encoder
+                .set_buffer(0, &attachment_view)
+                .expect("attachment binding");
+            encoder.set_buffer(1, &output_view).expect("output binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end compute");
+        }
+        {
+            let mut encoder = command.render_command_encoder().expect("render encoder");
+            encoder
+                .set_render_pipeline_state(&render)
+                .expect("render pipeline");
+            encoder
+                .draw_render_pass(
+                    &attachment_view,
+                    AttachmentFormat::Rgba8Unorm,
+                    2,
+                    2,
+                    RenderAttachmentLoad::Clear([0xfe; 4]),
+                    Some(objects::PresentInitial::Sentinel([0xef; 4])),
+                )
+                .expect("render pass");
+            encoder.end_encoding().expect("end render");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        assert_eq!(
+            attachment.read().expect("attachment readback"),
+            [0x40, 0x80, 0xc0, 0xff].repeat(4),
+            "the rendered attachment reads back the solid unorm8 colour"
+        );
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "one present target is acquired and presented once"
+        );
+    }
+
+    /// In deferred mode the present tail executes during `submit`, so a
+    /// cancelled present-bearing command abandons the writeback landing but
+    /// keeps the submit-time present action (counters and target layout).
+    #[test]
+    fn cancelling_an_async_present_command_keeps_the_submit_time_present() {
+        use metal_api_core::provider::{
+            AttachmentFormat, CompletionDisposition, PipelineCompileRequest,
+            RenderPipelineContract, SemanticDigest, ShaderSource, VertexLayout,
+        };
+        use metal_api_core::provider_api::{self as objects, RenderAttachmentLoad};
+        use metal_api_core::CommandBufferStatus;
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let provider = Arc::new(
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor))
+                .expect("provider")
+                .with_async_execution(true),
+        );
+        let device = objects::Device::new(provider.clone());
+
+        let copy = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "copy_word".to_owned(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_cancel_declaring".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_copy_word.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("compute pipeline");
+        let render_metadata = provider
+            .register_render_pipeline(RenderPipelineRequest {
+                contract: RenderPipelineContract {
+                    vertex_entry: "vertex_main".to_owned(),
+                    fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
+                    color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                    vertex_layout: VertexLayout::None,
+                },
+                vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
+                fragment_spirv: crate::render::solid_fragment_spirv(&[
+                    AttachmentFormat::Rgba8Unorm,
+                ])
+                .expect("reviewed fragment stage")
+                .to_vec(),
+                logical_digest: SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"object_render_cancel_pipeline".to_vec(),
+                )
+                .expect("digest"),
+            })
+            .expect("render pipeline registration");
+        let render = device
+            .render_pipeline(&render_metadata)
+            .expect("render handle");
+
+        let attachment = device
+            .new_buffer_with_bytes(vec![0xfe; 16])
+            .expect("attachment buffer");
+        let attachment_view = attachment.view(0, 16).expect("attachment view");
+        let output = device
+            .new_buffer_with_bytes(vec![0xff; 4])
+            .expect("output buffer");
+        let output_view = output.view(0, 4).expect("output view");
+
+        let queue = device.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("compute encoder");
+            encoder
+                .set_compute_pipeline_state(&copy)
+                .expect("compute pipeline");
+            encoder
+                .set_buffer(0, &attachment_view)
+                .expect("attachment binding");
+            encoder.set_buffer(1, &output_view).expect("output binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end compute");
+        }
+        {
+            let mut encoder = command.render_command_encoder().expect("render encoder");
+            encoder
+                .set_render_pipeline_state(&render)
+                .expect("render pipeline");
+            encoder
+                .draw_render_pass(
+                    &attachment_view,
+                    AttachmentFormat::Rgba8Unorm,
+                    2,
+                    2,
+                    RenderAttachmentLoad::Clear([0xfe; 4]),
+                    Some(objects::PresentInitial::Sentinel([0xef; 4])),
+                )
+                .expect("render pass");
+            encoder.end_encoding().expect("end render");
+        }
+        command.commit().expect("commit");
+        assert_eq!(
+            command.status().unwrap(),
+            CommandBufferStatus::Committed,
+            "the deferred command stays Committed until its results land"
+        );
+        // The present action ran during `submit`, before any observation.
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "the present tail advances its counters at submit time"
+        );
+        command.cancel().expect("cancel");
+        assert_eq!(
+            command.status().unwrap(),
+            CommandBufferStatus::Failed,
+            "cancel turns the command Failed"
+        );
+        assert!(matches!(
+            command.wait_until_completed(),
+            Err(objects::Error::CompletionUnavailable(
+                CompletionDisposition::Cancelled { .. }
+            ))
+        ));
+        // Cancel does not roll the present action back, and neither the render
+        // writeback nor the compute writeback landed.
+        assert_eq!(
+            provider.present_counts(),
+            (1, 1),
+            "cancel abandons observation without rolling the present back"
+        );
+        assert_eq!(
+            attachment.read().expect("attachment readback"),
+            vec![0xfe; 16],
+            "the render writeback is not landed by a cancelled command"
+        );
+        assert_eq!(
+            output.read().expect("output readback"),
+            vec![0xff; 4],
+            "the compute writeback is not landed by a cancelled command"
+        );
+    }
+
+    #[test]
+    fn texture_fixture_executes_a_texel_read_on_the_selected_device() {
+        use metal_api_core::provider::{
+            AllocationId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+            ViewId,
+        };
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        // 4x4 R32Uint texels 0..15; thread 0 reads texel (0, 0).
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = TextureView {
+            view_id: ViewId::new(900),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(901),
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(texels),
+        };
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 64],
+            }],
+            textures: vec![texture],
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).unwrap(),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).unwrap(),
+        };
+        let updates = executor.execute(submission).expect("texture read executes");
+        assert_eq!(updates.len(), 1);
+        // The fixture declares a 64-byte output buffer; a 1x1 dispatch writes
+        // only its first word.
+        assert_eq!(updates[0].bytes.len(), 64);
+        assert_eq!(updates[0].bytes[..4], 0_u32.to_le_bytes());
+    }
+
+    fn serial_fixture() -> (
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+    ) {
+        let meta = KernMeta {
+            roles: vec![(0, KernRole::Buffer(0))],
+            max_work_group_size: Some(32),
+            ..KernMeta::default()
+        };
+        let mut reflection = ShaderReflection::from_kernel(&meta, Some("serial"), [1, 1, 1]);
+        reflection.kernel_dispatch = Some(KernelDispatch::safe_default());
+        reflection.bindings[0].footprint = Some(BufferFootprint {
+            static_ranges: Vec::new(),
+            strided_accesses: vec![BufferStridedAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdX,
+                        stride: 4,
+                    },
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdY,
+                        stride: 40,
+                    },
+                    BufferStrideTerm {
+                        source: BufferIndexSource::GlobalInvocationIdZ,
+                        stride: 120,
+                    },
+                ],
+            }],
+            has_unbounded_access: false,
+        });
+        let limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_size: [128, 128, 64],
+            max_compute_work_group_invocations: 128,
+            max_compute_work_group_count: [65535; 3],
+            max_push_constants_size: 128,
+            max_bound_descriptor_sets: 4,
+            max_per_stage_descriptor_storage_buffers: 8,
+            max_descriptor_set_storage_buffers: 8,
+            max_per_stage_resources: 8,
+            max_storage_buffer_range: 4096,
+            ..vk::PhysicalDeviceLimits::default()
+        };
+        (
+            TranslatedComputePipeline {
+                spv: Vec::new(),
+                reflection,
+            },
+            vec![BufferBinding {
+                index: 0,
+                bytes: vec![0; 240],
+            }],
+            limits,
+        )
+    }
+
+    fn rebound_fixture() -> (
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+    ) {
+        let (mut translated, mut buffers, limits) = serial_fixture();
+        translated.reflection.bindings[0].access = Some(ResourceAccess::ReadOnly);
+        let mut output = translated.reflection.bindings[0].clone();
+        output.metal_index = 1;
+        output.descriptor.as_mut().unwrap().binding = 1;
+        output.access = Some(ResourceAccess::WriteOnly);
+        translated.reflection.bindings.push(output);
+        buffers.push(BufferBinding {
+            index: 1,
+            bytes: vec![0; 240],
+        });
+        (translated, buffers, limits)
+    }
+
+    fn ping_pong_dispatches(pool: &[BufferBinding]) -> Vec<BoundDispatch> {
+        vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
+            },
+        ]
+    }
+
+    fn alternate_pipeline_fixture() -> TranslatedComputePipeline {
+        let meta = KernMeta {
+            roles: vec![(0, KernRole::Buffer(3)), (1, KernRole::Buffer(7))],
+            max_work_group_size: Some(16),
+            ..KernMeta::default()
+        };
+        let mut reflection = ShaderReflection::from_kernel(&meta, Some("alternate"), [1; 3]);
+        reflection.kernel_dispatch = Some(KernelDispatch::ThreadsDynamic { offset: 16 });
+        let (first, _, _) = rebound_fixture();
+        for (index, binding) in reflection.bindings.iter_mut().enumerate() {
+            binding.footprint = first.reflection.bindings[index].footprint.clone();
+            // Deliberately reverse access roles while retaining the same pool
+            // mapping, so readback must consult each pipeline's reflection.
+            binding.access = Some(if index == 0 {
+                ResourceAccess::WriteOnly
+            } else {
+                ResourceAccess::ReadOnly
+            });
+        }
+        validate_pipeline_reflection("alternate", &reflection).unwrap();
+        TranslatedComputePipeline {
+            spv: Vec::new(),
+            reflection,
+        }
+    }
+
+    fn mixed_pipeline_dispatches(pool: &[BufferBinding]) -> Vec<BoundDispatch> {
+        vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 3,
+                        key: PoolKey::buffer(0),
+                        width: test_pool_width(pool, 0),
+                    },
+                    Binding {
+                        metal_index: 7,
+                        key: PoolKey::buffer(1),
+                        width: test_pool_width(pool, 1),
+                    },
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn mixed_preflight_uses_each_shader_binding_layout_and_write_access() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        assert_ne!(
+            first.reflection.bindings[0].descriptor,
+            second.reflection.bindings[0].descriptor
+        );
+        let dispatches = mixed_pipeline_dispatches(&buffers);
+        let planned =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap();
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([0, 1]));
+        assert_eq!(planned.plans.len(), 2);
+        for (plan, dispatch) in planned.plans.iter().zip(dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    fn subset_pipeline_fixture() -> (
+        TranslatedComputePipeline,
+        TranslatedComputePipeline,
+        Vec<BufferBinding>,
+        vk::PhysicalDeviceLimits,
+        Vec<BoundDispatch>,
+    ) {
+        let (mut first, mut buffers, limits) = rebound_fixture();
+        let mut scalar = first.reflection.bindings[0].clone();
+        scalar.metal_index = 9;
+        scalar.descriptor.as_mut().unwrap().binding = 9;
+        scalar.footprint.as_mut().unwrap().strided_accesses[0]
+            .terms
+            .clear();
+        first.reflection.bindings.push(scalar);
+        validate_pipeline_reflection("serial", &first.reflection).unwrap();
+        buffers[0].index = 11;
+        buffers[1].index = 19;
+        buffers.push(BufferBinding {
+            index: 23,
+            bytes: vec![0; 4],
+        });
+        buffers.push(BufferBinding {
+            index: 29,
+            bytes: vec![0; 240],
+        });
+        let dispatches = vec![
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 9,
+                        key: PoolKey::buffer(23),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 23)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [7, 2, 1],
+                local: [4, 1, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 3,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 7,
+                        key: PoolKey::buffer(29),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 29)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(29),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 29)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 9,
+                        key: PoolKey::buffer(23),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 23)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+        ];
+        (
+            first,
+            alternate_pipeline_fixture(),
+            buffers,
+            limits,
+            dispatches,
+        )
+    }
+
+    #[test]
+    fn subset_preflight_allows_three_two_three_slots_and_later_pool_resources() {
+        let (first, second, buffers, limits, dispatches) = subset_pipeline_fixture();
+        let planned =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap();
+        // Resource 29 appears only in later passes and takes slot 1 from 19.
+        // The scalar pool resource stays read-only and is absent in pass two.
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([19, 29]));
+        assert_eq!(planned.plans.len(), 3);
+        for (plan, dispatch) in planned.plans.iter().zip(dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    #[test]
+    fn subset_preflight_rejects_unused_pool_and_invalid_per_pass_maps() {
+        let (first, second, mut buffers, limits, dispatches) = subset_pipeline_fixture();
+        buffers.push(BufferBinding {
+            index: 31,
+            bytes: vec![0; 240],
+        });
+        let error =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("at least one pass"));
+        buffers.pop();
+
+        for (bindings, detail) in [
+            (
+                test_bindings(&[(3, 19), (7, 31)], &buffers),
+                "unknown buffer pool key 31",
+            ),
+            (
+                test_bindings(&[(3, 19), (7, 19)], &buffers),
+                "bound more than once in one pass",
+            ),
+            (
+                test_bindings(&[(3, 19)], &buffers),
+                "do not match reflection",
+            ),
+            (
+                test_bindings(&[(3, 19), (3, 29)], &buffers),
+                "buffer 3 is bound more than once",
+            ),
+            (
+                test_bindings(&[(3, 19), (7, 29), (9, 11)], &buffers),
+                "buffer 9 is not reflected",
+            ),
+        ] {
+            let mut invalid_dispatches = dispatches.clone();
+            invalid_dispatches[1].bindings = bindings;
+            let error = plan_pipeline_sequence(
+                &[&first, &second, &first],
+                &buffers,
+                &limits,
+                &invalid_dispatches,
+            )
+            .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert!(error.detail.unwrap().contains(detail));
+        }
+    }
+
+    #[test]
+    fn subset_preflight_checks_scalar_rebound_to_later_array_footprint() {
+        let (first, second, buffers, limits, mut dispatches) = subset_pipeline_fixture();
+        // The first pipeline reads pool 23 as a scalar, but the next pipeline
+        // reads its input as an array. The later pass must reject that mapping.
+        plan_pipeline_sequence(&[&first], &buffers[..3], &limits, &dispatches[..1]).unwrap();
+        dispatches[1].bindings[1] = Binding {
+            metal_index: 7,
+            key: PoolKey::buffer(23),
+            width: buffers[..]
+                .iter()
+                .find(|buffer| buffer.index == 23)
+                .map_or(0, |buffer| buffer.bytes.len()),
+        };
+        let error =
+            plan_pipeline_sequence(&[&first, &second, &first], &buffers, &limits, &dispatches)
+                .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error
+            .detail
+            .unwrap()
+            .contains("buffer 7 length 4 is shorter than reflected reach 68"));
+    }
+
+    #[test]
+    fn subset_preflight_bounds_total_resources_separately_from_per_pass_descriptors() {
+        let (mut translated, _, limits) = serial_fixture();
+        let template = translated.reflection.bindings[0].clone();
+        translated.reflection.bindings = (0..8)
+            .map(|index| {
+                let mut binding = template.clone();
+                binding.metal_index = index;
+                binding.descriptor.as_mut().unwrap().binding = index;
+                binding
+            })
+            .collect();
+        let mut buffers = (0..MAX_SERIAL_RESOURCES)
+            .map(|index| BufferBinding {
+                index: index as u32,
+                bytes: vec![0; 4],
+            })
+            .collect::<Vec<_>>();
+        let dispatches = (0..8)
+            .map(|pass| BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: (0..8)
+                    .map(|index| Binding {
+                        metal_index: index,
+                        key: PoolKey::buffer(pass * 8 + index),
+                        width: test_pool_width(&buffers, pass * 8 + index),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let translated = vec![&translated; 8];
+        assert_eq!(
+            plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches)
+                .unwrap()
+                .plans
+                .len(),
+            8
+        );
+        buffers.push(BufferBinding {
+            index: MAX_SERIAL_RESOURCES as u32,
+            bytes: vec![0; 4],
+        });
+        let error =
+            plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("serial resource limit 64"));
+    }
+
+    #[test]
+    fn mixed_preflight_rejects_missing_or_extra_pipeline_artifacts() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
+        for translated in [vec![], vec![&first], vec![&first, &second, &first]] {
+            let error =
+                plan_pipeline_sequence(&translated, &buffers, &limits, &dispatches).unwrap_err();
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert!(error.detail.unwrap().contains("artifact count"));
+        }
+    }
+
+    #[test]
+    fn mixed_preflight_checks_later_shader_footprint_before_any_execution() {
+        let (first, buffers, limits) = rebound_fixture();
+        let mut second = alternate_pipeline_fixture();
+        second.reflection.bindings[0]
+            .footprint
+            .as_mut()
+            .unwrap()
+            .strided_accesses[0]
+            .base_offset = 240;
+        let dispatches = mixed_pipeline_dispatches(&buffers);
+        plan_pipeline_sequence(&[&first], &buffers, &limits, &dispatches[..1]).unwrap();
+        let error =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("buffer 3"));
+    }
+
+    #[test]
+    fn mixed_preflight_checks_later_shader_push_range_and_air_threadgroup_limit() {
+        let (first, buffers, limits) = rebound_fixture();
+        let second = alternate_pipeline_fixture();
+        let dispatches = mixed_pipeline_dispatches(&buffers);
+        let small_push_limits = vk::PhysicalDeviceLimits {
+            max_push_constants_size: 48,
+            ..limits
+        };
+        plan_pipeline_sequence(&[&first], &buffers, &small_push_limits, &dispatches[..1]).unwrap();
+        let error = plan_pipeline_sequence(
+            &[&first, &second],
+            &buffers,
+            &small_push_limits,
+            &dispatches,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("push constants end at 64"));
+
+        let mut dispatches = dispatches;
+        dispatches[1].local = [8, 4, 1];
+        let error =
+            plan_pipeline_sequence(&[&first, &second], &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        assert!(error.detail.unwrap().contains("AIR permits at most 16"));
+    }
+
+    #[test]
+    fn rebound_preflight_accepts_ping_pong_and_collects_all_written_pool_keys() {
+        let (translated, buffers, limits) = rebound_fixture();
+        let dispatches = ping_pong_dispatches(&buffers);
+        let first =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
+        assert_eq!(first.writable_pool_keys, BTreeSet::from([1]));
+        let both = plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap();
+        // Pool 0 is read-only initially and writable later; both resources need
+        // one final update even though their binding roles change between passes.
+        assert_eq!(both.writable_pool_keys, BTreeSet::from([0, 1]));
+        assert_eq!(both.plans.len(), 2);
+        for (plan, dispatch) in both.plans.iter().zip(&dispatches) {
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], dispatch.grid);
+        }
+    }
+
+    #[test]
+    fn rebound_preflight_separates_pool_keys_from_metal_binding_indices() {
+        let (translated, mut buffers, limits) = rebound_fixture();
+        buffers[0].index = 11;
+        buffers[1].index = 19;
+        let dispatches = [
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [10, 3, 2],
+                local: [8, 2, 1],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(19),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 19)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(11),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 11)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+        ];
+        let planned = plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap();
+        assert_eq!(planned.writable_pool_keys, BTreeSet::from([11, 19]));
+    }
+
+    #[test]
+    fn rebound_preflight_rejects_ambiguous_or_incomplete_resource_maps() {
+        let (translated, buffers, limits) = rebound_fixture();
+        for bindings in [
+            // Duplicate pool use.
+            test_bindings(&[(0, 0), (1, 0)], &buffers),
+            // Unknown pool key.
+            test_bindings(&[(0, 0), (1, 2)], &buffers),
+            // Missing pool resource and Metal slot.
+            test_bindings(&[(0, 0)], &buffers),
+            // Duplicate Metal slot.
+            test_bindings(&[(0, 0), (0, 1)], &buffers),
+            // Unknown Metal slot.
+            test_bindings(&[(0, 0), (2, 1)], &buffers),
+        ] {
+            let mut dispatches = ping_pong_dispatches(&buffers);
+            dispatches[1].bindings = bindings;
+            let error =
+                plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+        let duplicate_pool = vec![buffers[0].clone(), buffers[0].clone()];
+        let error = plan_rebound_submission(
+            &translated,
+            &duplicate_pool,
+            &limits,
+            &ping_pong_dispatches(&buffers),
+        )
+        .unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("pool key 0 occurs more than once"));
+        let error = plan_rebound_submission(
+            &translated,
+            &buffers[..1],
+            &limits,
+            &ping_pong_dispatches(&buffers),
+        )
+        .unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("unknown buffer pool key 1"));
+    }
+
+    #[test]
+    fn rebound_preflight_checks_the_later_slot_footprint_against_its_mapped_buffer() {
+        let (mut translated, mut buffers, limits) = rebound_fixture();
+        buffers[0].bytes.truncate(4);
+        buffers[1].bytes.truncate(8);
+        translated.reflection.bindings[1]
+            .footprint
+            .as_mut()
+            .unwrap()
+            .strided_accesses[0]
+            .access_size = 8;
+        let dispatches = [
+            BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(0),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 0)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(1),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 1)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+            BoundDispatch {
+                grid: [1; 3],
+                local: [1; 3],
+                bindings: vec![
+                    Binding {
+                        metal_index: 0,
+                        key: PoolKey::buffer(1),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 1)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                    Binding {
+                        metal_index: 1,
+                        key: PoolKey::buffer(0),
+                        width: buffers[..]
+                            .iter()
+                            .find(|buffer| buffer.index == 0)
+                            .map_or(0, |buffer| buffer.bytes.len()),
+                    },
+                ],
+            },
+        ];
+        plan_rebound_submission(&translated, &buffers, &limits, &dispatches[..1]).unwrap();
+        let error =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert!(error.detail.as_deref().unwrap().contains("buffer 1"));
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 8"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        let (translated, buffers, limits) = rebound_fixture();
+        let mut dispatches = ping_pong_dispatches(&buffers);
+        dispatches[1].grid = [11, 3, 2];
+        let error =
+            plan_rebound_submission(&translated, &buffers, &limits, &dispatches).unwrap_err();
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 244"));
+    }
+
+    #[test]
+    fn serial_preflight_preserves_each_dispatch_grid_and_tail_specialization() {
+        let (translated, buffers, limits) = serial_fixture();
+        let dispatches = [([10, 3, 2], [8, 2, 1]), ([7, 2, 1], [4, 1, 1])];
+        let plans =
+            plan_serial_submission(&translated, &buffers, &limits, dispatches[0], &dispatches)
+                .unwrap();
+        assert_eq!(plans.len(), 2);
+        for (plan, (grid, _)) in plans.iter().zip(dispatches) {
+            let launched: u32 = plan
+                .regions
+                .iter()
+                .map(|region| {
+                    region.local_size.into_iter().product::<u32>()
+                        * region.group_count.into_iter().product::<u32>()
+                })
+                .sum();
+            assert_eq!(launched, grid.into_iter().product::<u32>());
+            assert_eq!(plan.push_constants(plan.regions[0])[..3], grid);
+        }
+        let specializations = plans
+            .iter()
+            .flat_map(|plan| &plan.regions)
+            .map(|region| region.local_size)
+            .collect::<BTreeSet<_>>();
+        assert!(specializations.contains(&[8, 2, 1]));
+        assert!(specializations.contains(&[2, 1, 1]));
+        assert!(specializations.contains(&[4, 1, 1]));
+        assert!(specializations.contains(&[3, 1, 1]));
+    }
+
+    #[test]
+    fn serial_preflight_bounds_pass_count_and_rejects_ambiguous_first_sizes() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        assert_eq!(
+            plan_serial_submission(&translated, &buffers, &limits, first, &[first; 8])
+                .unwrap()
+                .len(),
+            8
+        );
+        for dispatches in [Vec::new(), vec![first; 9], vec![([1; 3], [1; 3])]] {
+            let error = plan_serial_submission(&translated, &buffers, &limits, first, &dispatches)
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Args);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
+
+    #[test]
+    fn serial_preflight_checks_later_buffer_reach_and_threadgroup_limits() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        let dispatches = [first, ([11, 3, 2], [8, 2, 1])];
+        let error =
+            plan_serial_submission(&translated, &buffers, &limits, first, &dispatches).unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Args);
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reflected reach 244"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        for local in [[0, 1, 1], [129, 1, 1], [8, 8, 1]] {
+            let dispatches = [first, ([10, 3, 2], local)];
+            let error = plan_serial_submission(&translated, &buffers, &limits, first, &dispatches)
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
+
+    #[test]
+    fn serial_preflight_checks_later_dispatch_count_and_shared_resource_limits() {
+        let (translated, buffers, limits) = serial_fixture();
+        let first = ([10, 3, 2], [8, 2, 1]);
+        let dispatches = [first, ([10, 3, 2], [1, 2, 1])];
+        let small_grid_limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_count: [2, 65535, 65535],
+            ..limits
+        };
+        let error = plan_serial_submission(
+            &translated,
+            &buffers,
+            &small_grid_limits,
+            first,
+            &dispatches,
+        )
+        .unwrap_err();
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert!(error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("group count dimension 0=10"));
+        assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+
+        for reduced in [
+            vk::PhysicalDeviceLimits {
+                max_descriptor_set_storage_buffers: 0,
+                ..limits
+            },
+            vk::PhysicalDeviceLimits {
+                max_storage_buffer_range: 239,
+                ..limits
+            },
+            vk::PhysicalDeviceLimits {
+                max_push_constants_size: 47,
+                ..limits
+            },
+        ] {
+            let error = plan_serial_submission(&translated, &buffers, &reduced, first, &[first])
+                .unwrap_err();
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+    }
+
+    #[test]
+    fn failures_before_queue_acceptance_are_not_submitted() {
+        for phase in [ProviderPhase::Encode, ProviderPhase::Submit] {
+            let failure = SubmissionFailure::Safe {
+                phase,
+                error: ExecutionFailure::vulkan(
+                    vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+                    "host allocation failed",
+                ),
+            };
+            assert!(!failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, phase);
+            assert_eq!(error.class, ProviderErrorClass::Execute);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+            assert_eq!(error.detail.as_deref(), Some("host allocation failed"));
+        }
+    }
+
+    #[test]
+    fn queue_submit_only_allocation_errors_guarantee_safe_rejection() {
+        for result in [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ] {
+            let failure = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                result,
+                "queue allocation failed",
+            ));
+            assert!(!failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, ProviderPhase::Submit);
+            assert_eq!(error.completion, CompletionDisposition::NotSubmitted);
+        }
+
+        let unknown = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+            vk::Result::ERROR_UNKNOWN,
+            "queue outcome unknown",
+        ));
+        assert!(unknown.is_pending());
+        let error = unknown.into_provider();
+        assert_eq!(error.phase, ProviderPhase::Submit);
+        assert_eq!(error.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::SubmittedUnknown { token: None }
+        );
+
+        let lost = SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+            vk::Result::ERROR_DEVICE_LOST,
+            "queue device lost",
+        ));
+        assert!(lost.is_pending());
+        let error = lost.into_provider();
+        assert_eq!(error.phase, ProviderPhase::Submit);
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+    }
+
+    #[test]
+    fn wait_failures_preserve_unknown_completion_and_pending_resources() {
+        for result in [vk::Result::TIMEOUT, vk::Result::ERROR_OUT_OF_HOST_MEMORY] {
+            let failure = SubmissionFailure::Pending {
+                phase: ProviderPhase::Wait,
+                error: ExecutionFailure::vulkan(result, "wait did not establish completion"),
+            };
+            assert!(failure.is_pending());
+            let error = failure.into_provider();
+            assert_eq!(error.phase, ProviderPhase::Wait);
+            assert_eq!(error.class, ProviderErrorClass::Execute);
+            assert_eq!(
+                error.completion,
+                CompletionDisposition::SubmittedUnknown { token: None }
+            );
+        }
+    }
+
+    #[test]
+    fn device_loss_is_classified_from_vulkan_result() {
+        assert!(
+            SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                vk::Result::ERROR_DEVICE_LOST,
+                "queue device lost",
+            ))
+            .is_device_lost()
+        );
+        assert!(
+            !SubmissionFailure::from_queue_submit(ExecutionFailure::vulkan(
+                vk::Result::ERROR_UNKNOWN,
+                "queue outcome unknown",
+            ))
+            .is_device_lost()
+        );
+        let error = SubmissionFailure::Pending {
+            phase: ProviderPhase::Wait,
+            error: ExecutionFailure::vulkan(
+                vk::Result::ERROR_DEVICE_LOST,
+                "arbitrary driver detail",
+            ),
+        }
+        .into_provider();
+        assert_eq!(error.phase, ProviderPhase::Wait);
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+
+        let misleading_detail = SubmissionFailure::Pending {
+            phase: ProviderPhase::Wait,
+            error: ExecutionFailure::vulkan(
+                vk::Result::TIMEOUT,
+                "ERROR_DEVICE_LOST appears only in diagnostics",
+            ),
+        }
+        .into_provider();
+        assert_eq!(misleading_detail.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            misleading_detail.completion,
+            CompletionDisposition::SubmittedUnknown { token: None }
+        );
+    }
+
+    #[test]
+    fn only_unobserved_live_work_retains_vulkan_handles() {
+        assert_eq!(
+            resource_drop_policy(true, false, false),
+            ResourceDropPolicy::Retain
+        );
+        assert_eq!(
+            resource_drop_policy(true, false, true),
+            ResourceDropPolicy::Destroy
+        );
+        assert_eq!(
+            resource_drop_policy(true, true, false),
+            ResourceDropPolicy::Destroy
+        );
+        assert_eq!(
+            resource_drop_policy(false, false, false),
+            ResourceDropPolicy::Destroy
+        );
+    }
+
+    /// Build a context for the lifecycle tests, following the skip pattern the
+    /// other device-backed tests use.
+    fn lifecycle_context() -> Option<Arc<VulkanContext>> {
+        match VulkanContext::new() {
+            Ok(context) => Some(Arc::new(context)),
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                None
+            }
+        }
+    }
+
+    /// Health, admission and the refusal fields have to describe one state.
+    ///
+    /// This is the single-source check: a context that reports `Usable` admits,
+    /// and a context that reports a terminal health returns the refusal naming
+    /// that same terminal cause.
+    fn assert_health_and_refusal_agree(context: &VulkanContext) {
+        let health = context.health();
+        match context.admit() {
+            Ok(()) => assert_eq!(health, ProviderHealth::Usable),
+            Err(error) => {
+                assert!(
+                    !health.is_usable(),
+                    "usable context refused work: {error:?}"
+                );
+                let expected = match health {
+                    ProviderHealth::DeviceLost => "device_lost",
+                    ProviderHealth::Exhausted => "abandonment_budget",
+                    ProviderHealth::Usable => unreachable!("handled by the match above"),
+                };
+                assert_eq!(error.phase, ProviderPhase::Resolve);
+                assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+                assert_eq!(
+                    error.fields.get("terminal"),
+                    Some(&FieldValue::Text(expected.to_owned())),
+                    "refusal field disagrees with the reported health: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_lifecycle_refuses_new_work_idempotently() {
+        let Some(context) = lifecycle_context() else {
+            return;
+        };
+        assert_eq!(context.health(), ProviderHealth::Usable);
+        assert!(context.admit().is_ok());
+        assert_eq!(context.abandonment_stats(), (0, 0));
+
+        // One unretirable submission is the whole Vulkan budget, so the first
+        // abandonment is what ends this instance.
+        assert_eq!(
+            context.record_abandonment(4096),
+            AbandonmentOutcome::Exhausted
+        );
+        assert_eq!(context.abandonment_stats(), (1, 4096));
+        assert_eq!(context.health(), ProviderHealth::Exhausted);
+
+        let refusal = context
+            .admit()
+            .expect_err("exhausted context admitted work");
+        assert_eq!(refusal.class, ProviderErrorClass::Resource);
+        assert_eq!(refusal.slug, "provider_unavailable");
+        assert_eq!(refusal.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(refusal.completion, CompletionDisposition::NotSubmitted);
+        assert_eq!(
+            refusal.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_eq!(
+            refusal.fields.get("abandoned_submissions"),
+            Some(&FieldValue::Unsigned(1))
+        );
+        assert_eq!(
+            refusal.fields.get("abandoned_bytes"),
+            Some(&FieldValue::Unsigned(4096))
+        );
+
+        // Retries answer the same structured refusal and neither re-charge the
+        // budget nor drift into another reason.
+        for _ in 0..3 {
+            assert_eq!(
+                context
+                    .admit()
+                    .expect_err("exhausted context admitted work"),
+                refusal
+            );
+            assert_eq!(
+                context.record_abandonment(4096),
+                AbandonmentOutcome::Exhausted
+            );
+            assert_eq!(context.abandonment_stats(), (1, 4096));
+        }
+        assert_eq!(context.health(), ProviderHealth::Exhausted);
+    }
+
+    #[test]
+    fn device_loss_and_budget_exhaustion_stay_distinguishable() {
+        let Some(lost_context) = lifecycle_context() else {
+            return;
+        };
+        let Some(exhausted_context) = lifecycle_context() else {
+            return;
+        };
+        assert_eq!(
+            exhausted_context.record_abandonment(64),
+            AbandonmentOutcome::Exhausted
+        );
+        lost_context.mark_device_lost();
+
+        assert_eq!(lost_context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(exhausted_context.health(), ProviderHealth::Exhausted);
+
+        let lost = lost_context.admit().expect_err("lost device admitted work");
+        let exhausted = exhausted_context
+            .admit()
+            .expect_err("exhausted context admitted work");
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(lost.slug, "device_lost");
+        assert_eq!(lost.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            lost.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".into()))
+        );
+        assert_eq!(exhausted.class, ProviderErrorClass::Resource);
+        assert_eq!(exhausted.slug, "provider_unavailable");
+        assert_eq!(exhausted.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(exhausted.completion, CompletionDisposition::NotSubmitted);
+        assert_eq!(
+            exhausted.fields.get("terminal"),
+            Some(&FieldValue::Text("abandonment_budget".into()))
+        );
+        assert_ne!(lost.slug, exhausted.slug);
+
+        // An observed device loss outranks an exhausted budget, so the cause is
+        // upgraded instead of being masked by the earlier abandonment.
+        exhausted_context.mark_device_lost();
+        assert_eq!(exhausted_context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(
+            exhausted_context
+                .admit()
+                .expect_err("lost device admitted work")
+                .slug,
+            "device_lost"
+        );
+    }
+
+    #[test]
+    fn health_admission_and_refusals_follow_one_lifecycle() {
+        let Some(context) = lifecycle_context() else {
+            return;
+        };
+        // Control: the normal path still admits and still executes. The
+        // `copy_word` fixture writes buffer 1 from buffer 0, so an exact
+        // writeback proves admission, submission and readback all ran.
+        assert_health_and_refusal_agree(&context);
+        let executor = Arc::new(VulkanExecutor {
+            context: Arc::clone(&context),
+        });
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_copy_word.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("copy_word")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![
+                metal_api_core::BufferBinding {
+                    index: 0,
+                    bytes: 0x6745_2301_u32.to_le_bytes().to_vec(),
+                },
+                metal_api_core::BufferBinding {
+                    index: 1,
+                    bytes: vec![0_u8; 4],
+                },
+            ],
+            textures: Vec::new(),
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).expect("grid size"),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).expect("local size"),
+        };
+        let updates = executor.execute(submission).expect("the copy executes");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].index, 1);
+        assert_eq!(updates[0].bytes, 0x6745_2301_u32.to_le_bytes());
+        assert_eq!(context.health(), ProviderHealth::Usable);
+        assert_eq!(context.abandonment_stats(), (0, 0));
+        assert_health_and_refusal_agree(&context);
+
+        // Every terminal transition keeps the same agreement, including the
+        // sealed cause that records no abandoned work.
+        let Some(sealed) = lifecycle_context() else {
+            return;
+        };
+        sealed.mark_unobservable_submission();
+        assert_eq!(sealed.health(), ProviderHealth::Exhausted);
+        assert_eq!(
+            sealed.abandonment_stats(),
+            (0, 0),
+            "a queue-refused submission is not abandoned GPU work"
+        );
+        assert_health_and_refusal_agree(&sealed);
+
+        let Some(exhausted) = lifecycle_context() else {
+            return;
+        };
+        exhausted.record_abandonment(1024);
+        assert_health_and_refusal_agree(&exhausted);
+
+        let Some(lost) = lifecycle_context() else {
+            return;
+        };
+        lost.mark_device_lost();
+        assert_health_and_refusal_agree(&lost);
+    }
+
+    #[test]
+    fn readback_failure_is_failed_after_queue_retirement() {
+        let error = ExecutionFailure::vulkan(vk::Result::ERROR_MEMORY_MAP_FAILED, "readback map")
+            .into_readback_provider();
+        assert_eq!(error.phase, ProviderPhase::Readback);
+        assert_eq!(error.class, ProviderErrorClass::Execute);
+        assert_eq!(
+            error.completion,
+            CompletionDisposition::Failed { token: None }
+        );
+
+        let lost = ExecutionFailure::vulkan(vk::Result::ERROR_DEVICE_LOST, "readback map")
+            .into_readback_provider();
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::Failed { token: None }
+        );
+    }
 
     fn spirv_bytes(instructions: &[&[u32]]) -> Vec<u8> {
         let mut words = vec![0x0723_0203, 0x0001_0400, 0, 1, 0];
@@ -1267,18 +6369,36 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_spirv_feature_gate_accepts_shader_and_rejects_optional_capabilities() {
+    fn phase_one_spirv_feature_gate_accepts_reviewed_capabilities_and_rejects_optional_ones() {
         let shader = [
             (2_u32 << 16) | Op::Capability as u32,
             Capability::Shader as u32,
         ];
         assert!(validate_spirv_capabilities(&spirv_bytes(&[&shader])).is_ok());
 
-        let int64 = [
+        // The reviewed texture fixtures need these core capabilities, and the
+        // device enables the matching shaderInt8/shaderInt64 features.
+        for capability in [
+            Capability::Int8,
+            Capability::Int64,
+            Capability::ImageQuery,
+            Capability::Sampled1D,
+            Capability::SampledBuffer,
+        ] {
+            let instruction = [(2_u32 << 16) | Op::Capability as u32, capability as u32];
+            assert!(
+                validate_spirv_capabilities(&spirv_bytes(&[&shader, &instruction])).is_ok(),
+                "{capability:?} is inside the reviewed subset"
+            );
+        }
+
+        // A capability outside the reviewed subset (Float64 has no matching
+        // enabled feature) stays refused.
+        let float64 = [
             (2_u32 << 16) | Op::Capability as u32,
-            Capability::Int64 as u32,
+            Capability::Float64 as u32,
         ];
-        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &int64])).unwrap_err();
+        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64])).unwrap_err();
         assert!(error.message().contains("outside the Phase 1 subset"));
 
         let extension = [(2_u32 << 16) | Op::Extension as u32, 0];
@@ -1416,5 +6536,915 @@ mod tests {
             Some(ResourceAccess::WriteOnly),
             Some(ResourceAccess::Unused | ResourceAccess::ReadOnly)
         ));
+    }
+
+    #[test]
+    fn queue_selection_prefers_idle_queues_and_keeps_round_robin_ties() {
+        assert_eq!(select_queue(&[0, 0, 0, 0], 0), 0);
+        assert_eq!(select_queue(&[0, 0, 0, 0], 2), 2);
+        assert_eq!(select_queue(&[3, 1, 2, 0], 0), 3);
+        assert_eq!(select_queue(&[1, 1, 0, 1], 2), 2);
+        assert_eq!(select_queue(&[2, 2, 2, 1], 3), 3);
+        assert_eq!(select_queue(&[7], 5), 0);
+        assert_eq!(select_queue(&[], 0), 0);
+    }
+
+    #[test]
+    fn queue_priority_policy_reduces_to_select_queue_on_one_tier() {
+        use metal_api_core::provider::QueuePriority;
+
+        let probes = 3_usize;
+        for len in 0..=3_usize {
+            for encoded in 0..probes.pow(len as u32) {
+                let mut loads = vec![0_usize; len];
+                let mut rest = encoded;
+                for load in &mut loads {
+                    *load = rest % probes;
+                    rest /= probes;
+                }
+                let priorities = vec![QueuePriority::Default; len];
+                // The cursor range crosses the 7-slot window boundary on
+                // purpose: the default path must stay the least-loaded rule for
+                // every cursor, not only for the first window.
+                for cursor in 0..32_usize {
+                    assert_eq!(
+                        select_queue_for_submission(&loads, &priorities, cursor),
+                        select_queue(&loads, cursor),
+                        "loads {loads:?} cursor {cursor} must keep the least-loaded rule"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_priority_policy_separates_tiers_when_loads_tie() {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let policy = QueueSchedulingPolicy::default();
+        let loads = [0_usize, 0];
+        let priorities = [QueuePriority::Low, QueuePriority::High];
+        // Window slot 0 nominates the high tier, so the high queue wins even
+        // though both queues are idle.
+        assert_eq!(select_queue_for_submission(&loads, &priorities, 0), 1);
+        // The last slot of the window belongs to the low tier, so the idle high
+        // queue yields instead of running again.
+        let low_slot = (policy.window() - 1) as usize;
+        assert_eq!(
+            select_queue_for_submission(&loads, &priorities, low_slot),
+            0
+        );
+    }
+
+    /// The `research/docs/21` §6 queue shape: one high queue, one default queue
+    /// and six low queues, the marking the RTX 5060 experiment installs.
+    fn rtx_5060_queue_tiers() -> Vec<QueuePriority> {
+        use metal_api_core::provider::QueuePriority;
+
+        vec![
+            QueuePriority::High,
+            QueuePriority::Default,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+            QueuePriority::Low,
+        ]
+    }
+
+    /// Assert the window contract on an observed tier sequence: the weighted
+    /// shares, the high-tier streak bound, and one low tier per window.
+    fn assert_queue_priority_window(tiers_seen: &[QueuePriority]) {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let policy = QueueSchedulingPolicy::default();
+        let window = usize::try_from(policy.window()).expect("window fits usize");
+        assert_eq!(window, 7);
+        assert_eq!(
+            tiers_seen.len(),
+            70,
+            "the contract is stated over 10 windows"
+        );
+        let count = |tier: QueuePriority| tiers_seen.iter().filter(|seen| **seen == tier).count();
+        assert_eq!(count(QueuePriority::High), 40);
+        assert_eq!(count(QueuePriority::Default), 20);
+        assert_eq!(count(QueuePriority::Low), 10);
+
+        let mut streak = 0_usize;
+        let mut longest = 0_usize;
+        for tier in tiers_seen {
+            streak = if *tier == QueuePriority::High {
+                streak + 1
+            } else {
+                0
+            };
+            longest = longest.max(streak);
+        }
+        assert_eq!(
+            u32::try_from(longest).expect("streak fits u32"),
+            policy.high_priority_streak_limit(),
+            "the high tier must not exceed its weight in a row"
+        );
+        for start in (0..tiers_seen.len() - window + 1).step_by(window) {
+            let lows = tiers_seen[start..start + window]
+                .iter()
+                .filter(|seen| **seen == QueuePriority::Low)
+                .count();
+            assert!(lows >= 1, "window {start} starved the low tier: {lows}");
+        }
+    }
+
+    #[test]
+    fn queue_priority_window_spreads_the_submission_tiers_over_the_rtx_5060_shape() {
+        let tiers = rtx_5060_queue_tiers();
+        // Every submission retires before the next one is enqueued, so the tier
+        // table is the only state the policy sees. The cursor is the monotonic
+        // selection counter, exactly as `VulkanContext::pick_queue` advances it.
+        let loads = vec![0_usize; tiers.len()];
+        let tiers_seen: Vec<QueuePriority> = (0..70_usize)
+            .map(|cursor| tiers[select_queue_for_submission(&loads, &tiers, cursor)])
+            .collect();
+        assert_queue_priority_window(&tiers_seen);
+    }
+
+    #[test]
+    fn queue_priority_tiers_never_override_the_least_loaded_rule() {
+        // The high queue is busy while six low queues are idle: window slot 0
+        // nominates the high tier, and the high queue still must not jump ahead
+        // of an idle queue (`research/docs/21` §3 invariant 1).
+        let tiers = rtx_5060_queue_tiers();
+        let mut loads = vec![0_usize; tiers.len()];
+        loads[0] = 7;
+        for cursor in 0..14_usize {
+            let picked = select_queue_for_submission(&loads, &tiers, cursor);
+            assert_ne!(picked, 0, "cursor {cursor} picked the busy high queue");
+            assert_eq!(loads[picked], 0, "cursor {cursor} picked a busy queue");
+        }
+    }
+
+    #[test]
+    fn queue_priority_table_reaches_the_async_object_submit_path() {
+        use metal_api_core::provider::{PipelineCompileRequest, ShaderSource, TextureFormat};
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        assert!(queues >= 1, "a selected device exposes at least one queue");
+        // The §6 marking, truncated to the device: Lavapipe exposes one queue
+        // and therefore keeps the degenerate one-tier table.
+        let installed: Vec<QueuePriority> =
+            rtx_5060_queue_tiers().into_iter().take(queues).collect();
+        executor
+            .set_queue_priorities(&installed)
+            .expect("a table with one entry per queue is accepted");
+        assert_eq!(executor.queue_priorities(), installed);
+        assert!(
+            executor
+                .set_queue_priorities(&installed[..queues - 1])
+                .is_err(),
+            "a table that does not describe the device is refused"
+        );
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+            if let Ok(mut sequence) = sink.lock() {
+                sequence.push(queue);
+            }
+        }));
+
+        // The asynchronous object path commits one command buffer per probe
+        // call, so its sequence is the observation surface for the window
+        // contract below. The synchronous paths select through the same policy
+        // (`synchronous_paths_select_queues_through_the_priority_policy`).
+        let provider = crate::VulkanComputeProvider::with_executor(Arc::clone(&executor))
+            .expect("provider")
+            .with_async_execution(true);
+        let device = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = device
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"queue_priority_table".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = device
+            .new_texture_with_bytes(TextureFormat::R32Uint, 4, 4, texels)
+            .expect("texture object");
+        let output = device
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = device.new_command_queue();
+        let submissions = 70_usize;
+        for _ in 0..submissions {
+            let command = queue.command_buffer();
+            {
+                let mut encoder = command.compute_command_encoder().expect("encoder");
+                encoder
+                    .set_compute_pipeline_state(&pipeline)
+                    .expect("pipeline state");
+                encoder.set_texture(0, &texture).expect("texture binding");
+                encoder
+                    .set_buffer(0, &output.view(0, 64).unwrap())
+                    .expect("buffer binding");
+                encoder
+                    .dispatch_threads(
+                        metal_api_core::Size::new(1, 1, 1).unwrap(),
+                        metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    )
+                    .expect("dispatch");
+                encoder.end_encoding().expect("end encoding");
+            }
+            command.commit().expect("commit");
+            command.wait_until_completed().expect("completion");
+        }
+        executor.clear_enqueue_probe_for_test();
+        // Priority only steers queue selection: the landing bytes are the same
+        // ones the synchronous path produces.
+        assert_eq!(output.read().expect("readback")[..4], 0_u32.to_le_bytes());
+
+        let sequence = observed.lock().expect("probe sequence").clone();
+        assert_eq!(sequence.len(), submissions, "one probe call per commit");
+        assert!(sequence.iter().all(|index| *index < queues));
+        let counts = executor.queue_submission_counts();
+        assert_eq!(counts.len(), queues);
+        assert_eq!(counts.iter().sum::<usize>(), submissions);
+        for (index, count) in counts.iter().enumerate() {
+            assert_eq!(
+                *count,
+                sequence.iter().filter(|picked| **picked == index).count(),
+                "queue {index} counts disagree with the enqueue probe"
+            );
+        }
+        if queues < 7 || installed.iter().collect::<BTreeSet<_>>().len() < 3 {
+            eprintln!(
+                "SKIP queue priority window: queues={queues} tiers={installed:?} \
+                 submissions={submissions}"
+            );
+            return;
+        }
+        let tiers_seen: Vec<QueuePriority> =
+            sequence.iter().map(|index| installed[*index]).collect();
+        assert_queue_priority_window(&tiers_seen);
+    }
+
+    #[test]
+    fn provider_queue_priority_marking_installs_on_the_device_table() {
+        use metal_api_core::provider::ComputeProvider;
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        assert!(queues >= 1, "a selected device exposes at least one queue");
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+
+        // A marking longer than the device is truncated and a shorter one is
+        // padded, so the owner never has to know the queue count.
+        let marking = rtx_5060_queue_tiers();
+        let installed = provider
+            .set_queue_priorities(&marking)
+            .expect("a marking expands to the device table");
+        let expected: Vec<QueuePriority> = marking.into_iter().take(queues).collect();
+        assert_eq!(installed, expected);
+        assert_eq!(installed.len(), queues);
+        // The response is the table the scheduler actually reads.
+        assert_eq!(executor.queue_priorities(), installed);
+
+        // The empty marking is the all-`Default` table, i.e. exactly the
+        // scheduling a connection that never sends the request keeps.
+        let cleared = provider
+            .set_queue_priorities(&[])
+            .expect("an empty marking clears the table");
+        assert_eq!(cleared, vec![QueuePriority::Default; queues]);
+        assert_eq!(executor.queue_priorities(), cleared);
+    }
+
+    #[test]
+    fn synchronous_paths_select_queues_through_the_priority_policy() {
+        use metal_api_core::provider::{ComputeProvider, PipelineCompileRequest, ShaderSource};
+
+        let executor = match VulkanExecutor::new() {
+            Ok(executor) => executor,
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                return;
+            }
+        };
+        let queues = executor.queue_count();
+        // The §6 marking, truncated to the device: Lavapipe exposes one queue
+        // and therefore keeps the degenerate one-tier table.
+        let installed: Vec<QueuePriority> =
+            rtx_5060_queue_tiers().into_iter().take(queues).collect();
+        executor
+            .set_queue_priorities(&installed)
+            .expect("a table with one entry per queue is accepted");
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        executor.set_enqueue_probe_for_test(Arc::new(move |queue| {
+            if let Ok(mut sequence) = sink.lock() {
+                sequence.push(queue);
+            }
+        }));
+
+        // Path one: the standalone `ComputeExecutor` entry point, which used to
+        // be pinned to queue 0.
+        let device = metal_api_core::Device::new(
+            Arc::clone(&executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("read_texture_2d")
+            .expect("the fixture entry exists");
+        let pipeline = executor
+            .new_compute_pipeline(&function)
+            .expect("pipeline creates");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let submission = metal_api_core::ComputeSubmission {
+            pipeline,
+            buffers: vec![metal_api_core::BufferBinding {
+                index: 0,
+                bytes: vec![0_u8; 64],
+            }],
+            textures: vec![metal_api_core::provider::TextureView {
+                view_id: metal_api_core::provider::ViewId::new(910),
+                metal_binding: 0,
+                allocation_id: metal_api_core::provider::AllocationId::new(911),
+                texture_type: metal_api_core::provider::TextureType::D2,
+                format: metal_api_core::provider::TextureFormat::R32Uint,
+                width: 4,
+                height: 4,
+                depth: 1,
+                array_length: 1,
+                sample_count: 1,
+                access: metal_api_core::provider::TextureAccess::Sampled,
+                source: metal_api_core::provider::TextureSource::OwnedBytes(texels),
+            }],
+            threads_per_grid: metal_api_core::Size::new(1, 1, 1).unwrap(),
+            threads_per_threadgroup: metal_api_core::Size::new(1, 1, 1).unwrap(),
+        };
+        let updates = executor.execute(submission).expect("texture read executes");
+        assert_eq!(updates[0].bytes[..4], 0_u32.to_le_bytes());
+
+        // Path two: the synchronous provider, which used to call
+        // `execute_on_context` on queue 0.
+        let provider =
+            crate::VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider");
+        assert_eq!(
+            provider
+                .set_queue_priorities(&installed)
+                .expect("the device-sized marking installs unchanged"),
+            installed
+        );
+        let objects = metal_api_core::provider_api::Device::new(Arc::new(provider));
+        let pipeline = objects
+            .compile_pipeline(PipelineCompileRequest {
+                entry_name: "read_texture_2d".to_owned(),
+                logical_digest: metal_api_core::provider::SemanticDigest::new(
+                    "metal-smoke-fixture-v1",
+                    b"synchronous_queue_selection".to_vec(),
+                )
+                .expect("digest"),
+                source: ShaderSource::SanitizedLl(
+                    include_str!("../../../examples/metal-smoke/shaders/kernel_read_texture_2d.ll")
+                        .to_owned(),
+                ),
+            })
+            .expect("pipeline");
+        let mut texels = Vec::with_capacity(64);
+        for value in 0..16_u32 {
+            texels.extend_from_slice(&value.to_le_bytes());
+        }
+        let texture = objects
+            .new_texture_with_bytes(
+                metal_api_core::provider::TextureFormat::R32Uint,
+                4,
+                4,
+                texels,
+            )
+            .expect("texture object");
+        let output = objects
+            .new_buffer_with_bytes(vec![0_u8; 64])
+            .expect("output buffer");
+        let queue = objects.new_command_queue();
+        let command = queue.command_buffer();
+        {
+            let mut encoder = command.compute_command_encoder().expect("encoder");
+            encoder
+                .set_compute_pipeline_state(&pipeline)
+                .expect("pipeline state");
+            encoder.set_texture(0, &texture).expect("texture binding");
+            encoder
+                .set_buffer(0, &output.view(0, 64).unwrap())
+                .expect("buffer binding");
+            encoder
+                .dispatch_threads(
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                    metal_api_core::Size::new(1, 1, 1).unwrap(),
+                )
+                .expect("dispatch");
+            encoder.end_encoding().expect("end encoding");
+        }
+        command.commit().expect("commit");
+        command.wait_until_completed().expect("completion");
+        assert_eq!(output.read().expect("readback")[..4], 0_u32.to_le_bytes());
+        executor.clear_enqueue_probe_for_test();
+
+        // Both paths reported exactly one selection, and each one is the answer
+        // the core policy gives for that cursor with every queue idle.
+        let loads = vec![0_usize; queues];
+        let sequence = observed.lock().expect("probe sequence").clone();
+        assert_eq!(
+            sequence.len(),
+            2,
+            "one probe call per synchronous submit: {sequence:?}"
+        );
+        for (cursor, picked) in sequence.iter().enumerate() {
+            assert_eq!(
+                *picked,
+                select_queue_for_submission(&loads, &installed, cursor),
+                "synchronous selection {cursor} did not go through the queue policy"
+            );
+        }
+        // The marking is scheduler state: two submissions neither consume it
+        // nor end the context that admits them.
+        assert_eq!(executor.queue_priorities(), installed);
+    }
+
+    // -------------------------------------------------------------------
+    // Real device-loss path: the driver's answer at a queue boundary.
+    // -------------------------------------------------------------------
+
+    use metal_api_core::provider::{
+        AllocationId, AllocationRecord, BufferLease, BufferSource, BufferView, CompletionPolicy,
+        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind,
+        DispatchType, LeaseReservation, OperationId, ResourceTableSnapshot, SubmissionId,
+        TerminalLeaseState, TerminalState, TracePass, ValidatedComputeTrace, ViewId,
+        PROVIDER_SCHEMA_VERSION,
+    };
+
+    /// The fault-address-name mapping the evidence field reports.
+    #[test]
+    fn device_fault_evidence_names_every_reported_address() {
+        let snapshot = DeviceFaultSnapshot {
+            extension_present: true,
+            description: Some("page fault".to_owned()),
+            addresses: vec![
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::READ_INVALID.as_raw(),
+                    reported_address: 0x1000,
+                    address_precision: 0x40,
+                },
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::WRITE_INVALID.as_raw(),
+                    reported_address: 0x2000,
+                    address_precision: 0x10,
+                },
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_FAULT.as_raw(),
+                    reported_address: 0x3000,
+                    address_precision: 4,
+                },
+                DeviceFaultAddress {
+                    address_type: 99,
+                    reported_address: 0x4000,
+                    address_precision: 1,
+                },
+                // Beyond the reported cap: counted, not listed.
+                DeviceFaultAddress {
+                    address_type: vk::DeviceFaultAddressTypeEXT::NONE.as_raw(),
+                    reported_address: 0x5000,
+                    address_precision: 1,
+                },
+            ],
+            vendor_info_count: 2,
+            vendor_binary_size: 4096,
+        };
+        let fields: BTreeMap<String, FieldValue> = snapshot.evidence_fields().into_iter().collect();
+        assert_eq!(
+            fields.get("device_fault_extension"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert_eq!(
+            fields.get("device_fault_description"),
+            Some(&FieldValue::Text("page fault".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(5))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_0"),
+            Some(&FieldValue::Text("READ_INVALID".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_0"),
+            Some(&FieldValue::Unsigned(0x1000))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_precision_0"),
+            Some(&FieldValue::Unsigned(0x40))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_1"),
+            Some(&FieldValue::Text("WRITE_INVALID".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_2"),
+            Some(&FieldValue::Text("INSTRUCTION_POINTER_FAULT".to_owned()))
+        );
+        assert_eq!(
+            fields.get("device_fault_address_type_3"),
+            Some(&FieldValue::Text("UNKNOWN".to_owned()))
+        );
+        assert!(
+            !fields.contains_key("device_fault_address_type_4"),
+            "the listing is capped at {DEVICE_FAULT_ADDRESS_FIELDS} addresses"
+        );
+        assert_eq!(
+            fields.get("device_fault_vendor_infos"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            fields.get("device_fault_vendor_binary_size"),
+            Some(&FieldValue::Unsigned(4096))
+        );
+
+        // An unavailable record is evidence too, and it never claims a fault.
+        let unavailable: BTreeMap<String, FieldValue> = DeviceFaultSnapshot::unavailable()
+            .evidence_fields()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            unavailable.get("device_fault_extension"),
+            Some(&FieldValue::Bool(false))
+        );
+        assert_eq!(
+            unavailable.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert!(!unavailable.contains_key("device_fault_description"));
+    }
+
+    /// Only a loss carries the raw `vk::Result`: the field means "the driver
+    /// answered this", so an ordinary failure must not claim it.
+    #[test]
+    fn device_loss_error_carries_the_raw_vk_result_and_the_documented_recovery() {
+        let lost = ExecutionFailure::vulkan(vk::Result::ERROR_DEVICE_LOST, "queue device lost")
+            .into_provider(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Execute,
+                "vulkan-queue-submit",
+                CompletionDisposition::SubmittedUnknown { token: None },
+            );
+        assert_eq!(lost.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(lost.slug, "vulkan-queue-submit");
+        assert_eq!(lost.phase, ProviderPhase::Submit);
+        assert_eq!(lost.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            lost.completion,
+            CompletionDisposition::DeviceLost { token: None }
+        );
+        assert_eq!(
+            lost.fields.get("vk_result"),
+            Some(&FieldValue::Text("VK_ERROR_DEVICE_LOST".to_owned()))
+        );
+        assert_eq!(
+            lost.fields.get("vk_result_raw"),
+            Some(&FieldValue::Signed(i64::from(
+                vk::Result::ERROR_DEVICE_LOST.as_raw()
+            )))
+        );
+        assert_eq!(lost.detail.as_deref(), Some("queue device lost"));
+
+        let ordinary = ExecutionFailure::vulkan(vk::Result::ERROR_UNKNOWN, "queue unknown")
+            .into_provider(
+                ProviderPhase::Submit,
+                ProviderErrorClass::Execute,
+                "vulkan-queue-submit",
+                CompletionDisposition::SubmittedUnknown { token: None },
+            );
+        assert_eq!(ordinary.class, ProviderErrorClass::Execute);
+        assert_eq!(ordinary.retryability, Retryability::Unknown);
+        assert!(!ordinary.fields.contains_key("vk_result"));
+        assert!(!ordinary.fields.contains_key("vk_result_raw"));
+    }
+
+    /// A provider over a fresh device, or `None` when the box has none.
+    fn device_loss_executor() -> Option<Arc<VulkanExecutor>> {
+        match VulkanExecutor::new() {
+            Ok(executor) => Some(executor),
+            Err(error) => {
+                eprintln!("SKIP: no Vulkan device: {error}");
+                None
+            }
+        }
+    }
+
+    /// A one-dispatch owner-readback trace over the shared `copy_word` fixture.
+    ///
+    /// The fixture reads binding 0 and writes binding 1, so a writeback proves
+    /// the device executed the submission that carried the fence.
+    fn copy_word_trace(
+        provider: &VulkanComputeProvider,
+        executor: &Arc<VulkanExecutor>,
+    ) -> (ComputeTrace, ResourceTableSnapshot) {
+        let device = metal_api_core::Device::new(
+            Arc::clone(executor) as Arc<dyn metal_api_core::ComputeExecutor>
+        );
+        let library = device
+            .new_library_with_air(include_str!(
+                "../../../examples/metal-smoke/shaders/kernel_copy_word.ll"
+            ))
+            .expect("the fixture library loads");
+        let function = library
+            .function("copy_word")
+            .expect("the fixture entry exists");
+        let pipeline = provider
+            .compile_pipeline(
+                &function,
+                SemanticDigest::new("metal-smoke-fixture-v1", b"driver_device_loss".to_vec())
+                    .expect("digest"),
+            )
+            .expect("the fixture pipeline compiles");
+        let mut buffers = Vec::new();
+        for (index, offset, bytes) in [
+            (0_u32, 8_u64, 0x6745_2301_u32.to_le_bytes().to_vec()),
+            (1_u32, 16_u64, vec![0_u8; 4]),
+        ] {
+            let access = pipeline
+                .contract
+                .buffer_bindings
+                .iter()
+                .find(|binding| binding.metal_binding == index)
+                .expect("fixture binding is reflected")
+                .access;
+            buffers.push(BufferView {
+                view_id: ViewId::new(200 + u64::from(index)),
+                metal_binding: index,
+                allocation_id: AllocationId::new(100 + u64::from(index)),
+                offset,
+                length: u64::try_from(bytes.len()).expect("fixture byte length"),
+                access,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(bytes),
+            });
+        }
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: pipeline.device_epoch,
+            operation_id: OperationId::new(77),
+            pipelines: vec![pipeline.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Compute(ComputePass {
+                pipeline: pipeline.pipeline_id,
+                buffers,
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            })],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let mut resources = ResourceTableSnapshot::new();
+        for view in &trace.passes[0]
+            .as_compute()
+            .expect("fixture pass is a compute pass")
+            .buffers
+        {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: view.allocation_id,
+                    owner_epoch: trace.device_epoch,
+                    size: view.offset + view.length + 8,
+                })
+                .expect("fixture allocation registers");
+        }
+        (trace, resources)
+    }
+
+    fn admitted_trace(
+        provider: &VulkanComputeProvider,
+        trace: &ComputeTrace,
+        resources: &ResourceTableSnapshot,
+    ) -> ValidatedComputeTrace {
+        provider
+            .capabilities()
+            .validate_trace(trace.clone(), resources.clone())
+            .expect("the fixture trace admits")
+    }
+
+    /// A loss reported by `vkQueueSubmit` or `vkWaitForFences`.
+    ///
+    /// Both boundaries answer the same way: the raw result arrives as a
+    /// structured `device_lost`, the core lifecycle reports `DeviceLost`, every
+    /// in-flight lease retires, later submissions are refused with the same
+    /// typed reason, and only a recreated provider resumes work.
+    #[test]
+    fn driver_reported_submit_loss_is_terminal_and_keeps_vk_result_evidence() {
+        assert_driver_loss_is_terminal(DeviceLossPoint::Submit);
+    }
+
+    #[test]
+    fn driver_reported_wait_loss_is_terminal_and_keeps_vk_result_evidence() {
+        assert_driver_loss_is_terminal(DeviceLossPoint::Wait);
+    }
+
+    fn assert_driver_loss_is_terminal(point: DeviceLossPoint) {
+        let Some(executor) = device_loss_executor() else {
+            return;
+        };
+        let provider =
+            VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider creates");
+        let (trace, resources) = copy_word_trace(&provider, &executor);
+        let context = Arc::clone(&executor.context);
+        assert_eq!(context.health(), ProviderHealth::Usable);
+
+        // The owner mapping an in-flight submission reads. The lifecycle
+        // ledger is the teardown authority for it (`research/docs/13` §5): a
+        // device loss releases every lease even when no completion was ever
+        // observed.
+        let lease_id = LeaseId::new(7);
+        let lease_token = CompletionToken {
+            submission_id: SubmissionId::new(1),
+            device_epoch: provider.device_epoch(),
+        };
+        {
+            let mut lifecycle = context.lock_lifecycle();
+            lifecycle
+                .leases_mut()
+                .register(LeaseReservation {
+                    lease: BufferLease {
+                        lease_id,
+                        allocation_id: AllocationId::new(100),
+                        owner_epoch: provider.device_epoch(),
+                    },
+                    offset: 0,
+                    length: 4,
+                })
+                .expect("the in-flight lease registers");
+            lifecycle
+                .leases_mut()
+                .bind(lease_id, lease_token)
+                .expect("the submission token binds to the lease");
+        }
+        assert_eq!(
+            context.lock_lifecycle().leases().leased(),
+            vec![(lease_id, TerminalLeaseState::Outstanding(1))],
+            "the lease is held while the submission is in flight"
+        );
+
+        executor.inject_driver_device_loss_for_test(point);
+        let error = provider
+            .submit(admitted_trace(&provider, &trace, &resources))
+            .expect_err("the substituted driver answer refuses the submission");
+
+        // 1. The first error is structured and carries the driver's own answer.
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(error.retryability, Retryability::RetryAfterRecreate);
+        let (expected_phase, expected_slug, expected_enqueues) = match point {
+            DeviceLossPoint::Submit => (ProviderPhase::Submit, "vulkan-queue-submit", 0),
+            DeviceLossPoint::Wait => (ProviderPhase::Wait, "vulkan-wait", 1),
+        };
+        assert_eq!(error.phase, expected_phase);
+        assert_eq!(error.slug, expected_slug);
+        assert_eq!(
+            error.fields.get("vk_result"),
+            Some(&FieldValue::Text("VK_ERROR_DEVICE_LOST".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("vk_result_raw"),
+            Some(&FieldValue::Signed(i64::from(
+                vk::Result::ERROR_DEVICE_LOST.as_raw()
+            )))
+        );
+        let CompletionDisposition::DeviceLost { token: Some(token) } = error.completion else {
+            panic!("the loss error lost its submission token: {error:?}");
+        };
+        let observed: usize = context.queue_submission_counts().iter().sum();
+        assert_eq!(
+            observed, expected_enqueues,
+            "a submit-time loss never reaches the driver; a wait-time loss does"
+        );
+        // The device-fault snapshot is evidence, and its absence is not an
+        // error: a device without `VK_EXT_device_fault` answers an empty record.
+        let fault = executor
+            .last_device_fault()
+            .expect("the loss recorded a fault snapshot");
+        assert_eq!(
+            error.fields.get("device_fault_extension"),
+            Some(&FieldValue::Bool(fault.extension_present))
+        );
+        assert_eq!(
+            error.fields.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(fault.addresses.len() as u64))
+        );
+        if !fault.extension_present {
+            assert!(fault.addresses.is_empty());
+            assert!(fault.description.is_none());
+        }
+
+        // 2. Health and the lease ledger come from the core lifecycle.
+        assert_eq!(context.health(), ProviderHealth::DeviceLost);
+        assert_eq!(context.lock_lifecycle().state(), TerminalState::DeviceLost);
+        let lifecycle = context.lock_lifecycle();
+        assert!(lifecycle.leases().is_device_lost());
+        assert_eq!(
+            lifecycle.leases().leased(),
+            vec![(lease_id, TerminalLeaseState::Released)],
+            "a lost device is a teardown guarantee for in-flight leases"
+        );
+        assert!(lifecycle.leases().release_ready(lease_id));
+        drop(lifecycle);
+
+        // 3. Later submissions answer the same typed refusal, and the refusal
+        // itself is idempotent: two calls compare equal, token included.
+        let first = context.admit().expect_err("a lost context admits no work");
+        let second = context.admit().expect_err("a lost context admits no work");
+        assert_eq!(first, second);
+        assert_eq!(first.slug, "device_lost");
+        assert_eq!(first.class, ProviderErrorClass::DeviceLost);
+        assert_eq!(first.retryability, Retryability::RetryAfterRecreate);
+        assert_eq!(
+            first.fields.get("terminal"),
+            Some(&FieldValue::Text("device_lost".to_owned()))
+        );
+        for _ in 0..2 {
+            let refused = provider
+                .submit(admitted_trace(&provider, &trace, &resources))
+                .expect_err("a lost provider admits no work");
+            assert_eq!(refused.slug, "device_lost");
+            assert_eq!(refused.class, ProviderErrorClass::DeviceLost);
+            assert_eq!(
+                refused.fields.get("terminal"),
+                Some(&FieldValue::Text("device_lost".to_owned()))
+            );
+        }
+
+        // 4. The lost instance is not reusable, and recreation is the repair.
+        assert_eq!(provider.health(), ProviderHealth::DeviceLost);
+        assert_eq!(context.abandonment_stats(), (0, 0));
+        let Some(recovered_executor) = device_loss_executor() else {
+            return;
+        };
+        let recovered = VulkanComputeProvider::with_executor(Arc::clone(&recovered_executor))
+            .expect("the recreated provider");
+        let (trace, resources) = copy_word_trace(&recovered, &recovered_executor);
+        let submission = recovered
+            .submit(admitted_trace(&recovered, &trace, &resources))
+            .expect("a recreated provider admits work");
+        assert_eq!(recovered.health(), ProviderHealth::Usable);
+        let [writeback] = submission.writebacks.as_slice() else {
+            panic!("the recovered submission needs exactly one writeback");
+        };
+        assert_eq!(writeback.bytes, 0x6745_2301_u32.to_le_bytes());
+        assert!(matches!(
+            submission.completion,
+            CompletionDisposition::CompletedVisible { .. }
+        ));
+        eprintln!(
+            "PASS driver_device_loss point={point:?} phase={expected_phase:?} slug={expected_slug} \
+             vk_result=VK_ERROR_DEVICE_LOST raw={} enqueues={observed} health={:?} \
+             leases=Released fault_extension={} fault_addresses={} token={} recovered=exact",
+            vk::Result::ERROR_DEVICE_LOST.as_raw(),
+            provider.health(),
+            fault.extension_present,
+            fault.addresses.len(),
+            token.submission_id.get(),
+        );
     }
 }

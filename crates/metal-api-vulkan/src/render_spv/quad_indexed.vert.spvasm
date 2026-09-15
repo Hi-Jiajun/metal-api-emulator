@@ -1,0 +1,44 @@
+; 本文件是 quad_indexed.vert.spv 的可读源（research/docs/23 §3.3 顶点缓冲轨道）。复现命令：
+;   spirv-as --target-env vulkan1.0 quad_indexed.vert.spvasm -o quad_indexed.vert.spv
+;   spirv-val --target-env vulkan1.0 quad_indexed.vert.spv
+; 入口名 vertex_buffer_main：core 的 RenderPipelineContract 要求 vertex/fragment 入口名不同。
+; 顶点位置来自调用方顶点缓冲（binding 0，location 0，vec2 float32，stride 8），
+; 直接是 NDC 坐标，所以顶点着色器只做 vec2 -> vec4(position, 0, 1)。
+; 索引 draw 由 vkCmdDrawIndexed 从调用方 uint16 索引缓冲选择顶点。
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "vertex_buffer_main" %pos_in %glpos
+               OpSource GLSL 450
+               OpName %main "vertex_buffer_main"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %pos_in "position"
+               OpName %glpos "gl_PerVertex"
+               OpDecorate %pos_in Location 0
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+%_ptr_Input_v2float = OpTypePointer Input %v2float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+     %pos_in = OpVariable %_ptr_Input_v2float Input
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+     %float_0 = OpConstant %float 0
+     %float_1 = OpConstant %float 1
+      %int_0 = OpConstant %int 0
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+        %pos = OpLoad %v2float %pos_in
+          %x = OpCompositeExtract %float %pos 0
+          %y = OpCompositeExtract %float %pos 1
+       %pos4 = OpCompositeConstruct %v4float %x %y %float_0 %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos4
+               OpReturn
+               OpFunctionEnd

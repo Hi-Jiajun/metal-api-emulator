@@ -1,0 +1,757 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v7",
+  "guard_byte": 90,
+  "cases": [
+    {
+      "id": "subset_chain_two",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 8,
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "length": 120,
+          "allocation_size": 156,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "495aa5a57e5aa5a56f5aa5a51c5aa5a50d5aa5a5325aa5a5235aa5a5d05aa5a5c15aa5a5f65aa5a5e75aa5a5945aa5a5855aa5a5aa5aa5a55b5ba5a5485ba5a5795ba5a56e5ba5a51f5ba5a50c5ba5a53d5ba5a5225ba5a5d35ba5a5c05ba5a5f15ba5a5e65ba5a5975ba5a5845ba5a5b55ba5a55a58a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "130000002400000035000000460000005700000068000000790000008a0000009b000000ac000000bd000000ce000000df000000f00000000101000012010000230100003401000045010000560100006701000078010000890100009a010000ab010000bc010000cd010000de010000ef01000000020000"
+        },
+        {
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "bytes_hex": "495aa5a57e5aa5a56f5aa5a51c5aa5a50d5aa5a5325aa5a5235aa5a5d05aa5a5c15aa5a5f65aa5a5e75aa5a5945aa5a5855aa5a5aa5aa5a55b5ba5a5485ba5a5795ba5a56e5ba5a51f5ba5a50c5ba5a53d5ba5a5225ba5a5d35ba5a5c05ba5a5f15ba5a5e65ba5a5975ba5a5845ba5a5b55ba5a55a58a5a5"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            430
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "copy_3d",
+          "air": {
+            "path": "shaders/copy_3d.ll",
+            "sha256": "9f379575b8f9ed45e62df27c24761d0030e257f45c6241c649b5caae73cbe9cb"
+          },
+          "metal": {
+            "path": "shaders/copy_3d.metal",
+            "sha256": "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f"
+          },
+          "buffer_slots": [
+            {
+              "binding": 4,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 9,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "subset_chain_four",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 8,
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "length": 120,
+          "allocation_size": 156,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 9,
+          "allocation": 340,
+          "view": 440,
+          "offset": 48,
+          "length": 120,
+          "allocation_size": 184,
+          "access": "write",
+          "initial_hex": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "495aa5a57e5aa5a56f5aa5a51c5aa5a50d5aa5a5325aa5a5235aa5a5d05aa5a5c15aa5a5f65aa5a5e75aa5a5945aa5a5855aa5a5aa5aa5a55b5ba5a5485ba5a5795ba5a56e5ba5a51f5ba5a50c5ba5a53d5ba5a5225ba5a5d35ba5a5c05ba5a5f15ba5a5e65ba5a5975ba5a5845ba5a5b55ba5a55a58a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "87ddb9bb30dcb9bb89dcb9bb42d3b9bbdbd3b9bb24d2b9bbbdd2b9bb76deb9bbcfdeb9bb78d9b9bbd1d9b9bb8adfb9bb63dcb9bb6cdfb9bb05dab9bbbedab9bbd725b9bb8025b9bb59d8b9bbd2d8b9bb6bdbb9bbb4dbb9bb4d27b9bbc627b9bb1f26b9bbc826b9bbe124b9bb1a25b9bbb327b9bb3ccfb9bb"
+        },
+        {
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "bytes_hex": "495aa5a57e5aa5a56f5aa5a51c5aa5a50d5aa5a5325aa5a5235aa5a5d05aa5a5c15aa5a5f65aa5a5e75aa5a5945aa5a5855aa5a5aa5aa5a55b5ba5a5485ba5a5795ba5a56e5ba5a51f5ba5a50c5ba5a53d5ba5a5225ba5a5d35ba5a5c05ba5a5f15ba5a5e65ba5a5975ba5a5845ba5a5b55ba5a55a58a5a5"
+        },
+        {
+          "allocation": 340,
+          "view": 440,
+          "offset": 48,
+          "bytes_hex": "87ddb9bb30dcb9bb89dcb9bb42d3b9bbdbd3b9bb24d2b9bbbdd2b9bb76deb9bbcfdeb9bb78d9b9bbd1d9b9bb8adfb9bb63dcb9bb6cdfb9bb05dab9bbbedab9bbd725b9bb8025b9bb59d8b9bbd2d8b9bb6bdbb9bbb4dbb9bb4d27b9bbc627b9bb1f26b9bbc826b9bbe124b9bb1a25b9bbb327b9bb3ccfb9bb"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            430
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            420,
+            430,
+            410
+          ],
+          "program": 2
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            440
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "copy_3d",
+          "air": {
+            "path": "shaders/copy_3d.ll",
+            "sha256": "9f379575b8f9ed45e62df27c24761d0030e257f45c6241c649b5caae73cbe9cb"
+          },
+          "metal": {
+            "path": "shaders/copy_3d.metal",
+            "sha256": "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f"
+          },
+          "buffer_slots": [
+            {
+              "binding": 4,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 9,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "remap_3d",
+          "air": {
+            "path": "shaders/remap_3d.ll",
+            "sha256": "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec"
+          },
+          "metal": {
+            "path": "shaders/remap_3d.metal",
+            "sha256": "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76"
+          },
+          "buffer_slots": [
+            {
+              "binding": 1,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 3,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 7,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "subset_chain_eight",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 8,
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "length": 120,
+          "allocation_size": 156,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 9,
+          "allocation": 340,
+          "view": 440,
+          "offset": 48,
+          "length": 120,
+          "allocation_size": 184,
+          "access": "write",
+          "initial_hex": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "f0871c1e09861c1ef6861c1e3f891c1ea4891c1e1d881c1eba881c1ec3841c1ea8841c1ec1831c1eae831c1ef7851c1edc861c1ed5851c1e72801c1ebb801c1ea07f1c1ef97f1c1e26821c1eaf821c1ed4811c1e8d811c1e2a7d1c1eb37d1c1e187c1c1eb17c1c1e5e7f1c1e677f1c1e8c7d1c1e05951c1e"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "1612fbeec70ffbee7815fbee7965fbee3a66fbee4b1dfbee9c18fbeedd04fbee1e05fbeecf3ffbee403cfbee410cfbee8215fbee530dfbeee426fbeee520fbee26d8fbee57dafbee882afbee4937fbee4a29fbee5b2ffbeeecc9fbeeadd5fbee6ec1fbee5fcdfbee10defbee51defbee52cbfbeee3b6f4ee"
+        },
+        {
+          "allocation": 330,
+          "view": 430,
+          "offset": 20,
+          "bytes_hex": "f0871c1e09861c1ef6861c1e3f891c1ea4891c1e1d881c1eba881c1ec3841c1ea8841c1ec1831c1eae831c1ef7851c1edc861c1ed5851c1e72801c1ebb801c1ea07f1c1ef97f1c1e26821c1eaf821c1ed4811c1e8d811c1e2a7d1c1eb37d1c1e187c1c1eb17c1c1e5e7f1c1e677f1c1e8c7d1c1e05951c1e"
+        },
+        {
+          "allocation": 340,
+          "view": 440,
+          "offset": 48,
+          "bytes_hex": "1612fbeec70ffbee7815fbee7965fbee3a66fbee4b1dfbee9c18fbeedd04fbee1e05fbeecf3ffbee403cfbee410cfbee8215fbee530dfbeee426fbeee520fbee26d8fbee57dafbee882afbee4937fbee4a29fbee5b2ffbeeecc9fbeeadd5fbee6ec1fbee5fcdfbee10defbee51defbee52cbfbeee3b6f4ee"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            430
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            420,
+            430,
+            410
+          ],
+          "program": 2
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            440
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ],
+          "program": 0
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            400,
+            430
+          ],
+          "program": 1
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            420,
+            430,
+            410
+          ],
+          "program": 2
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            410,
+            440
+          ],
+          "program": 1
+        }
+      ],
+      "programs": [
+        {
+          "entry": "transform_3d",
+          "air": {
+            "path": "shaders/transform_3d.ll",
+            "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+          },
+          "metal": {
+            "path": "shaders/transform_3d.metal",
+            "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+          },
+          "buffer_slots": [
+            {
+              "binding": 0,
+              "access": "read_write",
+              "length": 120
+            },
+            {
+              "binding": 2,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 5,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "copy_3d",
+          "air": {
+            "path": "shaders/copy_3d.ll",
+            "sha256": "9f379575b8f9ed45e62df27c24761d0030e257f45c6241c649b5caae73cbe9cb"
+          },
+          "metal": {
+            "path": "shaders/copy_3d.metal",
+            "sha256": "3d8d71178abe03067508183a87f8c5c6843f1a3092e7f1cb52471ecaaaf0593f"
+          },
+          "buffer_slots": [
+            {
+              "binding": 4,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 9,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        },
+        {
+          "entry": "remap_3d",
+          "air": {
+            "path": "shaders/remap_3d.ll",
+            "sha256": "5388b13783b13a616a3b6952e0c939a120e5d1961e060dd15c11cb54083092ec"
+          },
+          "metal": {
+            "path": "shaders/remap_3d.metal",
+            "sha256": "0d715fe43e72fd96218f3fefc9a582c8634092fa10cc79a544869b5dee025a76"
+          },
+          "buffer_slots": [
+            {
+              "binding": 1,
+              "access": "read",
+              "length": 4
+            },
+            {
+              "binding": 3,
+              "access": "read",
+              "length": 120
+            },
+            {
+              "binding": 7,
+              "access": "write",
+              "length": 120
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

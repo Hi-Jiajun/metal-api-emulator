@@ -1,0 +1,37 @@
+; 本文件是 solid_r32f.frag.spv 的可读源，由渲染轨道的 include_bytes! 内嵌
+; （crates/metal-api-vulkan/src/render.rs）。复现命令：
+;   spirv-as --target-env vulkan1.0 solid_r32f.frag.spvasm -o solid_r32f.frag.spv
+; 来源：/var/tmp/render-probe/shaders/solid_r32f.frag.spvasm（R32_SFLOAT 附件探针），
+; 探针的常量 0.5 按下面的取色纪律换成了 64/255，入口名从 "main" 改为 "fragment_main"
+; （core 的 RenderPipelineContract 拒绝 vertex/fragment 同名入口）。
+;
+; 单通道 float 附件（VK_FORMAT_R32_SFLOAT）的片元输出必须是一个 float，所以这里是
+; 标量 store，而不是 8-bit UNORM 模块那个 vec4 store：vec4 store 与该附件的
+; 组件形状不匹配，驱动只能按未定义行为处置（这正是审查项 I2 的成因）。
+;
+; 取色纪律：写"字节值 / 255"而不是 0.25/0.5/0.75，让三种准入格式写的是同一个标称
+; 颜色，且避开 f*255 落在半整数上的 tie-break（见 solid_unorm8.frag.spvasm）。
+; 这里取该颜色的红分量 64/255 = 0.250980407（f32 bits 0x3e808081）：
+;   a. 它与 8-bit UNORM 模块的 R 通道是同一个 f32 常量；
+;   b. float 附件不做 UNORM 量化，读回字节就是该 f32 的小端字节。
+; 2x2 附件的期望字节 = 81 80 80 3e 逐 texel 重复。
+               OpCapability Shader
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "fragment_main" %outColor
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "fragment_main"
+               OpName %outColor "outColor"
+               OpDecorate %outColor Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+%_ptr_Output_float = OpTypePointer Output %float
+   %outColor = OpVariable %_ptr_Output_float Output
+   %byte_64 = OpConstant %float 0.250980407
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+               OpStore %outColor %byte_64
+               OpReturn
+               OpFunctionEnd

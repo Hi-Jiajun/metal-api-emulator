@@ -1,0 +1,673 @@
+name: Standalone checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.96.0
+      - name: Install offline GPU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm spirv-tools libvulkan1 mesa-vulkan-drivers
+      - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s conformance -p 'test_*.py' -v
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Lavapipe smoke
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          cargo run --locked -p metal-smoke -- --executor standalone
+          cargo run --locked -p metal-smoke --bin provider-smoke
+          mkdir -p /tmp/vulkan-captures
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite.json --output /tmp/vulkan-captures/vulkan-capture.json
+          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/vulkan-captures/vulkan-capture.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v2.json --output /tmp/vulkan-captures/vulkan-capture-v2.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --check /tmp/vulkan-captures/vulkan-capture-v2.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v3.json --output /tmp/vulkan-captures/vulkan-capture-v3.json
+          python3 conformance/compare.py --suite conformance/suite-v3.json --check /tmp/vulkan-captures/vulkan-capture-v3.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v4.json --output /tmp/vulkan-captures/vulkan-capture-v4.json
+          python3 conformance/compare.py --suite conformance/suite-v4.json --check /tmp/vulkan-captures/vulkan-capture-v4.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v5.json --output /tmp/vulkan-captures/vulkan-capture-v5.json
+          python3 conformance/compare.py --suite conformance/suite-v5.json --check /tmp/vulkan-captures/vulkan-capture-v5.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v6.json --output /tmp/vulkan-captures/vulkan-capture-v6.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v7.json --output /tmp/vulkan-captures/vulkan-capture-v7.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/vulkan-captures/vulkan-capture-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v7.json --check /tmp/vulkan-captures/vulkan-capture-v7.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v8.json --output /tmp/vulkan-captures/vulkan-capture-v8.json
+          python3 conformance/compare.py --suite conformance/suite-v8.json --check /tmp/vulkan-captures/vulkan-capture-v8.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v9.json --output /tmp/vulkan-captures/vulkan-capture-v9.json
+          python3 conformance/compare.py --suite conformance/suite-v9.json --check /tmp/vulkan-captures/vulkan-capture-v9.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v10.json --output /tmp/vulkan-captures/vulkan-capture-v10.json
+          python3 conformance/compare.py --suite conformance/suite-v10.json --check /tmp/vulkan-captures/vulkan-capture-v10.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v11.json --output /tmp/vulkan-captures/vulkan-capture-v11.json
+          python3 conformance/compare.py --suite conformance/suite-v11.json --check /tmp/vulkan-captures/vulkan-capture-v11.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v12.json --output /tmp/vulkan-captures/vulkan-capture-v12.json
+          python3 conformance/compare.py --suite conformance/suite-v12.json --check /tmp/vulkan-captures/vulkan-capture-v12.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v13.json --output /tmp/vulkan-captures/vulkan-capture-v13.json
+          python3 conformance/compare.py --suite conformance/suite-v13.json --check /tmp/vulkan-captures/vulkan-capture-v13.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v14.json --output /tmp/vulkan-captures/vulkan-capture-v14.json
+          python3 conformance/compare.py --suite conformance/suite-v14.json --check /tmp/vulkan-captures/vulkan-capture-v14.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v15.json --output /tmp/vulkan-captures/vulkan-capture-v15.json
+          python3 conformance/compare.py --suite conformance/suite-v15.json --check /tmp/vulkan-captures/vulkan-capture-v15.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v16.json --output /tmp/vulkan-captures/vulkan-capture-v16.json
+          python3 conformance/compare.py --suite conformance/suite-v16.json --check /tmp/vulkan-captures/vulkan-capture-v16.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v17.json --output /tmp/vulkan-captures/vulkan-capture-v17.json
+          python3 conformance/compare.py --suite conformance/suite-v17.json --check /tmp/vulkan-captures/vulkan-capture-v17.json
+          cargo run --locked -p metal-smoke --bin provider-capture -- --suite conformance/suite-v18.json --output /tmp/vulkan-captures/vulkan-capture-v18.json
+          python3 conformance/compare.py --suite conformance/suite-v18.json --check /tmp/vulkan-captures/vulkan-capture-v18.json
+
+      - name: Capture Vulkan through shared object API
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/vulkan-captures/vulkan-objects-v${version}.json"
+          done
+
+      - name: Capture Vulkan through async object API
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            cargo run --locked -p metal-smoke --bin provider-capture -- --api objects --async --suite "$suite" --output "/tmp/vulkan-captures/vulkan-objects-async-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/vulkan-captures/vulkan-objects-async-v${version}.json"
+          done
+
+      - name: Preserve Vulkan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-capture
+          path: /tmp/vulkan-captures/
+          if-no-files-found: error
+
+  native-oracle-build:
+    runs-on: macos-15
+    timeout-minutes: 10
+    outputs:
+      capture_status: ${{ steps.capture.outputs.capture_status }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy
+          rustup override set 1.96.0
+      - name: Check Rust native provider
+        run: |
+          cargo test --locked -p metal-api-core -p metal-api-native
+          cargo clippy --locked -p metal-api-native --all-targets --no-deps -- -D warnings
+          cargo build --locked -p metal-smoke --bin provider-capture
+      - name: Compile native Metal capture tool
+        run: |
+          xcrun swiftc -swift-version 5 -warnings-as-errors -framework Foundation -framework Metal -framework CoreGraphics -framework CryptoKit conformance/NativeOracle.swift -o /tmp/native-oracle
+      - name: Probe Metal and capture when eligible
+        id: capture
+        run: |
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite.json --output-dir /tmp/native-evidence/v1 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v2.json --output-dir /tmp/native-evidence/v2 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v3.json --output-dir /tmp/native-evidence/v3 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v4.json --output-dir /tmp/native-evidence/v4 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v5.json --output-dir /tmp/native-evidence/v5 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v6.json --output-dir /tmp/native-evidence/v6 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v7.json --output-dir /tmp/native-evidence/v7 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v8.json --output-dir /tmp/native-evidence/v8 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v9.json --output-dir /tmp/native-evidence/v9 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v10.json --output-dir /tmp/native-evidence/v10 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v11.json --output-dir /tmp/native-evidence/v11 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v12.json --output-dir /tmp/native-evidence/v12 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v13.json --output-dir /tmp/native-evidence/v13 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v14.json --output-dir /tmp/native-evidence/v14 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v15.json --output-dir /tmp/native-evidence/v15 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v16.json --output-dir /tmp/native-evidence/v16 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v17.json --output-dir /tmp/native-evidence/v17 --source-revision "$GITHUB_SHA"
+          python3 conformance/run_native.py --oracle /tmp/native-oracle --suite conformance/suite-v18.json --output-dir /tmp/native-evidence/v18 --source-revision "$GITHUB_SHA"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          statuses = [json.loads(Path('/tmp/native-evidence', version, 'status.json').read_text()) for version in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18')]
+          combined = 'captured' if all(s['capture_status'] == 'captured' for s in statuses) else 'unavailable'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('capture_status=' + combined + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              for status in statuses:
+                  summary.write(status['suite'] + ': **' + status['capture_status'] + '**. ' + status['reason'] + '\n\n')
+          PY
+      - name: Capture Rust Metal provider through shared interface
+        if: steps.capture.outputs.capture_status == 'captured'
+        run: |
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite.json --output /tmp/native-evidence/rust-provider-v1.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v2.json --output /tmp/native-evidence/rust-provider-v2.json
+          python3 conformance/compare.py --suite conformance/suite.json --check /tmp/native-evidence/rust-provider-v1.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --check /tmp/native-evidence/rust-provider-v2.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v3.json --output /tmp/native-evidence/rust-provider-v3.json
+          python3 conformance/compare.py --suite conformance/suite-v3.json --check /tmp/native-evidence/rust-provider-v3.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v4.json --output /tmp/native-evidence/rust-provider-v4.json
+          python3 conformance/compare.py --suite conformance/suite-v4.json --check /tmp/native-evidence/rust-provider-v4.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v5.json --output /tmp/native-evidence/rust-provider-v5.json
+          python3 conformance/compare.py --suite conformance/suite-v5.json --check /tmp/native-evidence/rust-provider-v5.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v6.json --output /tmp/native-evidence/rust-provider-v6.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v7.json --output /tmp/native-evidence/rust-provider-v7.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --check /tmp/native-evidence/rust-provider-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v7.json --check /tmp/native-evidence/rust-provider-v7.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v8.json --output /tmp/native-evidence/rust-provider-v8.json
+          python3 conformance/compare.py --suite conformance/suite-v8.json --check /tmp/native-evidence/rust-provider-v8.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v9.json --output /tmp/native-evidence/rust-provider-v9.json
+          python3 conformance/compare.py --suite conformance/suite-v9.json --check /tmp/native-evidence/rust-provider-v9.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v10.json --output /tmp/native-evidence/rust-provider-v10.json
+          python3 conformance/compare.py --suite conformance/suite-v10.json --check /tmp/native-evidence/rust-provider-v10.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v11.json --output /tmp/native-evidence/rust-provider-v11.json
+          python3 conformance/compare.py --suite conformance/suite-v11.json --check /tmp/native-evidence/rust-provider-v11.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v12.json --output /tmp/native-evidence/rust-provider-v12.json
+          python3 conformance/compare.py --suite conformance/suite-v12.json --check /tmp/native-evidence/rust-provider-v12.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v13.json --output /tmp/native-evidence/rust-provider-v13.json
+          python3 conformance/compare.py --suite conformance/suite-v13.json --check /tmp/native-evidence/rust-provider-v13.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v14.json --output /tmp/native-evidence/rust-provider-v14.json
+          python3 conformance/compare.py --suite conformance/suite-v14.json --check /tmp/native-evidence/rust-provider-v14.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v15.json --output /tmp/native-evidence/rust-provider-v15.json
+          python3 conformance/compare.py --suite conformance/suite-v15.json --check /tmp/native-evidence/rust-provider-v15.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v16.json --output /tmp/native-evidence/rust-provider-v16.json
+          python3 conformance/compare.py --suite conformance/suite-v16.json --check /tmp/native-evidence/rust-provider-v16.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v17.json --output /tmp/native-evidence/rust-provider-v17.json
+          python3 conformance/compare.py --suite conformance/suite-v17.json --check /tmp/native-evidence/rust-provider-v17.json
+          target/debug/provider-capture --backend native-metal-provider --suite conformance/suite-v18.json --output /tmp/native-evidence/rust-provider-v18.json
+          python3 conformance/compare.py --suite conformance/suite-v18.json --check /tmp/native-evidence/rust-provider-v18.json
+      - name: Capture Rust Metal through shared object API
+        if: steps.capture.outputs.capture_status == 'captured'
+        run: |
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            target/debug/provider-capture --api objects --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/native-evidence/metal-objects-v${version}.json"
+          done
+      - name: Capture Rust Metal through async object API
+        if: steps.capture.outputs.capture_status == 'captured'
+        run: |
+          for version in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            suite="conformance/suite-v${version}.json"
+            if [ "$version" = 1 ]; then suite=conformance/suite.json; fi
+            target/debug/provider-capture --api objects --async --backend native-metal-provider --suite "$suite" --output "/tmp/native-evidence/metal-objects-async-v${version}.json"
+            python3 conformance/compare.py --suite "$suite" --check "/tmp/native-evidence/metal-objects-async-v${version}.json"
+          done
+      # The one-device render check (`conformance/RENDER-CAPTURE.md` §5). It runs
+      # after the compute capture on purpose: a render regression has to fail the
+      # job without discarding the compute evidence those steps produced. The
+      # oracle's own probe decides, so a host whose device it would refuse can
+      # only SKIP -- never a false PASS -- and an eligible host's failure is the
+      # wanted signal.
+      - name: Run native render self-test when a Metal device is eligible
+        run: |
+          # `tee` would otherwise mask a failing check's exit status.
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/render-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/render-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "render selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/render-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('render selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('render selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('render selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "render selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "render selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "render selftest: device eligible; running the reviewed 2x2 offscreen render" >> "$log"
+          # stdout is the JSON report and stderr is the oracle's diagnostics; they
+          # stay apart so the report remains parseable, then share one log.
+          # The self-test resolves the reviewed MSL pin (`shaders/...`) against
+          # the working directory, exactly like a suite resolves it against the
+          # suite file's directory, so it has to run from `conformance/`.
+          status=0
+          (cd conformance && /tmp/native-oracle --render-selftest) \
+            > /tmp/native-evidence/render-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/render-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "render selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          report = json.loads(Path('/tmp/native-evidence/render-selftest.json').read_text())
+          writebacks = report.get('writebacks', [])
+          allocations = report.get('allocations', [])
+          expected = '4080c0ff' * 4
+          # One writeback and one allocation, both holding the observed image
+          # (`conformance/RENDER-CAPTURE.md` §3): the flip's evidence is these bytes.
+          observed = [entry.get('bytes_hex') for entry in writebacks + allocations]
+          passed = observed == [expected, expected]
+          print('render_selftest: ' + ('PASS' if passed else 'FAIL')
+                + ' (' + (expected if passed else 'observed ' + repr(observed)) + ')')
+          raise SystemExit(0 if passed else 1)
+          PY
+      # The one-device vertex-input check (`research/docs/23` §3.3). It mirrors
+      # the render self-test: the same `--probe` eligibility gate, the same
+      # SKIP-not-PASS discipline for an ineligible host, and a report whose one
+      # writeback and one allocation must read the reviewed indexed quad's
+      # attachment rather than the `fefefefe` sentinel it was preset with. The
+      # byte comparison is `conformance/run_native.py::validate_vertex_selftest`,
+      # exercised by `conformance/test_run_native.py`, not an inline re-write.
+      - name: Run native vertex-input self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/vertex-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/vertex-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "vertex selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/vertex-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('vertex selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('vertex selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('vertex selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "vertex selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "vertex selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "vertex selftest: device eligible; running the reviewed indexed quad" >> "$log"
+          status=0
+          (cd conformance && /tmp/native-oracle --vertex-selftest) \
+            > /tmp/native-evidence/vertex-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/vertex-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "vertex selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'conformance')
+          from run_native import NativeRunError, validate_vertex_selftest
+          report = json.loads(Path('/tmp/native-evidence/vertex-selftest.json').read_text())
+          try:
+              observed = validate_vertex_selftest(report)
+          except NativeRunError as error:
+              print('vertex_selftest: FAIL (' + str(error) + ')')
+              raise SystemExit(1)
+          print('vertex_selftest: PASS (' + report['id'] + ' ' + observed + ')')
+          PY
+      # The one-device present check (`research/docs/24` §6 Step 7). It mirrors
+      # the render self-test above: the same `--probe` eligibility gate, the same
+      # SKIP-not-PASS discipline for an ineligible host, and a report whose one
+      # writeback and one allocation must read the reviewed present target rather
+      # than the `fefefefe` sentinel the target was preset with. The byte
+      # comparison is `conformance/run_native.py::validate_present_selftest`,
+      # exercised by `conformance/test_run_native.py`, not an inline re-write.
+      - name: Run native present self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/present-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/present-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "present selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/present-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('present selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('present selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('present selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "present selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "present selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "present selftest: device eligible; running the reviewed 2x2 present equivalent" >> "$log"
+          status=0
+          (cd conformance && /tmp/native-oracle --present-selftest) \
+            > /tmp/native-evidence/present-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/present-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "present selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'conformance')
+          from run_native import NativeRunError, validate_present_selftest
+          report = json.loads(Path('/tmp/native-evidence/present-selftest.json').read_text())
+          try:
+              observed = validate_present_selftest(report)
+          except NativeRunError as error:
+              print('present_selftest: FAIL (' + str(error) + ')')
+              raise SystemExit(1)
+          print('present_selftest: PASS (' + observed[0] + ')')
+          PY
+      # The one-device heap check (`research/docs/25` §6 Step 7a). It mirrors
+      # the render and present self-tests: the same `--probe` eligibility gate,
+      # the same SKIP-not-PASS discipline for an ineligible host, and a report
+      # whose one writeback and two allocations must read the reviewed copy_word
+      # result rather than the `ffffffff` sentinel the write buffer was preset
+      # with. The byte comparison is `conformance/run_native.py::
+      # validate_heap_selftest`, exercised by `conformance/test_run_native.py`,
+      # not an inline re-write.
+      - name: Run native heap self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/heap-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/heap-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "heap selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/heap-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('heap selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('heap selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('heap selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "heap selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "heap selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "heap selftest: device eligible; running the reviewed MTLHeap copy_word check" >> "$log"
+          status=0
+          (cd conformance && /tmp/native-oracle --heap-selftest) \
+            > /tmp/native-evidence/heap-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/heap-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "heap selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'conformance')
+          from run_native import NativeRunError, validate_heap_selftest
+          report = json.loads(Path('/tmp/native-evidence/heap-selftest.json').read_text())
+          try:
+              observed = validate_heap_selftest(report)
+          except NativeRunError as error:
+              print('heap_selftest: FAIL (' + str(error) + ')')
+              raise SystemExit(1)
+          print('heap_selftest: PASS (' + observed + ')')
+          PY
+      # The one-device MRT check (`conformance/RENDER-CAPTURE.md` §10). It
+      # mirrors the heap self-test above: the same `--probe` eligibility gate,
+      # the same SKIP-not-PASS discipline for an ineligible host, and a report
+      # whose two writebacks and two allocations must read the reviewed dual
+      # module's per-location texels rather than the `fefefefe` clear sentinel.
+      # The byte comparison is `conformance/run_native.py::validate_mrt_selftest`,
+      # exercised by `conformance/test_run_native.py`, not an inline re-write.
+      - name: Run native MRT self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/mrt-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/mrt-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "mrt selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/mrt-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('mrt selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('mrt selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('mrt selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "mrt selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "mrt selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "mrt selftest: device eligible; running the reviewed dual-output quad" >> "$log"
+          status=0
+          (cd conformance && /tmp/native-oracle --mrt-selftest) \
+            > /tmp/native-evidence/mrt-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/mrt-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "mrt selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'conformance')
+          from run_native import NativeRunError, validate_mrt_selftest
+          report = json.loads(Path('/tmp/native-evidence/mrt-selftest.json').read_text())
+          try:
+              observed = validate_mrt_selftest(report)
+          except NativeRunError as error:
+              print('mrt_selftest: FAIL (' + str(error) + ')')
+              raise SystemExit(1)
+          print('mrt_selftest: PASS (' + report['id'] + ' ' + ' '.join(observed) + ')')
+          PY
+      - name: Preserve native probe, status and any completed capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-evidence
+          path: /tmp/native-evidence/
+          if-no-files-found: warn
+
+  compare-captures:
+    needs: [standalone, native-oracle-build]
+    if: needs.native-oracle-build.outputs.capture_status == 'captured'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vulkan-capture
+          path: /tmp/vulkan-evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-evidence
+          path: /tmp/native-evidence
+      - name: Compare observed native and Vulkan results
+        run: |
+          python3 conformance/compare.py --suite conformance/suite.json --native /tmp/native-evidence/v1/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture.json --metal-provider /tmp/native-evidence/rust-provider-v1.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v1.json --metal-objects /tmp/native-evidence/metal-objects-v1.json
+          python3 conformance/compare.py --suite conformance/suite-v2.json --native /tmp/native-evidence/v2/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v2.json --metal-provider /tmp/native-evidence/rust-provider-v2.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v2.json --metal-objects /tmp/native-evidence/metal-objects-v2.json
+          python3 conformance/compare.py --suite conformance/suite-v3.json --native /tmp/native-evidence/v3/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v3.json --metal-provider /tmp/native-evidence/rust-provider-v3.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v3.json --metal-objects /tmp/native-evidence/metal-objects-v3.json
+          python3 conformance/compare.py --suite conformance/suite-v4.json --native /tmp/native-evidence/v4/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v4.json --metal-provider /tmp/native-evidence/rust-provider-v4.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v4.json --metal-objects /tmp/native-evidence/metal-objects-v4.json
+          python3 conformance/compare.py --suite conformance/suite-v5.json --native /tmp/native-evidence/v5/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v5.json --metal-provider /tmp/native-evidence/rust-provider-v5.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v5.json --metal-objects /tmp/native-evidence/metal-objects-v5.json
+          python3 conformance/compare.py --suite conformance/suite-v6.json --native /tmp/native-evidence/v6/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v6.json --metal-provider /tmp/native-evidence/rust-provider-v6.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v6.json --metal-objects /tmp/native-evidence/metal-objects-v6.json
+          python3 conformance/compare.py --suite conformance/suite-v7.json --native /tmp/native-evidence/v7/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v7.json --metal-provider /tmp/native-evidence/rust-provider-v7.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v7.json --metal-objects /tmp/native-evidence/metal-objects-v7.json
+          python3 conformance/compare.py --suite conformance/suite-v8.json --native /tmp/native-evidence/v8/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v8.json --metal-provider /tmp/native-evidence/rust-provider-v8.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v8.json --metal-objects /tmp/native-evidence/metal-objects-v8.json
+          python3 conformance/compare.py --suite conformance/suite-v9.json --native /tmp/native-evidence/v9/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v9.json --metal-provider /tmp/native-evidence/rust-provider-v9.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v9.json --metal-objects /tmp/native-evidence/metal-objects-v9.json
+          python3 conformance/compare.py --suite conformance/suite-v10.json --native /tmp/native-evidence/v10/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v10.json --metal-provider /tmp/native-evidence/rust-provider-v10.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v10.json --metal-objects /tmp/native-evidence/metal-objects-v10.json
+          python3 conformance/compare.py --suite conformance/suite-v11.json --native /tmp/native-evidence/v11/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v11.json --metal-provider /tmp/native-evidence/rust-provider-v11.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v11.json --metal-objects /tmp/native-evidence/metal-objects-v11.json
+          python3 conformance/compare.py --suite conformance/suite-v12.json --native /tmp/native-evidence/v12/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v12.json --metal-provider /tmp/native-evidence/rust-provider-v12.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v12.json --metal-objects /tmp/native-evidence/metal-objects-v12.json
+          python3 conformance/compare.py --suite conformance/suite-v13.json --native /tmp/native-evidence/v13/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v13.json --metal-provider /tmp/native-evidence/rust-provider-v13.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v13.json --metal-objects /tmp/native-evidence/metal-objects-v13.json
+          python3 conformance/compare.py --suite conformance/suite-v14.json --native /tmp/native-evidence/v14/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v14.json --metal-provider /tmp/native-evidence/rust-provider-v14.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v14.json --metal-objects /tmp/native-evidence/metal-objects-v14.json
+          python3 conformance/compare.py --suite conformance/suite-v15.json --native /tmp/native-evidence/v15/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v15.json --metal-provider /tmp/native-evidence/rust-provider-v15.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v15.json --metal-objects /tmp/native-evidence/metal-objects-v15.json
+          python3 conformance/compare.py --suite conformance/suite-v16.json --native /tmp/native-evidence/v16/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v16.json --metal-provider /tmp/native-evidence/rust-provider-v16.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v16.json --metal-objects /tmp/native-evidence/metal-objects-v16.json
+          python3 conformance/compare.py --suite conformance/suite-v17.json --native /tmp/native-evidence/v17/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v17.json --metal-provider /tmp/native-evidence/rust-provider-v17.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v17.json --metal-objects /tmp/native-evidence/metal-objects-v17.json
+          python3 conformance/compare.py --suite conformance/suite-v18.json --native /tmp/native-evidence/v18/native-metal.json --vulkan /tmp/vulkan-evidence/vulkan-capture-v18.json --metal-provider /tmp/native-evidence/rust-provider-v18.json --vulkan-objects /tmp/vulkan-evidence/vulkan-objects-v18.json --metal-objects /tmp/native-evidence/metal-objects-v18.json
+
+  reims-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup override set 1.96.0
+      - name: Install offline GPU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm spirv-tools libvulkan1 mesa-vulkan-drivers
+      - name: Prepare pinned reims sources
+        run: python3 integration/reims/prepare.py
+      - name: Test optional reims adapter
+        run: cargo test --manifest-path integration/reims/Cargo.toml --locked
+      - name: Run reims smoke on Lavapipe
+        run: |
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          test "${#icds[@]}" -eq 1
+          export VK_ICD_FILENAMES="${icds[0]}"
+          cargo run --manifest-path integration/reims/Cargo.toml --locked --bin reims-smoke
+
+  windows-cross-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy
+          rustup override set 1.96.0
+      - name: Install MinGW-w64 and the Windows target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build the Windows rail
+        run: cargo build --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins
+      - name: Clippy the Windows rail
+        run: cargo clippy --locked --target x86_64-pc-windows-gnu -p metal-smoke --bins --no-deps -- -D warnings
+      - name: Prepare pinned reims sources
+        run: python3 integration/reims/prepare.py
+      - name: Check the Windows reims adapter
+        run: cargo check --locked --target x86_64-pc-windows-gnu --manifest-path integration/reims/Cargo.toml --bin reims-smoke

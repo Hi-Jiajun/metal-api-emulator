@@ -1,0 +1,530 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v4",
+  "guard_byte": 90,
+  "cases": [
+    {
+      "id": "transform_pingpong_two",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "6c5aa5a5a15aa5a5925aa5a53f5aa5a5305aa5a5555aa5a5465aa5a5f35aa5a5e45aa5a5195ba5a50a5ba5a5b75aa5a5a85aa5a5cd5aa5a57e5ba5a56b5ba5a59c5ba5a5915ba5a5425ba5a52f5ba5a5605ba5a5455ba5a5f65ba5a5e35ba5a5145ca5a5095ca5a5ba5ba5a5a75ba5a5d85ba5a57d58a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "36000000fb000000c8000000650000006a0000000f0000001c000000a9000000be0000004301000050010000ed000000f2000000970000002401000031010000c6010000cb01000018010000750100003a0100001f010000ac010000b90100004e06000053060000e0010000fd0100008201000027020000"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transform_pingpong_three",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "035aa5a5445ba5a5b15aa5a5d25aa5a5d75aa5a5685aa5a5655aa5a5965aa5a5bb5aa5a53c5ba5a5295ba5a54a5ba5a54f5ba5a5e05aa5a51d5ba5a50e5ba5a5b35ba5a5b45ba5a5615ba5a5c25ba5a5075ba5a5185ba5a5955ba5a5865ba5a52b5ca5a52c5ca5a55958a5a57a58a5a5ff5ba5a51058a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "590000001e010000eb000000880000008d000000320000003f000000cc000000e100000066010000730100001001000015010000ba0000004701000054010000e9010000ee0100003b010000980100005d01000042010000cf010000dc01000071060000760600000302000020020000a50100004a020000"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transform_pingpong_eight",
+      "entry": "transform_3d",
+      "grid": [
+        5,
+        3,
+        2
+      ],
+      "local": [
+        4,
+        2,
+        2
+      ],
+      "air": {
+        "path": "shaders/transform_3d.ll",
+        "sha256": "32bb9a29fef9825972b61cb982106b2bcb7c582413e50350eabc7834532b4df2"
+      },
+      "metal": {
+        "path": "shaders/transform_3d.metal",
+        "sha256": "5637cf50a3de44568ff7d3b09341e84111e2a9f6ff9b617181c6368efeacaf9b"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "length": 120,
+          "allocation_size": 152,
+          "access": "read_write",
+          "initial_hex": "f0ffffff0100000012000000230000003400000045000000560000006700000078000000890000009a000000ab000000bc000000cd000000de000000ef00000000010000110100002201000033010000440100005501000066010000770100008801000099010000aa010000bb010000cc010000dd010000"
+        },
+        {
+          "binding": 2,
+          "allocation": 320,
+          "view": 420,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "read",
+          "initial_hex": "23000000"
+        },
+        {
+          "binding": 5,
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "length": 120,
+          "allocation_size": 200,
+          "access": "write",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 300,
+          "view": 400,
+          "offset": 64,
+          "bytes_hex": "b25aa5a5935ba5a5505ba5a5715ba5a5765ba5a5175ba5a5145ba5a5355ba5a5ea5ba5a5cb5ba5a5c85ba5a5e95ba5a5ee5ba5a58f5ba5a5cc5ba5a5ad5ba5a5625ca5a5435ca5a54058a5a5215ca5a5a65ba5a5475ca5a5c458a5a52558a5a5da5ca5a57b5da5a5f858a5a51959a5a5de5ca5a5bf58a5a5"
+        },
+        {
+          "allocation": 310,
+          "view": 410,
+          "offset": 16,
+          "bytes_hex": "e8000000c90100000a0100002b0100002c0100004d0100004e0100006f010000b00100009101000092010000b3010000b4010000d501000096010000f701000038060000190600001a0200007b060000fc0100001d0600009e0200007f0200008006000021070000a20200004303000084060000e5020000"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            4,
+            2,
+            2
+          ],
+          "bindings": [
+            410,
+            420,
+            400
+          ]
+        },
+        {
+          "grid": [
+            5,
+            3,
+            2
+          ],
+          "local": [
+            8,
+            4,
+            4
+          ],
+          "bindings": [
+            400,
+            420,
+            410
+          ]
+        }
+      ]
+    },
+    {
+      "id": "copy_pingpong",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 100,
+          "view": 200,
+          "offset": 16,
+          "length": 4,
+          "allocation_size": 36,
+          "access": "read",
+          "initial_hex": "01234567"
+        },
+        {
+          "binding": 1,
+          "allocation": 101,
+          "view": 201,
+          "offset": 32,
+          "length": 4,
+          "allocation_size": 52,
+          "access": "write",
+          "initial_hex": "abababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 100,
+          "view": 200,
+          "offset": 16,
+          "bytes_hex": "01234567"
+        },
+        {
+          "allocation": 101,
+          "view": 201,
+          "offset": 32,
+          "bytes_hex": "01234567"
+        }
+      ],
+      "dispatches": [
+        {
+          "grid": [
+            1,
+            1,
+            1
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            200,
+            201
+          ]
+        },
+        {
+          "grid": [
+            1,
+            1,
+            1
+          ],
+          "local": [
+            1,
+            1,
+            1
+          ],
+          "bindings": [
+            201,
+            200
+          ]
+        }
+      ]
+    }
+  ]
+}

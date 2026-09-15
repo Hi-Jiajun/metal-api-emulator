@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v10",
+  "guard_byte": 92,
+  "cases": [
+    {
+      "id": "alias_disjoint_pair",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 500,
+          "view": 510,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "01234567"
+        },
+        {
+          "binding": 1,
+          "allocation": 500,
+          "view": 520,
+          "offset": 8,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "abababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 500,
+          "view": 520,
+          "offset": 8,
+          "bytes_hex": "01234567"
+        }
+      ]
+    },
+    {
+      "id": "alias_disjoint_pair_reversed",
+      "entry": "copy_word",
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "local": [
+        1,
+        1,
+        1
+      ],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 500,
+          "view": 530,
+          "offset": 8,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "read",
+          "initial_hex": "89abcdef"
+        },
+        {
+          "binding": 1,
+          "allocation": 500,
+          "view": 540,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "abababab"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 500,
+          "view": 540,
+          "offset": 4,
+          "bytes_hex": "89abcdef"
+        }
+      ]
+    }
+  ]
+}

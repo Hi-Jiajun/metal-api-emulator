@@ -1,0 +1,51 @@
+; 本文件是 single_pixel.vert.spv 的可读源，供渲染轨道的清屏测试使用。复现命令：
+;   spirv-as --target-env vulkan1.0 single_pixel.vert.spvasm -o single_pixel.vert.spv
+; 顶点为 (-1,-1) (0.4,-1) (-1,0.4)：2x2 视口下只包含像素 (0,0) 的中心 (-0.5,-0.5)，
+; 其余三个像素中心都在斜边之外，因此保持 CLEAR 值——这正是"清屏值必须按格式解释"
+; 可被观测的前提（全屏三角会把清屏值全部覆盖掉）。注意不能用三点重合的退化三角形：
+; 零面积会被光栅化剔除，一个像素都不写。
+               OpCapability Shader
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "single_pixel" %vid %glpos
+               OpSource GLSL 450
+               OpName %main "single_pixel"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %vid "gl_VertexIndex"
+               OpName %glpos "gl_PerVertex"
+               OpDecorate %vid BuiltIn VertexIndex
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+%_ptr_Input_int = OpTypePointer Input %int
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+        %vid = OpVariable %_ptr_Input_int Input
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+    %float_n1 = OpConstant %float -1
+ %float_edge = OpConstant %float 0.4
+     %float_0 = OpConstant %float 0
+     %float_1 = OpConstant %float 1
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+        %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %ix = OpLoad %int %vid
+     %is_top = OpSGreaterThan %bool %ix %int_1
+  %is_middle = OpIEqual %bool %ix %int_1
+      %middle_x = OpSelect %float %is_middle %float_n1 %float_edge
+        %first_x = OpSelect %float %is_top %float_n1 %middle_x
+     %middle_y = OpSelect %float %is_middle %float_edge %float_n1
+        %first_y = OpSelect %float %is_top %float_n1 %middle_y
+        %pos = OpCompositeConstruct %v4float %first_x %first_y %float_0 %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos
+               OpReturn
+               OpFunctionEnd

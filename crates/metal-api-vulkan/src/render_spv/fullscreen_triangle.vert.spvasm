@@ -1,0 +1,56 @@
+; 本文件是 fullscreen_triangle.vert.spv 的可读源，由渲染轨道的测试 include_bytes! 内嵌
+; （crates/metal-api-vulkan/src/render.rs、crates/metal-api-vulkan/tests/render_e2e.rs）。复现命令：
+;   spirv-as --target-env vulkan1.0 fullscreen_triangle.vert.spvasm -o fullscreen_triangle.vert.spv
+; 来源：/var/tmp/render-probe/shaders/fullscreen.vert.spvasm（linear/optimal 附件探针）。
+; 入口名 vertex_main：core 的 RenderPipelineContract 拒绝 vertex/fragment 同名入口
+; （两段名必须区分），所以本文件的入口名从探针的 "main" 改为 "vertex_main"，
+; 着色器行为与探针一致（探针本身不依赖入口名）。
+; 全屏三角形顶点着色器（无顶点缓冲，位置由 gl_VertexIndex 生成）
+; 2x2 视口下三角形为 (-1,-1) (3,-1) (-1,3)，覆盖全部 4 个像素中心
+; 顶点 1 的 x = 4*ix-1 = 3（必须是"超采样大三角"，x=2*ix-1 只覆盖 3 个像素）
+               OpCapability Shader
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "vertex_main" %vid %glpos
+               OpSource GLSL 450
+               OpName %main "vertex_main"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %vid "gl_VertexIndex"
+               OpName %glpos "gl_PerVertex"
+               OpDecorate %vid BuiltIn VertexIndex
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+%_ptr_Input_int = OpTypePointer Input %int
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+        %vid = OpVariable %_ptr_Input_int Input
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+    %float_n1 = OpConstant %float -1
+     %float_0 = OpConstant %float 0
+     %float_1 = OpConstant %float 1
+     %float_4 = OpConstant %float 4
+     %float_3 = OpConstant %float 3
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %ix = OpLoad %int %vid
+         %fx = OpConvertSToF %float %ix
+       %quad = OpFMul %float %fx %float_4
+        %xm1 = OpFSub %float %quad %float_1
+      %isTop = OpSGreaterThan %bool %ix %int_1
+          %x = OpSelect %float %isTop %float_n1 %xm1
+          %y = OpSelect %float %isTop %float_3 %float_n1
+        %pos = OpCompositeConstruct %v4float %x %y %float_0 %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos
+               OpReturn
+               OpFunctionEnd
