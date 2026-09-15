@@ -822,6 +822,11 @@ def _render_plan(plan, suite):
                              f"{attachment_where}: initial texels do not match the attachment")
                     _require("clear_hex" not in attachment,
                              f"{attachment_where}: a loaded attachment carries no clear colour")
+                elif load == "dontcare":
+                    _require("clear_hex" not in attachment,
+                             f"{attachment_where}: a dontcare load carries no clear colour")
+                    _require("initial_hex" not in attachment,
+                             f"{attachment_where}: a dontcare load carries no initial bytes")
                 else:
                     raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
                 parsed.append((attachment, allocation, view, None))
@@ -841,9 +846,13 @@ def _render_plan(plan, suite):
             # fragment output, repeated — and disagree about the rest: a
             # cleared attachment has no previous bytes to compare against
             # (`research/docs/23` §1.3), while a loaded one is expected to keep
-            # them where the draw missed (§3.3). The classification below is
-            # the loading rule; the clearing arm keeps the milestone's
-            # stricter one.
+            # them where the draw missed (§3.3). The v20 increment adds the
+            # undefined pre-pass contents: a `dontcare` load carries neither
+            # clear colour nor initial bytes, so its expectation follows the
+            # clearing arm's uniform rule and still has to differ from the
+            # bytes the declaring case pins for the same view (`research/docs/23`
+            # §13). The classification below is the loading rule; the clearing
+            # and dontcare arms keep the milestone's stricter one.
             load = attachment.get("load")
             if load == "clear":
                 _require(all(chunk == texel for chunk in texels),
@@ -891,6 +900,28 @@ def _render_plan(plan, suite):
                 _require(0 < kept < len(texels),
                          f"{attachment_where}: a loaded attachment needs both drawn and "
                          "kept texels")
+            elif load == "dontcare":
+                _require(all(chunk == texel for chunk in texels),
+                         f"{attachment_where}: every texel of a dontcare load has to be "
+                         "the fragment output")
+                _require("clear_hex" not in attachment,
+                         f"{attachment_where}: a dontcare load carries no clear colour")
+                _require("initial_hex" not in attachment,
+                         f"{attachment_where}: a dontcare load carries no initial bytes")
+                # The declaring pass still pins the view's bytes, but a
+                # `dontcare` load does not hand them to the pass, so they must
+                # not equal the expectation: that is what shows the undefined
+                # contents never entered the observation.
+                declared_bytes = [buffer for buffer in by_id[declaring]["buffers"]
+                                  if buffer["allocation"] == allocation
+                                  and buffer["view"] == view]
+                _require(len(declared_bytes) == 1,
+                         f"{attachment_where}: the declaring case has to declare exactly "
+                         "the attachment view")
+                _require(_hex(declared_bytes[0].get("initial_hex"),
+                              f"{attachment_where} declared initial bytes") != expected,
+                         f"{attachment_where}: the declared view's bytes equal the "
+                         "expectation")
             else:
                 raise CaptureError(f"{attachment_where}: unknown attachment load op {load!r}")
             parsed.append((attachment, allocation, view, expected))

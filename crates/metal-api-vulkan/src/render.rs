@@ -174,11 +174,12 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 
 /// One colour attachment of an offscreen render request.
 ///
-/// Each entry carries its own format, clear value and previous bytes, exactly
-/// like the pass's per-location attachment list: the format list selects the
-/// fragment module ([`solid_fragment_spirv`]), the clear is mapped onto the
-/// format's component order by [`clear_value_for`], and `previous` marks a
-/// `LoadOp::Load` entry whose bytes the rail uploads before the pass opens.
+/// Each entry carries its own format, load operation and previous bytes,
+/// exactly like the pass's per-location attachment list: the format list
+/// selects the fragment module ([`solid_fragment_spirv`]), the `Clear` colour
+/// is mapped onto the format's component order by [`clear_value_for`], and
+/// `previous` carries the bytes a `LoadOp::Load` entry uploads before the pass
+/// opens.
 pub(crate) struct OffscreenColorAttachment<'a> {
     /// Colour attachment format, in render-contract terms.
     pub format: AttachmentFormat,
@@ -188,17 +189,18 @@ pub(crate) struct OffscreenColorAttachment<'a> {
     /// no readback, so the discarded attachment disappears from the observable
     /// surface instead of passing as "landed correctly".
     pub store: StoreOp,
-    /// The `LoadOp::Clear` value. Carried as bytes for the same reason the
-    /// contract carries bytes: a float clear is not parity-stable
-    /// (`research/docs/23` §3.5). The bytes are in the attachment format's
-    /// *memory* order; [`clear_value_for`] maps them onto Vulkan's component
-    /// order, which is not the same thing (`Bgra8Unorm` needs a swap, and
-    /// `R32Float` is one component, not four).
-    pub clear: ClearColor,
+    /// How the pass establishes this attachment's contents. `Clear(color)` is
+    /// carried as bytes for the same reason the contract carries bytes: a
+    /// float clear is not parity-stable (`research/docs/23` §3.5), and the
+    /// bytes are in the format's *memory* order while [`clear_value_for`]
+    /// maps them onto Vulkan's component order. `Load` uploads `previous`
+    /// before the pass opens, and `DontCare` discards the pre-pass contents
+    /// without reading or uploading them (`docs/23` §3.1, v20).
+    pub load: LoadOp,
     /// The attachment's previous bytes for a `LoadOp::Load` pass
     /// (`research/docs/23` §3.3). `Some` means the rail uploads them into the
     /// image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
-    /// `Clear` shape every earlier increment used.
+    /// `Clear`/`DontCare` shape.
     pub previous: Option<&'a [u8]>,
 }
 
@@ -452,8 +454,8 @@ fn prepare_render_request<'a>(
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
     let mut extent: Option<[u32; 2]> = None;
     for (index, (attachment, previous)) in pass.color_attachments.iter().zip(previous).enumerate() {
-        let clear = match attachment.load {
-            LoadOp::Clear(clear) => clear,
+        match attachment.load {
+            LoadOp::Clear(_) => {}
             LoadOp::Load => {
                 // The rail uploads the attachment's previous bytes before
                 // opening the render pass (`research/docs/23` §3.3). The caller
@@ -469,15 +471,23 @@ fn prepare_render_request<'a>(
                              the trace's own view declaration; this pass resolved none",
                         ));
                 }
-                ClearColor::new([0; 4])
             }
             LoadOp::DontCare => {
-                return Err(capability_refusal("attachment_load_op_unsupported")
-                    .with_field("attachment", FieldValue::Unsigned(index as u64))
-                    .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
-                    .with_detail("core admission refuses `LoadOp::DontCare` for this increment"));
+                // The attachment's pre-pass contents are undefined, so the
+                // rail neither reads nor uploads declaring bytes. A caller
+                // that resolves bytes anyway is refused rather than silently
+                // ignored (`docs/23` §3.1, v20).
+                if previous.is_some() {
+                    return Err(capability_refusal("attachment_load_op_unsupported")
+                        .with_field("attachment", FieldValue::Unsigned(index as u64))
+                        .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
+                        .with_detail(
+                            "a `LoadOp::DontCare` attachment declares no previous bytes; the \
+                             trace must resolve none",
+                        ));
+                }
             }
-        };
+        }
         let width = narrow_dimension(attachment.width)?;
         let height = narrow_dimension(attachment.height)?;
         match extent {
@@ -504,7 +514,7 @@ fn prepare_render_request<'a>(
         attachments.push(OffscreenColorAttachment {
             format: attachment.format,
             store: attachment.store,
-            clear,
+            load: attachment.load,
             previous: *previous,
         });
     }
@@ -1035,7 +1045,7 @@ pub(crate) fn execute_offscreen_render(
             *vk_format,
             width,
             height,
-            attachment.previous.is_some(),
+            attachment.load,
             attachment.store == StoreOp::Store,
         )?;
     }
@@ -1630,7 +1640,9 @@ struct OffscreenObjects<'a> {
 /// `load_op` and `initial_layout` travel with the attachment because both feed
 /// the render pass's per-attachment description: a loading attachment opens
 /// with `LOAD_OP_LOAD` from `COLOR_ATTACHMENT_OPTIMAL` (the layout the upload
-/// leaves it in), a clearing one with `LOAD_OP_CLEAR` from `UNDEFINED`.
+/// leaves it in), a clearing one with `LOAD_OP_CLEAR` from `UNDEFINED`, and a
+/// `DontCare` one with `LOAD_OP_DONT_CARE` from `UNDEFINED` (`docs/23` §3.1,
+/// v20).
 struct AttachmentObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -1642,7 +1654,7 @@ struct AttachmentObjects {
     store_op: vk::AttachmentStoreOp,
     initial_layout: vk::ImageLayout,
     /// The host-visible staging buffer holding this attachment's previous bytes
-    /// for a `LoadOp::Load` pass. Null for a clearing attachment.
+    /// for a `LoadOp::Load` pass. Null unless the attachment loads.
     previous_buffer: vk::Buffer,
     previous_memory: vk::DeviceMemory,
 }
@@ -1718,6 +1730,10 @@ impl<'a> OffscreenObjects<'a> {
     /// `TRANSFER_SRC` is part of the usage exactly when the attachment is
     /// stored, because the readback copies the stored attachment out and a
     /// discarded attachment is never read back (`docs/23` §3.6, v19);
+    /// `TRANSFER_DST` is part of the usage exactly when the attachment loads,
+    /// because only a loading attachment receives bytes through
+    /// `vkCmdCopyBufferToImage` — a `DontCare` attachment neither uploads nor
+    /// reads its pre-pass contents (`docs/23` §3.1, v20);
     /// `DEVICE_LOCAL` is the memory class the probe used for every
     /// optimal-tiling candidate.
     fn create_attachment(
@@ -1725,9 +1741,10 @@ impl<'a> OffscreenObjects<'a> {
         format: vk::Format,
         width: u32,
         height: u32,
-        loading: bool,
+        load: LoadOp,
         storing: bool,
     ) -> Result<(), ProviderError> {
+        let loading = matches!(load, LoadOp::Load);
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -1772,15 +1789,14 @@ impl<'a> OffscreenObjects<'a> {
             image,
             memory,
             view,
-            // The upload leaves the image in the colour-attachment layout,
-            // which is the layout the render pass has to declare as its
-            // initial one: an `UNDEFINED` initial layout would tell the pass
-            // it may discard what the copy just wrote (`research/docs/23`
-            // §3.3).
-            load_op: if loading {
-                vk::AttachmentLoadOp::LOAD
-            } else {
-                vk::AttachmentLoadOp::CLEAR
+            // A loading attachment keeps the upload's layout as the pass's
+            // initial one; a clearing or `DontCare` attachment opens from
+            // `UNDEFINED`, because nothing defines its bytes before the pass
+            // (`research/docs/23` §3.3, `docs/23` §3.1 v20).
+            load_op: match load {
+                LoadOp::Load => vk::AttachmentLoadOp::LOAD,
+                LoadOp::Clear(_) => vk::AttachmentLoadOp::CLEAR,
+                LoadOp::DontCare => vk::AttachmentLoadOp::DONT_CARE,
             },
             store_op: if storing {
                 vk::AttachmentStoreOp::STORE
@@ -2452,7 +2468,16 @@ impl<'a> OffscreenObjects<'a> {
         let clear_values = attachments
             .iter()
             .map(|attachment| vk::ClearValue {
-                color: clear_value_for(attachment.format, attachment.clear),
+                color: clear_value_for(
+                    attachment.format,
+                    match attachment.load {
+                        LoadOp::Clear(clear) => clear,
+                        // A loading or `DontCare` attachment carries no clear
+                        // colour: Vulkan ignores this entry when the load op
+                        // is not `CLEAR`.
+                        LoadOp::Load | LoadOp::DontCare => ClearColor::new([0; 4]),
+                    },
+                ),
             })
             .collect::<Vec<_>>();
         let render_area = vk::Rect2D {
@@ -3307,7 +3332,7 @@ mod tests {
                 attachments: vec![OffscreenColorAttachment {
                     format,
                     store: StoreOp::Store,
-                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
                 }],
                 extent: [2, 2],
@@ -3588,7 +3613,7 @@ mod tests {
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::R32Uint,
                 store: StoreOp::Store,
-                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
             }],
             extent: [2, 2],
@@ -3647,7 +3672,7 @@ mod tests {
                     attachments: vec![OffscreenColorAttachment {
                         format,
                         store: StoreOp::Store,
-                        clear,
+                        load: LoadOp::Clear(clear),
                         previous: None,
                     }],
                     extent: [2, 2],
@@ -3783,7 +3808,7 @@ mod tests {
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::Store,
-                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
             }],
             extent: [2, 0],
@@ -3903,13 +3928,13 @@ mod tests {
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
                     },
                 ],
@@ -3963,13 +3988,13 @@ mod tests {
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
                     },
                 ],
@@ -4020,13 +4045,13 @@ mod tests {
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::Store,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                         previous: None,
                     },
                     OffscreenColorAttachment {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
-                        clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                        load: LoadOp::Load,
                         previous: Some(&previous),
                     },
                 ],
@@ -4062,7 +4087,7 @@ mod tests {
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
                 store: StoreOp::DontCare,
-                clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                 previous: None,
             }],
             extent: [2, 2],
@@ -4093,13 +4118,13 @@ mod tests {
                 OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,
                     store: StoreOp::Store,
-                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
                 },
                 OffscreenColorAttachment {
                     format: AttachmentFormat::R32Float,
                     store: StoreOp::Store,
-                    clear: ClearColor::new([CLEAR_SENTINEL; 4]),
+                    load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
                     previous: None,
                 },
             ],
@@ -4212,6 +4237,78 @@ mod tests {
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
+    /// The v20 load increment (`docs/23` §3.1): a `LoadOp::DontCare`
+    /// attachment declares its pre-pass contents undefined, so the rail opens
+    /// the pass with `LOAD_OP_DONT_CARE` from `UNDEFINED`, uploads nothing,
+    /// asks for no `TRANSFER_DST` and reads the draw's own writes back. The
+    /// full-coverage milestone quad makes those writes the whole 2×2 extent.
+    #[test]
+    fn a_dont_care_attachment_discards_the_pre_pass_contents_and_stores_the_draw() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let (uploads_before, readbacks_before) = context.buffer_copy_counts();
+        let blobs = execute_offscreen_render(
+            &context,
+            &OffscreenRenderRequest {
+                attachments: vec![OffscreenColorAttachment {
+                    format: AttachmentFormat::Rgba8Unorm,
+                    store: StoreOp::Store,
+                    load: LoadOp::DontCare,
+                    previous: None,
+                }],
+                extent: [2, 2],
+                vertex: milestone_vertex(),
+                vertex_streams: Vec::new(),
+                draw: DrawShape::Milestone,
+                index_stream: None,
+                indirect: None,
+            },
+        )
+        .expect("the reviewed single-attachment DontCare pass executes");
+        let (uploads_after, readbacks_after) = context.buffer_copy_counts();
+        let texels = blobs[0].as_ref().expect("the stored attachment reads back");
+        eprintln!("dont_care readback: {}", hex(texels));
+        assert_eq!(*texels, EXPECTED_RGBA8_TEXELS.repeat(4));
+        assert_eq!(
+            uploads_after, uploads_before,
+            "a DontCare attachment uploads no previous bytes"
+        );
+        assert_eq!(
+            readbacks_after,
+            readbacks_before + 1,
+            "copy_out counts the stored attachment only"
+        );
+    }
+
+    /// The trace path resolves no bytes for a `DontCare` attachment, and the
+    /// rail holds that invariant: carrying bytes for one is refused under the
+    /// retained slug rather than silently ignored. Host-side:
+    /// `prepare_render_request` reads no device.
+    #[test]
+    fn prepare_render_request_refuses_bytes_carried_for_a_dont_care_attachment() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.color_attachments[0].load = LoadOp::DontCare;
+        pass.validate()
+            .expect("the DontCare pass is a legal core shape now");
+
+        // Without bytes the shape plans; with bytes it is refused by name.
+        prepare_render_request(&stages, &pass, &[None])
+            .expect("a DontCare attachment with no previous bytes plans");
+        let previous: [u8; 16] = [0x11; 16];
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)]) {
+            Err(error) => error,
+            Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
+        };
+        assert_eq!(refused.slug, "attachment_load_op_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("load_op"),
+            Some(&FieldValue::Text("dont_care".to_owned()))
+        );
     }
 
     /// The render rail enqueues through the same driver boundary as the

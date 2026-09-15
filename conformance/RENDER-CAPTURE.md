@@ -839,3 +839,52 @@ Not yet achieved, and therefore still a condition rather than an observation:
   gates and refusals, and `ci.yml` names the suite on all four capture rails
   and all four object-API version loops. The Apple capture of that suite is
   still the observation that closes this section.
+
+## 12. The undefined-load milestone (`LoadOp::DontCare`, v20)
+
+The v20 increment admits `LoadOp::DontCare` as undefined pre-pass contents. A
+`dontcare` attachment still stores its rendered bytes — it differs from the v19
+`StoreOp::DontCare` shape, which discards the landing — but the pass starts
+from nothing, so neither a clear colour nor the declaring view's bytes travel
+with the attachment. What makes the observation falsifiable is the comparison
+discipline: the expectation has to be the uniform fragment output, and it has
+to differ from the bytes the declaring case pins for the same view — otherwise
+"the pass ignored the undefined contents and the renderer drew anyway" is
+indistinguishable from "the load actually happened".
+
+What the native rail does:
+
+* `render.rs` opens a `DontCare` attachment from `UNDEFINED` with
+  `VK_ATTACHMENT_LOAD_OP_DONT_CARE`, uploads no previous bytes and drops the
+  `TRANSFER_DST` requirement the `Load` arm enforces; a `DontCare` entry that
+  still carries previous bytes is refused under the preserved
+  `UnsupportedAttachmentLoadOp` slug;
+* the macOS encoder body maps `LoadOp::DontCare` onto `MTLLoadAction::DontCare`,
+  with no `MTLClearColor` and no pre-seeded texture; the Swift oracle decodes
+  `load: "dontcare"` the same way and refuses a fixture that carries
+  `clear_hex` or `initial_hex` on the attachment;
+* the known v19/v20 asymmetry stays deliberate for this step: a present target
+  still hard-codes `CLEAR` on the Vulkan rail while the native rail can spell
+  `DontCare`. The byte observation cannot distinguish them for the reviewed
+  full-coverage quad, so the present path is left out of the v20 fixture until
+  a present + dontcare case defines the contract (`docs/24` §3.1).
+
+The one-device fixture is the frozen `suite-v20.json`, render case
+`dontcare_load_quad_2x2`: the reviewed indexed quad, one 2x2 `rgba8_unorm`
+attachment at `allocation: 900, view: 910` with `load: "dontcare"`,
+`store: "store"` and the uniform `4080c0ff` expectation. Its declaring case is
+the reviewed `copy_word` whose read view carries `cdcdcdcd` four times, so the
+expectation differs from the declared bytes by construction. The count
+contract is two uploads (`copy_in == 2`) and two readbacks (`copy_out == 2`).
+`conformance/test_suite_v20.py` pins the schema, plan, marker gates, the
+`clear_hex`/`initial_hex` refusals, the declared-bytes equality refusal and the
+non-uniform-expectation refusal.
+
+Not yet achieved, and therefore still a condition rather than an observation:
+
+* no Apple CI run of the v20 fixture has been committed yet, so
+  `MTLLoadAction::DontCare` and the no-pre-seed texture path have not executed
+  on an Apple GPU; `cargo check --target aarch64-apple-darwin` and the Swift
+  source review are compile evidence today, not execution evidence;
+* the Vulkan execution evidence for this step is Lavapipe only in the local
+  gates; the RTX 5060 / dzn real-device capture of the v20 suite is still owed.
