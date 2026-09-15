@@ -25,7 +25,8 @@ use crate::provider::{
     PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
     ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
     ResourceTableSnapshot, StorageMode, StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
-    MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS,
+    PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,6 +106,18 @@ pub enum Error {
         vertex_buffers: usize,
         index_buffer: bool,
     },
+    /// A multi-attachment draw recorded no colour attachments, so the pass it
+    /// would become has no target for any fragment output to land in.
+    EmptyRenderAttachmentList,
+    /// A multi-attachment draw recorded more than
+    /// [`MAX_COLOR_ATTACHMENTS`], the cap the pass's own descriptor carries.
+    RenderAttachmentLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    /// The same attachment — one `(allocation, view)` identity — appears twice
+    /// in one recorded draw, so two locations would name one target.
+    DuplicateRenderAttachment,
 }
 
 impl fmt::Display for Error {
@@ -183,6 +196,18 @@ impl fmt::Display for Error {
                     f.write_str(" and an index buffer")?;
                 }
                 Ok(())
+            }
+            Self::EmptyRenderAttachmentList => {
+                f.write_str("a draw needs at least one colour attachment")
+            }
+            Self::RenderAttachmentLimitExceeded { requested, maximum } => {
+                write!(
+                    f,
+                    "a draw records {requested} colour attachments; maximum is {maximum}"
+                )
+            }
+            Self::DuplicateRenderAttachment => {
+                f.write_str("one colour attachment (allocation and view) is recorded twice")
             }
         }
     }
@@ -530,15 +555,46 @@ pub enum RenderAttachmentLoad {
     Load,
 }
 
+/// One colour attachment a multi-attachment draw records.
+///
+/// The attachment list's position is the attachment's `location` — entry `i`
+/// is the target the fragment stage's output `i` lands in — so the list the
+/// encoder holds is also the list the pass's descriptor carries. Each entry
+/// names its own view, format and load operation, while `width` and `height`
+/// stay pass-wide exactly as the contract's shared viewport makes them
+/// ([`RenderPassDescriptor`]).
+#[derive(Clone, Copy)]
+pub struct RenderColorAttachment<'a> {
+    /// The buffer view that carries the attachment's identity and byte range.
+    pub view: &'a BufferView,
+    /// The attachment's colour format, which has to equal the recorded
+    /// pipeline's compiled format at the same location.
+    pub format: AttachmentFormat,
+    /// How the pass establishes this attachment's contents.
+    pub load: RenderAttachmentLoad,
+}
+
 /// One recorded colour attachment: the buffer view that carries the attachment
-/// identity and byte range, plus the render-contract shape the encoder restates.
+/// identity and byte range, plus the format and load the encoder restates.
+///
+/// [`RenderColorAttachment`] is the recording-time shape a caller spells;
+/// this is the owned copy the recorded [`RenderTarget`] keeps, so the draw
+/// stays valid after the caller's views are dropped.
 #[derive(Clone)]
-struct RenderTarget {
+struct RenderTargetAttachment {
     view: BufferView,
     format: AttachmentFormat,
+    load: RenderAttachmentLoad,
+}
+
+/// The colour attachments one recorded render pass stores into, plus the
+/// pass-wide viewport and the draw it replays. The attachment list is
+/// positional: entry `i` is location `i`, up to [`MAX_COLOR_ATTACHMENTS`].
+#[derive(Clone)]
+struct RenderTarget {
+    attachments: Vec<RenderTargetAttachment>,
     width: u64,
     height: u64,
-    load: RenderAttachmentLoad,
     present: Option<PresentInitial>,
     draw: RenderDraw,
 }
@@ -650,23 +706,36 @@ impl RenderTarget {
         pipeline_id: PipelineId,
         input_bytes: &dyn Fn(&BufferView) -> Vec<u8>,
     ) -> Result<RenderPassDescriptor, Error> {
-        let attachment = RenderAttachment {
-            view_id: self.view.view_id,
-            allocation_id: self.view.allocation_id(),
-            format: self.format,
-            width: self.width,
-            height: self.height,
-            load: match self.load {
-                RenderAttachmentLoad::Clear(bytes) => LoadOp::Clear(ClearColor::new(bytes)),
-                RenderAttachmentLoad::Load => LoadOp::Load,
-            },
-            store: StoreOp::Store,
-        };
+        // One attachment per location, in list order: the descriptor's entry
+        // `i` is location `i`, which is also the order the recorded pipeline's
+        // compiled formats are checked against (`validate_against`).
+        let color_attachments = self
+            .attachments
+            .iter()
+            .map(|attachment| RenderAttachment {
+                view_id: attachment.view.view_id,
+                allocation_id: attachment.view.allocation_id(),
+                format: attachment.format,
+                width: self.width,
+                height: self.height,
+                load: match attachment.load {
+                    RenderAttachmentLoad::Clear(bytes) => LoadOp::Clear(ClearColor::new(bytes)),
+                    RenderAttachmentLoad::Load => LoadOp::Load,
+                },
+                store: StoreOp::Store,
+            })
+            .collect();
+        // The present tail hands on the location-0 attachment, which is the
+        // single-attachment shape v16/v17 published: the target restates the
+        // first attachment's view, allocation, format and extent. A recorded
+        // target always carries at least one attachment (`record_render_pass`
+        // refuses an empty list), so location 0 is always present here.
+        let first = &self.attachments[0];
         let present = self.present.map(|initial| PresentDescriptor {
             target: PresentTarget {
-                allocation_id: self.view.allocation_id(),
-                view_id: self.view.view_id,
-                format: self.format,
+                allocation_id: first.view.allocation_id(),
+                view_id: first.view.view_id,
+                format: first.format,
                 width: self.width,
                 height: self.height,
                 image_count: MAX_PRESENT_IMAGE_COUNT,
@@ -675,7 +744,7 @@ impl RenderTarget {
                     PresentInitial::Sentinel(bytes) => InitialState::Sentinel(bytes.to_vec()),
                 },
             },
-            source: self.view.view_id,
+            source: first.view.view_id,
             mode: PresentMode::Fifo,
             acquire: AcquirePolicy::Blocking,
         });
@@ -695,7 +764,7 @@ impl RenderTarget {
             });
         let descriptor = RenderPassDescriptor {
             pipeline: pipeline_id,
-            color_attachments: vec![attachment],
+            color_attachments,
             viewport: [
                 0,
                 0,
@@ -979,7 +1048,12 @@ fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
                 ids.extend(buffers.values().map(|view| view.view_id));
             }
             RecordedPass::Render { target, .. } => {
-                ids.insert(target.view.view_id);
+                ids.extend(
+                    target
+                        .attachments
+                        .iter()
+                        .map(|attachment| attachment.view.view_id),
+                );
             }
         }
     }
@@ -988,11 +1062,13 @@ fn recorded_view_ids(passes: &[RecordedPass]) -> BTreeSet<ViewId> {
 
 /// Reserve every range every recorded pass touches, in identity order.
 ///
-/// A render pass reserves its attachment as a write (the pass lands texels
-/// there) and each stream and index buffer it draws through as a read: the
-/// commit snapshot copies those bytes into the trace, and a read range only
-/// excludes a conflicting write (`research/docs/14` §3.2), so a CPU reader of a
-/// draw input does not wait out the whole window.
+/// A render pass reserves a `Clear` attachment as a write (the pass lands
+/// texels there without reading the old ones) and a `Load` attachment as a
+/// read: a load snapshots the attachment's current bytes at commit, exactly as
+/// the draw inputs do, and a read range only excludes a conflicting write
+/// (`research/docs/14` §3.2), so a CPU reader is not made to wait out the whole
+/// window. Each stream and index buffer a pass draws through is reserved as a
+/// read for the same reason.
 fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Error> {
     let mut by_allocation =
         BTreeMap::<AllocationId, (&Buffer, BTreeMap<(usize, usize), bool>)>::new();
@@ -1019,14 +1095,17 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
                 }
             }
             RecordedPass::Render { target, .. } => {
-                let view = &target.view;
-                by_allocation
-                    .entry(view.allocation_id())
-                    .or_insert_with(|| (&view.buffer, BTreeMap::new()))
-                    .1
-                    .entry((view.offset, view.offset + view.length))
-                    .and_modify(|write| *write = true)
-                    .or_insert(true);
+                for attachment in &target.attachments {
+                    let view = &attachment.view;
+                    let write = !matches!(attachment.load, RenderAttachmentLoad::Load);
+                    by_allocation
+                        .entry(view.allocation_id())
+                        .or_insert_with(|| (&view.buffer, BTreeMap::new()))
+                        .1
+                        .entry((view.offset, view.offset + view.length))
+                        .and_modify(|existing| *existing |= write)
+                        .or_insert(write);
+                }
                 // The draw's own inputs are read: the commit snapshot copies
                 // their bytes into the trace, and a read range only excludes a
                 // conflicting write (`research/docs/14` §3.2), so a CPU reader
@@ -2184,7 +2263,7 @@ impl RenderCommandEncoder {
     ///
     /// `attachment` names the buffer view the attachment lands in (its
     /// allocation/view identity and byte range); `format`, `width`, `height`
-    /// and `clear` restate the attachment shape the render contract fixes, and
+    /// and `load` restate the attachment shape the render contract fixes, and
     /// `present` selects the optional present tail action on that same
     /// attachment. Every other shape is refused here with a typed error rather
     /// than deferred to provider admission.
@@ -2215,11 +2294,13 @@ impl RenderCommandEncoder {
             return Err(Error::IndirectDirectConflict);
         }
         self.record_render_pass(
-            attachment,
-            format,
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+            }],
             width,
             height,
-            load,
             present,
             RenderDraw::vertex_id(),
             None,
@@ -2249,6 +2330,40 @@ impl RenderCommandEncoder {
         vertex_count: u32,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
+        self.draw_primitives_with_attachments(
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+            }],
+            width,
+            height,
+            vertex_count,
+            present,
+        )
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams.
+    ///
+    /// [`Self::draw_primitives`] is the single-attachment shape of this call:
+    /// it wraps one attachment in the list and delegates here, so every direct
+    /// vertex-buffer draw shares one recording path. `attachments` is
+    /// positional — entry `i` is location `i` — and the recorded pipeline's
+    /// compiled formats have to agree entry by entry, which the render contract
+    /// checks at recording time exactly as the single-attachment shape does. An
+    /// empty list is [`Error::EmptyRenderAttachmentList`], more than
+    /// [`MAX_COLOR_ATTACHMENTS`] entries is
+    /// [`Error::RenderAttachmentLimitExceeded`], and one `(allocation, view)`
+    /// identity recorded twice is [`Error::DuplicateRenderAttachment`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_with_attachments(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
         self.ensure_open()?;
         if self.indirect {
             return Err(Error::IndirectDirectConflict);
@@ -2268,7 +2383,7 @@ impl RenderCommandEncoder {
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
         };
-        self.record_render_pass(attachment, format, width, height, load, present, draw, None)
+        self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
     /// Record the milestone's render pass through the bound index buffer.
@@ -2291,6 +2406,38 @@ impl RenderCommandEncoder {
         width: u64,
         height: u64,
         load: RenderAttachmentLoad,
+        index_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.draw_indexed_primitives_with_attachments(
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+            }],
+            width,
+            height,
+            index_count,
+            present,
+        )
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer.
+    ///
+    /// [`Self::draw_indexed_primitives`] is the single-attachment shape of this
+    /// call: it wraps one attachment in the list and delegates here.
+    /// `index_count` is the number of indices the draw consumes and is what the
+    /// descriptor's `vertices` field carries, the way the frozen contract
+    /// spells `drawIndexedPrimitives(indexCount:)`; vertex streams are optional
+    /// exactly as they are for the single-attachment shape. The attachment
+    /// list's refusals are the ones
+    /// [`Self::draw_primitives_with_attachments`] states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_attachments(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
         index_count: u32,
         present: Option<PresentInitial>,
     ) -> Result<(), Error> {
@@ -2317,55 +2464,74 @@ impl RenderCommandEncoder {
                 format: *index_format,
             }),
         };
-        self.record_render_pass(attachment, format, width, height, load, present, draw, None)
+        self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
     /// Land one render pass in the command's pass list.
     ///
-    /// Every draw above ends here, so the four shapes share one statement of
-    /// what recording a pass means: the attachment belongs to this device and
-    /// has the extent the restated shape implies, the descriptor the pass
-    /// becomes passes the frozen contract's own shape rules, the registered
-    /// pipeline's render contract agrees with that descriptor, the command's
-    /// pass list has room, and the serial-resource budget holds. Only then does
-    /// the pass land. `indirect` carries the ICB a replayed pass inherits, which
-    /// is also the one pass the command may replay: an ICB already recorded is
+    /// Every draw above ends here, so all draw shapes share one statement of
+    /// what recording a pass means: every attachment belongs to this device,
+    /// has the extent the restated shape implies and names a distinct
+    /// `(allocation, view)` identity, the descriptor the pass becomes passes
+    /// the frozen contract's own shape rules, the registered pipeline's render
+    /// contract agrees with that descriptor, the command's pass list has room,
+    /// and the serial-resource budget holds. Only then does the pass land.
+    /// `indirect` carries the ICB a replayed pass inherits, which is also the
+    /// one pass the command may replay: an ICB already recorded is
     /// [`Error::IndirectAlreadyRecorded`].
     #[allow(clippy::too_many_arguments)]
     fn record_render_pass(
         &mut self,
-        attachment: &BufferView,
-        format: AttachmentFormat,
+        attachments: &[RenderColorAttachment<'_>],
         width: u64,
         height: u64,
-        load: RenderAttachmentLoad,
         present: Option<PresentInitial>,
         draw: RenderDraw,
         indirect: Option<&IndirectCommandBuffer>,
     ) -> Result<(), Error> {
         let pipeline = self.pipeline.clone().ok_or(ApiError::MissingPipeline)?;
-        if !Arc::ptr_eq(&self.shared.owner, &attachment.buffer.inner.owner) {
-            return Err(Error::ForeignBuffer);
+        if attachments.is_empty() {
+            return Err(Error::EmptyRenderAttachmentList);
         }
-        let expected_bytes = width
-            .checked_mul(height)
-            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()))
-            .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
-        if u64::try_from(attachment.length).unwrap_or(u64::MAX) != expected_bytes {
-            return Err(ContractError::AttachmentExtentMismatch {
-                pass_index: 0,
-                view: attachment.view_id,
-                expected: expected_bytes,
-                declared: u64::try_from(attachment.length).unwrap_or(u64::MAX),
+        if attachments.len() > MAX_COLOR_ATTACHMENTS {
+            return Err(Error::RenderAttachmentLimitExceeded {
+                requested: attachments.len(),
+                maximum: MAX_COLOR_ATTACHMENTS,
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for attachment in attachments {
+            if !Arc::ptr_eq(&self.shared.owner, &attachment.view.buffer.inner.owner) {
+                return Err(Error::ForeignBuffer);
             }
-            .into());
+            if !seen.insert((attachment.view.allocation_id(), attachment.view.view_id())) {
+                return Err(Error::DuplicateRenderAttachment);
+            }
+            let expected_bytes = width
+                .checked_mul(height)
+                .and_then(|texels| texels.checked_mul(attachment.format.bytes_per_texel()))
+                .ok_or(ContractError::ArithmeticOverflow("attachment extent"))?;
+            if u64::try_from(attachment.view.length).unwrap_or(u64::MAX) != expected_bytes {
+                return Err(ContractError::AttachmentExtentMismatch {
+                    pass_index: 0,
+                    view: attachment.view.view_id,
+                    expected: expected_bytes,
+                    declared: u64::try_from(attachment.view.length).unwrap_or(u64::MAX),
+                }
+                .into());
+            }
         }
         let target = RenderTarget {
-            view: attachment.clone(),
-            format,
+            attachments: attachments
+                .iter()
+                .map(|attachment| RenderTargetAttachment {
+                    view: attachment.view.clone(),
+                    format: attachment.format,
+                    load: attachment.load,
+                })
+                .collect(),
             width,
             height,
-            load,
             present,
             draw,
         };
@@ -2401,7 +2567,9 @@ impl RenderCommandEncoder {
             });
         }
         let mut unique = recorded_view_ids(&inner.passes);
-        unique.insert(target.view.view_id);
+        for attachment in &target.attachments {
+            unique.insert(attachment.view.view_id);
+        }
         if unique.len() > MAX_SERIAL_RESOURCES {
             return Err(ContractError::SerialResourceLimit {
                 requested: unique.len(),
@@ -2489,11 +2657,13 @@ impl RenderCommandEncoder {
             return Err(Error::IndirectDirectConflict);
         }
         self.record_render_pass(
-            attachment,
-            format,
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+            }],
             width,
             height,
-            load,
             present,
             draw,
             Some(icb),
