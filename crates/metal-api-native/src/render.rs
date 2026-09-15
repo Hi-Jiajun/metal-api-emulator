@@ -135,6 +135,16 @@ pub(crate) const REVIEWED_QUAD_SOURCE: &str =
 /// Fragment entry of the reviewed four-location module.
 pub(crate) const QUAD_FRAGMENT_ENTRY: &str = "render_solid_rgba8_quad";
 
+/// The reviewed three-location module: the indexed vertex stage plus a fragment
+/// stage that writes three colour locations
+/// (`conformance/shaders/quad_indexed_2x2_triple.metal`). Three is not the
+/// ceiling, but it is its own shape (`research/docs/23` §3.3, v25).
+pub(crate) const REVIEWED_TRIPLE_SOURCE: &str =
+    include_str!("../../../conformance/shaders/quad_indexed_2x2_triple.metal");
+
+/// Fragment entry of the reviewed three-location module.
+pub(crate) const TRIPLE_FRAGMENT_ENTRY: &str = "render_solid_rgba8_triple";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -164,7 +174,7 @@ pub(crate) struct ReviewedModule {
 
 /// The three reviewed modules, one per (vertex-input shape, colour-format
 /// shape) pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 5] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 6] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -200,6 +210,13 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 5] = [
         fragment_entry: QUAD_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
+    ReviewedModule {
+        source: REVIEWED_TRIPLE_SOURCE,
+        path: "conformance/shaders/quad_indexed_2x2_triple.metal",
+        vertex_entry: QUAD_VERTEX_ENTRY,
+        fragment_entry: TRIPLE_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
 ];
 
 /// The reviewed module a pipeline's vertex-input shape and colour-format list
@@ -229,6 +246,10 @@ pub(crate) fn reviewed_module(
             VertexLayout::Buffers(_),
             [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
         ) => Some(&REVIEWED_MODULES[2]),
+        (
+            VertexLayout::Buffers(_),
+            [AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
+        ) => Some(&REVIEWED_MODULES[5]),
         (VertexLayout::Buffers(_), formats)
             if formats.len() == usize::try_from(MAX_COLOR_ATTACHMENTS).unwrap_or(usize::MAX)
                 && formats

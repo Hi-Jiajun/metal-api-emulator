@@ -159,9 +159,10 @@ class FourLocationObservationTests(unittest.TestCase):
                                     "the attachments read back the same texels"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
-    def test_v23_refuses_three_and_five_attachments(self):
-        for count, message in ((3, "three attachments have no reviewed module yet"),
-                               (5, "two to four attachments")):
+    def test_v23_refuses_five_attachments(self):
+        # Three attachments became their own reviewed shape in v25; five remain
+        # beyond the contract's ceiling.
+        for count, message in ((5, "two to four attachments"),):
             broken = copy.deepcopy(self.suite)
             attachments = broken["render_cases"][0]["attachments"]
             while len(attachments) > count:

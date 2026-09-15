@@ -724,8 +724,6 @@ def _render_plan(plan, suite):
         if multiple:
             _require(2 <= len(definitions) <= 4,
                      f"{where}: the reviewed MRT shapes are two to four attachments")
-            _require(len(definitions) != 3,
-                     f"{where}: three attachments have no reviewed module yet")
         _require(case_id not in plan and case_id not in render_plan,
                  f"{where}: duplicate case")
         declaring = _string(case["declaring_case"], f"{where}.declaring_case")
