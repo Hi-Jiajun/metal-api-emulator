@@ -164,6 +164,54 @@ def validate_vertex_selftest(report):
     return writebacks[0]["bytes_hex"]
 
 
+def validate_mrt_selftest(report):
+    """One MRT self-test report is the reviewed dual-output quad's observation:
+    the fixture id, one writeback and one allocation per colour location,
+    location 0's four `4080c0ff` texels and location 1's four `ff8040c0`
+    texels, never the `fefefefe` clear sentinel the pass started from
+    (`conformance/RENDER-CAPTURE.md` §10).
+
+    The fixture id and the location order are part of the check rather than
+    decoration: both locations are drawn through the same stream and index
+    buffer, so only the id and the per-location bytes say the two outputs
+    landed in the right attachments instead of being swapped or duplicated.
+    The CI step reuses this instead of inlining its byte comparison, so the
+    comparison is exercised by `test_run_native.py` on a host without Metal.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("mrt selftest: report is not an object")
+    if report.get("id") != "mrt_dual_output_2x2":
+        raise NativeRunError(
+            "mrt selftest: report id " + repr(report.get("id"))
+            + " is not the reviewed dual-output fixture"
+        )
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError("mrt selftest: completion is not CompletedVisible")
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    first = "4080c0ff" * 4
+    second = "ff8040c0" * 4
+    expected_writebacks = [
+        {"allocation": 900, "view": 910, "offset": 0, "bytes_hex": first},
+        {"allocation": 901, "view": 911, "offset": 0, "bytes_hex": second},
+    ]
+    expected_allocations = [
+        {"allocation": 900, "bytes_hex": first},
+        {"allocation": 901, "bytes_hex": second},
+    ]
+    # The shape is part of the claim: the reviewed fixture reports exactly one
+    # writeback and one allocation per location, in location order, so a report
+    # that reached the same bytes by another route (for example swapped
+    # locations or one writeback and no allocation) is refused rather than
+    # compared as if it were the same observation.
+    if writebacks != expected_writebacks or allocations != expected_allocations:
+        raise NativeRunError(
+            "mrt selftest: observations do not match the reviewed dual output, got "
+            + repr((writebacks, allocations))
+        )
+    return [first, second]
+
+
 def run_capture(oracle, suite_path, output_dir, *, require_metal=False, revision=None,
                 run_command=subprocess.run):
     """Create a new evidence directory. A partial or failed capture cannot pass."""
