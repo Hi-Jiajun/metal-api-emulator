@@ -551,6 +551,40 @@ fn report_queue_priority_probe(
             .into());
         }
     }
+    // The production observation surfaces agree with the probe queue by queue:
+    // selections are counted at enqueue time and retirements at completion
+    // time, so the scheduler's allocation is queryable without the test-only
+    // probe (`research/docs/21` §6 observation).
+    let enqueues = executor.queue_enqueue_counts();
+    let completions = executor.queue_completion_counts();
+    if enqueues.len() != queues || enqueues.iter().sum::<usize>() != submissions {
+        return Err(format!(
+            "queue_enqueue_counts() reports {enqueues:?} for {submissions} submissions"
+        )
+        .into());
+    }
+    if completions.len() != queues || completions.iter().sum::<usize>() != submissions {
+        return Err(format!(
+            "queue_completion_counts() reports {completions:?} for {submissions} submissions"
+        )
+        .into());
+    }
+    for (index, enqueue_count) in enqueues.iter().enumerate() {
+        let observed = sequence.iter().filter(|picked| **picked == index).count();
+        if *enqueue_count != observed {
+            return Err(format!(
+                "queue {index}: queue_enqueue_counts={enqueue_count} enqueue_probe={observed}"
+            )
+            .into());
+        }
+        if completions[index] != counts[index] {
+            return Err(format!(
+                "queue {index}: queue_completion_counts={} queue_submission_counts={}",
+                completions[index], counts[index]
+            )
+            .into());
+        }
+    }
 
     let policy = QueueSchedulingPolicy::default();
     let tier_of = |index: usize| installed[index];
@@ -586,8 +620,25 @@ fn report_queue_priority_probe(
         share(QueuePriority::Low)
     );
     println!(
+        "queue_priority_probe enqueue_counts={}",
+        enqueues
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "queue_priority_probe completion_counts={}",
+        completions
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
         "PASS queue_priority_probe submissions={submissions} queues={queues} \
-         probe_matches_counts=exact writeback=exact"
+         probe_matches_counts=exact enqueue_matches=exact completion_matches=exact \
+         writeback=exact"
     );
 
     let window = usize::try_from(policy.window())?;
@@ -820,6 +871,8 @@ fn run_queue_priority_child(command_path: &std::ffi::OsStr) -> Result<()> {
 
     let installed = executor.queue_priorities();
     let counts = executor.queue_submission_counts();
+    let enqueues = executor.queue_enqueue_counts();
+    let completions = executor.queue_completion_counts();
     let sequence = observed
         .lock()
         .map_err(|_| "the enqueue probe sequence is poisoned")?
@@ -831,12 +884,22 @@ fn run_queue_priority_child(command_path: &std::ffi::OsStr) -> Result<()> {
     let share = |tier: QueuePriority| tiers.iter().filter(|seen| **seen == tier).count();
     println!(
         "queue_priority_child read={} queues={} submissions={} sequence={} index_counts={} \
-         tier_counts=high={} default={} low={}",
+         enqueue_counts={} completion_counts={} tier_counts=high={} default={} low={}",
         format_queue_tiers(&installed),
         installed.len(),
         sequence.len(),
         format_queue_sequence(&installed, &sequence),
         counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        enqueues
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        completions
             .iter()
             .map(|count| count.to_string())
             .collect::<Vec<_>>()
@@ -864,8 +927,40 @@ fn run_queue_priority_child(command_path: &std::ffi::OsStr) -> Result<()> {
             .into());
         }
     }
+    if enqueues.len() != installed.len() || enqueues.iter().sum::<usize>() != sequence.len() {
+        return Err(format!(
+            "queue_enqueue_counts() reports {enqueues:?} for {} submissions",
+            sequence.len()
+        )
+        .into());
+    }
+    if completions.len() != installed.len() || completions.iter().sum::<usize>() != sequence.len() {
+        return Err(format!(
+            "queue_completion_counts() reports {completions:?} for {} submissions",
+            sequence.len()
+        )
+        .into());
+    }
+    for (index, count) in counts.iter().enumerate() {
+        let seen = sequence.iter().filter(|picked| **picked == index).count();
+        if enqueues[index] != seen {
+            return Err(format!(
+                "queue {index}: queue_enqueue_counts={} enqueue_probe={seen}",
+                enqueues[index]
+            )
+            .into());
+        }
+        if completions[index] != *count {
+            return Err(format!(
+                "queue {index}: queue_completion_counts={} queue_submission_counts={count}",
+                completions[index]
+            )
+            .into());
+        }
+    }
     println!(
-        "PASS queue_priority_child queues={} submissions={} read={} probe_matches_counts=exact",
+        "PASS queue_priority_child queues={} submissions={} read={} probe_matches_counts=exact \
+         enqueue_matches=exact completion_matches=exact",
         installed.len(),
         sequence.len(),
         format_queue_tiers(&installed)

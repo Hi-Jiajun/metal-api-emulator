@@ -422,6 +422,30 @@ impl VulkanExecutor {
         self.context.queue_submission_counts()
     }
 
+    /// Cumulative queue selections the scheduler made, one per device queue.
+    ///
+    /// This is the allocation observation the policy exposes without a
+    /// test-only probe: every submit path reports its selected queue here,
+    /// even when the driver then refuses the submission. It pairs with
+    /// [`Self::queue_submission_counts`], which counts only confirmed
+    /// submissions, and [`Self::queue_completion_counts`], which counts
+    /// retirements (`research/docs/21` §6).
+    #[doc(hidden)]
+    pub fn queue_enqueue_counts(&self) -> Vec<usize> {
+        self.context.queue_enqueue_counts()
+    }
+
+    /// Cumulative queue retirements, one per device queue.
+    ///
+    /// Every confirmed submission eventually retires, so on a healthy device
+    /// this converges to [`Self::queue_submission_counts`]; the gap between the
+    /// two surfaces is the work the queue still holds in flight
+    /// (`research/docs/21` §6).
+    #[doc(hidden)]
+    pub fn queue_completion_counts(&self) -> Vec<usize> {
+        self.context.queue_completion_counts()
+    }
+
     /// Install a probe called with the selected queue index while that queue's
     /// host enqueue lock is held. Smoke tests use it to prove that independent
     /// queues enqueue concurrently; production callers leave it unset.
@@ -654,6 +678,23 @@ pub(crate) struct VulkanContext {
     next_queue: AtomicUsize,
     queue_submissions: Vec<AtomicUsize>,
     queue_in_flight: Vec<AtomicUsize>,
+    /// Cumulative queue selections the scheduler made, one per device queue.
+    ///
+    /// Unlike `queue_submissions`, which counts submissions a device queue
+    /// confirmed, this counts every selection the enqueue paths reported —
+    /// the scheduler's allocation, whether or not the driver then accepted the
+    /// submission. Together the two surfaces let an observer tell "the policy
+    /// never selected this queue" from "this queue was selected but the
+    /// submission was refused" (`research/docs/21` §6). Production callers read
+    /// it through [`VulkanExecutor::queue_enqueue_counts`]; no probe
+    /// installation is required.
+    queue_enqueue_counts: Vec<AtomicUsize>,
+    /// Cumulative queue retirements, one per device queue.
+    ///
+    /// Every confirmed submission eventually retires, so on a healthy device
+    /// this converges to `queue_submissions`; a widening gap is the in-flight
+    /// work the queue still holds (`research/docs/21` §6).
+    queue_completion_counts: Vec<AtomicUsize>,
     properties: vk::PhysicalDeviceProperties,
     /// The depth resolve modes the device reports through
     /// `VK_KHR_depth_stencil_resolve` (`research/docs/23` §3.3, v57). The
@@ -891,6 +932,8 @@ impl VulkanContext {
             present_acquires: AtomicUsize::new(0),
             present_presents: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
+            queue_enqueue_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
+            queue_completion_counts: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             depth_resolve_modes,
             stencil_resolve_modes,
@@ -1034,8 +1077,13 @@ impl VulkanContext {
     /// Every submit path calls this while it holds that queue's host enqueue
     /// lock, so the probe observes the same sequence the device does, whichever
     /// path (synchronous or deferred) enqueued the command buffer. Production
-    /// callers leave the probe unset and this is a lock-and-drop of an `Option`.
+    /// callers leave the probe unset, and the cumulative selection still lands
+    /// in `queue_enqueue_counts` so the allocation stays observable without a
+    /// probe.
     pub(crate) fn notify_enqueue(&self, index: usize) {
+        if let Some(counter) = self.queue_enqueue_counts.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(probe) = self
             .enqueue_probe
             .lock()
@@ -1073,6 +1121,9 @@ impl VulkanContext {
             let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             });
+        }
+        if let Some(counter) = self.queue_completion_counts.get(index) {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1140,6 +1191,23 @@ impl VulkanContext {
 
     pub(crate) fn queue_submission_counts(&self) -> Vec<usize> {
         self.queue_submissions
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Cumulative queue selections per device queue, the scheduler's
+    /// allocation before any driver answer (`research/docs/21` §6).
+    pub(crate) fn queue_enqueue_counts(&self) -> Vec<usize> {
+        self.queue_enqueue_counts
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Cumulative queue retirements per device queue (`research/docs/21` §6).
+    pub(crate) fn queue_completion_counts(&self) -> Vec<usize> {
+        self.queue_completion_counts
             .iter()
             .map(|counter| counter.load(Ordering::Relaxed))
             .collect()
@@ -6774,9 +6842,13 @@ mod tests {
         ]
     }
 
-    /// Assert the window contract on an observed tier sequence: the weighted
-    /// shares, the high-tier streak bound, and one low tier per window.
-    fn assert_queue_priority_window(tiers_seen: &[QueuePriority]) {
+    /// Violation labels of one observed tier sequence under the
+    /// `research/docs/21` §6 window contract: the weighted shares, the
+    /// high-tier streak bound, and one low tier per window. The fair policy
+    /// sequence reports an empty list; a sequence that violates the contract
+    /// is exactly the unfair allocation the observation surfaces
+    /// (`queue_enqueue_counts` / `queue_submission_counts`) expose.
+    fn queue_priority_window_violations(tiers_seen: &[QueuePriority]) -> Vec<&'static str> {
         use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
 
         let policy = QueueSchedulingPolicy::default();
@@ -6787,11 +6859,55 @@ mod tests {
             70,
             "the contract is stated over 10 windows"
         );
+        let mut violations = Vec::new();
         let count = |tier: QueuePriority| tiers_seen.iter().filter(|seen| **seen == tier).count();
-        assert_eq!(count(QueuePriority::High), 40);
-        assert_eq!(count(QueuePriority::Default), 20);
-        assert_eq!(count(QueuePriority::Low), 10);
+        let windows = tiers_seen.len() / window;
+        let expected_high = policy.high_weight() as usize * windows;
+        let expected_default = policy.medium_weight() as usize * windows;
+        if count(QueuePriority::High) != expected_high
+            || count(QueuePriority::Default) != expected_default
+        {
+            violations.push("tier_shares_off");
+        }
 
+        let mut streak = 0_usize;
+        let mut longest = 0_usize;
+        for tier in tiers_seen {
+            streak = if *tier == QueuePriority::High {
+                streak + 1
+            } else {
+                0
+            };
+            longest = longest.max(streak);
+        }
+        if longest > policy.high_priority_streak_limit() as usize {
+            violations.push("high_streak_exceeds_weight");
+        }
+
+        for start in (0..tiers_seen.len() - window + 1).step_by(window) {
+            let lows = tiers_seen[start..start + window]
+                .iter()
+                .filter(|seen| **seen == QueuePriority::Low)
+                .count();
+            if lows == 0 {
+                violations.push("low_tier_starved_in_window");
+            }
+        }
+        violations
+    }
+
+    /// Assert the window contract on an observed tier sequence: no violation
+    /// label, and the fair §6 shape saturates the streak bound exactly.
+    fn assert_queue_priority_window(tiers_seen: &[QueuePriority]) {
+        use metal_api_core::provider::{QueuePriority, QueueSchedulingPolicy};
+
+        let violations = queue_priority_window_violations(tiers_seen);
+        assert!(
+            violations.is_empty(),
+            "the observed tier sequence violates the window contract: {violations:?}"
+        );
+
+        let policy = QueueSchedulingPolicy::default();
         let mut streak = 0_usize;
         let mut longest = 0_usize;
         for tier in tiers_seen {
@@ -6805,15 +6921,8 @@ mod tests {
         assert_eq!(
             u32::try_from(longest).expect("streak fits u32"),
             policy.high_priority_streak_limit(),
-            "the high tier must not exceed its weight in a row"
+            "the fair sequence saturates the high-tier streak bound"
         );
-        for start in (0..tiers_seen.len() - window + 1).step_by(window) {
-            let lows = tiers_seen[start..start + window]
-                .iter()
-                .filter(|seen| **seen == QueuePriority::Low)
-                .count();
-            assert!(lows >= 1, "window {start} starved the low tier: {lows}");
-        }
     }
 
     #[test]
@@ -6827,6 +6936,44 @@ mod tests {
             .map(|cursor| tiers[select_queue_for_submission(&loads, &tiers, cursor)])
             .collect();
         assert_queue_priority_window(&tiers_seen);
+    }
+
+    #[test]
+    fn queue_observation_surfaces_flag_an_unfair_allocation() {
+        // The fair policy sequence — exactly the tier sequence the per-queue
+        // observation counters and the enqueue probe report for ten retired
+        // windows on the §6 queue shape — satisfies the contract.
+        let tiers = rtx_5060_queue_tiers();
+        let loads = vec![0_usize; tiers.len()];
+        let fair: Vec<QueuePriority> = (0..70_usize)
+            .map(|cursor| tiers[select_queue_for_submission(&loads, &tiers, cursor)])
+            .collect();
+        assert!(
+            queue_priority_window_violations(&fair).is_empty(),
+            "the fair policy sequence must satisfy the window contract"
+        );
+
+        // A scheduler pinned to the first (high) queue: both the streak bound
+        // and the low-tier slot are violated, so the observation surfaces that
+        // carry the sequence expose the unfairness instead of hiding it.
+        let pinned = vec![QueuePriority::High; 70];
+        let violations = queue_priority_window_violations(&pinned);
+        assert!(violations.contains(&"high_streak_exceeds_weight"));
+        assert!(violations.contains(&"low_tier_starved_in_window"));
+
+        // A bursty allocation that lands the right tier totals (40/20/10) but
+        // front-loads every low slot: the tier-share check alone cannot tell
+        // the difference, and the window checks still flag it.
+        let mut bursty = vec![QueuePriority::Low; 10];
+        bursty.extend((0..40).map(|_| QueuePriority::High));
+        bursty.extend((0..20).map(|_| QueuePriority::Default));
+        let violations = queue_priority_window_violations(&bursty);
+        assert!(violations.contains(&"high_streak_exceeds_weight"));
+        assert!(violations.contains(&"low_tier_starved_in_window"));
+        assert!(
+            !violations.contains(&"tier_shares_off"),
+            "a share-correct sequence must not be flagged for its totals"
+        );
     }
 
     #[test]
@@ -6952,6 +7099,27 @@ mod tests {
                 *count,
                 sequence.iter().filter(|picked| **picked == index).count(),
                 "queue {index} counts disagree with the enqueue probe"
+            );
+        }
+        // The production observation surfaces agree with the probe on every
+        // queue: selections are counted at enqueue time and retirements at
+        // completion time, so the scheduler's allocation stays queryable
+        // without the test-only probe (`research/docs/21` §6 observation).
+        let enqueues = executor.queue_enqueue_counts();
+        let completions = executor.queue_completion_counts();
+        assert_eq!(enqueues.len(), queues);
+        assert_eq!(completions.len(), queues);
+        assert_eq!(enqueues.iter().sum::<usize>(), submissions);
+        assert_eq!(completions.iter().sum::<usize>(), submissions);
+        for (index, count) in counts.iter().enumerate() {
+            assert_eq!(
+                enqueues[index],
+                sequence.iter().filter(|picked| **picked == index).count(),
+                "queue {index} enqueue counts disagree with the enqueue probe"
+            );
+            assert_eq!(
+                completions[index], *count,
+                "queue {index} completion counts disagree with the submission counts"
             );
         }
         if queues < 7 || installed.iter().collect::<BTreeSet<_>>().len() < 3 {
