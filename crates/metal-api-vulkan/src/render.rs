@@ -820,15 +820,21 @@ fn prepare_render_request<'a>(
             ));
         }
         // The depth surface beside the raster is admitted from v53 on
-        // (`research/docs/23` §3.3, v53): it is created with the pass's own
-        // sample count and stays rail-owned, because keeping its texels would
-        // need the depth resolve the increment after this one reviews. A
-        // stencil surface beside the raster stays refused, and so does a stored
-        // depth surface — the contract refuses the latter too, and this rail
-        // re-asserts it for a directly-constructed request.
-        if pass.stencil.is_some() {
-            return Err(capability_refusal("render_multisample_surface_unsupported")
-                .with_detail("the multisample raster does not execute a stencil surface yet"));
+        // (`research/docs/23` §3.3, v53) and the stencil surface from v55: both
+        // are created with the pass's own sample count and stay rail-owned,
+        // because keeping either surface's texels would need the resolve the
+        // increments after this one review. The two surfaces stay mutually
+        // exclusive — a combined depth-stencil surface is its own increment —
+        // and a stored surface of either kind is refused, which the contract
+        // refuses too and this rail re-asserts for a directly-constructed
+        // request.
+        if pass.stencil.is_some() && pass.depth.is_some() {
+            return Err(
+                capability_refusal("render_stencil_combined_surface_unsupported").with_detail(
+                    "the multisample raster opens one depth-stencil surface: a combined \
+                     surface is a later increment",
+                ),
+            );
         }
         if let Some(depth) = &pass.depth {
             if depth.store == Some(DepthStoreOp::Store) {
@@ -836,6 +842,16 @@ fn prepare_render_request<'a>(
                     capability_refusal("render_multisample_depth_store_unsupported").with_detail(
                         "a multisampled depth surface cannot be kept yet: the depth resolve \
                          filters are a later increment",
+                    ),
+                );
+            }
+        }
+        if let Some(stencil) = &pass.stencil {
+            if stencil.store == Some(StoreOp::Store) {
+                return Err(
+                    capability_refusal("render_multisample_stencil_store_unsupported").with_detail(
+                        "a multisampled stencil surface cannot be kept yet: the stencil \
+                         resolve is a later increment",
                     ),
                 );
             }
@@ -1675,6 +1691,27 @@ pub(crate) fn execute_offscreen_render(
                      DEPTH_STENCIL_ATTACHMENT combination for D32_SFLOAT",
                 ));
         }
+        // The stencil surface's own four-sample question, through the same
+        // `DEPTH_STENCIL_ATTACHMENT` probe the depth surface uses
+        // (`research/docs/23` §3.3, v55).
+        if request.stencil.is_some()
+            && !format_supports_multisample_depth_attachment(context, vk::Format::S8_UINT, tiling)
+        {
+            return Err(attachment_format_refusal()
+                .with_field(
+                    "vk_format",
+                    FieldValue::Unsigned(vk::Format::S8_UINT.as_raw() as u64),
+                )
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("stencil_attachment_samples_4".to_owned()),
+                )
+                .with_detail(
+                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
+                     DEPTH_STENCIL_ATTACHMENT combination for S8_UINT",
+                ));
+        }
     }
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
         admit_color_attachment(context, *vk_format, tiling)?;
@@ -1795,6 +1832,7 @@ pub(crate) fn execute_offscreen_render(
             stencil.height,
             stencil.clear.is_none(),
             stencil.storing(),
+            samples,
         )?;
         if stencil.storing() {
             objects.create_stencil_readback(stencil_byte_length)?;
@@ -2525,6 +2563,11 @@ struct StencilObjects {
     /// Whether the pass opens the image from the attachment layout a previous
     /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
     loading: bool,
+    /// The sample count the image was created with (`research/docs/23` §3.3,
+    /// v55): `TYPE_1` for every pre-v55 stencil surface, `TYPE_4` when the pass
+    /// states a multisample raster, which the render pass's own description
+    /// restates so the two cannot disagree.
+    samples: vk::SampleCountFlags,
     /// The host-visible buffer this pass's stencil texels land in, present
     /// exactly when the pass stores the surface (`research/docs/23` §3.3,
     /// v49). A discarded surface is never copied out, so it needs no
@@ -2746,6 +2789,7 @@ impl<'a> OffscreenObjects<'a> {
         height: u32,
         loading: bool,
         storing: bool,
+        samples: vk::SampleCountFlags,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -2757,7 +2801,7 @@ impl<'a> OffscreenObjects<'a> {
             })
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
@@ -2784,6 +2828,7 @@ impl<'a> OffscreenObjects<'a> {
             memory,
             view,
             loading,
+            samples,
             readback: None,
             mapping: None,
         });
@@ -3074,9 +3119,17 @@ impl<'a> OffscreenObjects<'a> {
                     .stencil
                     .as_ref()
                     .is_some_and(|objects| objects.readback.is_some());
+                // The stencil surface is created with the raster's own sample
+                // count when the pass states one (`research/docs/23` §3.3,
+                // v55), so the description restates what the image was built
+                // with.
+                let samples = self
+                    .stencil
+                    .as_ref()
+                    .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
                 vk::AttachmentDescription::default()
                     .format(vk::Format::S8_UINT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(samples)
                     .load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .stencil_load_op(

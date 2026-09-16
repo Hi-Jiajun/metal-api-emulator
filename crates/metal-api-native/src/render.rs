@@ -1713,6 +1713,32 @@ pub(crate) fn plan<'a>(
                         ),
                     );
                 }
+                // The stencil sibling's two refusals (`research/docs/23` §3.3,
+                // v55): a kept stencil surface needs the stencil resolve, and a
+                // combined depth-stencil surface is its own increment.
+                if request.pass.depth.is_some() && request.pass.stencil.is_some() {
+                    return Err(
+                        capability_refusal("render_stencil_combined_surface_unsupported")
+                            .with_detail(
+                                "the multisample raster opens one depth-stencil surface: a \
+                                 combined surface is a later increment",
+                            ),
+                    );
+                }
+                if request
+                    .pass
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.store == Some(StoreOp::Store))
+                {
+                    return Err(
+                        capability_refusal("render_multisample_stencil_store_unsupported")
+                            .with_detail(
+                                "a multisampled stencil surface cannot be kept yet: the \
+                                 stencil resolve is a later increment",
+                            ),
+                    );
+                }
                 Some(SampleCount::Four)
             }
             Some(_) => {
@@ -2586,7 +2612,7 @@ fn encode_into_and_readback(
     let stencil_target = planned
         .stencil
         .as_ref()
-        .map(|stencil| stencil_texture(device, stencil))
+        .map(|stencil| stencil_texture(device, stencil, planned.multisample))
         .transpose()?;
     if let (Some(stencil), Some(texture)) = (&planned.stencil, &stencil_target) {
         let attachment = pass
@@ -3040,9 +3066,24 @@ fn depth_texture(
 /// fixture observes a discarded surface's effect through the colour attachment
 /// the mask decides, and the rail-owned surface disappears with the pass.
 #[cfg(target_os = "macos")]
-fn stencil_texture(device: &Device, stencil: &PlannedStencil) -> Result<Texture, ProviderError> {
+fn stencil_texture(
+    device: &Device,
+    stencil: &PlannedStencil,
+    multisample: Option<SampleCount>,
+) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
-    descriptor.set_texture_type(MTLTextureType::D2);
+    // A multisampled pass creates its stencil surface with the raster's own
+    // sample count (`research/docs/23` §3.3, v55), exactly as the depth
+    // surface does: Metal refuses an encoder whose attachment disagrees with
+    // `rasterSampleCount`. The surface stays `Private` because a multisampled
+    // stencil surface is rail-owned in this increment — keeping it would need
+    // the stencil resolve the increment after this one reviews.
+    if multisample.is_some() {
+        descriptor.set_texture_type(MTLTextureType::D2Multisample);
+        descriptor.set_sample_count(4);
+    } else {
+        descriptor.set_texture_type(MTLTextureType::D2);
+    }
     descriptor.set_pixel_format(MTLPixelFormat::Stencil8);
     descriptor.set_width(u64::from(stencil.width));
     descriptor.set_height(u64::from(stencil.height));

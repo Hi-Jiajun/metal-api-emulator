@@ -2568,10 +2568,21 @@ impl RenderPassDescriptor {
                     return Err(ContractError::MultisampleDepthStoreUnsupported);
                 }
             }
-            if self.stencil.is_some() {
-                return Err(ContractError::MultisampleSurfaceUnsupported {
-                    surface: "stencil attachment",
-                });
+            // The stencil surface beside the raster (`research/docs/23` §3.3,
+            // v55) is the depth surface's sibling one byte wide: the pass may
+            // test and write it, and keeping its texels would need the same
+            // resolve the depth face does not have yet. The two surfaces stay
+            // mutually exclusive — a combined depth-stencil surface is its own
+            // increment — so a pass that opens both is refused here.
+            if let Some(stencil) = &self.stencil {
+                if self.depth.is_some() {
+                    return Err(ContractError::MultisampleSurfaceUnsupported {
+                        surface: "combined depth-stencil surface",
+                    });
+                }
+                if stencil.store == Some(StoreOp::Store) {
+                    return Err(ContractError::MultisampleStencilStoreUnsupported);
+                }
             }
             if self.present.is_some() {
                 return Err(ContractError::MultisamplePresentUnsupported);
@@ -7015,6 +7026,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MultisampleSurfaceUnsupported { .. }
         | E::MultisamplePresentUnsupported
         | E::MultisampleDepthStoreUnsupported
+        | E::MultisampleStencilStoreUnsupported
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
@@ -8468,6 +8480,12 @@ pub enum ContractError {
     /// Vulkan's depth-stencil-resolve step): the increment that reviews those
     /// filters is the one that can admit a stored surface here.
     MultisampleDepthStoreUnsupported,
+    /// The pass states a multisample raster and keeps its stencil surface
+    /// (`research/docs/23` §3.3, v55). The depth sibling's rule one byte wide:
+    /// a multisampled stencil surface's texels are only observable through a
+    /// resolve, and the increment that reviews that resolve is the one that can
+    /// admit a stored surface here.
+    MultisampleStencilStoreUnsupported,
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -9040,6 +9058,10 @@ impl fmt::Display for ContractError {
             Self::MultisampleDepthStoreUnsupported => formatter.write_str(
                 "a multisample raster cannot keep its depth surface yet: the depth resolve \
                  filters the two APIs spell differently are a later increment",
+            ),
+            Self::MultisampleStencilStoreUnsupported => formatter.write_str(
+                "a multisample raster cannot keep its stencil surface yet: the stencil \
+                 resolve is a later increment",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -13745,7 +13767,8 @@ mod tests {
             test_only.validate(),
             Err(ContractError::DepthTestWithoutAttachment)
         );
-        // The stencil surface and the present action stay refused.
+        // The stencil surface beside the raster is admitted from v55 on, as the
+        // rail-owned shape (`research/docs/23` §3.3, v55).
         let mut with_stencil = pass.clone();
         with_stencil.stencil = Some(RenderStencilAttachment {
             format: StencilFormat::Stencil8,
@@ -13764,12 +13787,41 @@ mod tests {
             write_mask: 0xff,
             reference: 0,
         });
+        with_stencil
+            .validate()
+            .expect("a rail-owned stencil surface beside the raster is well formed");
+        // Keeping the stencil surface needs the stencil resolve, and opening
+        // both surfaces at once needs a combined depth-stencil surface: both
+        // stay refused.
+        let mut stored_stencil = with_stencil.clone();
+        {
+            let stencil = stored_stencil
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = Some(StoreOp::Store);
+            stencil.identity = Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(951),
+            });
+        }
         assert_eq!(
-            with_stencil.validate(),
+            stored_stencil.validate(),
+            Err(ContractError::MultisampleStencilStoreUnsupported)
+        );
+        let mut combined = with_stencil.clone();
+        combined.depth = Some(depth_attachment());
+        combined.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        assert_eq!(
+            combined.validate(),
             Err(ContractError::MultisampleSurfaceUnsupported {
-                surface: "stencil attachment",
+                surface: "combined depth-stencil surface",
             })
         );
+        // The present action stays refused.
         let mut with_present = pass.clone();
         with_present.present = Some(PresentDescriptor {
             target: PresentTarget {

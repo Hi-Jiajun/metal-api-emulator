@@ -1551,20 +1551,28 @@ def _render_plan(plan, suite):
             _require(case["attachment"].get("load") == "clear",
                      f"{where}: the reviewed multisample pass opens its attachment from a "
                      "clear")
-            # The depth surface beside the raster is admitted from v53 on
-            # (`research/docs/23` §3.3, v53): it is rail-owned — the pass tests
-            # and writes it, but keeping its texels would need the depth resolve
-            # filters the two APIs spell differently — and the expectation then
-            # follows the depth pair's own uniform rule instead of the resolve
-            # rule. A stencil surface beside the raster stays refused.
-            _require("stencil" not in case,
-                     f"{where}: the reviewed multisample pass opens no stencil surface")
+            # The depth surface beside the raster is admitted from v53 on and
+            # the stencil surface from v55 (`research/docs/23` §3.3, v53/v55):
+            # both are rail-owned — the pass tests and writes them, but keeping
+            # their texels would need a resolve the two APIs spell differently —
+            # and the expectation then follows the pair's own uniform rule
+            # instead of the resolve rule. The two surfaces stay mutually
+            # exclusive.
+            _require(not ("depth" in case and "stencil" in case),
+                     f"{where}: the multisample raster opens one depth-stencil surface")
             if "depth" in case:
                 _require(case["depth"].get("store") is None,
                          f"{where}: a multisampled depth surface is rail-owned: the depth "
                          "resolve filters are a later increment")
                 _require(coverage is None,
                          f"{where}: a multisample pass with a depth surface claims no partial "
+                         "coverage")
+            elif "stencil" in case:
+                _require(case["stencil"].get("store") is None,
+                         f"{where}: a multisampled stencil surface is rail-owned: the stencil "
+                         "resolve is a later increment")
+                _require(coverage is None,
+                         f"{where}: a multisample pass with a stencil surface claims no partial "
                          "coverage")
             else:
                 _require(coverage == "partial",
@@ -1714,7 +1722,8 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
-                if multisample is not None and case.get("depth") is None:
+                if (multisample is not None and case.get("depth") is None
+                        and case.get("stencil") is None):
                     # The multisample resolve (`research/docs/23` §3.3, v51):
                     # every texel is the mean of the samples a primitive
                     # covered, so the expectation has to be a k-of-`sample_count`
