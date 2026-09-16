@@ -2098,6 +2098,122 @@ fn a_base_vertex_draw_records_the_offset_and_needs_an_index_buffer() {
 }
 
 #[test]
+fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_multi(&provider, vec![AttachmentFormat::Rgba8Unorm]);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let target = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let view = target.view(0, 16).unwrap();
+    let scratch = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let scratch_view = scratch.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+    let index = device
+        .new_buffer_with_bytes(vec![0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let index_view = index.view(0, 16).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &view).unwrap();
+        encoder.set_buffer(1, &scratch_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+
+    // The depth surface is a second raster with the pass's own extent: a
+    // surface a different size than the colour attachments is refused by the
+    // contract's own rule when the pass is recorded
+    // (`research/docs/23` §3.3, v36/v37).
+    assert_eq!(
+        encoder.draw_indexed_primitives_with_depth(
+            &[RenderColorAttachment {
+                view: &view,
+                format: AttachmentFormat::Rgba8Unorm,
+                load: RenderAttachmentLoad::Clear([0xfe; 4]),
+                store: StoreOp::Store,
+            }],
+            2,
+            2,
+            6,
+            1,
+            RenderDepthAttachment {
+                width: 4,
+                height: 2,
+                load: RenderDepthLoad::Clear(1.0),
+            },
+            Some(RenderDepthTest {
+                compare: contract::CompareFunction::Less,
+                write: true,
+            }),
+            None,
+        ),
+        Err(ContractError::DepthExtentMismatch {
+            viewport: [2, 2],
+            depth: [4, 2],
+        }
+        .into())
+    );
+
+    // The reviewed shape records, and the committed trace carries both the
+    // rail-owned surface and the state.
+    encoder
+        .draw_indexed_primitives_with_depth(
+            &[RenderColorAttachment {
+                view: &view,
+                format: AttachmentFormat::Rgba8Unorm,
+                load: RenderAttachmentLoad::Clear([0xfe; 4]),
+                store: StoreOp::Store,
+            }],
+            2,
+            2,
+            6,
+            1,
+            RenderDepthAttachment {
+                width: 2,
+                height: 2,
+                load: RenderDepthLoad::Clear(1.0),
+            },
+            Some(RenderDepthTest {
+                compare: contract::CompareFunction::Less,
+                write: true,
+            }),
+            None,
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let pass = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the recorded draw is a render pass");
+    let depth = pass.depth.as_ref().expect("the pass opens a depth surface");
+    assert_eq!((depth.width, depth.height), (2, 2));
+    assert_eq!(depth.load, contract::DepthLoadOp::Clear(1.0f32.to_bits()));
+    let test = pass.depth_test.expect("the pass tests depths");
+    assert_eq!(test.compare, contract::CompareFunction::Less);
+    assert!(test.write);
+}
+
+#[test]
 fn an_indexed_draw_records_two_attachments_through_the_shared_path() {
     let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
     let device = Device::new(provider.clone());
