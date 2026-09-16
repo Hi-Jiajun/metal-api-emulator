@@ -788,6 +788,7 @@ private struct Options {
     let vertexSelfTest: Bool
     let mrtSelfTest: Bool
     let heapSelfTest: Bool
+    let depthResolveSelfTest: Bool
 }
 
 private let usage = """
@@ -799,6 +800,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --vertex-selftest
        native-metal-oracle --mrt-selftest
        native-metal-oracle --heap-selftest
+       native-metal-oracle --depth-resolve-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -838,6 +840,16 @@ the pair, and reports the copied bytes. It fails unless both buffers are in the
 same heap with non-overlapping ranges and the write buffer reads back the
 reviewed word rather than the sentinel. It cannot be combined with other
 options.
+--depth-resolve-selftest needs no suite: it renders the reviewed depth pair's
+v51 edge geometry (a near triangle at z = 0.5 covering NDC x <= 0.25, a far
+triangle at z = 0.9 covering everything, one red tint) three times through a
+four-sample depth32float raster cleared to 1.0, once per depth resolve filter
+(sample0, min, max), and prints each texel's three resolved depth landings one
+line at a time. It prints PASS only when the stable columns are as reviewed
+(column 0 = 0.5 and column 3 = 0.9 for every filter) and the key column
+distinguishes the filters (column 2 = 0.5 for min, 0.9 for max); sample0's
+column 2 is recorded but not judged because it depends on the rasterizer's
+sample positions. It cannot be combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -851,6 +863,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var vertexSelfTest = false
     var mrtSelfTest = false
     var heapSelfTest = false
+    var depthResolveSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -896,51 +909,62 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!heapSelfTest, "Duplicate --heap-selftest option")
             heapSelfTest = true
             index += 1
+        case "--depth-resolve-selftest":
+            try require(!depthResolveSelfTest, "Duplicate --depth-resolve-selftest option")
+            depthResolveSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, --mrt-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: true, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !mrtSelfTest && !heapSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, --mrt-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: true, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
     }
     if vertexSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !mrtSelfTest && !heapSelfTest,
-                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, --mrt-selftest, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
+                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: true,
-                       mrtSelfTest: false, heapSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
     }
     if mrtSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest,
-                    "--mrt-selftest cannot be combined with --suite, --output, --validate-suite, or --heap-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest && !depthResolveSelfTest,
+                    "--mrt-selftest cannot be combined with --suite, --output, --validate-suite, --heap-selftest, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: true, heapSelfTest: false)
+                       mrtSelfTest: true, heapSelfTest: false, depthResolveSelfTest: false)
     }
     if heapSelfTest {
-        try require(suite == nil && output == nil && !validateOnly,
-                    "--heap-selftest cannot be combined with --suite, --output, or --validate-suite")
+        try require(suite == nil && output == nil && !validateOnly && !depthResolveSelfTest,
+                    "--heap-selftest cannot be combined with --suite, --output, --validate-suite, or --depth-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: true)
+                       mrtSelfTest: false, heapSelfTest: true, depthResolveSelfTest: false)
+    }
+    if depthResolveSelfTest {
+        try require(suite == nil && output == nil && !validateOnly,
+                    "--depth-resolve-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -950,7 +974,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
                    renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                   mrtSelfTest: false, heapSelfTest: false)
+                   mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -4402,6 +4426,405 @@ private func heapSelfTest() throws -> HeapSelfTestReport {
                               device: device.name, platform: eligibility.platform)
 }
 
+/// One reviewed pass of the depth-resolve self-test.
+///
+/// The reviewed depth pair module draws the caller's edge geometry through a
+/// four-sample `depth32float` raster cleared to one, a `less` test with writes
+/// on, and a `.multisampleResolve` store action whose `depthResolveFilter` is
+/// the caller's. The single-sample shared landing is read back with `getBytes`
+/// and returned: one `float32` per texel in memory order, 64 bytes. The colour
+/// side mirrors `runRenderCase`'s multisample pair but is never read back —
+/// the depth landing is the whole observation.
+@available(macOS 11.0, *)
+private func depthResolveSelftestPass(_ fixture: ValidatedRender, device: MTLDevice,
+                                      queue: MTLCommandQueue,
+                                      filter: MTLMultisampleDepthResolveFilter,
+                                      name: String) throws -> Data {
+    let definition = fixture.definition
+    guard let attachment = fixture.attachments.first, let depth = fixture.depth,
+          let multisample = definition.multisample else {
+        throw OracleError("\(definition.id): the depth-resolve self-test needs one colour "
+                          + "attachment, one depth attachment and the four-sample raster")
+    }
+    let samples = Int(multisample.sample_count)
+
+    // The colour pair the reviewed multisample raster draws through. Its texels
+    // are not observed, so both surfaces stay private, exactly as
+    // `runRenderCase` keeps the four-sample half private.
+    let colourDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: attachment.pixelFormat,
+        width: attachment.width,
+        height: attachment.height,
+        mipmapped: false)
+    colourDescriptor.textureType = .type2DMultisample
+    colourDescriptor.sampleCount = samples
+    colourDescriptor.usage = .renderTarget
+    colourDescriptor.storageMode = .private
+    guard let colourMSAA = device.makeTexture(descriptor: colourDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the multisample colour attachment")
+    }
+    colourMSAA.label = "native oracle: \(definition.id) colour msaa"
+    let colourResolveDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: attachment.pixelFormat,
+        width: attachment.width,
+        height: attachment.height,
+        mipmapped: false)
+    colourResolveDescriptor.usage = .renderTarget
+    colourResolveDescriptor.storageMode = .private
+    guard let colourResolve = device.makeTexture(descriptor: colourResolveDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the colour resolve target")
+    }
+    colourResolve.label = "native oracle: \(definition.id) colour resolve"
+
+    // The depth half: a private four-sample surface the raster writes, and the
+    // single-sample shared landing the resolve writes into — the same split
+    // `runRenderCase` states for the stored depth resolve shape
+    // (`research/docs/23` §3.3, v57c), and the landing is what the CPU reads
+    // back.
+    let depthDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float,
+        width: depth.width,
+        height: depth.height,
+        mipmapped: false)
+    depthDescriptor.textureType = .type2DMultisample
+    depthDescriptor.sampleCount = samples
+    depthDescriptor.usage = .renderTarget
+    depthDescriptor.storageMode = .private
+    guard let depthMSAA = device.makeTexture(descriptor: depthDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the multisample depth attachment")
+    }
+    depthMSAA.label = "native oracle: \(definition.id) depth msaa"
+    let landingDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float,
+        width: depth.width,
+        height: depth.height,
+        mipmapped: false)
+    landingDescriptor.usage = .renderTarget
+    landingDescriptor.storageMode = .shared
+    guard let landing = device.makeTexture(descriptor: landingDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the depth resolve landing")
+    }
+    landing.label = "native oracle: \(definition.id) depth resolve \(name)"
+
+    // The pipeline states the same shape `runRenderCase` builds for the depth
+    // pair's multisampled raster: one `rgba8Unorm` location, the depth format
+    // and the four-sample raster count.
+    let library = try device.makeLibrary(source: fixture.source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: definition.vertex_entry) else {
+        throw OracleError("\(definition.id): vertex entry \(definition.vertex_entry) was not found")
+    }
+    guard let fragmentFunction = library.makeFunction(name: definition.fragment_entry) else {
+        throw OracleError("\(definition.id): fragment entry \(definition.fragment_entry) was not found")
+    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: \(definition.id)"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    let vertexDescriptor = MTLVertexDescriptor()
+    for stream in fixture.vertexStreams {
+        guard let layout = vertexDescriptor.layouts[stream.binding] else {
+            throw OracleError("\(definition.id): the vertex descriptor has no layout "
+                              + "\(stream.binding)")
+        }
+        layout.stride = Int(stream.stride)
+        layout.stepFunction = .perVertex
+        for attribute in stream.attributes {
+            guard let format = vertexFormat(attribute.format) else {
+                throw OracleError("\(definition.id): unsupported vertex attribute format "
+                                  + attribute.format)
+            }
+            guard let target = vertexDescriptor.attributes[Int(attribute.location)] else {
+                throw OracleError("\(definition.id): the vertex descriptor has no attribute "
+                                  + "\(attribute.location)")
+            }
+            target.format = format
+            target.offset = Int(attribute.offset)
+            target.bufferIndex = stream.binding
+        }
+    }
+    pipelineDescriptor.vertexDescriptor = vertexDescriptor
+    pipelineDescriptor.colorAttachments[0].pixelFormat = attachment.pixelFormat
+    pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+    pipelineDescriptor.rasterSampleCount = samples
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+    // The pass opens the colour and depth halves with clears and resolves both
+    // on store; the depth resolve filter is the one this pass names.
+    let pass = MTLRenderPassDescriptor()
+    guard let colour = pass.colorAttachments[0], let depthAttachment = pass.depthAttachment else {
+        throw OracleError("\(definition.id): cannot reach the self-test's attachments")
+    }
+    colour.texture = colourMSAA
+    colour.resolveTexture = colourResolve
+    colour.loadAction = .clear
+    colour.clearColor = MTLClearColor(red: attachment.clearComponents[0],
+                                      green: attachment.clearComponents[1],
+                                      blue: attachment.clearComponents[2],
+                                      alpha: attachment.clearComponents[3])
+    colour.storeAction = .multisampleResolve
+    depthAttachment.texture = depthMSAA
+    depthAttachment.loadAction = .clear
+    depthAttachment.clearDepth = depth.clearDepth
+    depthAttachment.storeAction = .multisampleResolve
+    depthAttachment.resolveTexture = landing
+    depthAttachment.depthResolveFilter = filter
+
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("\(definition.id): cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "\(definition.id): command buffer does not retain resources")
+    commandBuffer.label = "native oracle: \(definition.id) depth resolve \(name)"
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("\(definition.id): cannot create a render encoder")
+    }
+    encoder.setRenderPipelineState(pipeline)
+    let depthStencilDescriptor = MTLDepthStencilDescriptor()
+    depthStencilDescriptor.depthCompareFunction = depth.isLess ? .less : .always
+    depthStencilDescriptor.isDepthWriteEnabled = depth.write
+    guard let state = device.makeDepthStencilState(descriptor: depthStencilDescriptor) else {
+        throw OracleError("\(definition.id): cannot create the depth-stencil state")
+    }
+    encoder.setDepthStencilState(state)
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(attachment.width),
+                                    height: Double(attachment.height),
+                                    znear: 0, zfar: 1))
+    // The streams are bound at the same indices the descriptor names, and they
+    // stay alive until the command buffer has completed (the buffers array is
+    // released after the readback below), the same keep-alive `runRenderCase`
+    // maintains.
+    var streamBuffers = [MTLBuffer]()
+    for stream in fixture.vertexStreams {
+        let buffer = try makeStreamBuffer(device: device, id: definition.id,
+                                          offset: stream.offset, bytes: stream.bytes)
+        streamBuffers.append(buffer)
+    }
+    for (stream, buffer) in zip(fixture.vertexStreams, streamBuffers) {
+        encoder.setVertexBuffer(buffer,
+                                offset: try hostOffset(stream.offset, id: definition.id),
+                                index: stream.binding)
+    }
+    if let indexStream = fixture.indexStream {
+        let indexBuffer = try makeStreamBuffer(device: device, id: definition.id,
+                                               offset: indexStream.offset,
+                                               bytes: indexStream.bytes)
+        streamBuffers.append(indexBuffer)
+        encoder.drawIndexedPrimitives(type: .triangle,
+                                      indexCount: Int(indexStream.indexCount),
+                                      indexType: indexStream.format.metal,
+                                      indexBuffer: indexBuffer,
+                                      indexBufferOffset: try hostOffset(indexStream.offset,
+                                                                        id: definition.id),
+                                      instanceCount: 1)
+    }
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("\(definition.id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+
+    var observed = Data(count: depth.width * depth.height * 4)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            landing.getBytes(destination,
+                             bytesPerRow: depth.width * 4,
+                             from: MTLRegionMake2D(0, 0, depth.width, depth.height),
+                             mipmapLevel: 0)
+        }
+    }
+    return observed
+}
+
+/// The depth-resolve milestone's own fixture, constructed in code.
+///
+/// This is the one-device check for the Min/Max question v57 left open
+/// (`research/docs/23` §3.3, v57e): the reviewed depth pair module draws the
+/// v51 edge geometry — a near triangle at z = 0.5 covering NDC x <= 0.25 and
+/// a far triangle at z = 0.9 covering everything, both tinted red — through a
+/// four-sample `depth32float` raster cleared to 1.0 with a `less` test and
+/// writes on, three times, once per resolve filter (sample0, min, max). Each
+/// pass resolves into its own single-sample shared landing, and the three
+/// landings are printed one texel per line so the CI log carries the answer
+/// Metal has no queryable mask for. It prints `depth_resolve_selftest: PASS`
+/// only when the stable columns are as reviewed — column 0 reads 0.5 and
+/// column 3 reads 0.9 for all three filters — and the key column
+/// distinguishes the filters: column 2 reads 0.5 for min and 0.9 for max.
+/// sample0's column 2 is recorded but not judged, because its landing depends
+/// on the rasterizer's sample positions. In particular, a device that reduces
+/// min and max to one value is a FAIL — exactly what this check exists to
+/// measure, and the reason PASS may not be asserted from min == max.
+@available(macOS 11.0, *)
+private func depthResolveSelfTest() throws {
+    let reviewed = reviewedDepthModule()
+    // The v51 edge geometry the v57d Min/Max pair pins (`research/docs/23`
+    // §3.3), spelled exactly as the suite's view bytes: one stride-32 stream
+    // whose two records carry position `float32x3` at offset 0 and tint
+    // `float32x4` at offset 16, with four padding bytes between them. Both
+    // triangles carry the same red tint, so the colour landing cannot vary
+    // between them and the depth landing is the whole observation.
+    let vertices = try decodeHex(
+        "0000803e000080bf0000003f000000000000803f00000000000000000000803f"
+        + "0000803e000040400000003f000000000000803f00000000000000000000803f"
+        + "000040c0000080bf0000003f000000000000803f00000000000000000000803f"
+        + "000080bf000080bf6666663f000000000000803f00000000000000000000803f"
+        + "00004040000080bf6666663f000000000000803f00000000000000000000803f"
+        + "000080bf000040406666663f000000000000803f00000000000000000000803f",
+        context: "depth-resolve self-test vertex stream")
+    // The six `uint16` indices (0,1,2) and (3,4,5): the near edge triangle
+    // then the full-screen far triangle, 12 bytes.
+    let indices = try decodeHex("000001000200030004000500",
+                                context: "depth-resolve self-test index buffer")
+    // Both triangles' reviewed tint: red, one `rgba8Unorm` texel replicated
+    // across the 4x4 attachment. The validation above the pass reads the
+    // depth landing, so this expectation is shape-only: the pass judgement
+    // below never reads the colour bytes.
+    let redImage = String(repeating: "ff0000ff", count: 16)
+    // The min filter's reviewed landing, used only to satisfy the stored
+    // depth surface's expectation rule (`research/docs/23` §3.3, v43): the
+    // self-test's own judgement below reads columns instead of this image.
+    let depthExpectation = String(repeating: "0000003f0000003f0000003f6666663f", count: 4)
+    let definition = RenderCaseDefinition(
+        id: "depth_resolve_selftest_4x4",
+        declaring_case: "",
+        vertex_entry: reviewed.vertex_entry,
+        fragment_entry: reviewed.fragment_entry,
+        metal: reviewed.metal,
+        // `vertices` is the index count in the indexed shape.
+        vertices: 6,
+        viewport: [0, 0, 4, 4],
+        scissor: nil,
+        instance_count: nil,
+        base_vertex: nil,
+        vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
+        // The stream and index views, spelled exactly as a suite spells them:
+        // each view carries its own bytes (`research/docs/23` §3.6), the same
+        // shape `validateRenderCase` reads out of a suite's render case.
+        vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
+                                                      length: UInt64(vertices.count),
+                                                      initial_hex: hex(vertices))],
+        indices: RenderIndexBufferDefinition(allocation: 960, view: 970, offset: 0,
+                                             length: UInt64(indices.count),
+                                             initial_hex: hex(indices),
+                                             format: "uint16"),
+        attachment: RenderAttachmentDefinition(
+            allocation: 900, view: 910, format: "rgba8_unorm",
+            width: 4, height: 4, load: "clear", store: "store",
+            clear_hex: "11223344", initial_hex: nil, expected_hex: nil),
+        attachments: nil,
+        expected_hex: redImage,
+        coverage: nil,
+        multisample: MultisampleDefinition(sample_count: 4),
+        // The validation fixture states the filter this rail declares; the
+        // three passes below state sample0, min and max themselves, so no
+        // suite-level gate or mask participates.
+        depth_resolve: DepthResolveDefinition(filter: "sample0"),
+        requires_depth_resolve_filter: nil,
+        wildcard_texels: nil,
+        depth: DepthAttachmentDefinition(
+            format: "depth32float", width: 4, height: 4, load: "clear",
+            clear_depth: 1.0, store: "store", allocation: 980, view: 990,
+            expected_hex: depthExpectation),
+        depth_test: DepthTestDefinition(compare: "less", write: true),
+        cull: nil,
+        blend: nil,
+        stencil: nil,
+        stencil_test: nil,
+        // The self-test runs on this rail by construction; the marker is the
+        // same one a suite would name for it.
+        capture_rails: ["native-metal"])
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fixture = try validateRenderCase(definition, root: root)
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the depth-resolve self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native depth-resolve self-test: device=\(device.name) platform=\(eligibility.platform)")
+
+    let filters: [(name: String, filter: MTLMultisampleDepthResolveFilter)] = [
+        ("sample0", .sample0), ("min", .min), ("max", .max),
+    ]
+    var landings = [String: Data]()
+    for entry in filters {
+        landings[entry.name] = try depthResolveSelftestPass(fixture, device: device,
+                                                            queue: queue, filter: entry.filter,
+                                                            name: entry.name)
+    }
+
+    // The reviewed near (0.5) and far (0.9) `float32` landings in memory
+    // order, which the four texel hexes below compare against.
+    let nearBytes = Data([0x00, 0x00, 0x00, 0x3f])
+    let farBytes = Data([0x66, 0x66, 0x66, 0x3f])
+    func texel(_ landing: Data, _ row: Int, _ column: Int) -> Data {
+        let start = (row * 4 + column) * 4
+        return Data(landing[start..<(start + 4)])
+    }
+    // One machine-readable line per texel, row-major, each carrying the three
+    // filters' landings for that texel. Column 0 (fully near) and column 3
+    // (fully far) are the stable columns, and column 2 is the key column the
+    // filters are expected to split.
+    var output = ""
+    for row in 0..<4 {
+        for column in 0..<4 {
+            let sample0Hex = hex(texel(landings["sample0"]!, row, column))
+            let minHex = hex(texel(landings["min"]!, row, column))
+            let maxHex = hex(texel(landings["max"]!, row, column))
+            output += "depth_resolve_selftest: row=\(row) column=\(column) "
+                + "sample0=\(sample0Hex) min=\(minHex) max=\(maxHex)\n"
+        }
+    }
+    // The PASS judgement is the stable columns for every filter plus the key
+    // column's split; sample0's column 2 is deliberately absent from it.
+    var failures = [String]()
+    for row in 0..<4 {
+        for entry in filters {
+            let column0 = texel(landings[entry.name]!, row, 0)
+            if column0 != nearBytes {
+                failures.append("column 0 row \(row) \(entry.name)=\(hex(column0)) "
+                                + "expected \(hex(nearBytes))")
+            }
+            let column3 = texel(landings[entry.name]!, row, 3)
+            if column3 != farBytes {
+                failures.append("column 3 row \(row) \(entry.name)=\(hex(column3)) "
+                                + "expected \(hex(farBytes))")
+            }
+        }
+        let minKey = texel(landings["min"]!, row, 2)
+        if minKey != nearBytes {
+            failures.append("column 2 row \(row) min=\(hex(minKey)) "
+                            + "expected \(hex(nearBytes))")
+        }
+        let maxKey = texel(landings["max"]!, row, 2)
+        if maxKey != farBytes {
+            failures.append("column 2 row \(row) max=\(hex(maxKey)) "
+                            + "expected \(hex(farBytes))")
+        }
+    }
+    if failures.isEmpty {
+        output += "depth_resolve_selftest: PASS\n"
+        FileHandle.standardOutput.write(Data(output.utf8))
+    } else {
+        for failure in failures {
+            output += "depth_resolve_selftest: FAIL (\(failure))\n"
+        }
+        FileHandle.standardOutput.write(Data(output.utf8))
+        // A device that reduces both filters to one value fails the key
+        // column's split, which is the authoritative answer this check
+        // exists to collect — so the failure has to propagate rather than
+        // print PASS.
+        throw OracleError("depth_resolve_selftest: " + failures.joined(separator: "; "))
+    }
+}
+
 @available(macOS 11.0, *)
 private func assessDevice(_ device: MTLDevice?) -> DeviceProbe {
     let platform = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -4554,6 +4977,16 @@ do {
         // (`research/docs/25` §6 Step 7a).
         let result = try heapSelfTest()
         try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.depthResolveSelfTest {
+        // The depth-resolve milestone's one-device check: the reviewed depth
+        // pair draws the v51 edge geometry once per filter, and the per-texel
+        // landings this check prints are the authoritative answer for whether
+        // the Apple device executes Min/Max. It exits nonzero unless the
+        // stable columns are as reviewed and the key column distinguishes min
+        // from max (`research/docs/23` §3.3, v57e).
+        try depthResolveSelfTest()
         exit(EXIT_SUCCESS)
     }
     guard let suiteURL = options.suite else { throw OracleError("--suite is required") }

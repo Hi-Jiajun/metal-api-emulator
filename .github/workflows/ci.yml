@@ -632,6 +632,66 @@ jobs:
               raise SystemExit(1)
           print('mrt_selftest: PASS (' + report['id'] + ' ' + ' '.join(observed) + ')')
           PY
+      # The one-device depth-resolve check (`research/docs/23` §3.3, v57e). It
+      # mirrors the neighbouring self-tests' `--probe` eligibility gate and
+      # SKIP-not-PASS discipline, then runs the three-filter depth resolve
+      # fixture. The oracle's own per-texel stdout lines are the authoritative
+      # answer for whether the Apple device executes Min/Max: it exits nonzero
+      # unless the stable columns hold (column 0 = 0.5, column 3 = 0.9) and the
+      # key column splits min (0.5) from max (0.9), so a device that reduces
+      # both filters to one value is a failing step, never a PASS.
+      - name: Run native depth-resolve self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/depth-resolve-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/depth-resolve-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "depth-resolve selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/depth-resolve-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('depth-resolve selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('depth-resolve selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('depth-resolve selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "depth-resolve selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "depth-resolve selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "depth-resolve selftest: device eligible; running the three-filter depth resolve" >> "$log"
+          # The oracle prints the per-texel landings and its own PASS line to
+          # stdout; stdout and stderr share the log and the step summary so the
+          # answer survives the job even when the step fails on purpose.
+          status=0
+          (cd conformance && /tmp/native-oracle --depth-resolve-selftest) \
+            2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY" || status=$?
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "depth-resolve selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
       - name: Preserve native probe, status and any completed capture
         if: always()
         uses: actions/upload-artifact@v4
