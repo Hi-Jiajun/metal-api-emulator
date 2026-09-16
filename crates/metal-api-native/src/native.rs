@@ -219,6 +219,7 @@ impl NativeMetalProvider {
             // footprints, and this snapshot publishes exactly the formats and
             // the stream count that rail translates.
             let vertex_bits = render::vertex_input_capability_bits();
+            let instancing_bits = render::instancing_capability_bits();
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
@@ -283,6 +284,15 @@ impl NativeMetalProvider {
                 max_vertex_buffers: vertex_bits.max_vertex_buffers,
                 supported_vertex_formats: vertex_bits.supported_vertex_formats,
                 supported_index_formats: vertex_bits.supported_index_formats,
+                // Instancing is executed by this rail as of v31: the plan
+                // carries each binding's step function and the draw carries the
+                // pass's instance count, both proved on the host before a
+                // device object exists (`research/docs/23` §3.3). The flip
+                // condition is the reviewed `instanced_pair_4x4` case on the
+                // Apple rail, recorded on
+                // `render::instancing_capability_bits`.
+                supports_render_instancing: instancing_bits.supports_render_instancing,
+                max_render_instances: instancing_bits.max_render_instances,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).

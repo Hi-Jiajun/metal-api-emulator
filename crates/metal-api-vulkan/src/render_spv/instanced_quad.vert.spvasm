@@ -1,0 +1,71 @@
+; 本文件是 instanced_quad.vert.spv 的可读源（research/docs/23 §3.3，v31 实例化步进）。
+; 复现命令：
+;   spirv-as --target-env vulkan1.0 instanced_quad.vert.spvasm -o instanced_quad.vert.spv
+;   spirv-val --target-env vulkan1.0 instanced_quad.vert.spv
+; 入口名 instanced_quad_main：core 的 RenderPipelineContract 要求 vertex/fragment 入口名不同。
+; 形状与被审查的 MSL 模块 conformance/shaders/instanced_quad_2x2.metal 逐条对应：
+;   - binding 0（location 0，vec2 float32，per-vertex）是 quad 的四个 NDC 角；
+;   - binding 1（location 1，vec4 float32，per-instance）是该实例的颜色；
+;   - InstanceIndex 内建把实例 0 的拷贝压到 NDC 左半、实例 1 压到右半
+;     （x' = x*0.5 + (iid == 0 ? -0.5 : +0.5)），y 不动，所以每个实例覆盖
+;     附件的一整半，实例颜色落在不同的 texel 上而不是互相覆盖。
+; 顶点缓冲的步进（VK_VERTEX_INPUT_RATE_INSTANCE）由管线顶点输入状态声明，
+; 不由本模块决定；本模块只读它拿到的两条流。
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "instanced_quad_main" %pos_in %tint_in %instance_index %glpos %tint_out
+               OpSource GLSL 450
+               OpName %main "instanced_quad_main"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %pos_in "position"
+               OpName %tint_in "tint"
+               OpName %instance_index "instance_index"
+               OpName %tint_out "tint_out"
+               OpName %glpos "gl_PerVertex"
+               OpDecorate %pos_in Location 0
+               OpDecorate %tint_in Location 1
+               OpDecorate %tint_out Location 0
+               OpDecorate %instance_index BuiltIn InstanceIndex
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %int = OpTypeInt 32 1
+       %bool = OpTypeBool
+    %v2float = OpTypeVector %float 2
+    %v4float = OpTypeVector %float 4
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Input_v2float = OpTypePointer Input %v2float
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+%_ptr_Input_int = OpTypePointer Input %int
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+     %pos_in = OpVariable %_ptr_Input_v2float Input
+    %tint_in = OpVariable %_ptr_Input_v4float Input
+%instance_index = OpVariable %_ptr_Input_int Input
+   %tint_out = OpVariable %_ptr_Output_v4float Output
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+    %float_0 = OpConstant %float 0
+ %float_half = OpConstant %float 0.5
+%float_neg_half = OpConstant %float -0.5
+     %float_1 = OpConstant %float 1
+      %int_0 = OpConstant %int 0
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+        %pos = OpLoad %v2float %pos_in
+       %tint = OpLoad %v4float %tint_in
+    %iid_value = OpLoad %int %instance_index
+          %x = OpCompositeExtract %float %pos 0
+          %y = OpCompositeExtract %float %pos 1
+    %scaled_x = OpFMul %float %x %float_half
+    %is_first = OpIEqual %bool %iid_value %int_0
+       %shift = OpSelect %float %is_first %float_neg_half %float_half
+   %shifted_x = OpFAdd %float %scaled_x %shift
+       %pos4 = OpCompositeConstruct %v4float %shifted_x %y %float_0 %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos4
+               OpStore %tint_out %tint
+               OpReturn
+               OpFunctionEnd

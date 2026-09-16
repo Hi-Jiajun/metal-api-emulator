@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import struct
 import sys
 
 
@@ -606,13 +607,16 @@ def _present_declaration(value, texel, where):
 def _vertex_input_declaration(case, where):
     """Pin the reviewed vertex-input shape of a render case (`docs/23` §3.3).
 
-    Two geometries exist and no third: the milestone's `vertex_id` triangle
-    (no `vertex_layout` at all), and the reviewed indexed quad — one
-    `float32x2` position stream at stride eight bound at index 0, plus six
-    `uint16` or `uint32` indices whose values all name one of the four
-    vertices the stream carries. The rules mirror `provider-capture`'s
-    `render_geometry` and the Swift oracle's own validation, so a suite one
-    rail would refuse cannot pass here either.
+    Three geometries exist and no fourth: the milestone's `vertex_id` triangle
+    (no `vertex_layout` at all), the reviewed indexed quad — one `float32x2`
+    position stream at stride eight bound at index 0, plus six `uint16` or
+    `uint32` indices whose values all name one of the four vertices the stream
+    carries — and the reviewed instanced pair (`research/docs/23` §3.3, v31):
+    the same position stream at binding 0, a `float32x4` tint stream at
+    binding 1 that advances once per *instance*, and exactly two instances.
+    The rules mirror `provider-capture`'s `render_geometry` and the Swift
+    oracle's own validation, so a suite one rail would refuse cannot pass here
+    either.
     """
     quad_vertices, quad_indices, quad_stride = 4, 6, 8
     layout = case.get("vertex_layout")
@@ -624,6 +628,8 @@ def _vertex_input_declaration(case, where):
         return None
     _object(layout, ("buffers",), f"{where}.vertex_layout")
     streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
+    if len(streams) == 2:
+        return _instanced_declaration(case, streams, vertex_buffers, indices, where)
     _require(len(streams) == 1, f"{where}: the reviewed shape is one vertex stream")
     _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
     _require(streams[0]["stride"] == quad_stride,
@@ -668,6 +674,109 @@ def _vertex_input_declaration(case, where):
         _require(index < quad_vertices,
                  f"{where}: index {position // width} names vertex {index} outside the quad")
     return {"vertices": quad_vertices, "indices": quad_indices}
+
+
+def _unorm_texel(record, where):
+    """The four texel bytes a reviewed instance tint stores.
+
+    Every component of a reviewed tint is exactly `0.0` or `1.0`, so the byte an
+    8-bit UNORM attachment stores is exactly `0x00` or `0xff` and the comparison
+    does not have to model a rounding rule. Any other component is refused: the
+    expectation could not pin what a driver would store
+    (`research/docs/23` §3.5).
+    """
+    _require(len(record) == 16, f"{where}: an instance tint is a float32x4")
+    texel = bytearray(4)
+    for index, component in enumerate(struct.unpack("<4f", record)):
+        _require(component in (0.0, 1.0),
+                 f"{where}: a reviewed instance tint is zero or one per component")
+        texel[index] = 0xFF if component == 1.0 else 0x00
+    return bytes(texel)
+
+
+def _instanced_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed instanced pair (`research/docs/23` §3.3, v31).
+
+    The two streams are the whole review surface: binding 0 is the reviewed
+    `float32x2` position stream that advances per vertex, binding 1 is a
+    `float32x4` tint stream that advances per instance, and the draw runs
+    exactly two instances so the first record's tint covers one half of the
+    attachment and the second record's tint the other. The returned mapping
+    carries the triangle's vertex and index counts plus the two tints, which
+    the expectation rules below read.
+    """
+    quad_vertices, quad_indices, quad_stride = 4, 6, 8
+    tint_stride = 16
+    _require(case.get("instance_count") == 2,
+             f"{where}: the reviewed instanced draw runs exactly two instances")
+    _object(streams[0], ("stride", "step", "attributes"),
+            f"{where}.vertex_layout.buffers[0]")
+    _object(streams[1], ("stride", "step", "attributes"),
+            f"{where}.vertex_layout.buffers[1]")
+    _require((streams[0]["stride"], streams[0]["step"]) == (quad_stride, "per_vertex"),
+             f"{where}: the reviewed instanced position stream is stride {quad_stride} "
+             "and steps per vertex")
+    _require((streams[1]["stride"], streams[1]["step"]) == (tint_stride, "per_instance"),
+             f"{where}: the reviewed instanced tint stream is stride {tint_stride} "
+             "and steps per instance")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 1, f"{where}: the reviewed stream has one attribute")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x2"),
+             f"{where}: the reviewed attribute is location 0, offset 0, float32x2")
+    tints = _list(streams[1]["attributes"],
+                  f"{where}.vertex_layout.buffers[1].attributes")
+    _require(len(tints) == 1, f"{where}: the reviewed tint stream has one attribute")
+    _object(tints[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[1].attributes[0]")
+    _require((tints[0]["location"], tints[0]["offset"], tints[0]["format"])
+             == (1, 0, "float32x4"),
+             f"{where}: the reviewed tint is location 1, offset 0, float32x4")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 2, f"{where}: the reviewed shape binds two vertex streams")
+    for position, binding in enumerate(bindings):
+        _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+                f"{where}.vertex_buffers[{position}]")
+        _require(binding["allocation"] > 0 and binding["view"] > 0,
+                 f"{where}: zero vertex stream identity")
+        _require("format" not in binding,
+                 f"{where}: a vertex stream carries no index format")
+        _require(len(_hex(binding["initial_hex"],
+                          f"{where}.vertex_buffers[{position}].initial_hex")) == binding["length"],
+                 f"{where}: the vertex stream bytes do not match its length")
+    _require(bindings[0]["length"] == quad_stride * quad_vertices,
+             f"{where}: the position stream is the reviewed quad")
+    _require(bindings[1]["length"] == tint_stride * 2,
+             f"{where}: the tint stream carries exactly the two reviewed records")
+    records = [_hex(bindings[1]["initial_hex"][index * tint_stride * 2:(index + 1) * tint_stride * 2],
+                    f"{where}.vertex_buffers[1].initial_hex")
+               for index in range(2)]
+    _require(records[0] != records[1],
+             f"{where}: the two instance tints have to differ, or the halves cannot "
+             "show which record each instance read")
+    tints = [_unorm_texel(record, where) for record in records]
+    _require(indices is not None, f"{where}: the reviewed instanced shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["allocation"] > 0 and indices["view"] > 0,
+             f"{where}: zero index buffer identity")
+    width = {"uint16": 2, "uint32": 4}.get(indices["format"])
+    _require(width is not None, f"{where}: unsupported index format")
+    _require(indices["length"] == quad_indices * width,
+             f"{where}: the index buffer is the reviewed six indices")
+    index_bytes = _hex(indices["initial_hex"], f"{where}.indices.initial_hex")
+    _require(len(index_bytes) == indices["length"],
+             f"{where}: the index bytes do not match their length")
+    for position in range(0, len(index_bytes), width):
+        chunk = index_bytes[position:position + width]
+        index = int.from_bytes(chunk, "little")
+        _require(index < quad_vertices,
+                 f"{where}: index {position // width} names vertex {index} outside the quad")
+    return {"vertices": quad_vertices, "indices": quad_indices, "instanced": True,
+            "tints": tints}
 
 
 def _inside_scissor(index, width, scissor):
@@ -721,7 +830,8 @@ def _render_plan(plan, suite):
         _require(not missing, f"{where}: missing fields {', '.join(missing)}")
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
-                               "vertex_layout", "vertex_buffers", "indices", "scissor"})
+                               "vertex_layout", "vertex_buffers", "indices", "scissor",
+                               "instance_count"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -901,9 +1011,29 @@ def _render_plan(plan, suite):
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
                 if scissor is None:
-                    _require(all(chunk == texel for chunk in texels),
-                             f"{attachment_where}: every texel of the expectation has to be "
-                             "the fragment output")
+                    if vertex_input and vertex_input.get("instanced"):
+                        # The instanced fixture covers each half of the
+                        # attachment with its own instance tint
+                        # (`research/docs/23` §3.3, v31): the left half has to
+                        # carry the first record's tint and the right half the
+                        # second's, each uniform. A uniform expectation could
+                        # not show that the per-instance stream stepped, and a
+                        # swapped pair would read as agreement on the wrong
+                        # halves.
+                        left, right = vertex_input["tints"]
+                        _require(left != right and left != clear and right != clear,
+                                 f"{attachment_where}: the two instance tints have to "
+                                 "differ from each other and from the clear colour")
+                        for index, chunk in enumerate(texels):
+                            column = index % width
+                            expected_chunk = left if column < width // 2 else right
+                            _require(chunk == expected_chunk,
+                                     f"{attachment_where}: texel {index} has to carry the "
+                                     "instance tint of its half")
+                    else:
+                        _require(all(chunk == texel for chunk in texels),
+                                 f"{attachment_where}: every texel of the expectation has to be "
+                                 "the fragment output")
                 else:
                     covered = 0
                     for index, chunk in enumerate(texels):

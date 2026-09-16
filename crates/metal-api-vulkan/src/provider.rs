@@ -25,6 +25,14 @@ use metal_api_core::ExecutorError;
 /// to the rail's window and to the conformance case that measures it.
 const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
 
+/// The largest instance count the instancing increment executes
+/// (`research/docs/23` §3.3, v31).
+///
+/// The reviewed fixture draws two instances; the ceiling is four so the rail
+/// has headroom without claiming a window no case proves. A wider draw is
+/// refused by core admission against this bit rather than silently narrowed.
+const MAX_RENDER_INSTANCES: u32 = 4;
+
 /// Conservative first-increment heap ceiling (`research/docs/25-heaps与ICB设计.md`
 /// §4.1). The placement rail is proven on a 4096-byte heap; capping admission
 /// far below the device's real single-allocation ceiling (Lavapipe reports a
@@ -84,6 +92,14 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         max_vertex_buffers: metal_api_core::provider::MAX_VERTEX_BUFFERS as u32,
         supported_vertex_formats: metal_api_core::provider::VertexFormat::ADMITTED.to_vec(),
         supported_index_formats: metal_api_core::provider::IndexFormat::ADMITTED.to_vec(),
+        // Instancing is executed (`render.rs` builds each binding's input rate
+        // from the layout's step and issues `vkCmdDraw*` with the pass's own
+        // instance count). Evidence: the reviewed `instanced_pair_4x4` case on
+        // Lavapipe and on the RTX 5060. The ceiling is the reviewed fixture's
+        // two instances rounded up to four; a wider draw is still refused by
+        // core admission (`research/docs/23` §3.3, v31).
+        supports_render_instancing: true,
+        max_render_instances: MAX_RENDER_INSTANCES,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

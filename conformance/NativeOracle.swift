@@ -152,9 +152,28 @@ private struct RenderVertexAttributeDefinition: Decodable, Equatable {
 
 /// One vertex stream of a render case's layout
 /// (`metal_api_core::provider::VertexBufferLayout`).
+///
+/// `step` is the v31 stream advance (`research/docs/23` §3.3): `"per_vertex"`
+/// or `"per_instance"`. A fixture that says nothing about it describes the
+/// per-vertex stream every pre-v31 layout meant — the same default
+/// `metal_api_core::provider`'s `default_vertex_step` applies — so equality
+/// resolves the missing field and the explicit spelling to one meaning, and
+/// the reviewed pins below can state `"per_vertex"` while a pre-v31 fixture
+/// stays silent.
 private struct RenderVertexBufferLayoutDefinition: Decodable, Equatable {
     let stride: UInt64
+    let step: String?
     let attributes: [RenderVertexAttributeDefinition]
+
+    /// The stream's advance with the pre-v31 default applied.
+    var resolvedStep: String { step ?? "per_vertex" }
+
+    static func == (lhs: RenderVertexBufferLayoutDefinition,
+                    rhs: RenderVertexBufferLayoutDefinition) -> Bool {
+        lhs.stride == rhs.stride
+            && lhs.attributes == rhs.attributes
+            && lhs.resolvedStep == rhs.resolvedStep
+    }
 }
 
 /// The vertex-input shape a render case draws with: one entry per bound stream,
@@ -205,6 +224,11 @@ private struct RenderCaseDefinition: Decodable {
     /// The pass's scissor rectangle in framebuffer coordinates, or `nil` for the
     /// whole attachment (`research/docs/23` §3.3, v29).
     let scissor: [UInt64]?
+    /// How many instances the pass's single draw runs, or `nil` for one
+    /// instance — the shape every pre-v31 case declares
+    /// (`metal_api_core::provider::RenderPassDescriptor::instance_count`,
+    /// `research/docs/23` §3.3, v31). The reviewed instanced case declares two.
+    let instance_count: UInt64?
     /// The vertex-input half, absent for the `vertex_id` shape
     /// (`research/docs/23` §3.3). A case that carries a layout draws the
     /// indexed reviewed module instead: the layout, its bindings and the index
@@ -245,11 +269,15 @@ private struct ValidatedRender {
     let indexStream: ValidatedIndexStream?
 }
 
-/// One vertex stream the draw reads: its binding index, stride, attributes and
-/// the bytes themselves, taken from the view the case declares.
+/// One vertex stream the draw reads: its binding index, stride, advance,
+/// attributes and the bytes themselves, taken from the view the case declares.
 private struct ValidatedVertexStream {
     let binding: Int
     let stride: UInt64
+    /// The reviewed stream advance, resolved to `"per_vertex"` /
+    /// `"per_instance"` (`research/docs/23` §3.3, v31): both the descriptor's
+    /// `stepFunction` and the footprint proof read it.
+    let step: String
     let attributes: [RenderVertexAttributeDefinition]
     /// Where the view starts inside its allocation, which is where the binding
     /// points (`render.rs::stream_buffer`).
@@ -1197,6 +1225,7 @@ private func reviewedIndexedModule() -> ReviewedRenderModule {
                                sha256: "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"),
         buffers: [RenderVertexBufferLayoutDefinition(
             stride: 8,
+            step: "per_vertex",
             attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
                                                           format: "float32x2")])])
 }
@@ -1214,6 +1243,7 @@ private func reviewedDualModule() -> ReviewedRenderModule {
                                sha256: "5afc95dd177ba64e3d2e115ab84805fad2b56a7450914a0ab6f8572f26ba7eba"),
         buffers: [RenderVertexBufferLayoutDefinition(
             stride: 8,
+            step: "per_vertex",
             attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
                                                           format: "float32x2")])])
 }
@@ -1231,6 +1261,7 @@ private func reviewedR32fModule() -> ReviewedRenderModule {
                                sha256: "2074ee223fe1e472124312b6e1507f383ceddc10a24c3a432e03e61449ed16aa"),
         buffers: [RenderVertexBufferLayoutDefinition(
             stride: 8,
+            step: "per_vertex",
             attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
                                                           format: "float32x2")])])
 }
@@ -1247,6 +1278,7 @@ private func reviewedQuadModule() -> ReviewedRenderModule {
                                sha256: "883a3234884c32ccd32ca1dfbfc22cdcefbc6c1a6f5047cbf65bd647a79dfb28"),
         buffers: [RenderVertexBufferLayoutDefinition(
             stride: 8,
+            step: "per_vertex",
             attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
                                                           format: "float32x2")])])
 }
@@ -1262,16 +1294,50 @@ private func reviewedTripleModule() -> ReviewedRenderModule {
                                sha256: "edfdc95fe3336fb457e71379ed64b358a5cb4f007d9ad93c75d7727e62338d26"),
         buffers: [RenderVertexBufferLayoutDefinition(
             stride: 8,
+            step: "per_vertex",
             attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
                                                           format: "float32x2")])])
+}
+
+/// The reviewed instanced fixture (`research/docs/23` §3.3, v31): the reviewed
+/// quad's `float32x2` position stream plus a second `float32x4` tint stream
+/// that advances once per *instance*, and a vertex stage that reads the tint
+/// and shifts each instance's copy of the quad with `instance_id`. The solid
+/// modules cannot stand in for it: the tint travels through a varying only
+/// this vertex stage produces, and the fragment stage that stores it is the
+/// same review surface as the pair.
+///
+/// The step pair is part of the pin rather than a knob: binding 0 advances per
+/// vertex and binding 1 per instance, which is what the two halves of the
+/// attachment observe at once.
+private func reviewedInstancedModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_instanced_quad_vertex",
+        fragment_entry: "render_instanced_tint",
+        metal: RenderSourcePin(path: "shaders/instanced_quad_2x2.metal",
+                               sha256: "5d22083c7a13f42bd20d7ba85aa1ef5d433409caf13a1d792fd89d76fcef5aab"),
+        buffers: [
+            RenderVertexBufferLayoutDefinition(
+                stride: 8,
+                step: "per_vertex",
+                attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                              format: "float32x2")]),
+            RenderVertexBufferLayoutDefinition(
+                stride: 16,
+                step: "per_instance",
+                attributes: [RenderVertexAttributeDefinition(location: 1, offset: 0,
+                                                              format: "float32x4")]),
+        ])
 }
 
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
-/// single-attachment case with a layout the indexed one, and an indexed case
-/// with two `rgba8_unorm` attachments the dual one. A shape no module was
-/// reviewed for is refused instead of matched approximately.
+/// single-attachment case whose two-stream layout steps per instance draws the
+/// instanced module, a single-attachment case with any other layout the
+/// indexed one, and an indexed case with two `rgba8_unorm` attachments the
+/// dual one. A shape no module was reviewed for is refused instead of matched
+/// approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
     let attachments = try colorAttachments(definition)
     // The 8-bit UNORM modules are layout-agnostic: the same store lands in
@@ -1281,11 +1347,21 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
     let unorm8 = { (format: String) in
         format == "rgba8_unorm" || format == "bgra8_unorm"
     }
+    // The instanced shape (`research/docs/23` §3.3, v31) is the one two-stream
+    // layout: binding 0 advances per vertex and binding 1 once per instance.
+    // The reviewed equality check below pins the rest of the layout, so this
+    // selection only has to find the shape's own module.
+    let instanced = definition.vertex_layout.map { layout -> Bool in
+        layout.buffers.count == 2
+            && layout.buffers.contains(where: { $0.resolvedStep == "per_instance" })
+    } ?? false
     switch (definition.vertex_layout, attachments.count) {
     case (nil, 1):
         return reviewedRenderModule()
     case (_?, 1) where attachments[0].format == "r32float":
         return reviewedR32fModule()
+    case (_?, 1) where instanced && unorm8(attachments[0].format):
+        return reviewedInstancedModule()
     case (_?, 1) where unorm8(attachments[0].format):
         return reviewedIndexedModule()
     case (_?, 2) where attachments.allSatisfy({ unorm8($0.format) }):
@@ -1355,6 +1431,44 @@ private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [Val
     return renderCases
 }
 
+/// The two texels a reviewed instance-tint stream stores (`research/docs/23`
+/// §3.3, v31): one `float32x4` record per instance, read from the start of the
+/// stream's own bytes exactly as `conformance/compare.py`'s
+/// `_instanced_declaration` reads them. Every component is exactly `0.0` or
+/// `1.0`, so the byte an 8-bit UNORM attachment stores is exactly `0x00` or
+/// `0xff` and the expectation does not have to model a rounding rule
+/// (`research/docs/23` §3.5). Any other component is refused, and the two
+/// texels have to differ, or the halves could not show which record each
+/// instance read.
+private func instancedTintTexels(_ stream: ValidatedVertexStream,
+                                 id: String) throws -> (left: Data, right: Data) {
+    let recordBytes = 16
+    try require(stream.bytes.count >= 2 * recordBytes,
+                "\(id): the instance tint stream carries two \(recordBytes)-byte records")
+    let bytes = stream.bytes
+    var texels = [Data]()
+    for record in 0..<2 {
+        var texel = Data()
+        texel.reserveCapacity(4)
+        for component in 0..<4 {
+            let base = bytes.startIndex + record * recordBytes + component * 4
+            let bits = UInt32(bytes[base])
+                | (UInt32(bytes[base + 1]) << 8)
+                | (UInt32(bytes[base + 2]) << 16)
+                | (UInt32(bytes[base + 3]) << 24)
+            let value = Float(bitPattern: bits)
+            try require(value == 0.0 || value == 1.0,
+                        "\(id): instance tint record \(record), component \(component) "
+                        + "has to be zero or one")
+            texel.append(value == 1.0 ? 0xff : 0x00)
+        }
+        texels.append(texel)
+    }
+    try require(texels[0] != texels[1],
+                "\(id): the two instance tints have to differ")
+    return (left: texels[0], right: texels[1])
+}
+
 /// The render milestone's shape, admitted as a whitelist rather than as a
 /// per-case table.
 ///
@@ -1412,6 +1526,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         + "\(buffer.length) bytes and carries \(bytes.count)")
             resolved.append(ValidatedVertexStream(binding: binding,
                                                   stride: reviewedBuffers[binding].stride,
+                                                  step: reviewedBuffers[binding].resolvedStep,
                                                   attributes: reviewedBuffers[binding].attributes,
                                                   offset: buffer.offset,
                                                   bytes: bytes))
@@ -1447,11 +1562,31 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 span = max(span, value + 1)
             }
         }
+        let instanceCount = definition.instance_count ?? 1
+        if resolved.contains(where: { $0.step == "per_instance" }) {
+            // The reviewed instanced shape runs exactly two instances, one per
+            // half of the attachment (`research/docs/23` §3.3, v31): any other
+            // count describes a draw no rail has been reviewed against, and
+            // the per-half expectation below could not follow it.
+            try require(instanceCount == 2,
+                        "\(definition.id): the reviewed instanced draw runs exactly two "
+                        + "instances")
+        }
+        // A per-instance stream advances once per instance instead of once per
+        // index-selected vertex, so the draw reads `instanceCount` records of
+        // it (`research/docs/23` §3.3, v31); every other stream has to cover
+        // the span the indices reach, exactly as before.
         for stream in resolved {
             let covered = UInt64(stream.bytes.count) / stream.stride
-            try require(span <= covered,
-                        "\(definition.id): index values reach vertex \(span - 1) of "
-                        + "binding \(stream.binding), which covers \(covered)")
+            if stream.step == "per_instance" {
+                try require(instanceCount <= covered,
+                            "\(definition.id): the draw reads \(instanceCount) records of "
+                            + "binding \(stream.binding), which covers \(covered)")
+            } else {
+                try require(span <= covered,
+                            "\(definition.id): index values reach vertex \(span - 1) of "
+                            + "binding \(stream.binding), which covers \(covered)")
+            }
         }
         vertexStreams = resolved
         indexStream = ValidatedIndexStream(format: format, indexCount: indexCount,
@@ -1537,6 +1672,32 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 // texel is the fragment output and outside it every texel is the
                 // clear colour (`research/docs/23` §3.3, v29). Both halves have
                 // to appear, or the fixture could not show the clip ran.
+                //
+                // The reviewed instanced pass (`research/docs/23` §3.3, v31)
+                // declares no scissor, and its expectation is per half instead:
+                // each instance's tint covers the half its `instance_id` shift
+                // puts it on, so the left half has to carry the first record's
+                // texel and the right half the second's. A uniform expectation
+                // could not show that the per-instance stream stepped at all,
+                // and a swapped pair would read as agreement on the wrong
+                // halves — which is why the two records have to differ and
+                // neither may equal the clear colour. The scissor branch keeps
+                // its precedence, mirroring `conformance/compare.py`.
+                var instanceTexels: (left: Data, right: Data)?
+                if definition.scissor == nil,
+                   let tintStream = vertexStreams.first(where: { $0.step == "per_instance" }) {
+                    let (left, right) = try instancedTintTexels(tintStream, id: definition.id)
+                    guard let clearHex = attachment.clear_hex else {
+                        throw OracleError("\(definition.id): a clear attachment needs clear_hex")
+                    }
+                    let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+                    try require(clearBytes.count == 4,
+                                "\(definition.id): a clear colour is four bytes")
+                    try require(left != clearBytes && right != clearBytes,
+                                "\(definition.id): the two instance tints have to differ "
+                                + "from the clear colour")
+                    instanceTexels = (left: left, right: right)
+                }
                 var scissorClear: Data?
                 var covered = 0
                 if let scissor = definition.scissor {
@@ -1555,6 +1716,16 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         try require(Data(texels[offset..<(offset + 4)]) == expected,
                                     "\(definition.id): texel \(index) has to follow the declared scissor")
                         covered += inside ? 1 : 0
+                        texelCount += 1
+                        continue
+                    }
+                    if let tints = instanceTexels {
+                        let index = offset / 4
+                        let column = index % attachment.width
+                        let half = column < attachment.width / 2 ? tints.left : tints.right
+                        try require(Data(texels[offset..<(offset + 4)]) == half,
+                                    "\(definition.id): texel \(index) has to carry the "
+                                    + "instance tint of its half")
                         texelCount += 1
                         continue
                     }
@@ -2008,6 +2179,9 @@ private func makeStreamBuffer(device: MTLDevice, id: String,
 private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                            queue: MTLCommandQueue) throws -> CaseResult {
     let definition = fixture.definition
+    // Every pre-v31 case draws a single instance; the reviewed instanced case
+    // declares two (`research/docs/23` §3.3, v31).
+    let instanceCount = Int(definition.instance_count ?? 1)
     // One texture per colour attachment, in location order. The attachments are
     // render targets, not sampled sources. Shared storage is what makes their
     // texels CPU-visible for the readback on the unified-memory device this
@@ -2068,9 +2242,16 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                   + "\(stream.binding)")
             }
             layout.stride = Int(stream.stride)
-            // One stream advance per vertex: per-instance step rates are not
-            // part of this increment.
-            layout.stepFunction = .perVertex
+            // The v31 stream advance (`research/docs/23` §3.3): a per-instance
+            // stream advances once per instance, every other stream once per
+            // vertex. Rate one is the reviewed step, not a knob: no reviewed
+            // fixture declares a wider rate.
+            if stream.step == "per_instance" {
+                layout.stepFunction = .perInstance
+                layout.stepRate = 1
+            } else {
+                layout.stepFunction = .perVertex
+            }
             for attribute in stream.attributes {
                 guard let format = vertexFormat(attribute.format) else {
                     throw OracleError("\(definition.id): unsupported vertex attribute format "
@@ -2169,7 +2350,8 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     if let indexStream = fixture.indexStream {
         // An indexed draw names its index buffer in the draw call, and the count
         // is the one the case declares for that shape
-        // (`RenderPassDescriptor::vertices`, `research/docs/23` §3.3).
+        // (`RenderPassDescriptor::vertices`, `research/docs/23` §3.3); the
+        // instance count is the case's own, one for every pre-v31 case.
         let indexBuffer = try makeStreamBuffer(device: device, id: definition.id,
                                                offset: indexStream.offset,
                                                bytes: indexStream.bytes)
@@ -2179,10 +2361,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                       indexType: indexStream.format.metal,
                                       indexBuffer: indexBuffer,
                                       indexBufferOffset: try hostOffset(indexStream.offset,
-                                                                        id: definition.id))
+                                                                        id: definition.id),
+                                      instanceCount: instanceCount)
     } else {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: Int(definition.vertices))
+                               vertexCount: Int(definition.vertices),
+                               instanceCount: instanceCount)
     }
     encoder.endEncoding()
     let completed = DispatchSemaphore(value: 0)
@@ -2254,6 +2438,7 @@ private func renderSelfTest() throws -> CaseResult {
         vertices: 3,
         viewport: [0, 0, 2, 2],
         scissor: nil,
+        instance_count: nil,
         // The `vertex_id` shape: positions come from the vertex index, so the
         // case declares no layout, no stream and no index buffer.
         vertex_layout: nil,
@@ -2311,6 +2496,7 @@ private func presentSelfTest() throws -> CaseResult {
         vertices: 3,
         viewport: [0, 0, 2, 2],
         scissor: nil,
+        instance_count: nil,
         // The present equivalent replays the `vertex_id` shape, so it declares
         // no vertex input either.
         vertex_layout: nil,
@@ -2384,6 +2570,7 @@ private func vertexSelfTest() throws -> CaseResult {
         vertices: 6,
         viewport: [0, 0, 2, 2],
         scissor: nil,
+        instance_count: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         // The stream and index views, spelled exactly as a suite spells them:
         // each view carries its own bytes (`research/docs/23` §3.6), which is
@@ -2461,6 +2648,7 @@ private func mrtSelfTest() throws -> CaseResult {
         vertices: 6,
         viewport: [0, 0, 2, 2],
         scissor: nil,
+        instance_count: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
                                                       length: UInt64(vertices.count),

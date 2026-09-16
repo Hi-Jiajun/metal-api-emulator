@@ -323,6 +323,7 @@ mod tests {
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         })
     }
@@ -407,6 +408,8 @@ mod tests {
             max_vertex_buffers: 0,
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
+            supports_render_instancing: false,
+            max_render_instances: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

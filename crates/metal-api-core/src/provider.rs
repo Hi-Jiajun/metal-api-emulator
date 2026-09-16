@@ -1396,9 +1396,62 @@ pub struct VertexAttribute {
     pub format: VertexFormat,
 }
 
+/// How often one vertex stream advances (`research/docs/23` §3.3, v31).
+///
+/// The two values are Metal's `MTLVertexStepFunction` split and Vulkan's
+/// `VkVertexInputRate`, and they are the *only* two this increment admits:
+/// `PerVertex` advances once per vertex of the instance, `PerInstance` once
+/// per instance. Both rails step a per-instance stream by exactly one record
+/// per instance (Metal's `stepRate` default of `1`, Vulkan core's
+/// `VK_VERTEX_INPUT_RATE_INSTANCE`), so a custom rate is a deliberate later
+/// change rather than a value this contract could carry and one rail would
+/// silently read with the wrong stride.
+///
+/// The codes are this contract's own (0..=1), for the reason [`VertexFormat`]
+/// records: neither `MTLVertexStepFunction` nor `VkVertexInputRate` numbering
+/// is a stable wire vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexStep {
+    /// `VK_VERTEX_INPUT_RATE_VERTEX` / `MTLVertexStepFunction::PerVertex`.
+    PerVertex,
+    /// `VK_VERTEX_INPUT_RATE_INSTANCE` / `MTLVertexStepFunction::PerInstance`.
+    PerInstance,
+}
+
+impl VertexStep {
+    /// Steps this increment admits. Both, because both rails already publish
+    /// the rate each one maps onto; the list stays closed so admitting a third
+    /// is a deliberate wire-visible change.
+    pub const ADMITTED: [Self; 2] = [Self::PerVertex, Self::PerInstance];
+
+    /// Stable wire code. See [`VertexStep`] for why this is not the
+    /// `MTLVertexStepFunction` or `VkVertexInputRate` value.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::PerVertex => 0,
+            Self::PerInstance => 1,
+        }
+    }
+
+    /// Inverse of [`VertexStep::code`]. An unknown code is a decoder error,
+    /// not a silent default.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::PerVertex),
+            1 => Some(Self::PerInstance),
+            _ => None,
+        }
+    }
+
+    /// Whether this increment admits the step.
+    pub const fn is_admitted(self) -> bool {
+        matches!(self, Self::PerVertex | Self::PerInstance)
+    }
+}
+
 /// One vertex stream: the stride between consecutive vertices and the
 /// attributes read out of it (Metal's `MTLVertexBufferLayoutDescriptor`,
-/// without the step function this increment does not schedule).
+/// including the step function from v31 on).
 ///
 /// The entry's position in [`VertexLayout::Buffers`] is the binding index both
 /// rails use: Vulkan's vertex input binding `i` and Metal's
@@ -1407,6 +1460,11 @@ pub struct VertexAttribute {
 pub struct VertexBufferLayout {
     /// Bytes between consecutive vertices.
     pub stride: u64,
+    /// How often the stream advances. [`VertexStep::PerInstance`] is what makes
+    /// a binding carry one record per instance instead of one per vertex
+    /// (`research/docs/23` §3.3, v31); a snapshot admits it only when its
+    /// `supports_render_instancing` bit is set.
+    pub step: VertexStep,
     /// Attributes read out of this stream. At least one: a stream with no
     /// attribute is not a layout this increment can execute.
     pub attributes: Vec<VertexAttribute>,
@@ -1620,11 +1678,11 @@ impl RenderAttachment {
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
 /// Deliberately absent fields, i.e. the features `docs/23` §3.3 schedules
-/// later: MSAA (no `sample_count`), depth/stencil attachments, instancing (no
-/// instance count, and the vertex layouts carry no step rate) and dynamic state
-/// beyond the explicit viewport (no scissor, blend, cull or winding). MRT is
-/// admitted at contract level: the attachment list carries up to
-/// [`MAX_COLOR_ATTACHMENTS`] entries, its position is the attachment's
+/// later: MSAA (no `sample_count`), depth/stencil attachments, base
+/// vertex/instance offsets and per-instance step *rates* other than one, and
+/// dynamic state beyond the explicit viewport and scissor (no blend, cull or
+/// winding). MRT is admitted at contract level: the attachment list carries up
+/// to [`MAX_COLOR_ATTACHMENTS`] entries, its position is the attachment's
 /// `location`, and each rail declares how many of those it can execute today.
 ///
 /// This type is not referenced by [`ComputeTrace`] yet: Step 1 fixes the shape,
@@ -1678,6 +1736,18 @@ pub struct RenderPassDescriptor {
     /// Index buffer this pass draws through, or `None` for a non-indexed draw.
     /// When present, [`Self::vertices`] is the index count.
     pub indices: Option<IndexBufferBinding>,
+    /// Instances of the one draw (`research/docs/23` §3.3, v31), i.e. Metal's
+    /// `drawPrimitives(vertexCount:instanceCount:)` and Vulkan's
+    /// `vkCmdDraw(vertexCount, instanceCount, …)`. `1` is the single-instance
+    /// draw every earlier increment published, so a trace that never instances
+    /// anything keeps its exact pre-v31 bytes; `0` is refused as a zero-length
+    /// draw rather than read as "no draw".
+    ///
+    /// How many instances a *snapshot* admits is
+    /// [`ProviderCapabilities::max_render_instances`]: the contract admits any
+    /// positive count, and admission refuses a trace above the device's own
+    /// declared ceiling.
+    pub instance_count: u32,
     /// The present action this pass hands its own attachment on to, or `None`
     /// for the offscreen-only pass.
     ///
@@ -1741,6 +1811,13 @@ impl RenderPassDescriptor {
                 expected: FULL_SCREEN_TRIANGLE_VERTICES,
                 actual: self.vertices,
             });
+        }
+        // A zero-instance draw is not a draw: it is the "nothing landed" shape
+        // [`StoreOp::DontCare`] and the scissor rule refuse on their own side,
+        // so it stays a structural refusal here instead of a pass that ran and
+        // left the load op's bytes behind (`research/docs/23` §3.3, v31).
+        if self.instance_count == 0 {
+            return Err(ContractError::ZeroLength("render instance count"));
         }
         if !self.vertex_buffers.is_empty() && self.vertices < FULL_SCREEN_TRIANGLE_VERTICES {
             return Err(ContractError::DrawVertexCountBelowMinimum {
@@ -4891,6 +4968,18 @@ pub struct ProviderCapabilities {
     /// Index widths this snapshot admits. Empty means none, and then no
     /// indexed draw is admissible even with a vertex buffer bound.
     pub supported_index_formats: Vec<IndexFormat>,
+    /// Whether this snapshot can execute the instanced draw of
+    /// `research/docs/23` §3.3 (v31). Defaults to `false`: no provider draws
+    /// more than one instance today, so a pass that asks for more is refused
+    /// during admission instead of being silently executed once. The bit also
+    /// gates [`VertexStep::PerInstance`] bindings, because a per-instance
+    /// stream is only meaningful for a draw that runs more than one instance.
+    pub supports_render_instancing: bool,
+    /// Instances this snapshot admits in one render pass. `0` means the
+    /// snapshot cannot instance at all; the field stays at that default for a
+    /// snapshot whose bit above is false, so a caller reading the limit
+    /// without checking the bit cannot read one as an admission.
+    pub max_render_instances: u32,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -4962,6 +5051,7 @@ impl ProviderCapabilities {
             || self.declares_presentation_support()
             || self.declares_heap_support()
             || self.declares_icb_support()
+            || self.declares_instancing_support()
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -4973,6 +5063,15 @@ impl ProviderCapabilities {
         self.max_vertex_buffers != 0
             || !self.supported_vertex_formats.is_empty()
             || !self.supported_index_formats.is_empty()
+    }
+
+    /// Whether any instancing bit differs from its default. Part of the render
+    /// bits for the same reason [`ProviderCapabilities::declares_vertex_input_support`]
+    /// is: a snapshot that declared instancing without declaring render would
+    /// otherwise keep sending the legacy capability payload, and the two bits
+    /// would be lost on the wire.
+    pub fn declares_instancing_support(&self) -> bool {
+        self.supports_render_instancing || self.max_render_instances != 0
     }
 
     /// Whether any present bit differs from its default.
@@ -5350,6 +5449,32 @@ impl ProviderCapabilities {
                         FieldValue::Unsigned(u64::from(self.max_vertex_buffers)),
                     ));
             }
+            // Instancing is the second pass-level bit this snapshot answers
+            // (`research/docs/23` §3.3, v31). A single-instance pass never
+            // reaches the check: `1` is the shape every earlier increment
+            // published, so a snapshot that does not declare instancing keeps
+            // admitting it without a declaration.
+            if pass.instance_count > 1 {
+                if !self.supports_render_instancing {
+                    return Err(
+                        capability_error("render_instancing_unsupported").with_field(
+                            "instances",
+                            FieldValue::Unsigned(u64::from(pass.instance_count)),
+                        ),
+                    );
+                }
+                if pass.instance_count > self.max_render_instances {
+                    return Err(capability_error("render_instance_limit")
+                        .with_field(
+                            "requested",
+                            FieldValue::Unsigned(u64::from(pass.instance_count)),
+                        )
+                        .with_field(
+                            "maximum",
+                            FieldValue::Unsigned(u64::from(self.max_render_instances)),
+                        ));
+                }
+            }
             if let Some(indices) = &pass.indices {
                 if !self.supported_index_formats.contains(&indices.format) {
                     return Err(capability_error("index_format_unsupported").with_field(
@@ -5386,6 +5511,15 @@ impl ProviderCapabilities {
                     return Err(capability_error("vertex_stride_limit")
                         .with_field("stride", FieldValue::Unsigned(layout.stride))
                         .with_field("maximum", FieldValue::Unsigned(self.max_buffer_range)));
+                }
+                // A per-instance stream is the layout half of the same bit: a
+                // snapshot that cannot run more than one instance would step
+                // this binding once and read the wrong record for every
+                // instance, so it is refused instead (`research/docs/23` §3.3,
+                // v31).
+                if layout.step == VertexStep::PerInstance && !self.supports_render_instancing {
+                    return Err(capability_error("vertex_step_unsupported")
+                        .with_field("step", FieldValue::Unsigned(u64::from(layout.step.code()))));
                 }
                 for attribute in &layout.attributes {
                     if !self.supported_vertex_formats.contains(&attribute.format) {
@@ -8909,6 +9043,7 @@ mod tests {
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         })
     }
@@ -9147,6 +9282,8 @@ mod tests {
             max_vertex_buffers: 0,
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
+            supports_render_instancing: false,
+            max_render_instances: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -12139,6 +12276,7 @@ mod tests {
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         }
     }
@@ -12458,6 +12596,7 @@ mod tests {
     fn quad_layout() -> VertexLayout {
         VertexLayout::Buffers(vec![VertexBufferLayout {
             stride: 8,
+            step: VertexStep::PerVertex,
             attributes: vec![VertexAttribute {
                 location: 0,
                 offset: 0,
@@ -12865,6 +13004,7 @@ mod tests {
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         })
     }
@@ -12993,7 +13133,7 @@ mod tests {
     /// fixture declares.
     fn vertex_input_resources() -> ResourceTableSnapshot {
         let mut pool = landing_resources();
-        for (allocation, size) in [(43_u64, 32_u64), (47, 12)] {
+        for (allocation, size) in [(43_u64, 32_u64), (47, 12), (51, 32)] {
             pool.insert_allocation(AllocationRecord {
                 allocation_id: AllocationId::new(allocation),
                 owner_epoch: DeviceEpoch::new(1),
@@ -13044,6 +13184,121 @@ mod tests {
             format: IndexFormat::Uint16,
         });
         value
+    }
+
+    /// The vertex-input fixture extended with the reviewed instanced pair
+    /// (`research/docs/23` §3.3, v31): the same position stream plus a
+    /// `float32x4` tint that advances once per instance, and a two-instance
+    /// draw.
+    fn instanced_trace() -> ComputeTrace {
+        let mut value = vertex_input_trace();
+        value.pipelines[0]
+            .render
+            .as_mut()
+            .expect("the fixture declares the render half")
+            .vertex_layout = VertexLayout::Buffers(vec![
+            VertexBufferLayout {
+                stride: 8,
+                step: VertexStep::PerVertex,
+                attributes: vec![VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            },
+            VertexBufferLayout {
+                stride: 16,
+                step: VertexStep::PerInstance,
+                attributes: vec![VertexAttribute {
+                    location: 1,
+                    offset: 0,
+                    format: VertexFormat::Float32x4,
+                }],
+            },
+        ]);
+        let pass = render_entry(&mut value);
+        pass.vertex_buffers = vec![stream_view(41, 0, 43, 32), stream_view(49, 1, 51, 32)];
+        pass.instance_count = 2;
+        value
+    }
+
+    /// The vertex-input snapshot extended with the two instancing bits.
+    fn instanced_capabilities() -> ProviderCapabilities {
+        let mut provider = vertex_input_capabilities();
+        provider.supports_render_instancing = true;
+        provider.max_render_instances = 4;
+        provider
+    }
+
+    #[test]
+    fn instancing_bits_gate_the_pass_and_the_per_instance_stream() {
+        let value = instanced_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(!capabilities().declares_render_support());
+        assert!(!vertex_input_capabilities().declares_instancing_support());
+        assert!(instanced_capabilities().declares_instancing_support());
+        // The two bits are part of the render question on purpose: a snapshot
+        // that declared them without declaring render would lose them on the
+        // wire, the failure `declares_render_support` documents.
+        let mut only_instancing = capabilities();
+        only_instancing.supports_render_instancing = true;
+        only_instancing.max_render_instances = 4;
+        assert!(only_instancing.declares_instancing_support());
+        assert!(only_instancing.declares_render_support());
+
+        instanced_capabilities()
+            .admit(&value, &vertex_input_resources())
+            .expect("a snapshot that declares the instancing bits admits the pair");
+
+        // The multi-instance draw is refused by name when the snapshot does not
+        // declare the bit, and by its declared ceiling when the draw is wider
+        // than the snapshot admits.
+        let mut no_instancing = vertex_input_capabilities();
+        no_instancing.max_render_instances = 0;
+        assert_eq!(
+            no_instancing
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_instancing_unsupported"
+        );
+        let mut narrow = instanced_capabilities();
+        narrow.max_render_instances = 1;
+        assert_eq!(
+            narrow
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_instance_limit"
+        );
+
+        // A per-instance stream is the layout half of the same bit, so a
+        // single-instance draw that binds one is refused too: the snapshot
+        // would step the binding as many times as it has instances.
+        let mut single = instanced_trace();
+        render_entry(&mut single).instance_count = 1;
+        single
+            .validate()
+            .expect("the fixture is structurally valid");
+        let mut no_steps = vertex_input_capabilities();
+        no_steps.supports_render_instancing = false;
+        no_steps.max_render_instances = 0;
+        assert_eq!(
+            no_steps
+                .admit(&single, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "vertex_step_unsupported"
+        );
+
+        // Zero instances is not a capability question: it is a pass that would
+        // leave the load op's bytes behind, so it stays a structural refusal.
+        let mut zero = instanced_trace();
+        render_entry(&mut zero).instance_count = 0;
+        assert_eq!(
+            zero.validate(),
+            Err(ContractError::ZeroLength("render instance count"))
+        );
     }
 
     #[test]

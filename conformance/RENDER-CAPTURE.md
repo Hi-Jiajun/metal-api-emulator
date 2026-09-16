@@ -888,3 +888,60 @@ Not yet achieved, and therefore still a condition rather than an observation:
   source review are compile evidence today, not execution evidence;
 * the Vulkan execution evidence for this step is Lavapipe only in the local
   gates; the RTX 5060 / dzn real-device capture of the v20 suite is still owed.
+
+## 13. The instancing milestone (v31)
+
+`research/docs/23` §3.3 schedules instancing as its own increment: a draw runs
+more than one instance, a vertex stream may advance once per *instance* instead
+of once per vertex, and the vertex stage may read the `instance_id` builtin.
+`conformance/shaders/instanced_quad_2x2.metal` is the third reviewed module and
+the one that makes both halves observable at once:
+
+| Entry | Stage | What it does |
+|---|---|---|
+| `render_instanced_quad_vertex` | vertex | reads `float2 position [[attribute(0)]]` from binding 0 (per vertex) and `float4 tint [[attribute(1)]]` from binding 1 (per instance), shifts its copy of the quad by half the viewport with `[[instance_id]]`, and forwards the tint |
+| `render_instanced_tint` | fragment | stores the forwarded tint |
+
+The fixture `instanced_pair_4x4` declares the four reviewed corners as the
+position stream, two `float32x4` tint records — `(1, 0, 0, 1)` and
+`(0, 1, 0, 1)` — as the per-instance stream, the reviewed six `uint16` indices
+and `instance_count: 2`, drawn into one 4x4 `rgba8_unorm` attachment cleared to
+`11223344`. Instance 0 covers the left half and instance 1 the right, so the
+expected bytes are `ff0000ff` twice then `00ff00ff` twice, on every row.
+
+That shape is what makes the increment falsifiable rather than merely observed:
+
+* a rail that ignores `instance_count` draws only the left half and leaves the
+  right half at the clear colour;
+* a rail that ignores `instance_id` draws the left half twice and leaves the
+  right half at the clear colour;
+* a rail that treats the tint stream as per-vertex reads the wrong records (or
+  past the view), so the green half never appears.
+
+The two schema fields this increment adds are:
+
+| Suite field | Core value | Rule |
+|---|---|---|
+| `vertex_layout.buffers[].step` | `VertexBufferLayout::step` | `"per_vertex"` (the default a pre-v31 fixture leaves implicit) or `"per_instance"`; the reviewed instanced layout is the only one that uses the latter |
+| `instance_count` | `RenderPassDescriptor::instance_count` | positive; absent means `1`, and the reviewed instanced case declares exactly `2` |
+
+Both rails execute the step function the contract carries: the Vulkan rail
+builds each binding's `VkVertexInputBindingDescription.inputRate` from it
+(`VK_VERTEX_INPUT_RATE_VERTEX` / `..._INSTANCE`) and passes the pass's instance
+count to `vkCmdDraw`/`vkCmdDrawIndexed`; the native rail sets
+`MTLVertexBufferLayoutDescriptor.stepFunction` (`.perVertex` / `.perInstance`,
+`stepRate = 1`) and draws with `drawPrimitives(...:instanceCount:)` /
+`drawIndexedPrimitives(...:instanceCount:)`. The wire carries the step through
+the stepped vertex-layout tag and the count through the pass's
+`RENDER_FEATURE_INSTANCING` bit, so a frame that instances nothing keeps its
+pre-v31 bytes exactly.
+
+The evidence boundary of this milestone:
+
+* the comparator's per-half expectation and the Swift oracle's matching rule are
+  what refuse a fixture that carries one tint twice or swaps the halves;
+* the object API has no instanced draw call yet, so the fixture's marker names
+  the three trace rails and the object captures must omit it;
+* the Apple evidence is the macOS job's `native-metal` capture of this suite,
+  and the Windows evidence is the RTX 5060 capture of the same suite on both
+  trace rails; a green job without either is compile evidence only.

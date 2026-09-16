@@ -1591,6 +1591,7 @@ mod tests {
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         }
     }
@@ -2151,6 +2152,7 @@ mod tests {
         RenderPipelineContract {
             vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
                 stride: 8,
+                step: metal_api_core::provider::VertexStep::PerVertex,
                 attributes: vec![VertexAttribute {
                     location: 0,
                     offset: 0,
@@ -2219,6 +2221,212 @@ mod tests {
         assert!(matches!(
             CommandCodec::decode_request(&patched),
             Err(CodecError::UnknownRenderFeature(features)) if features == 0x41
+        ));
+    }
+
+    /// The fixture's render contract extended with the reviewed instanced
+    /// pair: the same position stream plus a `float32x4` tint that advances
+    /// once per instance (`research/docs/23` §3.3, v31).
+    fn instanced_render_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_layout: VertexLayout::Buffers(vec![
+                VertexBufferLayout {
+                    stride: 8,
+                    step: metal_api_core::provider::VertexStep::PerVertex,
+                    attributes: vec![VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                VertexBufferLayout {
+                    stride: 16,
+                    step: metal_api_core::provider::VertexStep::PerInstance,
+                    attributes: vec![VertexAttribute {
+                        location: 1,
+                        offset: 0,
+                        format: VertexFormat::Float32x4,
+                    }],
+                },
+            ]),
+            ..render_contract()
+        }
+    }
+
+    /// A render trace whose pass binds the reviewed pair and draws two
+    /// instances.
+    fn instanced_trace() -> ComputeTrace {
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(instanced_render_contract());
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.vertices = 6;
+        pass.instance_count = 2;
+        pass.vertex_buffers = vec![
+            vertex_stream_view(),
+            BufferView {
+                view_id: ViewId::new(49),
+                metal_binding: 1,
+                allocation_id: AllocationId::new(51),
+                offset: 0,
+                length: 32,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0; 32]),
+            },
+        ];
+        pass.indices = Some(IndexBufferBinding {
+            view: index_stream_view(),
+            format: IndexFormat::Uint16,
+        });
+        trace
+    }
+
+    #[test]
+    fn instanced_frames_carry_the_instancing_feature_bit_and_round_trip() {
+        let request = CommandRequest::Submit {
+            trace: instanced_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The pass tag is the pair the encoder writes: `PASS_KIND_RENDER_EXT`
+        // followed by the feature byte. Scanning for the pair instead of the
+        // tag alone keeps a 0x10 inside a length field from being mistaken for
+        // the tag.
+        let extended = frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .filter(|(_, pair)| *pair == [0x10, 0x09])
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extended.len(),
+            1,
+            "the fixture carries exactly one instanced pass tag, got {extended:?}"
+        );
+        let extended_index = extended[0];
+        assert_eq!(
+            frame[extended_index + 1] & 0x09,
+            0x09,
+            "the instanced pass carries the vertex-input and instancing bits"
+        );
+        assert_eq!(
+            frame[extended_index + 1] & 0x02,
+            0x00,
+            "an offscreen pass carries no present bit"
+        );
+
+        // A single-instance pass keeps the pre-v31 bytes: the instancing bit is
+        // what makes the count travel, so a pass without it must not set one.
+        let mut single = instanced_trace();
+        let Some(TracePass::Render(pass)) = single.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.instance_count = 1;
+        let single_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: single,
+            resources: resources(),
+        })
+        .unwrap();
+        let extended = single_frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .find(|(_, pair)| *pair == [0x10, 0x01])
+            .map(|(index, _)| index)
+            .expect("the single-instance pass keeps the pre-v31 extended tag");
+        assert_eq!(
+            single_frame[extended + 1] & 0x08,
+            0x00,
+            "a single-instance pass carries no instancing bit"
+        );
+
+        // An unknown feature bit stays a decoder refusal.
+        let mut patched = frame.clone();
+        patched[extended_index + 1] |= 0x40;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x49
+        ));
+    }
+
+    #[test]
+    fn instancing_capability_bits_round_trip_and_extend_the_vertex_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.max_vertex_buffers = MAX_VERTEX_BUFFERS as u32;
+        capabilities.supported_vertex_formats = VertexFormat::ADMITTED.to_vec();
+        capabilities.supported_index_formats = IndexFormat::ADMITTED.to_vec();
+        assert!(!capabilities.declares_instancing_support());
+        let vertex_only = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&vertex_only).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_instancing = true;
+        capabilities.max_render_instances = 4;
+        assert!(capabilities.declares_instancing_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The instancing block is the extended payload's newest optional
+        // section: one presence tag, one bool and one `u32`, so a snapshot that
+        // declares the vertex-input bits alone keeps the shorter frame.
+        assert_eq!(frame.len(), vertex_only.len() + 6);
+
+        // The instancing block is positional: a snapshot that declares it
+        // *without* the vertex-input bits writes the presence tag directly
+        // after the heap/ICB half, and the decoder has to read it there rather
+        // than as a vertex-input block.
+        let mut only_instancing = fake_capabilities();
+        only_instancing.supports_render_passes = true;
+        only_instancing.max_color_attachments = 1;
+        only_instancing.max_attachment_dimension = [2, 2];
+        only_instancing.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        only_instancing.supports_render_instancing = true;
+        only_instancing.max_render_instances = 4;
+        let only_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: only_instancing.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: only_instancing,
+            }
+        );
+
+        // A decoder that predates the section refuses the tag rather than
+        // reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .iter()
+            .rposition(|byte| *byte == 0x02)
+            .expect("the instancing tail carries its presence tag");
+        patched[tag] = 0x03;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched),
+            Err(CodecError::UnknownCapabilityTail(0x03))
         ));
     }
 
@@ -3138,6 +3346,8 @@ mod tests {
                     max_vertex_buffers: 0,
                     supported_vertex_formats: Vec::new(),
                     supported_index_formats: Vec::new(),
+                    supports_render_instancing: false,
+                    max_render_instances: 0,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -3501,6 +3711,8 @@ mod tests {
             max_vertex_buffers: 0,
             supported_vertex_formats: Vec::new(),
             supported_index_formats: Vec::new(),
+            supports_render_instancing: false,
+            max_render_instances: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

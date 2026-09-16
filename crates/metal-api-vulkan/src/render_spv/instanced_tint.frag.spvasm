@@ -1,0 +1,32 @@
+; 本文件是 instanced_tint.frag.spv 的可读源（research/docs/23 §3.3，v31）。
+; 复现命令：
+;   spirv-as --target-env vulkan1.0 instanced_tint.frag.spvasm -o instanced_tint.frag.spv
+;   spirv-val --target-env vulkan1.0 instanced_tint.frag.spv
+; 入口名 instanced_tint_main（与 instanced_quad_main 成对，且与顶点入口不同名）。
+; 来源：instanced_quad.vert.spvasm 转发的 location 0 变量，直接 store 到
+; location 0。与 solid_unorm8 系列的固定颜色模块不同，这个模块的返回值来自顶点阶段，
+; 所以"实例 0 红 / 实例 1 绿"只能在 per-instance 步进真的生效时才出现。
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "instanced_tint_main" %tint_in %outColor
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "instanced_tint_main"
+               OpName %tint_in "tint_in"
+               OpName %outColor "outColor"
+               OpDecorate %tint_in Location 0
+               OpDecorate %outColor Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+    %tint_in = OpVariable %_ptr_Input_v4float Input
+   %outColor = OpVariable %_ptr_Output_v4float Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %tint = OpLoad %v4float %tint_in
+               OpStore %outColor %tint
+               OpReturn
+               OpFunctionEnd

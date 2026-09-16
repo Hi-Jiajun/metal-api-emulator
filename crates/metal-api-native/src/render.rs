@@ -53,7 +53,7 @@ use metal_api_core::provider::{
     ContractError, FieldValue, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor, LoadOp,
     PipelineId, PresentDescriptor, PresentMode, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout,
-    ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -145,6 +145,18 @@ pub(crate) const REVIEWED_TRIPLE_SOURCE: &str =
 /// Fragment entry of the reviewed three-location module.
 pub(crate) const TRIPLE_FRAGMENT_ENTRY: &str = "render_solid_rgba8_triple";
 
+/// The reviewed instanced module (`research/docs/23` §3.3, v31): a vertex stage
+/// that reads the caller-held quad positions, a per-instance tint and the
+/// `instance_id` builtin, plus a fragment stage that stores the forwarded tint.
+pub(crate) const REVIEWED_INSTANCED_SOURCE: &str =
+    include_str!("../../../conformance/shaders/instanced_quad_2x2.metal");
+
+/// Vertex entry of the reviewed instanced module.
+pub(crate) const INSTANCED_VERTEX_ENTRY: &str = "render_instanced_quad_vertex";
+
+/// Fragment entry of the reviewed instanced module.
+pub(crate) const INSTANCED_FRAGMENT_ENTRY: &str = "render_instanced_tint";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -172,9 +184,9 @@ pub(crate) struct ReviewedModule {
     pub(crate) binds_buffers: bool,
 }
 
-/// The three reviewed modules, one per (vertex-input shape, colour-format
-/// shape) pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 6] = [
+/// The reviewed modules, one per (vertex-input shape, colour-format shape)
+/// pair this rail executes.
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 7] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -217,6 +229,16 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 6] = [
         fragment_entry: TRIPLE_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
+    // The reviewed instanced fixture (`research/docs/23` §3.3, v31): the one
+    // module whose vertex stage reads `instance_id` and a per-instance stream,
+    // and whose fragment stage stores the tint that stage forwarded.
+    ReviewedModule {
+        source: REVIEWED_INSTANCED_SOURCE,
+        path: "conformance/shaders/instanced_quad_2x2.metal",
+        vertex_entry: INSTANCED_VERTEX_ENTRY,
+        fragment_entry: INSTANCED_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
 ];
 
 /// The reviewed module a pipeline's vertex-input shape and colour-format list
@@ -249,6 +271,18 @@ pub(crate) fn reviewed_module(
     match (layout, color_formats) {
         (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
             Some(&REVIEWED_MODULES[0])
+        }
+        // The instanced module is selected by the layout's own step function,
+        // not by the format list alone: a per-instance binding is the shape its
+        // vertex stage was written for, so it is matched before the plain
+        // single-output arm (`research/docs/23` §3.3, v31).
+        (VertexLayout::Buffers(buffers), [single])
+            if unorm8(single)
+                && buffers
+                    .iter()
+                    .any(|buffer| buffer.step == VertexStep::PerInstance) =>
+        {
+            Some(&REVIEWED_MODULES[6])
         }
         (VertexLayout::Buffers(_), [AttachmentFormat::R32Float]) => Some(&REVIEWED_MODULES[3]),
         (VertexLayout::Buffers(_), [single]) if unorm8(single) => Some(&REVIEWED_MODULES[1]),
@@ -341,6 +375,11 @@ pub(crate) const MAX_PRESENT_TARGETS: u32 = metal_api_core::provider::MAX_PRESEN
 /// [`MAX_PRESENT_TARGETS`].
 pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PRESENT_IMAGE_COUNT;
 
+/// The largest instance count the instancing increment executes
+/// (`research/docs/23` §3.3, v31). Same rule as the Vulkan rail's ceiling: the
+/// reviewed fixture draws two instances and the declared window is four.
+pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
+
 /// The render bits this provider declares as of the Step 7 flip.
 ///
 /// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
@@ -429,6 +468,40 @@ pub(crate) fn vertex_input_capability_bits() -> VertexInputCapabilityBits {
         max_vertex_buffers: MAX_VERTEX_BUFFERS,
         supported_vertex_formats: VertexFormat::ADMITTED.to_vec(),
         supported_index_formats: IndexFormat::ADMITTED.to_vec(),
+    }
+}
+
+/// The instancing bits the provider declares, in one value so the macOS
+/// capability snapshot and the host-side tests cannot drift
+/// (`research/docs/23` §3.3, v31).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InstancingCapabilityBits {
+    pub(crate) supports_render_instancing: bool,
+    pub(crate) max_render_instances: u32,
+}
+
+/// The instancing bits this provider declares as of the v31 flip.
+///
+/// Flip condition (`research/docs/23` §3.3): the reviewed `instanced_pair_4x4`
+/// case on the Apple rail, i.e. the macOS CI job's `native-metal` capture of
+/// the suite that names every rail. That run builds the reviewed MSL module,
+/// declares a `per_instance` stream through `MTLVertexDescriptor` (`
+/// stepFunction = .perInstance`, `stepRate = 1`), draws `instanceCount: 2` and
+/// reads back the red left half and the green right half the fixture pins. The
+/// ceiling follows the Vulkan rail's: the reviewed two instances rounded up to
+/// four, so a wider draw stays refused by core admission rather than silently
+/// narrowed.
+///
+/// Before this flip both bits were at their defaults, so core admission refused
+/// a multi-instance pass (or a per-instance layout) with
+/// `render_instancing_unsupported` / `vertex_step_unsupported` instead of
+/// executing it once; the host-side half this rail owns is
+/// [`plan_vertex_input`], which proves the per-instance footprint before a
+/// device object exists.
+pub(crate) fn instancing_capability_bits() -> InstancingCapabilityBits {
+    InstancingCapabilityBits {
+        supports_render_instancing: true,
+        max_render_instances: MAX_RENDER_INSTANCES,
     }
 }
 
@@ -646,6 +719,38 @@ pub(crate) const fn index_type(format: IndexFormat) -> RenderIndexType {
     }
 }
 
+/// The step function this rail hands its `MTLVertexBufferLayoutDescriptor`
+/// (`research/docs/23` §3.3, v31).
+///
+/// The sibling of [`RenderVertexFormat`]: a host-visible value so the
+/// `VertexStep` → `MTLVertexStepFunction` mapping (and the footprint proof that
+/// reads it) is testable without a device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenderVertexStep {
+    PerVertex,
+    PerInstance,
+}
+
+impl RenderVertexStep {
+    /// Stable spelling used by tests and refusals.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::PerVertex => "per_vertex",
+            Self::PerInstance => "per_instance",
+        }
+    }
+}
+
+/// Map an admitted step onto the function this rail builds. Total for the same
+/// reason [`vertex_format`] is: the contract's closed pair is exactly the two
+/// `MTLVertexStepFunction`s the rails execute.
+pub(crate) const fn vertex_step(step: VertexStep) -> RenderVertexStep {
+    match step {
+        VertexStep::PerVertex => RenderVertexStep::PerVertex,
+        VertexStep::PerInstance => RenderVertexStep::PerInstance,
+    }
+}
+
 /// One vertex attribute as the descriptor builder needs it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedVertexAttribute {
@@ -674,6 +779,10 @@ pub(crate) struct PlannedVertexStream<'a> {
     pub(crate) buffer_index: u32,
     /// Bytes between consecutive vertices.
     pub(crate) stride: u64,
+    /// How often the stream advances (`research/docs/23` §3.3, v31): once per
+    /// vertex or once per instance. The footprint proof below reads it to
+    /// decide which count the stream has to cover.
+    pub(crate) step: RenderVertexStep,
     /// Attributes this stream is read through.
     pub(crate) attributes: Vec<PlannedVertexAttribute>,
     /// The view's own bytes.
@@ -746,6 +855,7 @@ fn plan_vertex_input<'a>(
             buffer_index: u32::try_from(buffer_index)
                 .map_err(|_| capability_refusal("vertex_buffer_limit"))?,
             stride: layout.stride,
+            step: vertex_step(layout.step),
             attributes: layout
                 .attributes
                 .iter()
@@ -759,6 +869,30 @@ fn plan_vertex_input<'a>(
             offset: view.offset,
         });
     }
+    // A per-instance stream's record count is the draw's instance count, and a
+    // per-vertex stream's is the vertex span the draw reads; the two proofs
+    // below therefore ask each stream for the right count
+    // (`research/docs/23` §3.3, v31). The instance count comes from the pass,
+    // which `plan` has already validated as at least one.
+    let instance_count = u64::from(pass.instance_count);
+    for (buffer_index, stream) in streams.iter().enumerate() {
+        if stream.step != RenderVertexStep::PerInstance {
+            continue;
+        }
+        // Saturating for the same reason the per-vertex proof is: the product
+        // only has to decide whether the stream covers the count.
+        let required = instance_count.saturating_mul(stream.stride);
+        if u64::try_from(stream.bytes.len()).unwrap_or(u64::MAX) < required {
+            return Err(vertex_footprint_refusal(
+                buffer_index,
+                stream.stride,
+                required,
+                stream.bytes.len(),
+            )
+            .with_field("step", FieldValue::Text(stream.step.name().to_owned()))
+            .with_detail("a per-instance stream has to cover one record per instance"));
+        }
+    }
     let indices = match &pass.indices {
         None => None,
         Some(binding) => Some(plan_index_stream(binding, pass.vertices)?),
@@ -769,6 +903,12 @@ fn plan_vertex_input<'a>(
         // reached past the stream, because that is what the trace has to change.
         Some(indices) => {
             for (buffer_index, stream) in streams.iter().enumerate() {
+                // A per-instance stream is proved against the instance count
+                // above, so the vertex span does not apply to it
+                // (`research/docs/23` §3.3, v31).
+                if stream.step == RenderVertexStep::PerInstance {
+                    continue;
+                }
                 // `stride == 0` cannot reach here (`plan` re-runs the layout
                 // validator), so `checked_div` is only the safe spelling of the
                 // quotient: a zero stride would be refused upstairs rather than
@@ -808,6 +948,11 @@ fn plan_vertex_input<'a>(
         // stream has to cover the pass's own count.
         None => {
             for (buffer_index, stream) in streams.iter().enumerate() {
+                // The per-vertex arm of the same split: a per-instance stream
+                // covers one record per instance instead of one per vertex.
+                if stream.step == RenderVertexStep::PerInstance {
+                    continue;
+                }
                 // Saturating, because the proof only has to decide whether the
                 // stream covers the count: an unrepresentable product is by
                 // definition larger than any buffer this provider admits.
@@ -1007,6 +1152,10 @@ pub(crate) struct RenderPlan<'a> {
     /// (`research/docs/23` §3.3, v29).
     pub(crate) scissor: Option<[u32; 4]>,
     pub(crate) vertices: u32,
+    /// Instances the draw runs (`research/docs/23` §3.3, v31): Metal's
+    /// `drawPrimitives(vertexCount:instanceCount:)` second count. `1` for every
+    /// pre-v31 pass.
+    pub(crate) instance_count: u32,
     /// One entry per bound vertex stream, in binding order, with the bytes and
     /// footprints [`plan_vertex_input`] proved.
     pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
@@ -1234,6 +1383,7 @@ pub(crate) fn plan<'a>(
         viewport: request.pass.viewport,
         scissor: request.pass.scissor,
         vertices: request.pass.vertices,
+        instance_count: request.pass.instance_count,
         vertex_streams,
         indices,
         texel_bytes,
@@ -1898,17 +2048,27 @@ fn encode_into_and_readback(
             Some(indices) => {
                 let offset = NSUInteger::try_from(indices.offset).unwrap_or(NSUInteger::MAX);
                 let buffer = stream_buffer(device, indices.offset, indices.bytes)?;
-                encoder.draw_indexed_primitives(
+                encoder.draw_indexed_primitives_instanced(
                     MTLPrimitiveType::Triangle,
                     u64::from(indices.index_count),
                     metal_index_type(indices.format),
                     buffer.as_ref(),
                     offset,
+                    u64::from(planned.instance_count),
                 );
                 stream_buffers.push(buffer);
             }
             None => {
-                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, u64::from(planned.vertices))
+                // The instanced draw call (`research/docs/23` §3.3, v31): the
+                // same entry point with the pass's second count, which is `1`
+                // for every pre-v31 pass and therefore byte-identical to the
+                // single-instance call it replaces.
+                encoder.draw_primitives_instanced(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    u64::from(planned.vertices),
+                    u64::from(planned.instance_count),
+                )
             }
         },
         Some(replay) => {
@@ -2108,10 +2268,14 @@ fn render_pipeline_state(
                     resource_refusal("metal_render_vertex_layout_descriptor_unavailable")
                 })?;
             layout.set_stride(NSUInteger::try_from(stream.stride).unwrap_or(NSUInteger::MAX));
-            // One stream advance per vertex: per-instance step rates are not
-            // part of this increment (`VertexBufferLayout` carries no step
-            // rate), so the descriptor states the only rate it can mean.
-            layout.set_step_function(MTLVertexStepFunction::PerVertex);
+            // The binding's own step function (`research/docs/23` §3.3, v31).
+            // A per-instance stream advances once per instance, which is
+            // Metal's default `stepRate` of one; a per-vertex stream keeps the
+            // pre-v31 behavior exactly.
+            layout.set_step_function(metal_vertex_step(stream.step));
+            if stream.step == RenderVertexStep::PerInstance {
+                layout.set_step_rate(1);
+            }
             for attribute in &stream.attributes {
                 let target = vertex_descriptor
                     .attributes()
@@ -2191,6 +2355,16 @@ const fn metal_vertex_format(format: RenderVertexFormat) -> MTLVertexFormat {
     }
 }
 
+/// The `MTLVertexStepFunction` one planned step names
+/// (`research/docs/23` §3.3, v31).
+#[cfg(target_os = "macos")]
+const fn metal_vertex_step(step: RenderVertexStep) -> MTLVertexStepFunction {
+    match step {
+        RenderVertexStep::PerVertex => MTLVertexStepFunction::PerVertex,
+        RenderVertexStep::PerInstance => MTLVertexStepFunction::PerInstance,
+    }
+}
+
 /// The `MTLIndexType` one planned index width names.
 #[cfg(target_os = "macos")]
 const fn metal_index_type(format: RenderIndexType) -> MTLIndexType {
@@ -2241,6 +2415,7 @@ mod tests {
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         }
     }
@@ -2894,6 +3069,8 @@ mod tests {
             max_vertex_buffers: vertex.max_vertex_buffers,
             supported_vertex_formats: vertex.supported_vertex_formats.clone(),
             supported_index_formats: vertex.supported_index_formats.clone(),
+            supports_render_instancing: false,
+            max_render_instances: 0,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -2994,6 +3171,7 @@ mod tests {
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
                 stride: 8,
+                step: VertexStep::PerVertex,
                 attributes: vec![VertexAttribute {
                     location: 0,
                     offset: 0,
@@ -3025,6 +3203,7 @@ mod tests {
                 view: quad_index_view(),
                 format: IndexFormat::Uint16,
             }),
+            instance_count: 1,
             present: None,
         }
     }
@@ -3203,6 +3382,7 @@ mod tests {
             color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
                 stride: 8,
+                step: VertexStep::PerVertex,
                 attributes: vec![VertexAttribute {
                     location: 0,
                     offset: 0,

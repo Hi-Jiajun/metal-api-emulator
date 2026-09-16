@@ -660,6 +660,11 @@ struct RenderDraw {
     /// The index buffer this draw selects through, or `None` for a non-indexed
     /// draw.
     indices: Option<RenderIndex>,
+    /// Instances the draw runs (`research/docs/23` §3.3, v31). Every draw the
+    /// object API records today is the single-instance shape, so this stays `1`
+    /// until the encoder gains the instanced draw call; the field exists here
+    /// because the pass it lands in carries it.
+    instance_count: u32,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -704,6 +709,7 @@ impl RenderDraw {
             vertices: FULL_SCREEN_TRIANGLE_VERTICES,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
         }
     }
 }
@@ -795,6 +801,7 @@ impl RenderTarget {
             vertices: self.draw.vertices,
             vertex_buffers,
             indices,
+            instance_count: self.draw.instance_count,
             present,
         };
         descriptor.validate()?;
@@ -2434,6 +2441,7 @@ impl RenderCommandEncoder {
             vertices: vertex_count,
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
+            instance_count: 1,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2521,6 +2529,7 @@ impl RenderCommandEncoder {
                 view: index_view.clone(),
                 format: *index_format,
             }),
+            instance_count: 1,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2695,14 +2704,27 @@ impl RenderCommandEncoder {
             // reads it — the payload — because the contract's vertex_id shape
             // fixes the count at three, and carrying the payload's count here
             // would refuse an ICB the rail executes today.
-            IndirectCommandDescriptor::Draw { .. } => RenderDraw::vertex_id(),
+            IndirectCommandDescriptor::Draw { instance_count, .. } => {
+                let mut draw = RenderDraw::vertex_id();
+                // The replay's counts live in the ICB payload, which is what
+                // the rails read; mirroring the instance count here keeps the
+                // pass's own shape (and therefore admission's instancing bits)
+                // describing the draw the rail will actually replay
+                // (`research/docs/23` §3.3, v31).
+                draw.instance_count = *instance_count;
+                draw
+            }
             // The reviewed indexed replay: the descriptor's `vertices` is the
             // ICB's index count, and the rail supplies the `[0, 1, 2]` index
             // buffer the replayed draw selects through.
-            IndirectCommandDescriptor::DrawIndexed { index_count, .. } => RenderDraw {
+            IndirectCommandDescriptor::DrawIndexed {
+                index_count,
+                instance_count,
+            } => RenderDraw {
                 vertices: *index_count,
                 vertex_buffers: Vec::new(),
                 indices: None,
+                instance_count: *instance_count,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {
