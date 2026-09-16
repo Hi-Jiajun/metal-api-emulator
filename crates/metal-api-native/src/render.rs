@@ -4737,6 +4737,29 @@ mod tests {
         }
     }
 
+    /// A present action beside a four-sample raster is admitted from v62 on:
+    /// the encoder creates the n-sample surface and resolves it into the
+    /// provider-owned present target with `storeAction = .multisampleResolve`,
+    /// so the plan carries the raster and the single attachment unchanged
+    /// (`research/docs/24` §3.5, v62).
+    #[test]
+    fn plan_admits_a_multisampled_present_pass_over_its_resolve_landing() {
+        let mut pass = milestone_present_pass();
+        // The reviewed multisample load shape opens the attachment from a
+        // clear; the sentinel the present target carries is overwritten by the
+        // resolve, exactly as the v62 fixture states.
+        pass.color_attachments[0].load = LoadOp::Clear(sentinel());
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        let pipeline = milestone_pipeline();
+        let planned = plan(&milestone_request(&pass, &pipeline, None), 0, 0)
+            .expect("the four-sample present pass plans over its resolve landing");
+        assert_eq!(planned.multisample, Some(SampleCount::Four));
+        assert_eq!(planned.attachments.len(), 1);
+        assert_eq!(planned.attachments[0].store, RenderStoreAction::Store);
+    }
+
     #[test]
     fn plan_refuses_a_draw_shape_other_than_the_full_screen_triangle() {
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));

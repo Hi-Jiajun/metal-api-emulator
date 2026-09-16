@@ -4382,11 +4382,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        if case.present.is_some() || case.icb.is_some() {
-            return Err(format!(
-                "{where_}: a multisample case carries neither a present action nor an ICB"
-            )
-            .into());
+        // A present action beside the raster is admitted from v62 on: the
+        // pass resolves into the attachment view and the present hands that
+        // single-sample landing on, so the present section's own rules apply
+        // unchanged. An indirect replay beside the raster is still the later
+        // increment that reviews the two together (`research/docs/25` §5.2).
+        if case.icb.is_some() {
+            return Err(format!("{where_}: a multisample case carries no ICB").into());
         }
         if case.wildcard_texels.is_some() {
             return Err(

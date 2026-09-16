@@ -361,12 +361,15 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// (`research/docs/23` §3.3, v40), or `None` for "write the fragment
     /// output".
     pub blend: Option<RenderPassBlend>,
-    /// The pass-wide multisample raster (`research/docs/23` §3.3, v51), or
+    /// The pass-wide multisample raster (`research/docs/23` §3.3, v51/v61), or
     /// `None` for the single-sample raster every pre-v51 pass ran. When
-    /// present, every colour attachment is opened as a four-sample surface and
-    /// resolved into the attachment's own single-sample image before the
-    /// readback copies it out, so the trace observes the resolve's bytes and
-    /// not the multisampled surface's.
+    /// present, every colour attachment is opened as a surface of the raster's
+    /// own sample count and resolved into the attachment's own single-sample
+    /// image before the readback copies it out, so the trace observes the
+    /// resolve's bytes and not the multisampled surface's. A present pass
+    /// (`research/docs/24` §3.5, v62) resolves into the provider-owned present
+    /// target instead, which is the same single-sample landing the present
+    /// hands on.
     pub multisample: Option<MultisampleState>,
     /// The depth resolve a stored multisampled depth surface states
     /// (`research/docs/23` §3.3, v57), or `None` for a pass that resolves
@@ -911,12 +914,14 @@ fn prepare_render_request<'a>(
                     .with_field("attachment", FieldValue::Unsigned(index as u64)));
             }
         }
-        if pass.present.is_some() {
-            return Err(capability_refusal("render_multisample_present_unsupported").with_detail(
-                "the first multisample increment executes offscreen colour passes; the resolved \
-                 surface's presentation is a later increment",
-            ));
-        }
+        // The present action beside the raster (`research/docs/24` §3.5, v62)
+        // is executed by `execute_present_render`: the pass renders into a
+        // rail-owned n-sample surface and resolves into the provider-owned
+        // present target, whose single-sample texels are what the present
+        // hands on. The contract's own rule holds the present source to one
+        // of the pass's colour attachment views — the resolve landing — and
+        // the present rail's single-attachment gate below keeps that view
+        // unique, so no second rail-side refusal is needed here.
         // The depth surface beside the raster is admitted from v53 on
         // (`research/docs/23` §3.3, v53) and the stencil surface from v55, both
         // created with the pass's own sample count. Keeping either surface's
@@ -2745,6 +2750,45 @@ pub(crate) fn execute_present_render(
     let queue_index = select_graphics_queue(context)?;
     let fragment_spirv = solid_fragment_spirv(&[attachment.format])?;
     let vk_format = attachment_vk_format(attachment.format)?;
+    // The multisample raster (`research/docs/23` §3.3, v51/v61) is executed
+    // at the pass's own sample count. A present pass's n-sample surface is a
+    // per-format question at that count, asked before the first image exists —
+    // the same probe the offscreen rail runs.
+    let samples = match request.multisample.map(|state| state.sample_count) {
+        Some(SampleCount::Two) => vk::SampleCountFlags::TYPE_2,
+        Some(SampleCount::Four) => vk::SampleCountFlags::TYPE_4,
+        Some(SampleCount::Eight) => vk::SampleCountFlags::TYPE_8,
+        Some(SampleCount::One) => {
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::SingleSampleMultisampleState.to_string(),
+            ))
+        }
+        None => vk::SampleCountFlags::TYPE_1,
+    };
+    if samples != vk::SampleCountFlags::TYPE_1
+        && !format_supports_multisample_color_attachment(
+            context,
+            vk_format,
+            vk::ImageTiling::OPTIMAL,
+            samples,
+        )
+    {
+        return Err(attachment_format_refusal()
+            .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+            .with_field(
+                "tiling",
+                FieldValue::Text(tiling_name(vk::ImageTiling::OPTIMAL).to_owned()),
+            )
+            .with_field(
+                "missing_feature",
+                FieldValue::Text(format!("color_attachment_samples_{}", samples.as_raw())),
+            )
+            .with_detail(
+                "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                 combination this raster states for the COLOR_ATTACHMENT usage of \
+                 this format",
+            ));
+    }
     let vertex_words = spirv_words(request.vertex.spirv)
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
     let fragment_words = spirv_words(fragment_spirv)
@@ -2762,7 +2806,7 @@ pub(crate) fn execute_present_render(
     let mut layout = target.begin_present();
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
-    objects.attach_present_target(target, *layout);
+    objects.attach_present_target(target, *layout, samples, vk_format, width, height)?;
     objects.create_render_pass(&[vk_format], None, None, None, None)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
@@ -2850,12 +2894,6 @@ struct OffscreenObjects<'a> {
     /// (`research/docs/23` §3.3, v47). `None` for every pre-v47 pass, which is
     /// why the render pass, framebuffer and pipeline below all branch on it.
     stencil: Option<StencilObjects>,
-    /// Whether this scope created every `attachments` image/memory/view and
-    /// must destroy them on Drop. A present pass borrows the provider-owned
-    /// [`PresentTargetImage`] instead, so its per-pass scope must not destroy
-    /// the target when it finishes (`docs/24` §5.2: the target survives the
-    /// submission).
-    owns_attachments: bool,
     /// Whether this pass hands its attachment on as a present target. When set,
     /// the render pass ends in `COLOR_ATTACHMENT_OPTIMAL` and `record` inserts
     /// the explicit present layout transition before the copy-out
@@ -3031,6 +3069,18 @@ struct AttachmentObjects {
     /// (`docs/23` §3.6, v19).
     store_op: vk::AttachmentStoreOp,
     initial_layout: vk::ImageLayout,
+    /// Whether this pass scope created the attachment's own image, memory and
+    /// view and has to destroy them on Drop. A single-sample present pass
+    /// borrows the provider-owned [`PresentTargetImage`] for this half, so it
+    /// does not own them; a multisampled present pass creates the n-sample
+    /// surface itself and owns it (`research/docs/24` §5.2, v62).
+    owns_image: bool,
+    /// Whether this pass scope created the resolve target beside the
+    /// attachment and has to destroy it on Drop. A rail-owned resolve target
+    /// is the pass's own; a present pass's resolve target is the
+    /// provider-owned present image, which survives the submission
+    /// (`research/docs/24` §5.2, v62).
+    owns_resolve: bool,
     /// The host-visible staging buffer holding this attachment's previous bytes
     /// for a `LoadOp::Load` pass. Null unless the attachment loads.
     previous_buffer: vk::Buffer,
@@ -3047,6 +3097,13 @@ struct ResolveObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// The layout the image is actually in when the render pass opens it.
+    /// A rail-owned resolve target is freshly created and opens from
+    /// `UNDEFINED`; a present pass's resolve target is the provider-owned
+    /// [`PresentTargetImage`], which a sentinel preset or an earlier present
+    /// has already moved, so its description has to restate that layout
+    /// (`research/docs/24` §3.3 rule 1, v62).
+    initial_layout: vk::ImageLayout,
 }
 
 /// One readback destination: the `TRANSFER_DST` buffer, its host-visible
@@ -3063,7 +3120,6 @@ impl<'a> OffscreenObjects<'a> {
             attachments: Vec::new(),
             depth: None,
             stencil: None,
-            owns_attachments: true,
             present: false,
             render_pass: vk::RenderPass::null(),
             framebuffer: vk::Framebuffer::null(),
@@ -3094,34 +3150,111 @@ impl<'a> OffscreenObjects<'a> {
     /// borrowed for the pass's lifetime; its memory stays owned by the provider
     /// (`docs/24` §5.2).
     ///
+    /// A single-sample raster renders straight into the target. A multisampled
+    /// raster (`research/docs/24` §3.5, v62) creates its own n-sample colour
+    /// surface beside the target and resolves into the target, so the
+    /// single-sample texels the present hands on are the resolve's own
+    /// landing.
+    ///
     /// `initial_layout` is passed in rather than read from the target: the
     /// caller holds the target's present round-trip guard, and the guard's
-    /// value *is* the layout this submission must declare.
+    /// value *is* the layout this submission must declare — the attachment's
+    /// own for the single-sample shape, the resolve attachment's for the
+    /// multisampled one.
     fn attach_present_target(
         &mut self,
         target: &PresentTargetImage,
         initial_layout: vk::ImageLayout,
-    ) {
+        samples: vk::SampleCountFlags,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ProviderError> {
+        if samples == vk::SampleCountFlags::TYPE_1 {
+            self.attachments.push(AttachmentObjects {
+                image: target.image(),
+                memory: vk::DeviceMemory::null(),
+                view: target.view(),
+                samples: vk::SampleCountFlags::TYPE_1,
+                resolve: None,
+                load_op: vk::AttachmentLoadOp::CLEAR,
+                // A present target is the observable landing of the pass, so
+                // its store is always `STORE`; `execute_present_render`
+                // refuses a `StoreOp::DontCare` present attachment before
+                // this runs.
+                store_op: vk::AttachmentStoreOp::STORE,
+                initial_layout,
+                // The target itself is the provider's: the pass scope destroys
+                // none of its image, memory or view (`docs/24` §5.2).
+                owns_image: false,
+                owns_resolve: false,
+                previous_buffer: vk::Buffer::null(),
+                previous_memory: vk::DeviceMemory::null(),
+            });
+            self.present = true;
+            return Ok(());
+        }
+        // The multisampled present shape: a rail-owned n-sample surface the
+        // fragments land in, resolved into the provider-owned target. The
+        // n-sample surface opens from a clear — the reviewed multisample load
+        // shape — and is consumed by the resolve, so it carries neither
+        // transfer usage nor a readback of its own.
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, _) = crate::allocate_image_backing(
+            self.context,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "present attachment",
+        )
+        .map_err(|error| execution_refusal("create present attachment image", &error.detail))?;
+        let view =
+            crate::create_color_image_view(self.context, image, format, "present attachment")
+                .map_err(|error| {
+                    execution_refusal("create present attachment view", &error.detail)
+                })?;
         self.attachments.push(AttachmentObjects {
-            image: target.image(),
-            memory: vk::DeviceMemory::null(),
-            view: target.view(),
-            // A present target is the provider's own single-sample image; the
-            // multisample raster and the present action are mutually exclusive
-            // in this increment (`research/docs/23` §3.3, v51).
-            samples: vk::SampleCountFlags::TYPE_1,
-            resolve: None,
+            image,
+            memory,
+            view,
+            samples,
+            // The resolve target is the present image itself: the pass scope
+            // borrows it and never destroys it (`docs/24` §5.2). The resolve
+            // writes every texel, so its load operation is `DONT_CARE`; its
+            // initial layout is the target's own current layout, not
+            // `UNDEFINED`, because the sentinel preset or an earlier present
+            // has already moved the image.
+            resolve: Some(ResolveObjects {
+                image: target.image(),
+                memory: vk::DeviceMemory::null(),
+                view: target.view(),
+                initial_layout,
+            }),
             load_op: vk::AttachmentLoadOp::CLEAR,
-            // A present target is the observable landing of the pass, so its
-            // store is always `STORE`; `execute_present_render` refuses a
-            // `StoreOp::DontCare` present attachment before this runs.
             store_op: vk::AttachmentStoreOp::STORE,
-            initial_layout,
+            // The n-sample surface opens from a clear, so nothing defines its
+            // bytes before the pass.
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            owns_image: true,
+            owns_resolve: false,
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
         });
-        self.owns_attachments = false;
         self.present = true;
+        Ok(())
     }
 
     /// The 2D single-sample optimal-tiling colour attachment.
@@ -3607,6 +3740,10 @@ impl<'a> OffscreenObjects<'a> {
                 image: resolve_image,
                 memory: resolve_memory,
                 view: resolve_view,
+                // A rail-owned resolve target is created for this pass, so
+                // nothing has defined its bytes and the render pass opens it
+                // from `UNDEFINED` (`research/docs/23` §3.3, v51).
+                initial_layout: vk::ImageLayout::UNDEFINED,
             })
         };
         self.attachments.push(AttachmentObjects {
@@ -3634,6 +3771,11 @@ impl<'a> OffscreenObjects<'a> {
             } else {
                 vk::ImageLayout::UNDEFINED
             },
+            // An offscreen attachment and its resolve target are both created
+            // by this pass scope and destroyed with it
+            // (`research/docs/23` §3.3, v51).
+            owns_image: true,
+            owns_resolve: true,
             previous_buffer: vk::Buffer::null(),
             previous_memory: vk::DeviceMemory::null(),
         });
@@ -3714,7 +3856,12 @@ impl<'a> OffscreenObjects<'a> {
                         // never read. Its store action is the pass's own, and a
                         // storing resolve ends in `TRANSFER_SRC_OPTIMAL` for the
                         // copy-out exactly as a single-sample stored attachment
-                        // does (`research/docs/23` §3.3, v51).
+                        // does (`research/docs/23` §3.3, v51). A present
+                        // pass's resolve target is the provider-owned present
+                        // image, whose sentinel preset or earlier present has
+                        // already chosen a layout, so the description restates
+                        // that layout instead of opening from `UNDEFINED`
+                        // (`research/docs/24` §3.3 rule 1, v62).
                         let final_layout = if attachment.store_op == vk::AttachmentStoreOp::STORE
                             && !self.present
                         {
@@ -3729,7 +3876,14 @@ impl<'a> OffscreenObjects<'a> {
                             .store_op(attachment.store_op)
                             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                            .initial_layout(vk::ImageLayout::UNDEFINED)
+                            .initial_layout(
+                                attachment
+                                    .resolve
+                                    .as_ref()
+                                    .map_or(vk::ImageLayout::UNDEFINED, |resolve| {
+                                        resolve.initial_layout
+                                    }),
+                            )
                             .final_layout(final_layout)
                     }),
             )
@@ -5235,8 +5389,15 @@ impl<'a> OffscreenObjects<'a> {
             // as the render so the present cannot run before its writer
             // (`docs/24` §3.3 rule 1). The equivalent terminal state is
             // `TRANSFER_SRC_OPTIMAL`, i.e. "readable by the host after `wait`"
-            // (`docs/24` §3.6), not a real `VkQueuePresentKHR`.
-            let barrier = present_transition_barrier(self.attachments[0].image);
+            // (`docs/24` §3.6), not a real `VkQueuePresentKHR`. A multisampled
+            // pass presents its resolve target — the provider-owned present
+            // image — so the transition runs on that image rather than the
+            // n-sample surface the subpass consumed (`docs/24` §3.5, v62).
+            let present_image = self.attachments[0]
+                .resolve
+                .as_ref()
+                .map_or(self.attachments[0].image, |resolve| resolve.image);
+            let barrier = present_transition_barrier(present_image);
             unsafe {
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
@@ -5524,12 +5685,14 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     self.context.device.free_memory(stencil.memory, None);
                 }
             }
-            if self.owns_attachments {
-                for attachment in &self.attachments {
-                    // The resolve target of a multisampled attachment is owned
-                    // by the same pass scope (`research/docs/23` §3.3, v51), so
-                    // it is destroyed beside the multisampled image it was
-                    // created with.
+            for attachment in &self.attachments {
+                // The resolve target of a rail-owned multisampled attachment
+                // is owned by the same pass scope (`research/docs/23` §3.3,
+                // v51), so it is destroyed beside the multisampled image it
+                // was created with. A present pass's resolve target is the
+                // provider-owned present image, which the scope borrows and
+                // must not destroy (`docs/24` §5.2, v62).
+                if attachment.owns_resolve {
                     if let Some(resolve) = &attachment.resolve {
                         if resolve.view != vk::ImageView::null() {
                             self.context.device.destroy_image_view(resolve.view, None);
@@ -5541,6 +5704,8 @@ impl<'a> Drop for OffscreenObjects<'a> {
                             self.context.device.free_memory(resolve.memory, None);
                         }
                     }
+                }
+                if attachment.owns_image {
                     if attachment.view != vk::ImageView::null() {
                         self.context
                             .device
@@ -5810,9 +5975,10 @@ fn driver_refusal(
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AllocationId, DepthFormat, DepthLoadOp, PipelineId, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity,
-        StencilFormat, StencilLoadOp, VertexLayout, ViewId,
+        AcquirePolicy, AllocationId, DepthFormat, DepthLoadOp, InitialState, PipelineId,
+        PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
+        RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StencilFormat,
+        StencilLoadOp, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -6771,6 +6937,43 @@ mod tests {
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
         assert_eq!(refused.slug, "render_multisample_depth_store_unsupported");
+    }
+
+    /// The present action beside the raster is admitted from v62 on: the
+    /// request carries both the raster and the present tail, and the contract's
+    /// own rule holds the present source to the attachment view the resolve
+    /// lands in (`research/docs/24` §3.5, v62).
+    #[test]
+    fn prepare_render_request_admits_a_present_action_beside_the_multisample_raster() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(31),
+                view_id: ViewId::new(21),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: ViewId::new(21),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the fixture describes the reviewed single-attachment shape");
+        let request = prepare_render_request(&stages, &pass, &[None], 0, 0)
+            .expect("a present action beside the raster is well formed");
+        assert_eq!(
+            request.multisample.map(|state| state.sample_count),
+            Some(SampleCount::Four)
+        );
     }
 
     /// A stored multisampled stencil surface whose resolve the device mask

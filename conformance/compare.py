@@ -1745,12 +1745,16 @@ def _render_plan(plan, suite):
                 # v61 increment reviews: a partial coverage claim is the v51
                 # edge fixture's resolve rule, and an absent claim is the v61
                 # full-coverage fixtures' uniform rule — every texel is the
-                # fragment output. The general gate above already held a
-                # present claim to `"partial"`.
+                # fragment output. A present action beside the raster is
+                # admitted from v62 on: it hands on the resolve landing, which
+                # the fixture's attachment view already is, so the present
+                # section's own rules apply unchanged.
                 pass
-            _require("present" not in case and "icb" not in case,
-                     f"{where}: a multisample case carries neither a present action nor "
-                     "an ICB")
+            # The reviewed multisample shapes still carry no ICB: an indirect
+            # replay beside a four-sample resolve is the increment that
+            # reviews the two together (`research/docs/25` §5.2).
+            _require("icb" not in case,
+                     f"{where}: a multisample case carries no ICB")
             _require(wildcard_texels is None,
                      f"{where}: the multisample raster claims every texel it resolves")
             # The trace rails' footprint proof is the only gate that would
