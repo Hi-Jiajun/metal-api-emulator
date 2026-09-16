@@ -1456,6 +1456,31 @@ def _render_plan(plan, suite):
             _require(len(scissor) == 4, f"{where}: a scissor is four numbers")
             scissor = [_integer(value, f"{where}.scissor[{index}]")
                        for index, value in enumerate(scissor)]
+        # The zero-colour shape (`research/docs/23` §3.3, v46/v50) has no
+        # colour attachment to state the pass's render area, so the raster the
+        # viewport and the scissor are measured against is the depth surface the
+        # case stores — or the stencil surface, once a stencil-only shape is
+        # reviewed (`§3.3`, v47). The viewport has to cover that raster's extent
+        # and the scissor, when the case declares one, has to be a non-empty
+        # rectangle inside it: the two rules the colour side states once per
+        # attachment, and the two the Swift oracle's own zero-colour branch
+        # states, so a suite `NativeOracle.swift` would refuse cannot pass here
+        # either.
+        if no_colour:
+            raster = next(name for name in ("depth", "stencil") if name in case)
+            section = case[raster]
+            _require(isinstance(section, dict), f"{where}.{raster}: expected an object")
+            width = _integer(section.get("width"), f"{where}.{raster}.width", 1)
+            height = _integer(section.get("height"), f"{where}.{raster}.height", 1)
+            viewport = _list(case["viewport"], f"{where}.viewport")
+            _require(viewport == [0, 0, width, height],
+                     f"{where}: the viewport must cover the {raster} attachment")
+            if scissor is not None:
+                x, y, scissor_width, scissor_height = scissor
+                _require(scissor_width > 0 and scissor_height > 0
+                         and x + scissor_width <= width and y + scissor_height <= height,
+                         f"{where}: a scissor has to be a non-empty rectangle inside "
+                         f"the {raster} attachment")
         # The wildcard channel (`research/docs/23` §3.3, v33): a case may name
         # the texels it does not claim, and only a `dontcare` load has bytes
         # that may legitimately be unclaimed. The list has to leave at least one
