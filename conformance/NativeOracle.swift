@@ -234,9 +234,9 @@ private struct MultisampleDefinition: Decodable {
 /// The pass-level filter the two APIs spell differently: the case's own
 /// spelling is the closed family's wire name (`"sample0"`/`"min"`/`"max"`),
 /// and the rails map it onto their own constants. The reviewed fixture states
-/// `"sample0"`, the filter the native rail declares; the Min probe states
-/// `"min"` with an expectation the macOS CI still has to confirm
-/// (`research/docs/23` §3.3, v57c).
+/// `"sample0"`, the filter the native rail declares; the device-gated pair
+/// states `"min"`/`"max"` beside a gate of the same name
+/// (`research/docs/23` §3.3, v57d).
 private struct DepthResolveDefinition: Decodable {
     let filter: String
 }
@@ -437,6 +437,14 @@ private struct RenderCaseDefinition: Decodable {
     /// marker names this oracle's rail, so this rail maps the filter onto the
     /// native `MTLMultisampleDepthResolveFilter` and reads the landing back.
     let depth_resolve: DepthResolveDefinition?
+    /// The device gate one depth-resolve case may state (`research/docs/23`
+    /// §3.3, v57d): the case appears in a capture if and only if the device's
+    /// declared mask carries the named filter's bit. The marker still decides
+    /// which rails own the case; the gate is the device-side half of the same
+    /// question, and this oracle's declared mask carries Sample0 alone, so a
+    /// Min/Max-gated case is absent from every oracle capture until an Apple
+    /// device proves the filter.
+    let requires_depth_resolve_filter: String?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -708,12 +716,21 @@ private struct CaseResult: Encodable {
     let allocations: [AllocationResult]
 }
 
+/// The depth resolve capability mask this oracle declares
+/// (`research/docs/23` §3.3, v57c/v57d): bit `i` is the filter whose wire
+/// code is `i`, and the snapshot probes the Apple-family question once and
+/// declares Sample0 alone. Min/Max stay undeclared until an Apple Paravirtual
+/// run measures them, so a Min/Max-gated case is absent from every oracle
+/// capture under the presence-iff-bit rule.
+private let nativeDepthResolveModes: UInt64 = 1 << 0
+
 private struct SuiteResult: Encodable {
     let schema_version: UInt64
     let suite: String
     let suite_sha256: String
     let backend: String
     let allocation_observation: String
+    let depth_resolve_modes: UInt64
     let device: String
     let platform: String
     let results: [CaseResult]
@@ -1077,6 +1094,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         // attachment's 64 bytes and the depth attachment's 64 bytes, which
         // travel through the same writeback channel (`research/docs/23` §3.3,
         // v43) — and writes both into its 4-byte output view.
+        try require(definition.entry == "copy_word_with_witness"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3, "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 64 },
+                    "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
+                    + "and a 64-byte read buffer at 2")
+    case "render_declaring_depth_resolve":
+        // v57d's declaring case: the depth-store sibling's own shape — the
+        // reviewed `copy_word_with_witness` kernel over the colour view (64
+        // bytes), the 4-byte output view and the second depth landing the
+        // Min/Max pairs resolve into (64 bytes), which travels through the same
+        // writeback channel (`research/docs/23` §3.3, v57d).
         try require(definition.entry == "copy_word_with_witness"
                     && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
                     "\(definition.id): unsupported entry or dispatch shape")
@@ -1477,7 +1509,7 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v28":
         expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store",
-                       "render_declaring_stencil_store"]
+                       "render_declaring_depth_resolve", "render_declaring_stencil_store"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2279,6 +2311,19 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         } else {
             try require(definition.coverage == "partial",
                         "\(definition.id): the multisample raster has to claim partial coverage")
+        }
+        // The device gate (`research/docs/23` §3.3, v57d): a case that
+        // requires a filter has to state the resolve whose filter it names —
+        // the gate is the case's own admission condition, not a second
+        // spelling that could drift — and only the two filters a device may
+        // lack are gateable.
+        if let gate = definition.requires_depth_resolve_filter {
+            try require(gate == "min" || gate == "max",
+                        "\(definition.id): the device gate names the min or max depth "
+                        + "resolve filter")
+            try require(definition.depth_resolve?.filter == gate,
+                        "\(definition.id): the device gate has to name the resolve filter "
+                        + "the case states")
         }
         try require(definition.depth == nil || definition.stencil == nil,
                     "\(definition.id): the multisample raster opens one depth-stencil "
@@ -3942,6 +3987,7 @@ private func renderSelfTest() throws -> CaseResult {
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
+        requires_depth_resolve_filter: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -4014,6 +4060,7 @@ private func presentSelfTest() throws -> CaseResult {
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
+        requires_depth_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4108,6 +4155,7 @@ private func vertexSelfTest() throws -> CaseResult {
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
+        requires_depth_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4206,6 +4254,7 @@ private func mrtSelfTest() throws -> CaseResult {
         coverage: nil,
         multisample: nil,
         depth_resolve: nil,
+        requires_depth_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4416,12 +4465,21 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     // the compute fixtures, and their observable is the attachment's texels.
     // Only the cases this rail's marker names are reported: an unnamed rail
     // that reported a case would present a comparison the suite did not ask
-    // for, which `conformance/compare.py` refuses.
+    // for, which `conformance/compare.py` refuses. A device-gated case adds
+    // the mask half (`research/docs/23` §3.3, v57d): even a marked case is
+    // absent unless this rail's declared mask carries the filter's bit.
     for fixture in suite.renderCases where fixture.definition.capture_rails.contains("native-metal") {
+        if let gate = fixture.definition.requires_depth_resolve_filter {
+            let bit: UInt64 = gate == "min" ? 2 : 4
+            if nativeDepthResolveModes & bit == 0 {
+                continue
+            }
+        }
         results.append(try runRenderCase(fixture, device: device, queue: queue))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",
+        depth_resolve_modes: nativeDepthResolveModes,
         device: device.name, platform: eligibility.platform, results: results)
 }
 

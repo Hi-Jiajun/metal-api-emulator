@@ -39,11 +39,15 @@ ALLOCATION_OBSERVATIONS = {
 # observation — which is what keeps an attachment from passing as a buffer
 # writeback; and `present` is the case's optional present section, the
 # acquire/present counts every rail its marker names has to report
-# (`research/docs/24` §5.3), or `None` when the suite declares none.
+# (`research/docs/24` §5.3), or `None` when the suite declares none; and
+# `filter` is the case's optional device gate (`research/docs/23` §3.3, v57d):
+# the `"min"`/`"max"` depth resolve filter a capture has to carry in its
+# `depth_resolve_modes` mask for the case to appear, or `None` for a case every
+# rail its marker names reports unconditionally.
 RenderExpectation = namedtuple(
     "RenderExpectation",
-    "writes allocations touched written rails attachment present icb wildcards",
-    defaults=(None,))
+    "writes allocations touched written rails attachment present icb wildcards filter",
+    defaults=(None, None))
 
 # One render case's present section: the target mode and image count the first
 # increment fixes, the counts a capture has to report, and the sentinel the
@@ -64,6 +68,12 @@ HeapExpectation = namedtuple("HeapExpectation", "size storage_mode placements")
 # the expectation: the capture reports what it replayed, not what it was asked
 # to replay.
 IcbExpectation = namedtuple("IcbExpectation", "kind max_commands kinds start count")
+
+# The capability-mask bit each depth resolve filter occupies
+# (`research/docs/23` §3.3, v57d): bit `i` is the filter whose wire code is
+# `i`, the same numbering `metal-api-core` uses for
+# `ProviderCapabilities::depth_resolve_modes`.
+DEPTH_RESOLVE_FILTER_BITS = {"sample0": 1, "min": 2, "max": 4}
 
 
 class CaptureError(ValueError):
@@ -1380,7 +1390,8 @@ def _render_plan(plan, suite):
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
                                "depth", "depth_test", "coverage", "cull", "blend",
-                               "stencil", "stencil_test", "multisample", "depth_resolve"})
+                               "stencil", "stencil_test", "multisample", "depth_resolve",
+                               "requires_depth_resolve_filter"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1532,6 +1543,20 @@ def _render_plan(plan, suite):
             _object(depth_resolve, ("filter",), f"{where}.depth_resolve")
             _require(depth_resolve["filter"] in ("sample0", "min", "max"),
                      f"{where}.depth_resolve: unsupported depth resolve filter")
+        # The device gate (`research/docs/23` §3.3, v57d): a case that requires
+        # a filter appears in a capture if and only if the capture's
+        # `depth_resolve_modes` mask carries that filter's bit. The gate has to
+        # name the resolve the case states — it is the case's own admission
+        # condition, not a second spelling that could drift — and only the two
+        # filters a device may lack are gateable: Sample0 is the API's own
+        # baseline.
+        requires_filter = case.get("requires_depth_resolve_filter")
+        if requires_filter is not None:
+            _require(requires_filter in ("min", "max"),
+                     f"{where}: the device gate names the min or max depth resolve filter")
+            _require(depth_resolve is not None
+                     and depth_resolve["filter"] == requires_filter,
+                     f"{where}: the device gate has to name the resolve filter the case states")
         wildcard_texels = case.get("wildcard_texels")
         if wildcard_texels is not None:
             _require(single,
@@ -2112,7 +2137,8 @@ def _render_plan(plan, suite):
             attachment=identities[0] if single and len(identities) == 1 else identities,
             present=present,
             icb=icb,
-            wildcards=wildcards)
+            wildcards=wildcards,
+            filter=requires_filter)
     return render_plan
 
 
@@ -2122,9 +2148,20 @@ def validate_capture(suite, digest, report, required_backend=None):
     render_plan = _render_plan(plan, suite)
     _require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
              "suite digest: expected lowercase SHA-256")
-    _object(report, ("schema_version", "suite", "suite_sha256", "backend", "allocation_observation",
-                     "device", "platform", "results"),
-            "capture")
+    # The depth resolve mask (`research/docs/23` §3.3, v57d) rides on top of
+    # the pre-v57d capture shape: every capture the device-gated mechanism
+    # compares carries it, while a capture for a suite with no gated case may
+    # still omit it. The pre-v57d eight keys stay required and nothing else
+    # may appear.
+    _require(isinstance(report, dict), "capture: expected an object")
+    required_keys = {"schema_version", "suite", "suite_sha256", "backend",
+                     "allocation_observation", "device", "platform", "results"}
+    _require(required_keys <= set(report),
+             "capture: expected fields "
+             + ", ".join(sorted(required_keys - set(report))))
+    unexpected = set(report) - required_keys - {"depth_resolve_modes"}
+    _require(not unexpected,
+             "capture: unexpected fields " + ", ".join(sorted(unexpected)))
     _require(type(report["schema_version"]) is int and report["schema_version"] == 1,
              "capture: unsupported schema_version")
     _require(report["suite"] == suite["suite"], "capture: suite name mismatch")
@@ -2138,6 +2175,18 @@ def validate_capture(suite, digest, report, required_backend=None):
              f"capture: {report['backend']} requires allocation_observation {expected_observation}")
     _string(report["device"], "capture.device")
     _string(report["platform"], "capture.platform")
+    # The device's depth resolve capability mask (`research/docs/23` §3.3,
+    # v57d). A capture that reports device-gated cases has to carry the mask —
+    # otherwise a missing field would read as "the device lacks every filter"
+    # and the presence rule could not be checked. A suite without gated cases
+    # leaves the field optional, so the pre-v57d capture shape keeps passing.
+    modes = report.get("depth_resolve_modes", 0)
+    if "depth_resolve_modes" in report:
+        _integer(modes, "capture.depth_resolve_modes")
+    if any(expectation.filter is not None for expectation in render_plan.values()):
+        _require("depth_resolve_modes" in report,
+                 "capture: missing depth_resolve_modes (the suite declares "
+                 "device-gated cases)")
     results = _list(report["results"], "capture.results")
     seen = set()
     # The Swift reference oracle reports bytes but not device-buffer copy
@@ -2339,16 +2388,26 @@ def validate_capture(suite, digest, report, required_backend=None):
     # the object-API rails carry no render command encoder, so those captures
     # would have nothing to report. A rail that is not named must not report
     # the case either, which is the same exact-set rule the per-result check
-    # applies.
+    # applies. A device-gated render case (`research/docs/23` §3.3, v57d) adds
+    # the mask half: even a rail its marker names owes the case only when the
+    # capture's `depth_resolve_modes` carries the filter's bit.
     required = {case_id for case_id, expectation in plan.items()
                 if expectation[6] is None or report["backend"] in expectation[6]}
     required |= {case_id for case_id, expectation in render_plan.items()
-                 if report["backend"] in expectation.rails}
+                 if report["backend"] in expectation.rails
+                 and (expectation.filter is None
+                      or modes & DEPTH_RESOLVE_FILTER_BITS[expectation.filter])}
     missing = required - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
     for case_id in sorted(set(render_plan) - required):
-        _require(case_id not in seen,
-                 f"case {case_id}: {report['backend']} is not a rail this render case runs on")
+        expectation = render_plan[case_id]
+        if expectation.filter is not None and report["backend"] in expectation.rails:
+            message = (f"case {case_id}: {report['backend']} lacks the "
+                       f"{expectation.filter} depth resolve filter the case requires")
+        else:
+            message = (f"case {case_id}: {report['backend']} is not a rail this render "
+                       f"case runs on")
+        _require(case_id not in seen, message)
     for case_id, expectation in sorted(plan.items()):
         if expectation[6] is not None and case_id not in required:
             _require(case_id not in seen,
