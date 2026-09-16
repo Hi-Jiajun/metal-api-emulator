@@ -1150,6 +1150,12 @@ struct RenderCase {
     /// declares exactly two.
     #[serde(default = "default_instance_count")]
     instance_count: u64,
+    /// Texels the case does not claim, in row-major order
+    /// (`research/docs/23` §3.3, v33). Only a `dontcare` load may leave bytes
+    /// unclaimed — the undefined pre-pass contents are exactly what makes them
+    /// unobservable — and the list has to leave at least one texel observed.
+    #[serde(default)]
+    wildcard_texels: Option<Vec<u64>>,
 }
 
 /// The instance count a case draws when it says nothing: the single instance
@@ -2707,6 +2713,40 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     // the undefined load: a `dontcare` load carries no clear colour and no
     // initial bytes, and its expectation still has to differ from the bytes
     // the declaring case pins for the same view (`docs/23` §13).
+    // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
+    // texels it does not claim, and only a `dontcare` load has bytes that may
+    // legitimately be unclaimed. The list is the single-attachment shape's, it
+    // has to leave at least one texel observed, and every entry has to name a
+    // texel of that attachment.
+    if let Some(wildcards) = &case.wildcard_texels {
+        let (attachment, _) = shapes
+            .first()
+            .ok_or(format!("{where_}: a wildcard list needs an attachment"))?;
+        if !single {
+            return Err(
+                format!("{where_}: the wildcard channel is the single-attachment shape").into(),
+            );
+        }
+        if attachment.load != "dontcare" {
+            return Err(
+                format!("{where_}: only a dontcare load may leave texels unclaimed").into(),
+            );
+        }
+        if wildcards.is_empty() {
+            return Err(format!("{where_}: a wildcard list has to name at least one texel").into());
+        }
+        let texel_count = attachment.width * attachment.height;
+        let unique = wildcards.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != wildcards.len() {
+            return Err(format!("{where_}: duplicate wildcard texel").into());
+        }
+        if unique.len() as u64 >= texel_count || unique.iter().any(|texel| *texel >= texel_count) {
+            return Err(format!(
+                "{where_}: a wildcard list has to leave at least one texel observed"
+            )
+            .into());
+        }
+    }
     let mut parsed = Vec::new();
     let mut stored = Vec::new();
     for (attachment, expected_hex) in &shapes {
@@ -2968,14 +3008,45 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                     }
                     "dontcare" => {
                         // Undefined pre-pass contents (`docs/23` §13, v20):
-                        // the pass starts from nothing, so every texel has to
-                        // be the fragment output and neither a clear colour
-                        // nor initial bytes may travel with the attachment.
-                        if !uniform_texel {
-                            return Err(format!(
-                                "{where_}: every texel of a dontcare load has to be the fragment output"
-                            )
-                            .into());
+                        // the pass starts from nothing, so every texel it
+                        // *claims* has to be the fragment output and neither a
+                        // clear colour nor initial bytes may travel with the
+                        // attachment. The unclaimed texels are the wildcard
+                        // list's (`research/docs/23` §3.3, v33), and without
+                        // one the stricter v20 rule and its exact message stay.
+                        match &case.wildcard_texels {
+                            None => {
+                                if !uniform_texel {
+                                    return Err(format!(
+                                        "{where_}: every texel of a dontcare load has to be the fragment output"
+                                    )
+                                    .into());
+                                }
+                            }
+                            Some(wildcards) => {
+                                let wildcard = wildcards.iter().copied().collect::<BTreeSet<_>>();
+                                let texel_count = u64::try_from(texels.chunks_exact(4).count())?;
+                                for (position, chunk) in texels.chunks_exact(4).enumerate() {
+                                    let position = u64::try_from(position)?;
+                                    if wildcard.contains(&position) {
+                                        continue;
+                                    }
+                                    if chunk != &texels[..4] {
+                                        return Err(format!(
+                                            "{where_}: texel {position} of a dontcare load has to be the fragment output"
+                                        )
+                                        .into());
+                                    }
+                                }
+                                if wildcard.len() as u64 >= texel_count
+                                    || wildcard.iter().any(|texel| *texel >= texel_count)
+                                {
+                                    return Err(format!(
+                                        "{where_}: a wildcard list has to leave at least one texel observed"
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                         if attachment.clear_hex.is_some() {
                             return Err(format!(

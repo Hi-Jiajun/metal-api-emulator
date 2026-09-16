@@ -39,7 +39,8 @@ ALLOCATION_OBSERVATIONS = {
 # acquire/present counts every rail its marker names has to report
 # (`research/docs/24` §5.3), or `None` when the suite declares none.
 RenderExpectation = namedtuple(
-    "RenderExpectation", "writes allocations touched written rails attachment present icb",
+    "RenderExpectation",
+    "writes allocations touched written rails attachment present icb wildcards",
     defaults=(None,))
 
 # One render case's present section: the target mode and image count the first
@@ -99,10 +100,20 @@ def _list(value, where):
     return value
 
 
-def _same_bytes(actual, expected, where, offset=0):
+def _same_bytes(actual, expected, where, offset=0, wildcards=frozenset()):
+    """Compare two byte strings, skipping the offsets the case leaves wild.
+
+    `offset` is where the compared range starts inside its allocation, and
+    `wildcards` holds absolute allocation offsets whose bytes the case does not
+    claim (`research/docs/23` §3.3, v33). A byte at a wild offset is neither
+    compared nor used to build an error message: the case said in advance that
+    what landed there is undefined.
+    """
     _require(len(actual) == len(expected),
              f"{where}: length mismatch: expected {len(expected)} bytes, got {len(actual)}")
     for index, (left, right) in enumerate(zip(actual, expected)):
+        if offset + index in wildcards:
+            continue
         if left != right:
             raise CaptureError(
                 f"{where}: first differing byte at offset {offset + index}: "
@@ -110,7 +121,8 @@ def _same_bytes(actual, expected, where, offset=0):
             )
 
 
-def _compare_observation(result, expected_writes, expected_allocations, where):
+def _compare_observation(result, expected_writes, expected_allocations, where,
+                         wildcards=None):
     """Check one case's writebacks and allocation images against the plan.
 
     Both the compute and the render case report the same two surfaces, so the
@@ -132,10 +144,11 @@ def _compare_observation(result, expected_writes, expected_allocations, where):
              f"got {[key for key, _ in actual_writes]}")
     _require([identity for identity, _ in actual_writes] == expected_identities,
              f"{where}: writeback order differs from suite")
+    wildcards = wildcards or {}
     for (identity, actual), (_, expected) in zip(actual_writes, expected_writes):
         allocation, view, offset = identity
         _same_bytes(actual, expected, f"{where} writeback allocation {allocation}/view {view}",
-                    offset)
+                    offset, wildcards.get(identity, frozenset()))
 
     seen_allocations = set()
     for value in _list(result["allocations"], f"{where}.allocations"):
@@ -145,7 +158,14 @@ def _compare_observation(result, expected_writes, expected_allocations, where):
         _require(allocation in expected_allocations, f"{where}: unknown allocation {allocation}")
         seen_allocations.add(allocation)
         actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
-        _same_bytes(actual, expected_allocations[allocation], f"{where} allocation {allocation}")
+        skipped = frozenset(
+            index
+            for identity, offsets in wildcards.items()
+            if identity[0] == allocation
+            for index in offsets
+        )
+        _same_bytes(actual, expected_allocations[allocation],
+                    f"{where} allocation {allocation}", 0, skipped)
     missing = set(expected_allocations) - seen_allocations
     _require(not missing, f"{where}: missing allocations {sorted(missing)}")
 
@@ -831,7 +851,7 @@ def _render_plan(plan, suite):
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
-                               "instance_count"})
+                               "instance_count", "wildcard_texels"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -902,6 +922,27 @@ def _render_plan(plan, suite):
             _require(len(scissor) == 4, f"{where}: a scissor is four numbers")
             scissor = [_integer(value, f"{where}.scissor[{index}]")
                        for index, value in enumerate(scissor)]
+        # The wildcard channel (`research/docs/23` §3.3, v33): a case may name
+        # the texels it does not claim, and only a `dontcare` load has bytes
+        # that may legitimately be unclaimed. The list has to leave at least one
+        # texel observed and at least one wild, or the fixture would prove
+        # "everything" or "nothing" rather than a partial coverage.
+        wildcard_texels = case.get("wildcard_texels")
+        if wildcard_texels is not None:
+            _require(single,
+                     f"{where}: the wildcard channel is the single-attachment shape")
+            wildcard_texels = _list(wildcard_texels, f"{where}.wildcard_texels")
+            _require(wildcard_texels,
+                     f"{where}: a wildcard list has to name at least one texel")
+            seen_texels = set()
+            for position, value in enumerate(wildcard_texels):
+                texel = _integer(value, f"{where}.wildcard_texels[{position}]", 0)
+                _require(texel not in seen_texels,
+                         f"{where}: duplicate wildcard texel {texel}")
+                seen_texels.add(texel)
+            wildcard_texels = sorted(seen_texels)
+            _require(definitions[0].get("store", "store") == "store",
+                     f"{where}: a wildcard list needs a stored attachment")
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):
@@ -1003,6 +1044,18 @@ def _render_plan(plan, suite):
             # §13). The classification below is the loading rule; the clearing
             # and dontcare arms keep the milestone's stricter one.
             load = attachment.get("load")
+            if wildcard_texels is not None:
+                texel_count = width * height
+                _require(load == "dontcare",
+                         f"{attachment_where}: only a dontcare load may leave texels "
+                         "unclaimed")
+                _require(len(wildcard_texels) < texel_count,
+                         f"{attachment_where}: a wildcard list has to leave at least one "
+                         "texel observed")
+                for wildcard in wildcard_texels:
+                    _require(wildcard < texel_count,
+                             f"{attachment_where}: wildcard texel {wildcard} is outside the "
+                             "attachment")
             if load == "clear":
                 clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
                 _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
@@ -1084,9 +1137,26 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a loaded attachment needs both drawn and "
                          "kept texels")
             elif load == "dontcare":
-                _require(all(chunk == texel for chunk in texels),
-                         f"{attachment_where}: every texel of a dontcare load has to be "
-                         "the fragment output")
+                # A `dontcare` load claims no previous bytes, so every texel it
+                # *observes* has to be the fragment output and the unclaimed
+                # ones are named by the wildcard list (`research/docs/23` §3.3,
+                # v33). Without a list the milestone's stricter rule — and its
+                # exact message — stay: the fixture then has no way to say
+                # which bytes it does not claim, so it claims all of them.
+                if wildcard_texels is None:
+                    _require(all(chunk == texel for chunk in texels),
+                             f"{attachment_where}: every texel of a dontcare load has to be "
+                             "the fragment output")
+                else:
+                    claimed = [position for position in range(len(texels))
+                               if position not in wildcard_texels]
+                    _require(claimed,
+                             f"{attachment_where}: a wildcard list has to leave at least one "
+                             "texel observed")
+                    for position in claimed:
+                        _require(texels[position] == texel,
+                                 f"{attachment_where}: texel {position} of a dontcare load "
+                                 "has to be the fragment output")
                 _require("clear_hex" not in attachment,
                          f"{attachment_where}: a dontcare load carries no clear colour")
                 _require("initial_hex" not in attachment,
@@ -1198,6 +1268,16 @@ def _render_plan(plan, suite):
             identities.append((allocation, view, offset, len(expected)))
             written.add(allocation)
         touched = set(plan[declaring][1])
+        # The wildcard mask is stated once per observed attachment, in the
+        # absolute byte offsets of its allocation, so the writeback comparison
+        # and the allocation-image comparison read the same set.
+        wildcards = {}
+        if wildcard_texels is not None and writes:
+            (allocation, view, offset), _ = writes[0]
+            wildcards[(allocation, view, offset)] = frozenset(
+                offset + texel * 4 + byte
+                for texel in wildcard_texels
+                for byte in range(4))
         render_plan[case_id] = RenderExpectation(
             writes=writes,
             allocations=images,
@@ -1206,7 +1286,8 @@ def _render_plan(plan, suite):
             rails=frozenset(rails),
             attachment=identities[0] if single else identities,
             present=present,
-            icb=icb)
+            icb=icb,
+            wildcards=wildcards)
     return render_plan
 
 
@@ -1269,7 +1350,8 @@ def validate_capture(suite, digest, report, required_backend=None):
             # by a buffer writeback, and a buffer writeback cannot be reported
             # where the attachment belongs.
             expectation = render_plan[case_id]
-            _compare_observation(result, expectation.writes, expectation.allocations, where)
+            _compare_observation(result, expectation.writes, expectation.allocations, where,
+                                 expectation.wildcards)
             attachments = expectation.attachment
             if isinstance(attachments, tuple):
                 attachments = [attachments]

@@ -247,6 +247,13 @@ private struct RenderCaseDefinition: Decodable {
     /// The single-attachment case's expectation. An MRT case leaves this
     /// absent and spells the expectation on each attachment entry instead.
     let expected_hex: String?
+    /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
+    /// texel indices of the single attachment whose bytes the case does *not*
+    /// claim, stated in advance. Only a `dontcare` load may leave texels
+    /// unclaimed, because the undefined pre-pass contents are exactly what
+    /// makes an unclaimed byte legitimate. An absent list means the case
+    /// claims every texel, the semantics every case before v33 has.
+    let wildcard_texels: [Int]?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -334,6 +341,12 @@ private struct ValidatedRenderAttachment {
     /// The reviewed expectation of a stored attachment; `nil` for a discarded
     /// attachment, which carries no expectation and no observation.
     let expected: Data?
+    /// The byte offsets inside this attachment's own texel image that the case
+    /// does not claim (`research/docs/23` §3.3, v33): the four bytes of every
+    /// texel the wildcard list names. The readback comparison steps over them
+    /// and the reported bytes stay the measured ones; the empty set is every
+    /// attachment that declares no wildcard list.
+    let wildcardBytes: Set<Int>
     /// The ``MTLPixelFormat`` the case's declared attachment format names
     /// (`research/docs/23` §3.3, v21): the texture and the pipeline attachment
     /// both take it, so the case's expected texels pin which channel order the
@@ -1615,6 +1628,41 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): an attachment list carries its own expected_hex")
         expectedHexes = attachments.map { attachment in attachment.expected_hex }
     }
+    // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
+    // texels whose bytes it does not claim, and the undefined pre-pass contents
+    // of a `dontcare` load are exactly what makes an unclaimed byte
+    // legitimate. The list is the single-attachment shape's, it has to name at
+    // least one texel and leave at least one observed, and every entry has to
+    // name a texel of that attachment exactly once. An absent list means the
+    // case claims every texel, the semantics every case before v33 has.
+    if let wildcards = definition.wildcard_texels {
+        try require(definition.attachment != nil,
+                    "\(definition.id): the wildcard channel is the single-attachment shape")
+        try require(!wildcards.isEmpty,
+                    "\(definition.id): a wildcard list has to name at least one texel")
+        var seen = Set<Int>()
+        for texel in wildcards {
+            try require(texel >= 0,
+                        "\(definition.id): wildcard texel \(texel) is outside the attachment")
+            try require(!seen.contains(texel),
+                        "\(definition.id): duplicate wildcard texel \(texel)")
+            seen.insert(texel)
+        }
+        // The single-attachment shape was proved above, so `attachments` holds
+        // exactly the one entry the list describes: only undefined contents may
+        // leave texels unclaimed, the list has to leave at least one texel
+        // observed, and every entry has to name a texel of the attachment.
+        let attachment = attachments[0]
+        try require(attachment.load == "dontcare",
+                    "\(definition.id): only a dontcare load may leave texels unclaimed")
+        let texelCount = attachment.width * attachment.height
+        try require(wildcards.count < texelCount,
+                    "\(definition.id): a wildcard list has to leave at least one texel observed")
+        for texel in wildcards {
+            try require(texel < texelCount,
+                        "\(definition.id): wildcard texel \(texel) is outside the attachment")
+        }
+    }
     // The v19 pass-level rule core admission states as
     // `AllRenderAttachmentsDiscarded`: at least one attachment has to stay on
     // the observable surface, or "nothing landed" would pass as "landed
@@ -1825,10 +1873,42 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         "\(definition.id): a dontcare load carries no clear colour")
             try require(attachment.initial_hex == nil,
                         "\(definition.id): a dontcare load carries no initial bytes")
+            // The expectation follows the fragment output on every texel the
+            // case *claims*; the unclaimed ones are the wildcard list's
+            // (`research/docs/23` §3.3, v33). Without a list the v20 rule — and
+            // its exact message — stays: the fixture then has no way to say
+            // which bytes it does not claim, so it claims all of them, exactly
+            // as `conformance/compare.py` reads the same shape.
+            if let expected {
+                let fragment = Data(expected.prefix(4))
+                if let wildcards = definition.wildcard_texels {
+                    for texel in 0..<(expected.count / 4) where !wildcards.contains(texel) {
+                        try require(Data(expected[(texel * 4)..<(texel * 4 + 4)]) == fragment,
+                                    "\(definition.id): texel \(texel) of a dontcare load has to "
+                                    + "be the fragment output")
+                    }
+                } else {
+                    for offset in stride(from: 0, to: expected.count, by: 4) {
+                        try require(Data(expected[offset..<(offset + 4)]) == fragment,
+                                    "\(definition.id): every texel of a dontcare load has to "
+                                    + "be the fragment output")
+                    }
+                }
+            }
             clearComponents = []
             initial = nil
         default:
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
+        }
+        // The wildcard mask this attachment carries (`research/docs/23` §3.3,
+        // v33): the four bytes of every texel the case leaves unclaimed, stated
+        // as offsets inside the attachment's own image — the same image the
+        // readback compares, whose first texel sits at offset 0. Only the
+        // single-attachment shape may name a list, so every other attachment
+        // carries the empty set.
+        var wildcardBytes = Set<Int>()
+        for texel in definition.wildcard_texels ?? [] {
+            wildcardBytes.formUnion((texel * 4)..<(texel * 4 + 4))
         }
         let pixelFormat: MTLPixelFormat
         switch attachment.format {
@@ -1841,7 +1921,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             width: attachment.width, height: attachment.height,
             load: attachment.load, store: attachment.store,
             clearComponents: clearComponents, initial: initial, expected: expected,
-            pixelFormat: pixelFormat))
+            wildcardBytes: wildcardBytes, pixelFormat: pixelFormat))
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
@@ -2402,9 +2482,31 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                         mipmapLevel: 0)
             }
         }
-        try require(observed == expected,
-                    "\(definition.id): attachment \(index) bytes \(hex(observed)) do not match "
-                    + "the reviewed expectation \(hex(expected))")
+        // The comparison walks the attachment's own image and steps over the
+        // texels the case does not claim (`research/docs/23` §3.3, v33): a
+        // wildcard texel's four bytes are neither compared nor named, because
+        // the fixture said in advance that whatever lands there is undefined.
+        // Every other byte still has to equal the reviewed expectation, the
+        // first claimed byte that differs is reported with its offset, and the
+        // writeback and allocation below still carry the measured bytes.
+        try require(observed.count == expected.count,
+                    "\(definition.id): attachment \(index) read back \(observed.count) bytes "
+                    + "against the reviewed expectation's \(expected.count)")
+        var differing: Int?
+        for (offset, pair) in zip(expected, observed).enumerated() {
+            if attachment.wildcardBytes.contains(offset) {
+                continue
+            }
+            if pair.0 != pair.1 {
+                differing = offset
+                break
+            }
+        }
+        if let differing {
+            throw OracleError("\(definition.id): attachment \(index) bytes \(hex(observed)) "
+                              + "do not match the reviewed expectation \(hex(expected)) "
+                              + "(first differing byte at offset \(differing))")
+        }
         // One writeback and one allocation per attachment, both the
         // attachment's own texels.
         writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
@@ -2450,6 +2552,7 @@ private func renderSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        wildcard_texels: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
@@ -2508,6 +2611,7 @@ private func presentSelfTest() throws -> CaseResult {
             clear_hex: nil, initial_hex: hex(sentinel), expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        wildcard_texels: nil,
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
         capture_rails: ["native-metal"])
@@ -2590,6 +2694,7 @@ private func vertexSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        wildcard_texels: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
@@ -2676,6 +2781,7 @@ private func mrtSelfTest() throws -> CaseResult {
         // Location 0 first, then location 1: the fixture's own byte strings,
         // spelled per attachment the way a suite's MRT case does.
         expected_hex: nil,
+        wildcard_texels: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
