@@ -24,11 +24,11 @@ use metal_api_core::provider::{
     PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, ResourceTableSnapshot,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StencilCompare, StencilFormat,
-    StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
+    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StencilCompare,
+    StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, SubmissionId,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
     MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
@@ -214,13 +214,27 @@ const RENDER_WIDE_FEATURE_DEPTH_RESOURCE: u16 = 0x0200;
 /// refuses the wide word instead of skipping the block.
 const RENDER_WIDE_FEATURE_STENCIL: u16 = 0x0400;
 
+/// The wide feature word's fourth bit (`research/docs/23` §3.3, v49): the pass
+/// states its stencil attachment's store action, one byte after the stencil
+/// block. A pass that keeps nothing never sets it.
+const RENDER_WIDE_FEATURE_STENCIL_STORE: u16 = 0x0800;
+
+/// The wide feature word's fifth bit (`research/docs/23` §3.3, v49): the pass's
+/// stencil attachment is a caller-held resource, and its `allocation` and
+/// `view` follow — after the stencil block and after the store action when that
+/// one is present. The identity is what the stored texels land on, so it is
+/// only written for the shape that keeps them.
+const RENDER_WIDE_FEATURE_STENCIL_RESOURCE: u16 = 0x1000;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
 const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
     | RENDER_WIDE_FEATURE_DEPTH_STORE
     | RENDER_WIDE_FEATURE_DEPTH_RESOURCE
-    | RENDER_WIDE_FEATURE_STENCIL;
+    | RENDER_WIDE_FEATURE_STENCIL
+    | RENDER_WIDE_FEATURE_STENCIL_STORE
+    | RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -2011,7 +2025,21 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // pass with no stencil attachment never sets the bit, so its
                 // bytes stay exactly what they were.
                 let has_stencil = pass.stencil.is_some();
-                let wide = has_depth_store || has_depth_resource || has_stencil;
+                // The stencil store action and identity follow the depth pair's
+                // own rule (`docs/23` §3.3, v43/v49).
+                let has_stencil_store = pass
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.store.is_some());
+                let has_stencil_resource = pass
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.identity.is_some());
+                let wide = has_depth_store
+                    || has_depth_resource
+                    || has_stencil
+                    || has_stencil_store
+                    || has_stencil_resource;
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
@@ -2061,6 +2089,12 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         if has_stencil {
                             wide_features |= RENDER_WIDE_FEATURE_STENCIL;
                         }
+                        if has_stencil_store {
+                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_STORE;
+                        }
+                        if has_stencil_resource {
+                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
+                        }
                         encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
                         encoder.u16(wide_features);
                     } else {
@@ -2104,6 +2138,13 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     // decoder that knows both bits (`docs/23` §3.3, v47).
                     if let Some(stencil) = &pass.stencil {
                         put_stencil_block(encoder, stencil, pass.stencil_test.as_ref());
+                        if let Some(store) = stencil.store {
+                            encoder.u8(u8::from(store == StoreOp::Store));
+                        }
+                        if let Some(identity) = &stencil.identity {
+                            encoder.u64(identity.allocation_id.get());
+                            encoder.u64(identity.view_id.get());
+                        }
                     }
                     if let Some(cull) = &pass.cull {
                         encoder.u8(cull.mode.code());
@@ -2636,6 +2677,41 @@ fn get_render_ext_pass(
         pass.stencil = Some(stencil);
         pass.stencil_test = test;
     }
+    let stencil_features =
+        features & (RENDER_WIDE_FEATURE_STENCIL_STORE | RENDER_WIDE_FEATURE_STENCIL_RESOURCE);
+    if stencil_features != 0 && pass.stencil.is_none() {
+        return Err(CodecError::DepthFeatureWithoutAttachment(stencil_features));
+    }
+    if features & RENDER_WIDE_FEATURE_STENCIL_STORE != 0 {
+        let code = decoder.u8()?;
+        let store = match code {
+            0 => StoreOp::DontCare,
+            1 => StoreOp::Store,
+            value => {
+                return Err(CodecError::UnknownEnumValue {
+                    field: "stencil store action",
+                    value,
+                })
+            }
+        };
+        let stencil = pass
+            .stencil
+            .as_mut()
+            .ok_or(CodecError::DepthFeatureWithoutAttachment(stencil_features))?;
+        stencil.store = Some(store);
+    }
+    if features & RENDER_WIDE_FEATURE_STENCIL_RESOURCE != 0 {
+        let allocation_id = AllocationId::new(decoder.u64()?);
+        let view_id = ViewId::new(decoder.u64()?);
+        let stencil = pass
+            .stencil
+            .as_mut()
+            .ok_or(CodecError::DepthFeatureWithoutAttachment(stencil_features))?;
+        stencil.identity = Some(RenderStencilIdentity {
+            allocation_id,
+            view_id,
+        });
+    }
     if features & u16::from(RENDER_FEATURE_CULL) != 0 {
         let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
             field: "cull mode",
@@ -2898,6 +2974,10 @@ fn get_stencil_block(
             width,
             height,
             load,
+            // The base block never carries the v49 sections: the store action
+            // and the identity travel under the wide tag's own bits.
+            store: None,
+            identity: None,
         },
         test,
     ))

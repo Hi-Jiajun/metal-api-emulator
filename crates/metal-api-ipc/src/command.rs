@@ -2627,10 +2627,10 @@ mod tests {
         // tag is: a section this decoder cannot read stops the frame rather
         // than being skipped to reach the sections after it.
         let mut unknown = frame.clone();
-        unknown[wide + 1] = 0x0f;
+        unknown[wide + 1] = 0x3f;
         let refused = CommandCodec::decode_request(&unknown);
         assert!(
-            matches!(refused, Err(CodecError::UnknownRenderFeature(0x0800))),
+            matches!(refused, Err(CodecError::UnknownRenderFeature(0x2000))),
             "an unknown wide bit has to be refused, got {refused:?}"
         );
 
@@ -2662,6 +2662,8 @@ mod tests {
             width: 4,
             height: 4,
             load: StencilLoadOp::clear(0),
+            store: None,
+            identity: None,
         });
         pass.stencil_test = Some(StencilTest {
             compare: StencilCompare::Equal,

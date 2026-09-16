@@ -692,6 +692,12 @@ pub struct RenderStencilAttachment {
     pub width: u64,
     pub height: u64,
     pub load: RenderStencilLoad,
+    /// The store action the pass asks for, or `None` for the rail-owned shape
+    /// every pre-v49 recording means (`research/docs/23` §3.3, v49).
+    pub store: Option<StoreOp>,
+    /// The stored surface's resource identity, present exactly when the
+    /// recording observes the texels.
+    pub identity: Option<contract::RenderStencilIdentity>,
 }
 
 /// How a recorded pass establishes its stencil surface.
@@ -947,6 +953,12 @@ impl RenderTarget {
                         RenderStencilLoad::Clear(value) => contract::StencilLoadOp::clear(value),
                         RenderStencilLoad::Load => contract::StencilLoadOp::Load,
                     },
+                    // The object API records no stored stencil surface yet
+                    // (`research/docs/23` §3.3, v49): the recording's own store
+                    // action and landing identity travel into the contract,
+                    // exactly as the depth pair above does.
+                    store: stencil.store,
+                    identity: stencil.identity,
                 }),
             stencil_test: self.draw.stencil_test.map(|test| contract::StencilTest {
                 compare: test.compare,

@@ -31,6 +31,14 @@ rail-owned like the pre-v43 depth surface, so it adds no writeback, no
 allocation image and no count; v48 carries the same surface and the same test
 on every rail, so the marker names all five and each one owes the same colour
 pair's landing.
+
+The v49 increment upgrades that attachment the way v43 upgraded the depth one:
+the pass keeps the surface, states where the texels land and what the readback
+has to contain — one byte per texel — and the comparison observes them through
+the same writeback and allocation channel the colour side uses. The case then
+owes two landings, so the marker names all five rails and a provider capture
+owes the pair's own two touched and two written allocations plus the stencil
+landing's one of each.
 """
 
 import copy
@@ -69,11 +77,24 @@ DEPTH_NO_COLOUR_ID = "depth_only_no_colour_4x4"
 # `equal 0` test and increments the stored value, so the far one fails and is
 # discarded.
 STENCIL_ID = "stencil_increment_pair_4x4"
+# The v49 fixture: the same stencil surface this time *kept* by the pass. The
+# store hands the incremented value back through the same writeback and
+# allocation channel the colour and depth landings use, one byte per texel.
+STENCIL_STORE_ID = "stencil_store_pair_4x4"
+# The declaring case of the v49 fixture: the v43 declaring kernel with a
+# one-byte-per-texel third *read* binding in place of the depth view.
+STENCIL_DECLARING_ID = "render_declaring_stencil_store"
 # The reviewed depth resource of the v43 fixture: the allocation and the view
 # the stored texels land in, and the view's whole extent.
 DEPTH_STORE_ALLOCATION = 940
 DEPTH_STORE_VIEW = 950
 DEPTH_STORE_ATTACHMENT = (DEPTH_STORE_ALLOCATION, DEPTH_STORE_VIEW, 0, 64)
+# The reviewed stencil resource of the v49 fixture: one byte per texel, so the
+# view covers sixteen bytes of its sixty-four byte allocation — the guard bytes
+# around the landing stay part of the comparison.
+STENCIL_STORE_ALLOCATION = 940
+STENCIL_STORE_VIEW = 951
+STENCIL_STORE_ATTACHMENT = (STENCIL_STORE_ALLOCATION, STENCIL_STORE_VIEW, 0, 16)
 ALIGNMENT_ID = "top_half_quad_4x4"
 CULL_ID = "cull_back_half_quad_4x4"
 BLEND_ID = "blend_alpha_quad_4x4"
@@ -86,12 +107,15 @@ DEPTH_NO_COLOUR_INDEX = 7
 # The v47 stencil case follows the v46 no-colour case, so the alignment, culling
 # and blending fixtures moved by one more position.
 STENCIL_INDEX = 8
-ALIGNMENT_INDEX = 9
-CULL_INDEX = 10
-BLEND_INDEX = 11
+# The v49 stencil store case follows the v47 stencil pair, so the alignment,
+# culling and blending fixtures moved by one more position.
+STENCIL_STORE_INDEX = 9
+ALIGNMENT_INDEX = 10
+CULL_INDEX = 11
+BLEND_INDEX = 12
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
-                  STENCIL_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID)
+                  STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -138,6 +162,18 @@ STENCIL_SECTION = {"format": "stencil8", "width": 4, "height": 4, "load": "clear
 STENCIL_TEST = {"compare": "equal", "reference": 0, "read_mask": 255, "write_mask": 255,
                 "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "increment_wrap"}
 STENCIL_EXPECTED = INSTANCE_TINTS[0] * 16
+# The v49 fixture stores the value the near triangle leaves in the stencil
+# surface: one byte per texel, sixteen `01`, and the clear value is the byte
+# string the expectation has to differ from — it is exactly what a pass that
+# never stored the surface leaves behind.
+STENCIL_STORE_EXPECTED = "01" * 16
+# The allocation image the landing leaves behind on the declaring case's own
+# sixty-four byte allocation: the sixteen stored bytes at the view's offset,
+# then the declaring image's remaining bytes (the suite's zero guard byte).
+# The declaring case's stencil allocation is the view itself — sixteen bytes for the
+# 4x4 `stencil8` surface, the shape the depth sibling's 64-byte landing has
+# (`research/docs/23` §3.3, v43/v49).
+STENCIL_STORE_ALLOCATION_BYTES = STENCIL_STORE_EXPECTED
 # The v38 fixture: the reviewed quad over the attachment's top half in Metal's
 # NDC convention, with the `partial` coverage claim. The expectation mixes the
 # fragment output (top two rows) with the clear colour (bottom two), and the
@@ -190,6 +226,12 @@ DEPTH_NO_COLOUR_RAILS = ALL_RAILS
 # colour pair's own landing, so the wider marker owes the same shape on all
 # five rails.
 STENCIL_RAILS = ALL_RAILS
+# The v49 marker names the same five rails: the store action and the landing
+# identity travel through the trace contract and both object entries exactly as
+# the depth store's do since v44, and the Rust native rail's readback hands the
+# stored bytes back — so every rail owes both landings
+# (`research/docs/23` §3.3, v49).
+STENCIL_STORE_RAILS = ALL_RAILS
 # The alignment fixture names every rail: both trace and object rails execute
 # the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
 # framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
@@ -309,6 +351,22 @@ def stencil_marker(suite, rail):
     suite["render_cases"][STENCIL_INDEX]["capture_rails"] = (
         [rail] if rail in STENCIL_RAILS else [other_rail(rail)])
     return rail in STENCIL_RAILS
+
+
+def stencil_store_marker(suite, rail):
+    """Point the v49 case at `rail` when that rail owes it, and elsewhere when not.
+
+    The v49 case observes two resources: the colour pair's own landing and the
+    stored stencil surface's. The committed marker names all five rails — the
+    store action and the landing identity travel through the trace contract and
+    both object entries exactly as the depth store's do, and the Rust native
+    rail's readback carries the bytes — so a capture on a rail the marker names
+    is owed both writebacks, and one on any other rail has to leave the case out
+    entirely. Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][STENCIL_STORE_INDEX]["capture_rails"] = (
+        [rail] if rail in STENCIL_STORE_RAILS else [other_rail(rail)])
+    return rail in STENCIL_STORE_RAILS
 
 
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -450,6 +508,37 @@ def stencil_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
+def stencil_store_result(provider_backend=True, copy_in=3, copy_out=3):
+    """The v49 landing: the colour observation plus the stored stencil one.
+
+    Both resources use the same two surfaces — one writeback each, in the order
+    the suite fixes, and one allocation image each — and the stencil landing
+    covers one byte per texel inside the declaring case's own sixty-four byte
+    allocation. A provider capture owes one copy-in and one copy-out for that
+    allocation on top of the declaring pass's own two and one, so the counts are
+    three and three, the stored depth pair's own numbers
+    (`research/docs/23` §3.3, v43/v49).
+    """
+    result = {
+        "id": STENCIL_STORE_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [
+            {"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+             "offset": ATTACHMENT[2], "bytes_hex": STENCIL_EXPECTED},
+            {"allocation": STENCIL_STORE_ALLOCATION, "view": STENCIL_STORE_VIEW,
+             "offset": 0, "bytes_hex": STENCIL_STORE_EXPECTED},
+        ],
+        "allocations": [
+            {"allocation": ATTACHMENT[0], "bytes_hex": STENCIL_EXPECTED},
+            {"allocation": STENCIL_STORE_ALLOCATION,
+             "bytes_hex": STENCIL_STORE_ALLOCATION_BYTES},
+        ],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
 def alignment_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": ALIGNMENT_ID,
@@ -496,8 +585,11 @@ def counted_declaring(suite, digest, rail):
             # The v43 declaring case reads one more view than its v27 sibling:
             # it declares the depth attachment's own view beside the colour
             # attachment's, so it touches three allocations and still writes
-            # one (`research/docs/23` §3.3, v43).
-            result["copy_in"] = 3 if result["id"] == DEPTH_DECLARING_ID else 2
+            # one (`research/docs/23` §3.3, v43). The v49 declaring case is the
+            # same shape with the one-byte-per-texel stencil view in place of
+            # the depth one (`research/docs/23` §3.3, v49).
+            result["copy_in"] = (3 if result["id"] in (DEPTH_DECLARING_ID,
+                                                       STENCIL_DECLARING_ID) else 2)
             result["copy_out"] = 1
     return report
 
@@ -555,6 +647,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_only = depth_only_marker(suite, rail)
             owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             owes_stencil = stencil_marker(suite, rail)
+            owes_stencil_store = stencil_store_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -574,6 +667,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if owes_stencil:
                 report["results"].append(stencil_result(rail != "native-metal"))
+            if owes_stencil_store:
+                report["results"].append(stencil_store_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -606,6 +701,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_only = depth_only_marker(suite, rail)
             owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             owes_stencil = stencil_marker(suite, rail)
+            owes_stencil_store = stencil_store_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -623,6 +719,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if owes_stencil:
                 report["results"].append(stencil_result(rail != "native-metal"))
+            if owes_stencil_store:
+                report["results"].append(stencil_store_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -643,6 +741,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_only = depth_only_marker(suite, rail)
             owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             owes_stencil = stencil_marker(suite, rail)
+            owes_stencil_store = stencil_store_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -662,6 +761,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if owes_stencil:
                 report["results"].append(stencil_result(rail != "native-metal"))
+            if owes_stencil_store:
+                report["results"].append(stencil_store_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -706,6 +807,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_only_result())
         report["results"].append(depth_no_colour_result())
         report["results"].append(stencil_result())
+        report["results"].append(stencil_store_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
@@ -837,13 +939,17 @@ class ScissorObservationTests(unittest.TestCase):
         # allocation behind the provider counts (three and three); the v45 and
         # v46 cases touch the same three but write only the probe and the depth
         # surface — the v45 colour attachment discards, and the v46 pass binds
-        # none at all; every other render case keeps the declaring pass's two
-        # and two.
+        # none at all. The v49 stencil store is the stored depth pair's own
+        # shape one byte wide: the colour attachment still stores, so the case
+        # owes the stencil landing's one touched and one written allocation on
+        # top of the declaring pass's two and two (`research/docs/23` §3.3,
+        # v43/v49). Every other render case keeps the declaring pass's two and
+        # two.
         plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
         for case in self.suite["render_cases"]:
             expectation = plan[case["id"]]
             counts = (len(expectation.touched), len(expectation.written))
-            if case["id"] == DEPTH_STORE_ID:
+            if case["id"] in (DEPTH_STORE_ID, STENCIL_STORE_ID):
                 expected = (3, 3)
             elif case["id"] in (DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID):
                 expected = (3, 2)
@@ -1368,6 +1474,233 @@ class ScissorObservationTests(unittest.TestCase):
                         "the reviewed stencil shape carries no depth attachment"):
                     compare._render_plan(compare._suite_plan(broken), broken)
 
+    def test_v28_pins_the_stencil_store_fixture(self):
+        case = self.suite["render_cases"][STENCIL_STORE_INDEX]
+        self.assertEqual(case["id"], STENCIL_STORE_ID)
+        # The surface is the v47 stencil attachment plus the v49 store action:
+        # the pass keeps it, names the allocation and the view the texels land
+        # in, and states the bytes the readback has to carry — one per texel.
+        self.assertEqual(case["stencil"]["store"], "store")
+        self.assertEqual(case["stencil"]["allocation"], STENCIL_STORE_ALLOCATION)
+        self.assertEqual(case["stencil"]["view"], STENCIL_STORE_VIEW)
+        self.assertEqual(len(case["stencil"]["expected_hex"]), 32)
+        self.assertEqual(case["stencil"]["expected_hex"], STENCIL_STORE_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(STENCIL_STORE_RAILS))
+        # The colour side is the v47 pair's own: the near red triangle still
+        # wins, and the stored stencil value is the one it left behind.
+        self.assertEqual(case["expected_hex"], STENCIL_EXPECTED)
+        self.assertEqual(case["expected_hex"],
+                         self.suite["render_cases"][STENCIL_INDEX]["expected_hex"])
+        # Everything else is the v47 case's shape — the module, the layout, the
+        # streams, the indices, the viewport, the attachment and the state — so
+        # the only new fields are the surface's store trio and the declaring
+        # case whose third read binding is the stencil view.
+        increment = self.suite["render_cases"][STENCIL_INDEX]
+        for field in ("vertex_entry", "fragment_entry", "metal", "vertex_layout",
+                      "vertex_buffers", "indices", "vertices", "viewport",
+                      "attachment", "stencil_test"):
+            self.assertEqual(case[field], increment[field])
+        for field in ("format", "width", "height", "load", "clear_value"):
+            self.assertEqual(case["stencil"][field], increment["stencil"][field])
+        # The declaring case is the v43 declaring kernel with the stencil view in
+        # place of the depth one: a third *read* binding covering exactly the
+        # sixteen bytes of the stencil extent inside the sixty-four byte
+        # allocation.
+        declaring = [entry for entry in self.suite["cases"]
+                     if entry["id"] == STENCIL_DECLARING_ID]
+        self.assertEqual(len(declaring), 1)
+        bindings = declaring[0]["buffers"]
+        self.assertEqual([binding["binding"] for binding in bindings], [0, 1, 2])
+        self.assertEqual((bindings[2]["allocation"], bindings[2]["view"],
+                          bindings[2]["offset"], bindings[2]["length"],
+                          bindings[2]["allocation_size"], bindings[2]["access"]),
+                         (STENCIL_STORE_ALLOCATION, STENCIL_STORE_VIEW, 0, 16, 16,
+                          "read"))
+
+    def test_v28_plans_the_stencil_store_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[STENCIL_STORE_ID]
+        # Both landings use the colour side's own two surfaces: one writeback
+        # each, in the order the suite fixes, and one allocation image each. The
+        # stencil image is the declaring case's own sixty-four byte allocation
+        # with the sixteen stored bytes overlaid, so the guard bytes around the
+        # view stay part of the comparison.
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(STENCIL_EXPECTED)),
+                          ((STENCIL_STORE_ALLOCATION, STENCIL_STORE_VIEW, 0),
+                           bytes.fromhex(STENCIL_STORE_EXPECTED))])
+        self.assertEqual(expectation.allocations,
+                         {ATTACHMENT[0]: bytes.fromhex(STENCIL_EXPECTED),
+                          STENCIL_STORE_ALLOCATION:
+                              bytes.fromhex(STENCIL_STORE_ALLOCATION_BYTES)})
+        self.assertEqual(list(expectation.attachment),
+                         [ATTACHMENT, STENCIL_STORE_ATTACHMENT])
+        # The colour attachment still stores, so the case owes the stencil
+        # landing's one touched and one written allocation on top of the
+        # declaring pass's two and two: the stored depth pair's own three and
+        # three (`research/docs/23` §3.3, v43/v49).
+        self.assertEqual(expectation.touched, {900, 920, 940})
+        self.assertEqual(expectation.written, {900, 920, 940})
+        self.assertEqual(expectation.rails, frozenset(STENCIL_STORE_RAILS))
+
+    def test_v28_reports_the_stencil_store_on_every_rail_its_marker_names(self):
+        # The marker is the rule, whichever rails it names: a capture on a rail
+        # the fixture's marker names is owed both landings — the colour pair's
+        # and the stored stencil surface's — and a capture on any other rail has
+        # to leave the case out rather than report a run it does not own.
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = stencil_store_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != STENCIL_STORE_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(stencil_store_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_compares_the_stored_stencil_texels(self):
+        # The stencil landing goes through the same byte comparison the colour
+        # side uses, so a capture that reports the clear value instead of the
+        # stored texels is refused at the first differing byte, and the reported
+        # landing the suite declares is the one that passes.
+        suite = copy.deepcopy(self.suite)
+        for position, case in enumerate(suite["render_cases"]):
+            if position != STENCIL_STORE_INDEX:
+                case["capture_rails"] = ["native-metal"]
+        suite["render_cases"][STENCIL_STORE_INDEX]["capture_rails"] = ["vulkan"]
+        digest = hashlib.sha256(
+            json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+        report = counted_declaring(suite, digest, "vulkan")
+        broken = stencil_store_result()
+        broken["writebacks"][1]["bytes_hex"] = "00" * 16
+        broken["allocations"][1]["bytes_hex"] = "00" * 64
+        report["results"].append(broken)
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "first differing byte at offset 0"):
+            compare.validate_capture(suite, digest, report, "vulkan")
+        report["results"][-1] = stencil_store_result()
+        compare.validate_capture(suite, digest, report, "vulkan")
+
+    def test_v28_refuses_a_capture_that_counts_only_the_pair(self):
+        # The stored stencil surface is one more touched and one more written
+        # allocation, so the pair's own two and two are refused and the plan's
+        # three and three are the counts that pass.
+        suite = copy.deepcopy(self.suite)
+        for position, case in enumerate(suite["render_cases"]):
+            if position != STENCIL_STORE_INDEX:
+                case["capture_rails"] = ["native-metal"]
+        suite["render_cases"][STENCIL_STORE_INDEX]["capture_rails"] = ["vulkan"]
+        digest = hashlib.sha256(
+            json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+        report = counted_declaring(suite, digest, "vulkan")
+        report["results"].append(stencil_store_result(copy_in=2, copy_out=2))
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "copy_in 2 does not match 3 touched allocations"):
+            compare.validate_capture(suite, digest, report, "vulkan")
+        report["results"][-1] = stencil_store_result()
+        compare.validate_capture(suite, digest, report, "vulkan")
+
+    def test_v28_refuses_a_stencil_expectation_that_is_the_clear_value(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][STENCIL_STORE_INDEX]["stencil"]["expected_hex"] = (
+            "00" * 16)
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the expected stencil texels equal the clear value"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_expectation_of_the_wrong_length(self):
+        # The landing is one byte per texel, so a fifteen-byte expectation is
+        # not the surface's own extent and the shape is refused rather than
+        # compared.
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][STENCIL_STORE_INDEX]["stencil"]["expected_hex"] = (
+            "01" * 15)
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the expected stencil texels do not match the attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_identity_without_a_store_action(self):
+        broken = copy.deepcopy(self.suite)
+        del broken["render_cases"][STENCIL_STORE_INDEX]["stencil"]["store"]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a discarded stencil attachment carries no identity or expectation"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_store_action_without_its_identity(self):
+        broken = copy.deepcopy(self.suite)
+        del broken["render_cases"][STENCIL_STORE_INDEX]["stencil"]["allocation"]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a stored stencil attachment needs its store action, its identity"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_resource_that_is_the_colour_attachment(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][STENCIL_STORE_INDEX]["stencil"]["allocation"] = ATTACHMENT[0]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the stencil resource has to differ from the colour attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_store_the_declaring_case_does_not_declare(self):
+        # The landing resolves against the declaring case's own table, exactly
+        # as the depth landing does: without a declaration of the stencil view
+        # the texels have no writeback channel to leave through.
+        broken = copy.deepcopy(self.suite)
+        declaring = [case for case in broken["cases"]
+                     if case["id"] == STENCIL_DECLARING_ID][0]
+        declaring["buffers"] = [buffer for buffer in declaring["buffers"]
+                                if buffer["binding"] != 2]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the declaring case has to declare exactly the stencil attachment view"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_view_the_declaring_pass_writes(self):
+        # The declaring kernel only reads the stencil view: a compute write
+        # would race the store, so the shape is refused exactly as the depth
+        # landing's is.
+        broken = copy.deepcopy(self.suite)
+        declaring = [case for case in broken["cases"]
+                     if case["id"] == STENCIL_DECLARING_ID][0]
+        binding = declaring["buffers"][2]
+        binding["access"] = "read_write"
+        declaring["expected_writebacks"].append(
+            {"allocation": binding["allocation"], "view": binding["view"],
+             "offset": binding["offset"], "bytes_hex": binding["initial_hex"]})
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the declaring pass must only read the stencil attachment view"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_stencil_view_of_the_wrong_byte_range(self):
+        # The declaration's byte range is the one-byte-per-texel extent the
+        # attachment restates, so an eight-byte view cannot carry the sixteen
+        # stored bytes.
+        broken = copy.deepcopy(self.suite)
+        declaring = [case for case in broken["cases"]
+                     if case["id"] == STENCIL_DECLARING_ID][0]
+        binding = declaring["buffers"][2]
+        binding["length"] = 8
+        binding["initial_hex"] = binding["initial_hex"][:16]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the stencil view's byte range disagrees with the attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
     def test_v28_pins_the_alignment_fixture(self):
         case = self.suite["render_cases"][ALIGNMENT_INDEX]
         self.assertEqual(case["id"], ALIGNMENT_ID)
@@ -1508,6 +1841,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_only_result())
         report["results"].append(depth_no_colour_result())
         report["results"].append(stencil_result())
+        report["results"].append(stencil_store_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
@@ -1531,6 +1865,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_only = depth_only_marker(suite, rail)
             owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             owes_stencil = stencil_marker(suite, rail)
+            owes_stencil_store = stencil_store_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -1548,6 +1883,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if owes_stencil:
                 report["results"].append(stencil_result(rail != "native-metal"))
+            if owes_stencil_store:
+                report["results"].append(stencil_store_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:

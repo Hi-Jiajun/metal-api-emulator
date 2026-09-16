@@ -1785,8 +1785,9 @@ impl NativeMetalProvider {
 
     /// Execute the planned render passes in trace order, after the compute
     /// sequence, and turn each attachment readback into a buffer writeback —
-    /// the stored depth attachment's own included when the pass has one
-    /// (`research/docs/23` §3.3, v43).
+    /// the stored depth attachment's own included when the pass has one and the
+    /// stored stencil attachment's own when it has that one
+    /// (`research/docs/23` §3.3, v43/v49).
     ///
     /// The attachment's bytes leave the rail through the same channel a compute
     /// pass uses — one [`BufferWriteback`] for the view and allocation the trace
@@ -1810,7 +1811,7 @@ impl NativeMetalProvider {
                 }
                 // An offscreen pass reads every attachment back, one writeback
                 // per landing view in location order, plus the stored depth
-                // surface's own when the pass has one (v43).
+                // and stencil surfaces' own when the pass has them (v43/v49).
                 None if icb_replay.is_some() => {
                     let readback = render::encode_indirect_offscreen_render(
                         &state.device,

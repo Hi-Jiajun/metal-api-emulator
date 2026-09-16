@@ -919,6 +919,52 @@ impl VulkanComputeProvider {
                 },
                 None => None,
             };
+            // The stored stencil attachment's landing view, resolved the same
+            // way the depth one is (`research/docs/23` §3.3, v49): the bytes it
+            // receives have to be named by the trace, and a storing surface
+            // without a declaration is refused instead of executed.
+            let stencil_view = match planned.pass.stencil.as_ref() {
+                Some(stencil) => match (stencil.store, stencil.identity) {
+                    (Some(metal_api_core::provider::StoreOp::Store), Some(identity)) => {
+                        if !host_readback {
+                            // A trace that publishes no readback keeps its
+                            // stencil texels on the device, exactly as a colour
+                            // or depth landing does, and needs no landing view.
+                            None
+                        } else {
+                            Some(
+                                pool.iter()
+                                    .find(|view| {
+                                        view.view_id == identity.view_id
+                                            && view.allocation_id == identity.allocation_id
+                                    })
+                                    .ok_or_else(|| {
+                                        refusal(
+                                    ProviderPhase::Resolve,
+                                    ProviderErrorClass::Capability,
+                                    "render_stencil_landing_unsupported",
+                                )
+                                .with_field(
+                                    "view",
+                                    FieldValue::Unsigned(identity.view_id.get()),
+                                )
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored stencil attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                                    })?,
+                            )
+                        }
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
             let readback = match trace.indirect.as_deref() {
                 Some(payload) => {
                     let readback = render::execute_indirect_render_pass(
@@ -964,6 +1010,17 @@ impl VulkanComputeProvider {
             // and in the same (allocation, view) order the writeback contract
             // states (`research/docs/23` §3.3, v43).
             if let (Some(view), Some(texels)) = (depth_view, readback.depth) {
+                writebacks.push(BufferWriteback {
+                    view_id: view.view_id,
+                    allocation_id: view.allocation_id,
+                    offset: view.offset,
+                    bytes: texels,
+                });
+            }
+            // The stencil landing follows the depth one, one byte per texel,
+            // in the same channel and the same (allocation, view) order the
+            // writeback contract states (`research/docs/23` §3.3, v49).
+            if let (Some(view), Some(texels)) = (stencil_view, readback.stencil) {
                 writebacks.push(BufferWriteback {
                     view_id: view.view_id,
                     allocation_id: view.allocation_id,

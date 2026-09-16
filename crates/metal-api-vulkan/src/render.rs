@@ -49,6 +49,13 @@ use crate::VulkanContext;
 /// format-to-width mapping.
 const BYTES_PER_TEXEL: u64 = 4;
 
+/// The stencil surface's texel width (`research/docs/23` §3.3, v49).
+///
+/// `VK_FORMAT_S8_UINT` and `MTLPixelFormatStencil8` both carry one byte per
+/// texel; the rail restates the contract's constant for the same reason it
+/// restates the colour width above.
+const STENCIL_BYTES_PER_TEXEL: u64 = 1;
+
 /// The vertices of the milestone's single draw: the full-screen triangle
 /// (`research/docs/23` §1.2).
 const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
@@ -414,12 +421,14 @@ impl OffscreenDepthAttachment {
 }
 
 /// The stencil attachment one offscreen pass opens (`research/docs/23` §3.3,
-/// v47).
+/// v47/v49).
 ///
-/// Rail-owned like the first depth increment's surface: the reviewed fixture
-/// masks with it — the stored values decide which primitives survive — and
-/// nothing reads it back, so what it carries is the shape the rail creates and
-/// opens plus the state its draw tests and writes with.
+/// Rail-owned like the depth increment's surface: the reviewed fixture masks
+/// with it — the stored values decide which primitives survive — so what it
+/// carries is the shape the rail creates and opens plus the state its draw
+/// tests and writes with. From v49 on the trace may also keep the surface: a
+/// storing attachment is a landing, one byte per texel, and leaves through the
+/// same readback channel the colour and depth attachments use.
 pub(crate) struct OffscreenStencilAttachment {
     /// Extent in texels; core admission already held it to the colour
     /// attachments' own extent.
@@ -430,6 +439,20 @@ pub(crate) struct OffscreenStencilAttachment {
     /// The pass's stencil state, or `None` for "the attachment exists and
     /// nothing tests it".
     pub test: Option<StencilTest>,
+    /// The store action the trace stated, or `None` for the rail-owned shape
+    /// every pre-v49 trace means (`research/docs/23` §3.3, v49). A storing
+    /// surface is the second surface this rail reads back: it ends the render
+    /// pass in `TRANSFER_SRC_OPTIMAL`, gets its own readback buffer, and its
+    /// one-byte texels leave through the same `vkCmdCopyImageToBuffer` the
+    /// colour and depth attachments use.
+    pub store: Option<StoreOp>,
+}
+
+impl OffscreenStencilAttachment {
+    /// Whether the pass keeps this surface — and therefore reads it back.
+    fn storing(&self) -> bool {
+        self.store == Some(StoreOp::Store)
+    }
 }
 
 /// One colour attachment of an offscreen render request.
@@ -982,7 +1005,9 @@ fn prepare_render_request<'a>(
     });
     // The stencil attachment is rail-owned (`research/docs/23` §3.3, v47): the
     // rail creates the surface, clears it with the value the trace states and
-    // arms the draw with the state the pass declares.
+    // arms the draw with the state the pass declares. A trace that keeps the
+    // surface states its store action too, and the rail reads the texels back
+    // through its own copy-out (v49).
     let stencil = pass
         .stencil
         .as_ref()
@@ -991,6 +1016,7 @@ fn prepare_render_request<'a>(
             height: u32::try_from(stencil.height).unwrap_or(u32::MAX),
             clear: stencil.load.clear_value(),
             test: pass.stencil_test,
+            store: stencil.store,
         });
     let request = OffscreenRenderRequest {
         attachments,
@@ -1353,18 +1379,21 @@ pub(crate) fn admit_color_attachment(
 /// at-least-one-store gates are re-run here for a directly-constructed request,
 /// so the fail-closed shape does not depend on the caller having gone through
 /// `prepare_render_request`.
-/// The texels one offscreen pass hands back (`research/docs/23` §3.3, v43).
+/// The texels one offscreen pass hands back (`research/docs/23` §3.3, v43/v49).
 ///
 /// `attachments` carries one entry per colour attachment, in location order,
 /// with `None` for each discarded one — the shape the readback channel had
 /// before the depth attachment could be observed. `depth` carries the stored
 /// depth surface's own tightly packed `depth32float` texels, or `None` when the
 /// pass discards its depth attachment (which is what every pre-v43 trace
-/// states).
+/// states). `stencil` carries the stored stencil surface's own tightly packed
+/// one-byte texels, or `None` when the pass discards it (which is what every
+/// pre-v49 trace states).
 #[derive(Debug)]
 pub(crate) struct OffscreenReadback {
     pub attachments: Vec<Option<Vec<u8>>>,
     pub depth: Option<Vec<u8>>,
+    pub stencil: Option<Vec<u8>>,
 }
 
 pub(crate) fn execute_offscreen_render(
@@ -1480,6 +1509,13 @@ pub(crate) fn execute_offscreen_render(
         .checked_mul(u64::from(height))
         .and_then(|texels| texels.checked_mul(BYTES_PER_TEXEL))
         .ok_or_else(|| contract_refusal("render attachment bytes overflow u64"))?;
+    // The stencil surface's readback extent is the same render area one byte
+    // wide, which is what both its staging buffer and its copy state
+    // (`research/docs/23` §3.3, v49).
+    let stencil_byte_length = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|texels| texels.checked_mul(STENCIL_BYTES_PER_TEXEL))
+        .ok_or_else(|| contract_refusal("render stencil attachment bytes overflow u64"))?;
 
     crate::terminal_refusal(&context.lock_lifecycle())?;
     let queue_index = select_graphics_queue(context)?;
@@ -1530,7 +1566,19 @@ pub(crate) fn execute_offscreen_render(
                 ),
             );
         }
-        objects.create_stencil(stencil.width, stencil.height, stencil.clear.is_none())?;
+        // The stencil image is created before the render pass that names it,
+        // and a pass that keeps the surface also creates the readback
+        // destination its texels land in, exactly as the depth path does since
+        // v43 (`research/docs/23` §3.3, v49).
+        objects.create_stencil(
+            stencil.width,
+            stencil.height,
+            stencil.clear.is_none(),
+            stencil.storing(),
+        )?;
+        if stencil.storing() {
+            objects.create_stencil_readback(stencil_byte_length)?;
+        }
     }
     objects.create_render_pass(
         &vk_formats,
@@ -1614,9 +1662,14 @@ pub(crate) fn execute_offscreen_render(
         }
     }
     let depth = objects.depth_readback_bytes(byte_length as usize, context)?;
+    // The stored stencil surface follows the depth one through the same
+    // copy-out channel; its byte extent is one per texel, not the colour
+    // attachments' four (`research/docs/23` §3.3, v49).
+    let stencil = objects.stencil_readback_bytes(stencil_byte_length as usize, context)?;
     Ok(OffscreenReadback {
         attachments: results,
         depth,
+        stencil,
     })
 }
 
@@ -2025,6 +2078,30 @@ pub(crate) fn execute_present_render(
                  depth surface",
             ));
     }
+    // The stencil surface is the depth rule's sibling: the present shape opens
+    // neither surface, so a trace that names one — stored or not — is refused
+    // here rather than having it silently dropped by the pass that follows
+    // (`research/docs/23` §3.3, v49). No reviewed fixture pairs presentation
+    // with a stencil attachment; refusing keeps that combination fail-closed
+    // until one arrives.
+    if let Some(stencil) = &request.stencil {
+        return Err(capability_refusal("render_present_stencil_unsupported")
+            .with_field(
+                "store",
+                FieldValue::Text(
+                    match stencil.store {
+                        Some(StoreOp::Store) => "store",
+                        Some(StoreOp::DontCare) => "dontcare",
+                        None => "unstated",
+                    }
+                    .to_owned(),
+                ),
+            )
+            .with_detail(
+                "the present rail renders into one provider-owned colour target and opens no \
+                 stencil surface",
+            ));
+    }
     let [width, height] = request.extent;
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
@@ -2210,12 +2287,12 @@ struct DepthObjects {
 }
 
 /// The Vulkan objects one rail-owned stencil attachment owns
-/// (`research/docs/23` §3.3, v47).
+/// (`research/docs/23` §3.3, v47/v49).
 ///
-/// The depth sibling's shape without a readback: the reviewed fixture masks
-/// with the surface and never observes its bytes, so the rail creates the
-/// image, clears it with the value the trace states and lets it go with the
-/// pass.
+/// The depth sibling's shape: the rail creates the image, clears it with the
+/// value the trace states and — when the trace keeps the surface — copies its
+/// one-byte texels into a readback buffer of its own before the pass's objects
+/// go with the pass.
 struct StencilObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -2223,6 +2300,15 @@ struct StencilObjects {
     /// Whether the pass opens the image from the attachment layout a previous
     /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
     loading: bool,
+    /// The host-visible buffer this pass's stencil texels land in, present
+    /// exactly when the pass stores the surface (`research/docs/23` §3.3,
+    /// v49). A discarded surface is never copied out, so it needs no
+    /// destination.
+    readback: Option<ReadbackObjects>,
+    /// The mapping of [`Self::readback`], as the pointer the host reads after
+    /// the fence signals — the same shape the depth and colour attachments'
+    /// readbacks have.
+    mapping: Option<usize>,
 }
 
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
@@ -2391,18 +2477,20 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     /// Create the rail-owned stencil image of a pass that declares one
-    /// (`research/docs/23` §3.3, v47).
+    /// (`research/docs/23` §3.3, v47/v49).
     ///
     /// The image is a `VK_FORMAT_S8_UINT` stencil attachment opened from
     /// `UNDEFINED` for a clear and from the attachment layout for a load. It
-    /// carries `DEPTH_STENCIL_ATTACHMENT` alone: nothing reads the surface
-    /// back in this increment, exactly as the first depth increment's image
-    /// carried no transfer usage.
+    /// carries `DEPTH_STENCIL_ATTACHMENT` and, when the pass keeps the
+    /// surface, `TRANSFER_SRC` — the same pair the depth path states since
+    /// v43: a discarded surface is never copied out and must not be refused
+    /// for a feature its execution never needs.
     fn create_stencil(
         &mut self,
         width: u32,
         height: u32,
         loading: bool,
+        storing: bool,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -2416,7 +2504,14 @@ impl<'a> OffscreenObjects<'a> {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .usage(
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | if storing {
+                        vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    },
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let (image, memory, _) = crate::allocate_image_backing(
@@ -2434,6 +2529,8 @@ impl<'a> OffscreenObjects<'a> {
             memory,
             view,
             loading,
+            readback: None,
+            mapping: None,
         });
         Ok(())
     }
@@ -2602,7 +2699,15 @@ impl<'a> OffscreenObjects<'a> {
                 // operations carry the pass's decision — the depth aspect's
                 // pair is `DONT_CARE` for a format that has no depth aspect.
                 // A clearing pass opens it from `UNDEFINED`, a loading one from
-                // the attachment layout a previous pass left it in.
+                // the attachment layout a previous pass left it in. A pass
+                // that states no store action discards the surface and leaves
+                // it in that layout; a storing pass ends in
+                // `TRANSFER_SRC_OPTIMAL`, so the copy-out below runs without a
+                // further barrier (v49).
+                let storing = self
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|objects| objects.readback.is_some());
                 vk::AttachmentDescription::default()
                     .format(vk::Format::S8_UINT)
                     .samples(vk::SampleCountFlags::TYPE_1)
@@ -2615,7 +2720,11 @@ impl<'a> OffscreenObjects<'a> {
                             vk::AttachmentLoadOp::CLEAR
                         },
                     )
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .stencil_store_op(if storing {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    })
                     .initial_layout(
                         if self.stencil.as_ref().is_some_and(|objects| objects.loading) {
                             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
@@ -2623,7 +2732,11 @@ impl<'a> OffscreenObjects<'a> {
                             vk::ImageLayout::UNDEFINED
                         },
                     )
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .final_layout(if storing {
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    } else {
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                    })
             }))
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
@@ -2689,10 +2802,17 @@ impl<'a> OffscreenObjects<'a> {
             // The depth clear and the test's depth writes are their own access
             // class: the same pair the colour side states, named for the
             // early/late fragment tests (`research/docs/23` §3.3, v36).
-            let storing_depth = self
+            // The stencil surface's writes travel the same pair (`v47`), so a
+            // surface either rail keeps hands its writes on to the transfer
+            // stage the copy-out runs in.
+            let storing_surface = self
                 .depth
                 .as_ref()
-                .is_some_and(|objects| objects.readback.is_some());
+                .is_some_and(|objects| objects.readback.is_some())
+                || self
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|objects| objects.readback.is_some());
             dependencies.push(
                 vk::SubpassDependency::default()
                     .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -2717,12 +2837,14 @@ impl<'a> OffscreenObjects<'a> {
                             | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     )
                     // A storing surface hands its depth writes on to the
-                    // transfer stage the copy-out runs in; a discarded one has
-                    // nothing to hand on, so the dependency only has to witness
-                    // the pass (`research/docs/23` §3.3, v43).
+                    // transfer stage the copy-out runs in — the same rule for a
+                    // storing stencil surface's stencil writes (`v49`); a
+                    // discarded surface has nothing to hand on, so the
+                    // dependency only has to witness the pass
+                    // (`research/docs/23` §3.3, v43/v49).
                     .dst_stage_mask(vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER)
                     .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                    .dst_access_mask(if storing_depth {
+                    .dst_access_mask(if storing_surface {
                         vk::AccessFlags::TRANSFER_READ
                     } else {
                         vk::AccessFlags::empty()
@@ -3104,9 +3226,48 @@ impl<'a> OffscreenObjects<'a> {
         Ok(Some(texels))
     }
 
+    /// The stencil attachment's own readback destination
+    /// (`research/docs/23` §3.3, v49).
+    ///
+    /// The depth sibling's shape one byte wide: the stored stencil surface
+    /// lands through the same staging shape a colour attachment uses, kept
+    /// beside the stencil image rather than in `readbacks`, because that list is
+    /// zipped with the colour attachments in location order. Returns the
+    /// mapping the host reads once the fence signals.
+    fn create_stencil_readback(&mut self, byte_length: u64) -> Result<usize, ProviderError> {
+        let (objects, mapping) = Self::allocate_readback(self.context, byte_length)?;
+        let stencil = self.stencil.as_mut().ok_or_else(|| {
+            contract_refusal("a stencil readback needs the stencil attachment it copies out of")
+        })?;
+        stencil.readback = Some(objects);
+        stencil.mapping = Some(mapping);
+        Ok(mapping)
+    }
+
+    /// The stored stencil surface's texels, copied out of the readback mapping
+    /// once the fence has signalled (`research/docs/23` §3.3, v49).
+    ///
+    /// `None` for a pass whose stencil attachment has no readback — either no
+    /// stencil attachment at all or one the trace discards, which is the shape
+    /// every pre-v49 frame states.
+    fn stencil_readback_bytes(
+        &self,
+        byte_length: usize,
+        context: &VulkanContext,
+    ) -> Result<Option<Vec<u8>>, ProviderError> {
+        let Some(mapping) = self.stencil.as_ref().and_then(|stencil| stencil.mapping) else {
+            return Ok(None);
+        };
+        let texels =
+            unsafe { std::slice::from_raw_parts(mapping as *const u8, byte_length).to_vec() };
+        context.record_buffer_readback();
+        context.record_buffer_readback_bytes(texels.len());
+        Ok(Some(texels))
+    }
+
     /// Create one `TRANSFER_DST` host-visible buffer and map it, without
     /// attaching it to any list: the colour path pushes it into `readbacks`,
-    /// the depth path keeps it beside the depth image.
+    /// the depth and stencil paths keep it beside their own image.
     fn allocate_readback(
         context: &VulkanContext,
         byte_length: u64,
@@ -3790,6 +3951,41 @@ impl<'a> OffscreenObjects<'a> {
                     self.context.device.cmd_copy_image_to_buffer(
                         self.command,
                         depth.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        readback.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
+            }
+        }
+        // The stored stencil attachment's own copy, with the *stencil* aspect
+        // and one byte per texel (`research/docs/23` §3.3, v49). The render pass
+        // already left the image in `TRANSFER_SRC_OPTIMAL`, so the copy needs no
+        // barrier of its own; a discarded surface has no readback buffer and is
+        // not copied at all. The depth and stencil surfaces are mutually
+        // exclusive in this increment, so the two copies never share a pass.
+        if let Some(stencil) = &self.stencil {
+            if let Some(readback) = &stencil.readback {
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::STENCIL,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                unsafe {
+                    self.context.device.cmd_copy_image_to_buffer(
+                        self.command,
+                        stencil.image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         readback.buffer,
                         std::slice::from_ref(&copy),
@@ -5630,6 +5826,99 @@ mod tests {
         assert_eq!(
             discarded.attachments[0].as_deref(),
             Some(EXPECTED_RGBA8_TEXELS.repeat(4).as_slice())
+        );
+    }
+
+    /// A stored stencil attachment lands its own one-byte texels through the
+    /// readback channel (`research/docs/23` §3.3, v49).
+    ///
+    /// The pass clears the surface to zero and then draws the milestone's
+    /// full-screen triangle over a 4×4 surface with `equal 0` against reference
+    /// zero and `increment_wrap` on success, so every covered texel takes the
+    /// first (and only) triangle's increment and the stored bytes are sixteen
+    /// `01`s. A rail that opened the surface but never copied it out would hand
+    /// back `None`, and one that skipped the stencil write would hand back the
+    /// clear's sixteen `00`s: both are distinguishable from the expected bytes.
+    ///
+    /// The discarded shape is measured in the same test: it still opens the
+    /// surface — the pre-v49 shape — and hands nothing back, which is what the
+    /// absence of the wide section means.
+    #[test]
+    fn a_stored_stencil_attachment_reads_back_its_own_texels() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let request = |store: Option<StoreOp>| OffscreenRenderRequest {
+            blend: None,
+            cull: None,
+            depth: None,
+            stencil: Some(OffscreenStencilAttachment {
+                width: 4,
+                height: 4,
+                clear: Some(0),
+                test: Some(StencilTest {
+                    compare: StencilCompare::Equal,
+                    reference: 0,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                    fail_op: StencilOp::Keep,
+                    depth_fail_op: StencilOp::Keep,
+                    pass_op: StencilOp::IncrementWrap,
+                }),
+                store,
+            }),
+            base_vertex: 0,
+            scissor: None,
+            attachments: vec![OffscreenColorAttachment {
+                format: AttachmentFormat::Rgba8Unorm,
+                store: StoreOp::Store,
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+                previous: None,
+            }],
+            extent: [4, 4],
+            vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            instance_count: 1,
+            index_stream: None,
+            indirect: None,
+        };
+        let expected_colour = EXPECTED_RGBA8_TEXELS.repeat(16);
+
+        let readback = execute_offscreen_render(&context, &request(Some(StoreOp::Store)))
+            .expect("the stencil-storing pass executes");
+        let stencil = readback
+            .stencil
+            .expect("a stored stencil attachment reads back its texels");
+        eprintln!("stored stencil readback: {}", hex(&stencil));
+        assert_eq!(
+            stencil.len(),
+            16,
+            "one one-byte texel per pixel of the 4×4 surface"
+        );
+        assert_eq!(
+            stencil, [0x01u8; 16],
+            "`increment_wrap` leaves 01 in every texel the triangle covers"
+        );
+        assert_ne!(
+            stencil, [0x00u8; 16],
+            "the stored texels are the draw's stencil writes, not the clear value"
+        );
+        assert_eq!(
+            readback.attachments[0].as_deref(),
+            Some(expected_colour.as_slice()),
+            "the colour landing is unchanged by the stencil readback"
+        );
+
+        let discarded = execute_offscreen_render(&context, &request(None))
+            .expect("the discarded-stencil pass executes");
+        assert_eq!(
+            discarded.stencil, None,
+            "a pass that states no store action hands back no stencil bytes"
+        );
+        assert_eq!(
+            discarded.attachments[0].as_deref(),
+            Some(expected_colour.as_slice())
         );
     }
 

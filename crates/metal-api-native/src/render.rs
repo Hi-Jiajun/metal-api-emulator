@@ -1304,14 +1304,17 @@ impl PlannedDepth {
     }
 }
 
-/// The stencil attachment a plan opens (`research/docs/23` §3.3, v47).
+/// The stencil attachment a plan opens (`research/docs/23` §3.3, v47/v49).
 ///
-/// Rail-owned like the depth surface, with the one difference this increment's
-/// scope states: nothing reads a stencil texel back yet, so the trace names no
-/// landing identity for it, the surface never leaves the pass and its texture
-/// is created with `Private` storage ([`stencil_texture`]). What the trace does
-/// state is the extent, the clear value or previous-contents load op, and the
-/// stencil state the pass's draw tests and writes with.
+/// Rail-owned like the depth surface, so the plan carries the shape the encoder
+/// creates and opens while the trace's own landing is resolved beside it
+/// ([`TraceRenderPlan::stencil_landing`]). The store action is what decides
+/// whether the surface outlives the pass: a storing one is read back through
+/// the same `getBytes` shape the colour attachments use, one byte per texel,
+/// and every pre-v49 shape — no statement at all, or the explicit discard —
+/// keeps the surface rail-owned and disappears with the pass. What the trace
+/// always states is the extent, the clear value or previous-contents load op,
+/// and the stencil state the pass's draw tests and writes with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedStencil {
     pub(crate) width: u32,
@@ -1321,6 +1324,19 @@ pub(crate) struct PlannedStencil {
     /// The pass's stencil state, or `None` for "the attachment exists and
     /// nothing tests it".
     pub(crate) test: Option<StencilTest>,
+    /// The store action the trace stated, or `None` for the pre-v49 shape
+    /// (`research/docs/23` §3.3, v49). A storing surface is the only one this
+    /// rail reads back, which is also why its texture is created with shared
+    /// storage ([`stencil_texture`]).
+    pub(crate) store: Option<StoreOp>,
+}
+
+impl PlannedStencil {
+    /// Whether the pass keeps this surface — and therefore reads it back
+    /// (`research/docs/23` §3.3, v49).
+    pub(crate) fn storing(&self) -> bool {
+        self.store == Some(StoreOp::Store)
+    }
 }
 
 /// One colour attachment of a planned pass, resolved before any Metal object
@@ -1424,6 +1440,31 @@ pub(crate) fn plan<'a>(
                      depth surface",
                 ));
         }
+        // The stencil surface is the depth rule's sibling
+        // (`research/docs/23` §3.3, v49): the present shape hands its one
+        // colour attachment's texels on and opens no stencil surface, so a
+        // trace that names one — stored or not — is refused instead of
+        // executed with the attachment dropped, or, once a storing surface
+        // names a landing, with those bytes silently left behind. This is the
+        // same slug, class and detail the Vulkan rail's present entry states.
+        if let Some(stencil) = &request.pass.stencil {
+            return Err(capability_refusal("render_present_stencil_unsupported")
+                .with_field(
+                    "store",
+                    FieldValue::Text(
+                        match stencil.store {
+                            Some(StoreOp::Store) => "store",
+                            Some(StoreOp::DontCare) => "dontcare",
+                            None => "unstated",
+                        }
+                        .to_owned(),
+                    ),
+                )
+                .with_detail(
+                    "the present rail renders into one provider-owned colour target and opens no \
+                     stencil surface",
+                ));
+        }
     }
     // The pass's raster is its colour attachment's — or, for the
     // zero-colour-attachment depth pass (`research/docs/23` §3.3, v46), its
@@ -1516,8 +1557,11 @@ pub(crate) fn plan<'a>(
     // texel, so one texel-byte count serves the colour attachments and the
     // depth-only pass's readback (`crates/metal-api-core`:
     // `AttachmentFormat::bytes_per_texel` and `DEPTH_BYTES_PER_TEXEL`). The
-    // stencil surface contributes nothing here: one byte per texel it may be,
-    // but this increment never reads one back (`STENCIL_BYTES_PER_TEXEL`).
+    // stencil surface is the one surface these two counts do not describe: one
+    // byte per texel it is (`STENCIL_BYTES_PER_TEXEL`), so its own readback
+    // computes the flat byte extent and the row width from the pass extent
+    // beside the store it serves ([`read_stencil_texels`],
+    // `research/docs/23` §3.3, v49).
     let texel_bytes = usize::try_from(
         u64::from(extent[0])
             .saturating_mul(u64::from(extent[1]))
@@ -1619,6 +1663,11 @@ pub(crate) fn plan<'a>(
             // refused a test with no attachment to test
             // (`StencilTestWithoutAttachment`).
             test: request.pass.stencil_test,
+            // The store action is the pass's own statement
+            // (`research/docs/23` §3.3, v49): the pre-v49 shapes leave it
+            // absent, and core admission has already held the storing shape to
+            // naming a landing identity.
+            store: stencil.store,
         }),
         vertices: request.pass.vertices,
         instance_count: request.pass.instance_count,
@@ -1891,6 +1940,14 @@ pub(crate) struct TraceRenderPlan<'a> {
     /// through. A pass with no depth attachment and one that discards it both
     /// land here as `None`, exactly as they state nothing about a landing.
     pub(crate) depth_landing: Option<&'a BufferView>,
+    /// The landing view of a stored stencil attachment, or `None` for every
+    /// shape whose stencil surface does not outlive its pass
+    /// (`research/docs/23` §3.3, v49): the pool view whose identity is the
+    /// stencil identity, which is the writeback channel the stored one-byte
+    /// texels leave through. A pass with no stencil attachment and one that
+    /// discards it both land here as `None`, exactly as they state nothing
+    /// about a landing.
+    pub(crate) stencil_landing: Option<&'a BufferView>,
     pub(crate) plan: RenderPlan<'a>,
     /// The present action hanging off this pass, if any, with its sentinel
     /// already expanded to the target's whole texel extent so the macOS
@@ -1915,7 +1972,9 @@ pub(crate) struct PresentPlan<'a> {
 impl TraceRenderPlan<'_> {
     /// The writebacks this pass's readbacks become: one [`BufferWriteback`] per
     /// *stored* landing view, in location order, followed by the stored depth
-    /// attachment's own when the pass has one (`research/docs/23` §3.3, v43).
+    /// attachment's own when the pass has one (`research/docs/23` §3.3, v43)
+    /// and then the stored stencil attachment's own (`research/docs/23` §3.3,
+    /// v49).
     ///
     /// The view identity, allocation and offset are each landing view's own, so
     /// resource admission, lease bookkeeping and readback consumers need no
@@ -1926,14 +1985,15 @@ impl TraceRenderPlan<'_> {
     /// pass, so it cannot present a blank readback as "landed correctly"
     /// (`research/docs/23` §3.6, v19). The caller's `readback` therefore carries
     /// one entry per stored attachment, matching the filtered landings, plus
-    /// the depth texels exactly when the pass stores that surface.
+    /// the depth texels exactly when the pass stores that surface, and the
+    /// stencil texels exactly when it stores that one.
     ///
-    /// The depth writeback is the same shape as the colour ones — the landing
-    /// view's own identity and offset, and the surface's own `depth32float`
-    /// texels — so it needs no second channel either. The list it is appended
-    /// to need not be in identity order itself: every caller folds it through
-    /// [`merge_writebacks`], which is where the canonical order the core
-    /// contract states is established.
+    /// The depth and stencil writebacks are the same shape as the colour ones —
+    /// the landing view's own identity and offset, and the surface's own
+    /// `depth32float` or one-byte `stencil8` texels — so neither needs a second
+    /// channel. The list they are appended to need not be in identity order
+    /// itself: every caller folds it through [`merge_writebacks`], which is
+    /// where the canonical order the core contract states is established.
     pub(crate) fn writebacks(&self, readback: RenderReadback) -> Vec<BufferWriteback> {
         let mut writebacks: Vec<BufferWriteback> = self
             .landings
@@ -1952,6 +2012,16 @@ impl TraceRenderPlan<'_> {
         // writeback: the bytes never left the pass (`research/docs/23` §3.3,
         // v43).
         if let (Some(landing), Some(texels)) = (self.depth_landing, readback.depth) {
+            writebacks.push(BufferWriteback {
+                view_id: landing.view_id,
+                allocation_id: landing.allocation_id,
+                offset: landing.offset,
+                bytes: texels,
+            });
+        }
+        // A discarded or absent stencil surface is the same story one byte
+        // wide (`research/docs/23` §3.3, v49): no readback, no writeback.
+        if let (Some(landing), Some(texels)) = (self.stencil_landing, readback.stencil) {
             writebacks.push(BufferWriteback {
                 view_id: landing.view_id,
                 allocation_id: landing.allocation_id,
@@ -2090,6 +2160,39 @@ pub(crate) fn plan_trace<'a>(
             },
             None => None,
         };
+        // The stored stencil attachment's landing view is the depth rule one
+        // byte wide (`research/docs/23` §3.3, v49): resolved before the pass
+        // runs because the texels it receives have to be named by the trace,
+        // and refused by name when no declaration covers them, rather than
+        // executed and dropped. Every other shape — no stencil attachment, or
+        // one the pass discards with itself — states no landing and resolves
+        // none.
+        let stencil_landing = match pass.stencil.as_ref() {
+            Some(stencil) => match (stencil.store, stencil.identity) {
+                (Some(StoreOp::Store), Some(identity)) => Some(
+                    pool.iter()
+                        .find(|view| {
+                            view.view_id == identity.view_id
+                                && view.allocation_id == identity.allocation_id
+                        })
+                        .ok_or_else(|| {
+                            capability_refusal("render_stencil_landing_unsupported")
+                                .with_field("view", FieldValue::Unsigned(identity.view_id.get()))
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored stencil attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                        })?,
+                ),
+                _ => None,
+            },
+            None => None,
+        };
         let plan_of_pass = plan(&OffscreenRenderRequest {
             pass,
             pipeline: contract,
@@ -2116,6 +2219,7 @@ pub(crate) fn plan_trace<'a>(
             contract,
             landings,
             depth_landing,
+            stencil_landing,
             plan: plan_of_pass,
             present,
         });
@@ -2145,7 +2249,7 @@ pub(crate) fn merge_writebacks(
 }
 
 /// The texels one offscreen render pass hands back (`research/docs/23` §3.3,
-/// v43).
+/// v43/v49).
 ///
 /// `attachments` carries one entry per *stored* colour attachment, in location
 /// order: the shape the readback channel had before the depth attachment could
@@ -2153,16 +2257,21 @@ pub(crate) fn merge_writebacks(
 /// `depth32float` texels — four bytes per texel over the pass's extent, the
 /// same region [`read_texels`] reads a colour attachment from — or `None` when
 /// the pass discards its depth attachment, which is what every pre-v43 trace
-/// states.
+/// states. `stencil` carries the stored stencil surface's own tightly packed
+/// `stencil8` texels — one byte per texel over the same region, read by
+/// [`read_stencil_texels`] — or `None` when the pass discards its stencil
+/// attachment, which is what every pre-v49 trace states.
 #[derive(Debug)]
 pub(crate) struct RenderReadback {
     pub(crate) attachments: Vec<Vec<u8>>,
     pub(crate) depth: Option<Vec<u8>>,
+    pub(crate) stencil: Option<Vec<u8>>,
 }
 
 /// Execute one offscreen render pass and return its tightly packed texel bytes,
-/// one readback per colour attachment in location order and the stored depth
-/// surface's own when the pass has one.
+/// one readback per colour attachment in location order, the stored depth
+/// surface's own when the pass has one and the stored stencil surface's own
+/// when it has that one.
 ///
 /// Not verified on an Apple GPU: the check that would verify this encoder body
 /// is the Rust provider's own render path in a committed suite, and the macOS
@@ -2267,8 +2376,8 @@ pub(crate) fn encode_indirect_offscreen_render(
 /// The shared encoder body of the offscreen and present rails: build the
 /// reviewed pipeline, render the pass into `targets`, wait for a terminal
 /// command-buffer status, and read every attachment's texels back — the stored
-/// depth surface's own included when the plan has one
-/// (`research/docs/23` §3.3, v43).
+/// depth and stencil surfaces' own included when the plan has them
+/// (`research/docs/23` §3.3, v43/v49).
 #[cfg(target_os = "macos")]
 fn encode_into_and_readback(
     device: &Device,
@@ -2352,11 +2461,13 @@ fn encode_into_and_readback(
     }
     // The stencil attachment is rail-owned in the same way (`research/docs/23`
     // §3.3, v47): created when the plan declares one, opened with the plan's
-    // load operation and the pass's own clear value, and discarded with the
-    // pass — this increment has no stencil readback, so the surface stores
-    // `DontCare` and needs no identity. The texture stays in this local for the
-    // same reason the depth texture does: the pass descriptor references it
-    // until the encoder is done.
+    // load operation and the pass's own clear value, and stored or discarded
+    // after the draw exactly as the trace stated (v49). A storing surface has
+    // to survive the pass for its texels to leave it, which is what the
+    // readback below observes; every pre-v49 shape discards the rail-owned
+    // surface with the pass. The texture stays in this local for the same
+    // reason the depth texture does: the pass descriptor references it until
+    // the encoder is done.
     let stencil_target = planned
         .stencil
         .as_ref()
@@ -2374,7 +2485,11 @@ fn encode_into_and_readback(
             }
             None => attachment.set_load_action(MTLLoadAction::Load),
         }
-        attachment.set_store_action(MTLStoreAction::DontCare);
+        attachment.set_store_action(if stencil.storing() {
+            MTLStoreAction::Store
+        } else {
+            MTLStoreAction::DontCare
+        });
     }
     // Metal carries the depth and the stencil state in one descriptor
     // (`research/docs/23` §3.3, v36/v47): built when the pass opens either
@@ -2601,7 +2716,23 @@ fn encode_into_and_readback(
         (Some(depth), Some(texture)) if depth.storing() => Some(read_texels(texture, planned)?),
         _ => None,
     };
-    Ok(RenderReadback { attachments, depth })
+    // The stored stencil surface's texels leave through the same `getBytes`
+    // shape one byte wide (`research/docs/23` §3.3, v49): the texture is shared
+    // storage exactly when the pass stores it (`stencil_texture`), and the
+    // region is the pass's own extent, which the contract holds to the stencil
+    // surface's just as it holds the depth surface's. A discarded or absent
+    // surface keeps its bytes on the device and reads nothing back.
+    let stencil = match (&planned.stencil, &stencil_target) {
+        (Some(stencil), Some(texture)) if stencil.storing() => {
+            Some(read_stencil_texels(texture, planned)?)
+        }
+        _ => None,
+    };
+    Ok(RenderReadback {
+        attachments,
+        depth,
+        stencil,
+    })
 }
 
 /// The colour attachments this rail renders into, one texture per location.
@@ -2727,12 +2858,14 @@ fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, Provi
 }
 
 /// The rail-owned stencil texture of a pass that declares one
-/// (`research/docs/23` §3.3, v47).
+/// (`research/docs/23` §3.3, v47/v49).
 ///
-/// `Private` storage, unlike a storing depth surface: this increment never
-/// reads a stencil texel back — the stencil fixture observes its effect through
-/// the colour attachment the mask decides — so the surface is the pass's alone
-/// and no CPU-visible mapping is created (`research/docs/16` §4.8).
+/// Shared storage when the pass stores the surface, for the same reason a
+/// storing depth surface is shared: `getBytes` reads no `Private` texture, and
+/// the readback is what makes the stored texels observable
+/// (`research/docs/16` §4.8). Every pre-v49 shape keeps `Private`: the stencil
+/// fixture observes a discarded surface's effect through the colour attachment
+/// the mask decides, and the rail-owned surface disappears with the pass.
 #[cfg(target_os = "macos")]
 fn stencil_texture(device: &Device, stencil: &PlannedStencil) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
@@ -2742,7 +2875,11 @@ fn stencil_texture(device: &Device, stencil: &PlannedStencil) -> Result<Texture,
     descriptor.set_height(u64::from(stencil.height));
     descriptor.set_mipmap_level_count(1);
     descriptor.set_usage(MTLTextureUsage::RenderTarget);
-    descriptor.set_storage_mode(MTLStorageMode::Private);
+    descriptor.set_storage_mode(if stencil.storing() {
+        MTLStorageMode::Shared
+    } else {
+        MTLStorageMode::Private
+    });
     let pointer: *mut metal::MTLTexture =
         unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
     if pointer.is_null() {
@@ -2924,6 +3061,34 @@ fn read_texels(texture: &Texture, planned: &RenderPlan<'_>) -> Result<Vec<u8>, P
     Ok(texels)
 }
 
+/// Read the stored stencil surface back into host memory, tightly packed.
+///
+/// `Stencil8` carries one byte per texel — `metal-api-core`'s
+/// `STENCIL_BYTES_PER_TEXEL` — so this surface's flat byte extent is the texel
+/// extent itself rather than the four-byte-per-texel arithmetic the colour and
+/// depth readbacks share, and one texture row is `width` bytes wide
+/// (`research/docs/23` §3.3, v49). The region is the pass's own extent, which
+/// the contract holds to the stencil surface's exactly as it holds it to every
+/// colour attachment's.
+#[cfg(target_os = "macos")]
+fn read_stencil_texels(
+    texture: &Texture,
+    planned: &RenderPlan<'_>,
+) -> Result<Vec<u8>, ProviderError> {
+    let texel_bytes = u64::from(planned.extent[0]).saturating_mul(u64::from(planned.extent[1]));
+    let Ok(bytes) = usize::try_from(texel_bytes) else {
+        return Err(capability_refusal("attachment_dimension_limit"));
+    };
+    let mut texels = vec![0_u8; bytes];
+    texture.get_bytes(
+        texels.as_mut_ptr().cast(),
+        NSUInteger::try_from(u64::from(planned.extent[0])).unwrap_or(NSUInteger::MAX),
+        region(planned),
+        0,
+    );
+    Ok(texels)
+}
+
 #[cfg(target_os = "macos")]
 fn region(planned: &RenderPlan<'_>) -> MTLRegion {
     MTLRegion {
@@ -2994,9 +3159,9 @@ mod tests {
         IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
         IndirectCommandRange, InitialState, LeaseId, OperationId, PipelineContract, PresentTarget,
         ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, ResourceTableSnapshot, SemanticDigest, StencilCompare,
-        StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, VertexAttribute,
-        VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest,
+        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode,
+        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -3454,8 +3619,9 @@ mod tests {
         assert_eq!(attachment.store, RenderStoreAction::Store);
         // The rail-owned surface's three planned fields, each the contract's
         // own value: the extent, the clear the load op carries, and the state
-        // the draw tests and writes with. The surface itself is never read
-        // back, which is why the plan carries no landing for it.
+        // the draw tests and writes with. This fixture states no store action,
+        // so the surface never leaves the pass and carries no landing
+        // (`research/docs/23` §3.3, v49).
         let stencil = planned
             .stencil
             .expect("the pass opens the rail-owned stencil surface");
@@ -3463,6 +3629,7 @@ mod tests {
         assert_eq!(stencil.height, 2);
         assert_eq!(stencil.clear_value, Some(0));
         assert_eq!(stencil.test, Some(STENCIL_TEST));
+        assert_eq!(stencil.store, None);
     }
 
     /// The contract's own rule, one level below the plan
@@ -3647,6 +3814,52 @@ mod tests {
                 Some(
                     "the present rail renders into one provider-owned colour target and opens \
                      no depth surface"
+                )
+            );
+        }
+    }
+
+    /// A present pass renders into the provider-owned target alone: it opens no
+    /// stencil surface either, so a pass that names one — stored or not — is
+    /// refused instead of having the attachment dropped, the same refusal the
+    /// Vulkan rail's present entry states (`research/docs/23` §3.3, v49).
+    #[test]
+    fn plan_refuses_a_present_pass_with_a_stencil_attachment() {
+        for (store, expected) in [
+            (None, "unstated"),
+            (Some(StoreOp::DontCare), "dontcare"),
+            (Some(StoreOp::Store), "store"),
+        ] {
+            let mut pass = milestone_present_pass();
+            pass.stencil = Some(RenderStencilAttachment {
+                format: StencilFormat::Stencil8,
+                width: 2,
+                height: 2,
+                load: StencilLoadOp::clear(0),
+                store,
+                identity: match store {
+                    Some(StoreOp::Store) => Some(RenderStencilIdentity {
+                        allocation_id: STENCIL_STORE_ALLOCATION,
+                        view_id: STENCIL_STORE_VIEW,
+                    }),
+                    _ => None,
+                },
+            });
+            pass.stencil_test = Some(STENCIL_TEST);
+            let pipeline = milestone_pipeline();
+            let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+            assert_eq!(error.slug, "render_present_stencil_unsupported");
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(
+                error.fields.get("store"),
+                Some(&FieldValue::Text(expected.to_owned()))
+            );
+            assert_eq!(
+                error.detail.as_deref(),
+                Some(
+                    "the present rail renders into one provider-owned colour target and opens \
+                     no stencil surface"
                 )
             );
         }
@@ -4330,6 +4543,11 @@ mod tests {
             width: 2,
             height: 2,
             load: StencilLoadOp::clear(0),
+            // The v47 shape states no store and names no landing: the surface
+            // is the pass's own and disappears with it (`research/docs/23`
+            // §3.3, v49).
+            store: None,
+            identity: None,
         });
         pass.stencil_test = Some(STENCIL_TEST);
         pass
@@ -4375,6 +4593,116 @@ mod tests {
             source: REVIEWED_DEPTH_SOURCE,
             initial: vec![None],
         }
+    }
+
+    /// The stored stencil attachment's own resource (`research/docs/23` §3.3,
+    /// v49): allocation 960 and view 970, covering the stencil fixture's 2x2
+    /// `stencil8` extent — four one-byte texels.
+    const STENCIL_STORE_ALLOCATION: AllocationId = AllocationId::new(960);
+    const STENCIL_STORE_VIEW: ViewId = ViewId::new(970);
+    /// The stored stencil surface's byte length: 2x2 texels of a single-byte
+    /// `stencil8` texel each.
+    const STENCIL_STORE_BYTES: u64 = 4;
+    /// The stencil value the v49 fixture's draw leaves behind: `1`, which is
+    /// the reviewed state's `increment_wrap` on success. The pass clears the
+    /// surface to `0`, so a pass that never stored its stencil surface cannot
+    /// read back as one that did.
+    const STENCIL_STORE_TEXEL: u8 = 0x01;
+
+    /// The compute declaration of the stored stencil surface's landing view:
+    /// one read-only view over the whole attachment, the depth declaration's
+    /// own shape one byte wide.
+    ///
+    /// A stored stencil identity has to be declared by the trace: core
+    /// admission resolves it against the same declarations a colour attachment
+    /// resolves against and refuses an undeclared one (`AttachmentViewUnknown`),
+    /// and the declaring binding is what puts the view into the serial pool —
+    /// its access is what `serial_resources` upgrades to a write — which is
+    /// where [`plan_trace`] resolves the landing from (`research/docs/23` §3.3,
+    /// v49).
+    fn stencil_declaration_pass() -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(11),
+            buffers: vec![BufferView {
+                view_id: STENCIL_STORE_VIEW,
+                metal_binding: 0,
+                allocation_id: STENCIL_STORE_ALLOCATION,
+                offset: 0,
+                length: STENCIL_STORE_BYTES,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0x80; STENCIL_STORE_BYTES as usize]),
+            }],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The v49 trace: the stencil fixture's reviewed pass with the store action
+    /// under test, and the compute declaration of its landing view.
+    ///
+    /// `store` is the whole v49 axis. `Some(Store)` is the shape whose texels
+    /// survive the pass and therefore need a landing; `None` is the pre-v49
+    /// shape and `Some(DontCare)` the explicit discard, both of which keep the
+    /// surface rail-owned and land nothing.
+    fn stencil_store_trace(store: Option<StoreOp>) -> ComputeTrace {
+        let mut pass = stencil_pass();
+        let stencil = pass
+            .stencil
+            .as_mut()
+            .expect("the stencil fixture declares a stencil attachment");
+        stencil.store = store;
+        stencil.identity = match store {
+            Some(StoreOp::Store) => Some(RenderStencilIdentity {
+                allocation_id: STENCIL_STORE_ALLOCATION,
+                view_id: STENCIL_STORE_VIEW,
+            }),
+            _ => None,
+        };
+        ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: DeviceEpoch::new(3),
+            operation_id: OperationId::new(4),
+            pipelines: vec![declaration_pipeline(), stencil_table_entry()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![
+                TracePass::Compute(declaration_pass()),
+                // The stencil declaration comes before the render pass, exactly
+                // as the colour attachment's does: the pool it feeds is the
+                // compute rail's binding set and every pass of it runs before
+                // the draw.
+                TracePass::Compute(stencil_declaration_pass()),
+                TracePass::Render(pass),
+            ],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        }
+    }
+
+    /// The trace-table entry of the stencil registration, minted the way
+    /// `NativeMetalProvider::register_render_pipeline` mints it.
+    fn stencil_table_entry() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(3),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-stencil-fixture", vec![3]).unwrap(),
+                entry_name: DEPTH_VERTEX_ENTRY.to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: render_table_contract(),
+            render: Some(stencil_pipeline()),
+        }
+    }
+
+    /// The registrations `plan_trace` resolves the stencil trace against.
+    fn stencil_contracts() -> BTreeMap<PipelineId, RenderPipelineContract> {
+        BTreeMap::from([(PipelineId::new(3), stencil_pipeline())])
     }
 
     /// The reviewed dual pipeline contract: the indexed vertex stage plus the
@@ -4820,6 +5148,7 @@ mod tests {
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
+            stencil: None,
         });
         let [writeback] = writebacks.as_slice() else {
             panic!("the milestone attachment becomes one writeback");
@@ -4975,6 +5304,7 @@ mod tests {
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
+            stencil: None,
         });
         let [colour, depth] = writebacks.as_slice() else {
             panic!("the stored depth attachment becomes a second writeback");
@@ -5031,6 +5361,7 @@ mod tests {
         let writebacks = planned.writebacks(RenderReadback {
             attachments: Vec::new(),
             depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
+            stencil: None,
         });
         let [depth] = writebacks.as_slice() else {
             panic!("a depth-only pass lands exactly one writeback");
@@ -5063,6 +5394,7 @@ mod tests {
             let writebacks = planned.writebacks(RenderReadback {
                 attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
                 depth: None,
+                stencil: None,
             });
             let [writeback] = writebacks.as_slice() else {
                 panic!("{store:?} lands the colour attachment alone");
@@ -5116,6 +5448,134 @@ mod tests {
         assert_eq!(
             error.fields.get("allocation"),
             Some(&FieldValue::Unsigned(DEPTH_STORE_ALLOCATION.get()))
+        );
+    }
+
+    /// The v49 increment over the trace path: a stencil attachment the pass
+    /// stores resolves its declared view as a second landing beside the depth
+    /// one, and the stored one-byte texels become the writeback that follows
+    /// the colour ones in the same channel (`research/docs/23` §3.3, v49).
+    #[test]
+    fn plan_trace_plans_a_stored_stencil_pass_and_its_landing_view() {
+        let trace = stencil_store_trace(Some(StoreOp::Store));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = stencil_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("the stored stencil surface lands in its declaring view");
+        let [planned] = planned.as_slice() else {
+            panic!("the stencil trace carries one render pass");
+        };
+        let Some(stencil) = &planned.plan.stencil else {
+            panic!("the pass opens a stencil attachment");
+        };
+        assert_eq!(stencil.store, Some(StoreOp::Store));
+        // The landing is the declaration's own identity and range, so the
+        // stored texels leave through the view the trace named and no second
+        // channel is invented (`research/docs/23` §3.3, v49).
+        let landing = planned
+            .stencil_landing
+            .expect("a stored stencil attachment names its landing view");
+        assert_eq!(landing.view_id, STENCIL_STORE_VIEW);
+        assert_eq!(landing.allocation_id, STENCIL_STORE_ALLOCATION);
+        assert_eq!(landing.offset, 0);
+        assert_eq!(landing.length, STENCIL_STORE_BYTES);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+            depth: None,
+            stencil: Some(vec![STENCIL_STORE_TEXEL; 4]),
+        });
+        let [colour, stencil] = writebacks.as_slice() else {
+            panic!("the stored stencil attachment becomes a second writeback");
+        };
+        assert_eq!(colour.view_id, ViewId::new(7));
+        assert_eq!(colour.allocation_id, AllocationId::new(9));
+        assert_eq!(colour.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(stencil.view_id, STENCIL_STORE_VIEW);
+        assert_eq!(stencil.allocation_id, STENCIL_STORE_ALLOCATION);
+        assert_eq!(stencil.offset, 0);
+        assert_eq!(stencil.bytes, vec![STENCIL_STORE_TEXEL; 4]);
+    }
+
+    /// The two shapes that state no stencil store keep the surface rail-owned:
+    /// no landing is resolved, and a readback that carries no stencil texels
+    /// adds no second writeback — the pre-v49 byte shape exactly
+    /// (`research/docs/23` §3.3, v49).
+    #[test]
+    fn plan_trace_keeps_an_unstored_stencil_attachment_out_of_the_writebacks() {
+        for store in [None, Some(StoreOp::DontCare)] {
+            let trace = stencil_store_trace(store);
+            let pool = trace.serial_resources().expect("admitted serial pool");
+            let contracts = stencil_contracts();
+            let planned = plan_trace(&trace, &pool, &contracts)
+                .expect("a discarded stencil surface needs no landing");
+            let [planned] = planned.as_slice() else {
+                panic!("the stencil trace carries one render pass");
+            };
+            let Some(stencil) = &planned.plan.stencil else {
+                panic!("the pass opens a stencil attachment");
+            };
+            assert_eq!(stencil.store, store);
+            assert!(
+                planned.stencil_landing.is_none(),
+                "{store:?} keeps the stencil surface rail-owned"
+            );
+            let writebacks = planned.writebacks(RenderReadback {
+                attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+                depth: None,
+                stencil: None,
+            });
+            let [writeback] = writebacks.as_slice() else {
+                panic!("{store:?} lands the colour attachment alone");
+            };
+            assert_eq!(writeback.view_id, ViewId::new(7));
+            assert_eq!(writeback.allocation_id, AllocationId::new(9));
+            assert_eq!(writeback.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+        }
+    }
+
+    /// A storing stencil attachment no declared view covers has nowhere to
+    /// land, so the pass is refused by name instead of executed and dropped —
+    /// the shape the colour and depth attachments' landing refusals already
+    /// have (`research/docs/23` §3.3, v49).
+    #[test]
+    fn plan_trace_refuses_a_stored_stencil_attachment_without_a_landing_view() {
+        let mut trace = stencil_store_trace(Some(StoreOp::Store));
+        // The stencil declaration is what the landing resolution reads: without
+        // it the trace declares no view covering the stored surface, and the
+        // colour attachment's own declaration stays in place. Core admission
+        // states the same requirement one level up, which is why the trace
+        // itself no longer resolves to a pool.
+        trace.passes.retain(|pass| {
+            !matches!(
+                pass,
+                TracePass::Compute(compute)
+                    if compute
+                        .buffers
+                        .iter()
+                        .any(|view| view.view_id == STENCIL_STORE_VIEW)
+            )
+        });
+        assert!(matches!(
+            trace.serial_resources(),
+            Err(ContractError::AttachmentViewUnknown { .. })
+        ));
+        // The rail's own walk keeps the refusal for a plan that never went
+        // through admission: the pool below is the shape the colour attachment
+        // alone declares, so the stored stencil surface is the only landing
+        // left without a view.
+        let pool = vec![declaration_pass().buffers[0].clone()];
+        let error = plan_trace(&trace, &pool, &stencil_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_stencil_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(STENCIL_STORE_VIEW.get())),
+            "the refusal names the stencil view that has no landing rail"
+        );
+        assert_eq!(
+            error.fields.get("allocation"),
+            Some(&FieldValue::Unsigned(STENCIL_STORE_ALLOCATION.get()))
         );
     }
 
@@ -5532,6 +5992,7 @@ mod tests {
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
+            stencil: None,
         });
         let [writeback] = writebacks.as_slice() else {
             panic!("the indexed attachment becomes one writeback");
@@ -5565,6 +6026,7 @@ mod tests {
                 [0xff, 0x80, 0x40, 0xc0].repeat(4),
             ],
             depth: None,
+            stencil: None,
         });
         assert_eq!(writebacks.len(), 2);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
@@ -5602,6 +6064,7 @@ mod tests {
         let writebacks = planned.writebacks(RenderReadback {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
+            stencil: None,
         });
         assert_eq!(writebacks.len(), 1);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
