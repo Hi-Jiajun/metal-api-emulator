@@ -2358,6 +2358,73 @@ pub struct MultisampleState {
     pub sample_count: SampleCount,
 }
 
+/// How a multisampled depth attachment reduces its samples into the resolve
+/// target (`research/docs/23` §3.3, v57).
+///
+/// The three values pick three different depths out of the same samples, so a
+/// pass that asked for [`Self::Max`] and got [`Self::Sample0`] produces a depth
+/// buffer whose every texel may differ. The ordinals align with the MTL
+/// constants the reims protocol already carries
+/// (`MTLMultisampleDepthResolveFilterSample0/Min/Max` = 0/1/2), not a new
+/// invention. There is no default that is safe to substitute: `Sample0` is what
+/// the API starts at, so it is the value a caller that never set one carries,
+/// and never a fallback for one that did.
+///
+/// Depth and stencil resolve filters are two ordinal spaces, not one: ordinal
+/// `1` is `Min` here and `DepthResolvedSample` on the stencil slot, so a single
+/// type would make the two interchangeable at exactly the point where they
+/// disagree. The stencil slot stays a separate type for the increment that
+/// reviews it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepthResolveFilter {
+    /// Take sample zero — the value the API starts at.
+    Sample0,
+    /// Take the nearest of the samples.
+    Min,
+    /// Take the furthest of the samples.
+    Max,
+}
+
+impl DepthResolveFilter {
+    pub const ADMITTED: [Self; 3] = [Self::Sample0, Self::Min, Self::Max];
+
+    /// Stable wire code, which is also the capability mask's bit position.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Sample0 => 0,
+            Self::Min => 1,
+            Self::Max => 2,
+        }
+    }
+
+    /// Inverse of [`DepthResolveFilter::code`]. An unknown code is a decoder
+    /// error: the set is closed, so a third value is a corrupt record or a
+    /// wrong wire offset, and folding it onto a neighbour resolves at a filter
+    /// the caller did not ask for.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Sample0),
+            1 => Some(Self::Min),
+            2 => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+/// The depth resolve a multisampled pass states (`research/docs/23` §3.3, v57).
+///
+/// The state is pass-level rather than part of [`RenderDepthAttachment`]: a
+/// pass has exactly one depth attachment, and keeping the descriptor inside
+/// the attachment would rewrite the base payload bytes of every pre-v57 frame
+/// that opens a depth surface. The `None` shape is Metal's API default
+/// [`DepthResolveFilter::Sample0`] — an absent declaration is the value a
+/// caller that never set one carries, not a fallback for one that did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MultisampleDepthResolve {
+    /// The filter the resolve applies to the depth attachment's samples.
+    pub filter: DepthResolveFilter,
+}
+
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
@@ -2458,6 +2525,14 @@ pub struct RenderPassDescriptor {
     /// the two APIs' filters. A stencil surface beside the raster and a present
     /// action behind it stay refused until the increments that review them.
     pub multisample: Option<MultisampleState>,
+    /// The resolve the pass applies to a stored multisampled depth surface, or
+    /// `None` for the API default [`DepthResolveFilter::Sample0`]
+    /// (`research/docs/23` §3.3, v57). Only legal beside a multisample raster
+    /// whose depth attachment is stored: the resolve is how a four-sample
+    /// depth surface's texels become observable, so the pass states the filter
+    /// the observation reduces with. A pass that never resolves keeps the
+    /// field absent and its pre-v57 bytes exactly.
+    pub depth_resolve: Option<MultisampleDepthResolve>,
     /// The depth attachment this pass opens, or `None` for a pass with no
     /// depth surface at all (`research/docs/23` §3.3, v36). When present,
     /// [`Self::depth_test`] says what the fragments do with it.
@@ -2559,12 +2634,14 @@ impl RenderPassDescriptor {
                 return Err(ContractError::MultisampleWithoutColorAttachment);
             }
             // The depth surface beside the raster (`research/docs/23` §3.3,
-            // v53) is admitted as the rail-owned shape: the pass may test and
-            // write it, but keeping its texels would need the depth resolve
-            // filters the two APIs spell differently, which is the increment
-            // after this one.
+            // v53/v57) is admitted as the rail-owned shape: the pass may test
+            // and write it. Keeping its texels is admitted from v57 on, but
+            // only through the depth resolve the pass then has to state —
+            // without one the stored surface stays refused, because a
+            // multisampled depth surface's texels are only observable through
+            // a resolve.
             if let Some(depth) = &self.depth {
-                if depth.store == Some(DepthStoreOp::Store) {
+                if depth.store == Some(DepthStoreOp::Store) && self.depth_resolve.is_none() {
                     return Err(ContractError::MultisampleDepthStoreUnsupported);
                 }
             }
@@ -2586,6 +2663,27 @@ impl RenderPassDescriptor {
             }
             if self.present.is_some() {
                 return Err(ContractError::MultisamplePresentUnsupported);
+            }
+        }
+        // The depth resolve (`research/docs/23` §3.3, v57) only means
+        // something beside a multisample raster that keeps its depth surface:
+        // the resolve is the reduction of the stored four-sample texels, so a
+        // resolve without both is refused instead of silently ignored. The
+        // `store` field carries the depth attachment's store code when the
+        // attachment exists, which is the state that disagreed.
+        if self.depth_resolve.is_some() {
+            let stored = self.multisample.is_some()
+                && self
+                    .depth
+                    .as_ref()
+                    .is_some_and(|depth| depth.store == Some(DepthStoreOp::Store));
+            if !stored {
+                let store = self
+                    .depth
+                    .as_ref()
+                    .and_then(|depth| depth.store)
+                    .map(DepthStoreOp::code);
+                return Err(ContractError::DepthResolveWithoutStoredDepth { store });
             }
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
@@ -6116,6 +6214,20 @@ pub struct ProviderCapabilities {
     /// snapshot whose bit above is false, so a caller reading the limit
     /// without checking the bit cannot read one as an admission.
     pub max_render_sample_count: u32,
+    /// Whether this snapshot can resolve a stored multisampled depth surface
+    /// (`research/docs/23` §3.3, v57). Defaults to `false`: no provider
+    /// executes the depth resolve today, so a pass that states one is refused
+    /// during admission instead of being silently executed with a different
+    /// filter.
+    pub supports_render_depth_resolve: bool,
+    /// The depth resolve filters this snapshot admits, as a bitmask with
+    /// bit `i` = [`DepthResolveFilter`] code `i`. `0` means the snapshot
+    /// cannot resolve at all; the field stays at that default for a snapshot
+    /// whose bit above is false. The mask rather than a single bit is the
+    /// device-gated design: a device may execute [`DepthResolveFilter::Sample0`]
+    /// but not [`DepthResolveFilter::Min`]/[`DepthResolveFilter::Max`], so a
+    /// one-bit declaration would admit filters the device refuses.
+    pub depth_resolve_modes: u32,
     /// Instances this snapshot admits in one render pass. `0` means the
     /// snapshot cannot instance at all; the field stays at that default for a
     /// snapshot whose bit above is false, so a caller reading the limit
@@ -6194,6 +6306,7 @@ impl ProviderCapabilities {
             || self.declares_icb_support()
             || self.declares_instancing_support()
             || self.declares_multisample_support()
+            || self.declares_depth_resolve_support()
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -6223,6 +6336,16 @@ impl ProviderCapabilities {
     /// the two bits would be lost on the wire.
     pub fn declares_multisample_support(&self) -> bool {
         self.supports_render_multisample || self.max_render_sample_count != 0
+    }
+
+    /// Whether any depth-resolve bit differs from its default. Part of the
+    /// render bits for the same reason
+    /// [`ProviderCapabilities::declares_multisample_support`] is: a snapshot
+    /// that declared depth resolve support without declaring render would
+    /// otherwise keep sending the legacy capability payload, and the two bits
+    /// would be lost on the wire.
+    pub fn declares_depth_resolve_support(&self) -> bool {
+        self.supports_render_depth_resolve || self.depth_resolve_modes != 0
     }
 
     /// Whether any present bit differs from its default.
@@ -6652,6 +6775,32 @@ impl ProviderCapabilities {
                         ));
                 }
             }
+            // The depth resolve is the fourth pass-level bit this snapshot
+            // answers (`research/docs/23` §3.3, v57). A pass that never
+            // resolves never reaches the check: `None` is the shape every
+            // earlier increment published, so a snapshot that does not declare
+            // the capability keeps admitting it without a declaration. The
+            // question order is deliberate: the capability bit comes before
+            // the per-filter mask, so a snapshot that cannot resolve at all
+            // refuses the shape instead of reporting a filter detail about
+            // work it would not execute.
+            if let Some(resolve) = pass.depth_resolve {
+                if !self.supports_render_depth_resolve {
+                    return Err(capability_error("render_depth_resolve_unsupported"));
+                }
+                let mask = 1u32 << u32::from(resolve.filter.code());
+                if self.depth_resolve_modes & mask == 0 {
+                    return Err(capability_error("render_depth_resolve_filter_unsupported")
+                        .with_field(
+                            "filter",
+                            FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                        )
+                        .with_field(
+                            "modes",
+                            FieldValue::Unsigned(u64::from(self.depth_resolve_modes)),
+                        ));
+                }
+            }
             if let Some(indices) = &pass.indices {
                 if !self.supported_index_formats.contains(&indices.format) {
                     return Err(capability_error("index_format_unsupported").with_field(
@@ -7027,6 +7176,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MultisamplePresentUnsupported
         | E::MultisampleDepthStoreUnsupported
         | E::MultisampleStencilStoreUnsupported
+        | E::DepthResolveWithoutStoredDepth { .. }
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
@@ -8486,6 +8636,17 @@ pub enum ContractError {
     /// resolve, and the increment that reviews that resolve is the one that can
     /// admit a stored surface here.
     MultisampleStencilStoreUnsupported,
+    /// The pass states a depth resolve without the stored multisampled depth
+    /// surface it reduces (`research/docs/23` §3.3, v57). A resolve only means
+    /// something beside a multisample raster whose depth attachment is stored,
+    /// so any other shape — no raster, no depth attachment, or a depth
+    /// attachment the pass does not keep — is refused instead of silently
+    /// ignored. The `store` field carries the depth attachment's store code
+    /// when the attachment exists; `None` means the pass opens no depth
+    /// attachment at all.
+    DepthResolveWithoutStoredDepth {
+        store: Option<u8>,
+    },
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -9062,6 +9223,12 @@ impl fmt::Display for ContractError {
             Self::MultisampleStencilStoreUnsupported => formatter.write_str(
                 "a multisample raster cannot keep its stencil surface yet: the stencil \
                  resolve is a later increment",
+            ),
+            Self::DepthResolveWithoutStoredDepth { store } => write!(
+                formatter,
+                "a depth resolve needs a multisample raster that stores its depth surface: \
+                 the pass states the resolve without the stored depth attachment \
+                 (depth store code {store:?})"
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -10390,6 +10557,7 @@ mod tests {
         TracePass::Render(RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -10654,6 +10822,8 @@ mod tests {
             max_render_instances: 0,
             supports_render_multisample: false,
             max_render_sample_count: 0,
+            supports_render_depth_resolve: false,
+            depth_resolve_modes: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -13641,6 +13811,7 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -13756,6 +13927,52 @@ mod tests {
             stored_depth.validate(),
             Err(ContractError::MultisampleDepthStoreUnsupported)
         );
+        // The stored depth surface is admitted from v57 on, through the depth
+        // resolve the pass then has to state (`research/docs/23` §3.3, v57):
+        // the resolve is how a four-sample depth surface's texels become
+        // observable.
+        let mut resolved_depth = stored_depth.clone();
+        resolved_depth.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Min,
+        });
+        resolved_depth
+            .validate()
+            .expect("a stored multisampled depth surface with a resolve is well formed");
+        // The resolve without the stored surface it reduces is refused; the
+        // `store` field carries the depth attachment's store code when the
+        // attachment exists and stays `None` when the pass opens none at all.
+        let mut resolve_without_store = with_depth.clone();
+        resolve_without_store.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        assert_eq!(
+            resolve_without_store.validate(),
+            Err(ContractError::DepthResolveWithoutStoredDepth { store: None })
+        );
+        let mut resolve_without_depth = pass.clone();
+        resolve_without_depth.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        assert_eq!(
+            resolve_without_depth.validate(),
+            Err(ContractError::DepthResolveWithoutStoredDepth { store: None })
+        );
+        // The resolve is the stored depth surface's own tail: it is refused
+        // beside a single-sample raster, where no four-sample depth texels
+        // exist to reduce.
+        let mut single_sample_resolve = render_pass();
+        single_sample_resolve.depth = Some(depth_attachment());
+        single_sample_resolve.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        single_sample_resolve.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        assert_eq!(
+            single_sample_resolve.validate(),
+            Err(ContractError::DepthResolveWithoutStoredDepth { store: None })
+        );
         // A depth test beside the raster still needs its surface, exactly as
         // the single-sample shape states it.
         let mut test_only = pass.clone();
@@ -13850,6 +14067,17 @@ mod tests {
             assert_eq!(SampleCount::from_code(count.code()), Some(count));
         }
         assert_eq!(SampleCount::from_code(2), None);
+        // The depth resolve filters are the closed three-value family whose
+        // codes double as the capability mask's bit positions: Sample0/Min/Max
+        // = 0/1/2, and any fourth code is a decoder refusal.
+        assert_eq!(DepthResolveFilter::ADMITTED.len(), 3);
+        assert_eq!(DepthResolveFilter::Sample0.code(), 0);
+        assert_eq!(DepthResolveFilter::Min.code(), 1);
+        assert_eq!(DepthResolveFilter::Max.code(), 2);
+        for filter in DepthResolveFilter::ADMITTED {
+            assert_eq!(DepthResolveFilter::from_code(filter.code()), Some(filter));
+        }
+        assert_eq!(DepthResolveFilter::from_code(3), None);
     }
 
     /// The reviewed `2x2` depth surface in its pre-v43 shape: rail-owned, kept
@@ -14688,6 +14916,7 @@ mod tests {
         TracePass::Render(RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -14945,6 +15174,78 @@ mod tests {
         provider
     }
 
+    /// The multisample fixture extended with a stored depth surface and its
+    /// resolve filter (`research/docs/23` §3.3, v57).
+    fn depth_resolve_trace() -> ComputeTrace {
+        let mut value = multisample_trace();
+        // The stored depth surface names a landing the trace has to declare,
+        // exactly as the colour attachment's view is declared: the declaring
+        // compute pass reads the depth view beside the colour landing
+        // (`research/docs/23` §3.3, v43).
+        let landing = landing_view(950, 940);
+        value.pipelines[0]
+            .contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: landing.access,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            });
+        let Some(TracePass::Compute(pass)) = value.passes.first_mut() else {
+            panic!("the fixture opens with a compute pass");
+        };
+        pass.buffers.push(BufferView {
+            metal_binding: 1,
+            ..landing
+        });
+        let pass = render_entry(&mut value);
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            }),
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        value
+    }
+
+    /// The multisample snapshot extended with the two depth-resolve bits,
+    /// admitting [`DepthResolveFilter::Sample0`] only — the device-gated shape
+    /// a rail that executes just one filter reports
+    /// (`research/docs/23` §3.3, v57).
+    fn depth_resolve_capabilities() -> ProviderCapabilities {
+        let mut provider = multisample_capabilities();
+        provider.supports_render_depth_resolve = true;
+        provider.depth_resolve_modes = 1u32 << u32::from(DepthResolveFilter::Sample0.code());
+        provider
+    }
+
+    /// The vertex-input pool plus the allocation the stored depth surface
+    /// names as its landing (`research/docs/23` §3.3, v57).
+    fn depth_resolve_resources() -> ResourceTableSnapshot {
+        let mut pool = vertex_input_resources();
+        pool.insert_allocation(AllocationRecord {
+            allocation_id: AllocationId::new(940),
+            owner_epoch: DeviceEpoch::new(1),
+            size: 16,
+        })
+        .unwrap();
+        pool
+    }
+
     #[test]
     fn multisample_bits_gate_the_pass() {
         let value = multisample_trace();
@@ -14992,6 +15293,56 @@ mod tests {
         vertex_input_capabilities()
             .admit(&single, &vertex_input_resources())
             .expect("the pre-v51 raster keeps admitting without a declaration");
+    }
+
+    #[test]
+    fn depth_resolve_bits_gate_the_pass_and_the_filter() {
+        let value = depth_resolve_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(depth_resolve_capabilities().declares_render_support());
+        // The two bits are part of the render question on purpose: a snapshot
+        // that declared them without declaring render would lose them on the
+        // wire, the failure `declares_render_support` documents.
+        let mut only_depth_resolve = capabilities();
+        only_depth_resolve.supports_render_depth_resolve = true;
+        only_depth_resolve.depth_resolve_modes = 0b111;
+        assert!(only_depth_resolve.declares_depth_resolve_support());
+        assert!(only_depth_resolve.declares_render_support());
+        assert!(!multisample_capabilities().declares_depth_resolve_support());
+
+        depth_resolve_capabilities()
+            .admit(&value, &depth_resolve_resources())
+            .expect("a snapshot that declares the resolve bits admits the resolving pass");
+
+        // The resolve is refused by name when the snapshot does not declare
+        // the capability, and by the per-filter mask when the device reports
+        // modes that do not include the filter the pass states.
+        let no_resolve = multisample_capabilities();
+        assert_eq!(
+            no_resolve
+                .admit(&value, &depth_resolve_resources())
+                .unwrap_err()
+                .slug,
+            "render_depth_resolve_unsupported"
+        );
+        let mut narrow = depth_resolve_capabilities();
+        narrow.depth_resolve_modes = 1u32 << u32::from(DepthResolveFilter::Min.code());
+        let refusal = narrow
+            .admit(&value, &depth_resolve_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_depth_resolve_filter_unsupported");
+        assert_eq!(refusal.fields.get("filter"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            refusal.fields.get("modes"),
+            Some(&FieldValue::Unsigned(0b10))
+        );
+
+        // A pass that never resolves never reaches the check: the absent
+        // field is the shape every earlier increment published.
+        let plain = multisample_trace();
+        multisample_capabilities()
+            .admit(&plain, &depth_resolve_resources())
+            .expect("the pre-v57 raster keeps admitting without a declaration");
     }
 
     #[test]

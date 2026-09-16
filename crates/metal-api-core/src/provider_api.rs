@@ -915,6 +915,11 @@ impl RenderTarget {
             // the only one that sets this field, so every earlier recording
             // keeps the single-sample shape and its exact bytes.
             multisample: self.draw.multisample,
+            // The object API records no depth resolve yet
+            // (`research/docs/23` §3.3, v57): the recording's own field stays
+            // absent, so every earlier recording keeps the API default filter
+            // and its exact bytes.
+            depth_resolve: None,
             // The blend state is the pass's own, exactly as the culling and
             // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
             blend: self.draw.blend.clone(),

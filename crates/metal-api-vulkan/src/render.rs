@@ -4995,6 +4995,7 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,

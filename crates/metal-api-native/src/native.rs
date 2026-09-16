@@ -306,6 +306,13 @@ impl NativeMetalProvider {
                 // rail, recorded on `render::multisample_capability_bits`.
                 supports_render_multisample: multisample_bits.supports_render_multisample,
                 max_render_sample_count: multisample_bits.max_render_sample_count,
+                // The depth resolve is not executed yet: the `RenderPass2`
+                // migration and the per-device filter probe are the next
+                // increment's work, so both bits stay at the "cannot resolve"
+                // defaults and a resolving pass is refused during admission
+                // (`research/docs/23` §3.3, v57).
+                supports_render_depth_resolve: false,
+                depth_resolve_modes: 0,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).

@@ -3395,6 +3395,7 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -4417,6 +4418,8 @@ mod tests {
             // refuses the multisampled pass (`research/docs/23` §3.3, v51).
             supports_render_multisample: false,
             max_render_sample_count: 0,
+            supports_render_depth_resolve: false,
+            depth_resolve_modes: 0,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -4533,6 +4536,7 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,

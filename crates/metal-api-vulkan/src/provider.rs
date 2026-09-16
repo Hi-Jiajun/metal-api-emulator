@@ -123,6 +123,13 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         } else {
             0
         },
+        // The depth resolve is not executed yet: the Vulkan rail's RenderPass2
+        // migration and the per-device filter probe are the next increment's
+        // work, so both bits stay at the "cannot resolve" defaults and a
+        // resolving pass is refused during admission
+        // (`research/docs/23` §3.3, v57).
+        supports_render_depth_resolve: false,
+        depth_resolve_modes: 0,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

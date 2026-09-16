@@ -1420,20 +1420,21 @@ mod tests {
         BufferSource, BufferView, BufferWriteback, ClearColor, CompareFunction,
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
-        DepthLoadOp, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
-        FootprintProof, FunctionIdentity, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
-        HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-        IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
-        MultisampleState, OperationId, PipelineCompileRequest, PipelineContract, PipelineId,
-        PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities,
-        ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
-        QueuePriority, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-        RenderStencilAttachment, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
-        ShaderSource, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-        StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
-        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
+        DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
+        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor, HeapId,
+        HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+        IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
+        LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState, OperationId,
+        PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
+        PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+        RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment,
+        ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource,
+        StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest,
+        StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
+        TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
         MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
@@ -1590,6 +1591,7 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             stencil: None,
             stencil_test: None,
@@ -2630,12 +2632,12 @@ mod tests {
         // than being skipped to reach the sections after it.
         let mut unknown = frame.clone();
         // The wide word is big-endian, so the high byte is the first one after
-        // the tag; `0x43` sets the next unknown bit (`0x4000`) beside the
-        // known depth ones (`0x0321`).
-        unknown[wide + 1] = 0x43;
+        // the tag; `0x83` sets the next unknown bit (`0x8000`, the depth
+        // resolve took `0x4000` in v57) beside the known depth ones (`0x0321`).
+        unknown[wide + 1] = 0x83;
         let refused = CommandCodec::decode_request(&unknown);
         assert!(
-            matches!(refused, Err(CodecError::UnknownRenderFeature(0x4000))),
+            matches!(refused, Err(CodecError::UnknownRenderFeature(0x8000))),
             "an unknown wide bit has to be refused, got {refused:?}"
         );
 
@@ -2757,6 +2759,108 @@ mod tests {
         assert!(!plain_frame
             .windows(3)
             .any(|window| window == [0x11, 0x20, 0x01]));
+    }
+
+    /// A render trace whose pass states the four-sample raster, keeps its
+    /// depth surface and resolves it with a named filter
+    /// (`research/docs/23` §3.3, v57).
+    fn depth_resolve_trace() -> ComputeTrace {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 4,
+            height: 4,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            }),
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Min,
+        });
+        trace
+    }
+
+    #[test]
+    fn a_depth_resolve_pass_takes_the_wide_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: depth_resolve_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The wide word's low byte is still the narrow byte (vertex input and
+        // depth, `0x21`); the high byte carries the depth store, depth
+        // resource, multisample and depth resolve bits (`0x01 0x02 0x20 0x40`
+        // = `0x63`), so the pair reads `63 21` — the wide word travels
+        // big-endian (`research/docs/23` §3.3, v57).
+        assert!(
+            frame.windows(3).any(|window| window == [0x11, 0x63, 0x21]),
+            "the depth resolve pass carries the seventh wide bit"
+        );
+
+        // A pass that never resolves keeps the pre-v57 bytes: the same
+        // fixture without the filter is refused by the contract's validate
+        // (stored multisampled depth without a resolve), but its frame is the
+        // multisample plus depth-store word with no depth resolve bit.
+        let mut plain = depth_resolve_trace();
+        let Some(TracePass::Render(pass)) = plain.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.depth_resolve = None;
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(!plain_frame
+            .windows(3)
+            .any(|window| window == [0x11, 0x63, 0x21]));
+    }
+
+    #[test]
+    fn depth_resolve_frames_refuse_unknown_filter_codes() {
+        let request = CommandRequest::Submit {
+            trace: depth_resolve_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+
+        // The filter code travels one byte after the multisample section,
+        // which sits right after the depth block, its store action and its
+        // identity. The contract admits codes 0/1/2 only, so a fourth code is
+        // a decoder refusal rather than a filter the caller did not ask for.
+        let mut patched = frame.clone();
+        // The depth identity (allocation 940, view 950) travels as two
+        // big-endian `u64`s; the ten-byte run ends that identity with the
+        // four-sample count (`0x01`) followed by the Min filter code (`0x01`),
+        // so its last byte is the filter the decode would read.
+        let filter = frame
+            .windows(10)
+            .enumerate()
+            .skip(10)
+            .find(|(_, window)| {
+                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x01, 0x01]
+            })
+            .map(|(index, _)| index + 9)
+            .expect("the depth identity precedes the multisample count and the filter");
+        patched[filter] = 0x07;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::UnknownEnumValue {
+                field: "depth resolve filter",
+                value: 0x07,
+            })
+        ));
     }
 
     #[test]
@@ -2937,10 +3041,88 @@ mod tests {
             .windows(6)
             .rposition(|window| window == [0x04, 0x01, 0x00, 0x00, 0x00, 0x04])
             .expect("the multisample tail carries its presence tag, its bool and its count");
-        patched[tag] = 0x08;
+        patched[tag] = 0x10;
         assert!(matches!(
             CommandCodec::decode_response(&patched),
-            Err(CodecError::UnknownCapabilityTail(0x08))
+            Err(CodecError::UnknownCapabilityTail(0x10))
+        ));
+    }
+
+    #[test]
+    fn depth_resolve_capability_bits_round_trip_and_extend_the_multisample_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        assert!(!capabilities.declares_depth_resolve_support());
+        let plain = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(capabilities.declares_render_support());
+        assert_eq!(
+            CommandCodec::decode_response(&plain).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_depth_resolve = true;
+        capabilities.depth_resolve_modes = 0b101;
+        assert!(capabilities.declares_depth_resolve_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The depth-resolve block is the extended payload's newest optional
+        // section: one presence tag, one bool and one `u32` bitmask. A
+        // snapshot that declares no depth-resolve bit keeps the shorter frame;
+        // one that declares only depth resolving still writes the heap/ICB
+        // half the decoder reads by position before the tag (31 bytes), so
+        // the difference is that half plus this block
+        // (`research/docs/23` §3.3, v57).
+        assert_eq!(frame.len(), plain.len() + 31 + 6);
+
+        // The block is positional: a snapshot that declares it *without* the
+        // vertex-input, instancing and multisample bits writes the presence
+        // tag directly after the heap/ICB half, and the decoder has to read
+        // it there.
+        let mut only_depth_resolve = fake_capabilities();
+        only_depth_resolve.supports_render_passes = true;
+        only_depth_resolve.max_color_attachments = 1;
+        only_depth_resolve.max_attachment_dimension = [2, 2];
+        only_depth_resolve.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        only_depth_resolve.supports_render_depth_resolve = true;
+        only_depth_resolve.depth_resolve_modes = 0b101;
+        let only_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: only_depth_resolve.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: only_depth_resolve,
+            }
+        );
+
+        // A decoder that predates the section refuses the tag rather than
+        // reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .windows(6)
+            .rposition(|window| window == [0x08, 0x01, 0x00, 0x00, 0x00, 0x05])
+            .expect("the depth-resolve tail carries its presence tag, its bool and its mask");
+        patched[tag] = 0x10;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched),
+            Err(CodecError::UnknownCapabilityTail(0x10))
         ));
     }
 
@@ -3864,6 +4046,8 @@ mod tests {
                     max_render_instances: 0,
                     supports_render_multisample: false,
                     max_render_sample_count: 0,
+                    supports_render_depth_resolve: false,
+                    depth_resolve_modes: 0,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -4231,6 +4415,8 @@ mod tests {
             max_render_instances: 0,
             supports_render_multisample: false,
             max_render_sample_count: 0,
+            supports_render_depth_resolve: false,
+            depth_resolve_modes: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
