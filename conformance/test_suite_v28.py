@@ -151,6 +151,15 @@ MSAA_DEPTH_RESOLVE_MAX_EDGE_ID = "msaa_depth_resolve_max_edge_4x4"
 # triangle's stencil 0 (`research/docs/23` §3.3, v60).
 MSAA_STENCIL_RESOLVE_SAMPLE0_ID = "msaa_stencil_resolve_sample0_4x4"
 MSAA_STENCIL_RESOLVE_DRS_ID = "msaa_stencil_resolve_drs_4x4"
+# The v61 pair: the same quad module over the full-coverage geometry — all four
+# corners sit on the attachment's edges, so every sample of every texel is
+# covered and the expectation is the fragment output sixteen times. The two
+# cases state the 2x and 8x rasters, whose partial-coverage sample positions
+# are not documented, so only the full-coverage shape is pinned and each case
+# carries a device gate (`requires_sample_count`) that omits it from captures
+# whose device ceiling cannot run that raster (`research/docs/23` §3.3, v61).
+MSAA_UNIFORM_2X_ID = "msaa_uniform_2x_4x4"
+MSAA_UNIFORM_8X_ID = "msaa_uniform_8x_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -181,12 +190,16 @@ MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX = 18
 # The v60 stencil-resolve pair follows it.
 MSAA_STENCIL_RESOLVE_SAMPLE0_INDEX = 19
 MSAA_STENCIL_RESOLVE_DRS_INDEX = 20
+# The v61 sample-count fixtures are the newest cases.
+MSAA_UNIFORM_2X_INDEX = 21
+MSAA_UNIFORM_8X_INDEX = 22
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
                   MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID, MSAA_DEPTH_RESOLVE_ID,
                   MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
-                  MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID)
+                  MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID,
+                  MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -417,6 +430,17 @@ MSAA_STENCIL_RESOLVE_DRS_DEPTH = ("0000003f" * 2 + "3333333f" * 2) * 4
 # failures leave column 3 at the clear — so column 2 carries the 2-of-4 mix of
 # the red tint and the clear (`research/docs/23` §3.3, v60).
 MSAA_STENCIL_RESOLVE_COLOUR = ("ff0000ff" * 2 + "88111aa2" + "11223445") * 4
+# The v61 fixtures' uniform expectation: the full-coverage quad lands the
+# fragment output on every texel, so both the 2x and 8x cases pin the same
+# sixteen bytes. The device gate is the count half of the same question —
+# the marker names all five rails (the v52 recording entry carries the
+# raster), and each capture omits a case whose count its device ceiling
+# cannot run (`research/docs/23` §3.3, v61).
+MSAA_UNIFORM_CLEAR = "11223344"
+MSAA_UNIFORM_2X_EXPECTED = OUTPUT * 16
+MSAA_UNIFORM_8X_EXPECTED = OUTPUT * 16
+MSAA_UNIFORM_2X_RAILS = ALL_RAILS
+MSAA_UNIFORM_8X_RAILS = ALL_RAILS
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
 # `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
@@ -647,6 +671,31 @@ def msaa_stencil_resolve_drs_marker(suite, rail):
     return rail in MSAA_STENCIL_RESOLVE_DRS_RAILS
 
 
+def msaa_uniform_2x_marker(suite, rail):
+    """Point the v61 2x case at `rail` when that rail owes it.
+
+    The recording entry that carries the raster (`draw_indexed_primitives_with_
+    multisample`) exists on both object rails, so the marker names all five
+    rails and the device's sample-count mask then decides presence
+    (`research/docs/23` §3.3, v61). Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_UNIFORM_2X_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_UNIFORM_2X_RAILS else [other_rail(rail)])
+    return rail in MSAA_UNIFORM_2X_RAILS
+
+
+def msaa_uniform_8x_marker(suite, rail):
+    """Point the v61 8x case at `rail` when that rail owes it.
+
+    The same marker shape as the 2x sibling: the marker names every rail and
+    the device's sample-count mask decides presence (`research/docs/23` §3.3,
+    v61). Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_UNIFORM_8X_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_UNIFORM_8X_RAILS else [other_rail(rail)])
+    return rail in MSAA_UNIFORM_8X_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -686,6 +735,42 @@ def msaa_result(provider_backend=True, copy_in=2, copy_out=2):
         "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
                         "offset": ATTACHMENT[2], "bytes_hex": MSAA_EXPECTED}],
         "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_uniform_2x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v61 2x landing: the full-coverage raster's own resolve target.
+
+    The shape is the v51 case's — one colour attachment resolved into its own
+    view — so the writeback, the allocation image and the provider counts are
+    identical; only the expectation and the device gate change
+    (`research/docs/23` §3.3, v61).
+    """
+    result = {
+        "id": MSAA_UNIFORM_2X_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_UNIFORM_2X_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0],
+                         "bytes_hex": MSAA_UNIFORM_2X_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_uniform_8x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v61 8x landing: the 2x sibling with the wider raster's own gate."""
+    result = {
+        "id": MSAA_UNIFORM_8X_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_UNIFORM_8X_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0],
+                         "bytes_hex": MSAA_UNIFORM_8X_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -1064,10 +1149,11 @@ def blend_result(provider_backend=True, copy_in=2, copy_out=2):
 
 
 def counted_declaring(suite, digest, rail, depth_resolve_modes=0,
-                      stencil_resolve_modes=0):
+                      stencil_resolve_modes=0, render_sample_counts=0):
     report = synthetic_report(suite, digest, rail,
                               depth_resolve_modes=depth_resolve_modes,
-                              stencil_resolve_modes=stencil_resolve_modes)
+                              stencil_resolve_modes=stencil_resolve_modes,
+                              render_sample_counts=render_sample_counts)
     if rail != "native-metal":
         for result in report["results"]:
             # The v43 declaring case reads one more view than its v27 sibling:
@@ -1377,7 +1463,8 @@ class ScissorObservationTests(unittest.TestCase):
         # comparator that compared them would fail here.
         digest = hashlib.sha256(
             json.dumps(self.suite, sort_keys=True).encode("utf-8")).hexdigest()
-        report = counted_declaring(self.suite, digest, "vulkan")
+        report = counted_declaring(self.suite, digest, "vulkan",
+                                   render_sample_counts=1 << 1 | 1 << 3)
         report["results"].append(render_result())
         report["results"].append(instanced_result())
         report["results"].append(wildcard_result())
@@ -1396,6 +1483,8 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(msaa_stencil_result())
         report["results"].append(msaa_depth_resolve_result())
         report["results"].append(msaa_stencil_resolve_sample0_result())
+        report["results"].append(msaa_uniform_2x_result())
+        report["results"].append(msaa_uniform_8x_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -2647,18 +2736,24 @@ class ScissorObservationTests(unittest.TestCase):
                          [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
                            bytes.fromhex(MSAA_EXPECTED))])
 
-    def test_v28_refuses_a_multisample_state_that_is_not_four(self):
+    def test_v28_refuses_a_multisample_state_outside_the_reviewed_family(self):
         broken = copy.deepcopy(self.suite)
-        broken["render_cases"][MSAA_INDEX]["multisample"]["sample_count"] = 2
+        broken["render_cases"][MSAA_INDEX]["multisample"]["sample_count"] = 3
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "the reviewed multisample raster is four samples"):
+                                    "the reviewed multisample rasters are two, four or eight"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
-    def test_v28_refuses_a_multisample_case_without_the_coverage_claim(self):
+    def test_v28_refuses_a_full_coverage_multisample_expectation_with_a_mix(self):
+        # Deleting the edge fixture's coverage claim admits the v61
+        # full-coverage colour-only shape, whose expectation then has to be
+        # uniform — the mixed texel the edge fixture pins is refused by the
+        # uniform rule instead of the old coverage gate (`research/docs/23`
+        # §3.3, v61).
         broken = copy.deepcopy(self.suite)
         del broken["render_cases"][MSAA_INDEX]["coverage"]
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "the multisample raster has to claim partial coverage"):
+                                    "every texel of the expectation has to be the "
+                                    "fragment output"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_multisample_case_with_a_loading_attachment(self):
@@ -2722,6 +2817,112 @@ class ScissorObservationTests(unittest.TestCase):
                             compare.CaptureError,
                             "is not a rail this render case runs on"):
                         compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_pins_the_msaa_uniform_fixtures(self):
+        for index, case_id, sample_count, gate in (
+                (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_2X_ID, 2, 2),
+                (MSAA_UNIFORM_8X_INDEX, MSAA_UNIFORM_8X_ID, 8, 8)):
+            with self.subTest(case=case_id):
+                case = self.suite["render_cases"][index]
+                self.assertEqual(case["id"], case_id)
+                self.assertEqual(case["declaring_case"], "render_declaring_quad_extent")
+                self.assertEqual(case["multisample"], {"sample_count": sample_count})
+                self.assertEqual(case["requires_sample_count"], gate)
+                self.assertNotIn("coverage", case)
+                self.assertEqual(case["attachment"]["load"], "clear")
+                self.assertEqual(case["attachment"]["clear_hex"], MSAA_UNIFORM_CLEAR)
+                self.assertEqual(case["expected_hex"], OUTPUT * 16)
+                self.assertEqual(sorted(case["capture_rails"]), sorted(ALL_RAILS))
+                # The stream is the full-coverage quad: all four corners sit
+                # on the attachment's edges, so every sample of every texel is
+                # covered and no partial-coverage byte can be pinned
+                # (`research/docs/23` §3.3, v61).
+                stream = case["vertex_buffers"][0]["initial_hex"]
+                vertices = [struct.unpack("<2f", bytes.fromhex(stream)[offset:offset + 8])
+                            for offset in range(0, 32, 8)]
+                self.assertEqual(vertices,
+                                 [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)])
+
+    def test_v28_plans_the_msaa_uniform_fixtures(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        for case_id, gate in ((MSAA_UNIFORM_2X_ID, 2), (MSAA_UNIFORM_8X_ID, 8)):
+            with self.subTest(case=case_id):
+                expectation = plan[case_id]
+                self.assertEqual(expectation.writes,
+                                 [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                                   bytes.fromhex(OUTPUT * 16))])
+                self.assertEqual(expectation.sample_count_gate, gate)
+
+    def test_v28_refuses_a_sample_count_gate_that_does_not_name_the_raster(self):
+        # The gate is the case's own admission condition, so it has to name the
+        # raster the case states rather than drift into a second spelling
+        # (`research/docs/23` §3.3, v61).
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_UNIFORM_2X_INDEX]["requires_sample_count"] = 8
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the device gate has to name the sample count"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_sample_count_gate_outside_two_and_eight(self):
+        # 4x is the v51 baseline every multisampling device admits, so only 2x
+        # and 8x are gateable (`research/docs/23` §3.3, v61).
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_UNIFORM_2X_INDEX]["requires_sample_count"] = 4
+        broken["render_cases"][MSAA_UNIFORM_2X_INDEX]["multisample"]["sample_count"] = 4
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the device gate names the two- or eight-sample raster"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_gates_the_msaa_uniform_cases_on_the_sample_mask(self):
+        # Presence iff the mask carries the count's bit: absent without the
+        # bit passes, present without it is refused, absent with it is
+        # refused, and present with it passes (`research/docs/23` §3.3, v61).
+        for index, case_id, gate, bit, result_builder in (
+                (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_2X_ID, 2, 1 << 1,
+                 msaa_uniform_2x_result),
+                (MSAA_UNIFORM_8X_INDEX, MSAA_UNIFORM_8X_ID, 8, 1 << 3,
+                 msaa_uniform_8x_result)):
+            suite = copy.deepcopy(self.suite)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != index:
+                    case["capture_rails"] = ["native-metal"]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            with self.subTest(case=case_id, direction="absent without the bit"):
+                report = counted_declaring(suite, digest, "vulkan")
+                compare.validate_capture(suite, digest, report, "vulkan")
+            with self.subTest(case=case_id, direction="present without the bit"):
+                report = counted_declaring(suite, digest, "vulkan")
+                report["results"].append(result_builder())
+                with self.assertRaisesRegex(
+                        compare.CaptureError,
+                        f"lacks the {gate}-sample raster"):
+                    compare.validate_capture(suite, digest, report, "vulkan")
+            with self.subTest(case=case_id, direction="absent with the bit"):
+                report = counted_declaring(suite, digest, "vulkan",
+                                           render_sample_counts=bit)
+                with self.assertRaisesRegex(compare.CaptureError, "missing cases"):
+                    compare.validate_capture(suite, digest, report, "vulkan")
+            with self.subTest(case=case_id, direction="present with the bit"):
+                report = counted_declaring(suite, digest, "vulkan",
+                                           render_sample_counts=bit)
+                report["results"].append(result_builder())
+                compare.validate_capture(suite, digest, report, "vulkan")
+
+    def test_v28_the_sample_mask_is_per_count_not_a_ladder(self):
+        # Lavapipe is the measured counterexample: its framebuffer admits 4x
+        # and 8x but not 2x, so a capture whose mask carries only 8x owes the
+        # 8x case and leaves the 2x case out (`research/docs/23` §3.3, v61).
+        suite = copy.deepcopy(self.suite)
+        for position, case in enumerate(suite["render_cases"]):
+            if position not in (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_8X_INDEX):
+                case["capture_rails"] = ["native-metal"]
+        digest = hashlib.sha256(
+            json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+        report = counted_declaring(suite, digest, "vulkan",
+                                   render_sample_counts=1 << 3)
+        report["results"].append(msaa_uniform_8x_result())
+        compare.validate_capture(suite, digest, report, "vulkan")
 
     def test_v28_pins_the_msaa_depth_fixture(self):
         case = self.suite["render_cases"][MSAA_DEPTH_INDEX]

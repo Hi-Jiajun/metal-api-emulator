@@ -310,6 +310,17 @@ impl VulkanExecutor {
         capabilities
     }
 
+    /// The reviewed 2/4/8 sample counts the device's framebuffer admits, as
+    /// the contract-code bitmask `render.rs` derives from the device limits:
+    /// bit `i` = `SampleCount` code `i` (`research/docs/23` §3.3, v61).
+    ///
+    /// The capture runner reads the device-gated sample-count cases against
+    /// this mask, because the snapshot's single ceiling cannot say "8x yes,
+    /// 2x no" — Lavapipe is exactly that device.
+    pub fn render_sample_count_mask(&self) -> u32 {
+        crate::render::limits_render_sample_count_mask(&self.context.properties.limits)
+    }
+
     /// Simulate a confirmed device loss for lifecycle tests.
     ///
     /// CI cannot produce a deterministic `VK_ERROR_DEVICE_LOST`, so this hook

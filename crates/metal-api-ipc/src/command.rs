@@ -2888,14 +2888,14 @@ mod tests {
         let mut patched = frame.clone();
         // The stencil identity (allocation 941, view 951) travels as two
         // big-endian `u64`s; the ten-byte run ends that identity with the
-        // four-sample count (`0x01`) followed by the Sample0 filter code
+        // four-sample count (`0x02`) followed by the Sample0 filter code
         // (`0x00`), so its last byte is the filter the decode would read.
         let filter = frame
             .windows(10)
             .enumerate()
             .skip(10)
             .find(|(_, window)| {
-                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB7, 0x01, 0x00]
+                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB7, 0x02, 0x00]
             })
             .map(|(index, _)| index + 9)
             .expect("the stencil identity precedes the multisample count and the filter");
@@ -3051,7 +3051,7 @@ mod tests {
                 .enumerate()
                 .skip(10)
                 .find(|(_, window)| {
-                    *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x01, code]
+                    *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x02, code]
                 })
                 .map(|(index, _)| index + 9)
                 .unwrap_or_else(|| panic!("the frame carries the {filter:?} filter byte"));
@@ -3074,14 +3074,14 @@ mod tests {
         let mut patched = frame.clone();
         // The depth identity (allocation 940, view 950) travels as two
         // big-endian `u64`s; the ten-byte run ends that identity with the
-        // four-sample count (`0x01`) followed by the Min filter code (`0x01`),
+        // four-sample count (`0x02`) followed by the Min filter code (`0x01`),
         // so its last byte is the filter the decode would read.
         let filter = frame
             .windows(10)
             .enumerate()
             .skip(10)
             .find(|(_, window)| {
-                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x01, 0x01]
+                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x02, 0x01]
             })
             .map(|(index, _)| index + 9)
             .expect("the depth identity precedes the multisample count and the filter");

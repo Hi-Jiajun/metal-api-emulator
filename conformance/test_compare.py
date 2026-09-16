@@ -16,7 +16,7 @@ SUITE_PATH = Path(__file__).with_name("suite.json")
 
 
 def synthetic_report(suite, digest, backend="vulkan", depth_resolve_modes=0,
-                     stencil_resolve_modes=0):
+                     stencil_resolve_modes=0, render_sample_counts=0):
     """Fabricate expected bytes solely to unit-test the comparator."""
     results = []
     for case in suite["cases"]:
@@ -43,6 +43,7 @@ def synthetic_report(suite, digest, backend="vulkan", depth_resolve_modes=0,
         "allocation_observation": compare.ALLOCATION_OBSERVATIONS[backend],
         "depth_resolve_modes": depth_resolve_modes,
         "stencil_resolve_modes": stencil_resolve_modes,
+        "render_sample_counts": render_sample_counts,
         "device": "SYNTHETIC UNIT TEST; NOT HARDWARE EVIDENCE",
         "platform": "synthetic-test",
         "results": results,

@@ -2098,6 +2098,146 @@
         "filter": "depth_resolved_sample"
       },
       "requires_stencil_resolve_filter": "depth_resolved_sample"
+    },
+    {
+      "id": "msaa_uniform_2x_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1020,
+        "view": 1030,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "multisample": {
+        "sample_count": 2
+      },
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223344",
+        "store": "store"
+      },
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ],
+      "requires_sample_count": 2
+    },
+    {
+      "id": "msaa_uniform_8x_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1020,
+        "view": 1030,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "multisample": {
+        "sample_count": 8
+      },
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223344",
+        "store": "store"
+      },
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ],
+      "requires_sample_count": 8
     }
   ]
 }

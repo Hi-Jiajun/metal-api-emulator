@@ -1628,19 +1628,20 @@ pub(crate) fn admit_color_attachment(
         .with_detail("vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT bit"))
 }
 
-/// Whether the selected device can use `format` as a four-sample colour
-/// attachment with `tiling` (`research/docs/23` §3.3, v51).
+/// Whether the selected device can use `format` as a colour attachment with
+/// `tiling` at the requested `samples` (`research/docs/23` §3.3, v51/v61).
 ///
 /// `vkGetPhysicalDeviceFormatProperties` answers the single-sample
 /// `COLOR_ATTACHMENT` bit but carries no sample count; the multisample question
 /// is `vkGetPhysicalDeviceImageFormatProperties`'s own `sampleCounts` field,
-/// which is why this rail asks a second question before the first four-sample
-/// image exists. A format the device refuses, and a format whose 4x
+/// which is why this rail asks a second question before the first multisampled
+/// image exists. A format the device refuses, and a format whose requested
 /// combination the driver rejects outright, both answer `false`.
 pub(crate) fn format_supports_multisample_color_attachment(
     context: &VulkanContext,
     format: vk::Format,
     tiling: vk::ImageTiling,
+    samples: vk::SampleCountFlags,
 ) -> bool {
     let properties = unsafe {
         context
@@ -1655,24 +1656,24 @@ pub(crate) fn format_supports_multisample_color_attachment(
             )
     };
     match properties {
-        Ok(properties) => properties
-            .sample_counts
-            .contains(vk::SampleCountFlags::TYPE_4),
+        Ok(properties) => properties.sample_counts.contains(samples),
         Err(_) => false,
     }
 }
 
-/// Whether the selected device can use `format` as a four-sample depth-stencil
-/// attachment with `tiling` (`research/docs/23` §3.3, v53).
+/// Whether the selected device can use `format` as a depth-stencil attachment
+/// with `tiling` at the requested `samples` (`research/docs/23` §3.3,
+/// v53/v61).
 ///
 /// The colour sibling's rule one usage over: a multisampled pass's depth
 /// surface has to carry the same sample count as the colour attachments, so the
-/// device answers the four-sample combination through the same
+/// device answers the requested combination through the same
 /// `vkGetPhysicalDeviceImageFormatProperties` query.
 pub(crate) fn format_supports_multisample_depth_attachment(
     context: &VulkanContext,
     format: vk::Format,
     tiling: vk::ImageTiling,
+    samples: vk::SampleCountFlags,
 ) -> bool {
     let properties = unsafe {
         context
@@ -1687,24 +1688,55 @@ pub(crate) fn format_supports_multisample_depth_attachment(
             )
     };
     match properties {
-        Ok(properties) => properties
-            .sample_counts
-            .contains(vk::SampleCountFlags::TYPE_4),
+        Ok(properties) => properties.sample_counts.contains(samples),
         Err(_) => false,
     }
 }
 
-/// Whether the selected device's whole framebuffer admits four samples
-/// (`research/docs/23` §3.3, v51).
+/// The largest of the reviewed two-, four- and eight-sample rasters the
+/// device's whole framebuffer admits, or `None` when it admits none of them
+/// (`research/docs/23` §3.3, v51/v61).
 ///
 /// `VkPhysicalDeviceLimits::framebufferColorSampleCounts` is the framebuffer
 /// ceiling every colour attachment of a subpass shares, so it is the first
 /// question the capability snapshot answers; the per-format question above is
 /// what the rail asks before it creates the image.
-pub(crate) fn limits_support_multisample(limits: &vk::PhysicalDeviceLimits) -> bool {
-    limits
-        .framebuffer_color_sample_counts
-        .contains(vk::SampleCountFlags::TYPE_4)
+pub(crate) fn limits_render_sample_count_ceiling(limits: &vk::PhysicalDeviceLimits) -> Option<u32> {
+    let counts = limits.framebuffer_color_sample_counts;
+    if counts.contains(vk::SampleCountFlags::TYPE_8) {
+        Some(8)
+    } else if counts.contains(vk::SampleCountFlags::TYPE_4) {
+        Some(4)
+    } else if counts.contains(vk::SampleCountFlags::TYPE_2) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// The reviewed 2/4/8 sample counts the device's whole framebuffer admits, as
+/// a bitmask over the contract's codes: bit `i` = [`SampleCount`] code `i`
+/// (`research/docs/23` §3.3, v61).
+///
+/// `VkPhysicalDeviceLimits::framebufferColorSampleCounts` is defined over
+/// *all* framebuffer colour attachments, so a count the mask carries is one
+/// every admitted colour format can run — which is why the device-gated
+/// sample-count fixtures are owed exactly when their count's bit is present.
+/// The counts are not a ladder: Lavapipe reports 4x and 8x without 2x, so the
+/// ceiling alone cannot answer the 2x question.
+pub(crate) fn limits_render_sample_count_mask(limits: &vk::PhysicalDeviceLimits) -> u32 {
+    let counts = limits.framebuffer_color_sample_counts;
+    let mut mask = 0;
+    if counts.contains(vk::SampleCountFlags::TYPE_2) {
+        mask |= 1 << SampleCount::Two.code();
+    }
+    if counts.contains(vk::SampleCountFlags::TYPE_4) {
+        mask |= 1 << SampleCount::Four.code();
+    }
+    if counts.contains(vk::SampleCountFlags::TYPE_8) {
+        mask |= 1 << SampleCount::Eight.code();
+    }
+    mask
 }
 
 /// Execute one offscreen render pass and return, in location order, `Some` of
@@ -1798,16 +1830,19 @@ pub(crate) fn execute_offscreen_render(
         .iter()
         .map(|format| attachment_vk_format(*format))
         .collect::<Result<Vec<_>, _>>()?;
-    // The multisample raster's device half (`research/docs/23` §3.3, v51): a
-    // four-sample colour attachment is a per-format question, and every colour
-    // attachment of the pass has to answer it before the first `vkCreateImage`.
+    // The multisample raster's device half (`research/docs/23` §3.3,
+    // v51/v61): a multisampled colour attachment is a per-format question at
+    // the pass's own sample count, and every colour attachment of the pass has
+    // to answer it before the first `vkCreateImage`.
     // The load half is re-asserted here too, for a directly-constructed request
     // that skipped `prepare_render_request`: the only shape this increment
     // reviews opens every attachment from a clear, because uploading
     // single-sample previous bytes into a multisampled image is the load
     // increment this one does not execute.
     let samples = match request.multisample.map(|state| state.sample_count) {
+        Some(SampleCount::Two) => vk::SampleCountFlags::TYPE_2,
         Some(SampleCount::Four) => vk::SampleCountFlags::TYPE_4,
+        Some(SampleCount::Eight) => vk::SampleCountFlags::TYPE_8,
         Some(SampleCount::One) => {
             return Err(contract_refusal(
                 &metal_api_core::provider::ContractError::SingleSampleMultisampleState.to_string(),
@@ -1913,17 +1948,18 @@ pub(crate) fn execute_offscreen_render(
             }
         }
         for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
-            if !format_supports_multisample_color_attachment(context, *vk_format, tiling) {
+            if !format_supports_multisample_color_attachment(context, *vk_format, tiling, samples) {
                 return Err(attachment_format_refusal()
                     .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
                     .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
                     .with_field(
                         "missing_feature",
-                        FieldValue::Text("color_attachment_samples_4".to_owned()),
+                        FieldValue::Text(format!("color_attachment_samples_{}", samples.as_raw())),
                     )
                     .with_detail(
-                        "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
-                         COLOR_ATTACHMENT combination for this format",
+                        "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                         combination this raster states for the COLOR_ATTACHMENT usage of \
+                         this format",
                     ));
             }
             if !matches!(attachment.load, LoadOp::Clear(_)) {
@@ -1938,12 +1974,14 @@ pub(crate) fn execute_offscreen_render(
         }
         // The depth surface beside the raster is created with the same sample
         // count (`research/docs/23` §3.3, v53), so the device has to admit the
-        // four-sample depth combination before the first depth image exists.
+        // depth combination at the raster's own count before the first depth
+        // image exists.
         if request.depth.is_some()
             && !format_supports_multisample_depth_attachment(
                 context,
                 vk::Format::D32_SFLOAT,
                 tiling,
+                samples,
             )
         {
             return Err(attachment_format_refusal()
@@ -1954,18 +1992,24 @@ pub(crate) fn execute_offscreen_render(
                 .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
                 .with_field(
                     "missing_feature",
-                    FieldValue::Text("depth_attachment_samples_4".to_owned()),
+                    FieldValue::Text(format!("depth_attachment_samples_{}", samples.as_raw())),
                 )
                 .with_detail(
-                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
-                     DEPTH_STENCIL_ATTACHMENT combination for D32_SFLOAT",
+                    "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                     combination this raster states for the DEPTH_STENCIL_ATTACHMENT usage \
+                     of D32_SFLOAT",
                 ));
         }
-        // The stencil surface's own four-sample question, through the same
+        // The stencil surface's own sample-count question, through the same
         // `DEPTH_STENCIL_ATTACHMENT` probe the depth surface uses
-        // (`research/docs/23` §3.3, v55).
+        // (`research/docs/23` §3.3, v55/v61).
         if request.stencil.is_some()
-            && !format_supports_multisample_depth_attachment(context, vk::Format::S8_UINT, tiling)
+            && !format_supports_multisample_depth_attachment(
+                context,
+                vk::Format::S8_UINT,
+                tiling,
+                samples,
+            )
         {
             return Err(attachment_format_refusal()
                 .with_field(
@@ -1975,14 +2019,15 @@ pub(crate) fn execute_offscreen_render(
                 .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
                 .with_field(
                     "missing_feature",
-                    FieldValue::Text("stencil_attachment_samples_4".to_owned()),
+                    FieldValue::Text(format!("stencil_attachment_samples_{}", samples.as_raw())),
                 )
                 .with_detail(
-                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
-                     DEPTH_STENCIL_ATTACHMENT combination for S8_UINT",
+                    "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                     combination this raster states for the DEPTH_STENCIL_ATTACHMENT usage \
+                     of S8_UINT",
                 ));
         }
-        // The combined surface's own four-sample question
+        // The combined surface's own sample-count question
         // (`research/docs/23` §3.3, v60): one `D32_SFLOAT_S8_UINT` attachment
         // carries both faces, so the device has to admit that combination
         // before the combined image exists.
@@ -1992,6 +2037,7 @@ pub(crate) fn execute_offscreen_render(
                 context,
                 vk::Format::D32_SFLOAT_S8_UINT,
                 tiling,
+                samples,
             )
         {
             return Err(attachment_format_refusal()
@@ -2002,11 +2048,15 @@ pub(crate) fn execute_offscreen_render(
                 .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
                 .with_field(
                     "missing_feature",
-                    FieldValue::Text("depth_stencil_attachment_samples_4".to_owned()),
+                    FieldValue::Text(format!(
+                        "depth_stencil_attachment_samples_{}",
+                        samples.as_raw()
+                    )),
                 )
                 .with_detail(
-                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
-                     DEPTH_STENCIL_ATTACHMENT combination for D32_SFLOAT_S8_UINT",
+                    "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                     combination this raster states for the DEPTH_STENCIL_ATTACHMENT usage \
+                     of D32_SFLOAT_S8_UINT",
                 ));
         }
     }
