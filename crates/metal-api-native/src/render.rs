@@ -1848,7 +1848,9 @@ pub(crate) fn plan<'a>(
                         capability_refusal("render_multisample_stencil_store_unsupported")
                             .with_detail(
                                 "a multisampled stencil surface cannot be kept yet: the \
-                                 stencil resolve is a later increment",
+                                 stencil resolve is a later increment; its semantics are \
+                                 answered by `--stencil-resolve-selftest` (CI logs), and \
+                                 the contract stays closed until then",
                             ),
                     );
                 }

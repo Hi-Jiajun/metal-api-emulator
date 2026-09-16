@@ -790,6 +790,7 @@ private struct Options {
     let mrtSelfTest: Bool
     let heapSelfTest: Bool
     let depthResolveSelfTest: Bool
+    let stencilResolveSelfTest: Bool
 }
 
 private let usage = """
@@ -802,6 +803,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --mrt-selftest
        native-metal-oracle --heap-selftest
        native-metal-oracle --depth-resolve-selftest
+       native-metal-oracle --stencil-resolve-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -851,6 +853,21 @@ line at a time. It prints PASS only when the stable columns are as reviewed
 distinguishes the filters (column 2 = 0.5 for min, 0.9 for max); sample0's
 column 2 is recorded but not judged because it depends on the rasterizer's
 sample positions. It cannot be combined with other options.
+--stencil-resolve-selftest needs no suite: it renders the reviewed depth pair's
+v51 edge geometry (a near triangle at z = 0.5 covering NDC x <= 0.25, a far
+triangle at z = 0.9 covering everything) three times through a four-sample
+depth32float-stencil8 raster cleared to depth 1.0 and stencil 0. The near
+triangle passes an equal-0 test and increments-wraps to stencil 1; the far
+triangle covers the remaining samples without writing stencil, so every texel
+whose samples straddle x = 0.25 carries both a stencil-1 near sample and a
+stencil-0 far sample. The three passes print one stencil8 texel per line: the
+sample0 stencil filter, the depthResolvedSample filter with a min depth
+resolve, and the depthResolvedSample filter with a max depth resolve. It prints
+PASS only when the stable columns hold (column 0 = 01 and column 3 = 00 for
+every filter) and the key column distinguishes the depth-resolved sample
+(column 2 = 01 for min, 00 for max); sample0's column 2 is recorded but not
+judged because it depends on the rasterizer's sample positions. It cannot be
+combined with other options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -865,6 +882,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var mrtSelfTest = false
     var heapSelfTest = false
     var depthResolveSelfTest = false
+    var stencilResolveSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -914,58 +932,77 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!depthResolveSelfTest, "Duplicate --depth-resolve-selftest option")
             depthResolveSelfTest = true
             index += 1
+        case "--stencil-resolve-selftest":
+            try require(!stencilResolveSelfTest, "Duplicate --stencil-resolve-selftest option")
+            stencilResolveSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
     }
     if probe {
-        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
-                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !renderSelfTest && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--probe cannot be combined with --suite, --output, --validate-suite, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: true,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if renderSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
-                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--render-selftest cannot be combined with --suite, --output, --validate-suite, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: true, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if presentSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
-                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !vertexSelfTest && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--present-selftest cannot be combined with --suite, --output, --validate-suite, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: true, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if vertexSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest,
-                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, --mrt-selftest, --heap-selftest, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !mrtSelfTest && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--vertex-selftest cannot be combined with --suite, --output, --validate-suite, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: true,
-                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if mrtSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest && !depthResolveSelfTest,
-                    "--mrt-selftest cannot be combined with --suite, --output, --validate-suite, --heap-selftest, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !heapSelfTest && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--mrt-selftest cannot be combined with --suite, --output, --validate-suite, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: true, heapSelfTest: false, depthResolveSelfTest: false)
+                       mrtSelfTest: true, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if heapSelfTest {
-        try require(suite == nil && output == nil && !validateOnly && !depthResolveSelfTest,
-                    "--heap-selftest cannot be combined with --suite, --output, --validate-suite, or --depth-resolve-selftest")
+        try require(suite == nil && output == nil && !validateOnly && !depthResolveSelfTest && !stencilResolveSelfTest,
+                    "--heap-selftest cannot be combined with --suite, --output, --validate-suite, --depth-resolve-selftest, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: true, depthResolveSelfTest: false)
+                       mrtSelfTest: false, heapSelfTest: true, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false)
     }
     if depthResolveSelfTest {
-        try require(suite == nil && output == nil && !validateOnly,
-                    "--depth-resolve-selftest cannot be combined with --suite, --output, or --validate-suite")
+        try require(suite == nil && output == nil && !validateOnly && !stencilResolveSelfTest,
+                    "--depth-resolve-selftest cannot be combined with --suite, --output, --validate-suite, or --stencil-resolve-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: true)
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: true,
+                       stencilResolveSelfTest: false)
+    }
+    if stencilResolveSelfTest {
+        try require(suite == nil && output == nil && !validateOnly,
+                    "--stencil-resolve-selftest cannot be combined with --suite, --output, or --validate-suite")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: true)
     }
     try require(suite != nil, "--suite is required\n\(usage)")
     try require(!validateOnly || output == nil, "--output cannot be used with --validate-suite")
@@ -975,7 +1012,8 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     }
     return Options(suite: suite, output: output, validateOnly: validateOnly, probe: false,
                    renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
-                   mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false)
+                   mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                   stencilResolveSelfTest: false)
 }
 
 private func readBoundedFile(_ url: URL) throws -> Data {
@@ -4641,33 +4679,26 @@ private func depthResolveSelftestPass(_ fixture: ValidatedRender, device: MTLDev
     return observed
 }
 
-/// The depth-resolve milestone's own fixture, constructed in code.
+/// The v51 edge pair both resolve self-tests share, constructed in code.
 ///
-/// This is the one-device check for the Min/Max question v57 left open
-/// (`research/docs/23` §3.3, v57e): the reviewed depth pair module draws the
-/// v51 edge geometry — a near triangle at z = 0.5 covering NDC x <= 0.25 and
-/// a far triangle at z = 0.9 covering everything, both tinted red — through a
-/// four-sample `depth32float` raster cleared to 1.0 with a `less` test and
-/// writes on, three times, once per resolve filter (sample0, min, max). Each
-/// pass resolves into its own single-sample shared landing, and the three
-/// landings are printed one texel per line so the CI log carries the answer
-/// Metal has no queryable mask for. It prints `depth_resolve_selftest: PASS`
-/// only when the stable columns are as reviewed — column 0 reads 0.5 and
-/// column 3 reads 0.9 for all three filters — and the key column
-/// distinguishes the filters: column 2 reads 0.5 for min and 0.9 for max.
-/// sample0's column 2 is recorded but not judged, because its landing depends
-/// on the rasterizer's sample positions. In particular, a device that reduces
-/// min and max to one value is a FAIL — exactly what this check exists to
-/// measure, and the reason PASS may not be asserted from min == max.
+/// The reviewed depth pair module draws the v51 edge geometry — a near
+/// triangle at z = 0.5 covering NDC x <= 0.25 and a far triangle at z = 0.9
+/// covering everything, both tinted red — through a four-sample
+/// `depth32float` raster cleared to 1.0 with a `less` test and writes on.
+/// Both triangles carry the same red tint, so the colour landing cannot vary
+/// between them and the resolved depth (or stencil) landing is the whole
+/// observation. The definition is the reviewed depth-pair shape
+/// `validateRenderCase` pins, so both self-tests get the module hash, stream
+/// and index bytes, attachment extent and clear depth from the one validated
+/// fixture; the stencil sibling supplies its own stencil surface and state
+/// beside it.
 @available(macOS 11.0, *)
-private func depthResolveSelfTest() throws {
+private func resolvePairFixture(id: String) throws -> ValidatedRender {
     let reviewed = reviewedDepthModule()
     // The v51 edge geometry the v57d Min/Max pair pins (`research/docs/23`
     // §3.3), spelled exactly as the suite's view bytes: one stride-32 stream
     // whose two records carry position `float32x3` at offset 0 and tint
-    // `float32x4` at offset 16, with four padding bytes between them. Both
-    // triangles carry the same red tint, so the colour landing cannot vary
-    // between them and the depth landing is the whole observation.
+    // `float32x4` at offset 16, with four padding bytes between them.
     let vertices = try decodeHex(
         "0000803e000080bf0000003f000000000000803f00000000000000000000803f"
         + "0000803e000040400000003f000000000000803f00000000000000000000803f"
@@ -4675,22 +4706,21 @@ private func depthResolveSelfTest() throws {
         + "000080bf000080bf6666663f000000000000803f00000000000000000000803f"
         + "00004040000080bf6666663f000000000000803f00000000000000000000803f"
         + "000080bf000040406666663f000000000000803f00000000000000000000803f",
-        context: "depth-resolve self-test vertex stream")
+        context: "\(id) vertex stream")
     // The six `uint16` indices (0,1,2) and (3,4,5): the near edge triangle
     // then the full-screen far triangle, 12 bytes.
     let indices = try decodeHex("000001000200030004000500",
-                                context: "depth-resolve self-test index buffer")
+                                context: "\(id) index buffer")
     // Both triangles' reviewed tint: red, one `rgba8Unorm` texel replicated
-    // across the 4x4 attachment. The validation above the pass reads the
-    // depth landing, so this expectation is shape-only: the pass judgement
-    // below never reads the colour bytes.
+    // across the 4x4 attachment. The pass judgements never read the colour
+    // bytes, so this expectation is shape-only.
     let redImage = String(repeating: "ff0000ff", count: 16)
     // The min filter's reviewed landing, used only to satisfy the stored
     // depth surface's expectation rule (`research/docs/23` §3.3, v43): the
-    // self-test's own judgement below reads columns instead of this image.
+    // self-tests' own judgements read columns instead of this image.
     let depthExpectation = String(repeating: "0000003f0000003f0000003f6666663f", count: 4)
     let definition = RenderCaseDefinition(
-        id: "depth_resolve_selftest_4x4",
+        id: id,
         declaring_case: "",
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
@@ -4721,8 +4751,8 @@ private func depthResolveSelfTest() throws {
         coverage: nil,
         multisample: MultisampleDefinition(sample_count: 4),
         // The validation fixture states the filter this rail declares; the
-        // three passes below state sample0, min and max themselves, so no
-        // suite-level gate or mask participates.
+        // passes below state their own filters, so no suite-level gate or mask
+        // participates.
         depth_resolve: DepthResolveDefinition(filter: "sample0"),
         requires_depth_resolve_filter: nil,
         wildcard_texels: nil,
@@ -4735,11 +4765,34 @@ private func depthResolveSelfTest() throws {
         blend: nil,
         stencil: nil,
         stencil_test: nil,
-        // The self-test runs on this rail by construction; the marker is the
-        // same one a suite would name for it.
+        // The self-tests run on this rail by construction; the marker is the
+        // same one a suite would name for them.
         capture_rails: ["native-metal"])
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let fixture = try validateRenderCase(definition, root: root)
+    return try validateRenderCase(definition, root: root)
+}
+
+/// The depth-resolve milestone's own fixture, constructed in code.
+///
+/// This is the one-device check for the Min/Max question v57 left open
+/// (`research/docs/23` §3.3, v57e): the reviewed depth pair module draws the
+/// v51 edge geometry — a near triangle at z = 0.5 covering NDC x <= 0.25 and
+/// a far triangle at z = 0.9 covering everything, both tinted red — through a
+/// four-sample `depth32float` raster cleared to 1.0 with a `less` test and
+/// writes on, three times, once per resolve filter (sample0, min, max). Each
+/// pass resolves into its own single-sample shared landing, and the three
+/// landings are printed one texel per line so the CI log carries the answer
+/// Metal has no queryable mask for. It prints `depth_resolve_selftest: PASS`
+/// only when the stable columns are as reviewed — column 0 reads 0.5 and
+/// column 3 reads 0.9 for all three filters — and the key column
+/// distinguishes the filters: column 2 reads 0.5 for min and 0.9 for max.
+/// sample0's column 2 is recorded but not judged, because its landing depends
+/// on the rasterizer's sample positions. In particular, a device that reduces
+/// min and max to one value is a FAIL — exactly what this check exists to
+/// measure, and the reason PASS may not be asserted from min == max.
+@available(macOS 11.0, *)
+private func depthResolveSelfTest() throws {
+    let fixture = try resolvePairFixture(id: "depth_resolve_selftest_4x4")
     guard let device = MTLCreateSystemDefaultDevice() else {
         throw OracleError("No default Metal device is available; the depth-resolve self-test requires an Apple silicon Mac")
     }
@@ -4823,6 +4876,407 @@ private func depthResolveSelfTest() throws {
         // exists to collect — so the failure has to propagate rather than
         // print PASS.
         throw OracleError("depth_resolve_selftest: " + failures.joined(separator: "; "))
+    }
+}
+
+/// One reviewed pass of the stencil-resolve self-test.
+///
+/// The reviewed depth pair module draws the caller's v51 edge geometry through
+/// a four-sample depth-stencil raster cleared to depth 1.0 and stencil 0. The
+/// near triangle draws with the reviewed stencil pair's state (equal 0, both
+/// masks open, increment-wraps on pass) and writes 1 into the samples it
+/// covers; the far triangle draws with a stencil state whose write mask is
+/// zero, so it writes depth into the remaining samples without touching their
+/// stencil. Every texel whose samples straddle the x = 0.25 edge therefore
+/// carries both a stencil-1 near sample and a stencil-0 far sample. The depth
+/// attachment resolves with the caller's depth filter and the stencil
+/// attachment with the caller's stencil filter, so `.depthResolvedSample`
+/// means "the stencil of the sample the depth resolve selected" rather than an
+/// unobserved fallback; the single-sample shared stencil landing is read back
+/// with `getBytes` and returned, one `stencil8` byte per texel in memory
+/// order, 16 bytes.
+@available(macOS 11.0, *)
+private func stencilResolveSelftestPass(_ fixture: ValidatedRender, device: MTLDevice,
+                                        queue: MTLCommandQueue,
+                                        depthFilter: MTLMultisampleDepthResolveFilter,
+                                        stencilFilter: MTLMultisampleStencilResolveFilter,
+                                        name: String) throws -> Data {
+    let definition = fixture.definition
+    guard let attachment = fixture.attachments.first, let depth = fixture.depth,
+          let multisample = definition.multisample else {
+        throw OracleError("\(definition.id): the stencil-resolve self-test needs one colour "
+                          + "attachment, one depth attachment and the four-sample raster")
+    }
+    let samples = Int(multisample.sample_count)
+
+    // The colour pair the reviewed multisample raster draws through. Its texels
+    // are not observed, so both surfaces stay private, exactly as
+    // `runRenderCase` keeps the four-sample half private.
+    let colourDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: attachment.pixelFormat,
+        width: attachment.width,
+        height: attachment.height,
+        mipmapped: false)
+    colourDescriptor.textureType = .type2DMultisample
+    colourDescriptor.sampleCount = samples
+    colourDescriptor.usage = .renderTarget
+    colourDescriptor.storageMode = .private
+    guard let colourMSAA = device.makeTexture(descriptor: colourDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the multisample colour attachment")
+    }
+    colourMSAA.label = "native oracle: \(definition.id) colour msaa"
+    let colourResolveDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: attachment.pixelFormat,
+        width: attachment.width,
+        height: attachment.height,
+        mipmapped: false)
+    colourResolveDescriptor.usage = .renderTarget
+    colourResolveDescriptor.storageMode = .private
+    guard let colourResolve = device.makeTexture(descriptor: colourResolveDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the colour resolve target")
+    }
+    colourResolve.label = "native oracle: \(definition.id) colour resolve"
+
+    // The depth-stencil half: one private four-sample combined
+    // `depth32Float_stencil8` surface the raster writes, which both the depth
+    // and the stencil attachment name — Metal's own shape for a pass that
+    // tests and writes both (`research/docs/23` §3.3, v59). The two
+    // single-sample landings the resolves write into are separate textures:
+    // the depth landing is not read back — its only job is to keep the depth
+    // resolve active so the stencil filter's `.depthResolvedSample` follows
+    // the depth filter the pass names — and the stencil landing is what the
+    // CPU reads back below.
+    let depthStencilDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float_stencil8,
+        width: depth.width,
+        height: depth.height,
+        mipmapped: false)
+    depthStencilDescriptor.textureType = .type2DMultisample
+    depthStencilDescriptor.sampleCount = samples
+    depthStencilDescriptor.usage = .renderTarget
+    depthStencilDescriptor.storageMode = .private
+    guard let depthStencilMSAA = device.makeTexture(descriptor: depthStencilDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the multisample depth-stencil attachment")
+    }
+    depthStencilMSAA.label = "native oracle: \(definition.id) depth-stencil msaa"
+    let depthLandingDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float, width: depth.width, height: depth.height, mipmapped: false)
+    depthLandingDescriptor.usage = .renderTarget
+    depthLandingDescriptor.storageMode = .private
+    guard let depthLanding = device.makeTexture(descriptor: depthLandingDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the depth resolve landing")
+    }
+    depthLanding.label = "native oracle: \(definition.id) depth resolve \(name)"
+
+    // The single-sample shared landing the stencil resolve writes into — the
+    // same readback shape `runRenderCase` states for the stored stencil
+    // surface (`research/docs/23` §3.3, v49), one `stencil8` byte per texel.
+    let stencilLandingDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .stencil8, width: depth.width, height: depth.height, mipmapped: false)
+    stencilLandingDescriptor.usage = .renderTarget
+    stencilLandingDescriptor.storageMode = .shared
+    guard let stencilLanding = device.makeTexture(descriptor: stencilLandingDescriptor) else {
+        throw OracleError("\(definition.id): cannot allocate the stencil resolve landing")
+    }
+    stencilLanding.label = "native oracle: \(definition.id) stencil resolve \(name)"
+
+    // The pipeline states the same shape `runRenderCase` builds for the stencil
+    // pair's multisampled raster: one `rgba8Unorm` location, the depth and
+    // stencil formats and the four-sample raster count.
+    let library = try device.makeLibrary(source: fixture.source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: definition.vertex_entry) else {
+        throw OracleError("\(definition.id): vertex entry \(definition.vertex_entry) was not found")
+    }
+    guard let fragmentFunction = library.makeFunction(name: definition.fragment_entry) else {
+        throw OracleError("\(definition.id): fragment entry \(definition.fragment_entry) was not found")
+    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: \(definition.id)"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    let vertexDescriptor = MTLVertexDescriptor()
+    for stream in fixture.vertexStreams {
+        guard let layout = vertexDescriptor.layouts[stream.binding] else {
+            throw OracleError("\(definition.id): the vertex descriptor has no layout "
+                              + "\(stream.binding)")
+        }
+        layout.stride = Int(stream.stride)
+        layout.stepFunction = .perVertex
+        for attribute in stream.attributes {
+            guard let format = vertexFormat(attribute.format) else {
+                throw OracleError("\(definition.id): unsupported vertex attribute format "
+                                  + attribute.format)
+            }
+            guard let target = vertexDescriptor.attributes[Int(attribute.location)] else {
+                throw OracleError("\(definition.id): the vertex descriptor has no attribute "
+                                  + "\(attribute.location)")
+            }
+            target.format = format
+            target.offset = Int(attribute.offset)
+            target.bufferIndex = stream.binding
+        }
+    }
+    pipelineDescriptor.vertexDescriptor = vertexDescriptor
+    pipelineDescriptor.colorAttachments[0].pixelFormat = attachment.pixelFormat
+    pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float_stencil8
+    pipelineDescriptor.stencilAttachmentPixelFormat = .depth32Float_stencil8
+    pipelineDescriptor.rasterSampleCount = samples
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+    // The pass opens the colour, depth and stencil halves with clears and
+    // resolves all three on store; the depth and stencil resolve filters are
+    // the ones this pass names.
+    let pass = MTLRenderPassDescriptor()
+    guard let colour = pass.colorAttachments[0], let depthAttachment = pass.depthAttachment,
+          let stencilAttachment = pass.stencilAttachment else {
+        throw OracleError("\(definition.id): cannot reach the self-test's attachments")
+    }
+    colour.texture = colourMSAA
+    colour.resolveTexture = colourResolve
+    colour.loadAction = .clear
+    colour.clearColor = MTLClearColor(red: attachment.clearComponents[0],
+                                      green: attachment.clearComponents[1],
+                                      blue: attachment.clearComponents[2],
+                                      alpha: attachment.clearComponents[3])
+    colour.storeAction = .multisampleResolve
+    depthAttachment.texture = depthStencilMSAA
+    depthAttachment.loadAction = .clear
+    depthAttachment.clearDepth = depth.clearDepth
+    depthAttachment.storeAction = .multisampleResolve
+    depthAttachment.resolveTexture = depthLanding
+    depthAttachment.depthResolveFilter = depthFilter
+    stencilAttachment.texture = depthStencilMSAA
+    stencilAttachment.loadAction = .clear
+    stencilAttachment.clearStencil = 0
+    stencilAttachment.storeAction = .multisampleResolve
+    stencilAttachment.resolveTexture = stencilLanding
+    stencilAttachment.stencilResolveFilter = stencilFilter
+
+    // The near draw's state is the reviewed stencil pair's own
+    // (`research/docs/23` §3.3, v47): an `equal` test against reference zero
+    // with both masks wide open that keeps both failure outcomes and
+    // increments-wraps on pass. The far draw's state carries a zero write mask
+    // and keep operations, so it tests and writes depth without ever writing
+    // stencil — the second primitive the task's construction asks for.
+    let nearStencil = MTLStencilDescriptor()
+    nearStencil.stencilCompareFunction = .equal
+    nearStencil.stencilFailureOperation = .keep
+    nearStencil.depthFailureOperation = .keep
+    nearStencil.depthStencilPassOperation = .incrementWrap
+    nearStencil.readMask = 255
+    nearStencil.writeMask = 255
+    let nearDescriptor = MTLDepthStencilDescriptor()
+    nearDescriptor.depthCompareFunction = .less
+    nearDescriptor.isDepthWriteEnabled = true
+    nearDescriptor.frontFaceStencil = nearStencil
+    nearDescriptor.backFaceStencil = nearStencil
+    guard let nearState = device.makeDepthStencilState(descriptor: nearDescriptor) else {
+        throw OracleError("\(definition.id): cannot create the near stencil state")
+    }
+    let farStencil = MTLStencilDescriptor()
+    farStencil.stencilCompareFunction = .always
+    farStencil.stencilFailureOperation = .keep
+    farStencil.depthFailureOperation = .keep
+    farStencil.depthStencilPassOperation = .keep
+    farStencil.readMask = 0
+    farStencil.writeMask = 0
+    let farDescriptor = MTLDepthStencilDescriptor()
+    farDescriptor.depthCompareFunction = .less
+    farDescriptor.isDepthWriteEnabled = true
+    farDescriptor.frontFaceStencil = farStencil
+    farDescriptor.backFaceStencil = farStencil
+    guard let farState = device.makeDepthStencilState(descriptor: farDescriptor) else {
+        throw OracleError("\(definition.id): cannot create the far stencil state")
+    }
+
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("\(definition.id): cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "\(definition.id): command buffer does not retain resources")
+    commandBuffer.label = "native oracle: \(definition.id) stencil resolve \(name)"
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("\(definition.id): cannot create a render encoder")
+    }
+    encoder.setRenderPipelineState(pipeline)
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(attachment.width),
+                                    height: Double(attachment.height),
+                                    znear: 0, zfar: 1))
+    // The streams are bound at the same indices the descriptor names, and they
+    // stay alive until the command buffer has completed (the buffers array is
+    // released after the readback below).
+    var streamBuffers = [MTLBuffer]()
+    for stream in fixture.vertexStreams {
+        let buffer = try makeStreamBuffer(device: device, id: definition.id,
+                                          offset: stream.offset, bytes: stream.bytes)
+        streamBuffers.append(buffer)
+    }
+    for (stream, buffer) in zip(fixture.vertexStreams, streamBuffers) {
+        encoder.setVertexBuffer(buffer,
+                                offset: try hostOffset(stream.offset, id: definition.id),
+                                index: stream.binding)
+    }
+    guard let indexStream = fixture.indexStream else {
+        throw OracleError("\(definition.id): the indexed edge pair carries no index stream")
+    }
+    let indexBuffer = try makeStreamBuffer(device: device, id: definition.id,
+                                           offset: indexStream.offset,
+                                           bytes: indexStream.bytes)
+    streamBuffers.append(indexBuffer)
+    let indexBase = try hostOffset(indexStream.offset, id: definition.id)
+    // The near edge triangle (indices 0..2) writes stencil under the reviewed
+    // state; the full-screen far triangle (indices 3..5) then writes depth
+    // under the zero-write-mask state without changing any stencil byte.
+    encoder.setDepthStencilState(nearState)
+    encoder.setStencilReferenceValue(0)
+    encoder.drawIndexedPrimitives(type: .triangle,
+                                  indexCount: 3,
+                                  indexType: indexStream.format.metal,
+                                  indexBuffer: indexBuffer,
+                                  indexBufferOffset: indexBase,
+                                  instanceCount: 1)
+    encoder.setDepthStencilState(farState)
+    encoder.drawIndexedPrimitives(type: .triangle,
+                                  indexCount: 3,
+                                  indexType: indexStream.format.metal,
+                                  indexBuffer: indexBuffer,
+                                  indexBufferOffset: indexBase + 6,
+                                  instanceCount: 1)
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("\(definition.id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "\(definition.id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+
+    var observed = Data(count: depth.width * depth.height)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            stencilLanding.getBytes(destination,
+                                    bytesPerRow: depth.width,
+                                    from: MTLRegionMake2D(0, 0, depth.width, depth.height),
+                                    mipmapLevel: 0)
+        }
+    }
+    return observed
+}
+
+/// The stencil-resolve milestone's own fixture, constructed in code.
+///
+/// This is the one-device check for the question v55 left open
+/// (`research/docs/23` §3.3, v59): the reviewed depth pair module draws the
+/// v51 edge geometry — a near triangle at z = 0.5 covering NDC x <= 0.25 and
+/// a far triangle at z = 0.9 covering everything — three times through a
+/// four-sample depth-stencil raster cleared to depth 1.0 and stencil 0. The
+/// near triangle increments its covered samples to stencil 1 and the far
+/// triangle covers the rest without writing stencil, so the split column's
+/// texels carry both a near stencil-1 sample and a far stencil-0 sample. The
+/// three passes print one `stencil8` texel per line: the sample0 stencil
+/// filter, the depthResolvedSample stencil filter with a min depth resolve,
+/// and the depthResolvedSample stencil filter with a max depth resolve. It
+/// prints `stencil_resolve_selftest: PASS` only when the stable columns hold
+/// — column 0 reads 01 and column 3 reads 00 for all three passes — and the
+/// key column distinguishes the depth-resolved sample: column 2 reads 01 for
+/// the min resolve and 00 for the max resolve. sample0's column 2 is recorded
+/// but not judged, because its landing depends on the rasterizer's sample
+/// positions. A device that reduces `depthResolvedSample` to sample0 — or to
+/// any one value — fails the key column's split, which is the authoritative
+/// answer this check exists to collect.
+@available(macOS 11.0, *)
+private func stencilResolveSelfTest() throws {
+    let fixture = try resolvePairFixture(id: "stencil_resolve_selftest_4x4")
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the stencil-resolve self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native stencil-resolve self-test: device=\(device.name) platform=\(eligibility.platform)")
+
+    let passes: [(name: String, depthFilter: MTLMultisampleDepthResolveFilter,
+                  stencilFilter: MTLMultisampleStencilResolveFilter)] = [
+        ("sample0", .sample0, .sample0),
+        ("depth_resolved_sample_min", .min, .depthResolvedSample),
+        ("depth_resolved_sample_max", .max, .depthResolvedSample),
+    ]
+    var landings = [String: Data]()
+    for entry in passes {
+        landings[entry.name] = try stencilResolveSelftestPass(
+            fixture, device: device, queue: queue,
+            depthFilter: entry.depthFilter, stencilFilter: entry.stencilFilter,
+            name: entry.name)
+    }
+
+    // One byte per `stencil8` texel: the near sample's reviewed value 01 and
+    // the far sample's 00, which the texel hexes below compare against.
+    let nearByte = Data([0x01])
+    let farByte = Data([0x00])
+    func texel(_ landing: Data, _ row: Int, _ column: Int) -> Data {
+        let offset = row * 4 + column
+        return Data(landing[offset..<(offset + 1)])
+    }
+    // One machine-readable line per texel, row-major, each carrying the three
+    // passes' landings for that texel. Column 0 (fully near) and column 3
+    // (fully far) are the stable columns, and column 2 is the key column the
+    // min and max depth resolves are expected to split.
+    var output = ""
+    for row in 0..<4 {
+        for column in 0..<4 {
+            let sample0Hex = hex(texel(landings["sample0"]!, row, column))
+            let minHex = hex(texel(landings["depth_resolved_sample_min"]!, row, column))
+            let maxHex = hex(texel(landings["depth_resolved_sample_max"]!, row, column))
+            output += "stencil_resolve_selftest: row=\(row) column=\(column) "
+                + "sample0=\(sample0Hex) depth_resolved_sample(min)=\(minHex) "
+                + "depth_resolved_sample(max)=\(maxHex)\n"
+        }
+    }
+    // The PASS judgement is the stable columns for every pass plus the key
+    // column's min/max split; sample0's column 2 is deliberately absent.
+    var failures = [String]()
+    for row in 0..<4 {
+        for entry in passes {
+            let column0 = texel(landings[entry.name]!, row, 0)
+            if column0 != nearByte {
+                failures.append("column 0 row \(row) \(entry.name)=\(hex(column0)) "
+                                + "expected \(hex(nearByte))")
+            }
+            let column3 = texel(landings[entry.name]!, row, 3)
+            if column3 != farByte {
+                failures.append("column 3 row \(row) \(entry.name)=\(hex(column3)) "
+                                + "expected \(hex(farByte))")
+            }
+        }
+        let minKey = texel(landings["depth_resolved_sample_min"]!, row, 2)
+        if minKey != nearByte {
+            failures.append("column 2 row \(row) depth_resolved_sample(min)=\(hex(minKey)) "
+                            + "expected \(hex(nearByte))")
+        }
+        let maxKey = texel(landings["depth_resolved_sample_max"]!, row, 2)
+        if maxKey != farByte {
+            failures.append("column 2 row \(row) depth_resolved_sample(max)=\(hex(maxKey)) "
+                            + "expected \(hex(farByte))")
+        }
+    }
+    if failures.isEmpty {
+        output += "stencil_resolve_selftest: PASS\n"
+        FileHandle.standardOutput.write(Data(output.utf8))
+    } else {
+        for failure in failures {
+            output += "stencil_resolve_selftest: FAIL (\(failure))\n"
+        }
+        FileHandle.standardOutput.write(Data(output.utf8))
+        // A device that reduces `depthResolvedSample` to one value fails the
+        // key column's split, which is the authoritative answer this check
+        // exists to collect — so the failure has to propagate rather than
+        // print PASS.
+        throw OracleError("stencil_resolve_selftest: " + failures.joined(separator: "; "))
     }
 }
 
@@ -4988,6 +5442,18 @@ do {
         // stable columns are as reviewed and the key column distinguishes min
         // from max (`research/docs/23` §3.3, v57e).
         try depthResolveSelfTest()
+        exit(EXIT_SUCCESS)
+    }
+    if options.stencilResolveSelfTest {
+        // The stencil-resolve milestone's one-device check: the reviewed pair
+        // draws the v51 edge geometry once per filter, and the per-texel
+        // stencil8 landings this check prints are the authoritative answer for
+        // whether the Apple device executes `depthResolvedSample` as the
+        // sample the depth resolve filter selects. It exits nonzero unless the
+        // stable columns are as reviewed and the key column distinguishes the
+        // min-resolved from the max-resolved stencil (`research/docs/23` §3.3,
+        // v59).
+        try stencilResolveSelfTest()
         exit(EXIT_SUCCESS)
     }
     guard let suiteURL = options.suite else { throw OracleError("--suite is required") }
