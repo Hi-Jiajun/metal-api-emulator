@@ -5996,6 +5996,7 @@ fn run_object_render_case(
         // takes the second one.
         let index_count = u32::try_from(case.vertices)?;
         let cull = case_cull(case)?;
+        let blend = case_blend(case)?;
         if case.depth.is_some() {
             // The reviewed depth case opens the surface through the object
             // API's depth entry (`research/docs/23` §3.3, v36/v37): the pass
@@ -6025,6 +6026,19 @@ fn run_object_render_case(
                 u32::try_from(case.instance_count)?,
                 depth,
                 depth_test,
+                present,
+            )?;
+        } else if let Some(blend) = &blend {
+            // The reviewed blending case runs on the object rails too
+            // (`research/docs/23` §3.3, v40/v42): the encoder states the same
+            // per-attachment blend the trace contract names.
+            render.draw_indexed_primitives_with_blend(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                &blend.attachments,
                 present,
             )?;
         } else if let Some(cull) = cull {

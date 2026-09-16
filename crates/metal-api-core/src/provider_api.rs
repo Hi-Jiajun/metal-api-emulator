@@ -704,6 +704,10 @@ struct RenderDraw {
     /// triangle" — the shape every draw the object API could record before v41
     /// had (`research/docs/23` §3.3, v39/v41).
     cull: Option<contract::RenderPassCull>,
+    /// The blend state this pass draws with, or `None` for "write the fragment
+    /// output" — the shape every draw the object API could record before v42
+    /// had (`research/docs/23` §3.3, v40/v42).
+    blend: Option<contract::RenderPassBlend>,
     /// The depth surface this pass opens, or `None` for a pass with no depth
     /// surface — the shape every draw the object API could record before v37
     /// had (`research/docs/23` §3.3, v36/v37).
@@ -756,6 +760,7 @@ impl RenderDraw {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -836,7 +841,9 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
-            blend: None,
+            // The blend state is the pass's own, exactly as the culling and
+            // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
+            blend: self.draw.blend.clone(),
             // The culling state is the pass's own, exactly as the depth entry
             // states its surface (`research/docs/23` §3.3, v39/v41).
             cull: self.draw.cull,
@@ -2530,6 +2537,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -2573,6 +2581,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count,
             base_vertex: 0,
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -2610,6 +2619,7 @@ impl RenderCommandEncoder {
         }
         Self::admit_draw_counts(vertex_count, instance_count)?;
         let draw = RenderDraw {
+            blend: None,
             vertices: vertex_count,
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
@@ -2731,6 +2741,7 @@ impl RenderCommandEncoder {
             }),
             instance_count: 1,
             base_vertex: 0,
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -2775,6 +2786,7 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex: 0,
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -2824,6 +2836,93 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex,
+            blend: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams that
+    /// blends its fragment output (`research/docs/23` §3.3, v40/v42).
+    ///
+    /// `blend` states one entry per colour attachment, in location order,
+    /// exactly as the trace contract's list does; the pass the descriptor
+    /// builds carries that list, and the providers build their pipeline from
+    /// it. Every other rule is
+    /// [`Self::draw_primitives_with_attachments`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_with_blend(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        instance_count: u32,
+        blend: &[contract::BlendAttachment],
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        Self::admit_draw_counts(vertex_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+            instance_count,
+            base_vertex: 0,
+            blend: Some(contract::RenderPassBlend {
+                attachments: blend.to_vec(),
+            }),
+            cull: None,
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// that blends its fragment output (`research/docs/23` §3.3, v40/v42).
+    ///
+    /// The indexed sibling of [`Self::draw_primitives_with_blend`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_blend(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        blend: &[contract::BlendAttachment],
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: Some(contract::RenderPassBlend {
+                attachments: blend.to_vec(),
+            }),
             cull: None,
             depth: None,
             depth_test: None,
@@ -2863,6 +2962,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count,
             base_vertex: 0,
+            blend: None,
             cull: Some(cull),
             depth: None,
             depth_test: None,
@@ -2903,6 +3003,7 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex: 0,
+            blend: None,
             cull: Some(cull),
             depth: None,
             depth_test: None,
@@ -2940,6 +3041,7 @@ impl RenderCommandEncoder {
             .ok_or(Error::MissingIndexBuffer)?;
         Self::admit_draw_counts(index_count, instance_count)?;
         let draw = RenderDraw {
+            blend: None,
             vertices: index_count,
             vertex_buffers: self.bound_vertex_buffers(),
             indices: Some(RenderIndex {
@@ -3210,9 +3312,10 @@ impl RenderCommandEncoder {
                 // increment: the replay reads the index values the rail's own
                 // buffer holds (`research/docs/25` §4.3).
                 base_vertex: 0,
-                // An ICB replay states neither culling nor a depth surface: the
-                // payload has neither, so the replay stays the v20 shape
-                // (`research/docs/25` §4.3, v37/v41).
+                // An ICB replay states neither culling, blending nor a depth
+                // surface: the payload has none of them, so the replay stays
+                // the v20 shape (`research/docs/25` §4.3, v37/v41/v42).
+                blend: None,
                 cull: None,
                 depth: None,
                 depth_test: None,

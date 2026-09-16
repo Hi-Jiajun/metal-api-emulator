@@ -106,7 +106,10 @@ CULL_EXPECTED = INSTANCE_TINTS[1] * 16
 # a rail that ignored the blend state would store the tint's own bytes
 # (`4080c080`).
 BLEND_EXPECTED = "20406040" * 16
-BLEND_RAILS = TRACE_RAILS
+# The blend state is the same story from v42 on:
+# `draw_indexed_primitives_with_blend` is the object API's own blending entry,
+# so its marker names all five rails.
+BLEND_RAILS = ALL_RAILS
 # The culling state is the same story from v41 on:
 # `draw_indexed_primitives_with_cull` is the object API's own culling entry, so
 # its marker names all five rails.
