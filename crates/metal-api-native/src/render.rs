@@ -2856,6 +2856,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(3),
             color_attachments: vec![RenderAttachment {
@@ -3874,6 +3876,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: QUAD_PIPELINE,
             color_attachments: vec![RenderAttachment {

@@ -2282,6 +2282,30 @@ fn create_depth_image_view(
         .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
 }
 
+/// The stencil sibling of [`create_depth_image_view`]: the same 2D,
+/// single-mip, single-layer view over the image's **stencil** aspect, which is
+/// what a `stencil8` attachment's image needs (`research/docs/23` §3.3, v47).
+fn create_stencil_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::STENCIL,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { context.device.create_image_view(&info, None) }
+        .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
+}
+
 fn create_color_image_view(
     context: &VulkanContext,
     image: vk::Image,

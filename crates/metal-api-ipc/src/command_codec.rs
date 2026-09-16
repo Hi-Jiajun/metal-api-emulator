@@ -24,8 +24,9 @@ use metal_api_core::provider::{
     PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
+    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, ResourceTableSnapshot,
+    Retryability, SemanticDigest, ShaderSource, StagedLease, StencilCompare, StencilFormat,
+    StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess,
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
     VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
     MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
@@ -206,12 +207,20 @@ const RENDER_WIDE_FEATURE_DEPTH_STORE: u16 = 0x0100;
 /// only written for the shape that keeps them.
 const RENDER_WIDE_FEATURE_DEPTH_RESOURCE: u16 = 0x0200;
 
+/// The wide feature word's third bit (`research/docs/23` §3.3, v47): the pass
+/// opens a stencil attachment and, when it declares one, carries its stencil
+/// state. The block follows every depth section, so a pass that states no
+/// stencil keeps its bytes exactly — and a decoder that predates this bit
+/// refuses the wide word instead of skipping the block.
+const RENDER_WIDE_FEATURE_STENCIL: u16 = 0x0400;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
 const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
     | RENDER_WIDE_FEATURE_DEPTH_STORE
-    | RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
+    | RENDER_WIDE_FEATURE_DEPTH_RESOURCE
+    | RENDER_WIDE_FEATURE_STENCIL;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1998,7 +2007,11 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     .depth
                     .as_ref()
                     .is_some_and(|depth| depth.identity.is_some());
-                let wide = has_depth_store || has_depth_resource;
+                // The stencil block is the same story (`docs/23` §3.3, v47): a
+                // pass with no stencil attachment never sets the bit, so its
+                // bytes stay exactly what they were.
+                let has_stencil = pass.stencil.is_some();
+                let wide = has_depth_store || has_depth_resource || has_stencil;
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
@@ -2045,6 +2058,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         if has_depth_resource {
                             wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
                         }
+                        if has_stencil {
+                            wide_features |= RENDER_WIDE_FEATURE_STENCIL;
+                        }
                         encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
                         encoder.u16(wide_features);
                     } else {
@@ -2082,6 +2098,12 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                             encoder.u64(identity.allocation_id.get());
                             encoder.u64(identity.view_id.get());
                         }
+                    }
+                    // The stencil block follows every depth section, so the two
+                    // surfaces' state cannot be read in either order by a
+                    // decoder that knows both bits (`docs/23` §3.3, v47).
+                    if let Some(stencil) = &pass.stencil {
+                        put_stencil_block(encoder, stencil, pass.stencil_test.as_ref());
                     }
                     if let Some(cull) = &pass.cull {
                         encoder.u8(cull.mode.code());
@@ -2609,6 +2631,11 @@ fn get_render_ext_pass(
             view_id,
         });
     }
+    if features & RENDER_WIDE_FEATURE_STENCIL != 0 {
+        let (stencil, test) = get_stencil_block(decoder)?;
+        pass.stencil = Some(stencil);
+        pass.stencil_test = test;
+    }
     if features & u16::from(RENDER_FEATURE_CULL) != 0 {
         let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
             field: "cull mode",
@@ -2706,6 +2733,8 @@ fn get_render_pass(
     Ok(RenderPassDescriptor {
         blend: None,
         cull: None,
+        stencil: None,
+        stencil_test: None,
         pipeline,
         color_attachments,
         viewport,
@@ -2760,6 +2789,118 @@ fn put_depth_block(
         None => encoder.u8(0),
     }
     Ok(())
+}
+
+/// Encode the stencil block of an extended render pass: the rail-owned stencil
+/// attachment's shape and, when the pass declares one, its stencil state
+/// (`research/docs/23` §3.3, v47).
+///
+/// The block is the depth block's shape one byte wide: format, extent and load
+/// operation, then the pass's stencil state when it states one. The state's
+/// read/write masks and reference are the byte-wide values both APIs state.
+fn put_stencil_block(
+    encoder: &mut Encoder,
+    stencil: &RenderStencilAttachment,
+    test: Option<&StencilTest>,
+) {
+    encoder.u8(stencil.format.code());
+    encoder.u64(stencil.width);
+    encoder.u64(stencil.height);
+    match stencil.load {
+        StencilLoadOp::Clear(value) => {
+            encoder.u8(0);
+            encoder.u8(value);
+        }
+        StencilLoadOp::Load => encoder.u8(1),
+    }
+    match test {
+        Some(test) => {
+            encoder.u8(1);
+            encoder.u8(test.compare.code());
+            encoder.u8(test.fail_op.code());
+            encoder.u8(test.depth_fail_op.code());
+            encoder.u8(test.pass_op.code());
+            encoder.u8(test.read_mask);
+            encoder.u8(test.write_mask);
+            encoder.u8(test.reference);
+        }
+        None => encoder.u8(0),
+    }
+}
+
+/// Decode the stencil block. An unknown format, comparison, operation or
+/// presence byte is a typed refusal rather than a default.
+fn get_stencil_block(
+    decoder: &mut Decoder<'_>,
+) -> Result<(RenderStencilAttachment, Option<StencilTest>), CodecError> {
+    let format = StencilFormat::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+        field: "stencil format",
+        value: 0,
+    })?;
+    let width = decoder.u64()?;
+    let height = decoder.u64()?;
+    let load = match decoder.u8()? {
+        0 => StencilLoadOp::Clear(decoder.u8()?),
+        1 => StencilLoadOp::Load,
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "stencil load op",
+                value,
+            })
+        }
+    };
+    let test = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let compare =
+                StencilCompare::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "stencil compare function",
+                    value: 0,
+                })?;
+            let fail_op =
+                StencilOp::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "stencil fail operation",
+                    value: 0,
+                })?;
+            let depth_fail_op =
+                StencilOp::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "stencil depth fail operation",
+                    value: 0,
+                })?;
+            let pass_op =
+                StencilOp::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "stencil pass operation",
+                    value: 0,
+                })?;
+            let read_mask = decoder.u8()?;
+            let write_mask = decoder.u8()?;
+            let reference = decoder.u8()?;
+            Some(StencilTest {
+                compare,
+                fail_op,
+                depth_fail_op,
+                pass_op,
+                read_mask,
+                write_mask,
+                reference,
+            })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "stencil state presence",
+                value,
+            })
+        }
+    };
+    Ok((
+        RenderStencilAttachment {
+            format,
+            width,
+            height,
+            load,
+        },
+        test,
+    ))
 }
 
 /// Decode the depth block. An unknown format, compare function or presence byte

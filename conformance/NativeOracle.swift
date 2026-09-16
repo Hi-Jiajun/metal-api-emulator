@@ -217,6 +217,44 @@ private struct BlendAttachmentDefinition: Decodable {
     let operation: String
 }
 
+/// The rail-owned stencil attachment a render case declares
+/// (`research/docs/23` §3.3, v47).
+///
+/// The fields mirror `metal_api_core::provider::RenderStencilAttachment`: the
+/// format spelling, the extent and the load operation with the value a clear
+/// starts from. The surface is rail-owned like the first depth increment's:
+/// the stored values decide which primitives survive and nothing reads them
+/// back, so no trace identity and no readback travel with it. A stencil
+/// readback channel is a later increment, and it is what would add the
+/// identity fields this shape deliberately leaves out.
+private struct StencilAttachmentDefinition: Decodable {
+    let format: String
+    let width: Int
+    let height: Int
+    let load: String
+    /// The value a `"clear"` load starts from; absent for any other load.
+    let clear_value: UInt32?
+}
+
+/// The stencil state a render case declares (`research/docs/23` §3.3, v47).
+///
+/// The fields mirror `metal_api_core::provider::StencilTest`: the compare
+/// function spelling, the reference value the test compares against, the two
+/// byte-wide masks, and the three operations — what a fragment that fails the
+/// stencil test does, what one that passes it but fails the depth test does,
+/// and what one that passes both does. Metal states them on one
+/// `MTLStencilDescriptor` per face of a `MTLDepthStencilDescriptor`, with the
+/// reference value on the encoder rather than on the pipeline.
+private struct StencilTestDefinition: Decodable {
+    let compare: String
+    let reference: UInt32
+    let read_mask: UInt32
+    let write_mask: UInt32
+    let fail_op: String
+    let depth_fail_op: String
+    let pass_op: String
+}
+
 /// One attribute of a render case's vertex stream.
 ///
 /// The fields mirror `metal_api_core::provider::VertexAttribute`: the
@@ -374,6 +412,20 @@ private struct RenderCaseDefinition: Decodable {
     /// one-minus-source-alpha with an add over a cleared-to-zero attachment,
     /// so a rail that ignored the state would store the tint itself.
     let blend: [BlendAttachmentDefinition]?
+    /// The rail-owned stencil attachment the pass opens, or `nil` for no
+    /// stencil surface — the shape every case before v47 declares
+    /// (`metal_api_core::provider::RenderStencilAttachment`,
+    /// `research/docs/23` §3.3, v47). The reviewed stencil case clears one
+    /// `stencil8` surface to zero, covering the same render area as the colour
+    /// attachment, and the values the pass stores are what decide which half
+    /// of its draw survives; the observation stays the colour attachment.
+    let stencil: StencilAttachmentDefinition?
+    /// The pass's stencil state, or `nil` for no stencil state — the shape
+    /// every pre-v47 case declares. A state only exists for a pass that opens
+    /// a stencil attachment, and the reviewed stencil case states the `equal`
+    /// test against reference zero that writes the value the next primitive of
+    /// the same draw is then tested against (`research/docs/23` §3.3, v47).
+    let stencil_test: StencilTestDefinition?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -398,6 +450,11 @@ private struct ValidatedRender {
     /// every pre-v36 case declares (`research/docs/23` §3.3, v36). The runner
     /// states these on the pass descriptor and the encoder.
     let depth: ValidatedDepth?
+    /// The reviewed stencil surface and state, or `nil` for the stencil-less
+    /// shape every pre-v47 case declares (`research/docs/23` §3.3, v47). The
+    /// runner states these on the pass descriptor and the encoder, and the
+    /// surface itself is rail-owned: it is never read back.
+    let stencil: ValidatedStencil?
 }
 
 /// One vertex stream the draw reads: its binding index, stride, advance,
@@ -510,6 +567,21 @@ private struct ValidatedDepthStore {
     let allocation: UInt64
     let view: UInt64
     let expected: Data
+}
+
+/// The reviewed stencil surface and state a case carries
+/// (`research/docs/23` §3.3, v47): the `stencil8` surface's extent, the value
+/// its clear starts from and the reference the test compares against. The
+/// review above already forced these to the reviewed values, so the runner
+/// only has to state the surface on the pass descriptor and the test on the
+/// encoder's depth-stencil state. The surface is rail-owned exactly like the
+/// pre-v43 depth shape: the pass discards it, so there is no readback, no
+/// writeback and no allocation observation.
+private struct ValidatedStencil {
+    let width: Int
+    let height: Int
+    let clearValue: UInt32
+    let reference: UInt32
 }
 
 private struct SuiteDefinition: Decodable {
@@ -1840,14 +1912,33 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(definition.depth == nil,
                         "\(definition.id): the reviewed cull shape carries no depth attachment")
         }
+        // The reviewed stencil shape (`research/docs/23` §3.3, v47) is the
+        // fourth pair shape: the same two-attribute stream and module as the
+        // depth fixture, the culling pair and the blend shape, this time with
+        // the rail-owned stencil surface and the reviewed stencil state in
+        // place of the depth attachment. Like the two classifications above it
+        // is read ahead of the depth rule — a case that declares more than one
+        // of the pair shapes is refused by the shape it claims rather than
+        // silently read as another fixture.
+        if definition.stencil != nil || definition.stencil_test != nil {
+            try require(layout.buffers.count == 1
+                        && layout.buffers[0].attributes.count == 2,
+                        "\(definition.id): the reviewed stencil stream is one stride-32 "
+                        + "stream with two attributes")
+            try require(definition.depth == nil && definition.cull == nil
+                        && definition.blend == nil,
+                        "\(definition.id): the reviewed stencil shape carries no depth "
+                        + "attachment, culling state or blend state")
+        }
         // The reviewed depth shape (`research/docs/23` §3.3, v36) is the
         // two-attribute stream, and no rail was reviewed against drawing it
         // *without* its depth pair: the surface is what the case exists to
         // exercise, exactly as `render.rs::reviewed_depth_geometry` refuses a
-        // depth-shaped draw that carries no attachment. The two pair shapes
+        // depth-shaped draw that carries no attachment. The three pair shapes
         // above draw the same stream shape under their own states, so only a
-        // cull-less, blend-less case is the depth fixture.
+        // cull-less, blend-less, stencil-less case is the depth fixture.
         if definition.cull == nil, definition.blend == nil,
+           definition.stencil == nil, definition.stencil_test == nil,
            layout.buffers.count == 1 && layout.buffers[0].attributes.count == 2 {
             try require(definition.depth != nil,
                         "\(definition.id): the reviewed depth shape carries a depth attachment")
@@ -2487,10 +2578,68 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     } else {
         validatedDepth = nil
     }
+    // The stencil pair (`research/docs/23` §3.3, v47) is the second reviewed
+    // pair-with-state shape: one rail-owned `stencil8` attachment cleared to
+    // zero, covering the same render area as the colour attachment, and the
+    // reviewed stencil state. The stored values are the whole point of the
+    // fixture — the first primitive of the draw writes the value the second
+    // one is then tested against — so anything else describes a shape no rail
+    // has been reviewed against, and a state without its attachment — or the
+    // reverse — is refused, mirroring the two depth rules above.
+    try require(definition.stencil != nil || definition.stencil_test == nil,
+                "\(definition.id): a stencil test needs a stencil attachment")
+    let validatedStencil: ValidatedStencil?
+    if let stencil = definition.stencil {
+        try require(stencil.format == "stencil8",
+                    "\(definition.id): the reviewed stencil attachment is a stencil8")
+        try require(stencil.load == "clear",
+                    "\(definition.id): the reviewed stencil attachment is cleared")
+        guard let clearValue = stencil.clear_value, clearValue == 0 else {
+            throw OracleError("\(definition.id): the reviewed stencil clear is 0")
+        }
+        // The stencil attachment is a second raster with the pass's own extent,
+        // exactly as the depth sibling is (`research/docs/23` §3.3, v36): the
+        // two have to agree. The colour side's viewport rule already pins
+        // every colour attachment to one extent, so the first one is the whole
+        // comparison. Only the colour-carrying shape reaches this review: a
+        // pass with no colour attachment at all is the v46 zero-colour shape,
+        // whose stored depth attachment the classification above refuses
+        // beside a stencil pair.
+        guard let colour = attachments.first else {
+            throw OracleError("\(definition.id): the reviewed stencil shape carries a "
+                              + "colour attachment")
+        }
+        try require(stencil.width == colour.width && stencil.height == colour.height,
+                    "\(definition.id): the stencil attachment has to match the colour extent")
+        guard let test = definition.stencil_test else {
+            throw OracleError("\(definition.id): the reviewed stencil shape carries a stencil test")
+        }
+        // The reviewed stencil state (`research/docs/23` §3.3, v47): an `equal`
+        // test against reference zero, with both masks wide open, that keeps
+        // both failure outcomes and increments — with wraparound — on pass.
+        // That is the state that makes the fixture's two primitives differ:
+        // the first one passes against the cleared zero and writes one, and the
+        // second one is tested against that one and dropped. Any other
+        // spelling describes a state no rail has been reviewed against.
+        try require(test.compare == "equal"
+                    && test.reference == 0
+                    && test.read_mask == 255
+                    && test.write_mask == 255
+                    && test.fail_op == "keep"
+                    && test.depth_fail_op == "keep"
+                    && test.pass_op == "increment_wrap",
+                    "\(definition.id): the reviewed stencil state is an equal test against "
+                    + "reference zero with both masks wide open that keeps both failure "
+                    + "outcomes and increments-wraps on pass")
+        validatedStencil = ValidatedStencil(width: stencil.width, height: stencil.height,
+                                            clearValue: clearValue, reference: test.reference)
+    } else {
+        validatedStencil = nil
+    }
     return ValidatedRender(definition: definition, source: source,
                            attachments: validatedAttachments,
                            vertexStreams: vertexStreams, indexStream: indexStream,
-                           depth: validatedDepth)
+                           depth: validatedDepth, stencil: validatedStencil)
 }
 
 private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throws -> ProgramDefinition {
@@ -2880,6 +3029,26 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         texture.label = "native oracle: \(definition.id) depth"
         depthTarget = texture
     }
+    // The stencil surface is rail-owned too (`research/docs/23` §3.3, v47): the
+    // stored values decide which primitives survive and this increment reads
+    // nothing back, so private storage is enough and the pass discards it after
+    // the draw — the same shape the pre-v43 depth surface has. The local keeps
+    // the texture alive until the encoder's own reference takes over.
+    var stencilTarget: MTLTexture?
+    if let stencil = fixture.stencil {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .stencil8,
+            width: stencil.width,
+            height: stencil.height,
+            mipmapped: false)
+        descriptor.usage = .renderTarget
+        descriptor.storageMode = .private
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the stencil attachment")
+        }
+        texture.label = "native oracle: \(definition.id) stencil"
+        stencilTarget = texture
+    }
     // The two stage entries come from the one reviewed module; `loadSuite`
     // already proved the identity, so only the lookup can still fail.
     let library = try device.makeLibrary(source: fixture.source, options: nil)
@@ -2976,6 +3145,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     if fixture.depth != nil {
         pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
     }
+    // The stencil sibling (`research/docs/23` §3.3, v47): a pass that opens a
+    // stencil attachment compiles its pipeline against that attachment's
+    // format, exactly as the depth branch above states the depth format.
+    if fixture.stencil != nil {
+        pipelineDescriptor.stencilAttachmentPixelFormat = .stencil8
+    }
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
     let pass = MTLRenderPassDescriptor()
@@ -3029,6 +3204,19 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.clearDepth = depth.clearDepth
         attachment.storeAction = depth.store == nil ? .dontCare : .store
     }
+    // The stencil surface opens with its own load operation and leaves with the
+    // pass (`research/docs/23` §3.3, v47): it is rail-owned, so this increment
+    // reads nothing back and `dontCare` is its store action — the shape every
+    // pre-v43 depth surface has.
+    if let stencil = fixture.stencil {
+        guard let texture = stencilTarget, let attachment = pass.stencilAttachment else {
+            throw OracleError("\(definition.id): cannot reach the stencil attachment")
+        }
+        attachment.texture = texture
+        attachment.loadAction = .clear
+        attachment.clearStencil = stencil.clearValue
+        attachment.storeAction = .dontCare
+    }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
     }
@@ -3050,6 +3238,30 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             throw OracleError("\(definition.id): cannot create the depth-stencil state")
         }
         encoder.setDepthStencilState(state)
+    }
+    // The stencil pair's state is encoder state too (`research/docs/23` §3.3,
+    // v47): the reviewed state is the same `MTLStencilDescriptor` on the front
+    // and the back face — an `equal` test with both masks wide open that keeps
+    // both failure outcomes and increments-wraps on pass — and the reference
+    // value travels with the encoder rather than the descriptor. The depth half
+    // of the descriptor keeps Metal's own defaults, exactly as a pass without a
+    // depth attachment does.
+    if let stencil = fixture.stencil {
+        let stencilDescriptor = MTLStencilDescriptor()
+        stencilDescriptor.stencilCompareFunction = .equal
+        stencilDescriptor.stencilFailureOperation = .keep
+        stencilDescriptor.depthFailureOperation = .keep
+        stencilDescriptor.depthStencilPassOperation = .incrementWrap
+        stencilDescriptor.readMask = 255
+        stencilDescriptor.writeMask = 255
+        let depthStencilDescriptor = MTLDepthStencilDescriptor()
+        depthStencilDescriptor.frontFaceStencil = stencilDescriptor
+        depthStencilDescriptor.backFaceStencil = stencilDescriptor
+        guard let state = device.makeDepthStencilState(descriptor: depthStencilDescriptor) else {
+            throw OracleError("\(definition.id): cannot create the stencil state")
+        }
+        encoder.setDepthStencilState(state)
+        encoder.setStencilReferenceValue(stencil.reference)
     }
     // Culling is encoder state too (`research/docs/23` §3.3, v39): the mode and
     // the winding are the pass's own, and a pass without the state keeps
@@ -3285,6 +3497,9 @@ private func renderSelfTest() throws -> CaseResult {
         depth_test: nil,
         cull: nil,
         blend: nil,
+        // Every pre-v47 shape is stencil-less (`research/docs/23` §3.3, v47).
+        stencil: nil,
+        stencil_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
@@ -3350,6 +3565,9 @@ private func presentSelfTest() throws -> CaseResult {
         depth_test: nil,
         cull: nil,
         blend: nil,
+        // Every pre-v47 shape is stencil-less (`research/docs/23` §3.3, v47).
+        stencil: nil,
+        stencil_test: nil,
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
         capture_rails: ["native-metal"])
@@ -3439,6 +3657,9 @@ private func vertexSelfTest() throws -> CaseResult {
         depth_test: nil,
         cull: nil,
         blend: nil,
+        // Every pre-v47 shape is stencil-less (`research/docs/23` §3.3, v47).
+        stencil: nil,
+        stencil_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
@@ -3532,6 +3753,9 @@ private func mrtSelfTest() throws -> CaseResult {
         depth_test: nil,
         cull: nil,
         blend: nil,
+        // Every pre-v47 shape is stencil-less (`research/docs/23` §3.3, v47).
+        stencil: nil,
+        stencil_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])

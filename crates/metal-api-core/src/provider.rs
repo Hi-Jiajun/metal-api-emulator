@@ -2083,6 +2083,193 @@ impl RenderDepthAttachment {
 /// four-byte texel, which is what makes the depth readback a flat byte extent.
 pub const DEPTH_BYTES_PER_TEXEL: u64 = 4;
 
+/// The stencil formats this increment admits (`research/docs/23` §3.3, v47).
+///
+/// `VK_FORMAT_S8_UINT` and `MTLPixelFormatStencil8` are the same single-byte
+/// surface: a stencil-only attachment, which is the shape the reviewed fixture
+/// masks with. The list stays closed so admitting a second format is a
+/// deliberate wire-visible change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StencilFormat {
+    Stencil8,
+}
+
+impl StencilFormat {
+    pub const ADMITTED: [Self; 1] = [Self::Stencil8];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Stencil8 => 0,
+        }
+    }
+
+    /// Inverse of [`StencilFormat::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Stencil8),
+            _ => None,
+        }
+    }
+}
+
+/// How a stencil attachment's contents are established before the pass
+/// (`research/docs/23` §3.3, v47).
+///
+/// The depth sibling's shape, one byte wide: `Clear` carries the value every
+/// stencil texel starts from, `Load` keeps the attachment's previous contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StencilLoadOp {
+    Clear(u8),
+    Load,
+}
+
+impl StencilLoadOp {
+    /// The clear value a `Clear` arm carries, decoded.
+    pub const fn clear_value(self) -> Option<u8> {
+        match self {
+            Self::Clear(value) => Some(value),
+            Self::Load => None,
+        }
+    }
+
+    /// The `Clear` arm for one stencil value.
+    pub const fn clear(value: u8) -> Self {
+        Self::Clear(value)
+    }
+}
+
+/// How one stencil comparison treats a fragment (`research/docs/23` §3.3, v47).
+///
+/// Two values, because they are the ones the reviewed fixture needs and both
+/// APIs name identically: `Equal` is the ordinary "the stored value is the
+/// reference" test the fixture proves by writing the value it then tests, and
+/// `Always` is the "the attachment exists but the test passes" control a fixture
+/// can use to show which half of the state it is observing. The list stays
+/// closed so admitting a third is a deliberate wire-visible change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StencilCompare {
+    Equal,
+    Always,
+}
+
+impl StencilCompare {
+    pub const ADMITTED: [Self; 2] = [Self::Equal, Self::Always];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Equal => 0,
+            Self::Always => 1,
+        }
+    }
+
+    /// Inverse of [`StencilCompare::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Equal),
+            1 => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
+/// What a stencil test does to the stored value (`research/docs/23` §3.3, v47).
+///
+/// The three values the reviewed states need: `Keep` leaves the stored value
+/// alone, `Replace` stores the reference, and `IncrementWrap` adds one with
+/// wraparound — the operation the reviewed fixture uses to write the value the
+/// *next* primitive in the same draw then tests. The list stays closed so
+/// admitting another operation is a deliberate wire-visible change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StencilOp {
+    Keep,
+    Replace,
+    IncrementWrap,
+}
+
+impl StencilOp {
+    pub const ADMITTED: [Self; 3] = [Self::Keep, Self::Replace, Self::IncrementWrap];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Keep => 0,
+            Self::Replace => 1,
+            Self::IncrementWrap => 2,
+        }
+    }
+
+    /// Inverse of [`StencilOp::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Keep),
+            1 => Some(Self::Replace),
+            2 => Some(Self::IncrementWrap),
+            _ => None,
+        }
+    }
+}
+
+/// The stencil state one pass tests and writes with (`research/docs/23` §3.3,
+/// v47).
+///
+/// Every field is the pass's own, mirroring Metal, where the front and back
+/// `MTLStencilDescriptor`s and the encoder's stencil reference value carry the
+/// whole state — not the pipeline. The Vulkan rail bakes the same value into
+/// the per-pass pipeline it builds, so one description serves both. `fail_op`
+/// is what a fragment that fails the stencil test does, `depth_fail_op` what a
+/// fragment that passes the stencil test but fails the depth test does, and
+/// `pass_op` what a fragment that passes both does; the two masks and the
+/// reference are the byte-wide values both APIs state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StencilTest {
+    pub compare: StencilCompare,
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub reference: u8,
+}
+
+/// The stencil attachment one render pass carries (`research/docs/23` §3.3,
+/// v47).
+///
+/// Rail-owned like the first depth increment's surface: the reviewed fixture
+/// masks with it — the stored values decide which primitives survive — and
+/// nothing reads it back yet, so what a trace states is the format, the extent
+/// and the load operation. A stencil *readback* channel is a later increment,
+/// and it is what would add the identity fields this one deliberately leaves
+/// out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderStencilAttachment {
+    /// The only format this increment admits ([`StencilFormat::ADMITTED`]).
+    pub format: StencilFormat,
+    /// Extent in texels; it has to match every colour attachment's extent, the
+    /// same rule the viewport states for the colour side.
+    pub width: u64,
+    pub height: u64,
+    /// How the pass establishes the attachment's contents.
+    pub load: StencilLoadOp,
+}
+
+impl RenderStencilAttachment {
+    /// Tightly packed byte extent of the stencil surface: one byte per texel.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|texels| texels.checked_mul(STENCIL_BYTES_PER_TEXEL))
+            .ok_or(ContractError::ArithmeticOverflow(
+                "stencil attachment bytes",
+            ))
+    }
+}
+
+/// `VK_FORMAT_S8_UINT` and `MTLPixelFormatStencil8` both carry one byte per
+/// texel, which is what makes the stencil surface's extent a flat byte count.
+pub const STENCIL_BYTES_PER_TEXEL: u64 = 1;
+
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
@@ -2177,6 +2364,15 @@ pub struct RenderPassDescriptor {
     /// which is the shape every earlier increment published (they had no depth
     /// attachment at all).
     pub depth_test: Option<DepthTest>,
+    /// The stencil attachment this pass opens, or `None` for a pass with no
+    /// stencil surface at all (`research/docs/23` §3.3, v47). When present,
+    /// [`Self::stencil_test`] says what the fragments do with it.
+    pub stencil: Option<RenderStencilAttachment>,
+    /// The stencil state the pass's draw tests and writes with, or `None` for
+    /// "no test" — which a pass with a stencil attachment may still declare,
+    /// and which is the shape every earlier increment published (they had no
+    /// stencil attachment at all).
+    pub stencil_test: Option<StencilTest>,
     /// Instances of the one draw (`research/docs/23` §3.3, v31), i.e. Metal's
     /// `drawPrimitives(vertexCount:instanceCount:)` and Vulkan's
     /// `vkCmdDraw(vertexCount, instanceCount, …)`. `1` is the single-instance
@@ -2376,6 +2572,31 @@ impl RenderPassDescriptor {
         // channel has to state rather than a default this contract implies.
         if self.depth_test.is_some() && self.depth.is_none() {
             return Err(ContractError::DepthTestWithoutAttachment);
+        }
+        // The stencil attachment is a second raster with the pass's own extent
+        // (`research/docs/23` §3.3, v47): the same rules the depth surface
+        // states, one byte wide.
+        if let Some(stencil) = &self.stencil {
+            if stencil.width == 0 || stencil.height == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "stencil attachment",
+                    axis: if stencil.width == 0 { 0 } else { 1 },
+                });
+            }
+            if !StencilFormat::ADMITTED.contains(&stencil.format) {
+                return Err(ContractError::UnsupportedStencilFormat(stencil.format));
+            }
+            if u64::from(width) != stencil.width || u64::from(height) != stencil.height {
+                return Err(ContractError::StencilExtentMismatch {
+                    viewport: [width, height],
+                    stencil: [stencil.width, stencil.height],
+                });
+            }
+        }
+        // A stencil test without a stencil attachment has nothing to test
+        // against, exactly as the depth state states it.
+        if self.stencil_test.is_some() && self.stencil.is_none() {
+            return Err(ContractError::StencilTestWithoutAttachment);
         }
         // The scissor, when present, has to stay inside the viewport and be
         // non-empty: a zero-area scissor would make "nothing landed" look like
@@ -6502,6 +6723,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
         | E::DepthStoreIdentityMismatch { .. }
+        | E::UnsupportedStencilFormat(_)
+        | E::StencilExtentMismatch { .. }
+        | E::StencilTestWithoutAttachment
         | E::BlendAttachmentCountMismatch { .. } => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
@@ -7942,6 +8166,17 @@ pub enum ContractError {
     /// The pass declares depth state but carries no depth attachment
     /// (`research/docs/23` §3.3, v36).
     DepthTestWithoutAttachment,
+    /// The pass's stencil attachment is not a format this increment admits
+    /// (`research/docs/23` §3.3, v47).
+    UnsupportedStencilFormat(StencilFormat),
+    /// The pass's stencil attachment extent does not match the colour raster.
+    StencilExtentMismatch {
+        viewport: [u32; 2],
+        stencil: [u64; 2],
+    },
+    /// The pass declares stencil state but carries no stencil attachment
+    /// (`research/docs/23` §3.3, v47).
+    StencilTestWithoutAttachment,
     /// The pass's depth store action and depth identity disagree
     /// (`research/docs/23` §3.3, v43).
     ///
@@ -8484,6 +8719,18 @@ impl fmt::Display for ContractError {
                  together: a stored surface needs a landing, and a landing needs a stored surface",
                 store,
                 if *identity { "present" } else { "absent" }
+            ),
+            Self::UnsupportedStencilFormat(format) => write!(
+                formatter,
+                "stencil format {format:?} is not one this increment admits"
+            ),
+            Self::StencilExtentMismatch { viewport, stencil } => write!(
+                formatter,
+                "stencil attachment extent {stencil:?} does not match the colour raster {viewport:?}"
+            ),
+            Self::StencilTestWithoutAttachment => write!(
+                formatter,
+                "a stencil test needs a stencil attachment: there is nothing to test against"
             ),
             Self::BlendAttachmentCountMismatch {
                 blend,
@@ -9764,6 +10011,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(pipeline),
             color_attachments: vec![RenderAttachment {
@@ -13010,6 +13259,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(5),
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
@@ -13897,6 +14148,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(4),
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],

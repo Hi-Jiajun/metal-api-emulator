@@ -14,8 +14,9 @@ use metal_api_core::provider::{
     InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
     PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
     RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
+    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, ResourceTableSnapshot,
+    SemanticDigest, ShaderSource, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
+    StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
     TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
     VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
 };
@@ -1251,6 +1252,14 @@ struct RenderCase {
     /// nothing tests it" (`research/docs/23` §3.3, v36).
     #[serde(default)]
     depth_test: Option<DepthTestDefinition>,
+    /// The rail-owned stencil attachment the pass opens, or absent for a pass
+    /// with no stencil surface (`research/docs/23` §3.3, v47).
+    #[serde(default)]
+    stencil: Option<StencilAttachmentDefinition>,
+    /// The pass's stencil state, or absent for "the attachment exists and
+    /// nothing tests it".
+    #[serde(default)]
+    stencil_test: Option<StencilTestDefinition>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1336,6 +1345,39 @@ struct DepthAttachmentDefinition {
 struct DepthTestDefinition {
     compare: String,
     write: bool,
+}
+
+/// The rail-owned stencil attachment a render case declares
+/// (`research/docs/23` §3.3, v47).
+///
+/// The depth sibling's shape one byte wide: the format spelling, the extent and
+/// the load operation with the value a clear starts from. The surface has no
+/// trace identity yet — nothing reads it back — so the case names no view for
+/// it.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StencilAttachmentDefinition {
+    format: String,
+    width: u64,
+    height: u64,
+    load: String,
+    /// The value a `"clear"` load starts from; absent for any other load.
+    #[serde(default)]
+    clear_value: Option<u8>,
+}
+
+/// The stencil state a render case's draw tests and writes with
+/// (`research/docs/23` §3.3, v47).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StencilTestDefinition {
+    compare: String,
+    fail_op: String,
+    depth_fail_op: String,
+    pass_op: String,
+    read_mask: u8,
+    write_mask: u8,
+    reference: u8,
 }
 
 /// One vertex layout: the reviewed stream list, in binding order.
@@ -2920,6 +2962,55 @@ fn reviewed_depth_geometry(
     layout: &VertexLayoutDefinition,
     where_: &str,
 ) -> Result<RenderGeometry> {
+    // The stencil sibling masks with a stencil attachment instead of a depth
+    // one (`research/docs/23` §3.3, v47): the same pair stream, one rail-owned
+    // `stencil8` surface, and exactly the reviewed state. The two surfaces are
+    // mutually exclusive in this increment, so a case that declares both is
+    // refused rather than classified as either.
+    if case.stencil.is_some() {
+        if case.depth.is_some() {
+            return Err(format!(
+                "{where_}: the reviewed stencil shape carries no depth attachment"
+            )
+            .into());
+        }
+        if case.stencil_test.is_none() {
+            return Err(
+                format!("{where_}: the reviewed stencil shape carries a stencil test").into(),
+            );
+        }
+    } else if case.stencil_test.is_some() {
+        return Err(format!("{where_}: a stencil test needs a stencil attachment").into());
+    }
+    if let Some(stencil) = &case.stencil {
+        if stencil.format != "stencil8" || stencil.load != "clear" || stencil.clear_value != Some(0)
+        {
+            return Err(format!(
+                "{where_}: the reviewed stencil attachment is a stencil8 surface cleared to zero"
+            )
+            .into());
+        }
+        if stencil.width != 4 || stencil.height != 4 {
+            return Err(format!("{where_}: the reviewed stencil attachment is 4x4 texels").into());
+        }
+        let Some(test) = &case.stencil_test else {
+            unreachable!("the presence rule above proved the state is there");
+        };
+        if test.compare != "equal"
+            || test.reference != 0
+            || test.read_mask != 0xff
+            || test.write_mask != 0xff
+            || test.fail_op != "keep"
+            || test.depth_fail_op != "keep"
+            || test.pass_op != "increment_wrap"
+        {
+            return Err(format!(
+                "{where_}: the reviewed stencil state is an equal test against zero that keeps \
+                 the stored value on failure and increments it with wraparound on success"
+            )
+            .into());
+        }
+    }
     let stream = &layout.buffers[0];
     if layout.buffers.len() != 1
         || stream.stride != DEPTH_STRIDE
@@ -2945,10 +3036,11 @@ fn reviewed_depth_geometry(
         )
         .into());
     }
+    // From here on the review is the *depth* half of the shape: the stencil
+    // sibling's own rules are stated above, and the stream and index checks
+    // below are shared by both.
     let Some(depth) = &case.depth else {
-        return Err(
-            format!("{where_}: the reviewed depth shape carries a depth attachment").into(),
-        );
+        return reviewed_stencil_geometry_stream(case, layout, where_);
     };
     if depth.format != "depth32float" || depth.load != "clear" {
         return Err(
@@ -3065,6 +3157,46 @@ fn reviewed_depth_geometry(
         return Err(
             format!("{where_}: the reviewed depth indices are the two reviewed triangles").into(),
         );
+    }
+    Ok(RenderGeometry::DepthPair)
+}
+
+/// The tail of the reviewed pair review for the stencil sibling
+/// (`research/docs/23` §3.3, v47): the stream and attribute checks already ran
+/// in [`reviewed_depth_geometry`], so what is left is the caller-held stream's
+/// own bytes and the two-triangle index shape both pair fixtures pin.
+fn reviewed_stencil_geometry_stream(
+    case: &RenderCase,
+    _layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the reviewed stencil shape binds one stream").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let required = DEPTH_STRIDE * 6;
+    if buffer.length != required {
+        return Err(format!(
+            "{where_}: the reviewed stencil stream is six stride-{DEPTH_STRIDE} vertices"
+        )
+        .into());
+    }
+    if buffer.initial_hex != reviewed_depth_stream_hex() {
+        return Err(
+            format!("{where_}: the reviewed stencil stream is the two reviewed triangles").into(),
+        );
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed stencil shape is indexed").into());
+    };
+    if indices.initial_hex != "000001000200030004000500" {
+        return Err(format!(
+            "{where_}: the reviewed stencil indices are the two reviewed triangles"
+        )
+        .into());
     }
     Ok(RenderGeometry::DepthPair)
 }
@@ -3221,7 +3353,11 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     if case.cull.is_some() {
         return reviewed_cull_geometry(case, layout, where_);
     }
-    if case.depth.is_some() {
+    // The depth and stencil shapes are the same pair geometry with one
+    // depth-stencil surface behind it (`research/docs/23` §3.3, v36/v47): the
+    // geometry classifier routes both to the same review, and that review
+    // requires exactly one of the two.
+    if case.depth.is_some() || case.stencil.is_some() {
         return reviewed_depth_geometry(case, layout, where_);
     }
     if layout.buffers.len() == 2 {
@@ -5384,6 +5520,90 @@ fn case_depth(
     Ok((depth, test))
 }
 
+/// The stencil attachment and stencil state one render case declares
+/// (`research/docs/23` §3.3, v47).
+///
+/// The case's spellings mirror `compare.py` and the Swift oracle: `stencil8`
+/// with a `clear` value, and the reviewed state's comparison, operations, masks
+/// and reference. A state without an attachment is refused here as well as by
+/// the contract, so the refusal names the case rather than the pass index.
+fn case_stencil(
+    case: &RenderCase,
+    where_: &str,
+) -> Result<(Option<RenderStencilAttachment>, Option<StencilTest>)> {
+    let stencil = match &case.stencil {
+        None => None,
+        Some(stencil) => {
+            let format = match stencil.format.as_str() {
+                "stencil8" => StencilFormat::Stencil8,
+                other => {
+                    return Err(format!("{where_}: unsupported stencil format {other:?}").into())
+                }
+            };
+            let load = match stencil.load.as_str() {
+                "clear" => StencilLoadOp::clear(stencil.clear_value.ok_or(format!(
+                    "{where_}: a cleared stencil attachment needs clear_value"
+                ))?),
+                "load" => {
+                    if stencil.clear_value.is_some() {
+                        return Err(format!(
+                            "{where_}: a loading stencil attachment carries no clear_value"
+                        )
+                        .into());
+                    }
+                    StencilLoadOp::Load
+                }
+                other => {
+                    return Err(format!("{where_}: unsupported stencil load op {other:?}").into())
+                }
+            };
+            Some(RenderStencilAttachment {
+                format,
+                width: stencil.width,
+                height: stencil.height,
+                load,
+            })
+        }
+    };
+    let test = match &case.stencil_test {
+        None => None,
+        Some(test) => {
+            let compare = match test.compare.as_str() {
+                "equal" => StencilCompare::Equal,
+                "always" => StencilCompare::Always,
+                other => {
+                    return Err(format!("{where_}: unsupported stencil compare {other:?}").into())
+                }
+            };
+            let operation = |name: &str, spelling: &str| -> Result<StencilOp> {
+                Ok(match spelling {
+                    "keep" => StencilOp::Keep,
+                    "replace" => StencilOp::Replace,
+                    "increment_wrap" => StencilOp::IncrementWrap,
+                    other => {
+                        return Err(
+                            format!("{where_}: unsupported stencil {name} op {other:?}").into()
+                        )
+                    }
+                })
+            };
+            Some(StencilTest {
+                compare,
+                fail_op: operation("fail", &test.fail_op)?,
+                depth_fail_op: operation("depth fail", &test.depth_fail_op)?,
+                pass_op: operation("pass", &test.pass_op)?,
+                read_mask: test.read_mask,
+                write_mask: test.write_mask,
+                reference: test.reference,
+            })
+        }
+    };
+    if test.is_some() && stencil.is_none() {
+        return Err(format!("{where_}: a stencil test needs a stencil attachment").into());
+    }
+    Ok((stencil, test))
+}
+
 /// Execute one render case on the Vulkan trace rail.
 ///
 /// The trace is the declaring case's own pass followed by the render pass, i.e.
@@ -5407,6 +5627,11 @@ fn run_render_case(
 ) -> Result<CaseResult> {
     let attachments = render_attachment_shapes(case)?;
     let (depth_attachment, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
+    // The stencil sibling (`research/docs/23` §3.3, v47): the same pass-level
+    // state the depth pair carries, one byte wide, plus the rail-owned surface
+    // the reviewed state masks with.
+    let (stencil_attachment, stencil_test) =
+        case_stencil(case, &format!("render case {}", case.id))?;
     let cull = case_cull(case)?;
     let blend = case_blend(case)?;
     // The declaring pass's own resource table: one backing image and one
@@ -5658,6 +5883,11 @@ fn run_render_case(
         // surface" (`research/docs/23` §3.3, v36).
         depth: depth_attachment,
         depth_test,
+        // The reviewed stencil fixture declares the surface and the state;
+        // every other case leaves both absent, which the rails execute as "no
+        // stencil surface at all" (`research/docs/23` §3.3, v47).
+        stencil: stencil_attachment,
+        stencil_test,
         // The reviewed cull fixture declares the state; every other case leaves
         // it absent, which the rails execute as "keep every triangle"
         // (`research/docs/23` §3.3, v39).
@@ -6080,6 +6310,17 @@ fn run_object_render_case(
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
+    // The object API records no stencil surface yet (`research/docs/23` §3.3,
+    // v47): a marked stencil case is refused here rather than recorded without
+    // its state, which would land colour bytes the fixture's own review says
+    // the stencil test decides.
+    if case.stencil.is_some() {
+        return Err(format!(
+            "render case {}: the object rails have no stencil entry yet",
+            case.id
+        )
+        .into());
+    }
     let attachments = render_attachment_shapes(case)?;
     let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &declaring.buffers {
