@@ -320,6 +320,18 @@ impl CopyCounters {
         }
     }
 
+    /// The reviewed 2/4/8 sample counts the device admits, as the
+    /// contract-code bitmask (`research/docs/23` §3.3, v61): bit `i` =
+    /// `SampleCount` code `i`. The device-gated sample-count cases are owed
+    /// exactly when their count's bit is present.
+    fn render_sample_counts(&self) -> u32 {
+        match self {
+            Self::Vulkan { executor, .. } => executor.render_sample_count_mask(),
+            #[cfg(target_os = "macos")]
+            Self::Native(provider) => provider.render_sample_counts(),
+        }
+    }
+
     /// The placements the provider actually bound during its last submission
     /// (`research/docs/25` §5.1), mapped to one rail-independent tuple so the
     /// two providers' observation types do not have to be unified.
@@ -1303,6 +1315,14 @@ struct RenderCase {
     /// the filter skips the case instead of running (and refusing) it.
     #[serde(default)]
     requires_stencil_resolve_filter: Option<String>,
+    /// The device gate one sample-count case may state (`research/docs/23`
+    /// §3.3, v61): the case appears in a capture if and only if the device
+    /// capability snapshot's sample ceiling is at least the count the case
+    /// states. The marker still decides which rails own the case; the gate is
+    /// the device-side half of the same question, so a rail whose device lacks
+    /// the count skips the case instead of running (and refusing) it.
+    #[serde(default)]
+    requires_sample_count: Option<u64>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1403,17 +1423,19 @@ fn object_entry_carries_no_state(families: &[&str]) -> bool {
 }
 
 /// The pass-wide multisample state a case states, in the contract's own shape
-/// (`research/docs/23` §3.3, v51/v52).
+/// (`research/docs/23` §3.3, v51/v52/v61).
 ///
-/// `validate_render_case` already refused every count but the reviewed four
-/// before this runs, so the mapping is total over the shapes that can reach
-/// either rail; the refusal below keeps the helper total for a directly
+/// `validate_render_case` already refused every count but the reviewed 2/4/8
+/// family before this runs, so the mapping is total over the shapes that can
+/// reach either rail; the refusal below keeps the helper total for a directly
 /// constructed case.
 fn case_multisample(case: &RenderCase) -> Result<Option<MultisampleState>> {
     match &case.multisample {
         Some(definition) => Ok(Some(MultisampleState {
             sample_count: match definition.sample_count {
+                2 => SampleCount::Two,
                 4 => SampleCount::Four,
+                8 => SampleCount::Eight,
                 other => {
                     return Err(format!(
                         "render case {}: unsupported multisample count {other}",
@@ -1961,6 +1983,10 @@ struct Capture {
     /// `i`. The comparator reads the device-gated stencil cases' presence
     /// against it.
     stencil_resolve_modes: u32,
+    /// The device's reviewed sample-count mask (`research/docs/23` §3.3,
+    /// v61): bit `i` = `SampleCount` code `i`. The comparator reads the
+    /// device-gated sample-count cases' presence against it.
+    render_sample_counts: u32,
     device: String,
     platform: String,
     results: Vec<CaseResult>,
@@ -2361,6 +2387,26 @@ fn main() -> Result<()> {
                 continue;
             }
         }
+        // The sample-count device gate (`research/docs/23` §3.3, v61): the
+        // depth and stencil gates' sibling — a case that requires a sample
+        // count appears if and only if the device's sample-count mask carries
+        // that count's bit. The mask is the per-count answer the snapshot's
+        // ceiling cannot give: Lavapipe admits 4x and 8x but not 2x.
+        if let Some(count) = case.requires_sample_count {
+            let bit = 1u32
+                << u32::from(match count {
+                    2 => SampleCount::Two.code(),
+                    8 => SampleCount::Eight.code(),
+                    _ => unreachable!("validate_render_case held the gate to 2x or 8x"),
+                });
+            if counters.render_sample_counts() & bit == 0 {
+                println!(
+                    "render case skipped: {} (device lacks the {}-sample raster)",
+                    case.id, count
+                );
+                continue;
+            }
+        }
         let declaring = suite
             .cases
             .iter()
@@ -2475,6 +2521,7 @@ fn main() -> Result<()> {
         allocation_observation: "host-writeback-landing",
         depth_resolve_modes: provider.capabilities().depth_resolve_modes,
         stencil_resolve_modes: provider.capabilities().stencil_resolve_modes,
+        render_sample_counts: counters.render_sample_counts(),
         device: device_name,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         results,
@@ -4270,6 +4317,30 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             .into());
         }
     }
+    // The sample-count device gate (`research/docs/23` §3.3, v61): a case
+    // that requires a sample count has to state the raster whose count it
+    // names. Only the two counts a device may lack are gateable — 2x and 8x —
+    // because 4x is the v51 baseline every multisampling device admits, so
+    // nothing needs to be measured against it per device.
+    if let Some(count) = case.requires_sample_count {
+        if !matches!(count, 2 | 8) {
+            return Err(format!(
+                "{where_}: the device gate names the two- or eight-sample \
+                                raster"
+            )
+            .into());
+        }
+        if case
+            .multisample
+            .as_ref()
+            .is_none_or(|multisample| multisample.sample_count != count)
+        {
+            return Err(format!(
+                "{where_}: the device gate has to name the sample count the case states"
+            )
+            .into());
+        }
+    }
     // The multisample raster (`research/docs/23` §3.3, v51): the first
     // increment reviews exactly one shape — one colour attachment opened from
     // a clear, four samples, no depth or stencil surface, no present action,
@@ -4284,10 +4355,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 format!("{where_}: the multisample raster is the single-attachment shape").into(),
             );
         }
-        if multisample.sample_count != 4 {
-            return Err(
-                format!("{where_}: the reviewed multisample raster is four samples").into(),
-            );
+        if !matches!(multisample.sample_count, 2 | 4 | 8) {
+            return Err(format!(
+                "{where_}: the reviewed multisample rasters are two, four or eight \
+                         samples"
+            )
+            .into());
         }
         let (attachment, _) = shapes.first().ok_or(format!(
             "{where_}: a multisample raster needs an attachment"
@@ -4435,10 +4508,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 )
                 .into());
             }
-        } else if case.coverage.as_deref() != Some("partial") {
-            return Err(
-                format!("{where_}: the multisample raster has to claim partial coverage").into(),
-            );
+        } else {
+            // The colour-only raster admits both expectation shapes the v61
+            // increment reviews: `coverage: partial` is the v51 edge fixture's
+            // resolve rule, and an absent claim is the v61 full-coverage
+            // fixtures' uniform rule — every texel is the fragment output.
+            // The general gate above already held a present claim to
+            // `"partial"`, so nothing further to refuse here.
         }
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
@@ -4567,11 +4643,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             // The combined depth-stencil shape's far triangle
                             // fails the depth test on the samples the near
                             // triangle covered, so the mixed column carries
-                            // the colour resolve's k-of-four mix like a
-                            // partially covered raster does
-                            // (`research/docs/23` §3.3, v60).
+                            // the colour resolve's k-of-`sample_count` mix
+                            // like a partially covered raster does
+                            // (`research/docs/23` §3.3, v60). The v61
+                            // full-coverage colour-only fixtures keep the
+                            // uniform rule too: their expectation is the
+                            // fragment output on every texel, and a mixed
+                            // texel would claim a raster the fixture does not
+                            // describe (`research/docs/23` §3.3, v61).
                             if (case.depth.is_some() || case.stencil.is_some())
                                 && case.stencil_resolve.is_none()
+                                || (case.depth.is_none()
+                                    && case.stencil.is_none()
+                                    && case.coverage.as_deref() != Some("partial"))
                             {
                                 if !uniform_texel {
                                     return Err(format!(

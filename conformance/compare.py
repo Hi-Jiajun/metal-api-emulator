@@ -47,8 +47,8 @@ ALLOCATION_OBSERVATIONS = {
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
-    "stencil_filter",
-    defaults=(None, None, None))
+    "stencil_filter sample_count_gate",
+    defaults=(None, None, None, None))
 
 # One render case's present section: the target mode and image count the first
 # increment fixes, the counts a capture has to report, and the sentinel the
@@ -81,6 +81,13 @@ DEPTH_RESOLVE_FILTER_BITS = {"sample0": 1, "min": 2, "max": 4}
 # `i`, the same numbering `metal-api-core` uses for
 # `ProviderCapabilities::stencil_resolve_modes`.
 STENCIL_RESOLVE_FILTER_BITS = {"sample0": 1, "depth_resolved_sample": 2}
+
+# The capability-mask bit each device-gated sample count occupies
+# (`research/docs/23` §3.3, v61): bit `i` is the `SampleCount` whose wire code
+# is `i`, so 2x carries bit 1 and 8x carries bit 3. The capture's
+# `render_sample_counts` mask carries exactly the reviewed counts the device
+# admits, and a gated case is owed only when its count's bit is present.
+SAMPLE_COUNT_BITS = {2: 1 << 1, 8: 1 << 3}
 
 
 class CaptureError(ValueError):
@@ -1445,7 +1452,7 @@ def _render_plan(plan, suite):
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
-                               "requires_stencil_resolve_filter"})
+                               "requires_stencil_resolve_filter", "requires_sample_count"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1641,6 +1648,20 @@ def _render_plan(plan, suite):
             _require(stencil_resolve is not None
                      and stencil_resolve["filter"] == requires_stencil_filter,
                      f"{where}: the device gate has to name the resolve filter the case states")
+        # The sample-count device gate (`research/docs/23` §3.3, v61): a case
+        # that requires a sample count appears in a capture if and only if the
+        # capture's sample ceiling is at least that count. The gate has to name
+        # the raster the case states, and only the two counts a device may lack
+        # are gateable: 4x is the v51 baseline every multisampling device
+        # admits.
+        requires_sample_count = case.get("requires_sample_count")
+        if requires_sample_count is not None:
+            _require(_integer(requires_sample_count,
+                              f"{where}.requires_sample_count", 1) in (2, 8),
+                     f"{where}: the device gate names the two- or eight-sample raster")
+            _require(case.get("multisample") is not None
+                     and case["multisample"]["sample_count"] == requires_sample_count,
+                     f"{where}: the device gate has to name the sample count the case states")
         wildcard_texels = case.get("wildcard_texels")
         if wildcard_texels is not None:
             _require(single,
@@ -1670,8 +1691,9 @@ def _render_plan(plan, suite):
                      f"{where}: the multisample raster is the single-attachment shape")
             _object(multisample, ("sample_count",), f"{where}.multisample")
             _require(_integer(multisample["sample_count"],
-                              f"{where}.multisample.sample_count", 1) == 4,
-                     f"{where}: the reviewed multisample raster is four samples")
+                              f"{where}.multisample.sample_count", 1) in (2, 4, 8),
+                     f"{where}: the reviewed multisample rasters are two, four or eight "
+                     "samples")
             _require(case["attachment"].get("load") == "clear",
                      f"{where}: the reviewed multisample pass opens its attachment from a "
                      "clear")
@@ -1719,8 +1741,13 @@ def _render_plan(plan, suite):
                          f"{where}: a multisample pass with a stencil surface claims no partial "
                          "coverage")
             else:
-                _require(coverage == "partial",
-                         f"{where}: the multisample raster has to claim partial coverage")
+                # The colour-only raster admits both expectation shapes the
+                # v61 increment reviews: a partial coverage claim is the v51
+                # edge fixture's resolve rule, and an absent claim is the v61
+                # full-coverage fixtures' uniform rule — every texel is the
+                # fragment output. The general gate above already held a
+                # present claim to `"partial"`.
+                pass
             _require("present" not in case and "icb" not in case,
                      f"{where}: a multisample case carries neither a present action nor "
                      "an ICB")
@@ -1875,10 +1902,13 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: the clear colour equals the expected texel")
                 # The combined depth-stencil shape's mixed column carries the
                 # k-of-four colour resolve, so it follows the resolve rule; the
-                # single-surface shapes keep the uniform pair rule
-                # (`research/docs/23` §3.3, v53/v55/v60).
+                # single-surface shapes keep the uniform pair rule, and so do
+                # the v61 full-coverage colour-only fixtures — only a raster
+                # that *claims* partial coverage is owed a mixed texel
+                # (`research/docs/23` §3.3, v53/v55/v60/v61).
                 if multisample is not None and (
-                        (case.get("depth") is None and case.get("stencil") is None)
+                        (case.get("depth") is None and case.get("stencil") is None
+                         and coverage == "partial")
                         or case.get("stencil_resolve") is not None):
                     # The multisample resolve (`research/docs/23` §3.3, v51):
                     # every texel is the mean of the samples a primitive
@@ -2242,7 +2272,8 @@ def _render_plan(plan, suite):
             icb=icb,
             wildcards=wildcards,
             filter=requires_filter,
-            stencil_filter=requires_stencil_filter)
+            stencil_filter=requires_stencil_filter,
+            sample_count_gate=requires_sample_count)
     return render_plan
 
 
@@ -2264,7 +2295,8 @@ def validate_capture(suite, digest, report, required_backend=None):
              "capture: expected fields "
              + ", ".join(sorted(required_keys - set(report))))
     unexpected = set(report) - required_keys - {"depth_resolve_modes",
-                                                "stencil_resolve_modes"}
+                                                "stencil_resolve_modes",
+                                                "render_sample_counts"}
     _require(not unexpected,
              "capture: unexpected fields " + ", ".join(sorted(unexpected)))
     _require(type(report["schema_version"]) is int and report["schema_version"] == 1,
@@ -2291,6 +2323,9 @@ def validate_capture(suite, digest, report, required_backend=None):
     stencil_modes = report.get("stencil_resolve_modes", 0)
     if "stencil_resolve_modes" in report:
         _integer(stencil_modes, "capture.stencil_resolve_modes")
+    sample_counts = report.get("render_sample_counts", 0)
+    if "render_sample_counts" in report:
+        _integer(sample_counts, "capture.render_sample_counts")
     if any(expectation.filter is not None for expectation in render_plan.values()):
         _require("depth_resolve_modes" in report,
                  "capture: missing depth_resolve_modes (the suite declares "
@@ -2300,6 +2335,11 @@ def validate_capture(suite, digest, report, required_backend=None):
         _require("stencil_resolve_modes" in report,
                  "capture: missing stencil_resolve_modes (the suite declares "
                  "device-gated stencil cases)")
+    if any(expectation.sample_count_gate is not None
+           for expectation in render_plan.values()):
+        _require("render_sample_counts" in report,
+                 "capture: missing render_sample_counts (the suite declares "
+                 "device-gated sample-count cases)")
     results = _list(report["results"], "capture.results")
     seen = set()
     # The Swift reference oracle reports bytes but not device-buffer copy
@@ -2501,9 +2541,10 @@ def validate_capture(suite, digest, report, required_backend=None):
     # the object-API rails carry no render command encoder, so those captures
     # would have nothing to report. A rail that is not named must not report
     # the case either, which is the same exact-set rule the per-result check
-    # applies. A device-gated render case (`research/docs/23` §3.3, v57d) adds
-    # the mask half: even a rail its marker names owes the case only when the
-    # capture's `depth_resolve_modes` carries the filter's bit.
+    # applies. A device-gated render case (`research/docs/23` §3.3,
+    # v57d/v60/v61) adds the device half: even a rail its marker names owes the
+    # case only when the capture's mask carries the filter's bit, or its sample
+    # mask carries the count the case requires.
     required = {case_id for case_id, expectation in plan.items()
                 if expectation[6] is None or report["backend"] in expectation[6]}
     required |= {case_id for case_id, expectation in render_plan.items()
@@ -2512,7 +2553,10 @@ def validate_capture(suite, digest, report, required_backend=None):
                       or modes & DEPTH_RESOLVE_FILTER_BITS[expectation.filter])
                  and (expectation.stencil_filter is None
                       or stencil_modes
-                      & STENCIL_RESOLVE_FILTER_BITS[expectation.stencil_filter])}
+                      & STENCIL_RESOLVE_FILTER_BITS[expectation.stencil_filter])
+                 and (expectation.sample_count_gate is None
+                      or sample_counts
+                      & SAMPLE_COUNT_BITS[expectation.sample_count_gate])}
     missing = required - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
     for case_id in sorted(set(render_plan) - required):
@@ -2525,6 +2569,10 @@ def validate_capture(suite, digest, report, required_backend=None):
             message = (f"case {case_id}: {report['backend']} lacks the "
                        f"{expectation.stencil_filter} stencil resolve filter the case "
                        "requires")
+        elif (expectation.sample_count_gate is not None
+              and report["backend"] in expectation.rails):
+            message = (f"case {case_id}: {report['backend']} lacks the "
+                       f"{expectation.sample_count_gate}-sample raster the case requires")
         else:
             message = (f"case {case_id}: {report['backend']} is not a rail this render "
                        f"case runs on")

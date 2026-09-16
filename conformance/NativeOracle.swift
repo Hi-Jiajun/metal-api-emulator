@@ -467,6 +467,12 @@ private struct RenderCaseDefinition: Decodable {
     /// v59 self-test proved Apple Paravirtual executes both filters, so this
     /// oracle's mask carries both bits.
     let requires_stencil_resolve_filter: String?
+    /// The device gate one sample-count case may state (`research/docs/23`
+    /// §3.3, v61): the case appears in a capture if and only if the device's
+    /// declared sample-count mask carries the count's bit. The marker still
+    /// decides which rails own the case; the gate is the device-side half of
+    /// the same question.
+    let requires_sample_count: UInt64?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -757,6 +763,20 @@ private let nativeDepthResolveModes: UInt64 = (1 << 0) | (1 << 1) | (1 << 2)
 /// in every oracle capture under the presence-iff-bit rule.
 private let nativeStencilResolveModes: UInt64 = (1 << 0) | (1 << 1)
 
+/// The reviewed sample-count mask this oracle declares from the device's own
+/// answer (`research/docs/23` §3.3, v61): bit `i` is the `SampleCount` whose
+/// wire code is `i`, so 2x carries bit 1 and 8x carries bit 3. The
+/// device-gated sample-count cases the suite declares appear in an oracle
+/// capture if and only if this mask carries their count's bit — the ceiling
+/// alone cannot say which of the counts a device lacks.
+private func nativeRenderSampleCounts(device: MTLDevice) -> UInt64 {
+    var mask: UInt64 = 0
+    if device.supportsTextureSampleCount(2) { mask |= 1 << 1 }
+    if device.supportsTextureSampleCount(4) { mask |= 1 << 2 }
+    if device.supportsTextureSampleCount(8) { mask |= 1 << 3 }
+    return mask
+}
+
 private struct SuiteResult: Encodable {
     let schema_version: UInt64
     let suite: String
@@ -765,6 +785,7 @@ private struct SuiteResult: Encodable {
     let allocation_observation: String
     let depth_resolve_modes: UInt64
     let stencil_resolve_modes: UInt64
+    let render_sample_counts: UInt64
     let device: String
     let platform: String
     let results: [CaseResult]
@@ -2392,8 +2413,9 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     if let multisample = definition.multisample {
         try require(definition.attachment != nil,
                     "\(definition.id): the multisample raster is the single-attachment shape")
-        try require(multisample.sample_count == 4,
-                    "\(definition.id): the reviewed multisample raster is four samples")
+        try require([2, 4, 8].contains(multisample.sample_count),
+                    "\(definition.id): the reviewed multisample rasters are two, four or "
+                    + "eight samples")
         // The raster's own expectation shape depends on what it opens
         // (`research/docs/23` §3.3, v51/v53): a colour-only raster resolves
         // fragment output and clear into partial texels and therefore has to
@@ -2456,8 +2478,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         } else if definition.depth_resolve != nil {
             throw OracleError("\(definition.id): a depth resolve needs a stored depth surface")
         } else {
-            try require(definition.coverage == "partial",
-                        "\(definition.id): the multisample raster has to claim partial coverage")
+            // The colour-only raster admits both expectation shapes the v61
+            // increment reviews: a partial coverage claim is the v51 edge
+            // fixture's resolve rule, and an absent claim is the v61
+            // full-coverage fixtures' uniform rule — every texel is the
+            // fragment output. The general gate above already held a present
+            // claim to `"partial"`.
         }
         // The depthResolvedSample filter names the sample the depth resolve
         // selected, so a case that states it without one is refused
@@ -2479,6 +2505,18 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         + "resolve filter")
             try require(definition.depth_resolve?.filter == gate,
                         "\(definition.id): the device gate has to name the resolve filter "
+                        + "the case states")
+        }
+        // The sample-count device gate (`research/docs/23` §3.3, v61): a case
+        // that requires a sample count has to state the raster whose count it
+        // names, and only the two counts a device may lack are gateable — 4x
+        // is the v51 baseline every multisampling device admits.
+        if let gate = definition.requires_sample_count {
+            try require(gate == 2 || gate == 8,
+                        "\(definition.id): the device gate names the two- or eight-sample "
+                        + "raster")
+            try require(definition.multisample?.sample_count == gate,
+                        "\(definition.id): the device gate has to name the sample count "
                         + "the case states")
         }
         try require(definition.depth == nil || definition.stencil == nil
@@ -2597,9 +2635,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // The resolve rule covers the colour-only raster and the combined
             // depth-stencil shape whose stencil half resolves (`research/docs/23`
             // §3.3, v51/v60); the single-surface masked rasters keep the pair's
-            // uniform rule below.
+            // uniform rule below, and so do the v61 full-coverage colour-only
+            // fixtures — only a raster that claims partial coverage is owed a
+            // mixed texel (`research/docs/23` §3.3, v61).
             if attachment.load == "clear", let multisample = definition.multisample,
                (definition.depth == nil && definition.stencil == nil
+                && definition.coverage == "partial"
                 || definition.stencil_resolve != nil) {
                 // The multisample resolve (`research/docs/23` §3.3, v51): every
                 // texel is the arithmetic mean of the samples a primitive
@@ -4243,6 +4284,7 @@ private func renderSelfTest() throws -> CaseResult {
         requires_depth_resolve_filter: nil,
         stencil_resolve: nil,
         requires_stencil_resolve_filter: nil,
+        requires_sample_count: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -4318,6 +4360,7 @@ private func presentSelfTest() throws -> CaseResult {
         requires_depth_resolve_filter: nil,
         stencil_resolve: nil,
         requires_stencil_resolve_filter: nil,
+        requires_sample_count: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4415,6 +4458,7 @@ private func vertexSelfTest() throws -> CaseResult {
         requires_depth_resolve_filter: nil,
         stencil_resolve: nil,
         requires_stencil_resolve_filter: nil,
+        requires_sample_count: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4516,6 +4560,7 @@ private func mrtSelfTest() throws -> CaseResult {
         requires_depth_resolve_filter: nil,
         stencil_resolve: nil,
         requires_stencil_resolve_filter: nil,
+        requires_sample_count: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4955,6 +5000,7 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         requires_depth_resolve_filter: nil,
         stencil_resolve: nil,
         requires_stencil_resolve_filter: nil,
+        requires_sample_count: nil,
         wildcard_texels: nil,
         depth: DepthAttachmentDefinition(
             format: "depth32float", width: 4, height: 4, load: "clear",
@@ -5545,7 +5591,9 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
     // that reported a case would present a comparison the suite did not ask
     // for, which `conformance/compare.py` refuses. A device-gated case adds
     // the mask half (`research/docs/23` §3.3, v57d): even a marked case is
-    // absent unless this rail's declared mask carries the filter's bit.
+    // absent unless this rail's declared mask carries the filter's bit, or
+    // its sample-count mask carries the count the case requires (v61).
+    let nativeSampleCounts = nativeRenderSampleCounts(device: device)
     for fixture in suite.renderCases where fixture.definition.capture_rails.contains("native-metal") {
         if let gate = fixture.definition.requires_depth_resolve_filter {
             let bit: UInt64 = gate == "min" ? 2 : 4
@@ -5559,12 +5607,19 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
                 continue
             }
         }
+        if let gate = fixture.definition.requires_sample_count {
+            let bit: UInt64 = gate == 2 ? 1 << 1 : 1 << 3
+            if nativeSampleCounts & bit == 0 {
+                continue
+            }
+        }
         results.append(try runRenderCase(fixture, device: device, queue: queue))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",
         depth_resolve_modes: nativeDepthResolveModes,
         stencil_resolve_modes: nativeStencilResolveModes,
+        render_sample_counts: nativeSampleCounts,
         device: device.name, platform: eligibility.platform, results: results)
 }
 

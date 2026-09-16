@@ -2303,28 +2303,39 @@ pub struct RenderStencilIdentity {
 pub const STENCIL_BYTES_PER_TEXEL: u64 = 1;
 
 /// How many samples one multisampled render pass rasterizes per texel
-/// (`research/docs/23` §3.3, v51).
+/// (`research/docs/23` §3.3, v51/v61).
 ///
-/// The admitted set is the one shape the first multisample increment reviews:
-/// the four-sample raster both Rails spell `MTLSampleCount4`/`TYPE_4`, whose
-/// standard sample positions are what makes a partially covered texel resolve
-/// to exactly the samples the primitive covered. `One` exists so the wire has a
-/// code for "not multisampled" without a second field; a pass that *states* it
-/// is refused, because the absent state already means single-sample.
+/// The admitted set is the three multisampled rasters both Rails spell
+/// `MTLSampleCount2/4/8` and `TYPE_2/4/8`. The full-coverage fixtures the v61
+/// increment reviews execute 2x and 8x, and the v51 partial-coverage fixture
+/// executes 4x; the standard sample positions are what makes a partially
+/// covered texel resolve to exactly the samples the primitive covered. `One`
+/// exists so the wire has a code for "not multisampled" without a second field;
+/// a pass that *states* it is refused, because the absent state already means
+/// single-sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SampleCount {
     One,
+    Two,
     Four,
+    Eight,
 }
 
 impl SampleCount {
-    pub const ADMITTED: [Self; 2] = [Self::One, Self::Four];
+    pub const ADMITTED: [Self; 4] = [Self::One, Self::Two, Self::Four, Self::Eight];
 
     /// Stable wire code.
+    ///
+    /// The v61 increment widens the closed family and renumbers the code space
+    /// in ascending sample-count order (`One`/`Two`/`Four`/`Eight` = 0/1/2/3);
+    /// the wire shape itself is unchanged — the multisample section is still
+    /// the one code byte the v51 increment introduced.
     pub const fn code(self) -> u8 {
         match self {
             Self::One => 0,
-            Self::Four => 1,
+            Self::Two => 1,
+            Self::Four => 2,
+            Self::Eight => 3,
         }
     }
 
@@ -2332,7 +2343,9 @@ impl SampleCount {
     pub const fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::One),
-            1 => Some(Self::Four),
+            1 => Some(Self::Two),
+            2 => Some(Self::Four),
+            3 => Some(Self::Eight),
             _ => None,
         }
     }
@@ -2341,7 +2354,9 @@ impl SampleCount {
     pub const fn samples(self) -> u32 {
         match self {
             Self::One => 1,
+            Self::Two => 2,
             Self::Four => 4,
+            Self::Eight => 8,
         }
     }
 }
@@ -2692,18 +2707,14 @@ impl RenderPassDescriptor {
         if !stored_colour && !stored_depth && !stored_stencil {
             return Err(ContractError::AllRenderAttachmentsDiscarded);
         }
-        // The multisample state (`research/docs/23` §3.3, v51) is the pass-wide
-        // raster decision, so this is the one place its shape is held: the
-        // sample count has to be a multisampled one, the pass has to have
-        // colour attachments for the resolve to land in, and the first
-        // increment reviews neither a depth/stencil surface nor a present
-        // action beside the multisampled raster.
+        // The multisample state (`research/docs/23` §3.3, v51/v61) is the
+        // pass-wide raster decision, so this is the one place its shape is
+        // held: the sample count has to be a multisampled one — `Two`/`Four`/
+        // `Eight` are all admitted rasters — and the pass has to have colour
+        // attachments for the resolve to land in.
         if let Some(multisample) = self.multisample {
-            match multisample.sample_count {
-                SampleCount::One => {
-                    return Err(ContractError::SingleSampleMultisampleState);
-                }
-                SampleCount::Four => {}
+            if multisample.sample_count == SampleCount::One {
+                return Err(ContractError::SingleSampleMultisampleState);
             }
             if self.color_attachments.is_empty() {
                 return Err(ContractError::MultisampleWithoutColorAttachment);
@@ -14313,13 +14324,15 @@ mod tests {
         );
 
         // A colour-only pass that states the raster is the admitted shape.
-        assert_eq!(SampleCount::ADMITTED.len(), 2);
+        assert_eq!(SampleCount::ADMITTED.len(), 4);
         assert_eq!(SampleCount::One.samples(), 1);
+        assert_eq!(SampleCount::Two.samples(), 2);
         assert_eq!(SampleCount::Four.samples(), 4);
+        assert_eq!(SampleCount::Eight.samples(), 8);
         for count in SampleCount::ADMITTED {
             assert_eq!(SampleCount::from_code(count.code()), Some(count));
         }
-        assert_eq!(SampleCount::from_code(2), None);
+        assert_eq!(SampleCount::from_code(4), None);
         // The depth resolve filters are the closed three-value family whose
         // codes double as the capability mask's bit positions: Sample0/Min/Max
         // = 0/1/2, and any fourth code is a decoder refusal.

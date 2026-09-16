@@ -33,16 +33,6 @@ const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
 /// refused by core admission against this bit rather than silently narrowed.
 const MAX_RENDER_INSTANCES: u32 = 4;
 
-/// The largest sample count the multisample raster executes
-/// (`research/docs/23` §3.3, v51).
-///
-/// The reviewed fixture states the four-sample raster both APIs spell
-/// `SampleCount4`/`TYPE_4`, and the ceiling is exactly that count: the
-/// capability bit below reports it only when the device's own framebuffer
-/// sample counts carry it, so a wider or unsupported request is refused by core
-/// admission rather than silently narrowed.
-const MAX_RENDER_SAMPLE_COUNT: u32 = 4;
-
 /// Conservative first-increment heap ceiling (`research/docs/25-heaps与ICB设计.md`
 /// §4.1). The placement rail is proven on a 4096-byte heap; capping admission
 /// far below the device's real single-allocation ceiling (Lavapipe reports a
@@ -55,6 +45,7 @@ fn failure(message: impl Into<String>) -> ExecutorError {
 }
 
 pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> ProviderCapabilities {
+    let multisample_ceiling = crate::render::limits_render_sample_count_ceiling(limits);
     ProviderCapabilities {
         max_passes: 1,
         supports_threads_exact: true,
@@ -110,19 +101,17 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // core admission (`research/docs/23` §3.3, v31).
         supports_render_instancing: true,
         max_render_instances: MAX_RENDER_INSTANCES,
-        // The multisample raster is executed (`render.rs` builds a four-sample
+        // The multisample raster is executed (`render.rs` builds a multisampled
         // subpass with one resolve attachment per colour location and copies
-        // the resolve target back). Evidence: the reviewed `msaa_edge_4x4` case
-        // on Lavapipe and on the RTX 5060. Both bits are gated on the device's
-        // own framebuffer sample counts, so a device without a four-sample
-        // framebuffer reports 0 and core admission refuses the shape before the
-        // rail's per-format probe runs (`research/docs/23` §3.3, v51).
-        supports_render_multisample: crate::render::limits_support_multisample(limits),
-        max_render_sample_count: if crate::render::limits_support_multisample(limits) {
-            MAX_RENDER_SAMPLE_COUNT
-        } else {
-            0
-        },
+        // the resolve target back). Evidence: the reviewed `msaa_edge_4x4`
+        // case on Lavapipe and on the RTX 5060, and the v61 2x/8x
+        // full-coverage fixtures on both. Both bits are the device's own
+        // framebuffer sample counts — the ceiling is the largest of the
+        // reviewed 2/4/8 rasters the device admits — so a device without any
+        // of them reports 0 and core admission refuses the shape before the
+        // rail's per-format probe runs (`research/docs/23` §3.3, v51/v61).
+        supports_render_multisample: multisample_ceiling.is_some(),
+        max_render_sample_count: multisample_ceiling.unwrap_or(0),
         // The depth resolve is executed from v57 on (`render.rs` migrates the
         // render pass to RenderPass2 and resolves a stored multisampled depth
         // surface into its own single-sample landing). The two bits are the

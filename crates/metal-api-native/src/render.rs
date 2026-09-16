@@ -455,11 +455,6 @@ pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PR
 /// reviewed fixture draws two instances and the declared window is four.
 pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
 
-/// The largest sample count the multisample raster executes
-/// (`research/docs/23` §3.3, v51). Same rule as the Vulkan rail's ceiling: the
-/// reviewed fixture states the four-sample raster, so four is the whole window.
-pub(crate) const MAX_RENDER_SAMPLE_COUNT: u32 = 4;
-
 /// The render bits this provider declares as of the Step 7 flip.
 ///
 /// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
@@ -592,30 +587,45 @@ pub(crate) fn instancing_capability_bits() -> InstancingCapabilityBits {
 pub(crate) struct MultisampleCapabilityBits {
     pub(crate) supports_render_multisample: bool,
     pub(crate) max_render_sample_count: u32,
+    /// The reviewed 2/4/8 counts the device admits, as a bitmask over the
+    /// contract codes: bit `i` = [`SampleCount`] code `i`. The capture runner
+    /// reads the device-gated sample-count cases against this mask, because
+    /// the ceiling alone cannot say which of the counts a device lacks
+    /// (`research/docs/23` §3.3, v61).
+    pub(crate) render_sample_counts: u32,
 }
 
-/// The multisample bits this provider declares as of the v51 flip.
+/// The multisample bits this provider declares, from the device's own answer
+/// (`research/docs/23` §3.3, v51/v61).
 ///
-/// Flip condition (`research/docs/23` §3.3): the reviewed `msaa_edge_4x4` case
-/// on the Apple rail, i.e. the macOS CI job's `native-metal` capture of the
-/// suite that names every rail. That run builds the reviewed quad module,
-/// renders it into a four-sample texture (`rasterSampleCount = 4`,
-/// `storeAction = .multisampleResolve` with the attachment's own texture as the
-/// resolve target) and reads back the mixed texel the fixture pins — a byte
-/// pattern neither the fragment output nor the clear colour can produce. The
-/// ceiling is the reviewed count itself: four is the only raster both rails
-/// execute, so a wider request is refused by core admission rather than
-/// silently narrowed.
-///
-/// Before this flip both bits were at their defaults, so core admission refused
-/// a multisampled pass with `render_multisample_unsupported` instead of
-/// executing it as a single-sample draw; the host-side half this rail owns is
-/// [`plan`], which holds the state to the one count the encoder builds and the
-/// texture creation in [`multisample_attachment_textures`].
-pub(crate) fn multisample_capability_bits() -> MultisampleCapabilityBits {
+/// The v61 increment widens the reviewed raster family to 2x/4x/8x, so the
+/// ceiling is no longer a fixed reviewed count but the largest of the three
+/// rasters the device's `supportsTextureSampleCount:` probe admits. A device
+/// that admits none of them keeps both bits at their defaults, so core
+/// admission refuses a multisampled pass with
+/// `render_multisample_unsupported` instead of executing it as a single-sample
+/// draw; the host-side half this rail owns is [`plan`], which holds the state
+/// to the counts the encoder builds and the texture creation in
+/// [`multisample_attachment_textures`].
+#[cfg(target_os = "macos")]
+pub(crate) fn device_multisample_capability_bits(device: &Device) -> MultisampleCapabilityBits {
+    let counts = [
+        (8u32, 1 << SampleCount::Eight.code()),
+        (4, 1 << SampleCount::Four.code()),
+        (2, 1 << SampleCount::Two.code()),
+    ];
+    let mask = counts
+        .iter()
+        .filter(|(count, _)| device.supports_texture_sample_count(u64::from(*count)))
+        .fold(0, |mask, (_, bit)| mask | bit);
+    let ceiling = counts
+        .into_iter()
+        .find(|(count, _)| device.supports_texture_sample_count(u64::from(*count)))
+        .map(|(count, _)| count);
     MultisampleCapabilityBits {
-        supports_render_multisample: true,
-        max_render_sample_count: MAX_RENDER_SAMPLE_COUNT,
+        supports_render_multisample: ceiling.is_some(),
+        max_render_sample_count: ceiling.unwrap_or(0),
+        render_sample_counts: mask,
     }
 }
 
@@ -1882,14 +1892,19 @@ pub(crate) fn plan<'a>(
         scissor: request.pass.scissor,
         cull: request.pass.cull,
         blend: request.pass.blend.clone(),
-        // The multisample raster (`research/docs/23` §3.3, v51). The contract
-        // already refused a single-sample state, a non-clear load and a depth
-        // or stencil surface beside it; the rail re-asserts the count its
-        // encoder knows how to build, so a directly-constructed request cannot
-        // reach `newTextureWithDescriptor` with a raster this increment does
-        // not execute.
+        // The multisample raster (`research/docs/23` §3.3, v51/v61). The
+        // contract already refused a single-sample state, a non-clear load and
+        // a depth or stencil surface beside it; the rail re-asserts the counts
+        // its encoder knows how to build, so a directly-constructed request
+        // cannot reach `newTextureWithDescriptor` with a raster this
+        // increment does not execute.
         multisample: match request.pass.multisample {
-            Some(multisample) if multisample.sample_count == SampleCount::Four => {
+            Some(multisample)
+                if matches!(
+                    multisample.sample_count,
+                    SampleCount::Two | SampleCount::Four | SampleCount::Eight
+                ) =>
+            {
                 // A stored multisampled depth surface is admitted from v57c on,
                 // through the resolve the pass then has to state: its texels
                 // are only observable as the resolve's reduction, so a stored
@@ -1988,12 +2003,13 @@ pub(crate) fn plan<'a>(
                         }
                     }
                 }
-                Some(SampleCount::Four)
+                Some(multisample.sample_count)
             }
             Some(_) => {
                 return Err(capability_refusal("render_multisample_state_unsupported")
                     .with_detail(
-                        "the first multisample increment executes the four-sample raster only",
+                        "the multisample increment executes the two-, four- and eight-sample \
+                         rasters only",
                     ));
             }
             None => None,
@@ -2848,11 +2864,19 @@ fn encode_into_and_readback(
     // descriptors, so the two targets below share the one surface instead of
     // the two single-face textures the other shapes build.
     let combined = planned.depth.is_some() && planned.stencil.is_some();
+    let raster_samples = planned.multisample.map(|count| u64::from(count.samples()));
     let combined_target = if combined {
         planned
             .depth
             .as_ref()
-            .map(|depth| combined_depth_stencil_surface(device, depth))
+            .map(|depth| {
+                let samples = raster_samples.ok_or_else(|| {
+                    capability_refusal("render_multisample_state_unsupported").with_detail(
+                        "a combined depth-stencil surface states a multisampled raster",
+                    )
+                })?;
+                combined_depth_stencil_surface(device, depth, samples)
+            })
             .transpose()?
     } else {
         None
@@ -2867,7 +2891,11 @@ fn encode_into_and_readback(
                     .clone()
                     .expect("the combined target exists beside the combined plan"))
             } else if depth_resolving {
-                multisample_depth_surface(device, depth)
+                let samples = raster_samples.ok_or_else(|| {
+                    capability_refusal("render_multisample_state_unsupported")
+                        .with_detail("a depth resolve states a multisampled raster")
+                })?;
+                multisample_depth_surface(device, depth, samples)
             } else {
                 depth_texture(device, depth, planned.multisample)
             }
@@ -3265,24 +3293,30 @@ fn attachment_textures(
     Ok(textures)
 }
 
-/// The four-sample surfaces one multisampled pass renders into
-/// (`research/docs/23` §3.3, v51), one per colour location.
+/// The multisampled surfaces one multisampled pass renders into
+/// (`research/docs/23` §3.3, v51/v61), one per colour location.
 ///
 /// The textures are render targets with shared storage for the same reason
 /// every attachment texture is: the rail is synchronous and the resolved
 /// texels, not these, are what leaves through the readback. The sample count is
-/// the one the plan fixed — `SampleCount::Four`, the only raster this increment
-/// executes — so the raster state and the textures cannot disagree.
+/// the one the plan carried — the pass's own 2x/4x/8x raster — so the raster
+/// state and the textures cannot disagree.
 #[cfg(target_os = "macos")]
 fn multisample_attachment_textures(
     device: &Device,
     planned: &RenderPlan<'_>,
 ) -> Result<Vec<Texture>, ProviderError> {
     let samples = match planned.multisample {
-        Some(SampleCount::Four) => 4,
+        Some(count @ (SampleCount::Two | SampleCount::Four | SampleCount::Eight)) => {
+            u64::from(count.samples())
+        }
         _ => {
-            return Err(capability_refusal("render_multisample_state_unsupported")
-                .with_detail("the first multisample increment creates four-sample surfaces only"));
+            return Err(
+                capability_refusal("render_multisample_state_unsupported").with_detail(
+                    "the multisample increment creates two-, four- and eight-sample surfaces \
+                     only",
+                ),
+            );
         }
     };
     let mut textures = Vec::with_capacity(planned.attachments.len());
@@ -3394,14 +3428,15 @@ fn depth_texture(
 ) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
     // A multisampled pass creates its depth surface with the raster's own
-    // sample count (`research/docs/23` §3.3, v53): Metal refuses an encoder
-    // whose depth texture's sample count disagrees with `rasterSampleCount`, so
-    // the two come from one decision. The surface stays `Private` because a
-    // multisampled depth surface is rail-owned in this increment — keeping it
-    // would need the depth resolve filter the increment after this one reviews.
-    if multisample.is_some() {
+    // sample count (`research/docs/23` §3.3, v53/v61): Metal refuses an
+    // encoder whose depth texture's sample count disagrees with
+    // `rasterSampleCount`, so the two come from one decision. The surface
+    // stays `Private` because a multisampled depth surface is rail-owned in
+    // this increment — keeping it would need the depth resolve filter the
+    // increment after this one reviews.
+    if let Some(multisample) = multisample {
         descriptor.set_texture_type(MTLTextureType::D2Multisample);
-        descriptor.set_sample_count(4);
+        descriptor.set_sample_count(u64::from(multisample.samples()));
     } else {
         descriptor.set_texture_type(MTLTextureType::D2);
     }
@@ -3423,8 +3458,8 @@ fn depth_texture(
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
 
-/// The four-sample depth surface a resolving pass renders into
-/// (`research/docs/23` §3.3, v57c).
+/// The multisampled depth surface a resolving pass renders into
+/// (`research/docs/23` §3.3, v57c/v61).
 ///
 /// The resolve's landing is the single-sample shared texture
 /// [`depth_texture`] builds for a stored surface, so this surface is never
@@ -3432,15 +3467,16 @@ fn depth_texture(
 /// surfaces are private in the Swift oracle. Metal refuses an encoder whose
 /// depth texture's sample count disagrees with `rasterSampleCount`, so the two
 /// come from one decision exactly as the non-resolving multisampled surface
-/// does.
+/// does. The count is the raster's own, carried in from the plan.
 #[cfg(target_os = "macos")]
 fn multisample_depth_surface(
     device: &Device,
     depth: &PlannedDepth,
+    samples: u64,
 ) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2Multisample);
-    descriptor.set_sample_count(4);
+    descriptor.set_sample_count(samples);
     descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
     descriptor.set_width(u64::from(depth.width));
     descriptor.set_height(u64::from(depth.height));
@@ -3474,14 +3510,14 @@ fn stencil_texture(
 ) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
     // A multisampled pass creates its stencil surface with the raster's own
-    // sample count (`research/docs/23` §3.3, v55), exactly as the depth
+    // sample count (`research/docs/23` §3.3, v55/v61), exactly as the depth
     // surface does: Metal refuses an encoder whose attachment disagrees with
     // `rasterSampleCount`. The surface stays `Private` because a multisampled
     // stencil surface is rail-owned in this increment — keeping it would need
     // the stencil resolve the increment after this one reviews.
-    if multisample.is_some() {
+    if let Some(multisample) = multisample {
         descriptor.set_texture_type(MTLTextureType::D2Multisample);
-        descriptor.set_sample_count(4);
+        descriptor.set_sample_count(u64::from(multisample.samples()));
     } else {
         descriptor.set_texture_type(MTLTextureType::D2);
     }
@@ -3504,10 +3540,10 @@ fn stencil_texture(
 }
 
 /// The combined depth-stencil surface of a pass that opens both faces
-/// (`research/docs/23` §3.3, v60).
+/// (`research/docs/23` §3.3, v60/v61).
 ///
 /// Metal binds one texture to both attachment descriptors, so the combined
-/// shape creates one four-sample `depth32Float_stencil8` surface the depth and
+/// shape creates one multisampled `depth32Float_stencil8` surface the depth and
 /// stencil halves share; the resolve landings below are separate single-sample
 /// textures. The surface is private — its texels leave through the resolves,
 /// never through `getBytes`.
@@ -3515,10 +3551,11 @@ fn stencil_texture(
 fn combined_depth_stencil_surface(
     device: &Device,
     depth: &PlannedDepth,
+    samples: u64,
 ) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2Multisample);
-    descriptor.set_sample_count(4);
+    descriptor.set_sample_count(samples);
     descriptor.set_pixel_format(MTLPixelFormat::Depth32Float_Stencil8);
     descriptor.set_width(u64::from(depth.width));
     descriptor.set_height(u64::from(depth.height));
@@ -3613,12 +3650,12 @@ fn render_pipeline_state(
     descriptor.set_vertex_function(Some(vertex.as_ref()));
     descriptor.set_fragment_function(Some(fragment.as_ref()));
     // The pipeline's raster sample count follows the pass's own multisample
-    // state (`research/docs/23` §3.3, v51): Metal refuses a pipeline whose
+    // state (`research/docs/23` §3.3, v51/v61): Metal refuses a pipeline whose
     // `rasterSampleCount` disagrees with the attachments the encoder binds, so
     // the two come from one decision. A single-sample pass keeps the default
     // exactly as every pre-v51 pass did.
-    if let Some(SampleCount::Four) = planned.multisample {
-        descriptor.set_raster_sample_count(4);
+    if let Some(multisample) = planned.multisample {
+        descriptor.set_raster_sample_count(u64::from(multisample.samples()));
     }
     // The vertex descriptor is what makes `[[attribute(n)]]` mean a byte range
     // of a bound stream: the MSL module names the attribute locations, the

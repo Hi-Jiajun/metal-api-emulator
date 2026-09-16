@@ -137,6 +137,12 @@ pub struct NativeMetalProvider {
     epoch: DeviceEpoch,
     name: String,
     capabilities: ProviderCapabilities,
+    /// The reviewed 2/4/8 sample counts the device admits, as the
+    /// contract-code bitmask the device probe built (`research/docs/23` §3.3,
+    /// v61). The capture runner reads the device-gated sample-count cases
+    /// against it; the snapshot's ceiling alone cannot say which of the
+    /// counts a device lacks.
+    render_sample_counts: u32,
     state: Mutex<State>,
     /// Render registrations, keyed by pipeline id.
     ///
@@ -220,10 +226,13 @@ impl NativeMetalProvider {
             // the stream count that rail translates.
             let vertex_bits = render::vertex_input_capability_bits();
             let instancing_bits = render::instancing_capability_bits();
-            // The multisample bits come from the same rail value (`research/docs/23`
-            // §3.3, v51): the plan holds the raster to the one count the encoder
-            // builds, and this snapshot publishes exactly that count.
-            let multisample_bits = render::multisample_capability_bits();
+            // The multisample bits come from the device probe
+            // (`render::device_multisample_capability_bits`,
+            // `research/docs/23` §3.3, v51/v61): the snapshot publishes the
+            // largest of the reviewed 2x/4x/8x rasters the device's
+            // `supportsTextureSampleCount:` answer admits, and the plan holds
+            // the raster to the counts the encoder builds.
+            let multisample_bits = render::device_multisample_capability_bits(&device);
             // The depth-resolve bits come from the device probe
             // (`render::device_depth_resolve_capability_bits`,
             // `research/docs/23` §3.3, v57c): the snapshot publishes the
@@ -314,11 +323,13 @@ impl NativeMetalProvider {
                 max_render_instances: instancing_bits.max_render_instances,
                 // Multisampling is executed by this rail as of v51: the plan
                 // carries the pass-wide raster, the encoder creates one
-                // four-sample texture per colour location and resolves it into
-                // the attachment's own texture, both proved on the host before
-                // a device object exists (`research/docs/23` §3.3). The flip
-                // condition is the reviewed `msaa_edge_4x4` case on the Apple
-                // rail, recorded on `render::multisample_capability_bits`.
+                // multisampled texture per colour location and resolves it
+                // into the attachment's own texture, both proved on the host
+                // before a device object exists (`research/docs/23` §3.3).
+                // The flip condition is the reviewed `msaa_edge_4x4` case on
+                // the Apple rail, and the v61 increment widens the declared
+                // ceiling to the device's own 2x/4x/8x answer, recorded on
+                // `render::device_multisample_capability_bits`.
                 supports_render_multisample: multisample_bits.supports_render_multisample,
                 max_render_sample_count: multisample_bits.max_render_sample_count,
                 // The depth resolve is executed by this rail as of v57c: the
@@ -362,6 +373,7 @@ impl NativeMetalProvider {
                 epoch: allocate_device_epoch()?,
                 name: device.name().into(),
                 capabilities,
+                render_sample_counts: multisample_bits.render_sample_counts,
                 state: Mutex::new(State {
                     device,
                     queue,
@@ -389,6 +401,13 @@ impl NativeMetalProvider {
 
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// The reviewed sample counts this device admits, as the contract-code
+    /// bitmask (`research/docs/23` §3.3, v61): bit `i` = `SampleCount` code
+    /// `i`.
+    pub fn render_sample_counts(&self) -> u32 {
+        self.render_sample_counts
     }
 
     /// Select deferred submission. The default synchronous mode is retained
