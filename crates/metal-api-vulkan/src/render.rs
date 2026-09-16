@@ -31,11 +31,11 @@
 use ash::vk;
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
-    CompareFunction, CullMode, DepthStoreOp, DepthTest, FieldValue, IndexFormat,
-    IndirectCommandDescriptor, LoadOp, MultisampleState, ProviderError, ProviderErrorClass,
-    ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-    Retryability, SampleCount, StencilCompare, StencilOp, StencilTest, StoreOp, VertexBufferLayout,
-    VertexFormat, VertexStep, Winding,
+    CompareFunction, CullMode, DepthResolveFilter, DepthStoreOp, DepthTest, FieldValue,
+    IndexFormat, IndirectCommandDescriptor, LoadOp, MultisampleDepthResolve, MultisampleState,
+    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, Retryability, SampleCount, StencilCompare,
+    StencilOp, StencilTest, StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -367,6 +367,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// readback copies it out, so the trace observes the resolve's bytes and
     /// not the multisampled surface's.
     pub multisample: Option<MultisampleState>,
+    /// The depth resolve a stored multisampled depth surface states
+    /// (`research/docs/23` §3.3, v57), or `None` for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose depth attachment
+    /// is stored: the resolve is how a four-sample depth surface's texels
+    /// become observable, so the request carries the filter the observation
+    /// reduces with.
+    pub depth_resolve: Option<MultisampleDepthResolve>,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -732,7 +739,12 @@ pub(crate) fn execute_render_pass(
     pass: &RenderPassDescriptor,
     previous: &[Option<&[u8]>],
 ) -> Result<OffscreenReadback, ProviderError> {
-    let request = prepare_render_request(stages, pass, previous)?;
+    let request = prepare_render_request(
+        stages,
+        pass,
+        previous,
+        context.admitted_depth_resolve_modes(),
+    )?;
     execute_offscreen_render(context, &request)
 }
 
@@ -748,6 +760,7 @@ fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a [u8]>],
+    depth_resolve_modes: u32,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
@@ -790,6 +803,30 @@ fn prepare_render_request<'a>(
              fixtures; a pass that states none of those is a shape no review covered",
             ),
         );
+    }
+    // The depth resolve (`research/docs/23` §3.3, v57) only means something
+    // beside a multisample raster that keeps its depth surface: the resolve is
+    // the reduction of the stored four-sample texels, so a resolve without
+    // both is refused instead of silently ignored. The core contract refuses
+    // the same shape with `DepthResolveWithoutStoredDepth`; this is the
+    // value-level second line of defence for a directly-constructed request.
+    if pass.depth_resolve.is_some() {
+        let stored = pass.multisample.is_some()
+            && pass
+                .depth
+                .as_ref()
+                .is_some_and(|depth| depth.store == Some(DepthStoreOp::Store));
+        if !stored {
+            let store = pass
+                .depth
+                .as_ref()
+                .and_then(|depth| depth.store)
+                .map(DepthStoreOp::code);
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::DepthResolveWithoutStoredDepth { store }
+                    .to_string(),
+            ));
+        }
     }
     // The multisample raster (`research/docs/23` §3.3, v51) is executed as a
     // four-sample pass whose resolve target is the attachment view itself. Core
@@ -838,12 +875,39 @@ fn prepare_render_request<'a>(
         }
         if let Some(depth) = &pass.depth {
             if depth.store == Some(DepthStoreOp::Store) {
-                return Err(
-                    capability_refusal("render_multisample_depth_store_unsupported").with_detail(
-                        "a multisampled depth surface cannot be kept yet: the depth resolve \
-                         filters are a later increment",
-                    ),
-                );
+                // The stored surface is admitted from v57 on, through the
+                // resolve the pass then has to state: its texels are only
+                // observable as the resolve's reduction, so a stored surface
+                // without one stays refused, and a filter the device does not
+                // report is refused by the same per-filter question the
+                // capability snapshot answered (`research/docs/23` §3.3, v57).
+                match pass.depth_resolve {
+                    Some(resolve) => {
+                        let mask = 1u32 << u32::from(resolve.filter.code());
+                        if depth_resolve_modes & mask == 0 {
+                            return Err(capability_refusal(
+                                "render_depth_resolve_filter_unsupported",
+                            )
+                            .with_field(
+                                "filter",
+                                FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                            )
+                            .with_field(
+                                "modes",
+                                FieldValue::Unsigned(u64::from(depth_resolve_modes)),
+                            ));
+                        }
+                    }
+                    None => {
+                        return Err(capability_refusal(
+                            "render_multisample_depth_store_unsupported",
+                        )
+                        .with_detail(
+                            "a multisampled depth surface cannot be kept without a \
+                                     depth resolve",
+                        ))
+                    }
+                }
             }
         }
         if let Some(stencil) = &pass.stencil {
@@ -1099,6 +1163,10 @@ fn prepare_render_request<'a>(
         // the trace stated it (`research/docs/23` §3.3, v51); the load-op and
         // surface refusals above already ran.
         multisample: pass.multisample,
+        // The resolve filter travels with the request exactly as the trace
+        // stated it (`research/docs/23` §3.3, v57); the shape and per-filter
+        // refusals above already ran.
+        depth_resolve: pass.depth_resolve,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
@@ -1304,7 +1372,12 @@ pub(crate) fn execute_indirect_render_pass(
                 .with_detail("the first indirect increment replays draws only"));
         }
     };
-    let mut request = prepare_render_request(stages, pass, previous)?;
+    let mut request = prepare_render_request(
+        stages,
+        pass,
+        previous,
+        context.admitted_depth_resolve_modes(),
+    )?;
     request.indirect = Some(replay);
     execute_offscreen_render(context, &request)
 }
@@ -1637,10 +1710,40 @@ pub(crate) fn execute_offscreen_render(
             .as_ref()
             .is_some_and(OffscreenDepthAttachment::storing)
         {
-            return Err(capability_refusal("render_multisample_depth_store_unsupported").with_detail(
-                "a multisampled depth surface cannot be kept yet: the depth resolve filters are \
-                 a later increment",
-            ));
+            // The stored surface is admitted from v57 on, through the resolve
+            // the request then has to state (`research/docs/23` §3.3, v57):
+            // the same shape and per-filter questions `prepare_render_request`
+            // asked, re-asserted here for a hand-built request that skipped
+            // it.
+            match request.depth_resolve {
+                Some(resolve) => {
+                    let mask = 1u32 << u32::from(resolve.filter.code());
+                    if context.admitted_depth_resolve_modes() & mask == 0 {
+                        return Err(
+                            capability_refusal("render_depth_resolve_filter_unsupported")
+                                .with_field(
+                                    "filter",
+                                    FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                                )
+                                .with_field(
+                                    "modes",
+                                    FieldValue::Unsigned(u64::from(
+                                        context.admitted_depth_resolve_modes(),
+                                    )),
+                                ),
+                        );
+                    }
+                }
+                None => {
+                    return Err(
+                        capability_refusal("render_multisample_depth_store_unsupported")
+                            .with_detail(
+                                "a multisampled depth surface cannot be kept without a depth \
+                                 resolve",
+                            ),
+                    )
+                }
+            }
         }
         for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
             if !format_supports_multisample_color_attachment(context, *vk_format, tiling) {
@@ -1804,6 +1907,9 @@ pub(crate) fn execute_offscreen_render(
             depth.clear.is_none(),
             depth.storing(),
             samples,
+            // A stored multisampled surface states its resolve filter; every
+            // other shape carries none (`research/docs/23` §3.3, v57).
+            request.depth_resolve.map(|resolve| resolve.filter),
         )?;
         if depth.storing() {
             objects.create_depth_readback(byte_length)?;
@@ -1842,6 +1948,9 @@ pub(crate) fn execute_offscreen_render(
         &vk_formats,
         request.depth.as_ref(),
         request.stencil.as_ref(),
+        // A stored multisampled depth surface states its resolve filter; every
+        // other pass carries none (`research/docs/23` §3.3, v57).
+        request.depth_resolve.map(|resolve| resolve.filter),
     )?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
@@ -1893,6 +2002,10 @@ pub(crate) fn execute_offscreen_render(
         &request.attachments,
         request.depth.as_ref(),
         request.stencil.as_ref(),
+        // The resolve filter the subpass was built with; `record` reads the
+        // same request field for its clear-value placeholder and copy-out
+        // source (`research/docs/23` §3.3, v57).
+        request.depth_resolve.map(|resolve| resolve.filter),
         request.scissor,
         width,
         height,
@@ -2248,8 +2361,8 @@ const PRESENT_WRITE_ACCESS: vk::AccessFlags = vk::AccessFlags::COLOR_ATTACHMENT_
 /// The render pass's `0 → EXTERNAL` dependency for a present pass: the stored
 /// colour write is made available to the explicit present transition that
 /// follows the pass.
-fn present_subpass_dependency() -> vk::SubpassDependency {
-    vk::SubpassDependency::default()
+fn present_subpass_dependency() -> vk::SubpassDependency2<'static> {
+    vk::SubpassDependency2::default()
         .src_subpass(0)
         .dst_subpass(vk::SUBPASS_EXTERNAL)
         .src_stage_mask(PRESENT_WRITE_STAGE)
@@ -2299,7 +2412,12 @@ pub(crate) fn execute_present_render(
     // attachment list is not exactly one entry is outside this increment's
     // present shape.
     let previous = [previous];
-    let request = prepare_render_request(stages, pass, &previous)?;
+    let request = prepare_render_request(
+        stages,
+        pass,
+        &previous,
+        context.admitted_depth_resolve_modes(),
+    )?;
     let [attachment] = request.attachments.as_slice() else {
         return Err(contract_refusal(
             "the present rail executes exactly one colour attachment",
@@ -2391,7 +2509,7 @@ pub(crate) fn execute_present_render(
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout);
-    objects.create_render_pass(&[vk_format], None, None)?;
+    objects.create_render_pass(&[vk_format], None, None, None)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -2412,6 +2530,7 @@ pub(crate) fn execute_present_render(
     objects.create_command_pool(queue_index)?;
     objects.record(
         std::slice::from_ref(attachment),
+        None,
         None,
         None,
         None,
@@ -2540,6 +2659,12 @@ struct DepthObjects {
     /// states a multisample raster, which the render pass's own depth
     /// description restates so the two cannot disagree.
     samples: vk::SampleCountFlags,
+    /// The single-sample image a stored multisampled depth surface resolves
+    /// into (`research/docs/23` §3.3, v57), or `None` for a surface that
+    /// resolves nothing — every pre-v57 depth surface and every single-sample
+    /// stored one. The resolve target is what the copy-out reads and what the
+    /// trace observes as the depth view.
+    resolve: Option<DepthResolveObjects>,
     /// The host-visible buffer this pass's depth texels land in, present
     /// exactly when the pass stores the surface (`research/docs/23` §3.3, v43).
     /// A discarded surface is never copied out, so it needs no destination.
@@ -2547,6 +2672,18 @@ struct DepthObjects {
     /// The mapping of [`Self::readback`], as the pointer the host reads after
     /// the fence signals — the same shape a colour attachment's readback has.
     mapping: Option<usize>,
+}
+
+/// The single-sample resolve target of a stored multisampled depth attachment
+/// (`research/docs/23` §3.3, v57).
+///
+/// The colour sibling's shape for the depth aspect: the four-sample surface's
+/// depth texels reduce into this `D32_SFLOAT` image inside the subpass, and
+/// the copy-out reads the resolve target rather than the multisampled surface.
+struct DepthResolveObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
 }
 
 /// The Vulkan objects one rail-owned stencil attachment owns
@@ -2729,7 +2866,14 @@ impl<'a> OffscreenObjects<'a> {
         loading: bool,
         storing: bool,
         samples: vk::SampleCountFlags,
+        resolve: Option<DepthResolveFilter>,
     ) -> Result<(), ProviderError> {
+        // A resolving pass keeps its depth surface through the single-sample
+        // resolve target, so the four-sample image itself is never copied out;
+        // the resolve target below carries the transfer usage instead, the
+        // same split the multisampled colour attachment states
+        // (`research/docs/23` §3.3, v57).
+        let resolving = resolve.is_some();
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::D32_SFLOAT)
@@ -2744,7 +2888,7 @@ impl<'a> OffscreenObjects<'a> {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    | if storing {
+                    | if storing && !resolving {
                         vk::ImageUsageFlags::TRANSFER_SRC
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -2762,12 +2906,61 @@ impl<'a> OffscreenObjects<'a> {
         let view =
             crate::create_depth_image_view(self.context, image, vk::Format::D32_SFLOAT, "depth")
                 .map_err(|error| execution_refusal("create depth view", &error.detail))?;
+        // The resolve target of a stored multisampled depth surface
+        // (`research/docs/23` §3.3, v57): one single-sample `D32_SFLOAT` image
+        // created beside its four-sample sibling, so the render pass and the
+        // framebuffer can name both. It carries `TRANSFER_SRC` because it is
+        // the surface the copy-out reads; the filter itself is the subpass's
+        // resolve state, not an image property, so the image carries no
+        // filter field.
+        let resolve_objects = if resolving {
+            let resolve_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let (resolve_image, resolve_memory, _) = crate::allocate_image_backing(
+                self.context,
+                &resolve_info,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                "depth resolve",
+            )
+            .map_err(|error| execution_refusal("create depth resolve image", &error.detail))?;
+            let resolve_view = crate::create_depth_image_view(
+                self.context,
+                resolve_image,
+                vk::Format::D32_SFLOAT,
+                "depth resolve",
+            )
+            .map_err(|error| execution_refusal("create depth resolve view", &error.detail))?;
+            Some(DepthResolveObjects {
+                image: resolve_image,
+                memory: resolve_memory,
+                view: resolve_view,
+            })
+        } else {
+            None
+        };
         self.depth = Some(DepthObjects {
             image,
             memory,
             view,
             loading,
             samples,
+            resolve: resolve_objects,
             readback: None,
             mapping: None,
         });
@@ -2987,6 +3180,7 @@ impl<'a> OffscreenObjects<'a> {
         formats: &[vk::Format],
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
+        depth_resolve: Option<DepthResolveFilter>,
     ) -> Result<(), ProviderError> {
         // The multisampled shape (`research/docs/23` §3.3, v51) lists two
         // attachment descriptions per colour location — the four-sample
@@ -3010,7 +3204,7 @@ impl<'a> OffscreenObjects<'a> {
                 } else {
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                 };
-                vk::AttachmentDescription::default()
+                vk::AttachmentDescription2::default()
                     .format(*format)
                     .samples(attachment.samples)
                     .load_op(attachment.load_op)
@@ -3048,7 +3242,7 @@ impl<'a> OffscreenObjects<'a> {
                         } else {
                             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
                         };
-                        vk::AttachmentDescription::default()
+                        vk::AttachmentDescription2::default()
                             .format(*format)
                             .samples(vk::SampleCountFlags::TYPE_1)
                             .load_op(vk::AttachmentLoadOp::DONT_CARE)
@@ -3074,11 +3268,15 @@ impl<'a> OffscreenObjects<'a> {
                     .depth
                     .as_ref()
                     .is_some_and(|objects| objects.readback.is_some());
+                let resolving = self
+                    .depth
+                    .as_ref()
+                    .is_some_and(|objects| objects.resolve.is_some());
                 let samples = self
                     .depth
                     .as_ref()
                     .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
-                vk::AttachmentDescription::default()
+                vk::AttachmentDescription2::default()
                     .format(vk::Format::D32_SFLOAT)
                     .samples(samples)
                     .load_op(if loading {
@@ -3086,7 +3284,12 @@ impl<'a> OffscreenObjects<'a> {
                     } else {
                         vk::AttachmentLoadOp::CLEAR
                     })
-                    .store_op(if storing {
+                    // A resolving surface's own contents are consumed by the
+                    // depth resolve inside the subpass, so the four-sample
+                    // image itself is never stored; the resolve target below
+                    // carries the pass's store decision
+                    // (`research/docs/23` §3.3, v57).
+                    .store_op(if storing && !resolving {
                         vk::AttachmentStoreOp::STORE
                     } else {
                         vk::AttachmentStoreOp::DONT_CARE
@@ -3098,11 +3301,28 @@ impl<'a> OffscreenObjects<'a> {
                     } else {
                         vk::ImageLayout::UNDEFINED
                     })
-                    .final_layout(if storing {
+                    .final_layout(if storing && !resolving {
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL
                     } else {
                         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                     })
+            }))
+            .chain(depth_resolve.map(|_| {
+                // The depth resolve target (`research/docs/23` §3.3, v57): a
+                // single-sample `D32_SFLOAT` image the four-sample surface's
+                // depth texels reduce into. Its load operation is `DONT_CARE`
+                // by construction — the resolve writes every texel — and it
+                // ends in `TRANSFER_SRC_OPTIMAL` for the copy-out, exactly as
+                // a stored single-sample depth attachment does.
+                vk::AttachmentDescription2::default()
+                    .format(vk::Format::D32_SFLOAT)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
             }))
             .chain(stencil.filter(|_| depth.is_none()).map(|_| {
                 // The rail-owned stencil attachment (`research/docs/23` §3.3,
@@ -3127,7 +3347,7 @@ impl<'a> OffscreenObjects<'a> {
                     .stencil
                     .as_ref()
                     .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
-                vk::AttachmentDescription::default()
+                vk::AttachmentDescription2::default()
                     .format(vk::Format::S8_UINT)
                     .samples(samples)
                     .load_op(vk::AttachmentLoadOp::DONT_CARE)
@@ -3160,7 +3380,7 @@ impl<'a> OffscreenObjects<'a> {
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
             .map(|index| {
-                vk::AttachmentReference::default()
+                vk::AttachmentReference2::default()
                     .attachment(index as u32)
                     .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             })
@@ -3173,7 +3393,7 @@ impl<'a> OffscreenObjects<'a> {
         let resolve_refs = multisampled.then(|| {
             (0..self.attachments.len())
                 .map(|index| {
-                    vk::AttachmentReference::default()
+                    vk::AttachmentReference2::default()
                         .attachment((self.attachments.len() + index) as u32)
                         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 })
@@ -3188,7 +3408,7 @@ impl<'a> OffscreenObjects<'a> {
             .and(Some(()))
             .or_else(|| stencil.map(|_| ()))
             .map(|_| {
-                vk::AttachmentReference::default()
+                vk::AttachmentReference2::default()
                     // The depth-stencil surface always follows the colour
                     // attachments: a pass carries one such reference and the one
                     // surface behind it, so the index is the colour count in both
@@ -3200,7 +3420,33 @@ impl<'a> OffscreenObjects<'a> {
                     .attachment((self.attachments.len() * if multisampled { 2 } else { 1 }) as u32)
                     .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
             });
-        let mut subpass = vk::SubpassDescription::default()
+        // The depth resolve reference (`research/docs/23` §3.3, v57): the
+        // single-sample landing follows the four-sample depth surface, which
+        // itself follows both halves of the colour list, so its index is one
+        // past the depth reference's.
+        let depth_resolve_ref = depth_resolve.map(|_| {
+            vk::AttachmentReference2::default()
+                .attachment((self.attachments.len() * if multisampled { 2 } else { 1 } + 1) as u32)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        });
+        // The depth resolve state the subpass carries (`research/docs/23`
+        // §3.3, v57): the filter is the pass's own statement and the resolve
+        // reference is the single-sample landing above. The stencil slot stays
+        // `NONE` — this increment reviews depth resolve only — and the struct
+        // lives beside the subpass so its pNext chain stays valid for the
+        // `create_render_pass2` call.
+        let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::default();
+        if let (Some(resolve), Some(depth_resolve_ref)) = (depth_resolve, &depth_resolve_ref) {
+            depth_stencil_resolve = depth_stencil_resolve
+                .depth_resolve_mode(match resolve {
+                    DepthResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
+                    DepthResolveFilter::Min => vk::ResolveModeFlags::MIN,
+                    DepthResolveFilter::Max => vk::ResolveModeFlags::MAX,
+                })
+                .stencil_resolve_mode(vk::ResolveModeFlags::NONE)
+                .depth_stencil_resolve_attachment(depth_resolve_ref);
+        }
+        let mut subpass = vk::SubpassDescription2::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs);
         if let Some(resolve_refs) = &resolve_refs {
@@ -3209,8 +3455,11 @@ impl<'a> OffscreenObjects<'a> {
         if let Some(depth_ref) = &depth_ref {
             subpass = subpass.depth_stencil_attachment(depth_ref);
         }
+        if depth_resolve.is_some() {
+            subpass = subpass.push_next(&mut depth_stencil_resolve);
+        }
         let subpasses = [subpass];
-        let mut dependencies = vec![vk::SubpassDependency::default()
+        let mut dependencies = vec![vk::SubpassDependency2::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
@@ -3229,7 +3478,7 @@ impl<'a> OffscreenObjects<'a> {
             // copy-out would not be synchronized with the colour store.
             present_subpass_dependency()
         } else {
-            vk::SubpassDependency::default()
+            vk::SubpassDependency2::default()
                 .src_subpass(0)
                 .dst_subpass(vk::SUBPASS_EXTERNAL)
                 .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
@@ -3253,7 +3502,7 @@ impl<'a> OffscreenObjects<'a> {
                     .as_ref()
                     .is_some_and(|objects| objects.readback.is_some());
             dependencies.push(
-                vk::SubpassDependency::default()
+                vk::SubpassDependency2::default()
                     .src_subpass(vk::SUBPASS_EXTERNAL)
                     .dst_subpass(0)
                     .src_stage_mask(
@@ -3268,7 +3517,7 @@ impl<'a> OffscreenObjects<'a> {
                     .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
             );
             dependencies.push(
-                vk::SubpassDependency::default()
+                vk::SubpassDependency2::default()
                     .src_subpass(0)
                     .dst_subpass(vk::SUBPASS_EXTERNAL)
                     .src_stage_mask(
@@ -3290,11 +3539,11 @@ impl<'a> OffscreenObjects<'a> {
                     }),
             );
         }
-        let info = vk::RenderPassCreateInfo::default()
+        let info = vk::RenderPassCreateInfo2::default()
             .attachments(&attachments)
             .subpasses(&subpasses)
             .dependencies(&dependencies);
-        self.render_pass = unsafe { self.context.device.create_render_pass(&info, None) }
+        self.render_pass = unsafe { self.context.device.create_render_pass2(&info, None) }
             .map_err(|error| execution_refusal("create render pass", &error.to_string()))?;
         Ok(())
     }
@@ -3318,6 +3567,13 @@ impl<'a> OffscreenObjects<'a> {
             // same order: the colour views first, the depth view last
             // (`research/docs/23` §3.3, v36).
             views.push(depth.view);
+            // The depth resolve target follows its four-sample sibling in the
+            // render pass's own order (`research/docs/23` §3.3, v57): a
+            // resolving pass names both, and every other depth pass adds
+            // nothing here.
+            if let Some(resolve) = &depth.resolve {
+                views.push(resolve.view);
+            }
         }
         if let Some(stencil) = &self.stencil {
             // The stencil view follows the depth view in the render pass's own
@@ -4053,11 +4309,13 @@ impl<'a> OffscreenObjects<'a> {
     /// components follow the format's *component* order. Each entry of
     /// `attachments` is the pass's request record at the same location as the
     /// scope's own attachment objects.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         attachments: &[OffscreenColorAttachment<'_>],
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
+        depth_resolve: Option<DepthResolveFilter>,
         scissor: Option<[u32; 4]>,
         width: u32,
         height: u32,
@@ -4114,6 +4372,20 @@ impl<'a> OffscreenObjects<'a> {
                     stencil: 0,
                 },
             });
+            if depth_resolve.is_some() {
+                // The placeholder the depth resolve attachment's own index
+                // needs: its load op is `DONT_CARE`, so the value is never
+                // read — the same rule the colour resolve placeholders state —
+                // but the array still has to reach the attachment count, or
+                // the clear list would be one entry short of the render
+                // pass's own (`research/docs/23` §3.3, v57).
+                clear_values.push(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 0.0,
+                        stencil: 0,
+                    },
+                });
+            }
         }
         if let Some(stencil) = stencil.filter(|_| depth.is_none()) {
             clear_values.push(vk::ClearValue {
@@ -4419,6 +4691,16 @@ impl<'a> OffscreenObjects<'a> {
         // buffer and is not copied at all.
         if let Some(depth) = &self.depth {
             if let Some(readback) = &depth.readback {
+                // A resolving pass's bytes are the resolve target's, not the
+                // four-sample image's, which the subpass consumed
+                // (`research/docs/23` §3.3, v57). The render pass already left
+                // the resolve image in `TRANSFER_SRC_OPTIMAL`, so the copy
+                // needs no barrier of its own — the same rule the stored
+                // single-sample attachment states (v43).
+                let source = depth
+                    .resolve
+                    .as_ref()
+                    .map_or(depth.image, |resolve| resolve.image);
                 let copy = vk::BufferImageCopy::default()
                     .buffer_offset(0)
                     .buffer_row_length(0)
@@ -4438,7 +4720,7 @@ impl<'a> OffscreenObjects<'a> {
                 unsafe {
                     self.context.device.cmd_copy_image_to_buffer(
                         self.command,
-                        depth.image,
+                        source,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         readback.buffer,
                         std::slice::from_ref(&copy),
@@ -4568,6 +4850,20 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     .destroy_render_pass(self.render_pass, None);
             }
             if let Some(depth) = &self.depth {
+                // The depth resolve target is owned by the same pass scope
+                // (`research/docs/23` §3.3, v57), so it is destroyed beside
+                // the four-sample image it was created with.
+                if let Some(resolve) = &depth.resolve {
+                    if resolve.view != vk::ImageView::null() {
+                        self.context.device.destroy_image_view(resolve.view, None);
+                    }
+                    if resolve.image != vk::Image::null() {
+                        self.context.device.destroy_image(resolve.image, None);
+                    }
+                    if resolve.memory != vk::DeviceMemory::null() {
+                        self.context.device.free_memory(resolve.memory, None);
+                    }
+                }
                 if depth.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(depth.view, None);
                 }
@@ -4875,7 +5171,8 @@ fn driver_refusal(
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AllocationId, PipelineId, RenderAttachment, VertexLayout, ViewId,
+        AllocationId, DepthFormat, DepthLoadOp, PipelineId, RenderAttachment,
+        RenderDepthAttachment, RenderDepthIdentity, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -5137,6 +5434,7 @@ mod tests {
             &OffscreenRenderRequest {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5429,6 +5727,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5496,6 +5795,7 @@ mod tests {
                 &OffscreenRenderRequest {
                     blend: None,
                     multisample: None,
+                    depth_resolve: None,
                     cull: None,
                     depth: None,
                     base_vertex: 0,
@@ -5643,6 +5943,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5738,7 +6039,7 @@ mod tests {
             .expect("the fixture describes one format per location");
         let previous = vec![None; maximum + 1];
 
-        let refused = match prepare_render_request(&stages, &pass, &previous) {
+        let refused = match prepare_render_request(&stages, &pass, &previous, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pass beyond the ceiling"),
         };
@@ -5755,6 +6056,78 @@ mod tests {
         );
     }
 
+    /// One pass whose stored multisampled depth surface states the resolve the
+    /// device admits (`research/docs/23` §3.3, v57).
+    fn depth_resolving_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            }),
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        pass
+    }
+
+    #[test]
+    fn prepare_render_request_admits_a_stored_multisampled_depth_resolve_in_the_device_mask() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = depth_resolving_pass();
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the fixture describes the reviewed single-attachment shape");
+        let request = prepare_render_request(&stages, &pass, &[None], 0b1)
+            .expect("a stored multisampled depth resolve the device admits is well formed");
+        assert_eq!(
+            request.depth_resolve.map(|resolve| resolve.filter),
+            Some(DepthResolveFilter::Sample0)
+        );
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_a_depth_resolve_filter_the_device_does_not_report() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = depth_resolving_pass();
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0b10) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
+        };
+        assert_eq!(refused.slug, "render_depth_resolve_filter_unsupported");
+        assert_eq!(refused.fields.get("filter"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            refused.fields.get("modes"),
+            Some(&FieldValue::Unsigned(0b10))
+        );
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_a_stored_multisampled_depth_without_a_resolve() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = depth_resolving_pass();
+        pass.depth_resolve = None;
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
+        };
+        assert_eq!(refused.slug, "render_multisample_depth_store_unsupported");
+    }
+
     /// The reviewed dual shape end to end on one draw: both 2×2
     /// `Rgba8Unorm` attachments read back their own location's bytes, and the
     /// copy-out counter advances by two (`copy_out == 2`).
@@ -5769,6 +6142,7 @@ mod tests {
             &OffscreenRenderRequest {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5837,6 +6211,7 @@ mod tests {
             &OffscreenRenderRequest {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5909,6 +6284,7 @@ mod tests {
             &OffscreenRenderRequest {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5960,6 +6336,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -6050,6 +6427,7 @@ mod tests {
         let request = OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -6122,7 +6500,7 @@ mod tests {
             .validate_against(&pass)
             .expect("the pipeline compiles one format per location");
 
-        let refused = match prepare_render_request(&stages, &pass, &[None, None]) {
+        let refused = match prepare_render_request(&stages, &pass, &[None, None], 0) {
             Err(error) => error,
             Ok(_) => panic!("attachments of one pass share one extent"),
         };
@@ -6197,6 +6575,7 @@ mod tests {
             &OffscreenRenderRequest {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -6248,10 +6627,10 @@ mod tests {
             .expect("the DontCare pass is a legal core shape now");
 
         // Without bytes the shape plans; with bytes it is refused by name.
-        prepare_render_request(&stages, &pass, &[None])
+        prepare_render_request(&stages, &pass, &[None], 0)
             .expect("a DontCare attachment with no previous bytes plans");
         let previous: [u8; 16] = [0x11; 16];
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)]) {
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], 0) {
             Err(error) => error,
             Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
         };
@@ -6285,6 +6664,7 @@ mod tests {
         let request = |store: Option<DepthStoreOp>| OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: Some(OffscreenDepthAttachment {
                 width: 2,
@@ -6367,6 +6747,7 @@ mod tests {
         let request = |store: Option<StoreOp>| OffscreenRenderRequest {
             blend: None,
             multisample: None,
+            depth_resolve: None,
             cull: None,
             depth: None,
             stencil: Some(OffscreenStencilAttachment {

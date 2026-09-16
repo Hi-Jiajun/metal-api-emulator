@@ -7,19 +7,19 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
     BlendOperation, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
-    CullMode, DepthFormat, DepthLoadOp, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
-    DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
-    HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    CullMode, DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
+    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
     IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, MultisampleState, OperationId, PipelineCompileRequest, PipelineProvider,
-    PresentDescriptor, PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy,
-    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource, StencilCompare,
-    StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    PROVIDER_SCHEMA_VERSION,
+    InitialState, LoadOp, MultisampleDepthResolve, MultisampleState, OperationId,
+    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
+    RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
+    SampleCount, SemanticDigest, ShaderSource, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexLayout, VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1267,6 +1267,13 @@ struct RenderCase {
     /// fragment output and the load's own colour in the attachment view.
     #[serde(default)]
     multisample: Option<MultisampleDefinition>,
+    /// The depth resolve a stored multisampled depth surface states
+    /// (`research/docs/23` §3.3, v57), or absent for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose depth attachment
+    /// is stored; the reviewed fixture states the `Sample0` filter the
+    /// Lavapipe device reports.
+    #[serde(default)]
+    depth_resolve: Option<DepthResolveDefinition>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1374,6 +1381,33 @@ fn case_multisample(case: &RenderCase) -> Result<Option<MultisampleState>> {
                 other => {
                     return Err(format!(
                         "render case {}: unsupported multisample count {other}",
+                        case.id
+                    )
+                    .into())
+                }
+            },
+        })),
+        None => Ok(None),
+    }
+}
+
+/// The depth resolve one render case states, in the contract's own shape
+/// (`research/docs/23` §3.3, v57).
+///
+/// `validate_render_case` already refused every filter outside the closed
+/// family before this runs, so the mapping is total over the shapes that can
+/// reach either rail; the refusal below keeps the helper total for a directly
+/// constructed case.
+fn case_depth_resolve(case: &RenderCase) -> Result<Option<MultisampleDepthResolve>> {
+    match &case.depth_resolve {
+        Some(definition) => Ok(Some(MultisampleDepthResolve {
+            filter: match definition.filter.as_str() {
+                "sample0" => DepthResolveFilter::Sample0,
+                "min" => DepthResolveFilter::Min,
+                "max" => DepthResolveFilter::Max,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported depth resolve filter {other:?}",
                         case.id
                     )
                     .into())
@@ -1526,6 +1560,18 @@ struct StencilTestDefinition {
 struct MultisampleDefinition {
     /// Samples per texel. The reviewed fixture states `4`.
     sample_count: u64,
+}
+
+/// The depth resolve one render case states (`research/docs/23` §3.3, v57).
+///
+/// The pass-level filter the two APIs spell differently: the case's own
+/// spelling is the closed family's wire name (`"sample0"`/`"min"`/`"max"`),
+/// and the rails map it onto their own constants. The reviewed fixture states
+/// `"sample0"`, the one filter the Lavapipe device reports.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepthResolveDefinition {
+    filter: String,
 }
 
 /// One vertex layout: the reviewed stream list, in binding order.
@@ -3938,6 +3984,22 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             );
         }
     }
+    // The depth resolve (`research/docs/23` §3.3, v57) only means something
+    // beside a multisample raster that keeps its depth surface: the resolve is
+    // the reduction of the stored four-sample texels, so any other shape is
+    // refused instead of silently ignored.
+    if case.depth_resolve.is_some() {
+        if case.multisample.is_none() {
+            return Err(format!("{where_}: a depth resolve needs a multisample raster").into());
+        }
+        if case
+            .depth
+            .as_ref()
+            .is_none_or(|depth| depth.store.as_deref() != Some("store"))
+        {
+            return Err(format!("{where_}: a depth resolve needs a stored depth surface").into());
+        }
+    }
     // The multisample raster (`research/docs/23` §3.3, v51): the first
     // increment reviews exactly one shape — one colour attachment opened from
     // a clear, four samples, no depth or stencil surface, no present action,
@@ -4008,11 +4070,32 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             let (depth, test) = case_depth(case, &where_)?;
             let depth = depth.ok_or(format!("{where_}: a depth surface needs its attachment"))?;
             if depth.store.is_some() {
-                return Err(format!(
-                    "{where_}: a multisampled depth surface is rail-owned: the depth resolve \
-                     filters are a later increment"
-                )
-                .into());
+                // A stored multisampled depth surface is admitted from v57
+                // on, through the resolve the case then has to state: its
+                // texels are only observable as the resolve's reduction, so a
+                // stored surface without one is refused, and a filter outside
+                // the closed family is refused by name
+                // (`research/docs/23` §3.3, v57).
+                let Some(resolve) = &case.depth_resolve else {
+                    return Err(format!(
+                        "{where_}: a stored multisampled depth surface needs its depth resolve"
+                    )
+                    .into());
+                };
+                if !matches!(resolve.filter.as_str(), "sample0" | "min" | "max") {
+                    return Err(format!(
+                        "{where_}: unsupported depth resolve filter {:?}",
+                        resolve.filter
+                    )
+                    .into());
+                }
+            } else if case.depth_resolve.is_some() {
+                // The resolve is the stored surface's own tail: a depth
+                // resolve beside a surface the pass discards is refused
+                // instead of silently ignored (`research/docs/23` §3.3, v57).
+                return Err(
+                    format!("{where_}: a depth resolve needs a stored depth surface").into(),
+                );
             }
             if test.is_none() {
                 return Err(
@@ -6375,10 +6458,10 @@ fn run_render_case(
         ],
         scissor,
         multisample,
-        // No reviewed case states the depth resolve yet (`research/docs/23`
-        // §3.3, v57): the capture leaves the field absent, which the rails
-        // execute as the API default filter.
-        depth_resolve: None,
+        // The reviewed depth-resolve case states its filter; every other case
+        // leaves the field absent, which the rails execute as "resolve
+        // nothing" (`research/docs/23` §3.3, v57).
+        depth_resolve: case_depth_resolve(case)?,
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,

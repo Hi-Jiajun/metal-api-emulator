@@ -10,8 +10,8 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
-    DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract, PresentMode,
-    ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
+    DepthResolveFilter, DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract,
+    PresentMode, ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
     MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
@@ -123,10 +123,15 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         } else {
             0
         },
-        // The depth resolve is not executed yet: the Vulkan rail's RenderPass2
-        // migration and the per-device filter probe are the next increment's
-        // work, so both bits stay at the "cannot resolve" defaults and a
-        // resolving pass is refused during admission
+        // The depth resolve is executed from v57 on (`render.rs` migrates the
+        // render pass to RenderPass2 and resolves a stored multisampled depth
+        // surface into its own single-sample landing). The two bits are the
+        // device's own answer, not this function's: they come from the
+        // `VkPhysicalDeviceDepthStencilResolveProperties` the context probes,
+        // which a `PhysicalDeviceLimits` snapshot does not carry, so
+        // [`VulkanProvider::provider_capabilities`] overlays them on this
+        // struct's defaults. A device that reports no admitted filter keeps
+        // both bits at the fail-closed "cannot resolve" defaults
         // (`research/docs/23` §3.3, v57).
         supports_render_depth_resolve: false,
         depth_resolve_modes: 0,
@@ -173,6 +178,30 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
             IndirectCommandKind::Dispatch,
         ],
     }
+}
+
+/// The contract's depth-resolve filter mask for a device's reported resolve
+/// modes (`research/docs/23` §3.3, v57).
+///
+/// The mask maps the admitted filters onto their wire bit positions —
+/// [`DepthResolveFilter::Sample0`]/[`DepthResolveFilter::Min`]/
+/// [`DepthResolveFilter::Max`] are bits 0/1/2 — and drops every mode the
+/// contract does not carry: `AVERAGE` is a real Vulkan resolve mode that has no
+/// depth filter in the closed family, so folding it onto a neighbour would
+/// admit a filter the caller did not ask for. A device that reports none of
+/// the three yields `0`, the fail-closed "cannot resolve" mask.
+pub(crate) fn depth_resolve_mode_mask(modes: vk::ResolveModeFlags) -> u32 {
+    let mut mask = 0;
+    if modes.contains(vk::ResolveModeFlags::SAMPLE_ZERO) {
+        mask |= 1u32 << u32::from(DepthResolveFilter::Sample0.code());
+    }
+    if modes.contains(vk::ResolveModeFlags::MIN) {
+        mask |= 1u32 << u32::from(DepthResolveFilter::Min.code());
+    }
+    if modes.contains(vk::ResolveModeFlags::MAX) {
+        mask |= 1u32 << u32::from(DepthResolveFilter::Max.code());
+    }
+    mask
 }
 
 pub(crate) fn pipeline_contract(
@@ -492,5 +521,30 @@ mod tests {
             MAX_PRESENT_IMAGE_COUNT
         );
         assert!(capabilities.declares_presentation_support());
+    }
+
+    #[test]
+    fn depth_resolve_mode_mask_maps_the_admitted_filters_and_drops_the_rest() {
+        // The three admitted filters are bits 0/1/2; every Vulkan mode the
+        // contract does not carry (AVERAGE and friends) is dropped rather than
+        // folded onto a filter the caller did not ask for
+        // (`research/docs/23` §3.3, v57).
+        assert_eq!(
+            depth_resolve_mode_mask(vk::ResolveModeFlags::SAMPLE_ZERO),
+            0b1
+        );
+        assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::MIN), 0b10);
+        assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::MAX), 0b100);
+        assert_eq!(
+            depth_resolve_mode_mask(
+                vk::ResolveModeFlags::SAMPLE_ZERO
+                    | vk::ResolveModeFlags::MIN
+                    | vk::ResolveModeFlags::MAX
+                    | vk::ResolveModeFlags::AVERAGE
+            ),
+            0b111
+        );
+        assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::AVERAGE), 0);
+        assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::empty()), 0);
     }
 }
