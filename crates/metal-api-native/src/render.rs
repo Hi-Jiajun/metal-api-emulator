@@ -624,11 +624,12 @@ pub(crate) fn multisample_capability_bits() -> MultisampleCapabilityBits {
 ///
 /// The mode mask is the contract's per-filter bit layout: bit `i` =
 /// [`DepthResolveFilter`] code `i` (`metal-api-core`:
-/// `ProviderCapabilities::depth_resolve_modes`). Only the Sample0 bit is
-/// declared in this increment — Min/Max stay undeclared until an Apple
-/// Paravirtual run measures whether the device actually executes them, so a
-/// Min/Max request is refused at admission instead of claiming an unmeasured
-/// semantic.
+/// `ProviderCapabilities::depth_resolve_modes`). The v57e
+/// `--depth-resolve-selftest` run measured an Apple Paravirtual device
+/// executing all three filters — the mixed column's `min=0000003f` and
+/// `max=6666663f` against `sample0=0000003f` (`f4d70e4`, CI run
+/// `35112569688`) — so the mask declares Sample0|Min|Max (`0b111`) instead of
+/// the fail-closed Sample0-only value the pre-evidence increments used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DepthResolveCapabilityBits {
     pub(crate) supports_render_depth_resolve: bool,
@@ -638,6 +639,14 @@ pub(crate) struct DepthResolveCapabilityBits {
 /// The Sample0 mode bit, spelled once so the probe and the snapshot cannot
 /// disagree about which filter the rail admits.
 pub(crate) const DEPTH_RESOLVE_SAMPLE0_BIT: u32 = 1u32 << DepthResolveFilter::Sample0.code();
+
+/// The Min mode bit, declared on the same v57e self-test evidence as Sample0
+/// and Max: the mixed column's reduction really lands the nearest depth.
+pub(crate) const DEPTH_RESOLVE_MIN_BIT: u32 = 1u32 << DepthResolveFilter::Min.code();
+
+/// The Max mode bit, declared on the same v57e self-test evidence as Sample0
+/// and Min: the mixed column's reduction really lands the furthest depth.
+pub(crate) const DEPTH_RESOLVE_MAX_BIT: u32 = 1u32 << DepthResolveFilter::Max.code();
 
 /// The depth-resolve bits derived from the device itself, queried exactly once
 /// when the provider is created (`native.rs`).
@@ -649,18 +658,19 @@ pub(crate) const DEPTH_RESOLVE_SAMPLE0_BIT: u32 = 1u32 << DepthResolveFilter::Sa
 /// The feature-set API is deprecated in the SDK, so the probe asks the modern
 /// `supportsFamily:` question for the Apple family the provider's admission
 /// already requires — a real device query rather than a compile-time constant,
-/// combined with the platform fact the crate models. The filter mask stays
-/// fail-closed at Sample0 because Min/Max execution on Apple Paravirtual is
-/// not yet measured (`research/docs/23` §3.3, v57c). Min/Max are decided by
-/// the `--depth-resolve-selftest` CI output; until that evidence lands, only
-/// Sample0 is declared.
+/// combined with the platform fact the crate models. The v57e
+/// `--depth-resolve-selftest` CI output landed the evidence the mask was
+/// waiting for: the Apple Paravirtual device executed all three filters and
+/// printed `depth_resolve_selftest: PASS` (`f4d70e4`, CI run `35112569688`),
+/// so an eligible device now declares Sample0|Min|Max (`0b111`) and an
+/// ineligible one still declares `0` (`research/docs/23` §3.3, v57c/v57e).
 #[cfg(target_os = "macos")]
 pub(crate) fn device_depth_resolve_capability_bits(device: &Device) -> DepthResolveCapabilityBits {
     let supports = device.supports_family(metal::MTLGPUFamily::Apple4);
     DepthResolveCapabilityBits {
         supports_render_depth_resolve: supports,
         depth_resolve_modes: if supports {
-            DEPTH_RESOLVE_SAMPLE0_BIT
+            DEPTH_RESOLVE_SAMPLE0_BIT | DEPTH_RESOLVE_MIN_BIT | DEPTH_RESOLVE_MAX_BIT
         } else {
             0
         },
