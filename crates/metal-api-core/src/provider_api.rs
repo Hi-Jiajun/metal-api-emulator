@@ -776,6 +776,12 @@ struct RenderDraw {
     /// the single-sample raster every draw the object API could record before
     /// v52 had (`research/docs/23` §3.3, v51/v52).
     multisample: Option<contract::MultisampleState>,
+    /// The resolve the pass applies to a stored multisampled depth surface, or
+    /// `None` for the API default [`contract::DepthResolveFilter::Sample0`]
+    /// (`research/docs/23` §3.3, v57/v58). Only the recording entry that
+    /// names it sets this field, so every earlier recording keeps the absent
+    /// shape and its exact bytes.
+    depth_resolve: Option<contract::MultisampleDepthResolve>,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -829,6 +835,7 @@ impl RenderDraw {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         }
     }
 }
@@ -915,11 +922,11 @@ impl RenderTarget {
             // the only one that sets this field, so every earlier recording
             // keeps the single-sample shape and its exact bytes.
             multisample: self.draw.multisample,
-            // The object API records no depth resolve yet
-            // (`research/docs/23` §3.3, v57): the recording's own field stays
-            // absent, so every earlier recording keeps the API default filter
+            // The resolve travels with the recording (`research/docs/23` §3.3,
+            // v57/v58): the entry that names it is the only one that sets this
+            // field, so every earlier recording keeps the API default filter
             // and its exact bytes.
-            depth_resolve: None,
+            depth_resolve: self.draw.depth_resolve,
             // The blend state is the pass's own, exactly as the culling and
             // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
             blend: self.draw.blend.clone(),
@@ -2662,6 +2669,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2714,6 +2722,7 @@ impl RenderCommandEncoder {
             stencil: Some(stencil),
             stencil_test,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2761,6 +2770,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2807,6 +2817,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2927,6 +2938,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2986,6 +2998,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: Some(multisample),
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3052,6 +3065,90 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: Some(multisample),
+            depth_resolve: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record the stored-depth sibling of
+    /// [`Self::draw_indexed_primitives_with_multisample_depth`]
+    /// (`research/docs/23` §3.3, v57/v58).
+    ///
+    /// The recording carries the resolve the v57 increment reviewed: the
+    /// pass-wide four-sample raster keeps its depth surface, and `filter`
+    /// states how the stored four-sample texels reduce into the surface the
+    /// caller's identity names. The surface has to be stored — the `store`
+    /// action and the landing identity are one decision, exactly as the
+    /// contract's own admission states them — and the recording refuses every
+    /// other shape with the contract's own errors instead of recording a pass
+    /// admission would refuse. Every other rule is
+    /// [`Self::draw_indexed_primitives_with_multisample_depth`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_multisample_depth_resolve(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        depth: RenderDepthAttachment,
+        depth_test: Option<RenderDepthTest>,
+        multisample: contract::MultisampleState,
+        filter: contract::DepthResolveFilter,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        // The single-sample state is what the absent field means, exactly as
+        // the colour-only entry states it (`research/docs/23` §3.3, v51).
+        if multisample.sample_count == contract::SampleCount::One {
+            return Err(ContractError::SingleSampleMultisampleState.into());
+        }
+        // The resolve only means something beside a stored multisampled depth
+        // surface (`research/docs/23` §3.3, v57): a filter beside a surface the
+        // pass drops, or beside no surface at all, is refused with the
+        // contract's own error rather than silently ignored.
+        if depth.store != Some(contract::DepthStoreOp::Store) {
+            return Err(ContractError::DepthResolveWithoutStoredDepth {
+                store: depth.store.map(contract::DepthStoreOp::code),
+            }
+            .into());
+        }
+        // The store action and the landing identity are one decision in two
+        // fields (`research/docs/23` §3.3, v43): keeping the surface needs a
+        // landing, so a stored surface without one is refused here exactly as
+        // the contract's own admission refuses it.
+        if depth.identity.is_none() {
+            return Err(ContractError::DepthStoreIdentityMismatch {
+                store: depth.store.map(contract::DepthStoreOp::code),
+                identity: depth.identity.is_some(),
+            }
+            .into());
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: Some(depth),
+            depth_test,
+            stencil: None,
+            stencil_test: None,
+            multisample: Some(multisample),
+            depth_resolve: Some(contract::MultisampleDepthResolve { filter }),
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3111,6 +3208,7 @@ impl RenderCommandEncoder {
             stencil: Some(stencil),
             stencil_test,
             multisample: Some(multisample),
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3159,6 +3257,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3212,6 +3311,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3258,6 +3358,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3304,6 +3405,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3347,6 +3449,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3391,6 +3494,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3440,6 +3544,7 @@ impl RenderCommandEncoder {
             stencil: None,
             stencil_test: None,
             multisample: None,
+            depth_resolve: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3718,6 +3823,7 @@ impl RenderCommandEncoder {
                 stencil: None,
                 stencil_test: None,
                 multisample: None,
+                depth_resolve: None,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {

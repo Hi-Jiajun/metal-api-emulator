@@ -328,26 +328,28 @@ MSAA_DEPTH_RAILS = ALL_RAILS
 MSAA_STENCIL_RAILS = ALL_RAILS
 # The depth resolve is device-gated: this increment's Lavapipe device reports
 # `SAMPLE_ZERO` only, and the native rail declares Sample0 alone, so the
-# reviewed fixture states `sample0` and its marker names the Vulkan rail and
-# the two native trace rails. The object rails keep their fail-closed "cannot
-# resolve" snapshots, so they must refuse the case rather than report it
-# (`research/docs/23` §3.3, v57c).
-MSAA_DEPTH_RESOLVE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+# reviewed fixture states `sample0`. The v57c marker named the three trace
+# rails; the v58 recording entry
+# (`draw_indexed_primitives_with_multisample_depth_resolve`) carries the same
+# resolve on both object rails, so the marker widens to every rail
+# (`research/docs/23` §3.3, v57c/v58).
+MSAA_DEPTH_RESOLVE_RAILS = ALL_RAILS
 # The device-gated pair named the Vulkan trace rail alone through v57d: the
 # RTX 5060 reports Min and Max and Lavapipe reports Sample0 alone, so the pair
 # is the mask-gated observation that tells the two devices apart. The v57e
 # depth-resolve self-test then measured the Apple Paravirtual device executing
 # all three filters (`f4d70e4`, CI run `35112569688`), so v57f widens the
-# marker to the three trace rails — an object-rail capture still omits the
-# pair, and the device mask still decides presence (`research/docs/23` §3.3,
-# v57d/v57f).
-MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
-MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
-# The mask the three trace rails publish once the device proves the filters:
-# Sample0|Min|Max, bit `i` = filter code `i`. The v57e self-test is the native
-# half of that proof, and the RTX 5060 reports the same value, so the per-rail
-# synthetic captures declare it on the rails that own the edge pair
-# (`research/docs/23` §3.3, v57f).
+# marker to the three trace rails, and v58 widens it again to every rail —
+# the object rails run the same gated pair, and the device mask still decides
+# presence (`research/docs/23` §3.3, v57d/v57f/v58).
+MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ALL_RAILS
+MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ALL_RAILS
+# The mask the rails publish once the device proves the filters: Sample0|Min|
+# Max, bit `i` = filter code `i`. The v57e self-test is the native half of
+# that proof, and the RTX 5060 reports the same value; the v57f marker named
+# the three trace rails and v58 widens it to every rail, so the per-rail
+# synthetic captures declare the mask on every rail that owns the edge pair
+# (`research/docs/23` §3.3, v57f/v58).
 DEPTH_RESOLVE_ALL_FILTERS_BITS = (1 << 0) | (1 << 1) | (1 << 2)
 MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
@@ -535,13 +537,13 @@ def msaa_stencil_marker(suite, rail):
 def msaa_depth_resolve_marker(suite, rail):
     """Point the v57 case at `rail` when that rail owes it, and elsewhere when not.
 
-    The depth-resolve case is device-gated: this increment's Vulkan rail is the
-    only one whose snapshot declares the capability, so the committed marker
-    names `vulkan` alone. A capture on `vulkan` is owed both landings — the
-    resolved colour attachment and the resolved depth surface — and one on any
-    other rail has to leave the case out entirely, because that rail refuses
-    the resolving pass at admission (`research/docs/23` §3.3, v57). Returns
-    whether `rail` owes the case.
+    The v57c marker named the three trace rails; the v58 recording entry
+    (`draw_indexed_primitives_with_multisample_depth_resolve`) carries the same
+    resolve on both object rails, so the marker names all five. A capture on a
+    rail the marker names is owed both landings — the resolved colour
+    attachment and the resolved depth surface — and `sample0` is the API's own
+    baseline, so no device mask gates it (`research/docs/23` §3.3, v57c/v58).
+    Returns whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_DEPTH_RESOLVE_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DEPTH_RESOLVE_RAILS else [other_rail(rail)])
@@ -553,9 +555,10 @@ def msaa_depth_resolve_min_edge_marker(suite, rail):
 
     The v57f marker names the three trace rails — the v57e self-test measured
     the Apple Paravirtual device executing Min, so the native rails own the
-    case. The marker only decides which rail *owns* the case, and the device
-    mask then decides presence (`research/docs/23` §3.3, v57d/v57f). Returns
-    whether `rail` owes the case.
+    case — and v58 widens it to every rail, because the object recording entry
+    carries the same gated pair. The marker only decides which rail *owns* the
+    case, and the device mask then decides presence (`research/docs/23` §3.3,
+    v57d/v57f/v58). Returns whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else [other_rail(rail)])
@@ -565,8 +568,9 @@ def msaa_depth_resolve_min_edge_marker(suite, rail):
 def msaa_depth_resolve_max_edge_marker(suite, rail):
     """Point the v57d Max edge case at `rail` when that rail owes it, and elsewhere when not.
 
-    The same v57f marker shape as the Min sibling (`research/docs/23` §3.3,
-    v57d/v57f). Returns whether `rail` owes the case.
+    The same v57f-then-v58 marker shape as the Min sibling
+    (`research/docs/23` §3.3, v57d/v57f/v58). Returns whether `rail` owes the
+    case.
     """
     suite["render_cases"][MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS else [other_rail(rail)])
@@ -2718,11 +2722,11 @@ class ScissorObservationTests(unittest.TestCase):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_reports_the_msaa_depth_resolve_case_on_every_rail_its_marker_names(self):
-        # The marker is the rule, and it is the device gate: the Vulkan rail
-        # declares the `sample0` filter on Lavapipe and the two native trace
-        # rails declare it on macOS, so a capture on any of the three owes the
-        # two landings and a capture on any other rail has to leave the case
-        # out (`research/docs/23` §3.3, v57c).
+        # The marker is the rule: the v57c marker named the three trace rails,
+        # and the v58 recording entry carries the same resolve on both object
+        # rails, so a capture on any of the five owes the two landings. The
+        # `sample0` filter is the API's own baseline, so no device mask gates
+        # this case (`research/docs/23` §3.3, v57c/v58).
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             owes = msaa_depth_resolve_marker(suite, rail)
@@ -2825,13 +2829,14 @@ class ScissorObservationTests(unittest.TestCase):
                                     "the device gate names the min or max"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
-    def test_v28_the_marker_still_owns_the_edge_resolve_cases(self):
+    def test_v28_the_marker_names_every_rail_for_the_edge_resolve_cases(self):
         # The marker is the rail half and the mask the device half of one
-        # question: a capture on a rail the marker does not name has to omit
-        # the case even when its mask carries the filter's bit, and reporting
-        # it anyway is refused. The v57f marker names the three trace rails,
-        # so only the two object-rail captures refuse (`research/docs/23`
-        # §3.3, v57d/v57f).
+        # question. The v57f marker named the three trace rails, so only the
+        # two object-rail captures had to refuse the pair; the v58 recording
+        # entry carries the gated pair on both object rails too, so the marker
+        # names every rail and a capture on any rail is owed the pair when its
+        # mask carries the filter's bit (`research/docs/23` §3.3,
+        # v57d/v57f/v58).
         for index, marker, result_builder, bit in (
                 (MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX, msaa_depth_resolve_min_edge_marker,
                  msaa_depth_resolve_min_edge_result, 2),
@@ -2839,7 +2844,7 @@ class ScissorObservationTests(unittest.TestCase):
                  msaa_depth_resolve_max_edge_result, 4)):
             for rail in ALL_RAILS:
                 suite = copy.deepcopy(self.suite)
-                owes = marker(suite, rail)
+                marker(suite, rail)
                 for position, case in enumerate(suite["render_cases"]):
                     if position != index:
                         case["capture_rails"] = [other_rail(rail)]
@@ -2849,13 +2854,7 @@ class ScissorObservationTests(unittest.TestCase):
                                            depth_resolve_modes=bit)
                 report["results"].append(result_builder(rail != "native-metal"))
                 with self.subTest(case=suite["render_cases"][index]["id"], rail=rail):
-                    if owes:
-                        compare.validate_capture(suite, digest, report, rail)
-                    else:
-                        with self.assertRaisesRegex(
-                                compare.CaptureError,
-                                "is not a rail this render case runs on"):
-                            compare.validate_capture(suite, digest, report, rail)
+                    compare.validate_capture(suite, digest, report, rail)
 
     def test_v28_gates_the_edge_resolve_cases_on_the_device_mask(self):
         # Presence iff the bit: absent without the bit passes, present without
