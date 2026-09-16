@@ -1259,11 +1259,18 @@ pub(crate) fn execute_offscreen_render(
     // `AllRenderAttachmentsDiscarded`, and the rail re-asserts the same
     // at-least-one-store rule for a directly-constructed request. Discarding
     // every attachment would turn "nothing landed" into a blank proof of
-    // "landed correctly".
-    if request
-        .attachments
-        .iter()
-        .all(|attachment| attachment.store == StoreOp::DontCare)
+    // "landed correctly" — but the depth attachment is a landing too from v43
+    // on, so the depth-only shape (every colour attachment discards, the pass
+    // keeps its depth surface) is the one exception (`docs/23` §3.3, v45).
+    let stored_depth = request
+        .depth
+        .as_ref()
+        .is_some_and(OffscreenDepthAttachment::storing);
+    if !stored_depth
+        && request
+            .attachments
+            .iter()
+            .all(|attachment| attachment.store == StoreOp::DontCare)
     {
         return Err(render_all_attachments_discarded_refusal());
     }
@@ -4943,6 +4950,38 @@ mod tests {
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         // The refusal precedes every Vulkan object and every copy.
         assert_eq!(context.buffer_copy_counts(), (0, 0));
+
+        // v45: the depth surface is a landing, so the same all-discarded colour
+        // list executes as soon as the pass keeps its depth attachment — and
+        // the readback is the depth texels, with no colour entry at all
+        // (`research/docs/23` §3.3, v45).
+        let depth_only = OffscreenRenderRequest {
+            depth: Some(OffscreenDepthAttachment {
+                width: 2,
+                height: 2,
+                clear: Some(1.0),
+                test: Some(DepthTest {
+                    compare: CompareFunction::Less,
+                    write: true,
+                }),
+                store: Some(DepthStoreOp::Store),
+            }),
+            ..request
+        };
+        let readback = execute_offscreen_render(&context, &depth_only)
+            .expect("a pass whose only landing is its depth surface executes");
+        assert_eq!(
+            readback.attachments,
+            vec![None],
+            "a discarded colour attachment keeps its place in the result list and lands nothing"
+        );
+        let depth = readback
+            .depth
+            .expect("the stored depth surface reads back its texels");
+        eprintln!("depth-only readback: {}", hex(&depth));
+        assert_eq!(depth.len(), 16);
+        assert_eq!(depth, 0.0_f32.to_le_bytes().repeat(4));
+        assert_ne!(depth, 1.0_f32.to_le_bytes().repeat(4));
     }
 
     /// A dual-format list outside the reviewed `[Rgba8Unorm, Rgba8Unorm]` shape

@@ -2219,15 +2219,23 @@ impl RenderPassDescriptor {
         for attachment in &self.color_attachments {
             attachment.validate_shape()?;
         }
-        // `docs/23` §3.6, v19: a discarded attachment is now a legal shape,
-        // but the pass as a whole still needs one observable landing point.
+        // `docs/23` §3.6, v19/v45: a discarded attachment is a legal shape, but
+        // the pass as a whole still needs one observable landing point.
         // All-`DontCare` would turn "nothing landed" into a blank proof of
-        // "landed correctly", so it stays a structural refusal.
-        if !self
+        // "landed correctly", so it stays a structural refusal — and the depth
+        // attachment is a landing too from v43 on, which is what makes a
+        // depth-only pass expressible: every colour attachment discards, the
+        // pass keeps its depth surface, and the depth texels are the whole
+        // observation.
+        let stored_colour = self
             .color_attachments
             .iter()
-            .any(|attachment| matches!(attachment.store, StoreOp::Store))
-        {
+            .any(|attachment| matches!(attachment.store, StoreOp::Store));
+        let stored_depth = self
+            .depth
+            .as_ref()
+            .is_some_and(RenderDepthAttachment::is_stored);
+        if !stored_colour && !stored_depth {
             return Err(ContractError::AllRenderAttachmentsDiscarded);
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
@@ -8429,7 +8437,8 @@ impl fmt::Display for ContractError {
                 "attachment store operation {store:?} is outside the first render increment"
             ),
             Self::AllRenderAttachmentsDiscarded => formatter.write_str(
-                "render pass discards every colour attachment, leaving no observable landing point",
+                "render pass discards every colour attachment and keeps no depth attachment, \
+                 leaving no observable landing point",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -13370,6 +13379,39 @@ mod tests {
         let refusal = contract_error_refusal(ContractError::AllRenderAttachmentsDiscarded);
         assert_eq!(refusal.class, ProviderErrorClass::Args);
         assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // v45: the depth attachment is a landing too, so the same pass becomes
+        // the depth-only shape as soon as it keeps its depth surface — the
+        // colour attachments still render, and their bytes still disappear.
+        let mut depth_only = render_pass();
+        depth_only.color_attachments[0].store = StoreOp::DontCare;
+        let mut stored = depth_attachment();
+        stored.store = Some(DepthStoreOp::Store);
+        stored.identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(950),
+        });
+        depth_only.depth = Some(stored);
+        depth_only.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        depth_only
+            .validate()
+            .expect("a pass whose only landing is its depth surface is well formed");
+
+        // And the landing has to be *stored*: a discarded depth attachment
+        // leaves the pass with nothing to observe again.
+        let mut discarded_too = depth_only.clone();
+        discarded_too
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .store = Some(DepthStoreOp::DontCare);
+        assert_eq!(
+            discarded_too.validate(),
+            Err(ContractError::AllRenderAttachmentsDiscarded)
+        );
     }
 
     #[test]

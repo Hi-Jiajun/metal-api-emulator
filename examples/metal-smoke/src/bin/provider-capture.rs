@@ -4017,8 +4017,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     // Core admission refuses an all-discarded pass
     // (`AllRenderAttachmentsDiscarded`), so the suite has to keep at least one
     // attachment on the observable surface or "nothing landed" would pass as
-    // "landed correctly".
-    if stored.is_empty() {
+    // "landed correctly". The stored depth attachment is a landing too
+    // (`research/docs/23` §3.3, v43/v45), which is what makes the depth-only
+    // shape — every colour attachment discarded, the depth surface kept —
+    // expressible.
+    let depth_landing = case
+        .depth
+        .as_ref()
+        .is_some_and(|depth| depth.store.as_deref() == Some("store"));
+    if stored.is_empty() && !depth_landing {
         return Err(format!(
             "{where_}: every colour attachment discards, leaving no observable landing point"
         )
