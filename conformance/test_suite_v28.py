@@ -1297,6 +1297,66 @@ class ScissorObservationTests(unittest.TestCase):
         self.assertEqual(expectation.touched, {900, 920, 940})
         self.assertEqual(expectation.written, {920, 940})
 
+    def test_v28_refuses_a_depth_no_colour_case_whose_viewport_misses_the_depth_extent(self):
+        # The zero-colour shape binds no colour attachment to state the pass's
+        # render area, so the stored depth surface is the raster the case's
+        # viewport has to cover — the rule the Swift oracle's own zero-colour
+        # branch already states, now mirrored here (`research/docs/23` §3.3,
+        # v46/v50).
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][DEPTH_NO_COLOUR_INDEX]["viewport"] = [0, 0, 3, 4]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the viewport must cover the depth attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+        # The colour-carrying shape keeps its own spelling of the rule: the
+        # viewport covers the *colour* attachment, and the stored depth surface
+        # follows that extent rather than stating it.
+        colour = copy.deepcopy(self.suite)
+        colour["render_cases"][DEPTH_ONLY_INDEX]["viewport"] = [0, 0, 3, 4]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the viewport must cover the attachment"):
+            compare._render_plan(compare._suite_plan(colour), colour)
+
+    def test_v28_refuses_a_depth_no_colour_case_whose_scissor_leaves_the_depth_extent(self):
+        # With no colour attachment to clip, the scissor is measured against the
+        # stored depth raster (`research/docs/23` §3.3, v46/v50): a rectangle
+        # that leaves that extent — on either axis, by its origin or its size —
+        # or one with no area at all describes coverage the case's one landing
+        # cannot show.
+        for scissor in ([0, 0, 5, 4], [2, 0, 3, 4], [0, 0, 4, 0], [3, 3, 1, 2]):
+            broken = copy.deepcopy(self.suite)
+            broken["render_cases"][DEPTH_NO_COLOUR_INDEX]["scissor"] = scissor
+            with self.subTest(scissor=scissor), self.assertRaisesRegex(
+                    compare.CaptureError,
+                    "a scissor has to be a non-empty rectangle inside the depth "
+                    "attachment"):
+                compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_accepts_a_depth_no_colour_case_whose_scissor_stays_inside_the_depth_extent(self):
+        # A scissor inside the stored depth raster is the reviewed shape, and it
+        # leaves the case's observation alone: the depth texels are still the
+        # whole landing, because there is no colour surface for the rectangle to
+        # classify (`research/docs/23` §3.3, v46/v50).
+        suite = copy.deepcopy(self.suite)
+        suite["render_cases"][DEPTH_NO_COLOUR_INDEX]["scissor"] = [1, 0, 2, 4]
+        plan = compare._render_plan(compare._suite_plan(suite), suite)
+        expectation = plan[DEPTH_NO_COLOUR_ID]
+        self.assertEqual(expectation.writes,
+                         [((DEPTH_STORE_ALLOCATION, DEPTH_STORE_VIEW, 0),
+                           bytes.fromhex(DEPTH_STORE_EXPECTED))])
+        self.assertEqual(expectation.allocations,
+                         {DEPTH_STORE_ALLOCATION: bytes.fromhex(DEPTH_STORE_EXPECTED)})
+        self.assertEqual(expectation.touched, {900, 920, 940})
+        self.assertEqual(expectation.written, {920, 940})
+        self.assertEqual(list(expectation.attachment), [DEPTH_STORE_ATTACHMENT])
+        self.assertEqual(expectation.rails, frozenset(DEPTH_NO_COLOUR_RAILS))
+        # The whole-raster rectangle is the shape the fixture's own viewport
+        # states, so it is inside the depth extent and accepted too.
+        whole = copy.deepcopy(self.suite)
+        whole["render_cases"][DEPTH_NO_COLOUR_INDEX]["scissor"] = [0, 0, 4, 4]
+        compare._render_plan(compare._suite_plan(whole), whole)
+
     def test_v28_pins_the_stencil_fixture(self):
         case = self.suite["render_cases"][STENCIL_INDEX]
         self.assertEqual(case["id"], STENCIL_ID)
