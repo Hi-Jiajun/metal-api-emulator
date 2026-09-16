@@ -4899,11 +4899,34 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        if attachment.load != "dontcare" {
-            return Err(format!(
-                "{where_}: only a dontcare load may leave texels unclaimed by an allowed set"
-            )
-            .into());
+        // A `dontcare` load's pre-pass contents are undefined, which is what a
+        // constrained claim bounds; a cleared raster has no undefined content,
+        // so the channel is only admitted there beside a multisample raster
+        // that claims the partial coverage its allowed set resolves
+        // (`research/docs/23` §3.3, v67/v69), and a loaded attachment hands the
+        // pass its own bytes, so nothing is unclaimed beside it.
+        match attachment.load.as_str() {
+            "dontcare" => {}
+            "clear" => {
+                if case.multisample.is_none() {
+                    return Err(format!(
+                        "{where_}: only a dontcare load may leave texels unclaimed by an \
+                         allowed set"
+                    )
+                    .into());
+                }
+                if case.coverage.as_deref() != Some("partial") {
+                    return Err(format!(
+                        "{where_}: a cleared multisample raster states the partial coverage \
+                         its allowed set resolves"
+                    )
+                    .into());
+                }
+            }
+            "load" => {
+                return Err(format!("{where_}: a loaded attachment has no unclaimed texel").into())
+            }
+            other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
         }
         if allowed.is_empty() {
             return Err(format!("{where_}: an allowed set has to name at least one texel").into());
@@ -5164,8 +5187,26 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                                 }
                                 let samples = u32::try_from(multisample.sample_count)?;
                                 let fragment = [texel[0], texel[1], texel[2], texel[3]];
+                                // A texel the case leaves to its allowed set
+                                // (`research/docs/23` §3.3, v69) states its claim
+                                // as that closed set instead of one byte, so the
+                                // exact resolve rule holds for every texel the
+                                // case does pin.
+                                let claimed = case
+                                    .wildcard_allowed_texels
+                                    .as_ref()
+                                    .map(|entries| {
+                                        entries
+                                            .iter()
+                                            .map(|entry| entry.index)
+                                            .collect::<BTreeSet<_>>()
+                                    })
+                                    .unwrap_or_default();
                                 let mut partial = 0_usize;
                                 for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                    if claimed.contains(&u64::try_from(index)?) {
+                                        continue;
+                                    }
                                     let mut covered = None;
                                     for count in 0..=samples {
                                         let Some(mixed) =
@@ -5189,7 +5230,30 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                                         partial += 1;
                                     }
                                 }
-                                if partial == 0 {
+                                if !claimed.is_empty()
+                                    && !(1..samples).any(|count| {
+                                        resolve_texel(&fragment, &clear_colour, count, samples)
+                                            .is_some()
+                                    })
+                                {
+                                    // The allowed sets are held to the case's own
+                                    // arithmetic where they are parsed; what stays
+                                    // to check here is that they admit a partial mix
+                                    // — the one shape a single-sample raster could
+                                    // not produce (`research/docs/23` §3.3, v69).
+                                    return Err(format!(
+                                        "{where_}: a cleared multisample raster that leaves a texel \
+                                         to its allowed set needs an exactly representable partial \
+                                         mix of its colours"
+                                    )
+                                    .into());
+                                }
+                                // A case that leaves texels to their allowed set
+                                // states the partial coverage through that set
+                                // instead of a pinned byte, so the rule binds
+                                // the texels it does pin (`research/docs/23`
+                                // §3.3, v69).
+                                if claimed.is_empty() && partial == 0 {
                                     return Err(format!(
                                         "{where_}: a multisample expectation needs at least one \
                                      partially covered texel"

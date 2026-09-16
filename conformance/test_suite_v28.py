@@ -160,6 +160,16 @@ MSAA_STENCIL_RESOLVE_DRS_ID = "msaa_stencil_resolve_drs_4x4"
 # whose device ceiling cannot run that raster (`research/docs/23` §3.3, v61).
 MSAA_UNIFORM_2X_ID = "msaa_uniform_2x_4x4"
 MSAA_UNIFORM_8X_ID = "msaa_uniform_8x_4x4"
+# The v69 pair: the v51 edge geometry on the 2x and 8x rasters, whose sample
+# positions are not documented. The cleared raster gives the resolve its
+# reference colour, so the column the right edge crosses is stated as the
+# closed set of exact k-of-`sample_count` mixes of the fragment output and that
+# colour (`wildcard_allowed_texels`) instead of one byte, while the fully
+# covered and the uncovered columns stay pinned; each case carries the v61
+# device gate because a device may lack either raster
+# (`research/docs/23` §3.3, v69).
+MSAA_EDGE_2X_ID = "msaa_edge_2x_4x4"
+MSAA_EDGE_8X_ID = "msaa_edge_8x_4x4"
 # The v66 case: the rail-owned combined depth-stencil pair, whose three
 # triangles share the v51 edge coverage and whose two faces are both discarded
 # with the pass (`research/docs/23` §3.3, v66).
@@ -199,13 +209,17 @@ MSAA_UNIFORM_2X_INDEX = 21
 MSAA_UNIFORM_8X_INDEX = 22
 # The v66 rail-owned combined pair is the newest case.
 MSAA_DS_INDEX = 23
+# The v69 edge pair follows it, the 2x case first.
+MSAA_EDGE_2X_INDEX = 24
+MSAA_EDGE_8X_INDEX = 25
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
                   MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID, MSAA_DEPTH_RESOLVE_ID,
                   MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
                   MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID,
-                  MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID, MSAA_DS_ID)
+                  MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID, MSAA_DS_ID,
+                  MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -455,6 +469,19 @@ MSAA_MIXED = "316293c4"
 MSAA_EXPECTED = "".join(
     OUTPUT if (index % 4) < 2 else (MSAA_MIXED if (index % 4) == 2 else MSAA_CLEAR)
     for index in range(16))
+# The v69 edge pair's claim (`research/docs/23` §3.3, v69): the same geometry
+# over the 2x and 8x rasters, whose sample positions are not documented, so the
+# crossed column states the closed set of exact k-of-`sample_count` mixes of
+# the fragment output and the clear colour instead of one byte. Both measured
+# devices land that column on the 4x fixture's `2`-of-`4` mix, which is the
+# byte the expectation carries there as its own spelling of the claim; the two
+# fully covered columns and the uncovered one stay pinned.
+MSAA_EDGE_TEXELS = [2, 6, 10, 14]
+MSAA_EDGE_CANDIDATES = [MSAA_CLEAR, MSAA_MIXED, OUTPUT]
+MSAA_EDGE_2X_EXPECTED = MSAA_EXPECTED
+MSAA_EDGE_8X_EXPECTED = MSAA_EXPECTED
+MSAA_EDGE_2X_RAILS = ALL_RAILS
+MSAA_EDGE_8X_RAILS = ALL_RAILS
 
 # The v66 fixture: the rail-owned combined depth-stencil pair
 # (`research/docs/23` §3.3, v66). Three copies of the v51 edge triangle share
@@ -818,6 +845,42 @@ def msaa_uniform_8x_result(provider_backend=True, copy_in=2, copy_out=2):
                         "offset": ATTACHMENT[2], "bytes_hex": MSAA_UNIFORM_8X_EXPECTED}],
         "allocations": [{"allocation": ATTACHMENT[0],
                          "bytes_hex": MSAA_UNIFORM_8X_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_edge_2x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v69 2x landing: the crossed column inside its closed mix set.
+
+    The shape is the v51 case's — one colour attachment resolved into its own
+    view — so the writeback, the allocation image and the provider counts are
+    identical; only the expectation, the raster and the device gate change
+    (`research/docs/23` §3.3, v69).
+    """
+    result = {
+        "id": MSAA_EDGE_2X_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_EDGE_2X_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0],
+                         "bytes_hex": MSAA_EDGE_2X_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_edge_8x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v69 8x landing: the 2x sibling with the wider raster's own gate."""
+    result = {
+        "id": MSAA_EDGE_8X_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_EDGE_8X_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0],
+                         "bytes_hex": MSAA_EDGE_8X_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -1561,6 +1624,8 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(msaa_stencil_resolve_sample0_result())
         report["results"].append(msaa_uniform_2x_result())
         report["results"].append(msaa_uniform_8x_result())
+        report["results"].append(msaa_edge_2x_result())
+        report["results"].append(msaa_edge_8x_result())
         report["results"].append(msaa_ds_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
@@ -2934,6 +2999,61 @@ class ScissorObservationTests(unittest.TestCase):
                                    bytes.fromhex(OUTPUT * 16))])
                 self.assertEqual(expectation.sample_count_gate, gate)
 
+    def test_v28_pins_the_msaa_edge_fixtures(self):
+        for index, case_id, sample_count, gate in (
+                (MSAA_EDGE_2X_INDEX, MSAA_EDGE_2X_ID, 2, 2),
+                (MSAA_EDGE_8X_INDEX, MSAA_EDGE_8X_ID, 8, 8)):
+            with self.subTest(case=case_id):
+                case = self.suite["render_cases"][index]
+                self.assertEqual(case["id"], case_id)
+                self.assertEqual(case["declaring_case"], "render_declaring_quad_extent")
+                self.assertEqual(case["multisample"], {"sample_count": sample_count})
+                self.assertEqual(case["requires_sample_count"], gate)
+                self.assertEqual(case["coverage"], "partial")
+                self.assertEqual(case["attachment"], {
+                    "allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                    "format": "rgba8_unorm", "width": 4, "height": 4,
+                    "load": "clear", "clear_hex": MSAA_CLEAR, "store": "store"})
+                # The crossed column states its closed mix set instead of one
+                # byte, and the byte the expectation carries there is that
+                # column's measured resolve — the 4x fixture's own mix
+                # (`research/docs/23` §3.3, v69).
+                self.assertEqual(case["wildcard_allowed_texels"],
+                                 [{"index": texel, "allowed": MSAA_EDGE_CANDIDATES}
+                                  for texel in MSAA_EDGE_TEXELS])
+                self.assertEqual(case["expected_hex"], MSAA_EXPECTED)
+                self.assertEqual(sorted(case["capture_rails"]), sorted(ALL_RAILS))
+                # The stream is the v51 edge geometry: the quad's right edge
+                # sits at x = 0.25 NDC, halfway through the third column.
+                stream = case["vertex_buffers"][0]["initial_hex"]
+                vertices = [struct.unpack("<2f", bytes.fromhex(stream)[offset:offset + 8])
+                            for offset in range(0, 32, 8)]
+                self.assertEqual(vertices, [(-1.0, -1.0), (0.25, -1.0),
+                                            (-1.0, 1.0), (0.25, 1.0)])
+
+    def test_v28_plans_the_msaa_edge_fixtures(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        for case_id, gate in ((MSAA_EDGE_2X_ID, 2), (MSAA_EDGE_8X_ID, 8)):
+            with self.subTest(case=case_id):
+                expectation = plan[case_id]
+                self.assertEqual(expectation.writes,
+                                 [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                                   bytes.fromhex(MSAA_EXPECTED))])
+                self.assertEqual(expectation.sample_count_gate, gate)
+                claims = expectation.wildcards[
+                    (ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2])]
+                for texel in MSAA_EDGE_TEXELS:
+                    for byte in range(4):
+                        self.assertEqual(sorted(claims[texel * 4 + byte]),
+                                         sorted(bytes.fromhex(value)[byte]
+                                                for value in MSAA_EDGE_CANDIDATES))
+                # Every other column stays an exact comparison: the covered
+                # half is the fragment output and the last column the clear
+                # (`research/docs/23` §3.3, v69).
+                for texel in (0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15):
+                    for byte in range(4):
+                        self.assertNotIn(texel * 4 + byte, claims)
+
     def test_v28_refuses_a_sample_count_gate_that_does_not_name_the_raster(self):
         # The gate is the case's own admission condition, so it has to name the
         # raster the case states rather than drift into a second spelling
@@ -2962,7 +3082,11 @@ class ScissorObservationTests(unittest.TestCase):
                 (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_2X_ID, 2, 1 << 1,
                  msaa_uniform_2x_result),
                 (MSAA_UNIFORM_8X_INDEX, MSAA_UNIFORM_8X_ID, 8, 1 << 3,
-                 msaa_uniform_8x_result)):
+                 msaa_uniform_8x_result),
+                (MSAA_EDGE_2X_INDEX, MSAA_EDGE_2X_ID, 2, 1 << 1,
+                 msaa_edge_2x_result),
+                (MSAA_EDGE_8X_INDEX, MSAA_EDGE_8X_ID, 8, 1 << 3,
+                 msaa_edge_8x_result)):
             suite = copy.deepcopy(self.suite)
             for position, case in enumerate(suite["render_cases"]):
                 if position != index:
@@ -2993,16 +3117,19 @@ class ScissorObservationTests(unittest.TestCase):
     def test_v28_the_sample_mask_is_per_count_not_a_ladder(self):
         # Lavapipe is the measured counterexample: its framebuffer admits 4x
         # and 8x but not 2x, so a capture whose mask carries only 8x owes the
-        # 8x case and leaves the 2x case out (`research/docs/23` §3.3, v61).
+        # 8x cases and leaves the 2x cases out (`research/docs/23` §3.3,
+        # v61/v69).
         suite = copy.deepcopy(self.suite)
         for position, case in enumerate(suite["render_cases"]):
-            if position not in (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_8X_INDEX):
+            if position not in (MSAA_UNIFORM_2X_INDEX, MSAA_UNIFORM_8X_INDEX,
+                                MSAA_EDGE_2X_INDEX, MSAA_EDGE_8X_INDEX):
                 case["capture_rails"] = ["native-metal"]
         digest = hashlib.sha256(
             json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
         report = counted_declaring(suite, digest, "vulkan",
                                    render_sample_counts=1 << 3)
         report["results"].append(msaa_uniform_8x_result())
+        report["results"].append(msaa_edge_8x_result())
         compare.validate_capture(suite, digest, report, "vulkan")
 
     def test_v28_pins_the_msaa_depth_fixture(self):

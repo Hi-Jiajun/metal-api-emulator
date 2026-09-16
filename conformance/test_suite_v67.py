@@ -225,11 +225,21 @@ class ConstrainedWildcardTests(unittest.TestCase):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_a_cleared_raster_may_not_claim_an_allowed_set(self):
+        # A cleared *single-sample* attachment has no undefined content, so the
+        # channel stays refused there. Beside a multisample raster the claim is
+        # admitted from v69 on, and then only when the case states the partial
+        # coverage its allowed set resolves (`research/docs/23` §3.3, v69):
+        # both halves are the two refusals below.
         broken = copy.deepcopy(self.suite)
         broken["render_cases"][0]["attachment"]["load"] = "clear"
-        broken["render_cases"][0]["multisample"] = {"sample_count": 4}
         with self.assertRaisesRegex(compare.CaptureError,
                                     "a cleared attachment has no unclaimed texel"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+        broken["render_cases"][0]["multisample"] = {"sample_count": 4}
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a cleared multisample raster states the partial coverage its allowed "
+                "set resolves"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_a_multisample_case_states_mix_candidates(self):
