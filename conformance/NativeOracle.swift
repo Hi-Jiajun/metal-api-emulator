@@ -2677,9 +2677,28 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(!allowed.isEmpty,
                     "\(definition.id): an allowed set has to name at least one texel")
         let attachment = attachments[0]
-        try require(attachment.load == "dontcare",
-                    "\(definition.id): only a dontcare load may leave texels unclaimed by "
-                    + "an allowed set")
+        // A `dontcare` load's pre-pass contents are undefined, which is what a
+        // constrained claim bounds; a cleared raster has no undefined content,
+        // so the channel is only admitted there beside a multisample raster that
+        // claims the partial coverage its allowed set resolves
+        // (`research/docs/23` §3.3, v67/v69), and a loaded attachment hands the
+        // pass its own bytes, so nothing is unclaimed beside it.
+        switch attachment.load {
+        case "dontcare":
+            break
+        case "clear":
+            try require(definition.multisample != nil,
+                        "\(definition.id): only a dontcare load may leave texels unclaimed by "
+                        + "an allowed set")
+            try require(definition.coverage == "partial",
+                        "\(definition.id): a cleared multisample raster states the partial "
+                        + "coverage its allowed set resolves")
+        case "load":
+            throw OracleError("\(definition.id): a loaded attachment has no unclaimed texel")
+        default:
+            throw OracleError("\(definition.id): unsupported attachment load op "
+                              + attachment.load)
+        }
         let texelCount = attachment.width * attachment.height
         var seen = Set<Int>()
         for entry in allowed {
@@ -2792,8 +2811,20 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 try require(clearBytes.count == 4,
                             "\(definition.id): a clear colour is four bytes")
                 let samples = Int(multisample.sample_count)
+                // A texel the case leaves to its allowed set
+                // (`research/docs/23` §3.3, v69) states its claim as that closed
+                // set instead of one byte, so the exact resolve rule below holds
+                // for every texel the case does pin.
+                var claimed = Set<Int>()
+                for entry in definition.wildcard_allowed_texels ?? [] {
+                    claimed.insert(entry.index)
+                }
                 var coveredSeen = Set<Int>()
                 for offset in stride(from: 0, to: texels.count, by: 4) {
+                    if claimed.contains(offset / 4) {
+                        texelCount += 1
+                        continue
+                    }
                     let chunk = Data(texels[offset..<(offset + 4)])
                     var matched: Int?
                     for covered in 0...samples {
@@ -2811,12 +2842,28 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     coveredSeen.insert(covered)
                     texelCount += 1
                 }
-                try require(coveredSeen.contains { $0 > 0 && $0 < samples },
-                            "\(definition.id): a multisample expectation needs at least one "
-                            + "partially covered texel")
+                if claimed.isEmpty {
+                    try require(coveredSeen.contains { $0 > 0 && $0 < samples },
+                                "\(definition.id): a multisample expectation needs at least one "
+                                + "partially covered texel")
+                }
                 try require(coveredSeen.contains(0) && coveredSeen.contains(samples),
                             "\(definition.id): a multisample expectation needs both a fully "
                             + "covered and an uncovered texel")
+                if !claimed.isEmpty {
+                    // The allowed sets are held to the case's own arithmetic
+                    // where they are parsed; what stays to check here is that
+                    // they admit a partial mix — the one shape a single-sample
+                    // raster could not produce (`research/docs/23` §3.3, v69).
+                    let admitsPartial = (1..<samples).contains {
+                        resolveTexel(fragment: texel, clear: clearBytes,
+                                     covered: $0, samples: samples) != nil
+                    }
+                    try require(admitsPartial,
+                                "\(definition.id): a cleared multisample raster that leaves a "
+                                + "texel to its allowed set needs an exactly representable "
+                                + "partial mix of its colours")
+                }
             } else if attachment.load == "clear", definition.coverage == "partial" {
                 // The coverage claim (`research/docs/23` §3.3, v38): the draw
                 // covers part of the attachment, so every texel is either the
@@ -2958,6 +3005,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 throw OracleError("\(definition.id): a loaded attachment needs its previous texels")
             }
             let previous = try decodeHex(initialHex, context: "\(definition.id) initial texels")
+            // A loaded attachment hands the pass its own bytes, so no texel is
+            // unclaimed and a constrained claim has no meaning beside it
+            // (`research/docs/23` §3.3, v69); the free list states the same rule
+            // where it is parsed.
+            try require(definition.wildcard_allowed_texels == nil,
+                        "\(definition.id): a loaded attachment has no unclaimed texel")
             try require(previous.count == byteCount,
                         "\(definition.id): initial texels do not match the attachment")
             clearComponents = []

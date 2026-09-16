@@ -2340,6 +2340,216 @@
         "vulkan-objects",
         "native-metal-provider-objects"
       ]
+    },
+    {
+      "id": "msaa_edge_2x_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf0000803e000080bf000080bf0000803f0000803e0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1020,
+        "view": 1030,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "multisample": {
+        "sample_count": 2
+      },
+      "requires_sample_count": 2,
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "22446689",
+        "store": "store"
+      },
+      "coverage": "partial",
+      "wildcard_allowed_texels": [
+        {
+          "index": 2,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 6,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 10,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 14,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        }
+      ],
+      "expected_hex": "4080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c422446689",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
+    },
+    {
+      "id": "msaa_edge_8x_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1000,
+          "view": 1010,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000080bf0000803e000080bf000080bf0000803f0000803e0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1020,
+        "view": 1030,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "multisample": {
+        "sample_count": 8
+      },
+      "requires_sample_count": 8,
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "22446689",
+        "store": "store"
+      },
+      "coverage": "partial",
+      "wildcard_allowed_texels": [
+        {
+          "index": 2,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 6,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 10,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        },
+        {
+          "index": 14,
+          "allowed": [
+            "22446689",
+            "316293c4",
+            "4080c0ff"
+          ]
+        }
+      ],
+      "expected_hex": "4080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c4224466894080c0ff4080c0ff316293c422446689",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
     }
   ]
 }

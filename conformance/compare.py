@@ -2124,8 +2124,20 @@ def _render_plan(plan, suite):
                 _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
                 _require("initial_hex" not in attachment,
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
-                _require(wildcard_allowed is None,
-                         f"{attachment_where}: a cleared attachment has no unclaimed texel")
+                # A cleared raster has no undefined pre-pass contents, so the
+                # fixture can pin every byte and the *free* list stays refused
+                # here. The constrained channel (`research/docs/23` §3.3, v69)
+                # is the one exception, and only beside a multisample raster
+                # that claims the partial coverage its allowed set resolves:
+                # the named texels are the ones whose covered-sample count the
+                # rails' own sample *positions* do not pin, while the colours
+                # the resolve is built from stay the case's own.
+                if wildcard_allowed is not None:
+                    _require(multisample is not None,
+                             f"{attachment_where}: a cleared attachment has no unclaimed texel")
+                    _require(coverage == "partial",
+                             f"{attachment_where}: a cleared multisample raster states the "
+                             "partial coverage its allowed set resolves")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
                 # The combined depth-stencil shape's mixed column carries the
@@ -2152,6 +2164,13 @@ def _render_plan(plan, suite):
                     samples = multisample["sample_count"]
                     covered_seen = set()
                     for index, chunk in enumerate(texels):
+                        # A texel the case leaves to its allowed set
+                        # (`research/docs/23` §3.3, v69) states its claim as
+                        # that closed set instead of one byte, so the exact
+                        # resolve rule below holds for every texel the case
+                        # does pin.
+                        if wildcard_allowed is not None and index in wildcard_allowed:
+                            continue
                         for covered in range(samples + 1):
                             if chunk == _resolve_texel(texel, clear, covered, samples):
                                 covered_seen.add(covered)
@@ -2160,20 +2179,30 @@ def _render_plan(plan, suite):
                             raise CaptureError(
                                 f"{attachment_where}: texel {index} is not the resolve of "
                                 f"any coverage of the {samples}-sample raster")
-                    _require(any(0 < covered < samples for covered in covered_seen),
-                             f"{attachment_where}: a multisample expectation needs at "
-                             "least one partially covered texel")
+                    if wildcard_allowed is None:
+                        _require(any(0 < covered < samples for covered in covered_seen),
+                                 f"{attachment_where}: a multisample expectation needs at "
+                                 "least one partially covered texel")
                     _require(0 in covered_seen and samples in covered_seen,
                              f"{attachment_where}: a multisample expectation needs both "
                              "a fully covered and an uncovered texel")
-                    # A cleared raster has no unclaimed texel: the colour it
-                    # starts from is the fixture's own, so the expectation can
-                    # pin every byte. The constrained channel exists for the
-                    # `dontcare` load the multisample gate admits beside it
-                    # (`research/docs/23` §3.3, v67).
-                    _require(wildcard_allowed is None,
-                             f"{attachment_where}: a cleared multisample raster has no "
-                             "unclaimed texel")
+                    if wildcard_allowed is not None:
+                        # The allowed set is held to the case's own arithmetic
+                        # by the same rule the `dontcare` shape states
+                        # (`research/docs/23` §3.3, v67): the reference colour
+                        # is the attachment's own clear, and the declared sets
+                        # have to be exactly the exact k-of-`sample_count`
+                        # mixes of the two colours. The pinned texels then
+                        # carry both extremes, and the allowed sets have to
+                        # admit a partial mix — the one shape a single-sample
+                        # raster could not produce.
+                        _check_allowed_texels(wildcard_allowed, len(texels), texel, samples,
+                                              attachment["clear_hex"], attachment_where)
+                        _require(any(_resolve_texel(texel, clear, covered, samples) is not None
+                                     for covered in range(1, samples)),
+                                 f"{attachment_where}: a cleared multisample raster that leaves "
+                                 "a texel to its allowed set needs an exactly representable "
+                                 "partial mix of its colours")
                 elif coverage == "partial":
                     # The draw covers part of the attachment: every texel is
                     # the fragment output or the colour the pass started from,
@@ -2234,6 +2263,13 @@ def _render_plan(plan, suite):
             elif load == "load":
                 previous = _hex(attachment.get("initial_hex"),
                                 f"{attachment_where}.initial_hex")
+                # A loaded attachment hands the pass its own bytes, so no texel
+                # is unclaimed and neither wildcard channel has a meaning here:
+                # the expectation compares against what the load carried
+                # (`research/docs/23` §3.3, v69). The free list states the same
+                # rule where it is parsed.
+                _require(wildcard_allowed is None,
+                         f"{attachment_where}: a loaded attachment has no unclaimed texel")
                 _require(len(previous) == len(expected),
                          f"{attachment_where}: initial texels do not match the attachment")
                 _require(previous != expected,
