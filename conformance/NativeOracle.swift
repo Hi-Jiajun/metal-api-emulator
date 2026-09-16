@@ -217,6 +217,18 @@ private struct BlendAttachmentDefinition: Decodable {
     let operation: String
 }
 
+/// The pass-wide multisample state a render case declares
+/// (`research/docs/23` §3.3, v51).
+///
+/// The reviewed shape is the four-sample raster both rails spell
+/// `MTLSampleCount4`/`TYPE_4`: Metal renders into a four-sample texture with
+/// `rasterSampleCount = 4` and resolves it into the attachment's own texture
+/// with `storeAction = .multisampleResolve`, which is what the oracle reads
+/// back. The state is the pass's own, so it carries no attachment identity.
+private struct MultisampleDefinition: Decodable {
+    let sample_count: UInt64
+}
+
 /// The stencil attachment a render case declares (`research/docs/23` §3.3,
 /// v47; the store pair is v49).
 ///
@@ -400,6 +412,12 @@ private struct RenderCaseDefinition: Decodable {
     /// load started them from. An absent claim keeps the milestone's rule
     /// since v13: a clearing pass claims every texel.
     let coverage: String?
+    /// The pass-wide multisample raster (`research/docs/23` §3.3, v51), or
+    /// `nil` for the single-sample raster every pre-v51 case runs. The reviewed
+    /// case states four samples and observes the resolve of the fragment output
+    /// and the load's own colour in the attachment view: its expectation is a
+    /// k-of-four mix of the two, which a single-sample raster cannot produce.
+    let multisample: MultisampleDefinition?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -2190,6 +2208,28 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(definition.attachment != nil,
                     "\(definition.id): the coverage claim is the single-attachment shape")
     }
+    // The pass-wide multisample raster (`research/docs/23` §3.3, v51): the
+    // first increment reviews one shape — a single colour attachment opened
+    // from a clear, four samples, no depth or stencil surface, no present
+    // action, no ICB and no wildcard texels — and its expectation follows the
+    // resolve rule below instead of the coverage rule. `conformance/compare.py`
+    // and the Rust providers read the same field the same way.
+    if let multisample = definition.multisample {
+        try require(definition.attachment != nil,
+                    "\(definition.id): the multisample raster is the single-attachment shape")
+        try require(multisample.sample_count == 4,
+                    "\(definition.id): the reviewed multisample raster is four samples")
+        try require(definition.coverage == "partial",
+                    "\(definition.id): the multisample raster has to claim partial coverage")
+        try require(definition.depth == nil && definition.stencil == nil,
+                    "\(definition.id): the reviewed multisample pass opens no depth or "
+                    + "stencil surface")
+        try require(definition.wildcard_texels == nil,
+                    "\(definition.id): the multisample raster claims every texel it resolves")
+        try require(!definition.capture_rails.contains { $0.hasSuffix("-objects") },
+                    "\(definition.id): the multisample raster is the trace rail's first "
+                    + "increment: the object API entry is the increment after it")
+    }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents
     // of a `dontcare` load are exactly what makes an unclaimed byte
@@ -2283,7 +2323,50 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // the previous bytes are decoded, below.
             let texel = Data(texels.prefix(4))
             var texelCount = 0
-            if attachment.load == "clear", definition.coverage == "partial" {
+            if attachment.load == "clear", let multisample = definition.multisample {
+                // The multisample resolve (`research/docs/23` §3.3, v51): every
+                // texel is the arithmetic mean of the samples a primitive
+                // covered, so the expectation has to be a k-of-`sample_count`
+                // mix of the fragment output and the clear colour — and both
+                // extremes and at least one partial mix have to appear, or the
+                // fixture would claim a pattern a single-sample raster could
+                // produce. A mix that is not exactly representable is refused:
+                // the fixture has to choose colours whose mixes divide
+                // exactly, which is what keeps the expectation independent of
+                // a driver's rounding rule.
+                guard let clearHex = attachment.clear_hex else {
+                    throw OracleError("\(definition.id): a clear attachment needs clear_hex")
+                }
+                let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+                try require(clearBytes.count == 4,
+                            "\(definition.id): a clear colour is four bytes")
+                let samples = Int(multisample.sample_count)
+                var coveredSeen = Set<Int>()
+                for offset in stride(from: 0, to: texels.count, by: 4) {
+                    let chunk = Data(texels[offset..<(offset + 4)])
+                    var matched: Int?
+                    for covered in 0...samples {
+                        if chunk == resolveTexel(fragment: texel, clear: clearBytes,
+                                                 covered: covered, samples: samples) {
+                            matched = covered
+                            break
+                        }
+                    }
+                    guard let covered = matched else {
+                        throw OracleError("\(definition.id): texel \(offset / 4) is not the "
+                                          + "resolve of any coverage of the \(samples)-sample "
+                                          + "raster")
+                    }
+                    coveredSeen.insert(covered)
+                    texelCount += 1
+                }
+                try require(coveredSeen.contains { $0 > 0 && $0 < samples },
+                            "\(definition.id): a multisample expectation needs at least one "
+                            + "partially covered texel")
+                try require(coveredSeen.contains(0) && coveredSeen.contains(samples),
+                            "\(definition.id): a multisample expectation needs both a fully "
+                            + "covered and an uncovered texel")
+            } else if attachment.load == "clear", definition.coverage == "partial" {
                 // The coverage claim (`research/docs/23` §3.3, v38): the draw
                 // covers part of the attachment, so every texel is either the
                 // fragment output or the colour the clear load started it
@@ -3035,6 +3118,25 @@ private func runCase(_ fixture: ValidatedCase, device: MTLDevice, queue: MTLComm
     return CaseResult(id: definition.id, completion: "CompletedVisible", writebacks: writebacks, allocations: allocations)
 }
 
+/// The resolve of one texel's samples (`research/docs/23` §3.3, v51).
+///
+/// `covered` of `samples` samples carry the fragment output and the rest the
+/// colour the pass started from, so each resolved channel is their arithmetic
+/// mean. A mean that is not exactly representable answers `nil` rather than a
+/// rounded byte — the same rule `conformance/compare.py` states, and what keeps
+/// the expectation independent of a driver's rounding rule.
+private func resolveTexel(fragment: Data, clear: Data, covered: Int, samples: Int) -> Data? {
+    var resolved = Data(capacity: 4)
+    for channel in 0..<4 {
+        let total = Int(fragment[channel]) * covered + Int(clear[channel]) * (samples - covered)
+        if total % samples != 0 {
+            return nil
+        }
+        resolved.append(UInt8(total / samples))
+    }
+    return resolved
+}
+
 private func hostOffset(_ value: UInt64, id: String) throws -> Int {
     // A view offset is a wire `u64`, so the narrowing is fallible by
     // construction; refusing it is the same answer `render.rs::stream_buffer`
@@ -3119,6 +3221,33 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             }
         }
         targets.append(target)
+    }
+    // A multisampled pass renders into its own four-sample textures
+    // (`research/docs/23` §3.3, v51), one per colour location; `targets` above
+    // are the resolve targets the pass writes into and the readback below
+    // observes. The four-sample surfaces are never read back, so private
+    // storage is enough, exactly as the discarded depth surface above states
+    // it. The local keeps them alive until the encoder's own reference takes
+    // over.
+    var multisampleTargets = [MTLTexture]()
+    if let multisample = definition.multisample {
+        let samples = Int(multisample.sample_count)
+        for attachment in fixture.attachments {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: attachment.pixelFormat,
+                width: attachment.width,
+                height: attachment.height,
+                mipmapped: false)
+            descriptor.textureType = .type2DMultisample
+            descriptor.sampleCount = samples
+            descriptor.usage = .renderTarget
+            descriptor.storageMode = .private
+            guard let target = device.makeTexture(descriptor: descriptor) else {
+                throw OracleError("\(definition.id): cannot allocate the multisample attachment")
+            }
+            target.label = "native oracle: \(definition.id) msaa"
+            multisampleTargets.append(target)
+        }
     }
     // The depth surface is the rail's own texture for the shape every pre-v43
     // case declares (`research/docs/23` §3.3, v36): no trace identity and no
@@ -3271,6 +3400,14 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     if fixture.stencil != nil {
         pipelineDescriptor.stencilAttachmentPixelFormat = .stencil8
     }
+    // The pipeline's raster sample count follows the pass's own multisample
+    // state (`research/docs/23` §3.3, v51): Metal refuses a pipeline whose
+    // `rasterSampleCount` disagrees with the attachments the pass binds, so the
+    // two come from one decision. A single-sample case keeps the default
+    // exactly as every pre-v51 case did.
+    if let multisample = definition.multisample {
+        pipelineDescriptor.rasterSampleCount = Int(multisample.sample_count)
+    }
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
     let pass = MTLRenderPassDescriptor()
@@ -3281,12 +3418,27 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         guard let color = pass.colorAttachments[index] else {
             throw OracleError("\(definition.id): cannot reach colour attachment \(index)")
         }
-        color.texture = targets[index]
+        // A multisampled location names the four-sample surface as its render
+        // target and the attachment's own texture as the resolve target
+        // (`research/docs/23` §3.3, v51): `.multisampleResolve` writes the
+        // resolved texels into the latter, which is what the readback below
+        // observes. A single-sample location names one texture, exactly as
+        // every pre-v51 case did.
+        if definition.multisample != nil {
+            color.texture = multisampleTargets[index]
+            color.resolveTexture = targets[index]
+        } else {
+            color.texture = targets[index]
+        }
         // A discarded attachment still renders, but Metal does not keep its
         // bytes: `.dontCare` is what makes it disappear from the observable
         // surface, and the readback below skips it (`research/docs/23` §3.6,
         // v19).
-        color.storeAction = attachment.store == "store" ? .store : .dontCare
+        if definition.multisample != nil {
+            color.storeAction = attachment.store == "store" ? .multisampleResolve : .dontCare
+        } else {
+            color.storeAction = attachment.store == "store" ? .store : .dontCare
+        }
         switch attachment.load {
         case "clear":
             color.loadAction = .clear
@@ -3655,6 +3807,7 @@ private func renderSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
+        multisample: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -3725,6 +3878,7 @@ private func presentSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
+        multisample: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -3817,6 +3971,7 @@ private func vertexSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
+        multisample: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -3913,6 +4068,7 @@ private func mrtSelfTest() throws -> CaseResult {
         // spelled per attachment the way a suite's MRT case does.
         expected_hex: nil,
         coverage: nil,
+        multisample: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,

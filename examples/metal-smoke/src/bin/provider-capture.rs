@@ -11,14 +11,15 @@ use metal_api_core::provider::{
     DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
     HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
     IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
-    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
-    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    InitialState, LoadOp, MultisampleState, OperationId, PipelineCompileRequest, PipelineProvider,
+    PresentDescriptor, PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy,
+    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, SemanticDigest, ShaderSource, StencilCompare, StencilFormat,
-    StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
+    ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource, StencilCompare,
+    StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1260,6 +1261,12 @@ struct RenderCase {
     /// nothing tests it".
     #[serde(default)]
     stencil_test: Option<StencilTestDefinition>,
+    /// The pass-wide multisample state, or absent for the single-sample raster
+    /// every pre-v51 case runs (`research/docs/23` §3.3, v51). The reviewed
+    /// fixture states the four-sample raster and observes the resolve of the
+    /// fragment output and the load's own colour in the attachment view.
+    #[serde(default)]
+    multisample: Option<MultisampleDefinition>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1287,6 +1294,28 @@ struct RenderCase {
 /// every pre-v31 fixture means.
 fn default_instance_count() -> u64 {
     1
+}
+
+/// The resolve of one texel's samples (`research/docs/23` §3.3, v51).
+///
+/// `covered` of `samples` samples carry the fragment output and the rest the
+/// colour the pass started from, so each resolved channel is their arithmetic
+/// mean. A mean that is not exactly representable is refused — `None` — rather
+/// than rounded, because that is what keeps the expectation independent of a
+/// driver's rounding rule: the fixture has to choose colours whose mixes divide
+/// exactly, and the reviewed one does.
+fn resolve_texel(fragment: &[u8; 4], clear: &[u8], covered: u32, samples: u32) -> Option<[u8; 4]> {
+    let mut texel = [0_u8; 4];
+    for channel in 0..4 {
+        let sum = u32::from(fragment[channel])
+            .checked_mul(covered)?
+            .checked_add(u32::from(clear[channel]).checked_mul(samples - covered)?)?;
+        if sum % samples != 0 {
+            return None;
+        }
+        texel[channel] = u8::try_from(sum / samples).ok()?;
+    }
+    Some(texel)
 }
 
 /// One colour attachment's blend state (`research/docs/23` §3.3, v40).
@@ -1396,6 +1425,19 @@ struct StencilTestDefinition {
     read_mask: u8,
     write_mask: u8,
     reference: u8,
+}
+
+/// The pass-wide multisample state (`research/docs/23` §3.3, v51).
+///
+/// The reviewed shape is the four-sample raster both rails spell
+/// `SampleCount4`/`TYPE_4`, whose resolve lands in the attachment view the case
+/// declares. The state is the pass's own, so it carries no attachment identity
+/// and no per-attachment fields.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultisampleDefinition {
+    /// Samples per texel. The reviewed fixture states `4`.
+    sample_count: u64,
 }
 
 /// One vertex layout: the reviewed stream list, in binding order.
@@ -3808,6 +3850,68 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             );
         }
     }
+    // The multisample raster (`research/docs/23` §3.3, v51): the first
+    // increment reviews exactly one shape — one colour attachment opened from
+    // a clear, four samples, no depth or stencil surface, no present action,
+    // no ICB and no wildcard texels. The resolve expectation itself is the
+    // comparator's rule (every texel is the fragment output, the clear colour,
+    // or the arithmetic mean of the two); what this gate holds is that the case
+    // states the one shape the rails execute, so no rail can silently run a
+    // different raster than the expectation describes.
+    if let Some(multisample) = &case.multisample {
+        if !single {
+            return Err(
+                format!("{where_}: the multisample raster is the single-attachment shape").into(),
+            );
+        }
+        if multisample.sample_count != 4 {
+            return Err(
+                format!("{where_}: the reviewed multisample raster is four samples").into(),
+            );
+        }
+        let (attachment, _) = shapes.first().ok_or(format!(
+            "{where_}: a multisample raster needs an attachment"
+        ))?;
+        if attachment.load != "clear" {
+            return Err(format!(
+                "{where_}: the reviewed multisample pass opens its attachment from a clear"
+            )
+            .into());
+        }
+        if case.depth.is_some() || case.stencil.is_some() {
+            return Err(format!(
+                "{where_}: the reviewed multisample pass opens no depth or stencil surface"
+            )
+            .into());
+        }
+        if case.present.is_some() || case.icb.is_some() {
+            return Err(format!(
+                "{where_}: a multisample case carries neither a present action nor an ICB"
+            )
+            .into());
+        }
+        if case.wildcard_texels.is_some() {
+            return Err(
+                format!("{where_}: the multisample raster claims every texel it resolves").into(),
+            );
+        }
+        if case.coverage.as_deref() != Some("partial") {
+            return Err(
+                format!("{where_}: the multisample raster has to claim partial coverage").into(),
+            );
+        }
+        if case
+            .capture_rails
+            .iter()
+            .any(|rail| rail.ends_with("-objects"))
+        {
+            return Err(format!(
+                "{where_}: the multisample raster is the trace rail's first increment: the \
+                 object API entry is the increment after it"
+            )
+            .into());
+        }
+    }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels it does not claim, and only a `dontcare` load has bytes that may
     // legitimately be unclaimed. The list is the single-attachment shape's, it
@@ -3922,7 +4026,59 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         // checks. Without a scissor the milestone's stricter
                         // rule stays: every texel is the output
                         // (`research/docs/23` §3.3, v29).
-                        if case.coverage.as_deref() == Some("partial") {
+                        if let Some(multisample) = &case.multisample {
+                            // The multisample resolve (`research/docs/23` §3.3,
+                            // v51): every texel is the arithmetic mean of the
+                            // samples a primitive covered, so the expectation
+                            // has to be a k-of-`sample_count` mix of the
+                            // fragment output and the clear colour — and at
+                            // least one texel has to be a *partial* mix, which
+                            // is the one byte pattern a single-sample raster
+                            // cannot produce.
+                            let clear_colour =
+                                unhex(attachment.clear_hex.as_deref().ok_or(format!(
+                                    "{where_}: a clear attachment needs clear_hex"
+                                ))?)?;
+                            if clear_colour.len() != 4 {
+                                return Err(
+                                    format!("{where_}: a clear colour is four bytes").into()
+                                );
+                            }
+                            let samples = u32::try_from(multisample.sample_count)?;
+                            let fragment = [texel[0], texel[1], texel[2], texel[3]];
+                            let mut partial = 0_usize;
+                            for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                let mut covered = None;
+                                for count in 0..=samples {
+                                    let Some(mixed) =
+                                        resolve_texel(&fragment, &clear_colour, count, samples)
+                                    else {
+                                        continue;
+                                    };
+                                    if chunk == mixed {
+                                        covered = Some(count);
+                                        break;
+                                    }
+                                }
+                                let Some(count) = covered else {
+                                    return Err(format!(
+                                        "{where_}: texel {index} is not the resolve of any \
+                                         coverage of the {samples}-sample raster"
+                                    )
+                                    .into());
+                                };
+                                if count > 0 && count < samples {
+                                    partial += 1;
+                                }
+                            }
+                            if partial == 0 {
+                                return Err(format!(
+                                    "{where_}: a multisample expectation needs at least one \
+                                     partially covered texel"
+                                )
+                                .into());
+                            }
+                        } else if case.coverage.as_deref() == Some("partial") {
                             let clear_colour =
                                 unhex(attachment.clear_hex.as_deref().ok_or(format!(
                                     "{where_}: a clear attachment needs clear_hex"
@@ -6044,6 +6200,25 @@ fn run_render_case(
         ]),
         None => None,
     };
+    // The pass-wide multisample state (`research/docs/23` §3.3, v51): the
+    // reviewed fixture's four-sample raster. `validate_render_case` refused
+    // every other count before this point, so the mapping is total over the
+    // shapes that can reach it.
+    let multisample = match &case.multisample {
+        Some(definition) => Some(MultisampleState {
+            sample_count: match definition.sample_count {
+                4 => SampleCount::Four,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported multisample count {other}",
+                        case.id
+                    )
+                    .into())
+                }
+            },
+        }),
+        None => None,
+    };
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
@@ -6054,6 +6229,7 @@ fn run_render_case(
             u32::try_from(case.viewport[3])?,
         ],
         scissor,
+        multisample,
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,

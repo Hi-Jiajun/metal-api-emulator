@@ -188,6 +188,8 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, v31).
             supports_render_instancing: self.vertex_input,
             max_render_instances: if self.vertex_input { 4 } else { 0 },
+            supports_render_multisample: false,
+            max_render_sample_count: 0,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

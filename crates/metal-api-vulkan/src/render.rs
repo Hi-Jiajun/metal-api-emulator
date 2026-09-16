@@ -32,10 +32,10 @@ use ash::vk;
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
     CompareFunction, CullMode, DepthStoreOp, DepthTest, FieldValue, IndexFormat,
-    IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
-    StencilCompare, StencilOp, StencilTest, StoreOp, VertexBufferLayout, VertexFormat, VertexStep,
-    Winding,
+    IndirectCommandDescriptor, LoadOp, MultisampleState, ProviderError, ProviderErrorClass,
+    ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    Retryability, SampleCount, StencilCompare, StencilOp, StencilTest, StoreOp, VertexBufferLayout,
+    VertexFormat, VertexStep, Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -360,6 +360,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// (`research/docs/23` §3.3, v40), or `None` for "write the fragment
     /// output".
     pub blend: Option<RenderPassBlend>,
+    /// The pass-wide multisample raster (`research/docs/23` §3.3, v51), or
+    /// `None` for the single-sample raster every pre-v51 pass ran. When
+    /// present, every colour attachment is opened as a four-sample surface and
+    /// resolved into the attachment's own single-sample image before the
+    /// readback copies it out, so the trace observes the resolve's bytes and
+    /// not the multisampled surface's.
+    pub multisample: Option<MultisampleState>,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -784,6 +791,42 @@ fn prepare_render_request<'a>(
             ),
         );
     }
+    // The multisample raster (`research/docs/23` §3.3, v51) is executed as a
+    // four-sample pass whose resolve target is the attachment view itself. Core
+    // admission already holds the shape (`RenderPassDescriptor::validate`);
+    // the rail re-asserts the two facts its execution depends on, so a
+    // directly-constructed request cannot reach `vkCreateImage` with a shape
+    // the rail would silently narrow: the state names a multisampled count, and
+    // every attachment opens from a clear. Uploading single-sample previous
+    // bytes into a multisampled image is the load increment this one does not
+    // review, and a depth or stencil surface or a present action beside the
+    // raster is refused at the contract before this point.
+    if let Some(multisample) = pass.multisample {
+        if multisample.sample_count == SampleCount::One {
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::SingleSampleMultisampleState.to_string(),
+            ));
+        }
+        for (index, attachment) in pass.color_attachments.iter().enumerate() {
+            if !matches!(attachment.load, LoadOp::Clear(_)) {
+                return Err(capability_refusal("render_multisample_load_unsupported")
+                    .with_field("attachment", FieldValue::Unsigned(index as u64)));
+            }
+        }
+        if pass.present.is_some() {
+            return Err(capability_refusal("render_multisample_present_unsupported").with_detail(
+                "the first multisample increment executes offscreen colour passes; the resolved \
+                 surface's presentation is a later increment",
+            ));
+        }
+        if pass.depth.is_some() || pass.stencil.is_some() {
+            return Err(
+                capability_refusal("render_multisample_surface_unsupported").with_detail(
+                    "the first multisample increment executes colour-only offscreen passes",
+                ),
+            );
+        }
+    }
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
     let mut extent: Option<[u32; 2]> = None;
     for (index, (attachment, previous)) in pass.color_attachments.iter().zip(previous).enumerate() {
@@ -1022,6 +1065,10 @@ fn prepare_render_request<'a>(
         attachments,
         depth,
         stencil,
+        // The pass-wide raster decision travels with the request exactly as
+        // the trace stated it (`research/docs/23` §3.3, v51); the load-op and
+        // surface refusals above already ran.
+        multisample: pass.multisample,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
@@ -1367,6 +1414,53 @@ pub(crate) fn admit_color_attachment(
         .with_detail("vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT bit"))
 }
 
+/// Whether the selected device can use `format` as a four-sample colour
+/// attachment with `tiling` (`research/docs/23` §3.3, v51).
+///
+/// `vkGetPhysicalDeviceFormatProperties` answers the single-sample
+/// `COLOR_ATTACHMENT` bit but carries no sample count; the multisample question
+/// is `vkGetPhysicalDeviceImageFormatProperties`'s own `sampleCounts` field,
+/// which is why this rail asks a second question before the first four-sample
+/// image exists. A format the device refuses, and a format whose 4x
+/// combination the driver rejects outright, both answer `false`.
+pub(crate) fn format_supports_multisample_color_attachment(
+    context: &VulkanContext,
+    format: vk::Format,
+    tiling: vk::ImageTiling,
+) -> bool {
+    let properties = unsafe {
+        context
+            .instance
+            .get_physical_device_image_format_properties(
+                context.physical,
+                format,
+                vk::ImageType::TYPE_2D,
+                tiling,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageCreateFlags::empty(),
+            )
+    };
+    match properties {
+        Ok(properties) => properties
+            .sample_counts
+            .contains(vk::SampleCountFlags::TYPE_4),
+        Err(_) => false,
+    }
+}
+
+/// Whether the selected device's whole framebuffer admits four samples
+/// (`research/docs/23` §3.3, v51).
+///
+/// `VkPhysicalDeviceLimits::framebufferColorSampleCounts` is the framebuffer
+/// ceiling every colour attachment of a subpass shares, so it is the first
+/// question the capability snapshot answers; the per-format question above is
+/// what the rail asks before it creates the image.
+pub(crate) fn limits_support_multisample(limits: &vk::PhysicalDeviceLimits) -> bool {
+    limits
+        .framebuffer_color_sample_counts
+        .contains(vk::SampleCountFlags::TYPE_4)
+}
+
 /// Execute one offscreen render pass and return, in location order, `Some` of
 /// each stored attachment's tightly packed texel bytes (`width * height * 4`)
 /// and `None` for each discarded attachment.
@@ -1458,6 +1552,49 @@ pub(crate) fn execute_offscreen_render(
         .iter()
         .map(|format| attachment_vk_format(*format))
         .collect::<Result<Vec<_>, _>>()?;
+    // The multisample raster's device half (`research/docs/23` §3.3, v51): a
+    // four-sample colour attachment is a per-format question, and every colour
+    // attachment of the pass has to answer it before the first `vkCreateImage`.
+    // The load half is re-asserted here too, for a directly-constructed request
+    // that skipped `prepare_render_request`: the only shape this increment
+    // reviews opens every attachment from a clear, because uploading
+    // single-sample previous bytes into a multisampled image is the load
+    // increment this one does not execute.
+    let samples = match request.multisample.map(|state| state.sample_count) {
+        Some(SampleCount::Four) => vk::SampleCountFlags::TYPE_4,
+        Some(SampleCount::One) => {
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::SingleSampleMultisampleState.to_string(),
+            ))
+        }
+        None => vk::SampleCountFlags::TYPE_1,
+    };
+    if samples != vk::SampleCountFlags::TYPE_1 {
+        for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
+            if !format_supports_multisample_color_attachment(context, *vk_format, tiling) {
+                return Err(attachment_format_refusal()
+                    .with_field("vk_format", FieldValue::Unsigned(vk_format.as_raw() as u64))
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field(
+                        "missing_feature",
+                        FieldValue::Text("color_attachment_samples_4".to_owned()),
+                    )
+                    .with_detail(
+                        "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
+                         COLOR_ATTACHMENT combination for this format",
+                    ));
+            }
+            if !matches!(attachment.load, LoadOp::Clear(_)) {
+                return Err(
+                    capability_refusal("render_multisample_load_unsupported").with_detail(
+                        "the first multisample increment opens every attachment from a clear: \
+                         a multisampled surface's previous contents are the load increment it \
+                         does not execute",
+                    ),
+                );
+            }
+        }
+    }
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
         admit_color_attachment(context, *vk_format, tiling)?;
         // Only a stored attachment is read back, so `TRANSFER_SRC` is asked of
@@ -1534,6 +1671,7 @@ pub(crate) fn execute_offscreen_render(
             height,
             attachment.load,
             attachment.store == StoreOp::Store,
+            samples,
         )?;
     }
     if let Some(depth) = &request.depth {
@@ -2323,6 +2461,17 @@ struct AttachmentObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// The sample count the image was created with (`research/docs/23` §3.3,
+    /// v51): `TYPE_1` for every pre-v51 attachment, `TYPE_4` for a
+    /// multisampled pass's own attachment. The render pass and the pipeline
+    /// read it back from here so the raster state cannot disagree with the
+    /// images the framebuffer binds.
+    samples: vk::SampleCountFlags,
+    /// The single-sample image a multisampled attachment resolves into
+    /// (`research/docs/23` §3.3, v51), or `None` for a single-sample
+    /// attachment. The resolve target is what the copy-out reads and what the
+    /// trace observes as the attachment view.
+    resolve: Option<ResolveObjects>,
     load_op: vk::AttachmentLoadOp,
     /// The attachment's store operation: `STORE` keeps the rendered bytes for
     /// the copy-out, `DONT_CARE` discards them so no readback exists
@@ -2333,6 +2482,18 @@ struct AttachmentObjects {
     /// for a `LoadOp::Load` pass. Null unless the attachment loads.
     previous_buffer: vk::Buffer,
     previous_memory: vk::DeviceMemory,
+}
+
+/// The single-sample resolve target of one multisampled colour attachment
+/// (`research/docs/23` §3.3, v51).
+///
+/// The image is owned by the pass exactly as its multisampled sibling is; the
+/// resolve runs as part of the subpass, so its final layout is the copy-out's
+/// `TRANSFER_SRC_OPTIMAL` when the pass keeps the bytes.
+struct ResolveObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
 }
 
 /// One readback destination: the `TRANSFER_DST` buffer, its host-visible
@@ -2392,6 +2553,11 @@ impl<'a> OffscreenObjects<'a> {
             image: target.image(),
             memory: vk::DeviceMemory::null(),
             view: target.view(),
+            // A present target is the provider's own single-sample image; the
+            // multisample raster and the present action are mutually exclusive
+            // in this increment (`research/docs/23` §3.3, v51).
+            samples: vk::SampleCountFlags::TYPE_1,
+            resolve: None,
             load_op: vk::AttachmentLoadOp::CLEAR,
             // A present target is the observable landing of the pass, so its
             // store is always `STORE`; `execute_present_render` refuses a
@@ -2542,6 +2708,7 @@ impl<'a> OffscreenObjects<'a> {
         height: u32,
         load: LoadOp,
         storing: bool,
+        samples: vk::SampleCountFlags,
     ) -> Result<(), ProviderError> {
         let loading = matches!(load, LoadOp::Load);
         let info = vk::ImageCreateInfo::default()
@@ -2554,11 +2721,16 @@ impl<'a> OffscreenObjects<'a> {
             })
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | if storing {
+                    // A multisampled attachment's bytes are consumed by the
+                    // resolve inside the subpass, so the multisampled image
+                    // itself is never copied out; the resolve target below
+                    // carries the transfer usage instead
+                    // (`research/docs/23` §3.3, v51).
+                    | if storing && samples == vk::SampleCountFlags::TYPE_1 {
                         vk::ImageUsageFlags::TRANSFER_SRC
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -2584,10 +2756,59 @@ impl<'a> OffscreenObjects<'a> {
         .map_err(|error| execution_refusal("create attachment image", &error.detail))?;
         let view = crate::create_color_image_view(self.context, image, format, "attachment")
             .map_err(|error| execution_refusal("create attachment view", &error.detail))?;
+        // The resolve target of a multisampled attachment
+        // (`research/docs/23` §3.3, v51): one single-sample image per colour
+        // location, created beside its multisampled sibling so the render pass
+        // and the framebuffer can name both. `TRANSFER_SRC` is asked of it
+        // exactly when the pass keeps the bytes, the same rule the
+        // single-sample attachment states above.
+        let resolve = if samples == vk::SampleCountFlags::TYPE_1 {
+            None
+        } else {
+            let resolve_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | if storing {
+                            vk::ImageUsageFlags::TRANSFER_SRC
+                        } else {
+                            vk::ImageUsageFlags::empty()
+                        },
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let (resolve_image, resolve_memory, _) = crate::allocate_image_backing(
+                self.context,
+                &resolve_info,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                "resolve attachment",
+            )
+            .map_err(|error| execution_refusal("create resolve image", &error.detail))?;
+            let resolve_view =
+                crate::create_color_image_view(self.context, resolve_image, format, "resolve")
+                    .map_err(|error| execution_refusal("create resolve view", &error.detail))?;
+            Some(ResolveObjects {
+                image: resolve_image,
+                memory: resolve_memory,
+                view: resolve_view,
+            })
+        };
         self.attachments.push(AttachmentObjects {
             image,
             memory,
             view,
+            samples,
+            resolve,
             // A loading attachment keeps the upload's layout as the pass's
             // initial one; a clearing or `DontCare` attachment opens from
             // `UNDEFINED`, because nothing defines its bytes before the pass
@@ -2633,6 +2854,16 @@ impl<'a> OffscreenObjects<'a> {
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
     ) -> Result<(), ProviderError> {
+        // The multisampled shape (`research/docs/23` §3.3, v51) lists two
+        // attachment descriptions per colour location — the four-sample
+        // surface the fragments land in, then the single-sample resolve target
+        // — so the resolve references below are the colour locations shifted
+        // by the attachment count. The single-sample shape keeps the list and
+        // the indices it always had.
+        let multisampled = self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.samples != vk::SampleCountFlags::TYPE_1);
         let attachments = self
             .attachments
             .iter()
@@ -2647,14 +2878,53 @@ impl<'a> OffscreenObjects<'a> {
                 };
                 vk::AttachmentDescription::default()
                     .format(*format)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(attachment.samples)
                     .load_op(attachment.load_op)
-                    .store_op(attachment.store_op)
+                    // A multisampled attachment's own contents are consumed by
+                    // the resolve inside the subpass, so the surface itself is
+                    // never stored; the resolve target below carries the pass's
+                    // own store decision (`research/docs/23` §3.3, v51).
+                    .store_op(if attachment.samples != vk::SampleCountFlags::TYPE_1 {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    } else {
+                        attachment.store_op
+                    })
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(attachment.initial_layout)
                     .final_layout(final_layout)
             })
+            .chain(
+                self.attachments
+                    .iter()
+                    .zip(formats)
+                    .filter(|(attachment, _)| attachment.samples != vk::SampleCountFlags::TYPE_1)
+                    .map(|(attachment, format)| {
+                        // A resolve attachment's load operation is `DONT_CARE`
+                        // by construction: the resolve writes every texel, so
+                        // the pre-pass contents of the single-sample image are
+                        // never read. Its store action is the pass's own, and a
+                        // storing resolve ends in `TRANSFER_SRC_OPTIMAL` for the
+                        // copy-out exactly as a single-sample stored attachment
+                        // does (`research/docs/23` §3.3, v51).
+                        let final_layout = if attachment.store_op == vk::AttachmentStoreOp::STORE
+                            && !self.present
+                        {
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                        } else {
+                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                        };
+                        vk::AttachmentDescription::default()
+                            .format(*format)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .store_op(attachment.store_op)
+                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .initial_layout(vk::ImageLayout::UNDEFINED)
+                            .final_layout(final_layout)
+                    }),
+            )
             .chain(depth.map(|_| {
                 // The depth attachment: opened from `UNDEFINED` for a clear and
                 // from the attachment layout for a load
@@ -2746,6 +3016,20 @@ impl<'a> OffscreenObjects<'a> {
                     .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             })
             .collect::<Vec<_>>();
+        // The resolve references of a multisampled pass, one per colour
+        // location: entry `i` names the single-sample image created beside
+        // attachment `i`, i.e. the attachment list's second half
+        // (`research/docs/23` §3.3, v51). A single-sample pass keeps the
+        // subpass it always had.
+        let resolve_refs = multisampled.then(|| {
+            (0..self.attachments.len())
+                .map(|index| {
+                    vk::AttachmentReference::default()
+                        .attachment((self.attachments.len() + index) as u32)
+                        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                })
+                .collect::<Vec<_>>()
+        });
         // The depth reference follows the colour references, so its attachment
         // index is the colour count (`research/docs/23` §3.3, v36).
         // The stencil attachment takes the same reference slot as the depth one
@@ -2760,13 +3044,19 @@ impl<'a> OffscreenObjects<'a> {
                     // attachments: a pass carries one such reference and the one
                     // surface behind it, so the index is the colour count in both
                     // the depth and the stencil-only case (`research/docs/23` §3.3,
-                    // v36/v47).
-                    .attachment(self.attachments.len() as u32)
+                    // v36/v47). A multisampled pass lists the resolve targets
+                    // between the two, so the surface follows *both* halves of
+                    // the colour list (v51); no multisampled pass carries the
+                    // surface today, and the index stays correct if one does.
+                    .attachment((self.attachments.len() * if multisampled { 2 } else { 1 }) as u32)
                     .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
             });
         let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs);
+        if let Some(resolve_refs) = &resolve_refs {
+            subpass = subpass.resolve_attachments(resolve_refs);
+        }
         if let Some(depth_ref) = &depth_ref {
             subpass = subpass.depth_stencil_attachment(depth_ref);
         }
@@ -2866,6 +3156,14 @@ impl<'a> OffscreenObjects<'a> {
             .iter()
             .map(|attachment| attachment.view)
             .collect::<Vec<_>>();
+        // The resolve targets follow the colour views in the render pass's own
+        // order — one single-sample view per multisampled attachment
+        // (`research/docs/23` §3.3, v51). A single-sample pass adds none.
+        for attachment in &self.attachments {
+            if let Some(resolve) = &attachment.resolve {
+                views.push(resolve.view);
+            }
+        }
         if let Some(depth) = &self.depth {
             // The framebuffer's attachment list is the render pass's, in the
             // same order: the colour views first, the depth view last
@@ -3001,8 +3299,20 @@ impl<'a> OffscreenObjects<'a> {
             .cull_mode(cull_mode)
             .front_face(front_face)
             .line_width(1.0);
+        // The pipeline's raster state follows the attachments' own sample
+        // count, which is what keeps the subpass's references and the pipeline
+        // from disagreeing (`research/docs/23` §3.3, v51). Per-fragment shading
+        // (the default) shades each covered fragment once and replicates the
+        // output to its covered samples, which is exactly the resolve
+        // semantics the fixture proves.
+        let rasterization_samples = self
+            .attachments
+            .first()
+            .map_or(vk::SampleCountFlags::TYPE_1, |attachment| {
+                attachment.samples
+            });
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(rasterization_samples);
         // One blend state per colour attachment, indexed by location exactly
         // like the subpass's attachment references. A pass that states none
         // keeps the pre-v40 no-blend, all-writes state
@@ -3898,6 +4208,16 @@ impl<'a> OffscreenObjects<'a> {
             .filter(|attachment| attachment.store_op == vk::AttachmentStoreOp::STORE)
             .zip(&self.readbacks)
         {
+            // A multisampled location's bytes are the resolve target's, not the
+            // four-sample image's, which the subpass consumed
+            // (`research/docs/23` §3.3, v51). The render pass already left the
+            // resolve image in `TRANSFER_SRC_OPTIMAL`, so the copy needs no
+            // barrier of its own — the same rule the stored single-sample
+            // attachment states (`docs/23` §3.6, v19).
+            let source = attachment
+                .resolve
+                .as_ref()
+                .map_or(attachment.image, |resolve| resolve.image);
             let copy = vk::BufferImageCopy::default()
                 .buffer_offset(0)
                 .buffer_row_length(0)
@@ -3917,7 +4237,7 @@ impl<'a> OffscreenObjects<'a> {
             unsafe {
                 self.context.device.cmd_copy_image_to_buffer(
                     self.command,
-                    attachment.image,
+                    source,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     readback.buffer,
                     std::slice::from_ref(&copy),
@@ -4103,6 +4423,21 @@ impl<'a> Drop for OffscreenObjects<'a> {
             }
             if self.owns_attachments {
                 for attachment in &self.attachments {
+                    // The resolve target of a multisampled attachment is owned
+                    // by the same pass scope (`research/docs/23` §3.3, v51), so
+                    // it is destroyed beside the multisampled image it was
+                    // created with.
+                    if let Some(resolve) = &attachment.resolve {
+                        if resolve.view != vk::ImageView::null() {
+                            self.context.device.destroy_image_view(resolve.view, None);
+                        }
+                        if resolve.image != vk::Image::null() {
+                            self.context.device.destroy_image(resolve.image, None);
+                        }
+                        if resolve.memory != vk::DeviceMemory::null() {
+                            self.context.device.free_memory(resolve.memory, None);
+                        }
+                    }
                     if attachment.view != vk::ImageView::null() {
                         self.context
                             .device
@@ -4491,6 +4826,7 @@ mod tests {
     fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -4631,6 +4967,7 @@ mod tests {
             context,
             &OffscreenRenderRequest {
                 blend: None,
+                multisample: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -4922,6 +5259,7 @@ mod tests {
         };
         let request = OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -4988,6 +5326,7 @@ mod tests {
                 &context,
                 &OffscreenRenderRequest {
                     blend: None,
+                    multisample: None,
                     cull: None,
                     depth: None,
                     base_vertex: 0,
@@ -5134,6 +5473,7 @@ mod tests {
         };
         let request = OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5259,6 +5599,7 @@ mod tests {
             &context,
             &OffscreenRenderRequest {
                 blend: None,
+                multisample: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5326,6 +5667,7 @@ mod tests {
             &context,
             &OffscreenRenderRequest {
                 blend: None,
+                multisample: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5397,6 +5739,7 @@ mod tests {
             &context,
             &OffscreenRenderRequest {
                 blend: None,
+                multisample: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5447,6 +5790,7 @@ mod tests {
         };
         let request = OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5536,6 +5880,7 @@ mod tests {
         };
         let request = OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5682,6 +6027,7 @@ mod tests {
             &context,
             &OffscreenRenderRequest {
                 blend: None,
+                multisample: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5769,6 +6115,7 @@ mod tests {
         };
         let request = |store: Option<DepthStoreOp>| OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: Some(OffscreenDepthAttachment {
                 width: 2,
@@ -5850,6 +6197,7 @@ mod tests {
         };
         let request = |store: Option<StoreOp>| OffscreenRenderRequest {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             stencil: Some(OffscreenStencilAttachment {

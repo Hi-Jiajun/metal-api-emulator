@@ -309,6 +309,7 @@ mod tests {
     fn render_pass() -> TracePass {
         TracePass::Render(RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -417,6 +418,8 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_instancing: false,
             max_render_instances: 0,
+            supports_render_multisample: false,
+            max_render_sample_count: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

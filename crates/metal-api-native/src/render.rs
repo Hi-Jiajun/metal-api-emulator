@@ -53,8 +53,8 @@ use metal_api_core::provider::{
     ContractError, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, StencilTest, StoreOp, TracePass, VertexFormat, VertexLayout,
-    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    RenderPipelineContract, SampleCount, StencilTest, StoreOp, TracePass, VertexFormat,
+    VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -454,6 +454,11 @@ pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PR
 /// reviewed fixture draws two instances and the declared window is four.
 pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
 
+/// The largest sample count the multisample raster executes
+/// (`research/docs/23` §3.3, v51). Same rule as the Vulkan rail's ceiling: the
+/// reviewed fixture states the four-sample raster, so four is the whole window.
+pub(crate) const MAX_RENDER_SAMPLE_COUNT: u32 = 4;
+
 /// The render bits this provider declares as of the Step 7 flip.
 ///
 /// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
@@ -576,6 +581,40 @@ pub(crate) fn instancing_capability_bits() -> InstancingCapabilityBits {
     InstancingCapabilityBits {
         supports_render_instancing: true,
         max_render_instances: MAX_RENDER_INSTANCES,
+    }
+}
+
+/// The multisample bits the provider declares, in one value so the macOS
+/// capability snapshot and the host-side tests cannot drift
+/// (`research/docs/23` §3.3, v51).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MultisampleCapabilityBits {
+    pub(crate) supports_render_multisample: bool,
+    pub(crate) max_render_sample_count: u32,
+}
+
+/// The multisample bits this provider declares as of the v51 flip.
+///
+/// Flip condition (`research/docs/23` §3.3): the reviewed `msaa_edge_4x4` case
+/// on the Apple rail, i.e. the macOS CI job's `native-metal` capture of the
+/// suite that names every rail. That run builds the reviewed quad module,
+/// renders it into a four-sample texture (`rasterSampleCount = 4`,
+/// `storeAction = .multisampleResolve` with the attachment's own texture as the
+/// resolve target) and reads back the mixed texel the fixture pins — a byte
+/// pattern neither the fragment output nor the clear colour can produce. The
+/// ceiling is the reviewed count itself: four is the only raster both rails
+/// execute, so a wider request is refused by core admission rather than
+/// silently narrowed.
+///
+/// Before this flip both bits were at their defaults, so core admission refused
+/// a multisampled pass with `render_multisample_unsupported` instead of
+/// executing it as a single-sample draw; the host-side half this rail owns is
+/// [`plan`], which holds the state to the one count the encoder builds and the
+/// texture creation in [`multisample_attachment_textures`].
+pub(crate) fn multisample_capability_bits() -> MultisampleCapabilityBits {
+    MultisampleCapabilityBits {
+        supports_render_multisample: true,
+        max_render_sample_count: MAX_RENDER_SAMPLE_COUNT,
     }
 }
 
@@ -1245,6 +1284,13 @@ pub(crate) struct RenderPlan<'a> {
     /// The pass's blend state, or `None` for "write the fragment output"
     /// (`research/docs/23` §3.3, v40).
     pub(crate) blend: Option<RenderPassBlend>,
+    /// The pass-wide multisample raster (`research/docs/23` §3.3, v51), or
+    /// `None` for the single-sample raster every pre-v51 pass ran. When
+    /// present, the encoder creates a four-sample texture per colour location,
+    /// renders into it and resolves it into the attachment's own shared
+    /// texture with `storeAction = .multisampleResolve`; the readback observes
+    /// the resolve target exactly as the trace's attachment view.
+    pub(crate) multisample: Option<SampleCount>,
     /// The rail-owned depth attachment this pass opens, or `None` for a pass
     /// with no depth surface (`research/docs/23` §3.3, v36).
     pub(crate) depth: Option<PlannedDepth>,
@@ -1640,6 +1686,24 @@ pub(crate) fn plan<'a>(
         scissor: request.pass.scissor,
         cull: request.pass.cull,
         blend: request.pass.blend.clone(),
+        // The multisample raster (`research/docs/23` §3.3, v51). The contract
+        // already refused a single-sample state, a non-clear load and a depth
+        // or stencil surface beside it; the rail re-asserts the count its
+        // encoder knows how to build, so a directly-constructed request cannot
+        // reach `newTextureWithDescriptor` with a raster this increment does
+        // not execute.
+        multisample: match request.pass.multisample {
+            Some(multisample) if multisample.sample_count == SampleCount::Four => {
+                Some(SampleCount::Four)
+            }
+            Some(_) => {
+                return Err(capability_refusal("render_multisample_state_unsupported")
+                    .with_detail(
+                        "the first multisample increment executes the four-sample raster only",
+                    ));
+            }
+            None => None,
+        },
         depth: request.pass.depth.as_ref().map(|depth| PlannedDepth {
             width: u32::try_from(depth.width).unwrap_or(u32::MAX),
             height: u32::try_from(depth.height).unwrap_or(u32::MAX),
@@ -2387,6 +2451,16 @@ fn encode_into_and_readback(
     indirect: Option<icb::IcbPlan>,
 ) -> Result<RenderReadback, ProviderError> {
     let pipeline = render_pipeline_state(device, planned)?;
+    // A multisampled pass renders into its own four-sample textures
+    // (`research/docs/23` §3.3, v51): one per colour location, created beside
+    // the resolve targets `targets` already holds. The resolve targets are what
+    // the readback below observes; the pass descriptor names both, and the
+    // textures stay in this local for the same reason the depth and stencil
+    // textures do — the encoder references them until it ends.
+    let multisample_targets = planned
+        .multisample
+        .map(|_| multisample_attachment_textures(device, planned))
+        .transpose()?;
     // The pass descriptor is autoreleased; it only has to outlive the
     // encoder creation below.
     let pass = MetalRenderPassDescriptor::new();
@@ -2398,7 +2472,18 @@ fn encode_into_and_readback(
             .color_attachments()
             .object_at(index as u64)
             .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))?;
-        color.set_texture(Some(target));
+        // A multisampled location names *two* textures: the four-sample surface
+        // the fragments land in and the single-sample resolve target — the
+        // attachment's own texture, which is what the trace observes
+        // (`research/docs/23` §3.3, v51). A single-sample location names one,
+        // exactly as every pre-v51 pass did.
+        let multisampled = multisample_targets
+            .as_ref()
+            .map(|textures| &textures[index]);
+        color.set_texture(Some(multisampled.unwrap_or(target)));
+        if let Some(_multisampled) = multisampled {
+            color.set_resolve_texture(Some(target));
+        }
         match attachment.load {
             RenderLoadAction::Clear(components) => {
                 color.set_load_action(MTLLoadAction::Clear);
@@ -2420,9 +2505,20 @@ fn encode_into_and_readback(
         // the store action is what makes the attachment disappear from the
         // observable surface, and the readback below skips it
         // (`research/docs/23` §3.6, v19).
-        match attachment.store {
-            RenderStoreAction::Store => color.set_store_action(MTLStoreAction::Store),
-            RenderStoreAction::DontCare => color.set_store_action(MTLStoreAction::DontCare),
+        match (multisampled, attachment.store) {
+            // The resolve is the only landing a multisampled location has:
+            // `.multisampleResolve` writes the resolved texels into the resolve
+            // texture and does not keep the four-sample surface, which is
+            // exactly the "resolve into the attachment view" shape the trace
+            // states (`research/docs/23` §3.3, v51).
+            (Some(_), RenderStoreAction::Store) => {
+                color.set_store_action(MTLStoreAction::MultisampleResolve)
+            }
+            (Some(_), RenderStoreAction::DontCare) => {
+                color.set_store_action(MTLStoreAction::DontCare)
+            }
+            (None, RenderStoreAction::Store) => color.set_store_action(MTLStoreAction::Store),
+            (None, RenderStoreAction::DontCare) => color.set_store_action(MTLStoreAction::DontCare),
         }
     }
     // The depth attachment is the rail's own texture, created when the plan
@@ -2757,6 +2853,49 @@ fn attachment_textures(
     Ok(textures)
 }
 
+/// The four-sample surfaces one multisampled pass renders into
+/// (`research/docs/23` §3.3, v51), one per colour location.
+///
+/// The textures are render targets with shared storage for the same reason
+/// every attachment texture is: the rail is synchronous and the resolved
+/// texels, not these, are what leaves through the readback. The sample count is
+/// the one the plan fixed — `SampleCount::Four`, the only raster this increment
+/// executes — so the raster state and the textures cannot disagree.
+#[cfg(target_os = "macos")]
+fn multisample_attachment_textures(
+    device: &Device,
+    planned: &RenderPlan<'_>,
+) -> Result<Vec<Texture>, ProviderError> {
+    let samples = match planned.multisample {
+        Some(SampleCount::Four) => 4,
+        _ => {
+            return Err(capability_refusal("render_multisample_state_unsupported")
+                .with_detail("the first multisample increment creates four-sample surfaces only"));
+        }
+    };
+    let mut textures = Vec::with_capacity(planned.attachments.len());
+    for attachment in &planned.attachments {
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2Multisample);
+        descriptor.set_pixel_format(metal_pixel_format(attachment.format));
+        descriptor.set_width(u64::from(planned.extent[0]));
+        descriptor.set_height(u64::from(planned.extent[1]));
+        descriptor.set_mipmap_level_count(1);
+        descriptor.set_sample_count(samples);
+        descriptor.set_usage(MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        let pointer: *mut metal::MTLTexture =
+            unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
+        if pointer.is_null() {
+            return Err(resource_refusal(
+                "metal_render_multisample_target_allocation_failed",
+            ));
+        }
+        textures.push(unsafe { Texture::from_ptr(pointer) });
+    }
+    Ok(textures)
+}
+
 /// One render target texture, built for an offscreen attachment or a present
 /// target. A present target is created once and then reused across submissions,
 /// which is why this creation is split from the initial upload
@@ -2965,6 +3104,14 @@ fn render_pipeline_state(
     let descriptor = RenderPipelineDescriptor::new();
     descriptor.set_vertex_function(Some(vertex.as_ref()));
     descriptor.set_fragment_function(Some(fragment.as_ref()));
+    // The pipeline's raster sample count follows the pass's own multisample
+    // state (`research/docs/23` §3.3, v51): Metal refuses a pipeline whose
+    // `rasterSampleCount` disagrees with the attachments the encoder binds, so
+    // the two come from one decision. A single-sample pass keeps the default
+    // exactly as every pre-v51 pass did.
+    if let Some(SampleCount::Four) = planned.multisample {
+        descriptor.set_raster_sample_count(4);
+    }
     // The vertex descriptor is what makes `[[attribute(n)]]` mean a byte range
     // of a bound stream: the MSL module names the attribute locations, the
     // descriptor says which binding, stride, offset and format each one reads.
@@ -3172,6 +3319,7 @@ mod tests {
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -4188,6 +4336,12 @@ mod tests {
             supported_index_formats: vertex.supported_index_formats.clone(),
             supports_render_instancing: false,
             max_render_instances: 0,
+            // The test snapshot spells the pre-flip shape out for the same
+            // reason the instancing pair above does: a test constructs the
+            // "cannot multisample" declaration and asserts core admission
+            // refuses the multisampled pass (`research/docs/23` §3.3, v51).
+            supports_render_multisample: false,
+            max_render_sample_count: 0,
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -4303,6 +4457,7 @@ mod tests {
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
