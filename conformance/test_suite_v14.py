@@ -27,6 +27,7 @@ from test_suite_v13 import (ATTACHMENT, REPORTING_RAILS, RENDER_ID, TEXELS,
 
 CONFORMANCE = Path(__file__).resolve().parent
 V13_PATH = CONFORMANCE / "suite-v13.json"
+V14_PATH = CONFORMANCE / "suite-v14.json"
 
 # The present section the provider side parses (`research/docs/24` §5.3): one
 # target image, one acquire and one present, and a sentinel that cannot be
@@ -34,6 +35,14 @@ V13_PATH = CONFORMANCE / "suite-v13.json"
 PRESENT = {"mode": "fifo", "image_count": 1, "acquire": 1, "present": 1,
            "initial_hex": "fefefefe"}
 OBSERVATION = {"acquire": 1, "present": 1}
+
+# The v62 case: the v14 present fixture's own shape over a four-sample raster.
+# The full-coverage triangle resolves every sample to the fragment output, so
+# the expectation is the v14 texel four times; the marker names the Vulkan
+# trace rail alone, because the object rails record no present entry and the
+# native/oracle present path is the separate self-test channel
+# (`research/docs/24` §5.3, v62).
+MSAA_PRESENT_ID = "present_msaa_triangle_2x2"
 
 # The v1-v13 render plans as they are shipped (`research/docs/24` §6 Step 4:
 # "v1-v13 的 plan 不受影响"). Twelve of the thirteen committed suites carry no
@@ -310,6 +319,119 @@ class PresentObservationTests(unittest.TestCase):
         self.reject(report, "optionally with copy_in and copy_out")
 
 
+class MsaaPresentObservationTests(unittest.TestCase):
+    """The v62 case: the v14 present shape over a four-sample raster.
+
+    The committed suite carries the case on the Vulkan trace rail alone, so a
+    Vulkan capture owes the resolved texels *and* the acquire/present counts,
+    while every other rail has to leave the case out entirely — the same
+    marker rule the v14 case states, with the narrower marker spelling which
+    rail owns the multisampled present path (`research/docs/24` §5.3, v62).
+    """
+
+    def setUp(self):
+        self.raw = V14_PATH.read_bytes()
+        self.suite = json.loads(self.raw)
+        self.digest = hashlib.sha256(self.raw).hexdigest()
+
+    def present_result(self, case_id, provider_backend=True, observation=OBSERVATION):
+        result = {
+            "id": case_id,
+            "completion": "CompletedVisible",
+            "writebacks": [{"allocation": 900, "view": 910, "offset": 0,
+                            "bytes_hex": TEXELS}],
+            "allocations": [{"allocation": 900, "bytes_hex": TEXELS}],
+        }
+        if provider_backend:
+            result["copy_in"], result["copy_out"] = 2, 2
+        if observation is not None:
+            result["present"] = copy.deepcopy(observation)
+        return result
+
+    def report(self, backend, msaa=True, observation=OBSERVATION):
+        report = synthetic_report(self.suite, self.digest, backend)
+        if backend != "native-metal":
+            for result in report["results"]:
+                result["copy_in"], result["copy_out"] = 2, 1
+        if backend in V14_REPORTING_RAILS:
+            report["results"].append(self.present_result("present_triangle_clear_2x2",
+                                                         backend != "native-metal"))
+        if backend == "vulkan":
+            if msaa:
+                report["results"].append(
+                    self.present_result(MSAA_PRESENT_ID, backend != "native-metal",
+                                        observation))
+        return report
+
+    def test_v14_pins_the_multisample_present_fixture(self):
+        case = self.suite["render_cases"][1]
+        self.assertEqual(case["id"], MSAA_PRESENT_ID)
+        self.assertEqual(case["declaring_case"], "render_declaring_copy_word")
+        self.assertEqual(case["vertex_entry"], "render_fullscreen_triangle")
+        self.assertEqual(case["multisample"], {"sample_count": 4})
+        self.assertEqual(case["attachment"]["allocation"], 900)
+        self.assertEqual(case["attachment"]["view"], 910)
+        self.assertEqual(case["attachment"]["load"], "clear")
+        self.assertEqual(case["attachment"]["clear_hex"], "fefefefe")
+        self.assertEqual(case["present"], {
+            "mode": "fifo", "image_count": 1, "acquire": 1, "present": 1,
+            "initial_hex": "efefefef"})
+        self.assertEqual(case["expected_hex"], TEXELS)
+        self.assertEqual(case["capture_rails"], ["vulkan"])
+        # The full-coverage triangle resolves every sample to the fragment
+        # output, so the expectation is the uniform texel and the sentinel
+        # stays distinguishable from it (`research/docs/24` §3.1, v62).
+        self.assertNotEqual(case["attachment"]["clear_hex"], case["expected_hex"][:8])
+        self.assertNotEqual(case["present"]["initial_hex"], case["expected_hex"][:8])
+
+    def test_the_vulkan_capture_reports_both_present_cases(self):
+        report = self.report("vulkan")
+        compare.validate_capture(self.suite, self.digest, report, "vulkan")
+
+    def test_the_msaa_present_case_needs_its_own_observation(self):
+        report = self.report("vulkan", observation=None)
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "has to report the present observation"):
+            compare.validate_capture(self.suite, self.digest, report, "vulkan")
+
+    def test_the_msaa_present_case_needs_the_vulkan_landing(self):
+        report = self.report("vulkan", msaa=False)
+        with self.assertRaisesRegex(compare.CaptureError, "missing cases"):
+            compare.validate_capture(self.suite, self.digest, report, "vulkan")
+
+    def test_a_rail_the_marker_does_not_name_must_not_report_the_msaa_case(self):
+        # The committed marker names `vulkan` alone, so a native-metal capture
+        # that reports the case is refused by the byte rule before the present
+        # rule can even run (`research/docs/24` §5.5, v62).
+        report = self.report("native-metal")
+        report["results"].append(self.present_result(MSAA_PRESENT_ID, False))
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "must not report the present observation"):
+            compare.validate_capture(self.suite, self.digest, report, "native-metal")
+
+    def test_a_rail_the_marker_does_not_name_omits_the_case(self):
+        # Every rail the marker does not name owes the v14 case's own landing
+        # where its marker names that one, and owes nothing of the v62 case
+        # (`research/docs/24` §5.5, v62).
+        for backend in ("native-metal", "vulkan-objects", "native-metal-provider",
+                        "native-metal-provider-objects"):
+            with self.subTest(backend=backend):
+                compare.validate_capture(self.suite, self.digest,
+                                         self.report(backend), backend)
+
+    def test_the_msaa_present_counts_do_not_relax_the_counter_pair_rule(self):
+        for observation, message in (
+                ({"acquire": 2, "present": 1}, "acquire 2 does not match the 1"),
+                ({"acquire": 1, "present": 2}, "present count 2 does not match the 1"),
+                ({"acquire": 0, "present": 1}, "acquire 0 does not match the 1"),
+                ({"acquire": 1, "present": 0}, "present count 0 does not match the 1"),
+        ):
+            with self.subTest(observation=observation):
+                report = self.report("vulkan", observation=observation)
+                with self.assertRaisesRegex(compare.CaptureError, message):
+                    compare.validate_capture(self.suite, self.digest, report, "vulkan")
+
+
 # The committed v14 suite's render plan (`research/docs/24` §6 Step 8): the
 # same 2x2 attachment as v13, plus the present section the provider rails
 # report. It is pinned here for the same reason the v13 plan is: a change to
@@ -323,6 +445,21 @@ PINNED_V14_PLAN = {
         "written": [900, 920],
         "rails": sorted(["vulkan", "vulkan-objects", "native-metal-provider",
                          "native-metal-provider-objects"]),
+        "attachment": list(ATTACHMENT),
+        "present": {
+            "mode": "fifo",
+            "image_count": 1,
+            "acquire": 1,
+            "present": 1,
+            "sentinel": "efefefef",
+        },
+    },
+    MSAA_PRESENT_ID: {
+        "writes": [[[900, 910, 0], TEXELS]],
+        "allocations": [[900, TEXELS]],
+        "touched": [900, 920],
+        "written": [900, 920],
+        "rails": ["vulkan"],
         "attachment": list(ATTACHMENT),
         "present": {
             "mode": "fifo",

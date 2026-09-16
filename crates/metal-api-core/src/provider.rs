@@ -2595,8 +2595,11 @@ pub struct RenderPassDescriptor {
     /// a depth surface beside it is admitted from v53 on — the surface is
     /// implicitly four-sample, rail-owned and must not be stored, because the
     /// resolve of a multisampled depth surface is the increment that reviews
-    /// the two APIs' filters. A stencil surface beside the raster and a present
-    /// action behind it stay refused until the increments that review them.
+    /// the two APIs' filters. A stencil surface beside the raster is admitted
+    /// from v60 on through the stencil resolve it then has to state, and a
+    /// present action behind it is admitted from v62 on when its source names
+    /// one of the pass's colour attachment views — the single-sample resolve
+    /// landing the present hands on.
     pub multisample: Option<MultisampleState>,
     /// The resolve the pass applies to a stored multisampled depth surface, or
     /// `None` for the API default [`DepthResolveFilter::Sample0`]
@@ -2748,8 +2751,25 @@ impl RenderPassDescriptor {
                     return Err(ContractError::MultisampleStencilStoreUnsupported);
                 }
             }
-            if self.present.is_some() {
-                return Err(ContractError::MultisamplePresentUnsupported);
+            // The present action beside the raster (`research/docs/24` §3.5,
+            // v62) is admitted as the reviewed shape: the present hands on the
+            // attachment the pass resolves into, so its source has to be one
+            // of the pass's colour attachment views — the resolve landing. A
+            // source that names no such view would present a surface the pass
+            // never produced the single-sample texels of, so it stays refused.
+            // The target/view/allocation/format agreement the single-sample
+            // shape already states is `PresentDescriptor::validate_against`'s
+            // own job below, unchanged.
+            if let Some(present) = &self.present {
+                let resolves_into_source = self
+                    .color_attachments
+                    .iter()
+                    .any(|attachment| attachment.view_id == present.source);
+                if !resolves_into_source {
+                    return Err(ContractError::MultisamplePresentSourceMismatch {
+                        source: present.source,
+                    });
+                }
             }
         }
         // The depth resolve (`research/docs/23` §3.3, v57) only means
@@ -7335,7 +7355,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::SingleSampleMultisampleState
         | E::MultisampleWithoutColorAttachment
         | E::MultisampleSurfaceUnsupported { .. }
-        | E::MultisamplePresentUnsupported
+        | E::MultisamplePresentSourceMismatch { .. }
         | E::MultisampleDepthStoreUnsupported
         | E::MultisampleStencilStoreUnsupported
         | E::DepthResolveWithoutStoredDepth { .. }
@@ -8782,11 +8802,14 @@ pub enum ContractError {
         surface: &'static str,
     },
     /// The pass states a multisample raster and hands its attachment on to a
-    /// present action (`research/docs/23` §3.3, v51). The present path
-    /// transitions the attachment it renders into, and which of the two
-    /// surfaces of a resolved pass that is has to be a deliberate increment
-    /// rather than an implication.
-    MultisamplePresentUnsupported,
+    /// present action whose source does not name one of the pass's colour
+    /// attachment views (`research/docs/23` §3.3, v62). The present hands on
+    /// the single-sample resolve landing, which the contract spells as the
+    /// attachment view the pass resolves into, so a source outside that set
+    /// would present a surface the pass never produced.
+    MultisamplePresentSourceMismatch {
+        source: ViewId,
+    },
     /// The pass states a multisample raster and keeps its depth surface
     /// (`research/docs/23` §3.3, v53). A multisampled depth surface's texels
     /// are only observable through a resolve, and the two APIs spell that
@@ -9394,9 +9417,11 @@ impl fmt::Display for ContractError {
                 "a multisample raster beside a {surface} is outside the first multisample \
                  increment: it executes colour-only offscreen passes"
             ),
-            Self::MultisamplePresentUnsupported => formatter.write_str(
-                "a multisample raster with a present action is outside the first multisample \
-                 increment: the resolved surface's presentation is a later increment",
+            Self::MultisamplePresentSourceMismatch { source } => write!(
+                formatter,
+                "a multisample raster's present source view {source:?} does not name one of \
+                 the pass's colour attachment views: the present hands on the single-sample \
+                 resolve landing, which is the attachment view the pass resolves into",
             ),
             Self::MultisampleDepthStoreUnsupported => formatter.write_str(
                 "a multisample raster cannot keep its depth surface yet: the depth resolve \
@@ -14302,7 +14327,9 @@ mod tests {
         combined_resolved
             .validate()
             .expect("the combined depth-stencil resolve shape is well formed");
-        // The present action stays refused.
+        // The present action beside the raster is admitted from v62 on only
+        // when its source names the resolve landing — one of the pass's colour
+        // attachment views (`research/docs/23` §3.3, v62).
         let mut with_present = pass.clone();
         with_present.present = Some(PresentDescriptor {
             target: PresentTarget {
@@ -14320,8 +14347,32 @@ mod tests {
         });
         assert_eq!(
             with_present.validate(),
-            Err(ContractError::MultisamplePresentUnsupported)
+            Err(ContractError::MultisamplePresentSourceMismatch {
+                source: ViewId::new(7),
+            })
         );
+        // The reviewed shape names the attachment view itself: the four-sample
+        // surface resolves into it, and the present hands that single-sample
+        // landing on. The target restates the attachment's own identity, so
+        // the whole present agreement holds unchanged.
+        let mut reviewed_present = pass.clone();
+        reviewed_present.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(22),
+                view_id: ViewId::new(21),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: ViewId::new(21),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        reviewed_present
+            .validate()
+            .expect("a multisample raster that presents its own resolve landing is well formed");
 
         // A colour-only pass that states the raster is the admitted shape.
         assert_eq!(SampleCount::ADMITTED.len(), 4);

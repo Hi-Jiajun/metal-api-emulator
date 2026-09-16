@@ -97,6 +97,47 @@
         "native-metal-provider",
         "native-metal-provider-objects"
       ]
+    },
+    {
+      "id": "present_msaa_triangle_2x2",
+      "declaring_case": "render_declaring_copy_word",
+      "vertex_entry": "render_fullscreen_triangle",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/render_offscreen_2x2.metal",
+        "sha256": "7430cd19a3497582618226066e95fb6f4ead9071f83b00c53398ccab8ba9d7de"
+      },
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        2,
+        2
+      ],
+      "multisample": {
+        "sample_count": 4
+      },
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 2,
+        "height": 2,
+        "load": "clear",
+        "store": "store",
+        "clear_hex": "fefefefe"
+      },
+      "present": {
+        "mode": "fifo",
+        "image_count": 1,
+        "acquire": 1,
+        "present": 1,
+        "initial_hex": "efefefef"
+      },
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff",
+      "capture_rails": [
+        "vulkan"
+      ]
     }
   ]
 }
