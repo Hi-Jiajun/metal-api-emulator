@@ -4453,6 +4453,7 @@ private func renderSelfTest() throws -> CaseResult {
         requires_stencil_resolve_filter: nil,
         requires_sample_count: nil,
         wildcard_texels: nil,
+        wildcard_allowed_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
         depth: nil,
@@ -4529,6 +4530,7 @@ private func presentSelfTest() throws -> CaseResult {
         requires_stencil_resolve_filter: nil,
         requires_sample_count: nil,
         wildcard_texels: nil,
+        wildcard_allowed_texels: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -4627,6 +4629,7 @@ private func vertexSelfTest() throws -> CaseResult {
         requires_stencil_resolve_filter: nil,
         requires_sample_count: nil,
         wildcard_texels: nil,
+        wildcard_allowed_texels: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -4729,6 +4732,7 @@ private func mrtSelfTest() throws -> CaseResult {
         requires_stencil_resolve_filter: nil,
         requires_sample_count: nil,
         wildcard_texels: nil,
+        wildcard_allowed_texels: nil,
         depth: nil,
         depth_test: nil,
         cull: nil,
@@ -5169,6 +5173,7 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         requires_stencil_resolve_filter: nil,
         requires_sample_count: nil,
         wildcard_texels: nil,
+        wildcard_allowed_texels: nil,
         depth: DepthAttachmentDefinition(
             format: "depth32float", width: 4, height: 4, load: "clear",
             clear_depth: 1.0, store: "store", allocation: 980, view: 990,
