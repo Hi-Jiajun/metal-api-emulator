@@ -143,6 +143,13 @@ const MRT_DECLARE4: &str = include_str!("../../../conformance/shaders/mrt_declar
 const COPY_WORD_WITH_WITNESS: &str =
     include_str!("../../../conformance/shaders/copy_word_with_witness.metal");
 
+/// The v60 combined depth-stencil declaring pass (`research/docs/23` §3.3,
+/// v60): the four-binding sibling of the v43 kernel, whose third and fourth
+/// reads declare the depth and stencil landings the two resolves write.
+#[cfg(any(target_os = "macos", test))]
+const COPY_WORD_WITH_WITNESSES: &str =
+    include_str!("../../../conformance/shaders/copy_word_with_witnesses.metal");
+
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
 #[cfg(any(target_os = "macos", test))]
@@ -199,6 +206,17 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
                 binding(0, BufferAccess::Read, static_word()),
                 binding(1, BufferAccess::Write, static_word()),
                 binding(2, BufferAccess::Read, static_word()),
+            ],
+        ),
+        // The v60 combined-declaring pass reads both attachments' own views
+        // and writes the reviewed output view (`research/docs/23` §3.3, v60).
+        ("copy_word_with_witnesses", COPY_WORD_WITH_WITNESSES) => (
+            [1, 1, 1],
+            vec![
+                binding(0, BufferAccess::Read, static_word()),
+                binding(1, BufferAccess::Write, static_word()),
+                binding(2, BufferAccess::Read, static_word()),
+                binding(3, BufferAccess::Read, static_word()),
             ],
         ),
         ("kernel_dispatch_threads_boundary_barrier", INDEXED) => (
@@ -445,6 +463,7 @@ mod tests {
         for (entry, source) in [
             ("copy_word", COPY),
             ("copy_word_with_witness", COPY_WORD_WITH_WITNESS),
+            ("copy_word_with_witnesses", COPY_WORD_WITH_WITNESSES),
             ("kernel_dispatch_threads_boundary_barrier", INDEXED),
             ("transform_3d", TRANSFORM),
             ("mix_3d", MIX),

@@ -46,8 +46,9 @@ ALLOCATION_OBSERVATIONS = {
 # rail its marker names reports unconditionally.
 RenderExpectation = namedtuple(
     "RenderExpectation",
-    "writes allocations touched written rails attachment present icb wildcards filter",
-    defaults=(None, None))
+    "writes allocations touched written rails attachment present icb wildcards filter "
+    "stencil_filter",
+    defaults=(None, None, None))
 
 # One render case's present section: the target mode and image count the first
 # increment fixes, the counts a capture has to report, and the sentinel the
@@ -74,6 +75,12 @@ IcbExpectation = namedtuple("IcbExpectation", "kind max_commands kinds start cou
 # `i`, the same numbering `metal-api-core` uses for
 # `ProviderCapabilities::depth_resolve_modes`.
 DEPTH_RESOLVE_FILTER_BITS = {"sample0": 1, "min": 2, "max": 4}
+
+# The capability-mask bit each stencil resolve filter occupies
+# (`research/docs/23` §3.3, v60): bit `i` is the filter whose wire code is
+# `i`, the same numbering `metal-api-core` uses for
+# `ProviderCapabilities::stencil_resolve_modes`.
+STENCIL_RESOLVE_FILTER_BITS = {"sample0": 1, "depth_resolved_sample": 2}
 
 
 class CaptureError(ValueError):
@@ -1140,8 +1147,6 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     _require((attributes[1]["location"], attributes[1]["offset"], attributes[1]["format"])
              == (1, 16, "float32x4"),
              f"{where}: the reviewed stencil tint is location 1, offset 16, float32x4")
-    _require(case.get("depth") is None,
-             f"{where}: the reviewed stencil shape carries no depth attachment")
     stencil = case.get("stencil")
     # A stencil test without the attachment it reads has nothing to test
     # against (`research/docs/23` §3.3, v47), so the half-declared shape is
@@ -1227,11 +1232,24 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
         reference = _integer(test["reference"], f"{where}.stencil_test.reference", 0, 255)
         read_mask = _integer(test["read_mask"], f"{where}.stencil_test.read_mask", 0, 255)
         write_mask = _integer(test["write_mask"], f"{where}.stencil_test.write_mask", 0, 255)
-        _require(test["compare"] == "equal" and test["fail_op"] == "keep"
-                 and test["depth_fail_op"] == "keep" and test["pass_op"] == "increment_wrap"
-                 and (reference, read_mask, write_mask) == (0, 255, 255),
-                 f"{where}: the reviewed stencil state is an equal-zero test with both "
-                 "masks on that increments and wraps on pass")
+        reviewed_states = (
+            # v47's equal-zero shape: the near triangle writes 1 where it
+            # passes and the far triangle keeps its mask-closed zero.
+            test["compare"] == "equal" and test["fail_op"] == "keep"
+            and test["depth_fail_op"] == "keep" and test["pass_op"] == "increment_wrap"
+            and (reference, read_mask, write_mask) == (0, 255, 255),
+            # v60's depth-differentiated shape: an always test that increments
+            # on depth pass and keeps on depth fail, so the near triangle
+            # writes 1 through its depth pass while the far triangle's depth
+            # failures leave the rest at zero.
+            test["compare"] == "always" and test["fail_op"] == "keep"
+            and test["depth_fail_op"] == "keep" and test["pass_op"] == "increment_wrap"
+            and (reference, read_mask, write_mask) == (0, 255, 255),
+        )
+        _require(any(reviewed_states),
+                 f"{where}: the reviewed stencil state is one of the two reviewed shapes: an "
+                 "equal-zero test or a depth-differentiated always test, both with both masks "
+                 "on and an increment-wrap pass op")
     bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
     _require(len(bindings) == 1, f"{where}: the reviewed stencil shape binds one stream")
     binding = bindings[0]
@@ -1255,8 +1273,43 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     # observed by its effect on the colour side only, so the shape declares no
     # landing and the assembly owes it neither a writeback nor an allocation
     # image (`research/docs/23` §3.3, v47/v49).
+    # The combined depth-stencil shape (`research/docs/23` §3.3, v60) opens a
+    # depth surface beside the stencil one: the depth attachment clears to a
+    # value between the two triangles' depths, so the near triangle's depth
+    # pass writes stencil 1 while the far triangle's depth failures leave the
+    # rest at zero. Its stored depth is a second landing, the same triple the
+    # depth pair states.
+    depth_store = None
+    if case.get("depth") is not None:
+        _require("stencil_resolve" in case,
+                 f"{where}: the combined depth-stencil shape needs its stencil resolve")
+        depth = case["depth"]
+        _require(isinstance(depth, dict), f"{where}: a depth attachment is an object")
+        allowed = {"format", "width", "height", "load", "clear_depth",
+                   "store", "allocation", "view", "expected_hex"}
+        _require(set(depth) - allowed == set(),
+                 f"{where}.depth: unexpected fields "
+                 + ", ".join(sorted(set(depth) - allowed)))
+        _require(depth["format"] == "depth32float" and depth["load"] == "clear"
+                 and depth.get("clear_depth") == 0.7 and depth.get("store") == "store",
+                 f"{where}: the combined depth surface clears to 0.7 and stores")
+        allocation = _integer(depth["allocation"], f"{where}.depth.allocation")
+        view = _integer(depth["view"], f"{where}.depth.view")
+        _require(allocation > 0 and view > 0,
+                 f"{where}: zero depth attachment identity")
+        expected = _hex(depth["expected_hex"], f"{where}.depth.expected_hex")
+        width = _integer(depth["width"], f"{where}.depth.width", 1)
+        height = _integer(depth["height"], f"{where}.depth.height", 1)
+        _require(len(expected) == width * height * 4,
+                 f"{where}.depth: the expected depth texels do not match the attachment")
+        _require(case.get("depth_test") == {"compare": "less", "write": True},
+                 f"{where}: the combined depth state is a less test with writes on")
+        depth_store = (allocation, view, expected)
+    else:
+        _require("stencil" in case or "stencil_test" in case,
+                 f"{where}: the reviewed stencil shape carries a stencil surface")
     return {"vertices": quad_indices, "indices": quad_indices,
-            "stencil_store": stencil_store}
+            "stencil_store": stencil_store, "depth_store": depth_store}
 
 
 def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
@@ -1391,7 +1444,8 @@ def _render_plan(plan, suite):
                                "instance_count", "wildcard_texels", "base_vertex",
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
-                               "requires_depth_resolve_filter"})
+                               "requires_depth_resolve_filter", "stencil_resolve",
+                               "requires_stencil_resolve_filter"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1557,6 +1611,36 @@ def _render_plan(plan, suite):
             _require(depth_resolve is not None
                      and depth_resolve["filter"] == requires_filter,
                      f"{where}: the device gate has to name the resolve filter the case states")
+        # The stencil resolve (`research/docs/23` §3.3, v60) is the depth
+        # resolve's sibling one byte wide: it only means something beside a
+        # multisample raster that keeps its stencil surface, and the
+        # `depth_resolved_sample` filter names the sample the depth resolve
+        # selected, so it is refused without one instead of silently degrading
+        # to sample zero.
+        stencil_resolve = case.get("stencil_resolve")
+        if stencil_resolve is not None:
+            _require(case.get("multisample") is not None,
+                     f"{where}: a stencil resolve needs a multisample raster")
+            _require(case.get("stencil", {}).get("store") is not None,
+                     f"{where}: a stencil resolve needs a stored stencil surface")
+            _object(stencil_resolve, ("filter",), f"{where}.stencil_resolve")
+            _require(stencil_resolve["filter"] in ("sample0", "depth_resolved_sample"),
+                     f"{where}.stencil_resolve: unsupported stencil resolve filter")
+            if stencil_resolve["filter"] == "depth_resolved_sample":
+                _require(depth_resolve is not None,
+                         f"{where}: the depth_resolved_sample stencil resolve names the "
+                         "sample the depth resolve selects, so the case has to state a "
+                         "depth resolve")
+        # The stencil device gate (`research/docs/23` §3.3, v60): the sibling
+        # of the depth gate, naming the one stencil filter a device may lack.
+        requires_stencil_filter = case.get("requires_stencil_resolve_filter")
+        if requires_stencil_filter is not None:
+            _require(requires_stencil_filter == "depth_resolved_sample",
+                     f"{where}: the device gate names the depth_resolved_sample stencil "
+                     "resolve filter")
+            _require(stencil_resolve is not None
+                     and stencil_resolve["filter"] == requires_stencil_filter,
+                     f"{where}: the device gate has to name the resolve filter the case states")
         wildcard_texels = case.get("wildcard_texels")
         if wildcard_texels is not None:
             _require(single,
@@ -1596,9 +1680,11 @@ def _render_plan(plan, suite):
             # both are rail-owned — the pass tests and writes them, but keeping
             # their texels would need a resolve the two APIs spell differently —
             # and the expectation then follows the pair's own uniform rule
-            # instead of the resolve rule. The two surfaces stay mutually
-            # exclusive.
-            _require(not ("depth" in case and "stencil" in case),
+            # instead of the resolve rule. The two surfaces combine only
+            # through a stencil resolve: the combined depth-stencil surface is
+            # the one attachment both resolve targets name.
+            _require(not ("depth" in case and "stencil" in case)
+                     or "stencil_resolve" in case,
                      f"{where}: the multisample raster opens one depth-stencil surface")
             if "depth" in case:
                 # A stored multisampled depth surface is admitted from v57 on,
@@ -1610,13 +1696,25 @@ def _render_plan(plan, suite):
                     _require("depth_resolve" in case,
                              f"{where}: a stored multisampled depth surface needs its "
                              "depth resolve")
+                # The combined shape's stencil half states the same stored
+                # surface rule its single-surface sibling does
+                # (`research/docs/23` §3.3, v60).
+                if "stencil" in case and case["stencil"].get("store") is not None:
+                    _require("stencil_resolve" in case,
+                             f"{where}: a stored multisampled stencil surface needs its "
+                             "stencil resolve")
                 _require(coverage is None,
                          f"{where}: a multisample pass with a depth surface claims no partial "
                          "coverage")
             elif "stencil" in case:
-                _require(case["stencil"].get("store") is None,
-                         f"{where}: a multisampled stencil surface is rail-owned: the stencil "
-                         "resolve is a later increment")
+                # A stored multisampled stencil surface is admitted from v60
+                # on, through the resolve the case then has to state: its
+                # texels are only observable as the resolve's reduction, so a
+                # stored surface without one is refused.
+                if case["stencil"].get("store") is not None:
+                    _require("stencil_resolve" in case,
+                             f"{where}: a stored multisampled stencil surface needs its "
+                             "stencil resolve")
                 _require(coverage is None,
                          f"{where}: a multisample pass with a stencil surface claims no partial "
                          "coverage")
@@ -1775,8 +1873,13 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
-                if (multisample is not None and case.get("depth") is None
-                        and case.get("stencil") is None):
+                # The combined depth-stencil shape's mixed column carries the
+                # k-of-four colour resolve, so it follows the resolve rule; the
+                # single-surface shapes keep the uniform pair rule
+                # (`research/docs/23` §3.3, v53/v55/v60).
+                if multisample is not None and (
+                        (case.get("depth") is None and case.get("stencil") is None)
+                        or case.get("stencil_resolve") is not None):
                     # The multisample resolve (`research/docs/23` §3.3, v51):
                     # every texel is the mean of the samples a primitive
                     # covered, so the expectation has to be a k-of-`sample_count`
@@ -2138,7 +2241,8 @@ def _render_plan(plan, suite):
             present=present,
             icb=icb,
             wildcards=wildcards,
-            filter=requires_filter)
+            filter=requires_filter,
+            stencil_filter=requires_stencil_filter)
     return render_plan
 
 
@@ -2159,7 +2263,8 @@ def validate_capture(suite, digest, report, required_backend=None):
     _require(required_keys <= set(report),
              "capture: expected fields "
              + ", ".join(sorted(required_keys - set(report))))
-    unexpected = set(report) - required_keys - {"depth_resolve_modes"}
+    unexpected = set(report) - required_keys - {"depth_resolve_modes",
+                                                "stencil_resolve_modes"}
     _require(not unexpected,
              "capture: unexpected fields " + ", ".join(sorted(unexpected)))
     _require(type(report["schema_version"]) is int and report["schema_version"] == 1,
@@ -2183,10 +2288,18 @@ def validate_capture(suite, digest, report, required_backend=None):
     modes = report.get("depth_resolve_modes", 0)
     if "depth_resolve_modes" in report:
         _integer(modes, "capture.depth_resolve_modes")
+    stencil_modes = report.get("stencil_resolve_modes", 0)
+    if "stencil_resolve_modes" in report:
+        _integer(stencil_modes, "capture.stencil_resolve_modes")
     if any(expectation.filter is not None for expectation in render_plan.values()):
         _require("depth_resolve_modes" in report,
                  "capture: missing depth_resolve_modes (the suite declares "
                  "device-gated cases)")
+    if any(expectation.stencil_filter is not None
+           for expectation in render_plan.values()):
+        _require("stencil_resolve_modes" in report,
+                 "capture: missing stencil_resolve_modes (the suite declares "
+                 "device-gated stencil cases)")
     results = _list(report["results"], "capture.results")
     seen = set()
     # The Swift reference oracle reports bytes but not device-buffer copy
@@ -2396,7 +2509,10 @@ def validate_capture(suite, digest, report, required_backend=None):
     required |= {case_id for case_id, expectation in render_plan.items()
                  if report["backend"] in expectation.rails
                  and (expectation.filter is None
-                      or modes & DEPTH_RESOLVE_FILTER_BITS[expectation.filter])}
+                      or modes & DEPTH_RESOLVE_FILTER_BITS[expectation.filter])
+                 and (expectation.stencil_filter is None
+                      or stencil_modes
+                      & STENCIL_RESOLVE_FILTER_BITS[expectation.stencil_filter])}
     missing = required - seen
     _require(not missing, f"capture: missing cases {sorted(missing)}")
     for case_id in sorted(set(render_plan) - required):
@@ -2404,6 +2520,11 @@ def validate_capture(suite, digest, report, required_backend=None):
         if expectation.filter is not None and report["backend"] in expectation.rails:
             message = (f"case {case_id}: {report['backend']} lacks the "
                        f"{expectation.filter} depth resolve filter the case requires")
+        elif (expectation.stencil_filter is not None
+              and report["backend"] in expectation.rails):
+            message = (f"case {case_id}: {report['backend']} lacks the "
+                       f"{expectation.stencil_filter} stencil resolve filter the case "
+                       "requires")
         else:
             message = (f"case {case_id}: {report['backend']} is not a rail this render "
                        f"case runs on")

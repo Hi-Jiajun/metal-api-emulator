@@ -232,6 +232,13 @@ impl NativeMetalProvider {
             // Apple Paravirtual device executing all three filters
             // (`f4d70e4`, CI run `35112569688`).
             let depth_resolve_bits = render::device_depth_resolve_capability_bits(&device);
+            // The stencil-resolve bits come from the same device probe
+            // (`render::device_stencil_resolve_capability_bits`,
+            // `research/docs/23` §3.3, v60): the v59
+            // `--stencil-resolve-selftest` run measured the Apple Paravirtual
+            // device executing both filters (`2b877b8`, CI run
+            // `35120171655`), so the mask carries Sample0|DepthResolvedSample.
+            let stencil_resolve_bits = render::device_stencil_resolve_capability_bits(&device);
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
@@ -325,6 +332,17 @@ impl NativeMetalProvider {
                 // on (`research/docs/23` §3.3, v57c/v57e).
                 supports_render_depth_resolve: depth_resolve_bits.supports_render_depth_resolve,
                 depth_resolve_modes: depth_resolve_bits.depth_resolve_modes,
+                // The stencil resolve is executed by this rail as of v60: the
+                // encoder opens the combined depth-stencil surface with
+                // `storeAction = .multisampleResolve` and lands the two
+                // reductions in their single-sample shared textures. The bits
+                // come from the device probe
+                // (`render::device_stencil_resolve_capability_bits`), which
+                // declares both filters on the v59 self-test evidence
+                // (`research/docs/23` §3.3, v60).
+                supports_render_stencil_resolve: stencil_resolve_bits
+                    .supports_render_stencil_resolve,
+                stencil_resolve_modes: stencil_resolve_bits.stencil_resolve_modes,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).
@@ -1426,6 +1444,7 @@ impl NativeMetalProvider {
             &pool,
             &render_contracts,
             self.capabilities.depth_resolve_modes,
+            self.capabilities.stencil_resolve_modes,
         )?;
         pending.submitted = true;
         let resources = pending.resources.as_ref().expect("encoded resources");
@@ -1962,6 +1981,7 @@ impl NativeMetalProvider {
                 &pool,
                 &render_contracts,
                 self.capabilities.depth_resolve_modes,
+                self.capabilities.stencil_resolve_modes,
             )?;
             pending.submitted = true;
             let resources = pending.resources.as_ref().expect("encoded resources");

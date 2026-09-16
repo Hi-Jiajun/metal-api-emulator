@@ -11,8 +11,8 @@ use metal2vulkan::reflect::{
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
     DepthResolveFilter, DispatchKind, FootprintProof, IndirectCommandKind, PipelineContract,
-    PresentMode, ProviderCapabilities, SemanticDigest, StorageMode, MAX_COLOR_ATTACHMENTS,
-    MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
+    PresentMode, ProviderCapabilities, SemanticDigest, StencilResolveFilter, StorageMode,
+    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_PRESENT_TARGETS,
 };
 use metal_api_core::ExecutorError;
 
@@ -212,6 +212,26 @@ pub(crate) fn depth_resolve_mode_mask(modes: vk::ResolveModeFlags) -> u32 {
         mask |= 1u32 << u32::from(DepthResolveFilter::Max.code());
     }
     mask
+}
+
+/// The contract's stencil-resolve filter mask for a device's reported stencil
+/// resolve modes (`research/docs/23` §3.3, v60).
+///
+/// The mask maps the admitted filters onto their wire bit positions —
+/// [`StencilResolveFilter::Sample0`] is bit 0 — and drops every mode the
+/// contract does not carry. Vulkan's stencil resolve modes are
+/// `SAMPLE_ZERO`/`MIN`/`MAX`, where `MIN`/`MAX` reduce the *stencil* values
+/// themselves; Metal's [`StencilResolveFilter::DepthResolvedSample`] takes the
+/// stencil of whichever sample the *depth* resolve selected, which no Vulkan
+/// mode expresses. The two therefore have no mapping and are dropped rather
+/// than folded onto a filter the caller did not ask for, so a device's mask
+/// carries at most the Sample0 bit.
+pub(crate) fn stencil_resolve_mode_mask(modes: vk::ResolveModeFlags) -> u32 {
+    if modes.contains(vk::ResolveModeFlags::SAMPLE_ZERO) {
+        1u32 << u32::from(StencilResolveFilter::Sample0.code())
+    } else {
+        0
+    }
 }
 
 pub(crate) fn pipeline_contract(
@@ -556,5 +576,29 @@ mod tests {
         );
         assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::AVERAGE), 0);
         assert_eq!(depth_resolve_mode_mask(vk::ResolveModeFlags::empty()), 0);
+    }
+
+    #[test]
+    fn stencil_resolve_mode_mask_admits_sample_zero_alone_and_drops_min_max() {
+        // The contract's stencil family is Sample0 / DepthResolvedSample, and
+        // Vulkan has no mode for the latter: SAMPLE_ZERO maps onto bit 0, while
+        // MIN and MAX reduce stencil values themselves and are dropped rather
+        // than folded onto a filter the caller did not ask for
+        // (`research/docs/23` §3.3, v60).
+        assert_eq!(
+            stencil_resolve_mode_mask(vk::ResolveModeFlags::SAMPLE_ZERO),
+            0b1
+        );
+        assert_eq!(
+            stencil_resolve_mode_mask(
+                vk::ResolveModeFlags::SAMPLE_ZERO
+                    | vk::ResolveModeFlags::MIN
+                    | vk::ResolveModeFlags::MAX
+            ),
+            0b1
+        );
+        assert_eq!(stencil_resolve_mode_mask(vk::ResolveModeFlags::MIN), 0);
+        assert_eq!(stencil_resolve_mode_mask(vk::ResolveModeFlags::MAX), 0);
+        assert_eq!(stencil_resolve_mode_mask(vk::ResolveModeFlags::empty()), 0);
     }
 }

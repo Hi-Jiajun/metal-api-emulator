@@ -212,6 +212,11 @@ const DEPTH_ONLY_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
 const DEPTH_STRIDE: u64 = 32;
 /// The depth the pass clears its attachment to before the draw.
 const DEPTH_CLEAR: f64 = 1.0;
+/// The combined depth-stencil shape's clear (`research/docs/23` §3.3, v60):
+/// the value between the two triangles' depths (0.5 and 0.9) that makes the
+/// near triangle's depth pass write stencil while the far triangle's depth
+/// failures leave the rest untouched.
+const COMBINED_DEPTH_CLEAR: f64 = 0.7;
 /// Bytes per instance of the reviewed tint stream: one `float32x4`.
 const INSTANCED_TINT_STRIDE: u64 = 16;
 
@@ -2561,6 +2566,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "render_declaring_depth_store",
             "render_declaring_depth_resolve",
             "render_declaring_stencil_store",
+            "render_declaring_stencil_resolve",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -3319,13 +3325,14 @@ fn reviewed_depth_geometry(
 ) -> Result<RenderGeometry> {
     // The stencil sibling masks with a stencil attachment instead of a depth
     // one (`research/docs/23` §3.3, v47): the same pair stream, one rail-owned
-    // `stencil8` surface, and exactly the reviewed state. The two surfaces are
-    // mutually exclusive in this increment, so a case that declares both is
-    // refused rather than classified as either.
+    // `stencil8` surface, and exactly the reviewed state. The two surfaces
+    // combine only through a stencil resolve — the one attachment both resolve
+    // targets name — so a case that declares both without one is refused
+    // rather than classified as either (`research/docs/23` §3.3, v60).
     if case.stencil.is_some() {
-        if case.depth.is_some() {
+        if case.depth.is_some() && case.stencil_resolve.is_none() {
             return Err(format!(
-                "{where_}: the reviewed stencil shape carries no depth attachment"
+                "{where_}: the combined depth-stencil shape needs its stencil resolve"
             )
             .into());
         }
@@ -3351,17 +3358,21 @@ fn reviewed_depth_geometry(
         let Some(test) = &case.stencil_test else {
             unreachable!("the presence rule above proved the state is there");
         };
-        if test.compare != "equal"
-            || test.reference != 0
-            || test.read_mask != 0xff
-            || test.write_mask != 0xff
-            || test.fail_op != "keep"
-            || test.depth_fail_op != "keep"
-            || test.pass_op != "increment_wrap"
-        {
+        let reviewed_state = (test.compare == "equal"
+            || (test.compare == "always"
+                && case.depth.is_some()
+                && case.stencil_resolve.is_some()))
+            && test.reference == 0
+            && test.read_mask == 0xff
+            && test.write_mask == 0xff
+            && test.fail_op == "keep"
+            && test.depth_fail_op == "keep"
+            && test.pass_op == "increment_wrap";
+        if !reviewed_state {
             return Err(format!(
-                "{where_}: the reviewed stencil state is an equal test against zero that keeps \
-                 the stored value on failure and increments it with wraparound on success"
+                "{where_}: the reviewed stencil state is the equal-zero test or the combined \
+                 shape's always test, both keeping the stored value on failure and incrementing \
+                 it with wraparound on pass"
             )
             .into());
         }
@@ -3468,8 +3479,18 @@ fn reviewed_depth_geometry(
             format!("{where_}: the reviewed depth attachment is a cleared depth32float").into(),
         );
     }
-    if depth.clear_depth != Some(DEPTH_CLEAR) {
-        return Err(format!("{where_}: the reviewed depth clear is {DEPTH_CLEAR}").into());
+    // The combined shape clears to the value between the two triangles'
+    // depths (0.7), which is what lets the near triangle's depth pass write
+    // stencil while the far triangle's depth failures leave the rest at zero
+    // (`research/docs/23` §3.3, v60); the single-surface depth pair keeps the
+    // reviewed clear of one.
+    let reviewed_clear = if case.stencil.is_some() {
+        COMBINED_DEPTH_CLEAR
+    } else {
+        DEPTH_CLEAR
+    };
+    if depth.clear_depth != Some(reviewed_clear) {
+        return Err(format!("{where_}: the reviewed depth clear is {reviewed_clear}").into());
     }
     // The depth readback pair (`research/docs/23` §3.3, v43): a pass that keeps
     // its depth surface states its store action, where the texels land and what
@@ -3570,7 +3591,10 @@ fn reviewed_depth_geometry(
     // reviewed stream: it is admitted only beside a Min or Max resolve, because
     // the edge shape exists to make those two reductions disagree — a
     // full-coverage pair cannot, and Sample0 leaves the review surface as the
-    // pre-v57d fixture.
+    // pre-v57d fixture. The v60 stencil-resolve pair reuses the same edge
+    // geometry: its mixed column is what makes the two stencil filters
+    // disagree, so a case that states a stencil resolve also admits the edge
+    // stream (`research/docs/23` §3.3, v60).
     if buffer.initial_hex == reviewed_depth_resolve_edge_stream_hex() {
         match case
             .depth_resolve
@@ -3578,6 +3602,7 @@ fn reviewed_depth_geometry(
             .map(|resolve| resolve.filter.as_str())
         {
             Some("min" | "max") => {}
+            _ if case.stencil_resolve.is_some() => {}
             _ => {
                 return Err(format!(
                     "{where_}: the edge depth stream is the min/max device-gated shape"
@@ -4343,6 +4368,18 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                     format!("{where_}: a depth resolve needs a stored depth surface").into(),
                 );
             }
+            // The combined shape's stencil half states the same stored
+            // surface rule its single-surface sibling does
+            // (`research/docs/23` §3.3, v60).
+            if let Some(stencil) = &case.stencil {
+                if stencil.store.is_some() && case.stencil_resolve.is_none() {
+                    return Err(format!(
+                        "{where_}: a stored multisampled stencil surface needs its stencil \
+                         resolve"
+                    )
+                    .into());
+                }
+            }
             if test.is_none() {
                 return Err(
                     format!("{where_}: a multisampled depth surface needs its test").into(),
@@ -4527,7 +4564,15 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             // texel is one fragment output — so the resolve
                             // rule below, which exists for a *partially
                             // covered* raster, is not the one that applies.
-                            if case.depth.is_some() || case.stencil.is_some() {
+                            // The combined depth-stencil shape's far triangle
+                            // fails the depth test on the samples the near
+                            // triangle covered, so the mixed column carries
+                            // the colour resolve's k-of-four mix like a
+                            // partially covered raster does
+                            // (`research/docs/23` §3.3, v60).
+                            if (case.depth.is_some() || case.stencil.is_some())
+                                && case.stencil_resolve.is_none()
+                            {
                                 if !uniform_texel {
                                     return Err(format!(
                                         "{where_}: a masked multisample expectation has to be one \
@@ -5196,6 +5241,15 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/copy_word_with_witness.metal",
             "c116fec300f1369069fbcf19d5fbb95e8c5ad07475757c19930075a19ad4367a",
         ),
+        // v60's declaring pass: the same reviewed copy over four bindings, so
+        // the pass also declares both the depth and the stencil landing the
+        // combined render pass stores (`research/docs/23` §3.3, v60).
+        "copy_word_with_witnesses" => (
+            "../examples/metal-smoke/shaders/kernel_copy_word_with_witnesses.ll",
+            "a06dcfcf052e51a8b30e42942bee50d620f53e5cca3107bb6779e0d42f43c37e",
+            "shaders/copy_word_with_witnesses.metal",
+            "256da53df3f30d52f0b864d545d015bdaa7e8e45c055f4eb9e1f8a1c3963a335",
+        ),
         "kernel_dispatch_threads_boundary_barrier" => (
             "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
             "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945",
@@ -5422,6 +5476,21 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4), (2, "read", 16)][..],
+        ),
+        // v60: the same kernel with both landings declared — the depth view
+        // (64 bytes) and the stencil view (16 bytes) as the third and fourth
+        // reads — so one submission declares both views the combined render
+        // pass stores into (`research/docs/23` §3.3, v60).
+        "render_declaring_stencil_resolve" => (
+            "copy_word_with_witnesses",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[
+                (0, "read", 64),
+                (1, "write", 4),
+                (2, "read", 64),
+                (3, "read", 16),
+            ][..],
         ),
         "render_declaring_four_attachments" => (
             "mrt_declare4",
