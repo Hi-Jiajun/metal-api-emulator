@@ -2721,7 +2721,9 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // counter-clockwise front.
     if definition.cull != nil {
         encoder.setCullMode(.back)
-        encoder.setFrontFacingWinding(.counterClockwise)
+        // `setFrontFacingWinding(_:)` was renamed to `setFrontFacing(_:)`; the
+        // ObjC selector behind it is the same state the contract names.
+        encoder.setFrontFacing(.counterClockwise)
     }
     // The viewport is explicit because the contract carries it, even though the
     // first increment only accepts the attachment-covering default.
