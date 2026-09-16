@@ -53,8 +53,8 @@ use metal_api_core::provider::{
     ContractError, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
-    FULL_SCREEN_TRIANGLE_VERTICES,
+    RenderPipelineContract, StencilTest, StoreOp, TracePass, VertexFormat, VertexLayout,
+    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -68,15 +68,15 @@ use metal::{
     IndirectCommandBufferDescriptor, MTLBlendFactor, MTLBlendOperation, MTLClearColor,
     MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLIndexType, MTLIndirectCommandType,
     MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
-    MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat,
-    MTLVertexStepFunction, MTLViewport, MTLWinding, NSInteger, NSRange, NSUInteger,
-    RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
-    RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
+    MTLSize, MTLStencilOperation, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
+    MTLVertexFormat, MTLVertexStepFunction, MTLViewport, MTLWinding, NSInteger, NSRange,
+    NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
+    RenderPipelineState, StencilDescriptor, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
 use metal_api_core::provider::{
-    BlendFactor, BlendOperation, CompareFunction, CullMode as ContractCullMode,
-    Winding as ContractWinding,
+    BlendFactor, BlendOperation, CompareFunction, CullMode as ContractCullMode, StencilCompare,
+    StencilOp, Winding as ContractWinding,
 };
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
@@ -1248,6 +1248,9 @@ pub(crate) struct RenderPlan<'a> {
     /// The rail-owned depth attachment this pass opens, or `None` for a pass
     /// with no depth surface (`research/docs/23` §3.3, v36).
     pub(crate) depth: Option<PlannedDepth>,
+    /// The rail-owned stencil attachment this pass opens, or `None` for a pass
+    /// with no stencil surface (`research/docs/23` §3.3, v47).
+    pub(crate) stencil: Option<PlannedStencil>,
     pub(crate) vertices: u32,
     /// Instances the draw runs (`research/docs/23` §3.3, v31): Metal's
     /// `drawPrimitives(vertexCount:instanceCount:)` second count. `1` for every
@@ -1299,6 +1302,25 @@ impl PlannedDepth {
     pub(crate) fn storing(&self) -> bool {
         self.store == Some(DepthStoreOp::Store)
     }
+}
+
+/// The stencil attachment a plan opens (`research/docs/23` §3.3, v47).
+///
+/// Rail-owned like the depth surface, with the one difference this increment's
+/// scope states: nothing reads a stencil texel back yet, so the trace names no
+/// landing identity for it, the surface never leaves the pass and its texture
+/// is created with `Private` storage ([`stencil_texture`]). What the trace does
+/// state is the extent, the clear value or previous-contents load op, and the
+/// stencil state the pass's draw tests and writes with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedStencil {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `Some(value)` for a clear, `None` for `Load`.
+    pub(crate) clear_value: Option<u8>,
+    /// The pass's stencil state, or `None` for "the attachment exists and
+    /// nothing tests it".
+    pub(crate) test: Option<StencilTest>,
 }
 
 /// One colour attachment of a planned pass, resolved before any Metal object
@@ -1407,7 +1429,11 @@ pub(crate) fn plan<'a>(
     // zero-colour-attachment depth pass (`research/docs/23` §3.3, v46), its
     // depth attachment's: the depth surface is the whole raster, and the
     // pipeline's empty colour-format list is what states that no colour
-    // target exists beside it.
+    // target exists beside it. A stencil surface is never the raster on its
+    // own: it is a second surface beside the pass's colour or depth one, and
+    // the contract refuses a colour-less pass with no depth surface
+    // (`EmptyAttachmentList`) before this rail reaches the fallback
+    // (`research/docs/23` §3.3, v47).
     let raster = match attachments.first() {
         Some(attachment) => [attachment.width, attachment.height],
         None => {
@@ -1489,7 +1515,9 @@ pub(crate) fn plan<'a>(
     // Every admitted colour format and `depth32float` alike store four bytes per
     // texel, so one texel-byte count serves the colour attachments and the
     // depth-only pass's readback (`crates/metal-api-core`:
-    // `AttachmentFormat::bytes_per_texel` and `DEPTH_BYTES_PER_TEXEL`).
+    // `AttachmentFormat::bytes_per_texel` and `DEPTH_BYTES_PER_TEXEL`). The
+    // stencil surface contributes nothing here: one byte per texel it may be,
+    // but this increment never reads one back (`STENCIL_BYTES_PER_TEXEL`).
     let texel_bytes = usize::try_from(
         u64::from(extent[0])
             .saturating_mul(u64::from(extent[1]))
@@ -1578,6 +1606,19 @@ pub(crate) fn plan<'a>(
             // absent, and core admission has already held the storing shape to
             // naming a landing identity.
             store: depth.store,
+        }),
+        stencil: request.pass.stencil.as_ref().map(|stencil| PlannedStencil {
+            width: u32::try_from(stencil.width).unwrap_or(u32::MAX),
+            height: u32::try_from(stencil.height).unwrap_or(u32::MAX),
+            // The same decoding the depth load op uses: the clear arm
+            // carries the value every stencil texel starts from, and `Load`
+            // keeps the attachment's previous contents
+            // (`research/docs/23` §3.3, v47).
+            clear_value: stencil.load.clear_value(),
+            // The state is the pass's own, and core admission has already
+            // refused a test with no attachment to test
+            // (`StencilTestWithoutAttachment`).
+            test: request.pass.stencil_test,
         }),
         vertices: request.pass.vertices,
         instance_count: request.pass.instance_count,
@@ -2309,9 +2350,42 @@ fn encode_into_and_readback(
             MTLStoreAction::DontCare
         });
     }
-    let depth_stencil_state = planned.depth.as_ref().map(|depth| {
+    // The stencil attachment is rail-owned in the same way (`research/docs/23`
+    // §3.3, v47): created when the plan declares one, opened with the plan's
+    // load operation and the pass's own clear value, and discarded with the
+    // pass — this increment has no stencil readback, so the surface stores
+    // `DontCare` and needs no identity. The texture stays in this local for the
+    // same reason the depth texture does: the pass descriptor references it
+    // until the encoder is done.
+    let stencil_target = planned
+        .stencil
+        .as_ref()
+        .map(|stencil| stencil_texture(device, stencil))
+        .transpose()?;
+    if let (Some(stencil), Some(texture)) = (&planned.stencil, &stencil_target) {
+        let attachment = pass
+            .stencil_attachment()
+            .ok_or_else(|| resource_refusal("metal_render_stencil_descriptor_unavailable"))?;
+        attachment.set_texture(Some(texture));
+        match stencil.clear_value {
+            Some(value) => {
+                attachment.set_load_action(MTLLoadAction::Clear);
+                attachment.set_clear_stencil(u32::from(value));
+            }
+            None => attachment.set_load_action(MTLLoadAction::Load),
+        }
+        attachment.set_store_action(MTLStoreAction::DontCare);
+    }
+    // Metal carries the depth and the stencil state in one descriptor
+    // (`research/docs/23` §3.3, v36/v47): built when the pass opens either
+    // surface, because a stencil-only pass has no depth test to state and a
+    // depth-only pass no stencil state. The depth half is the pass's own test,
+    // or `Always` with no write for an attachment nothing tests; the stencil
+    // half arms the front and back descriptors with the same state, exactly as
+    // the contract states it for both faces.
+    let depth_stencil_state = (planned.depth.is_some() || planned.stencil.is_some()).then(|| {
         let descriptor = DepthStencilDescriptor::new();
-        let (compare, write) = match depth.test {
+        let (compare, write) = match planned.depth.as_ref().and_then(|depth| depth.test) {
             Some(test) => (
                 match test.compare {
                     CompareFunction::Less => MTLCompareFunction::Less,
@@ -2320,10 +2394,25 @@ fn encode_into_and_readback(
                 test.write,
             ),
             // An attachment with no test still clears; every fragment passes.
+            // A pass with no depth attachment at all keeps these same defaults,
+            // spelled out because the two halves travel in one object.
             None => (MTLCompareFunction::Always, false),
         };
         descriptor.set_depth_compare_function(compare);
         descriptor.set_depth_write_enabled(write);
+        if let Some(test) = planned.stencil.as_ref().and_then(|stencil| stencil.test) {
+            let stencil_descriptor = StencilDescriptor::new();
+            stencil_descriptor.set_stencil_compare_function(metal_stencil_compare(test.compare));
+            stencil_descriptor.set_stencil_failure_operation(metal_stencil_operation(test.fail_op));
+            stencil_descriptor
+                .set_depth_failure_operation(metal_stencil_operation(test.depth_fail_op));
+            stencil_descriptor
+                .set_depth_stencil_pass_operation(metal_stencil_operation(test.pass_op));
+            stencil_descriptor.set_read_mask(u32::from(test.read_mask));
+            stencil_descriptor.set_write_mask(u32::from(test.write_mask));
+            descriptor.set_front_face_stencil(Some(&stencil_descriptor));
+            descriptor.set_back_face_stencil(Some(&stencil_descriptor));
+        }
         device.new_depth_stencil_state(&descriptor)
     });
     // The command buffer and the encoder are autoreleased and the rail is
@@ -2337,6 +2426,13 @@ fn encode_into_and_readback(
     // contract states them.
     if let Some(state) = &depth_stencil_state {
         encoder.set_depth_stencil_state(state);
+    }
+    // The stencil reference value is encoder state too, not pipeline state
+    // (`research/docs/23` §3.3, v47): Metal takes it per draw call, so the
+    // pass's own value is set once before the draw exactly as the contract
+    // states it.
+    if let Some(test) = planned.stencil.as_ref().and_then(|stencil| stencil.test) {
+        encoder.set_stencil_reference_value(u32::from(test.reference));
     }
     // Culling is encoder state too (`research/docs/23` §3.3, v39): the mode and
     // the winding are the pass's own, and a pass without the state keeps
@@ -2575,6 +2671,31 @@ const fn metal_blend_operation(operation: BlendOperation) -> MTLBlendOperation {
     }
 }
 
+/// One contract stencil comparison as the `MTLCompareFunction` it names
+/// (`research/docs/23` §3.3, v47).
+///
+/// The two admitted values are the ones both APIs spell identically, so the
+/// mapping is total over the contract's own list — the same shape the Vulkan
+/// rail's `vk_stencil_compare` has.
+#[cfg(target_os = "macos")]
+const fn metal_stencil_compare(compare: StencilCompare) -> MTLCompareFunction {
+    match compare {
+        StencilCompare::Equal => MTLCompareFunction::Equal,
+        StencilCompare::Always => MTLCompareFunction::Always,
+    }
+}
+
+/// One contract stencil operation as the `MTLStencilOperation` it names
+/// (`research/docs/23` §3.3, v47).
+#[cfg(target_os = "macos")]
+const fn metal_stencil_operation(operation: StencilOp) -> MTLStencilOperation {
+    match operation {
+        StencilOp::Keep => MTLStencilOperation::Keep,
+        StencilOp::Replace => MTLStencilOperation::Replace,
+        StencilOp::IncrementWrap => MTLStencilOperation::IncrementWrap,
+    }
+}
+
 /// The rail-owned depth texture of a pass that declares one
 /// (`research/docs/23` §3.3, v36/v43).
 ///
@@ -2601,6 +2722,31 @@ fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, Provi
         unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
     if pointer.is_null() {
         return Err(resource_refusal("metal_render_depth_allocation_failed"));
+    }
+    Ok(unsafe { Texture::from_ptr(pointer) })
+}
+
+/// The rail-owned stencil texture of a pass that declares one
+/// (`research/docs/23` §3.3, v47).
+///
+/// `Private` storage, unlike a storing depth surface: this increment never
+/// reads a stencil texel back — the stencil fixture observes its effect through
+/// the colour attachment the mask decides — so the surface is the pass's alone
+/// and no CPU-visible mapping is created (`research/docs/16` §4.8).
+#[cfg(target_os = "macos")]
+fn stencil_texture(device: &Device, stencil: &PlannedStencil) -> Result<Texture, ProviderError> {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::Stencil8);
+    descriptor.set_width(u64::from(stencil.width));
+    descriptor.set_height(u64::from(stencil.height));
+    descriptor.set_mipmap_level_count(1);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(MTLStorageMode::Private);
+    let pointer: *mut metal::MTLTexture =
+        unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
+    if pointer.is_null() {
+        return Err(resource_refusal("metal_render_stencil_allocation_failed"));
     }
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
@@ -2727,6 +2873,13 @@ fn render_pipeline_state(
     if planned.depth.is_some() {
         descriptor.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
     }
+    // The stencil slot is the same rule one surface over
+    // (`research/docs/23` §3.3, v47): a pass that opens a stencil attachment
+    // compiles its pipeline against that attachment's format, and a pass
+    // without one leaves the slot at its default exactly as before.
+    if planned.stencil.is_some() {
+        descriptor.set_stencil_attachment_pixel_format(MTLPixelFormat::Stencil8);
+    }
     // One pipeline attachment per colour location: entry `i` states the pixel
     // format the reviewed fragment's output `i` is compiled against, which the
     // plan already forced to agree with the pass's attachment list
@@ -2841,8 +2994,9 @@ mod tests {
         IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
         IndirectCommandRange, InitialState, LeaseId, OperationId, PipelineContract, PresentTarget,
         ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        ResourceTableSnapshot, SemanticDigest, StorageMode, VertexAttribute, VertexBufferLayout,
-        VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        RenderStencilAttachment, ResourceTableSnapshot, SemanticDigest, StencilCompare,
+        StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, VertexAttribute,
+        VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -3269,6 +3423,69 @@ mod tests {
         };
         let error = plan(&mismatched).expect_err("the pair module is not this shape's module");
         assert_eq!(error.slug, "native_render_source_not_reviewed");
+    }
+
+    /// The v47 stencil shape (`research/docs/23` §3.3, v47): one colour
+    /// attachment beside a rail-owned `stencil8` surface the pass clears to
+    /// zero, and the reviewed state the depth pair's stream plus one colour
+    /// target compiles under.
+    ///
+    /// Runs without a device, so the shape rules and the three planned fields
+    /// are the whole check here; the macOS CI compiles the pipeline state and
+    /// the depth-stencil state this plan builds.
+    #[test]
+    fn plan_admits_a_stencil_pass_and_plans_the_reviewed_state() {
+        let pass = stencil_pass();
+        let pipeline = stencil_pipeline();
+        let planned = plan(&stencil_request(&pass, &pipeline)).expect("the stencil pass plans");
+        // The colour attachment is the raster, the stencil surface the second
+        // one beside it: the pair module is what this shape compiles.
+        assert_eq!(planned.extent, [2, 2]);
+        assert_eq!(
+            planned.module_path,
+            "conformance/shaders/depth_pair_4x4.metal"
+        );
+        assert_eq!(planned.vertex_entry, DEPTH_VERTEX_ENTRY);
+        assert_eq!(planned.fragment_entry, DEPTH_FRAGMENT_ENTRY);
+        let [attachment] = planned.attachments.as_slice() else {
+            panic!("the stencil shape renders one colour attachment");
+        };
+        assert_eq!(attachment.format, RenderPixelFormat::Rgba8Unorm);
+        assert_eq!(attachment.store, RenderStoreAction::Store);
+        // The rail-owned surface's three planned fields, each the contract's
+        // own value: the extent, the clear the load op carries, and the state
+        // the draw tests and writes with. The surface itself is never read
+        // back, which is why the plan carries no landing for it.
+        let stencil = planned
+            .stencil
+            .expect("the pass opens the rail-owned stencil surface");
+        assert_eq!(stencil.width, 2);
+        assert_eq!(stencil.height, 2);
+        assert_eq!(stencil.clear_value, Some(0));
+        assert_eq!(stencil.test, Some(STENCIL_TEST));
+    }
+
+    /// The contract's own rule, one level below the plan
+    /// (`research/docs/23` §3.3, v47): stencil state with no stencil
+    /// attachment has nothing to test, and core admission refuses it before
+    /// this rail plans anything — the same shape the depth test states.
+    #[test]
+    fn plan_refuses_stencil_state_without_a_stencil_attachment() {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.stencil_test = Some(STENCIL_TEST);
+        assert_eq!(
+            plan(&milestone_request(&pass, &milestone_pipeline(), None))
+                .unwrap_err()
+                .slug,
+            "trace_contract_invalid"
+        );
+        // The contract states the refusal by name, so the rail's slug is the
+        // one core admission uses rather than a second spelling of the same
+        // fact.
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::StencilTestWithoutAttachment)
+        );
     }
 
     /// The v20 load increment (`research/docs/23` §3.1): a `LoadOp::DontCare`
@@ -4062,6 +4279,100 @@ mod tests {
             pass,
             pipeline,
             source: REVIEWED_VERTEX_SOURCE,
+            initial: vec![None],
+        }
+    }
+
+    /// The stencil fixture's reviewed state: the v47 fixture's own values —
+    /// `equal 0` with reference 0, both failure operations `keep`, and
+    /// `increment_wrap` on success, over the full read and write masks
+    /// (`research/docs/23` §3.3, v47). Spelled once so the pass and the
+    /// assertion cannot drift.
+    const STENCIL_TEST: StencilTest = StencilTest {
+        compare: StencilCompare::Equal,
+        fail_op: StencilOp::Keep,
+        depth_fail_op: StencilOp::Keep,
+        pass_op: StencilOp::IncrementWrap,
+        read_mask: 0xff,
+        write_mask: 0xff,
+        reference: 0,
+    };
+
+    /// The v47 fixture's pass shape: the milestone's one 2x2 `rgba8_unorm`
+    /// attachment, the reviewed pair stream with six indices over it, and the
+    /// rail-owned `stencil8` surface cleared to zero that the state above
+    /// tests (`research/docs/23` §3.3, v47).
+    ///
+    /// The stream is the depth pair's two-attribute layout — a `float32x3`
+    /// position and a `float32x4` tint — which is the shape the pair module's
+    /// vertex stage reads; the vertex bytes themselves are the fixture's
+    /// business, not the plan's, so a zeroed 192-byte view (six records of 32)
+    /// stands in for them exactly as the zero-colour depth fixture does.
+    fn stencil_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.vertex_buffers = vec![BufferView {
+            view_id: ViewId::new(41),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(43),
+            offset: 0,
+            length: 192,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 192]),
+        }];
+        pass.indices = Some(IndexBufferBinding {
+            view: quad_index_view(),
+            format: IndexFormat::Uint16,
+        });
+        pass.vertices = 6;
+        pass.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::clear(0),
+        });
+        pass.stencil_test = Some(STENCIL_TEST);
+        pass
+    }
+
+    /// The reviewed pair pipeline contract the stencil fixture declares: the
+    /// depth pair's two stages compiled against one `rgba8_unorm` attachment,
+    /// with the two-attribute stream layout its vertex stage was written for
+    /// (`research/docs/23` §3.3, v47).
+    fn stencil_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            vertex_entry: DEPTH_VERTEX_ENTRY.to_owned(),
+            fragment_entry: DEPTH_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                stride: 32,
+                step: VertexStep::PerVertex,
+                attributes: vec![
+                    VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x3,
+                    },
+                    VertexAttribute {
+                        location: 1,
+                        offset: 16,
+                        format: VertexFormat::Float32x4,
+                    },
+                ],
+            }]),
+        }
+    }
+
+    /// The request the trace path builds for the reviewed stencil pass: the
+    /// pair module's bytes and one previous-bytes slot per colour attachment.
+    fn stencil_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_DEPTH_SOURCE,
             initial: vec![None],
         }
     }

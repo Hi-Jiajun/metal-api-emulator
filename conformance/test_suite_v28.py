@@ -28,8 +28,9 @@ stored value, so the far one fails the test and is discarded — the expectation
 is the near tint sixteen times, and a rail that ignored the stencil state would
 show the far one exactly as it would for the depth pair. The attachment is
 rail-owned like the pre-v43 depth surface, so it adds no writeback, no
-allocation image and no count; the marker names the three trace rails, because
-the object API records no stencil surface yet.
+allocation image and no count; v48 carries the same surface and the same test
+on every rail, so the marker names all five and each one owes the same colour
+pair's landing.
 """
 
 import copy
@@ -179,16 +180,16 @@ DEPTH_ONLY_RAILS = ALL_RAILS
 # entries carry the same store action and landing identity, and the pass binds
 # no colour attachment at all (`research/docs/23` §3.3, v46).
 DEPTH_NO_COLOUR_RAILS = ALL_RAILS
-# The v47 stencil fixture names the three trace rails: the stencil surface is
-# rail-owned and read back by nothing, but the object API records no stencil
-# surface at all yet — its render entries state the state as absent
-# (`research/docs/23` §3.3, v47). The object entries that carry it are the next
-# increment, and they are what will widen this marker the way v44 widened the
-# stored depth one.
-# The v47 fixture names the rails that execute it: the Swift oracle and the
-# Vulkan rail. The Rust native rail's stencil path and both object rails
-# follow in v48, so its marker stays narrow for now.
-STENCIL_RAILS = ("native-metal", "vulkan")
+# The v47 marker named the two rails that first executed the stencil fixture:
+# the Swift oracle and the Vulkan rail. The v48 increment carries the same
+# rail-owned `stencil8` surface and the same `equal 0` test on the Rust native
+# rail and through both object rails — the object entries record the surface
+# the way v44's depth entry recorded its own store action — so the marker
+# widens to every rail the way the stored-depth one did
+# (`research/docs/23` §3.3, v48). The case is still observed through the
+# colour pair's own landing, so the wider marker owes the same shape on all
+# five rails.
+STENCIL_RAILS = ALL_RAILS
 # The alignment fixture names every rail: both trace and object rails execute
 # the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
 # framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
@@ -301,8 +302,9 @@ def stencil_marker(suite, rail):
     behind, so the marker rule is the same one the depth fixtures state: a
     capture on a rail the marker names is owed the colour observation, and one
     on any other rail has to leave the case out entirely. The committed marker
-    names the three trace rails, because the object API records no stencil
-    surface yet. Returns whether `rail` owes the case.
+    names all five rails: v48 widened it when the Rust native rail's stencil
+    path and both object rails took the same surface and test
+    (`research/docs/23` §3.3, v48). Returns whether `rail` owes the case.
     """
     suite["render_cases"][STENCIL_INDEX]["capture_rails"] = (
         [rail] if rail in STENCIL_RAILS else [other_rail(rail)])
@@ -1235,8 +1237,10 @@ class ScissorObservationTests(unittest.TestCase):
         # The marker is the rule, whichever rails it names: a capture on a rail
         # the fixture's marker names is owed the colour observation the stencil
         # state produced, and a capture on any other rail has to leave the case
-        # out. The committed marker names the three trace rails, because the
-        # object API records no stencil surface yet.
+        # out. The committed marker names all five rails, because v48 carried
+        # the same surface and test through the Rust native rail and both
+        # object rails (`research/docs/23` §3.3, v48), so every rail's capture
+        # owes the same colour landing.
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             owes = stencil_marker(suite, rail)

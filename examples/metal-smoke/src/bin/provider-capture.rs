@@ -5634,6 +5634,7 @@ fn run_render_case(
         case_stencil(case, &format!("render case {}", case.id))?;
     let cull = case_cull(case)?;
     let blend = case_blend(case)?;
+
     // The declaring pass's own resource table: one backing image and one
     // `AllocationRecord` per allocation (`docs/23` §4.1).
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -6310,17 +6311,6 @@ fn run_object_render_case(
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
-    // The object API records no stencil surface yet (`research/docs/23` §3.3,
-    // v47): a marked stencil case is refused here rather than recorded without
-    // its state, which would land colour bytes the fixture's own review says
-    // the stencil test decides.
-    if case.stencil.is_some() {
-        return Err(format!(
-            "render case {}: the object rails have no stencil entry yet",
-            case.id
-        )
-        .into());
-    }
     let attachments = render_attachment_shapes(case)?;
     let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &declaring.buffers {
@@ -6577,6 +6567,37 @@ fn run_object_render_case(
         let index_count = u32::try_from(case.vertices)?;
         let cull = case_cull(case)?;
         let blend = case_blend(case)?;
+
+        // The object rail's own stencil pair (`research/docs/23` §3.3, v47/v48):
+        // the same rail-owned surface and the same state the trace contract names,
+        // converted once so the recording entry takes exactly what the fixture
+        // declares.
+        let object_stencil = {
+            let (stencil, test) = case_stencil(case, &format!("render case {}", case.id))?;
+            (
+                stencil.map(|stencil| objects::RenderStencilAttachment {
+                    width: stencil.width,
+                    height: stencil.height,
+                    load: match stencil.load {
+                        metal_api_core::provider::StencilLoadOp::Clear(value) => {
+                            objects::RenderStencilLoad::Clear(value)
+                        }
+                        metal_api_core::provider::StencilLoadOp::Load => {
+                            objects::RenderStencilLoad::Load
+                        }
+                    },
+                }),
+                test.map(|test| objects::RenderStencilTest {
+                    compare: test.compare,
+                    fail_op: test.fail_op,
+                    depth_fail_op: test.depth_fail_op,
+                    pass_op: test.pass_op,
+                    read_mask: test.read_mask,
+                    write_mask: test.write_mask,
+                    reference: test.reference,
+                }),
+            )
+        };
         if case.depth.is_some() {
             // The reviewed depth case opens the surface through the object
             // API's depth entry (`research/docs/23` §3.3, v36/v37): the pass
@@ -6628,6 +6649,21 @@ fn run_object_render_case(
                 u32::try_from(case.instance_count)?,
                 depth,
                 depth_test,
+                present,
+            )?;
+        } else if let (Some(stencil), stencil_test) = &object_stencil {
+            // The reviewed stencil case runs on the object rails too
+            // (`research/docs/23` §3.3, v47/v48): the encoder records the same
+            // rail-owned surface and the same state the trace contract names,
+            // so the pass it becomes is the one the other rails execute.
+            render.draw_indexed_primitives_with_stencil(
+                &recorded,
+                width,
+                height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                *stencil,
+                *stencil_test,
                 present,
             )?;
         } else if let Some(blend) = &blend {
