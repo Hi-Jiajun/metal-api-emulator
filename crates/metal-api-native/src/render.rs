@@ -50,7 +50,7 @@ use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
-    ContractError, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
+    ContractError, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
@@ -1237,10 +1237,15 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) row_pitch: usize,
 }
 
-/// The depth attachment a plan opens (`research/docs/23` §3.3, v36).
+/// The depth attachment a plan opens (`research/docs/23` §3.3, v36/v43).
 ///
-/// Rail-owned like the Vulkan rail's: no trace identity and no readback, so the
-/// plan carries the shape the encoder creates and opens.
+/// Rail-owned like the Vulkan rail's: no trace identity lives here, so the plan
+/// carries the shape the encoder creates and opens, and the trace's own landing
+/// is resolved beside it ([`TraceRenderPlan::depth_landing`]). The store action
+/// is what decides whether the surface outlives the pass: a storing one is read
+/// back through the same `getBytes` shape the colour attachments use, and every
+/// pre-v43 shape — no statement at all, or the explicit discard — keeps the
+/// surface rail-owned and disappears with the pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedDepth {
     pub(crate) width: u32,
@@ -1250,6 +1255,19 @@ pub(crate) struct PlannedDepth {
     /// The pass's depth state, or `None` for "the attachment exists and
     /// nothing tests it".
     pub(crate) test: Option<DepthTest>,
+    /// The store action the trace stated, or `None` for the pre-v43 shape
+    /// (`research/docs/23` §3.3, v43). A storing surface is the only one this
+    /// rail reads back, which is also why its texture is created with shared
+    /// storage ([`depth_texture`]).
+    pub(crate) store: Option<DepthStoreOp>,
+}
+
+impl PlannedDepth {
+    /// Whether the pass keeps this surface — and therefore reads it back
+    /// (`research/docs/23` §3.3, v43).
+    pub(crate) fn storing(&self) -> bool {
+        self.store == Some(DepthStoreOp::Store)
+    }
 }
 
 /// One colour attachment of a planned pass, resolved before any Metal object
@@ -1327,6 +1345,32 @@ pub(crate) fn plan<'a>(
             )
             .with_field("maximum", FieldValue::Unsigned(1))
             .with_detail("a present pass hands exactly one colour attachment on to its target"));
+    }
+    // A present pass renders into the provider-owned target alone: it opens no
+    // depth surface, so a trace that names one — stored or not — asks for a
+    // state this shape cannot execute. Refusing here keeps the depth attachment
+    // from being silently dropped instead of opened, which is what the
+    // offscreen path would do with it (`research/docs/23` §3.3, v43; the same
+    // slug, class and detail the Vulkan rail's present entry states).
+    if present {
+        if let Some(depth) = &request.pass.depth {
+            return Err(capability_refusal("render_present_depth_unsupported")
+                .with_field(
+                    "store",
+                    FieldValue::Text(
+                        match depth.store {
+                            Some(DepthStoreOp::Store) => "store",
+                            Some(DepthStoreOp::DontCare) => "dontcare",
+                            None => "unstated",
+                        }
+                        .to_owned(),
+                    ),
+                )
+                .with_detail(
+                    "the present rail renders into one provider-owned colour target and opens no \
+                     depth surface",
+                ));
+        }
     }
     let Some(attachment) = attachments.first() else {
         return Err(contract_refusal(ContractError::EmptyAttachmentList));
@@ -1470,6 +1514,11 @@ pub(crate) fn plan<'a>(
             height: u32::try_from(depth.height).unwrap_or(u32::MAX),
             clear_bits: depth.load.clear_depth().map(f32::to_bits),
             test: request.pass.depth_test,
+            // The store action is the pass's own statement
+            // (`research/docs/23` §3.3, v43): the pre-v43 shapes leave it
+            // absent, and core admission has already held the storing shape to
+            // naming a landing identity.
+            store: depth.store,
         }),
         vertices: request.pass.vertices,
         instance_count: request.pass.instance_count,
@@ -1735,6 +1784,13 @@ pub(crate) struct TraceRenderPlan<'a> {
     /// view whose identity covers the attachment, which is the writeback
     /// channel each attachment's texels leave through.
     pub(crate) landings: Vec<&'a BufferView>,
+    /// The landing view of a stored depth attachment, or `None` for every
+    /// shape whose depth surface does not outlive its pass
+    /// (`research/docs/23` §3.3, v43): the pool view whose identity is the
+    /// depth identity, which is the writeback channel the stored texels leave
+    /// through. A pass with no depth attachment and one that discards it both
+    /// land here as `None`, exactly as they state nothing about a landing.
+    pub(crate) depth_landing: Option<&'a BufferView>,
     pub(crate) plan: RenderPlan<'a>,
     /// The present action hanging off this pass, if any, with its sentinel
     /// already expanded to the target's whole texel extent so the macOS
@@ -1757,8 +1813,9 @@ pub(crate) struct PresentPlan<'a> {
 }
 
 impl TraceRenderPlan<'_> {
-    /// The writebacks this pass's per-attachment readbacks become: one
-    /// [`BufferWriteback`] per *stored* landing view, in location order.
+    /// The writebacks this pass's readbacks become: one [`BufferWriteback`] per
+    /// *stored* landing view, in location order, followed by the stored depth
+    /// attachment's own when the pass has one (`research/docs/23` §3.3, v43).
     ///
     /// The view identity, allocation and offset are each landing view's own, so
     /// resource admission, lease bookkeeping and readback consumers need no
@@ -1767,21 +1824,42 @@ impl TraceRenderPlan<'_> {
     /// attachment has no readback and no writeback: its landing view stays in
     /// the plan for the load-side resolution, but its bytes never leave the
     /// pass, so it cannot present a blank readback as "landed correctly"
-    /// (`research/docs/23` §3.6, v19). The caller's `texels` therefore carries
-    /// one entry per stored attachment, matching the filtered landings.
-    pub(crate) fn writebacks(&self, texels: Vec<Vec<u8>>) -> Vec<BufferWriteback> {
-        self.landings
+    /// (`research/docs/23` §3.6, v19). The caller's `readback` therefore carries
+    /// one entry per stored attachment, matching the filtered landings, plus
+    /// the depth texels exactly when the pass stores that surface.
+    ///
+    /// The depth writeback is the same shape as the colour ones — the landing
+    /// view's own identity and offset, and the surface's own `depth32float`
+    /// texels — so it needs no second channel either. The list it is appended
+    /// to need not be in identity order itself: every caller folds it through
+    /// [`merge_writebacks`], which is where the canonical order the core
+    /// contract states is established.
+    pub(crate) fn writebacks(&self, readback: RenderReadback) -> Vec<BufferWriteback> {
+        let mut writebacks: Vec<BufferWriteback> = self
+            .landings
             .iter()
             .zip(&self.plan.attachments)
             .filter(|(_, attachment)| attachment.store == RenderStoreAction::Store)
-            .zip(texels)
+            .zip(readback.attachments)
             .map(|((landing, _), bytes)| BufferWriteback {
                 view_id: landing.view_id,
                 allocation_id: landing.allocation_id,
                 offset: landing.offset,
                 bytes,
             })
-            .collect()
+            .collect();
+        // A discarded or absent depth surface has no readback, so it adds no
+        // writeback: the bytes never left the pass (`research/docs/23` §3.3,
+        // v43).
+        if let (Some(landing), Some(texels)) = (self.depth_landing, readback.depth) {
+            writebacks.push(BufferWriteback {
+                view_id: landing.view_id,
+                allocation_id: landing.allocation_id,
+                offset: landing.offset,
+                bytes: texels,
+            });
+        }
+        writebacks
     }
 
     /// The single writeback a present pass's one attachment becomes.
@@ -1879,6 +1957,39 @@ pub(crate) fn plan_trace<'a>(
             landings.push(landing);
             previous.push(bytes);
         }
+        // The stored depth attachment's landing view, resolved before the pass
+        // runs for the same reason the colour ones are: the texels it receives
+        // have to be named by the trace, and a storing surface without a
+        // declaration is refused instead of executed and dropped
+        // (`research/docs/23` §3.3, v43). Every other shape — no depth
+        // attachment, or one the pass discards with itself — states no landing
+        // and resolves none.
+        let depth_landing = match pass.depth.as_ref() {
+            Some(depth) => match (depth.store, depth.identity) {
+                (Some(DepthStoreOp::Store), Some(identity)) => Some(
+                    pool.iter()
+                        .find(|view| {
+                            view.view_id == identity.view_id
+                                && view.allocation_id == identity.allocation_id
+                        })
+                        .ok_or_else(|| {
+                            capability_refusal("render_depth_landing_unsupported")
+                                .with_field("view", FieldValue::Unsigned(identity.view_id.get()))
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored depth attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                        })?,
+                ),
+                _ => None,
+            },
+            None => None,
+        };
         let plan_of_pass = plan(&OffscreenRenderRequest {
             pass,
             pipeline: contract,
@@ -1904,6 +2015,7 @@ pub(crate) fn plan_trace<'a>(
             pass,
             contract,
             landings,
+            depth_landing,
             plan: plan_of_pass,
             present,
         });
@@ -1932,8 +2044,25 @@ pub(crate) fn merge_writebacks(
     merged.into_values().collect()
 }
 
+/// The texels one offscreen render pass hands back (`research/docs/23` §3.3,
+/// v43).
+///
+/// `attachments` carries one entry per *stored* colour attachment, in location
+/// order: the shape the readback channel had before the depth attachment could
+/// be observed. `depth` carries the stored depth surface's own tightly packed
+/// `depth32float` texels — four bytes per texel over the pass's extent, the
+/// same region [`read_texels`] reads a colour attachment from — or `None` when
+/// the pass discards its depth attachment, which is what every pre-v43 trace
+/// states.
+#[derive(Debug)]
+pub(crate) struct RenderReadback {
+    pub(crate) attachments: Vec<Vec<u8>>,
+    pub(crate) depth: Option<Vec<u8>>,
+}
+
 /// Execute one offscreen render pass and return its tightly packed texel bytes,
-/// one readback per colour attachment in location order.
+/// one readback per colour attachment in location order and the stored depth
+/// surface's own when the pass has one.
 ///
 /// Not verified on an Apple GPU: the check that would verify this encoder body
 /// is the Rust provider's own render path in a committed suite, and the macOS
@@ -1951,7 +2080,7 @@ pub(crate) fn execute_offscreen_render(
     device: &Device,
     queue: &CommandQueue,
     request: &OffscreenRenderRequest<'_>,
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<RenderReadback, ProviderError> {
     let planned = plan(request)?;
     encode_offscreen_render(device, queue, &planned)
 }
@@ -1969,7 +2098,7 @@ pub(crate) fn encode_offscreen_render(
     device: &Device,
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<RenderReadback, ProviderError> {
     objc::rc::autoreleasepool(|| {
         let attachments = attachment_textures(device, planned)?;
         encode_into_and_readback(device, queue, planned, &attachments, None)
@@ -1995,6 +2124,7 @@ pub(crate) fn encode_present_render(
         let readbacks =
             encode_into_and_readback(device, queue, planned, std::slice::from_ref(target), None)?;
         readbacks
+            .attachments
             .into_iter()
             .next()
             .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))
@@ -2016,7 +2146,7 @@ pub(crate) fn encode_indirect_offscreen_render(
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
     replay: &icb::IcbPlan,
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<RenderReadback, ProviderError> {
     // `plan_trace` refuses an indirect draw whose pass binds streams, because
     // the replay shape this rail builds carries the pipeline state and the draw
     // counts rather than the streams a caller-held layout reads. This is the
@@ -2036,7 +2166,9 @@ pub(crate) fn encode_indirect_offscreen_render(
 
 /// The shared encoder body of the offscreen and present rails: build the
 /// reviewed pipeline, render the pass into `targets`, wait for a terminal
-/// command-buffer status, and read every attachment's texels back.
+/// command-buffer status, and read every attachment's texels back — the stored
+/// depth surface's own included when the plan has one
+/// (`research/docs/23` §3.3, v43).
 #[cfg(target_os = "macos")]
 fn encode_into_and_readback(
     device: &Device,
@@ -2044,7 +2176,7 @@ fn encode_into_and_readback(
     planned: &RenderPlan<'_>,
     targets: &[Texture],
     indirect: Option<icb::IcbPlan>,
-) -> Result<Vec<Vec<u8>>, ProviderError> {
+) -> Result<RenderReadback, ProviderError> {
     let pipeline = render_pipeline_state(device, planned)?;
     // The pass descriptor is autoreleased; it only has to outlive the
     // encoder creation below.
@@ -2085,9 +2217,9 @@ fn encode_into_and_readback(
         }
     }
     // The depth attachment is the rail's own texture, created when the plan
-    // declares one and never read back (`research/docs/23` §3.3, v36): the pass
-    // descriptor opens it with the plan's load operation and discards it after
-    // the draw.
+    // declares one (`research/docs/23` §3.3, v36): the pass descriptor opens it
+    // with the plan's load operation and stores or discards it after the draw
+    // exactly as the trace stated (v43). A storing surface is read back below.
     // The texture and the depth-stencil state stay in these locals until the
     // readback below: the pass descriptor and the encoder reference them, and
     // the rail's objects are autoreleased at the end of the pool.
@@ -2108,7 +2240,15 @@ fn encode_into_and_readback(
             }
             None => attachment.set_load_action(MTLLoadAction::Load),
         }
-        attachment.set_store_action(MTLStoreAction::DontCare);
+        // The store action is the pass's own statement
+        // (`research/docs/23` §3.3, v43): a storing surface has to survive the
+        // pass for its texels to leave it, and every pre-v43 shape discards the
+        // rail-owned surface with the pass.
+        attachment.set_store_action(if depth.storing() {
+            MTLStoreAction::Store
+        } else {
+            MTLStoreAction::DontCare
+        });
     }
     let depth_stencil_state = planned.depth.as_ref().map(|depth| {
         let descriptor = DepthStencilDescriptor::new();
@@ -2289,13 +2429,24 @@ fn encode_into_and_readback(
         return Err(resource_refusal("metal_render_command_failed")
             .with_detail(format!("command buffer ended with status {status}")));
     }
-    planned
+    let attachments = planned
         .attachments
         .iter()
         .zip(targets)
         .filter(|(attachment, _)| attachment.store == RenderStoreAction::Store)
         .map(|(_, target)| read_texels(target, planned))
-        .collect()
+        .collect::<Result<Vec<Vec<u8>>, ProviderError>>()?;
+    // The stored depth surface's texels leave through the same `getBytes` shape
+    // the colour attachments use (`research/docs/23` §3.3, v43): the texture is
+    // shared storage exactly when the pass stores it (`depth_texture`), and the
+    // region is the pass's own extent, which the contract holds to the colour
+    // attachments'. A discarded or absent surface keeps its bytes on the
+    // device and reads nothing back.
+    let depth = match (&planned.depth, &depth_target) {
+        (Some(depth), Some(texture)) if depth.storing() => Some(read_texels(texture, planned)?),
+        _ => None,
+    };
+    Ok(RenderReadback { attachments, depth })
 }
 
 /// The colour attachments this rail renders into, one texture per location.
@@ -2366,11 +2517,13 @@ const fn metal_blend_operation(operation: BlendOperation) -> MTLBlendOperation {
 }
 
 /// The rail-owned depth texture of a pass that declares one
-/// (`research/docs/23` §3.3, v36).
+/// (`research/docs/23` §3.3, v36/v43).
 ///
-/// Private storage, because nothing reads the depth texels back: the colour
-/// attachments' shared storage exists for their readback, and the depth
-/// attachment has none in this increment.
+/// Shared storage when the pass stores the surface, because `getBytes` reads no
+/// `Private` texture and the readback is what makes the stored texels
+/// observable — the same reason the colour attachments are shared
+/// (`research/docs/16` §4.8). The pre-v43 shapes keep `Private`: nothing reads
+/// those texels back, and the rail-owned surface disappears with the pass.
 #[cfg(target_os = "macos")]
 fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
@@ -2380,7 +2533,11 @@ fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, Provi
     descriptor.set_height(u64::from(depth.height));
     descriptor.set_mipmap_level_count(1);
     descriptor.set_usage(MTLTextureUsage::RenderTarget);
-    descriptor.set_storage_mode(MTLStorageMode::Private);
+    descriptor.set_storage_mode(if depth.storing() {
+        MTLStorageMode::Shared
+    } else {
+        MTLStorageMode::Private
+    });
     let pointer: *mut metal::MTLTexture =
         unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
     if pointer.is_null() {
@@ -2619,11 +2776,12 @@ mod tests {
     use super::*;
     use metal_api_core::provider::{
         AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BufferAccess,
-        BufferBindingContract, BufferSource, CompiledComputePipeline, CompletionPolicy,
-        ComputePass, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-        FunctionIdentity, FunctionSource, IndirectCommandBufferDescriptor, IndirectCommandKind,
-        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, OperationId,
-        PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
+        BufferBindingContract, BufferSource, CompareFunction, CompiledComputePipeline,
+        CompletionPolicy, ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch,
+        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
+        IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
+        IndirectCommandRange, InitialState, LeaseId, OperationId, PipelineContract, PresentTarget,
+        ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
         ResourceTableSnapshot, SemanticDigest, StorageMode, VertexAttribute, VertexBufferLayout,
         VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
@@ -3075,6 +3233,55 @@ mod tests {
         assert_eq!(error.fields.get("maximum"), Some(&FieldValue::Unsigned(1)));
     }
 
+    /// A present pass renders into the provider-owned target alone: it opens no
+    /// depth surface, so a pass that names one — stored or not — is refused
+    /// instead of having the attachment silently dropped, the same refusal the
+    /// Vulkan rail's present entry states (`research/docs/23` §3.3, v43).
+    #[test]
+    fn plan_refuses_a_present_pass_with_a_depth_attachment() {
+        for (store, expected) in [
+            (None, "unstated"),
+            (Some(DepthStoreOp::DontCare), "dontcare"),
+            (Some(DepthStoreOp::Store), "store"),
+        ] {
+            let mut pass = milestone_present_pass();
+            pass.depth = Some(RenderDepthAttachment {
+                format: DepthFormat::Depth32Float,
+                width: 2,
+                height: 2,
+                load: DepthLoadOp::clear(1.0),
+                store,
+                identity: match store {
+                    Some(DepthStoreOp::Store) => Some(RenderDepthIdentity {
+                        allocation_id: DEPTH_STORE_ALLOCATION,
+                        view_id: DEPTH_STORE_VIEW,
+                    }),
+                    _ => None,
+                },
+            });
+            pass.depth_test = Some(DepthTest {
+                compare: CompareFunction::Less,
+                write: true,
+            });
+            let pipeline = milestone_pipeline();
+            let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+            assert_eq!(error.slug, "render_present_depth_unsupported");
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.phase, ProviderPhase::Resolve);
+            assert_eq!(
+                error.fields.get("store"),
+                Some(&FieldValue::Text(expected.to_owned()))
+            );
+            assert_eq!(
+                error.detail.as_deref(),
+                Some(
+                    "the present rail renders into one provider-owned colour target and opens \
+                     no depth surface"
+                )
+            );
+        }
+    }
+
     #[test]
     fn plan_refuses_a_draw_shape_other_than_the_full_screen_triangle() {
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
@@ -3272,6 +3479,93 @@ mod tests {
         };
         *pass = milestone_present_pass();
         (trace, resources)
+    }
+
+    /// The stored depth attachment's own resource (`research/docs/23` §3.3,
+    /// v43): allocation 940 and view 950, covering the milestone pass's 2x2
+    /// `depth32float` extent — four texels of four bytes, the same length the
+    /// colour attachment's landing view has.
+    const DEPTH_STORE_ALLOCATION: AllocationId = AllocationId::new(940);
+    const DEPTH_STORE_VIEW: ViewId = ViewId::new(950);
+    /// The stored depth surface's byte length: 2x2 texels of a four-byte
+    /// `depth32float` texel each.
+    const DEPTH_STORE_BYTES: u64 = 16;
+
+    /// The depth the v43 fixture's draw leaves behind: `0.5` as
+    /// `depth32float`'s little-endian bytes. The clear below writes `1.0`
+    /// (`00 00 80 3f`), so a pass that never stored its depth surface cannot
+    /// read back as one that did.
+    const DEPTH_STORE_TEXEL: [u8; 4] = [0x00, 0x00, 0x00, 0x3f];
+
+    /// The compute declaration of the stored depth surface's landing view: one
+    /// read-only view over the whole attachment, the same shape the colour
+    /// attachment's own declaration pass has.
+    ///
+    /// A stored depth identity has to be declared by the trace: core admission
+    /// resolves it against the same declarations a colour attachment resolves
+    /// against and refuses an undeclared one (`AttachmentViewUnknown`), and the
+    /// declaring binding is what puts the view into the serial pool — its
+    /// access is what `serial_resources` upgrades to a write — which is where
+    /// [`plan_trace`] resolves the landing from (`research/docs/23` §3.3, v43).
+    fn depth_declaration_pass() -> ComputePass {
+        ComputePass {
+            pipeline: PipelineId::new(11),
+            buffers: vec![BufferView {
+                view_id: DEPTH_STORE_VIEW,
+                metal_binding: 0,
+                allocation_id: DEPTH_STORE_ALLOCATION,
+                offset: 0,
+                length: DEPTH_STORE_BYTES,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![0x80; DEPTH_STORE_BYTES as usize]),
+            }],
+            dispatch: Dispatch {
+                kind: DispatchKind::ThreadsExact,
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            },
+            textures: Vec::new(),
+        }
+    }
+
+    /// The v43 trace: the milestone pass plus a depth attachment of the same
+    /// 2x2 extent, and the compute declaration of its landing view.
+    ///
+    /// `store` is the whole v43 axis. `Some(Store)` is the shape whose texels
+    /// survive the pass and therefore need a landing; `None` is the pre-v43
+    /// shape and `Some(DontCare)` the explicit discard, both of which keep the
+    /// surface rail-owned and land nothing.
+    fn depth_store_trace(store: Option<DepthStoreOp>) -> ComputeTrace {
+        let (mut trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store,
+            identity: match store {
+                Some(DepthStoreOp::Store) => Some(RenderDepthIdentity {
+                    allocation_id: DEPTH_STORE_ALLOCATION,
+                    view_id: DEPTH_STORE_VIEW,
+                }),
+                _ => None,
+            },
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        // The declaration comes before the render pass, exactly as the colour
+        // attachment's does: the pool it feeds is the compute rail's binding
+        // set and every pass of it runs before the draw.
+        trace
+            .passes
+            .insert(1, TracePass::Compute(depth_declaration_pass()));
+        trace
     }
 
     /// The capability snapshot the macOS provider builds, with the render bits
@@ -4057,7 +4351,10 @@ mod tests {
         // invented.
         assert_eq!(planned.landings[0].view_id, ViewId::new(7));
         assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
-        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+            depth: None,
+        });
         let [writeback] = writebacks.as_slice() else {
             panic!("the milestone attachment becomes one writeback");
         };
@@ -4179,6 +4476,132 @@ mod tests {
         pass.color_attachments[0].view_id = ViewId::new(8);
         let error = plan_trace(&loading, &pool, &milestone_contracts()).unwrap_err();
         assert_eq!(error.slug, "render_attachment_landing_unsupported");
+    }
+
+    /// The v43 increment over the trace path: a depth attachment the pass
+    /// stores resolves its declared view as a second landing, and the stored
+    /// texels become the writeback that follows the colour ones in the same
+    /// channel (`research/docs/23` §3.3, v43).
+    #[test]
+    fn plan_trace_plans_a_stored_depth_pass_and_its_landing_view() {
+        let trace = depth_store_trace(Some(DepthStoreOp::Store));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("the stored depth surface lands in its declaring view");
+        let [planned] = planned.as_slice() else {
+            panic!("the depth trace carries one render pass");
+        };
+        let Some(depth) = &planned.plan.depth else {
+            panic!("the pass opens a depth attachment");
+        };
+        assert_eq!(depth.store, Some(DepthStoreOp::Store));
+        // The landing is the declaration's own identity and range, so the
+        // stored texels leave through the view the trace named and no second
+        // channel is invented (`research/docs/23` §3.3, v43).
+        let landing = planned
+            .depth_landing
+            .expect("a stored depth attachment names its landing view");
+        assert_eq!(landing.view_id, DEPTH_STORE_VIEW);
+        assert_eq!(landing.allocation_id, DEPTH_STORE_ALLOCATION);
+        assert_eq!(landing.offset, 0);
+        assert_eq!(landing.length, DEPTH_STORE_BYTES);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+            depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
+        });
+        let [colour, depth] = writebacks.as_slice() else {
+            panic!("the stored depth attachment becomes a second writeback");
+        };
+        assert_eq!(colour.view_id, ViewId::new(7));
+        assert_eq!(colour.allocation_id, AllocationId::new(9));
+        assert_eq!(colour.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+        assert_eq!(depth.view_id, DEPTH_STORE_VIEW);
+        assert_eq!(depth.allocation_id, DEPTH_STORE_ALLOCATION);
+        assert_eq!(depth.offset, 0);
+        assert_eq!(depth.bytes, DEPTH_STORE_TEXEL.repeat(4));
+    }
+
+    /// The two shapes that state no store keep the surface rail-owned: no
+    /// landing is resolved, and a readback that carries no depth texels adds no
+    /// second writeback — the pre-v43 byte shape exactly
+    /// (`research/docs/23` §3.3, v43).
+    #[test]
+    fn plan_trace_keeps_a_discarded_depth_attachment_out_of_the_writebacks() {
+        for store in [None, Some(DepthStoreOp::DontCare)] {
+            let trace = depth_store_trace(store);
+            let pool = trace.serial_resources().expect("admitted serial pool");
+            let contracts = milestone_contracts();
+            let planned = plan_trace(&trace, &pool, &contracts)
+                .expect("a discarded depth surface needs no landing");
+            let [planned] = planned.as_slice() else {
+                panic!("the depth trace carries one render pass");
+            };
+            let Some(depth) = &planned.plan.depth else {
+                panic!("the pass opens a depth attachment");
+            };
+            assert_eq!(depth.store, store);
+            assert!(
+                planned.depth_landing.is_none(),
+                "{store:?} keeps the depth surface rail-owned"
+            );
+            let writebacks = planned.writebacks(RenderReadback {
+                attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+                depth: None,
+            });
+            let [writeback] = writebacks.as_slice() else {
+                panic!("{store:?} lands the colour attachment alone");
+            };
+            assert_eq!(writeback.view_id, ViewId::new(7));
+            assert_eq!(writeback.allocation_id, AllocationId::new(9));
+            assert_eq!(writeback.bytes, EXPECTED_TEXEL_BYTES.repeat(4));
+        }
+    }
+
+    /// A storing depth attachment no declared view covers has nowhere to land,
+    /// so the pass is refused by name instead of executed and dropped — the
+    /// shape the colour attachments' landing refusal already has
+    /// (`research/docs/23` §3.3, v43).
+    #[test]
+    fn plan_trace_refuses_a_stored_depth_attachment_without_a_landing_view() {
+        let mut trace = depth_store_trace(Some(DepthStoreOp::Store));
+        // The depth declaration is what the landing resolution reads: without
+        // it the trace declares no view covering the stored surface, and the
+        // colour attachment's own declaration stays in place. Core admission
+        // states the same requirement one level up, which is why the trace
+        // itself no longer resolves to a pool.
+        trace.passes.retain(|pass| {
+            !matches!(
+                pass,
+                TracePass::Compute(compute)
+                    if compute
+                        .buffers
+                        .iter()
+                        .any(|view| view.view_id == DEPTH_STORE_VIEW)
+            )
+        });
+        assert!(matches!(
+            trace.serial_resources(),
+            Err(ContractError::AttachmentViewUnknown { .. })
+        ));
+        // The rail's own walk keeps the refusal for a plan that never went
+        // through admission: the pool below is the shape the colour attachment
+        // alone declares, so the stored depth surface is the only landing left
+        // without a view.
+        let pool = vec![declaration_pass().buffers[0].clone()];
+        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        assert_eq!(error.slug, "render_depth_landing_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(DEPTH_STORE_VIEW.get())),
+            "the refusal names the depth view that has no landing rail"
+        );
+        assert_eq!(
+            error.fields.get("allocation"),
+            Some(&FieldValue::Unsigned(DEPTH_STORE_ALLOCATION.get()))
+        );
     }
 
     /// The ordering rule the trace path shares with the Vulkan rail: every
@@ -4591,7 +5014,10 @@ mod tests {
         );
         assert_eq!(planned.landings[0].view_id, ViewId::new(7));
         assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
-        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+            depth: None,
+        });
         let [writeback] = writebacks.as_slice() else {
             panic!("the indexed attachment becomes one writeback");
         };
@@ -4618,10 +5044,13 @@ mod tests {
         assert_eq!(planned.landings[0].allocation_id, AllocationId::new(9));
         assert_eq!(planned.landings[1].view_id, ViewId::new(8));
         assert_eq!(planned.landings[1].allocation_id, AllocationId::new(10));
-        let writebacks = planned.writebacks(vec![
-            EXPECTED_TEXEL_BYTES.repeat(4),
-            [0xff, 0x80, 0x40, 0xc0].repeat(4),
-        ]);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![
+                EXPECTED_TEXEL_BYTES.repeat(4),
+                [0xff, 0x80, 0x40, 0xc0].repeat(4),
+            ],
+            depth: None,
+        });
         assert_eq!(writebacks.len(), 2);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
         assert_eq!(writebacks[0].bytes, EXPECTED_TEXEL_BYTES.repeat(4));
@@ -4655,7 +5084,10 @@ mod tests {
         // declaring view for the load-side resolution — but only the stored
         // attachment's readback becomes a writeback.
         assert_eq!(planned.landings.len(), 2);
-        let writebacks = planned.writebacks(vec![EXPECTED_TEXEL_BYTES.repeat(4)]);
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
+            depth: None,
+        });
         assert_eq!(writebacks.len(), 1);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
         assert_eq!(writebacks[0].allocation_id, AllocationId::new(9));

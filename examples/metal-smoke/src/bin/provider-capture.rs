@@ -7,17 +7,17 @@ use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
     BlendOperation, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction,
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
-    CullMode, DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind,
-    DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
-    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
-    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
-    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
-    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode, StoreOp, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    PROVIDER_SCHEMA_VERSION,
+    CullMode, DepthFormat, DepthLoadOp, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
+    DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
+    HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
+    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
+    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
+    ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1288,6 +1288,24 @@ struct DepthAttachmentDefinition {
     load: String,
     #[serde(default)]
     clear_depth: Option<f64>,
+    /// The store action the pass states (`research/docs/23` §3.3, v43), or
+    /// absent for the pre-v43 shape: the rail-owned surface disappears with the
+    /// pass and nothing observes its texels.
+    #[serde(default)]
+    store: Option<String>,
+    /// The allocation the stored texels land in. Present exactly when `store`
+    /// is, together with `view` and `expected_hex`.
+    #[serde(default)]
+    allocation: Option<u64>,
+    /// The view inside that allocation the landing covers.
+    #[serde(default)]
+    view: Option<u64>,
+    /// The depth texels the readback has to carry, as lowercase hex. The
+    /// fixture states them because the comparison is byte-exact: a rail that
+    /// skipped the store, the readback or the draw's depth write lands other
+    /// bytes and fails here.
+    #[serde(default)]
+    expected_hex: Option<String>,
 }
 
 /// The depth state a render case's draw tests with (`research/docs/23` §3.3,
@@ -2167,7 +2185,10 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v25") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v26") => &["render_declaring_quad_extent"],
         (1, "compute-buffer-v27") => &["render_declaring_two_attachments"],
-        (1, "compute-buffer-v28") => &["render_declaring_quad_extent"],
+        (1, "compute-buffer-v28") => &[
+            "render_declaring_quad_extent",
+            "render_declaring_depth_store",
+        ],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -2197,12 +2218,18 @@ fn validate_suite(suite: &Suite) -> Result<()> {
     // The view a render case draws into is the attachment's own allocation: the
     // render rail reads the image back directly, so the guard-byte discipline
     // that makes a compute case's offset mistake observable in the allocation
-    // image does not apply to it (`research/docs/23` §5.2).
+    // image does not apply to it (`research/docs/23` §5.2). A stored depth
+    // attachment is the same shape from v43 on: the render pass writes its
+    // whole view, so that view needs no guard bytes either.
     let attachment_views = suite
         .render_cases
         .iter()
-        .flat_map(render_case_attachments)
-        .map(|attachment| (attachment.allocation, attachment.view))
+        .flat_map(|case| {
+            render_case_attachments(case)
+                .into_iter()
+                .map(|attachment| (attachment.allocation, attachment.view))
+                .chain(case.depth.as_ref().and_then(depth_attachment_identity))
+        })
         .collect::<BTreeSet<_>>();
     for case in &suite.cases {
         validate_case_programs(case)?;
@@ -2366,6 +2393,17 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
         return attachments.iter().collect();
     }
     case.attachment.iter().collect()
+}
+
+/// The identity a render case's stored depth attachment lands in
+/// (`research/docs/23` §3.3, v43), or `None` for the pre-v43 shape: a depth
+/// attachment with no store action is rail-owned and names nowhere its texels
+/// would land.
+fn depth_attachment_identity(depth: &DepthAttachmentDefinition) -> Option<(u64, u64)> {
+    match (depth.store.as_deref(), depth.allocation, depth.view) {
+        (Some("store"), Some(allocation), Some(view)) => Some((allocation, view)),
+        _ => None,
+    }
 }
 
 /// The (attachment, expected texel hex) pairs a render case declares, in
@@ -2889,6 +2927,77 @@ fn reviewed_depth_geometry(
     }
     if depth.clear_depth != Some(DEPTH_CLEAR) {
         return Err(format!("{where_}: the reviewed depth clear is {DEPTH_CLEAR}").into());
+    }
+    // The depth readback pair (`research/docs/23` §3.3, v43): a pass that keeps
+    // its depth surface states its store action, where the texels land and what
+    // the readback has to contain, and states all three together. The
+    // expectation is what makes the channel falsifiable: it must be the depth
+    // extent's own bytes and must differ from the clear value, or "the store
+    // ran" and "the surface was never written" would read back the same bytes.
+    let depth_extent = depth
+        .width
+        .checked_mul(depth.height)
+        .and_then(|texels| texels.checked_mul(4))
+        .ok_or("depth extent overflows")?;
+    match (&depth.store, &depth.expected_hex) {
+        (None, None) => {
+            if depth.allocation.is_some() || depth.view.is_some() {
+                return Err(format!(
+                    "{where_}: a discarded depth attachment carries no identity or expectation"
+                )
+                .into());
+            }
+        }
+        (Some(store), Some(expected_hex)) => {
+            if store != "store" {
+                return Err(format!(
+                    "{where_}: the only depth store action is \"store\", got {store:?}"
+                )
+                .into());
+            }
+            let (Some(allocation), Some(view)) = (depth.allocation, depth.view) else {
+                return Err(format!(
+                    "{where_}: a stored depth attachment needs its allocation and view"
+                )
+                .into());
+            };
+            if allocation == 0 || view == 0 {
+                return Err(format!("{where_}: zero depth identity").into());
+            }
+            let texels = unhex(expected_hex)?;
+            if texels.len() as u64 != depth_extent {
+                return Err(format!(
+                    "{where_}: the expected depth texels do not match the depth extent"
+                )
+                .into());
+            }
+            let clear_texel = (DEPTH_CLEAR as f32).to_le_bytes();
+            if texels
+                .chunks_exact(4)
+                .all(|texel| texel == clear_texel.as_slice())
+            {
+                return Err(
+                    format!("{where_}: the expected depth texels equal the clear depth").into(),
+                );
+            }
+            // The depth surface is its own raster, so its landing cannot be the
+            // colour attachment's view: one view carrying two different
+            // attachments' bytes could not be compared at all.
+            if let Some(attachment) = &case.attachment {
+                if attachment.allocation == allocation && attachment.view == view {
+                    return Err(format!(
+                        "{where_}: the depth identity has to differ from the colour attachment"
+                    )
+                    .into());
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{where_}: the depth store action, its identity and its expectation travel together"
+            )
+            .into())
+        }
     }
     let Some(test) = &case.depth_test else {
         return Err(format!("{where_}: the reviewed depth shape carries a depth test").into());
@@ -4128,6 +4237,15 @@ fn validate_program(program: &CaseProgram) -> Result<()> {
             "shaders/copy_word.metal",
             "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc",
         ),
+        // v43's declaring pass: the same reviewed copy over three bindings, so
+        // the pass also *declares* the depth attachment's view the render pass
+        // then stores (`research/docs/23` §3.3, v43).
+        "copy_word_with_witness" => (
+            "../examples/metal-smoke/shaders/kernel_copy_word_with_witness.ll",
+            "f24e33124da1c228bf4766d32496d8d7ede4fc29d8e6c582c889a36343dfc18e",
+            "shaders/copy_word_with_witness.metal",
+            "c116fec300f1369069fbcf19d5fbb95e8c5ad07475757c19930075a19ad4367a",
+        ),
         "kernel_dispatch_threads_boundary_barrier" => (
             "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
             "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945",
@@ -4332,6 +4450,16 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4)][..],
+        ),
+        // v43: the same 4x4 attachment view, plus the depth attachment's own
+        // view as a second read, and the 4-byte output view the reviewed
+        // kernel writes. One submission therefore declares every view the
+        // depth-storing render pass touches (`research/docs/23` §3.3, v43).
+        "render_declaring_depth_store" => (
+            "copy_word_with_witness",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 64), (1, "write", 4), (2, "read", 64)][..],
         ),
         "render_declaring_four_attachments" => (
             "mrt_declare4",
@@ -5148,6 +5276,38 @@ fn case_depth(
                 width: depth.width,
                 height: depth.height,
                 load,
+                // The v43 pair travels together (`research/docs/23` §3.3): a
+                // pass that keeps its depth surface names where the texels land,
+                // and the reviewed shape is validated before this point, so a
+                // half-stated pair cannot reach the trace.
+                store: match depth.store.as_deref() {
+                    None => None,
+                    Some("store") => Some(DepthStoreOp::Store),
+                    Some(other) => {
+                        return Err(
+                            format!("{where_}: unsupported depth store action {other:?}").into(),
+                        )
+                    }
+                },
+                identity: match (depth.store.is_some(), depth.allocation, depth.view) {
+                    (true, Some(allocation), Some(view)) => Some(RenderDepthIdentity {
+                        allocation_id: AllocationId::new(allocation),
+                        view_id: ViewId::new(view),
+                    }),
+                    (true, ..) => {
+                        return Err(format!(
+                            "{where_}: a stored depth attachment needs its allocation and view"
+                        )
+                        .into())
+                    }
+                    (false, None, None) => None,
+                    (false, ..) => {
+                        return Err(format!(
+                            "{where_}: a discarded depth attachment carries no identity"
+                        )
+                        .into())
+                    }
+                },
             })
         }
     };
@@ -5274,6 +5434,53 @@ fn run_render_case(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // The stored depth attachment's own landing view (`research/docs/23` §3.3,
+    // v43): its identity is resolved against the declaring pass's table exactly
+    // as a colour attachment's is, because the depth texels leave through the
+    // same byte-keyed writeback channel. The declaring pass *reads* the depth
+    // view — the reviewed kernel carries a third read binding for it — so the
+    // view is in the trace's pool and its offset and length are the ones the
+    // writeback has to cover.
+    let depth_view = match case.depth.as_ref().and_then(|depth| depth.store.as_deref()) {
+        None => None,
+        Some("store") => {
+            let definition = case
+                .depth
+                .as_ref()
+                .ok_or("a stored depth attachment needs its definition")?;
+            let allocation = definition
+                .allocation
+                .ok_or("a stored depth attachment needs its allocation")?;
+            let view = definition
+                .view
+                .ok_or("a stored depth attachment needs its view")?;
+            Some(
+                views
+                    .iter()
+                    .find(|candidate| {
+                        candidate.view_id == ViewId::new(view)
+                            && candidate.allocation_id == AllocationId::new(allocation)
+                    })
+                    .cloned()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        format!(
+                            "the declaring pass does not declare the depth view {view} of render \
+                             case {}",
+                            case.id
+                        )
+                        .into()
+                    })?,
+            )
+        }
+        Some(other) => {
+            return Err(format!(
+                "render case {}: unsupported depth store action {other:?}",
+                case.id
+            )
+            .into())
+        }
+    };
 
     let mut trace = case_trace(
         provider.device_epoch(),
@@ -5433,6 +5640,7 @@ fn run_render_case(
         backing[start..start + write.bytes.len()].copy_from_slice(&write.bytes);
         if declared_views
             .iter()
+            .chain(depth_view.iter())
             .any(|view| view.view_id == write.view_id && view.allocation_id == write.allocation_id)
         {
             landed.insert((write.allocation_id, write.view_id), write);
@@ -5491,6 +5699,69 @@ fn run_render_case(
         });
         images.push(Allocation {
             allocation: attachment.allocation,
+            bytes_hex: hex(&image),
+        });
+    }
+    // The stored depth attachment's own landing, after the colour ones
+    // (`research/docs/23` §3.3, v43): one writeback covering the exact view the
+    // declaring pass declared, and one allocation image holding that view's
+    // bytes. A rail that does not read the depth surface back lands no
+    // writeback for it, so this is where "the channel exists" is observed
+    // rather than assumed.
+    if let Some(declared) = &depth_view {
+        let definition = case
+            .depth
+            .as_ref()
+            .ok_or("a stored depth attachment needs its definition")?;
+        let allocation = definition
+            .allocation
+            .ok_or("a stored depth attachment needs its allocation")?;
+        let view = definition
+            .view
+            .ok_or("a stored depth attachment needs its view")?;
+        let write = landed
+            .get(&(AllocationId::new(allocation), ViewId::new(view)))
+            .ok_or("the render rail landed no depth writeback")?;
+        if write.offset != declared.offset || write.bytes.len() as u64 != declared.length {
+            return Err(format!(
+                "render case {}: the depth writeback covers {}..{} instead of {}..{}",
+                case.id,
+                write.offset,
+                write.offset + write.bytes.len() as u64,
+                declared.offset,
+                declared.offset + declared.length
+            )
+            .into());
+        }
+        let expected = unhex(
+            definition
+                .expected_hex
+                .as_deref()
+                .ok_or("a stored depth attachment needs expected_hex")?,
+        )?;
+        if write.bytes != expected {
+            return Err(format!(
+                "render case {}: the depth readback is {} against the reviewed {}",
+                case.id,
+                hex(&write.bytes),
+                hex(&expected)
+            )
+            .into());
+        }
+        let image = allocations
+            .iter()
+            .find(|(id, _)| *id == allocation)
+            .ok_or("the depth allocation is missing")?
+            .1
+            .clone();
+        writebacks.push(Writeback {
+            allocation,
+            view,
+            offset: write.offset,
+            bytes_hex: hex(&write.bytes),
+        });
+        images.push(Allocation {
+            allocation,
             bytes_hex: hex(&image),
         });
     }

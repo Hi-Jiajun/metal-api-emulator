@@ -54,38 +54,117 @@ pub enum CodecError {
     Io(io::Error),
     Eof,
     BadMagic([u8; 4]),
-    FrameTooLarge { length: usize, maximum: usize },
-    FailureSlugTooLong { length: usize, maximum: usize },
-    TruncatedFrame { expected: usize, actual: usize },
-    TruncatedPayload { needed: usize, remaining: usize },
-    TrailingPayload { extra: usize },
+    FrameTooLarge {
+        length: usize,
+        maximum: usize,
+    },
+    FailureSlugTooLong {
+        length: usize,
+        maximum: usize,
+    },
+    TruncatedFrame {
+        expected: usize,
+        actual: usize,
+    },
+    TruncatedPayload {
+        needed: usize,
+        remaining: usize,
+    },
+    TrailingPayload {
+        extra: usize,
+    },
     UnknownMessageTag(u8),
     UnknownUpdateTag(u8),
     UnknownCommandTag(u8),
     UnknownFrameKind(u8),
-    ChunkSequence { expected: u64, actual: u64 },
-    ChunkTotalMismatch { declared: u64, actual: u64 },
-    ChunkInterrupted { received: u64, declared: u64 },
-    ChunkedPayloadTooLarge { total: u64, maximum: usize },
-    QueuePriorityCount { count: usize, maximum: usize },
-    TracePassCount { count: usize, maximum: usize },
-    ColorAttachmentCount { count: usize, maximum: usize },
-    RenderPipelineFormatCount { count: usize, maximum: usize },
-    VertexBufferCount { count: usize, maximum: usize },
-    VertexAttributeCount { count: usize, maximum: usize },
-    SupportedColorFormatCount { count: usize, maximum: usize },
-    SupportedVertexFormatCount { count: usize, maximum: usize },
-    SupportedIndexFormatCount { count: usize, maximum: usize },
-    PresentModeCount { count: usize, maximum: usize },
-    PresentSentinelLength { length: usize, maximum: usize },
-    HeapPlacementCount { count: usize, maximum: usize },
-    HeapStorageModeCount { count: usize, maximum: usize },
-    IndirectCommandKindCount { count: usize, maximum: usize },
+    ChunkSequence {
+        expected: u64,
+        actual: u64,
+    },
+    ChunkTotalMismatch {
+        declared: u64,
+        actual: u64,
+    },
+    ChunkInterrupted {
+        received: u64,
+        declared: u64,
+    },
+    ChunkedPayloadTooLarge {
+        total: u64,
+        maximum: usize,
+    },
+    QueuePriorityCount {
+        count: usize,
+        maximum: usize,
+    },
+    TracePassCount {
+        count: usize,
+        maximum: usize,
+    },
+    ColorAttachmentCount {
+        count: usize,
+        maximum: usize,
+    },
+    RenderPipelineFormatCount {
+        count: usize,
+        maximum: usize,
+    },
+    VertexBufferCount {
+        count: usize,
+        maximum: usize,
+    },
+    VertexAttributeCount {
+        count: usize,
+        maximum: usize,
+    },
+    SupportedColorFormatCount {
+        count: usize,
+        maximum: usize,
+    },
+    SupportedVertexFormatCount {
+        count: usize,
+        maximum: usize,
+    },
+    SupportedIndexFormatCount {
+        count: usize,
+        maximum: usize,
+    },
+    PresentModeCount {
+        count: usize,
+        maximum: usize,
+    },
+    PresentSentinelLength {
+        length: usize,
+        maximum: usize,
+    },
+    HeapPlacementCount {
+        count: usize,
+        maximum: usize,
+    },
+    HeapStorageModeCount {
+        count: usize,
+        maximum: usize,
+    },
+    IndirectCommandKindCount {
+        count: usize,
+        maximum: usize,
+    },
     UnknownPassTag(u8),
-    UnknownRenderFeature(u8),
+    /// A feature bit an extended render pass set that this decoder does not
+    /// know. The word is 16 bits wide since v43, when the narrow byte ran out
+    /// of free bits; the low byte keeps the meanings it always had.
+    UnknownRenderFeature(u16),
+    /// A wide feature that describes the depth attachment arrived without one.
+    /// The store action and the identity are properties *of* the depth
+    /// attachment, so either bit without the depth section names a surface the
+    /// pass never opens (`research/docs/23` §3.3, v43).
+    DepthFeatureWithoutAttachment(u16),
     UnknownCapabilityTail(u8),
     UnknownPipelineTag(u8),
-    UnknownEnumValue { field: &'static str, value: u8 },
+    UnknownEnumValue {
+        field: &'static str,
+        value: u8,
+    },
     InvalidUtf8(std::string::FromUtf8Error),
     Contract(ContractError),
 }
@@ -204,7 +283,12 @@ impl fmt::Display for CodecError {
             }
             Self::UnknownRenderFeature(features) => write!(
                 formatter,
-                "unknown extended render pass feature bits {features:#04x}"
+                "unknown extended render pass feature bits {features:#06x}"
+            ),
+            Self::DepthFeatureWithoutAttachment(features) => write!(
+                formatter,
+                "extended render pass feature bits {features:#06x} describe a depth attachment \
+                 the pass does not open"
             ),
             Self::UnknownCapabilityTail(tag) => {
                 write!(formatter, "unknown capability payload tail tag {tag:#04x}")

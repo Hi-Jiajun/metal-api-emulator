@@ -861,6 +861,13 @@ impl RenderTarget {
                         RenderDepthLoad::Clear(value) => contract::DepthLoadOp::clear(value),
                         RenderDepthLoad::Load => contract::DepthLoadOp::Load,
                     },
+                    // The object API's depth surface keeps the rail-owned shape
+                    // (`research/docs/23` §3.3, v36/v37): the store action and
+                    // the identity fields are the depth readback increment's,
+                    // and this entry states neither, exactly as it did before
+                    // they existed.
+                    store: None,
+                    identity: None,
                 }),
             depth_test: self.draw.depth_test.map(|test| contract::DepthTest {
                 compare: test.compare,

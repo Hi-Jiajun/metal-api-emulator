@@ -1784,7 +1784,9 @@ impl NativeMetalProvider {
     }
 
     /// Execute the planned render passes in trace order, after the compute
-    /// sequence, and turn each attachment readback into a buffer writeback.
+    /// sequence, and turn each attachment readback into a buffer writeback —
+    /// the stored depth attachment's own included when the pass has one
+    /// (`research/docs/23` §3.3, v43).
     ///
     /// The attachment's bytes leave the rail through the same channel a compute
     /// pass uses — one [`BufferWriteback`] for the view and allocation the trace
@@ -1807,23 +1809,24 @@ impl NativeMetalProvider {
                     writebacks.push(planned.writeback(texels));
                 }
                 // An offscreen pass reads every attachment back, one writeback
-                // per landing view in location order.
+                // per landing view in location order, plus the stored depth
+                // surface's own when the pass has one (v43).
                 None if icb_replay.is_some() => {
-                    let readbacks = render::encode_indirect_offscreen_render(
+                    let readback = render::encode_indirect_offscreen_render(
                         &state.device,
                         &state.queue,
                         &planned.plan,
                         icb_replay.expect("the indirect draw was planned"),
                     )?;
-                    writebacks.extend(planned.writebacks(readbacks));
+                    writebacks.extend(planned.writebacks(readback));
                 }
                 None => {
-                    let readbacks = render::encode_offscreen_render(
+                    let readback = render::encode_offscreen_render(
                         &state.device,
                         &state.queue,
                         &planned.plan,
                     )?;
-                    writebacks.extend(planned.writebacks(readbacks));
+                    writebacks.extend(planned.writebacks(readback));
                 }
             }
         }
