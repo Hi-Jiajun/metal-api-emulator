@@ -3222,6 +3222,94 @@ impl RenderCommandEncoder {
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
+    /// Record the combined-surface sibling of
+    /// [`Self::draw_indexed_primitives_with_multisample_depth`]
+    /// (`research/docs/23` §3.3, v66/v68).
+    ///
+    /// One entry carries both faces of the combined depth-stencil surface the
+    /// v66 increment reviewed: the pass-wide four-sample raster and the single
+    /// rail-owned surface the pass tests and writes through both faces. The
+    /// two faces share that surface, so their store decisions are one decision
+    /// and a lopsided pair is refused with the contract's own error rather
+    /// than read as either reviewed shape. This entry carries the v66 shape —
+    /// both faces dropped with the pass, observed through the colour resolve —
+    /// and states no resolve for either face, so the v60 stored shape (both
+    /// faces kept through their own resolves) is refused here with the
+    /// contract's own error instead of recording a pass admission would
+    /// refuse. A single-sample state is refused as every multisample sibling
+    /// refuses it. Every other rule is
+    /// [`Self::draw_indexed_primitives_with_multisample_stencil`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_multisample_depth_stencil(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        multisample: contract::MultisampleState,
+        depth: RenderDepthAttachment,
+        stencil: RenderStencilAttachment,
+        depth_test: Option<RenderDepthTest>,
+        stencil_test: Option<RenderStencilTest>,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        // The single-sample state is what the absent field means, exactly as
+        // the colour-only entry states it (`research/docs/23` §3.3, v51).
+        if multisample.sample_count == contract::SampleCount::One {
+            return Err(ContractError::SingleSampleMultisampleState.into());
+        }
+        // The two faces share one surface, so the pass keeps both or neither
+        // (`research/docs/23` §3.3, v66): a pair that stores one face while
+        // dropping the other is refused with the contract's own error, in the
+        // same shape the contract's own admission refuses it.
+        let depth_stored = depth.store == Some(contract::DepthStoreOp::Store);
+        let stencil_stored = stencil.store == Some(StoreOp::Store);
+        if depth_stored != stencil_stored {
+            return Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+                depth_stored,
+                stencil_stored,
+            }
+            .into());
+        }
+        // A kept face's texels are only observable through its own resolve,
+        // and this entry states neither — so the stored shape is refused at
+        // recording time with the contract's own error, the same one admission
+        // would answer the recorded pass with, rather than silently dropping
+        // the run's landing (`research/docs/23` §3.3, v57/v66).
+        if depth_stored {
+            return Err(ContractError::MultisampleDepthStoreUnsupported.into());
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: Some(depth),
+            depth_test,
+            stencil: Some(stencil),
+            stencil_test,
+            multisample: Some(multisample),
+            depth_resolve: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
     /// Record a multi-attachment render pass through the bound index buffer,
     /// run once per instance (`research/docs/23` §3.3, v31/v32).
     ///
