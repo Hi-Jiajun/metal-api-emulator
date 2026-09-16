@@ -2281,6 +2281,7 @@ mod tests {
 
     fn ordering_render_pass(view: u64) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(1),
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(view),

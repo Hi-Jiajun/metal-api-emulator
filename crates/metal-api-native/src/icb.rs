@@ -308,6 +308,7 @@ mod tests {
 
     fn render_pass() -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(1),
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(3),

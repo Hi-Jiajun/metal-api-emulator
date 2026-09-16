@@ -665,6 +665,10 @@ struct RenderDraw {
     /// until the encoder gains the instanced draw call; the field exists here
     /// because the pass it lands in carries it.
     instance_count: u32,
+    /// Vertex offset every index is read through (`research/docs/23` §3.3,
+    /// v34). `0` is the shape every object-API draw records today; the field
+    /// exists here because the pass it lands in carries it.
+    base_vertex: u32,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -710,6 +714,7 @@ impl RenderDraw {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            base_vertex: 0,
         }
     }
 }
@@ -801,6 +806,7 @@ impl RenderTarget {
             vertices: self.draw.vertices,
             vertex_buffers,
             indices,
+            base_vertex: self.draw.base_vertex,
             instance_count: self.draw.instance_count,
             present,
         };
@@ -2456,6 +2462,7 @@ impl RenderCommandEncoder {
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
             instance_count: 1,
+            base_vertex: 0,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2495,6 +2502,7 @@ impl RenderCommandEncoder {
             vertex_buffers: self.bound_vertex_buffers(),
             indices: None,
             instance_count,
+            base_vertex: 0,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2607,6 +2615,7 @@ impl RenderCommandEncoder {
                 format: *index_format,
             }),
             instance_count: 1,
+            base_vertex: 0,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2647,6 +2656,7 @@ impl RenderCommandEncoder {
                 format: *index_format,
             }),
             instance_count,
+            base_vertex: 0,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2871,6 +2881,10 @@ impl RenderCommandEncoder {
                 vertex_buffers: Vec::new(),
                 indices: None,
                 instance_count: *instance_count,
+                // The ICB's own payload has no base-vertex field in this
+                // increment: the replay reads the index values the rail's own
+                // buffer holds (`research/docs/25` §4.3).
+                base_vertex: 0,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {

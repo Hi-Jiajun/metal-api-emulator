@@ -945,6 +945,15 @@ fn register_render_pipeline(
             (INSTANCED_VERTEX_SPV, INSTANCED_FRAGMENT_SPV),
             reviewed_instanced_layout(),
         ),
+        // The base-vertex shape is the reviewed quad's module and layout: the
+        // offset is draw state, not pipeline state, so the pair does not change
+        // (`research/docs/23` §3.3, v34).
+        RenderGeometry::BaseVertexQuad => (
+            (QUAD_VERTEX_ENTRY, QUAD_FRAGMENT_ENTRY),
+            (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+            (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
+            reviewed_quad_layout(),
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
@@ -1150,6 +1159,11 @@ struct RenderCase {
     /// declares exactly two.
     #[serde(default = "default_instance_count")]
     instance_count: u64,
+    /// Vertex offset every index is read through (`research/docs/23` §3.3,
+    /// v34). Absent means `0`, the shape every pre-v34 case draws; the reviewed
+    /// base-vertex fixture declares exactly `1` over its five-vertex stream.
+    #[serde(default)]
+    base_vertex: u64,
     /// Texels the case does not claim, in row-major order
     /// (`research/docs/23` §3.3, v33). Only a `dontcare` load may leave bytes
     /// unclaimed — the undefined pre-pass contents are exactly what makes them
@@ -2203,6 +2217,11 @@ enum RenderGeometry {
     /// The reviewed instanced pair (`research/docs/23` §3.3, v31): the same
     /// indexed quad, a second per-instance tint stream, and two instances.
     InstancedPair,
+    /// The reviewed base-vertex shape (`research/docs/23` §3.3, v34): the same
+    /// reviewed layout and module over a five-vertex stream whose first vertex
+    /// is a degenerate centre, drawn with `base_vertex: 1` so the four reviewed
+    /// corners are the ones the indices reach.
+    BaseVertexQuad,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -2305,6 +2324,101 @@ const INSTANCED_TINT_GREEN_HEX: &str = "000000000000803f000000000000803f";
 /// rails' own captures rather than pass here.
 const INSTANCED_TINT_RED_BYTES: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
 const INSTANCED_TINT_GREEN_BYTES: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
+
+/// The reviewed base-vertex fixture's stream (`research/docs/23` §3.3, v34):
+/// a degenerate centre vertex followed by the reviewed quad corners, so the
+/// same indices draw the reviewed quad only when the draw adds a base vertex
+/// of one. The exact bytes are pinned for the same reason the quad's are: the
+/// shape is the review.
+const BASE_VERTEX_POSITION_HEX: &str = "0000000000000000\
+     000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f";
+/// The offset the reviewed fixture draws with: one degenerate vertex in front
+/// of the reviewed corners.
+const BASE_VERTEX_OFFSET: u64 = 1;
+
+/// Pin the reviewed base-vertex shape (`research/docs/23` §3.3, v34).
+///
+/// The layout and the index buffer are the reviewed quad's; what the pair adds
+/// is the five-vertex stream (`BASE_VERTEX_POSITION_HEX`) and `base_vertex: 1`.
+/// A rail that ignored the offset would read the first four vertices — the
+/// degenerate centre and three corners — and leave part of the attachment at
+/// the clear colour, which is what makes the fixture falsifiable.
+fn reviewed_base_vertex_geometry(
+    case: &RenderCase,
+    layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the reviewed base-vertex shape binds one stream").into());
+    }
+    let stream = &layout.buffers[0];
+    if stream.stride != QUAD_STRIDE || stream.step != "per_vertex" || stream.attributes.len() != 1 {
+        return Err(format!(
+            "{where_}: the reviewed base-vertex stream is one float32x2 at stride {QUAD_STRIDE}"
+        )
+        .into());
+    }
+    let attribute = &stream.attributes[0];
+    if attribute.location != 0 || attribute.offset != 0 || attribute.format != "float32x2" {
+        return Err(format!(
+            "{where_}: the reviewed base-vertex attribute is location 0, offset 0, float32x2"
+        )
+        .into());
+    }
+    if case.base_vertex != BASE_VERTEX_OFFSET {
+        return Err(format!(
+            "{where_}: the reviewed base-vertex draw offsets its indices by {BASE_VERTEX_OFFSET}"
+        )
+        .into());
+    }
+    if case.instance_count != 1 {
+        return Err(format!("{where_}: the reviewed base-vertex shape draws one instance").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let required = QUAD_STRIDE * (QUAD_VERTICES + BASE_VERTEX_OFFSET);
+    if buffer.length != required || buffer.initial_hex != BASE_VERTEX_POSITION_HEX {
+        return Err(format!(
+            "{where_}: the reviewed base-vertex stream is the degenerate centre plus the quad"
+        )
+        .into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed base-vertex shape is indexed").into());
+    };
+    if indices.allocation == 0 || indices.view == 0 {
+        return Err(format!("{where_}: zero index buffer identity").into());
+    }
+    let width = match indices.format.as_str() {
+        "uint16" => 2_u64,
+        "uint32" => 4,
+        other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
+    };
+    let required = QUAD_INDICES * width;
+    if indices.length != required {
+        return Err(format!(
+            "{where_}: the reviewed base-vertex index buffer is {QUAD_INDICES} indices wide"
+        )
+        .into());
+    }
+    let bytes = unhex(&indices.initial_hex)?;
+    if bytes.len() != usize::try_from(indices.length)? {
+        return Err(format!("{where_}: the index bytes do not match their length").into());
+    }
+    // The reviewed index list is the quad's over the reviewed four corners: the
+    // draw reaches vertices `base_vertex + index`, and the rails prove that
+    // span against the stream's own footprint before a device object exists.
+    let reviewed = "000001000200010003000200";
+    if indices.initial_hex != reviewed {
+        return Err(
+            format!("{where_}: the reviewed base-vertex indices are the reviewed quad's").into(),
+        );
+    }
+    let _ = width;
+    Ok(RenderGeometry::BaseVertexQuad)
+}
 
 /// Pin the reviewed instanced shape (`research/docs/23` §3.3, v31).
 ///
@@ -2450,6 +2564,9 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     // shift was written for (`research/docs/23` §3.3, v31).
     if layout.buffers.len() == 2 {
         return reviewed_instanced_geometry(case, layout, where_);
+    }
+    if case.base_vertex != 0 {
+        return reviewed_base_vertex_geometry(case, layout, where_);
     }
     if layout.buffers.len() != 1 || case.vertex_buffers.len() != 1 {
         return Err(format!(
@@ -2633,6 +2750,20 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::BaseVertexQuad => {
+            if case.vertices != QUAD_INDICES {
+                return Err(format!(
+                    "{where_}: the reviewed base-vertex quad draws {QUAD_INDICES} indices"
+                )
+                .into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a base-vertex case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::InstancedPair => {
             if case.vertices != QUAD_INDICES {
                 return Err(format!(
@@ -2678,6 +2809,10 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // stand in for it, because the tint travels through a varying the
         // reviewed instanced vertex stage is the only one to produce.
         RenderGeometry::InstancedPair => (INSTANCED_MSL_VERTEX_ENTRY, INSTANCED_MSL_FRAGMENT_ENTRY),
+        // The base-vertex shape compiles the reviewed quad's module pair: the
+        // offset is draw state, so the entries and the layout do not change
+        // (`research/docs/23` §3.3, v34).
+        RenderGeometry::BaseVertexQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -4512,6 +4647,9 @@ fn run_render_case(
         // the field at its single-instance default
         // (`research/docs/23` §3.3, v31).
         instance_count: u32::try_from(case.instance_count)?,
+        // The reviewed base-vertex fixture declares one; every pre-v34 case
+        // leaves the offset at zero (`research/docs/23` §3.3, v34).
+        base_vertex: u32::try_from(case.base_vertex)?,
         present,
     }));
 
@@ -5095,6 +5233,17 @@ fn run_object_render_case(
             present,
         )?;
     } else if let Some((index, format)) = &object_index {
+        // The object API's indexed draws have no base-vertex entry point yet,
+        // so a case that asks for one is refused rather than recorded with
+        // offset zero — which would draw a different pass
+        // (`research/docs/23` §3.3, v34).
+        if case.base_vertex != 0 {
+            return Err(format!(
+                "render case {}: the object rails have no base-vertex draw yet",
+                case.id
+            )
+            .into());
+        }
         for (binding, stream) in object_streams.iter().enumerate() {
             render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
         }

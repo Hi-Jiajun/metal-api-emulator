@@ -1736,6 +1736,21 @@ pub struct RenderPassDescriptor {
     /// Index buffer this pass draws through, or `None` for a non-indexed draw.
     /// When present, [`Self::vertices`] is the index count.
     pub indices: Option<IndexBufferBinding>,
+    /// Vertex offset added to every index the draw reads (`research/docs/23`
+    /// §3.3, v34), i.e. Metal's
+    /// `drawIndexedPrimitives(…:baseVertex:)` and Vulkan's
+    /// `vkCmdDrawIndexed(…, vertexOffset, …)`. `0` is the shape every earlier
+    /// increment published, so a trace that never offsets its indices keeps its
+    /// exact pre-v34 bytes; the field is only meaningful for an indexed draw
+    /// and is refused on a non-indexed one, because the two APIs spell
+    /// "firstVertex" and "baseVertex" as different parameters and only the
+    /// indexed one is this increment's reviewed shape.
+    ///
+    /// The bound streams have to cover the offset vertices too: the rails'
+    /// footprint proofs read the index values *after* the offset, so a stream
+    /// too short for `base_vertex + highest_index + 1` is refused before any
+    /// device object exists.
+    pub base_vertex: u32,
     /// Instances of the one draw (`research/docs/23` §3.3, v31), i.e. Metal's
     /// `drawPrimitives(vertexCount:instanceCount:)` and Vulkan's
     /// `vkCmdDraw(vertexCount, instanceCount, …)`. `1` is the single-instance
@@ -1818,6 +1833,14 @@ impl RenderPassDescriptor {
         // left the load op's bytes behind (`research/docs/23` §3.3, v31).
         if self.instance_count == 0 {
             return Err(ContractError::ZeroLength("render instance count"));
+        }
+        // The base vertex only exists for an indexed draw: both APIs add it to
+        // the index values, and a non-indexed draw has no index to add it to
+        // (`research/docs/23` §3.3, v34).
+        if self.base_vertex != 0 && self.indices.is_none() {
+            return Err(ContractError::BaseVertexRequiresIndices {
+                base_vertex: self.base_vertex,
+            });
         }
         if !self.vertex_buffers.is_empty() && self.vertices < FULL_SCREEN_TRIANGLE_VERTICES {
             return Err(ContractError::DrawVertexCountBelowMinimum {
@@ -5841,7 +5864,9 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Args,
             "trace_contract_invalid",
         ),
-        E::ViewportExtentMismatch { .. } | E::ScissorOutOfBounds { .. } => {
+        E::ViewportExtentMismatch { .. }
+        | E::ScissorOutOfBounds { .. }
+        | E::BaseVertexRequiresIndices { .. } => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
         // Presentation contract, Step 1. The three first-increment narrowings
@@ -7265,6 +7290,11 @@ pub enum ContractError {
         scissor: [u32; 4],
         viewport: [u32; 2],
     },
+    /// The pass declares a base vertex but no index buffer to add it to
+    /// (`research/docs/23` §3.3, v34).
+    BaseVertexRequiresIndices {
+        base_vertex: u32,
+    },
     ViewportExtentMismatch {
         viewport: [u32; 2],
         attachment: [u64; 2],
@@ -7759,6 +7789,11 @@ impl fmt::Display for ContractError {
             Self::ScissorOutOfBounds { scissor, viewport } => write!(
                 formatter,
                 "the scissor {scissor:?} is empty or reaches outside the viewport {viewport:?}"
+            ),
+            Self::BaseVertexRequiresIndices { base_vertex } => write!(
+                formatter,
+                "base vertex {base_vertex} needs an index buffer: the two APIs add it to \
+                 the index values, and a non-indexed draw has none"
             ),
             Self::ViewportExtentMismatch {
                 viewport,
@@ -9028,6 +9063,7 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(pipeline),
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(7),
@@ -12269,6 +12305,7 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(5),
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
             viewport: [0, 0, 2, 2],
@@ -12997,6 +13034,7 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(4),
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],
             scissor: None,
@@ -13228,6 +13266,27 @@ mod tests {
         provider.supports_render_instancing = true;
         provider.max_render_instances = 4;
         provider
+    }
+
+    #[test]
+    fn a_base_vertex_needs_an_index_buffer() {
+        // A non-indexed draw has no index for the offset to be added to, so the
+        // field is a structural refusal rather than a value a rail would
+        // silently ignore (`research/docs/23` §3.3, v34).
+        let mut pass = render_pass();
+        pass.base_vertex = 1;
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::BaseVertexRequiresIndices { base_vertex: 1 })
+        );
+
+        // The indexed shape admits it, and zero stays the default every
+        // earlier increment published.
+        let mut pass = indexed_quad_pass();
+        pass.base_vertex = 1;
+        pass.validate().expect("an indexed draw admits an offset");
+        pass.base_vertex = 0;
+        pass.validate().expect("zero is the pre-v34 shape");
     }
 
     #[test]

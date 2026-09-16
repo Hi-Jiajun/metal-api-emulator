@@ -236,6 +236,9 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// Instances the draw runs (`research/docs/23` §3.3, v31): the second count
     /// of `vkCmdDraw`/`vkCmdDrawIndexed`. `1` for every pre-v31 pass.
     pub instance_count: u32,
+    /// Vertex offset every index is read through (`research/docs/23` §3.3,
+    /// v34): `vkCmdDrawIndexed`'s `vertexOffset`. `0` for every pre-v34 pass.
+    pub base_vertex: u32,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -677,13 +680,20 @@ fn prepare_render_request<'a>(
                     continue;
                 }
                 let vertex_capacity = stream.view.length / stream.layout.stride;
-                if let Some(index) = index_values
-                    .iter()
-                    .find(|index| u64::from(**index) >= vertex_capacity)
-                {
+                // The vertex a draw reads is `base_vertex + index`, so the
+                // offset takes part in the proof (`research/docs/23` §3.3,
+                // v34): an index that fits on its own can still reach past the
+                // stream once the offset is added.
+                if let Some(index) = index_values.iter().find(|index| {
+                    u64::from(**index) + u64::from(pass.base_vertex) >= vertex_capacity
+                }) {
                     return Err(
                         capability_refusal("render_vertex_buffer_footprint_unsupported")
                             .with_field("index", FieldValue::Unsigned(u64::from(*index)))
+                            .with_field(
+                                "base_vertex",
+                                FieldValue::Unsigned(u64::from(pass.base_vertex)),
+                            )
                             .with_field("vertex_capacity", FieldValue::Unsigned(vertex_capacity))
                             .with_field("stride", FieldValue::Unsigned(stream.layout.stride))
                             .with_field("declared_bytes", FieldValue::Unsigned(stream.view.length))
@@ -742,6 +752,7 @@ fn prepare_render_request<'a>(
         attachments,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
+        base_vertex: pass.base_vertex,
         extent,
         vertex: OffscreenVertexStage {
             entry: &stages.contract.vertex_entry,
@@ -1214,6 +1225,7 @@ pub(crate) fn execute_offscreen_render(
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
     objects.instance_count = request.instance_count;
+    objects.base_vertex = request.base_vertex;
     for (index, attachment) in request.attachments.iter().enumerate() {
         if let Some(previous) = attachment.previous {
             objects.create_previous_bytes(index, previous)?;
@@ -1685,6 +1697,7 @@ pub(crate) fn execute_present_render(
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
     objects.instance_count = request.instance_count;
+    objects.base_vertex = request.base_vertex;
     objects.create_command_pool(queue_index)?;
     objects.record(std::slice::from_ref(attachment), None, width, height)?;
     objects.submit_and_wait(queue_index)?;
@@ -1777,6 +1790,9 @@ struct OffscreenObjects<'a> {
     /// Instances a direct draw runs (`research/docs/23` §3.3, v31); `1` for
     /// every pre-v31 pass.
     instance_count: u32,
+    /// Vertex offset every index is read through (`research/docs/23` §3.3,
+    /// v34); `0` for every pre-v34 pass.
+    base_vertex: u32,
     /// Index width of the caller-held index buffer.
     input_index_type: vk::IndexType,
     command_pool: vk::CommandPool,
@@ -1838,6 +1854,7 @@ impl<'a> OffscreenObjects<'a> {
             input_index_memory: vk::DeviceMemory::null(),
             draw: DrawShape::Milestone,
             instance_count: 1,
+            base_vertex: 0,
             input_index_type: vk::IndexType::UINT16,
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
@@ -2787,7 +2804,7 @@ impl<'a> OffscreenObjects<'a> {
                             index_count,
                             self.instance_count,
                             0,
-                            0,
+                            i32::try_from(self.base_vertex).unwrap_or(i32::MAX),
                             0,
                         );
                     }
@@ -3386,6 +3403,7 @@ mod tests {
     /// sentinel the coverage assertions look for.
     fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(11),
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(21),
@@ -3519,6 +3537,7 @@ mod tests {
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
+                base_vertex: 0,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format,
@@ -3814,6 +3833,7 @@ mod tests {
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
+            base_vertex: 0,
             index_stream: None,
             indirect: None,
         };
@@ -3863,6 +3883,7 @@ mod tests {
             let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
+                    base_vertex: 0,
                     scissor: None,
                     attachments: vec![OffscreenColorAttachment {
                         format,
@@ -4013,6 +4034,7 @@ mod tests {
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
+            base_vertex: 0,
             index_stream: None,
             indirect: None,
         };
@@ -4121,6 +4143,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                base_vertex: 0,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4183,6 +4206,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                base_vertex: 0,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4242,6 +4266,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                base_vertex: 0,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4299,6 +4324,7 @@ mod tests {
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
+            base_vertex: 0,
             index_stream: None,
             indirect: None,
         };
@@ -4339,6 +4365,7 @@ mod tests {
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
+            base_vertex: 0,
             index_stream: None,
             indirect: None,
         };
@@ -4460,6 +4487,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                base_vertex: 0,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,

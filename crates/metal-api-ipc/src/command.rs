@@ -1584,6 +1584,7 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: compiled.pipeline_id,
             color_attachments: vec![render_attachment(width, height)],
             viewport: [0, 0, width as u32, height as u32],
@@ -2351,6 +2352,68 @@ mod tests {
         assert!(matches!(
             CommandCodec::decode_request(&patched),
             Err(CodecError::UnknownRenderFeature(features)) if features == 0x49
+        ));
+    }
+
+    /// A render trace whose pass offsets the reviewed quad's indices by one
+    /// (`research/docs/23` §3.3, v34).
+    fn base_vertex_trace() -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.base_vertex = 1;
+        trace
+    }
+
+    #[test]
+    fn a_base_vertex_pass_carries_its_own_feature_bit_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: base_vertex_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(frame[9], 0x0f);
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The pass carries the vertex-input and base-vertex bits, and neither
+        // the present nor the instancing one.
+        let tag = frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .find(|(_, pair)| *pair == [0x10, 0x11])
+            .map(|(index, _)| index)
+            .expect("the base-vertex pass carries both feature bits");
+        assert_eq!(frame[tag + 1] & 0x02, 0x00, "no present bit");
+        assert_eq!(frame[tag + 1] & 0x08, 0x00, "no instancing bit");
+
+        // A pass that offsets nothing keeps the pre-v34 bytes: the bit is what
+        // makes the field travel.
+        let mut plain = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = plain.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.base_vertex = 0;
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        let tag = plain_frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .find(|(_, pair)| *pair == [0x10, 0x01])
+            .map(|(index, _)| index)
+            .expect("the plain pass keeps the vertex-only feature byte");
+        assert_eq!(plain_frame[tag + 1] & 0x10, 0x00, "no base-vertex bit");
+
+        // An unknown feature bit stays a decoder refusal.
+        let mut patched = frame.clone();
+        patched[tag + 1] |= 0x40;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x51
         ));
     }
 

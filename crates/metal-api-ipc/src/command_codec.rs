@@ -139,12 +139,19 @@ const RENDER_FEATURE_SCISSOR: u8 = 0x04;
 /// exactly what they were, and the decoder reads the missing section as the
 /// single instance the older frames meant.
 const RENDER_FEATURE_INSTANCING: u8 = 0x08;
+/// The base-vertex tail (`research/docs/23` §3.3, v34): one `u32` vertex offset
+/// after every earlier optional section. A pass whose indices start at zero —
+/// the only shape published before v34 — never sets the bit, so its bytes stay
+/// exactly what they were, and the decoder reads the missing section as the
+/// zero offset the older frames meant.
+const RENDER_FEATURE_BASE_VERTEX: u8 = 0x10;
 /// Every bit this version knows. An unknown bit is a decoder refusal rather
 /// than a silently skipped section.
 const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
     | RENDER_FEATURE_PRESENT
     | RENDER_FEATURE_SCISSOR
-    | RENDER_FEATURE_INSTANCING;
+    | RENDER_FEATURE_INSTANCING
+    | RENDER_FEATURE_BASE_VERTEX;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1905,7 +1912,11 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // increment wrote, so only a multi-instance draw takes the
                 // extended kind and appends its own count.
                 let has_instancing = pass.instance_count != 1;
-                if has_vertex_input || pass.scissor.is_some() || has_instancing {
+                // The base vertex follows the same rule (`docs/23` §3.3, v34):
+                // only a draw that offsets its indices takes the extended kind
+                // and appends its own field.
+                let has_base_vertex = pass.base_vertex != 0;
+                if has_vertex_input || pass.scissor.is_some() || has_instancing || has_base_vertex {
                     encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -1920,6 +1931,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if has_instancing {
                         features |= RENDER_FEATURE_INSTANCING;
+                    }
+                    if has_base_vertex {
+                        features |= RENDER_FEATURE_BASE_VERTEX;
                     }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
@@ -1936,6 +1950,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if has_instancing {
                         encoder.u32(pass.instance_count);
+                    }
+                    if has_base_vertex {
+                        encoder.u32(pass.base_vertex);
                     }
                     continue;
                 }
@@ -2323,6 +2340,9 @@ fn get_trace_tagged(
                 if features & RENDER_FEATURE_INSTANCING != 0 {
                     pass.instance_count = decoder.u32()?;
                 }
+                if features & RENDER_FEATURE_BASE_VERTEX != 0 {
+                    pass.base_vertex = decoder.u32()?;
+                }
                 TracePass::Render(pass)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
@@ -2414,10 +2434,12 @@ fn get_render_pass(
         vertices,
         vertex_buffers: Vec::new(),
         indices: None,
-        // The single instance every pre-v31 frame drew. A frame that carries
-        // the instancing feature bit overwrites this after the optional
-        // sections are read (`research/docs/23` §3.3, v31).
+        // The single instance every pre-v31 frame drew and the zero offset
+        // every pre-v34 frame read its indices through. A frame that carries
+        // the matching feature bit overwrites each after the optional sections
+        // are read (`research/docs/23` §3.3, v31/v34).
         instance_count: 1,
+        base_vertex: 0,
         present,
     })
 }
