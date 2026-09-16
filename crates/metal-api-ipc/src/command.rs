@@ -3876,6 +3876,32 @@ mod tests {
     }
 
     #[test]
+    fn an_aliasing_heap_descriptor_round_trips_without_new_wire_bytes() {
+        let mut trace = heap_trace();
+        trace
+            .heap
+            .as_mut()
+            .expect("the fixture carries a heap")
+            .descriptor
+            .allows_aliasing = true;
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("an aliasing heap submit decodes as a submit");
+        };
+        let heap = trace.heap.as_ref().expect("the fixture carries a heap");
+        assert!(heap.descriptor.allows_aliasing);
+        // The aliasing flag is the existing descriptor bool: it rides the
+        // same length-prefixed heap tail and changes no frame layout.
+        assert_eq!(frame.len(), HEAP_SUBMIT_FRAME.len());
+    }
+
+    #[test]
     fn icb_frames_use_their_own_tag_and_round_trip() {
         let request = CommandRequest::Submit {
             trace: icb_trace(),

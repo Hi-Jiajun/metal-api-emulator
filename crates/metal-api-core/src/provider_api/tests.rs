@@ -3531,15 +3531,46 @@ fn heap_place_refuses_duplicate_overflow_overlap_and_foreign_buffers() {
 }
 
 #[test]
-fn heap_construction_refuses_zero_size_and_aliasing() {
+fn heap_construction_refuses_zero_size_and_defers_aliasing_to_admission() {
     let device = Device::new(Arc::new(FakeProvider::new()));
     assert!(matches!(
         device.new_heap(0, StorageMode::OwnedBytes, false),
         Err(Error::Contract(ContractError::ZeroLength(_)))
     ));
+    // Declaring aliasing is well formed; the capability decision belongs to
+    // admission, so construction succeeds and a provider whose snapshot keeps
+    // `supports_heap_aliasing = false` refuses the commit.
+    device
+        .new_heap(64, StorageMode::OwnedBytes, true)
+        .expect("an aliasing heap declares before admission");
+}
+
+#[test]
+fn an_aliasing_heap_is_refused_at_commit_until_the_snapshot_admits_it() {
+    let provider = Arc::new(FakeProvider::new().with_heap());
+    let device = Device::new(provider.clone());
+    let copy = pipeline(&device, "copy");
+    let (first, first_view) = buffer(&device, 1);
+    let (second, second_view) = buffer(&device, 2);
+
+    let heap = device
+        .new_heap(64, StorageMode::OwnedBytes, true)
+        .expect("aliasing declares at construction");
+    heap.place(&first, 0).expect("first placement");
+    heap.place(&second, 0)
+        .expect("overlapping placement declares aliasing");
+
+    let command = device.new_command_queue().command_buffer();
+    command.set_heap(&heap).unwrap();
+    let mut encoder = command.compute_command_encoder().unwrap();
+    encoder.set_compute_pipeline_state(&copy).unwrap();
+    encoder.set_buffer(4, &first_view).unwrap();
+    encoder.set_buffer(9, &second_view).unwrap();
+    dispatch(&mut encoder).unwrap();
+    encoder.end_encoding().unwrap();
     assert!(matches!(
-        device.new_heap(64, StorageMode::OwnedBytes, true),
-        Err(Error::Contract(ContractError::HeapAliasingUnsupported))
+        command.commit(),
+        Err(Error::Provider(error)) if error.slug == "heap_alias_unsupported"
     ));
 }
 

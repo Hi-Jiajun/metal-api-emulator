@@ -423,9 +423,12 @@ impl Device {
     }
 
     /// Declare one heap (`research/docs/25` §6 Step 6). The first increment is
-    /// fixed-size and refuses aliasing: those rules run here, while the
-    /// capability questions (whether this snapshot can back the heap at all)
-    /// stay with admission at [`CommandBuffer::commit`].
+    /// fixed-size, and the aliasing flag is a declaration rather than a
+    /// capability: `allows_aliasing = true` is well formed here, but whether
+    /// the snapshot can execute it is answered at
+    /// [`CommandBuffer::commit`] admission, so a provider whose
+    /// `supports_heap_aliasing` stays `false` still refuses the commit
+    /// fail closed.
     pub fn new_heap(
         &self,
         size: u64,
