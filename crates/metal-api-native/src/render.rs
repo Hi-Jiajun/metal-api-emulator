@@ -162,6 +162,19 @@ pub(crate) const INSTANCED_VERTEX_ENTRY: &str = "render_instanced_quad_vertex";
 /// Fragment entry of the reviewed instanced module.
 pub(crate) const INSTANCED_FRAGMENT_ENTRY: &str = "render_instanced_tint";
 
+/// The reviewed depth module (`research/docs/23` §3.3, v36): a vertex stage
+/// that reads a caller-held `float32x3` position (so the caller chooses each
+/// triangle's depth) and a `float32x4` tint, plus a fragment stage that stores
+/// the forwarded tint.
+pub(crate) const REVIEWED_DEPTH_SOURCE: &str =
+    include_str!("../../../conformance/shaders/depth_pair_4x4.metal");
+
+/// Vertex entry of the reviewed depth module.
+pub(crate) const DEPTH_VERTEX_ENTRY: &str = "render_depth_pair_vertex";
+
+/// Fragment entry of the reviewed depth module.
+pub(crate) const DEPTH_FRAGMENT_ENTRY: &str = "render_depth_pair_tint";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -191,7 +204,7 @@ pub(crate) struct ReviewedModule {
 
 /// The reviewed modules, one per (vertex-input shape, colour-format shape)
 /// pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 7] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 8] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -244,6 +257,16 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 7] = [
         fragment_entry: INSTANCED_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
+    // The reviewed depth fixture (`research/docs/23` §3.3, v36): the module
+    // whose vertex stage reads a position whose z the caller chose, so the
+    // depth state is what decides which triangle survives.
+    ReviewedModule {
+        source: REVIEWED_DEPTH_SOURCE,
+        path: "conformance/shaders/depth_pair_4x4.metal",
+        vertex_entry: DEPTH_VERTEX_ENTRY,
+        fragment_entry: DEPTH_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
 ];
 
 /// The reviewed module a pipeline's vertex-input shape and colour-format list
@@ -276,6 +299,16 @@ pub(crate) fn reviewed_module(
     match (layout, color_formats) {
         (VertexLayout::None, [single]) if SUPPORTED_COLOR_FORMATS.contains(single) => {
             Some(&REVIEWED_MODULES[0])
+        }
+        // The depth module is selected by the layout's own shape: one stream
+        // with two attributes — a `float32x3` position and a `float32x4` tint —
+        // is the shape its vertex stage reads, so it is matched before the
+        // instanced and plain single-output arms
+        // (`research/docs/23` §3.3, v36).
+        (VertexLayout::Buffers(buffers), [single])
+            if unorm8(single) && buffers.len() == 1 && buffers[0].attributes.len() == 2 =>
+        {
+            Some(&REVIEWED_MODULES[7])
         }
         // The instanced module is selected by the layout's own step function,
         // not by the format list alone: a per-instance binding is the shape its
