@@ -953,3 +953,43 @@ The evidence boundary of this milestone:
   and the Windows evidence is the RTX 5060 capture of the same suite on both
   trace rails and both object rails; a green job without either is compile
   evidence only.
+
+## 14. The wildcard-texel channel (v33)
+
+The expectation rules in §2 and §3 assume the case can name every byte it claims:
+a clearing pass covers the whole attachment, a loading pass keeps what it was
+handed, and a `dontcare` load observes every texel it draws into. A draw that
+covers only *part* of a `dontcare`-loaded attachment is the shape none of those
+rules admits: the uncovered texels are undefined by construction, so a case that
+claimed them would be asserting bytes no rail ever promised.
+
+`wildcard_texels` is that claim's complement, stated in advance: a row-major
+list of texel indices whose bytes the case does **not** observe. The rules keep
+the fixture falsifiable:
+
+* only the single-attachment shape may carry the list, and only with
+  `load: "dontcare"` — the undefined pre-pass contents are exactly what makes an
+  unclaimed byte legitimate;
+* the list has to be non-empty and strictly smaller than the texel count, so the
+  case always claims at least one texel and never claims none;
+* every entry names a texel of that attachment, once.
+
+The comparison then skips exactly the named texels' four bytes, in both the
+attachment's writeback and its allocation image; every other byte still has to
+be the reviewed fragment output, and a wrong byte in a claimed texel is refused
+with the offset that differs. The expectation's own bytes at wildcard positions
+are placeholders — the fixture keeps `4080c0ff` there for readability — because
+what lands there is whatever the driver left.
+
+The reviewed fixture `dontcare_scissor_half_4x4` is the pair this channel was
+added for: a 4x4 `rgba8_unorm` attachment opened with `load: "dontcare"`, the
+reviewed indexed quad clipped to the left half by `scissor: [0, 0, 2, 4]`, and
+`wildcard_texels: [2, 3, 6, 7, 10, 11, 14, 15]` for the right half. Inside the
+rectangle every texel is the fragment output; outside it the pass neither read
+nor promises anything, and the capture may report whatever the rail left. It is
+the observation the partial-coverage fixtures (base vertex offsets, culling,
+depth) will need, and it is the reason the channel landed before them.
+
+The evidence boundary is the same as §13's: the five-rail CI run plus the
+RTX 5060 capture of the suite, with the Apple half in the `native-oracle-build`
+job.

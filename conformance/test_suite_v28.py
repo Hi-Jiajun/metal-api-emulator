@@ -28,6 +28,7 @@ V28_PATH = CONFORMANCE / "suite-v28.json"
 DECLARING_ID = "render_declaring_quad_extent"
 RENDER_ID = "scissor_left_half_4x4"
 INSTANCED_ID = "instanced_pair_4x4"
+WILDCARD_ID = "dontcare_scissor_half_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -40,6 +41,14 @@ EXPECTED = "".join(OUTPUT if (index % 4) < 2 else CLEAR for index in range(16))
 INSTANCE_TINTS = ("ff0000ff", "00ff00ff")
 INSTANCED_EXPECTED = "".join(
     INSTANCE_TINTS[0] if (index % 4) < 2 else INSTANCE_TINTS[1]
+    for index in range(16))
+# The v33 fixture: a `dontcare` load with a left-half scissor. The right half is
+# unclaimed, so its bytes are whatever the driver left; the synthetic capture
+# below reports a byte the expectation does not carry to prove the mask skips it.
+WILDCARD_EXPECTED = OUTPUT * 16
+WILDCARD_TEXELS = [2, 3, 6, 7, 10, 11, 14, 15]
+WILDCARD_REPORTED = "".join(
+    OUTPUT if index not in WILDCARD_TEXELS else "cdcdcdcd"
     for index in range(16))
 # Every rail executes the scissor from v30 on: the object API's encoder carries
 # `set_scissor`, so the fixture names all five. The instanced pair is the same
@@ -84,6 +93,19 @@ def other_rail(rail):
         if candidate != rail:
             return candidate
     raise AssertionError("no other rail exists")
+
+
+def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": WILDCARD_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": WILDCARD_REPORTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": WILDCARD_REPORTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
 
 
 def counted_declaring(suite, digest, rail):
@@ -149,6 +171,7 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(render_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(wildcard_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -163,6 +186,7 @@ class ScissorObservationTests(unittest.TestCase):
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
             report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(wildcard_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -179,10 +203,85 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(render_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(wildcard_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
                     compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_pins_the_wildcard_fixture(self):
+        case = self.suite["render_cases"][2]
+        self.assertEqual(case["id"], WILDCARD_ID)
+        self.assertEqual(case["attachment"]["load"], "dontcare")
+        self.assertEqual(case["scissor"], SCISSOR)
+        self.assertEqual(case["wildcard_texels"], WILDCARD_TEXELS)
+        self.assertEqual(case["expected_hex"], WILDCARD_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(ALL_RAILS))
+
+    def test_v28_wildcards_skip_exactly_the_unclaimed_texels(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[WILDCARD_ID]
+        mask = expectation.wildcards[(ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2])]
+        for texel in WILDCARD_TEXELS:
+            for byte in range(4):
+                self.assertIn(texel * 4 + byte, mask)
+        for texel in (0, 1, 4, 5, 8, 9, 12, 13):
+            for byte in range(4):
+                self.assertNotIn(texel * 4 + byte, mask)
+        # The synthetic report carries `cdcdcdcd` at every wildcard texel, so a
+        # comparator that compared them would fail here.
+        digest = hashlib.sha256(
+            json.dumps(self.suite, sort_keys=True).encode("utf-8")).hexdigest()
+        report = counted_declaring(self.suite, digest, "vulkan")
+        report["results"].append(render_result())
+        report["results"].append(instanced_result())
+        report["results"].append(wildcard_result())
+        compare.validate_capture(self.suite, digest, report, "vulkan")
+
+    def test_v28_refuses_a_wildcard_beyond_the_attachment(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][2]["wildcard_texels"] = WILDCARD_TEXELS + [16]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "wildcard texel 16 is outside the attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_wildcard_list_that_claims_nothing(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][2]["wildcard_texels"] = list(range(16))
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "has to leave at least one texel observed"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_wildcards_on_a_non_dontcare_load(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][2]["attachment"]["load"] = "clear"
+        broken["render_cases"][2]["attachment"]["clear_hex"] = CLEAR
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "only a dontcare load may leave texels unclaimed"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_wildcards_on_a_discarded_attachment(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][2]["attachment"]["store"] = "dontcare"
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "a wildcard list needs a stored attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_wrong_observed_texel(self):
+        digest = hashlib.sha256(
+            json.dumps(self.suite, sort_keys=True).encode("utf-8")).hexdigest()
+        report = counted_declaring(self.suite, digest, "vulkan")
+        report["results"].append(render_result())
+        report["results"].append(instanced_result())
+        broken = wildcard_result()
+        # The left half is claimed, so a wrong byte there is a refusal even
+        # though the right half stays wild.
+        broken["writebacks"][0]["bytes_hex"] = "ff0000ff" + WILDCARD_REPORTED[8:]
+        broken["allocations"][0]["bytes_hex"] = "ff0000ff" + WILDCARD_REPORTED[8:]
+        report["results"].append(broken)
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "first differing byte at offset 0"):
+            compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_refuses_an_instanced_marker_that_omits_its_rail(self):
         for rail in INSTANCED_RAILS:
@@ -194,6 +293,7 @@ class ScissorObservationTests(unittest.TestCase):
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
             report["results"].append(instanced_result(rail != "native-metal"))
+            report["results"].append(wildcard_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
