@@ -3903,9 +3903,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        if case.stencil.is_some() {
+        // The two surfaces stay mutually exclusive (`research/docs/23` §3.3,
+        // v55): a combined depth-stencil surface is its own increment, so a
+        // raster that opens both is refused rather than silently narrowed to
+        // one of them by the recording entries.
+        if case.depth.is_some() && case.stencil.is_some() {
             return Err(format!(
-                "{where_}: the reviewed multisample pass opens no stencil surface"
+                "{where_}: the multisample raster opens one depth-stencil surface"
             )
             .into());
         }
@@ -3921,11 +3925,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             );
         }
         // The raster's expectation shape depends on what it opens
-        // (`research/docs/23` §3.3, v51/v53): a colour-only raster resolves
+        // (`research/docs/23` §3.3, v51/v53/v55): a colour-only raster resolves
         // fragment output and clear into the partially covered texels and has
-        // to claim that shape, while a raster that opens a rail-owned depth
-        // surface is the depth pair's own shape — both primitives cover every
-        // sample, the near one wins and every texel is one fragment output.
+        // to claim that shape, while a raster that opens a rail-owned depth or
+        // stencil surface is the depth pair's own shape — both primitives cover
+        // every sample, the first one decides which survives per sample, and
+        // every texel is one fragment output.
         if case.depth.is_some() {
             let (depth, test) = case_depth(case, &where_)?;
             let depth = depth.ok_or(format!("{where_}: a depth surface needs its attachment"))?;
@@ -3944,6 +3949,29 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             if case.coverage.is_some() {
                 return Err(format!(
                     "{where_}: a multisample pass with a depth surface claims no partial coverage"
+                )
+                .into());
+            }
+        } else if case.stencil.is_some() {
+            let (stencil, test) = case_stencil(case, &where_)?;
+            let stencil =
+                stencil.ok_or(format!("{where_}: a stencil surface needs its attachment"))?;
+            if stencil.store.is_some() {
+                return Err(format!(
+                    "{where_}: a multisampled stencil surface is rail-owned: the stencil resolve \
+                     is a later increment"
+                )
+                .into());
+            }
+            if test.is_none() {
+                return Err(
+                    format!("{where_}: a multisampled stencil surface needs its test").into(),
+                );
+            }
+            if case.coverage.is_some() {
+                return Err(format!(
+                    "{where_}: a multisample pass with a stencil surface claims no partial \
+                     coverage"
                 )
                 .into());
             }
@@ -4068,18 +4096,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         // rule stays: every texel is the output
                         // (`research/docs/23` §3.3, v29).
                         if let Some(multisample) = &case.multisample {
-                            // A raster that opens a rail-owned depth surface
-                            // keeps the depth pair's own expectation shape
-                            // (`research/docs/23` §3.3, v53): both primitives
-                            // cover every sample, the near one wins and every
-                            // texel is one fragment output, so the resolve rule
-                            // below — which exists for a *partially covered*
-                            // raster — is not the one that applies.
-                            if case.depth.is_some() {
+                            // A raster that opens a rail-owned depth or stencil
+                            // surface keeps the pair's own expectation shape
+                            // (`research/docs/23` §3.3, v53/v55): both
+                            // primitives cover every sample, the first one
+                            // decides which survives per sample, and every
+                            // texel is one fragment output — so the resolve
+                            // rule below, which exists for a *partially
+                            // covered* raster, is not the one that applies.
+                            if case.depth.is_some() || case.stencil.is_some() {
                                 if !uniform_texel {
                                     return Err(format!(
-                                        "{where_}: a depth-tested multisample expectation has to \
-                                         be one fragment output"
+                                        "{where_}: a masked multisample expectation has to be one \
+                                         fragment output"
                                     )
                                     .into());
                                 }

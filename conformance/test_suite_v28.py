@@ -111,6 +111,11 @@ MSAA_ID = "msaa_edge_4x4"
 # sample, so the near tint wins on every texel and a rail that ignored the depth
 # test would land the far tint instead.
 MSAA_DEPTH_ID = "msaa_depth_pair_4x4"
+# The v55 fixture: the v47 stencil pair over the same four-sample raster — the
+# first triangle passes `equal 0` and increment-wraps the samples it covers, the
+# second is tested against the value the first wrote, so it is rejected on every
+# sample it covers and the resolve target carries the first tint.
+MSAA_STENCIL_ID = "msaa_stencil_pair_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -131,10 +136,12 @@ BLEND_INDEX = 12
 MSAA_INDEX = 13
 # The v53 depth-tested multisample fixture follows it.
 MSAA_DEPTH_INDEX = 14
+# The v55 stencil-masked multisample fixture follows that.
+MSAA_STENCIL_INDEX = 15
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
-                  MSAA_ID, MSAA_DEPTH_ID)
+                  MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -285,6 +292,10 @@ MSAA_RAILS = ALL_RAILS
 # halves on both object rails, so the marker widens to every rail
 # (`research/docs/23` §3.3, v53/v54).
 MSAA_DEPTH_RAILS = ALL_RAILS
+# The stencil sibling is the trace rails' own first increment, exactly as the
+# depth sibling was (`research/docs/23` §3.3, v55).
+MSAA_STENCIL_RAILS = TRACE_RAILS
+MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
@@ -435,6 +446,20 @@ def msaa_depth_marker(suite, rail):
     return rail in MSAA_DEPTH_RAILS
 
 
+def msaa_stencil_marker(suite, rail):
+    """Point the v55 case at `rail` when that rail owes it, and elsewhere when not.
+
+    The stencil-masked multisample case is the trace rails' first increment, so
+    its committed marker names the three trace rails: a capture on a rail the
+    marker names is owed the resolved attachment's landing, and one on any other
+    rail has to leave the case out entirely (`research/docs/23` §3.3, v55).
+    Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_STENCIL_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_STENCIL_RAILS else [other_rail(rail)])
+    return rail in MSAA_STENCIL_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -494,6 +519,25 @@ def msaa_depth_result(provider_backend=True, copy_in=2, copy_out=2):
         "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
                         "offset": ATTACHMENT[2], "bytes_hex": MSAA_DEPTH_EXPECTED}],
         "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_DEPTH_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_stencil_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v55 landing: the stencil-masked raster's own resolve target.
+
+    The rail-owned stencil surface contributes no writeback and no allocation
+    image — it disappears with the pass — so the observation is the colour
+    attachment's resolved texels (`research/docs/23` §3.3, v55).
+    """
+    result = {
+        "id": MSAA_STENCIL_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_STENCIL_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_STENCIL_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -784,6 +828,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_result(rail != "native-metal"))
             if rail in MSAA_DEPTH_RAILS:
                 report["results"].append(msaa_depth_result(rail != "native-metal"))
+            if rail in MSAA_STENCIL_RAILS:
+                report["results"].append(msaa_stencil_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -840,6 +886,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_result(rail != "native-metal"))
             if rail in MSAA_DEPTH_RAILS:
                 report["results"].append(msaa_depth_result(rail != "native-metal"))
+            if rail in MSAA_STENCIL_RAILS:
+                report["results"].append(msaa_stencil_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -886,6 +934,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_result(rail != "native-metal"))
             if rail in MSAA_DEPTH_RAILS:
                 report["results"].append(msaa_depth_result(rail != "native-metal"))
+            if rail in MSAA_STENCIL_RAILS:
+                report["results"].append(msaa_stencil_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -930,6 +980,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(blend_result())
         report["results"].append(msaa_result())
         report["results"].append(msaa_depth_result())
+        report["results"].append(msaa_stencil_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -2026,6 +2077,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(blend_result())
         report["results"].append(msaa_result())
         report["results"].append(msaa_depth_result())
+        report["results"].append(msaa_stencil_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -2076,6 +2128,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_result(rail != "native-metal"))
             if rail in MSAA_DEPTH_RAILS:
                 report["results"].append(msaa_depth_result(rail != "native-metal"))
+            if rail in MSAA_STENCIL_RAILS:
+                report["results"].append(msaa_stencil_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -2292,6 +2346,77 @@ class ScissorObservationTests(unittest.TestCase):
                             "is not a rail this render case runs on"):
                         compare.validate_capture(suite, digest, report, rail)
 
+    def test_v28_pins_the_msaa_stencil_fixture(self):
+        case = self.suite["render_cases"][MSAA_STENCIL_INDEX]
+        self.assertEqual(case["id"], MSAA_STENCIL_ID)
+        self.assertEqual(case["multisample"], {"sample_count": 4})
+        self.assertNotIn("coverage", case)
+        self.assertEqual(case["stencil"]["format"], "stencil8")
+        self.assertNotIn("store", case["stencil"])
+        self.assertEqual(case["stencil_test"]["compare"], "equal")
+        self.assertEqual(case["stencil_test"]["pass_op"], "increment_wrap")
+        self.assertEqual(case["expected_hex"], MSAA_STENCIL_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(MSAA_STENCIL_RAILS))
+
+    def test_v28_plans_the_msaa_stencil_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[MSAA_STENCIL_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(MSAA_STENCIL_EXPECTED))])
+
+    def test_v28_refuses_a_msaa_stencil_surface_that_is_stored(self):
+        # A multisampled stencil surface's texels are only observable through a
+        # resolve, and the reviewed shape is the rail-owned one, so a case that
+        # keeps the surface is refused rather than compared
+        # (`research/docs/23` §3.3, v55).
+        broken = copy.deepcopy(self.suite)
+        stencil = broken["render_cases"][MSAA_STENCIL_INDEX]["stencil"]
+        stencil["store"] = "store"
+        stencil["allocation"] = 940
+        stencil["view"] = 951
+        stencil["expected_hex"] = "01" * 16
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a multisampled stencil surface is rail-owned"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_msaa_stencil_case_that_claims_partial_coverage(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_STENCIL_INDEX]["coverage"] = "partial"
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a multisample pass with a stencil surface claims no partial coverage"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_msaa_stencil_expectation_that_is_not_one_output(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_STENCIL_INDEX]["expected_hex"] = (
+            "ff0000ff" * 15 + "00ff00ff")
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "has to be the fragment output"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_reports_the_msaa_stencil_case_on_every_rail_its_marker_names(self):
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = msaa_stencil_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != MSAA_STENCIL_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(msaa_stencil_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
     def test_v28_refuses_a_rail_the_msaa_marker_does_not_name(self):
         # The v51/v52 shape: a capture whose msaa marker names every rail
         # *except* the one it runs on is refused rather than compared, exactly
@@ -2306,6 +2431,7 @@ class ScissorObservationTests(unittest.TestCase):
         report = counted_declaring(broken, digest, "vulkan")
         report["results"].append(msaa_result())
         report["results"].append(msaa_depth_result())
+        report["results"].append(msaa_stencil_result())
         with self.assertRaisesRegex(compare.CaptureError,
                                     "is not a rail this render case runs on"):
             compare.validate_capture(broken, digest, report, "vulkan")

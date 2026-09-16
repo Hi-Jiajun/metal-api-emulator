@@ -2233,12 +2233,20 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(definition.coverage == nil,
                         "\(definition.id): a multisample pass with a depth surface claims no "
                         + "partial coverage")
+        } else if let stencil = definition.stencil {
+            try require(stencil.store == nil,
+                        "\(definition.id): a multisampled stencil surface is rail-owned: the "
+                        + "stencil resolve is a later increment")
+            try require(definition.coverage == nil,
+                        "\(definition.id): a multisample pass with a stencil surface claims no "
+                        + "partial coverage")
         } else {
             try require(definition.coverage == "partial",
                         "\(definition.id): the multisample raster has to claim partial coverage")
         }
-        try require(definition.stencil == nil,
-                    "\(definition.id): the reviewed multisample pass opens no stencil surface")
+        try require(definition.depth == nil || definition.stencil == nil,
+                    "\(definition.id): the multisample raster opens one depth-stencil "
+                    + "surface: a combined surface is a later increment")
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves")
     }
@@ -2336,7 +2344,7 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             let texel = Data(texels.prefix(4))
             var texelCount = 0
             if attachment.load == "clear", let multisample = definition.multisample,
-               definition.depth == nil {
+               definition.depth == nil, definition.stencil == nil {
                 // The multisample resolve (`research/docs/23` §3.3, v51): every
                 // texel is the arithmetic mean of the samples a primitive
                 // covered, so the expectation has to be a k-of-`sample_count`
@@ -3312,6 +3320,13 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             width: stencil.width,
             height: stencil.height,
             mipmapped: false)
+        // A multisampled pass creates its stencil surface with the raster's own
+        // sample count (`research/docs/23` §3.3, v55), exactly as the depth
+        // surface does; the surface is rail-owned, so private storage is enough.
+        if let multisample = definition.multisample {
+            descriptor.textureType = .type2DMultisample
+            descriptor.sampleCount = Int(multisample.sample_count)
+        }
         descriptor.usage = .renderTarget
         descriptor.storageMode = stencil.store == nil ? .private : .shared
         guard let texture = device.makeTexture(descriptor: descriptor) else {
