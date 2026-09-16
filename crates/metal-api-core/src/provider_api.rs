@@ -927,6 +927,12 @@ impl RenderTarget {
             // field, so every earlier recording keeps the API default filter
             // and its exact bytes.
             depth_resolve: self.draw.depth_resolve,
+            // The object API records no stencil resolve yet
+            // (`research/docs/23` §3.3, v60): the recording's own resolve will
+            // travel into this field exactly as the depth resolve above does
+            // once the entry that names it lands. A recording that states none
+            // keeps the API default filter.
+            stencil_resolve: None,
             // The blend state is the pass's own, exactly as the culling and
             // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
             blend: self.draw.blend.clone(),

@@ -135,6 +135,16 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // (`research/docs/23` §3.3, v57).
         supports_render_depth_resolve: false,
         depth_resolve_modes: 0,
+        // The stencil resolve is executed from v60 on, with the same
+        // device-owned answer the depth resolve states: the two bits come from
+        // the `VkPhysicalDeviceDepthStencilResolveProperties` the context
+        // probes, which a `PhysicalDeviceLimits` snapshot does not carry, so
+        // [`VulkanProvider::provider_capabilities`] overlays them on this
+        // struct's defaults. A device that reports no admitted filter keeps
+        // both bits at the fail-closed "cannot resolve" defaults
+        // (`research/docs/23` §3.3, v60).
+        supports_render_stencil_resolve: false,
+        stencil_resolve_modes: 0,
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

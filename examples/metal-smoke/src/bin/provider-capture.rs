@@ -11,15 +11,16 @@ use metal_api_core::provider::{
     Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
     HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
     IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, MultisampleDepthResolve, MultisampleState, OperationId,
-    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
+    InitialState, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
+    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
+    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
     SampleCount, SemanticDigest, ShaderSource, StencilCompare, StencilFormat, StencilLoadOp,
-    StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexLayout, VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1274,6 +1275,13 @@ struct RenderCase {
     /// Lavapipe device reports.
     #[serde(default)]
     depth_resolve: Option<DepthResolveDefinition>,
+    /// The stencil resolve a stored multisampled stencil surface states
+    /// (`research/docs/23` §3.3, v60), or absent for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose stencil
+    /// attachment is stored; the `depth_resolved_sample` filter additionally
+    /// requires the depth resolve the selected sample comes from.
+    #[serde(default)]
+    stencil_resolve: Option<StencilResolveDefinition>,
     /// The device gate one depth-resolve case may state (`research/docs/23`
     /// §3.3, v57d): the case appears in a capture if and only if the device
     /// capability mask carries the named filter's bit. The marker still
@@ -1282,6 +1290,14 @@ struct RenderCase {
     /// case instead of running (and refusing) it.
     #[serde(default)]
     requires_depth_resolve_filter: Option<String>,
+    /// The device gate one stencil-resolve case may state
+    /// (`research/docs/23` §3.3, v60): the case appears in a capture if and
+    /// only if the device capability mask carries the named filter's bit. The
+    /// marker still decides which rails own the case; the gate is the
+    /// device-side half of the same question, so a rail whose device lacks
+    /// the filter skips the case instead of running (and refusing) it.
+    #[serde(default)]
+    requires_stencil_resolve_filter: Option<String>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1423,6 +1439,32 @@ fn case_depth_resolve(case: &RenderCase) -> Result<Option<MultisampleDepthResolv
                 other => {
                     return Err(format!(
                         "render case {}: unsupported depth resolve filter {other:?}",
+                        case.id
+                    )
+                    .into())
+                }
+            },
+        })),
+        None => Ok(None),
+    }
+}
+
+/// The stencil resolve of a reviewed case, or `None` for every pass that
+/// resolves nothing (`research/docs/23` §3.3, v60).
+///
+/// `validate_render_case` already refused every filter outside the closed
+/// family before this runs, so the mapping is total over the shapes that can
+/// reach either rail; the refusal below keeps the helper total for a directly
+/// constructed case.
+fn case_stencil_resolve(case: &RenderCase) -> Result<Option<MultisampleStencilResolve>> {
+    match &case.stencil_resolve {
+        Some(definition) => Ok(Some(MultisampleStencilResolve {
+            filter: match definition.filter.as_str() {
+                "sample0" => StencilResolveFilter::Sample0,
+                "depth_resolved_sample" => StencilResolveFilter::DepthResolvedSample,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported stencil resolve filter {other:?}",
                         case.id
                     )
                     .into())
@@ -1586,6 +1628,15 @@ struct MultisampleDefinition {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DepthResolveDefinition {
+    filter: String,
+}
+
+/// The stencil resolve filter a case states (`research/docs/23` §3.3, v60):
+/// one of the two closed names, which the validator holds to the family and
+/// the rails map onto their own constants.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StencilResolveDefinition {
     filter: String,
 }
 
@@ -1900,6 +1951,11 @@ struct Capture {
     /// v57d): the same bitmask the provider snapshots, bit `i` = filter code
     /// `i`. The comparator reads the device-gated cases' presence against it.
     depth_resolve_modes: u32,
+    /// The device's stencil resolve capability mask (`research/docs/23` §3.3,
+    /// v60): the same bitmask the provider snapshots, bit `i` = filter code
+    /// `i`. The comparator reads the device-gated stencil cases' presence
+    /// against it.
+    stencil_resolve_modes: u32,
     device: String,
     platform: String,
     results: Vec<CaseResult>,
@@ -2283,6 +2339,23 @@ fn main() -> Result<()> {
                 continue;
             }
         }
+        // The stencil-resolve device gate (`research/docs/23` §3.3, v60): the
+        // depth gate's sibling — a case that requires the
+        // depth-resolved-sample filter appears if and only if the device's
+        // stencil mask carries its bit.
+        if let Some(filter) = &case.requires_stencil_resolve_filter {
+            let bit = 1u32
+                << u32::from(match filter.as_str() {
+                    "depth_resolved_sample" => StencilResolveFilter::DepthResolvedSample.code(),
+                    _ => {
+                        unreachable!("validate_render_case held the gate to depth_resolved_sample")
+                    }
+                });
+            if provider.capabilities().stencil_resolve_modes & bit == 0 {
+                println!("render case skipped: {} (device lacks {})", case.id, filter);
+                continue;
+            }
+        }
         let declaring = suite
             .cases
             .iter()
@@ -2396,6 +2469,7 @@ fn main() -> Result<()> {
         backend: backend.report_name(api),
         allocation_observation: "host-writeback-landing",
         depth_resolve_modes: provider.capabilities().depth_resolve_modes,
+        stencil_resolve_modes: provider.capabilities().stencil_resolve_modes,
         device: device_name,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         results,
@@ -4095,6 +4169,35 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             return Err(format!("{where_}: a depth resolve needs a stored depth surface").into());
         }
     }
+    // The stencil resolve (`research/docs/23` §3.3, v60) is the depth
+    // resolve's sibling one byte wide: it only means something beside a
+    // multisample raster that keeps its stencil surface, and the
+    // `depth_resolved_sample` filter names the sample the depth resolve
+    // selected, so it is refused without one instead of silently degrading to
+    // sample zero.
+    if case.stencil_resolve.is_some() {
+        if case.multisample.is_none() {
+            return Err(format!("{where_}: a stencil resolve needs a multisample raster").into());
+        }
+        if case
+            .stencil
+            .as_ref()
+            .is_none_or(|stencil| stencil.store.as_deref() != Some("store"))
+        {
+            return Err(
+                format!("{where_}: a stencil resolve needs a stored stencil surface").into(),
+            );
+        }
+    }
+    if let Some(resolve) = &case.stencil_resolve {
+        if resolve.filter == "depth_resolved_sample" && case.depth_resolve.is_none() {
+            return Err(format!(
+                "{where_}: the depth_resolved_sample stencil resolve names the sample the \
+                 depth resolve selects, so the case has to state a depth resolve"
+            )
+            .into());
+        }
+    }
     // The device gate (`research/docs/23` §3.3, v57d): a case that requires a
     // depth resolve filter has to state the resolve whose filter it names —
     // the gate is the case's own admission condition, not a second spelling of
@@ -4110,6 +4213,29 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         }
         if case
             .depth_resolve
+            .as_ref()
+            .is_none_or(|resolve| resolve.filter != *filter)
+        {
+            return Err(format!(
+                "{where_}: the device gate has to name the resolve filter the case states"
+            )
+            .into());
+        }
+    }
+    // The stencil-resolve device gate (`research/docs/23` §3.3, v60): a case
+    // that requires a stencil resolve filter has to state the resolve whose
+    // filter it names. Only the depth-resolved-sample filter is gateable:
+    // sample0 is the API's own baseline, so nothing needs to be measured
+    // against it per device.
+    if let Some(filter) = &case.requires_stencil_resolve_filter {
+        if filter != "depth_resolved_sample" {
+            return Err(format!(
+                "{where_}: the device gate names the depth_resolved_sample stencil resolve filter"
+            )
+            .into());
+        }
+        if case
+            .stencil_resolve
             .as_ref()
             .is_none_or(|resolve| resolve.filter != *filter)
         {
@@ -4147,11 +4273,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        // The two surfaces stay mutually exclusive (`research/docs/23` §3.3,
-        // v55): a combined depth-stencil surface is its own increment, so a
-        // raster that opens both is refused rather than silently narrowed to
-        // one of them by the recording entries.
-        if case.depth.is_some() && case.stencil.is_some() {
+        // The two surfaces stay mutually exclusive until the stencil resolve
+        // admits the combined shape (`research/docs/23` §3.3, v55/v60): a
+        // combined depth-stencil surface is the one texture both resolve
+        // targets name, so a raster that opens both without a stencil resolve
+        // is refused rather than silently narrowed to one of them.
+        if case.depth.is_some() && case.stencil.is_some() && case.stencil_resolve.is_none() {
             return Err(format!(
                 "{where_}: the multisample raster opens one depth-stencil surface"
             )
@@ -4232,11 +4359,32 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             let stencil =
                 stencil.ok_or(format!("{where_}: a stencil surface needs its attachment"))?;
             if stencil.store.is_some() {
-                return Err(format!(
-                    "{where_}: a multisampled stencil surface is rail-owned: the stencil resolve \
-                     is a later increment"
-                )
-                .into());
+                // A stored multisampled stencil surface is admitted from v60
+                // on, through the resolve the case then has to state: its
+                // texels are only observable as the resolve's reduction, so a
+                // stored surface without one is refused, and a filter outside
+                // the closed family is refused by name
+                // (`research/docs/23` §3.3, v60).
+                let Some(resolve) = &case.stencil_resolve else {
+                    return Err(format!(
+                        "{where_}: a stored multisampled stencil surface needs its stencil resolve"
+                    )
+                    .into());
+                };
+                if !matches!(resolve.filter.as_str(), "sample0" | "depth_resolved_sample") {
+                    return Err(format!(
+                        "{where_}: unsupported stencil resolve filter {:?}",
+                        resolve.filter
+                    )
+                    .into());
+                }
+            } else if case.stencil_resolve.is_some() {
+                // The resolve is the stored surface's own tail: a stencil
+                // resolve beside a surface the pass discards is refused
+                // instead of silently ignored (`research/docs/23` §3.3, v60).
+                return Err(
+                    format!("{where_}: a stencil resolve needs a stored stencil surface").into(),
+                );
             }
             if test.is_none() {
                 return Err(
@@ -6583,6 +6731,10 @@ fn run_render_case(
         // leaves the field absent, which the rails execute as "resolve
         // nothing" (`research/docs/23` §3.3, v57).
         depth_resolve: case_depth_resolve(case)?,
+        // The reviewed stencil-resolve case states its filter; every other
+        // case leaves the field absent, which the rails execute as "resolve
+        // nothing" (`research/docs/23` §3.3, v60).
+        stencil_resolve: case_stencil_resolve(case)?,
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,

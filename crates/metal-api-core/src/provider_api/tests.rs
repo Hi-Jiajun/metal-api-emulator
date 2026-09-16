@@ -209,6 +209,12 @@ impl ComputeProvider for FakeProvider {
             } else {
                 0
             },
+            // The object rails record no stencil resolve entry yet, so the
+            // fixture provider keeps the "cannot resolve" defaults and a
+            // resolving pass is refused during admission
+            // (`research/docs/23` §3.3, v60).
+            supports_render_stencil_resolve: false,
+            stencil_resolve_modes: 0,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self

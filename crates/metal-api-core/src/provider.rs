@@ -2425,6 +2425,64 @@ pub struct MultisampleDepthResolve {
     pub filter: DepthResolveFilter,
 }
 
+/// How a multisampled stencil attachment reduces its samples into the resolve
+/// target (`research/docs/23` §3.3, v60).
+///
+/// The two values are Metal's own closed family, and the ordinals align with
+/// the MTL constants the reims protocol already carries
+/// (`MTLMultisampleStencilResolveFilterSample0/DepthResolvedSample` = 0/1), not
+/// a new invention. [`Self::DepthResolvedSample`] is the slot's `1` exactly
+/// where the depth family's `1` is [`DepthResolveFilter::Min`], which is why
+/// the two slots stay two ordinal spaces: it takes the stencil of whichever
+/// sample the *depth* resolve selected, so it only means something beside a
+/// depth resolve the pass also states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StencilResolveFilter {
+    /// Take sample zero — the value the API starts at.
+    Sample0,
+    /// Take the stencil of the sample the depth resolve selected.
+    DepthResolvedSample,
+}
+
+impl StencilResolveFilter {
+    pub const ADMITTED: [Self; 2] = [Self::Sample0, Self::DepthResolvedSample];
+
+    /// Stable wire code, which is also the capability mask's bit position.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Sample0 => 0,
+            Self::DepthResolvedSample => 1,
+        }
+    }
+
+    /// Inverse of [`StencilResolveFilter::code`]. An unknown code is a decoder
+    /// error: the set is closed, so a second value is a corrupt record or a
+    /// wrong wire offset, and folding it onto a neighbour resolves at a filter
+    /// the caller did not ask for.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Sample0),
+            1 => Some(Self::DepthResolvedSample),
+            _ => None,
+        }
+    }
+}
+
+/// The stencil resolve a multisampled pass states (`research/docs/23` §3.3,
+/// v60).
+///
+/// The state is pass-level for the same reason the depth resolve is: a pass
+/// has exactly one stencil attachment, and keeping the descriptor inside the
+/// attachment would rewrite the base payload bytes of every pre-v60 frame that
+/// opens a stencil surface. The `None` shape is Metal's API default
+/// [`StencilResolveFilter::Sample0`] — an absent declaration is the value a
+/// caller that never set one carries, not a fallback for one that did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MultisampleStencilResolve {
+    /// The filter the resolve applies to the stencil attachment's samples.
+    pub filter: StencilResolveFilter,
+}
+
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
@@ -2546,6 +2604,15 @@ pub struct RenderPassDescriptor {
     /// stencil surface at all (`research/docs/23` §3.3, v47). When present,
     /// [`Self::stencil_test`] says what the fragments do with it.
     pub stencil: Option<RenderStencilAttachment>,
+    /// The resolve the pass applies to a stored multisampled stencil surface,
+    /// or `None` for the API default [`StencilResolveFilter::Sample0`]
+    /// (`research/docs/23` §3.3, v60). Only legal beside a multisample raster
+    /// whose stencil attachment is stored: the resolve is how a four-sample
+    /// stencil surface's texels become observable. The
+    /// [`StencilResolveFilter::DepthResolvedSample`] filter additionally
+    /// requires the pass to state a depth resolve, whose selected sample is
+    /// the one the stencil resolve then reduces from.
+    pub stencil_resolve: Option<MultisampleStencilResolve>,
     /// The stencil state the pass's draw tests and writes with, or `None` for
     /// "no test" — which a pass with a stencil attachment may still declare,
     /// and which is the shape every earlier increment published (they had no
@@ -2614,7 +2681,15 @@ impl RenderPassDescriptor {
             .depth
             .as_ref()
             .is_some_and(RenderDepthAttachment::is_stored);
-        if !stored_colour && !stored_depth {
+        // The stored stencil surface is a landing too (`research/docs/23`
+        // §3.3, v49/v60): a pass that keeps only its stencil surface — the
+        // stencil-resolve shape — is observable through the resolved texels
+        // exactly as a depth-only pass is through its stored depth.
+        let stored_stencil = self
+            .stencil
+            .as_ref()
+            .is_some_and(RenderStencilAttachment::is_stored);
+        if !stored_colour && !stored_depth && !stored_stencil {
             return Err(ContractError::AllRenderAttachmentsDiscarded);
         }
         // The multisample state (`research/docs/23` §3.3, v51) is the pass-wide
@@ -2646,18 +2721,19 @@ impl RenderPassDescriptor {
                 }
             }
             // The stencil surface beside the raster (`research/docs/23` §3.3,
-            // v55) is the depth surface's sibling one byte wide: the pass may
-            // test and write it, and keeping its texels would need the same
-            // resolve the depth face does not have yet. The two surfaces stay
-            // mutually exclusive — a combined depth-stencil surface is its own
-            // increment — so a pass that opens both is refused here.
+            // v55/v60) is the depth surface's sibling one byte wide: the pass
+            // may test and write it, and keeping its texels needs the stencil
+            // resolve the pass then has to state. A stored surface without one
+            // keeps the v55 refusal, and a combined depth-stencil surface is
+            // admitted from v60 on only through a stencil resolve — the shape
+            // whose resolve targets both faces name the one combined surface.
             if let Some(stencil) = &self.stencil {
-                if self.depth.is_some() {
+                if self.depth.is_some() && self.stencil_resolve.is_none() {
                     return Err(ContractError::MultisampleSurfaceUnsupported {
                         surface: "combined depth-stencil surface",
                     });
                 }
-                if stencil.store == Some(StoreOp::Store) {
+                if stencil.store == Some(StoreOp::Store) && self.stencil_resolve.is_none() {
                     return Err(ContractError::MultisampleStencilStoreUnsupported);
                 }
             }
@@ -2684,6 +2760,30 @@ impl RenderPassDescriptor {
                     .and_then(|depth| depth.store)
                     .map(DepthStoreOp::code);
                 return Err(ContractError::DepthResolveWithoutStoredDepth { store });
+            }
+        }
+        // The stencil resolve (`research/docs/23` §3.3, v60) is the depth
+        // resolve's sibling one byte wide: it only means something beside a
+        // multisample raster that keeps its stencil surface, and the
+        // `DepthResolvedSample` filter additionally names the sample the depth
+        // resolve selected, so it is refused without one instead of silently
+        // degrading to sample zero. The `store` field carries the stencil
+        // attachment's store code when the attachment exists, which is the
+        // state that disagreed.
+        if let Some(resolve) = self.stencil_resolve {
+            let stored = self.multisample.is_some()
+                && self
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.store == Some(StoreOp::Store));
+            if !stored {
+                let store = self.stencil.as_ref().and_then(|stencil| stencil.store);
+                return Err(ContractError::StencilResolveWithoutStoredStencil { store });
+            }
+            if resolve.filter == StencilResolveFilter::DepthResolvedSample
+                && self.depth_resolve.is_none()
+            {
+                return Err(ContractError::StencilResolveWithoutDepthResolve);
             }
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
@@ -6228,6 +6328,21 @@ pub struct ProviderCapabilities {
     /// but not [`DepthResolveFilter::Min`]/[`DepthResolveFilter::Max`], so a
     /// one-bit declaration would admit filters the device refuses.
     pub depth_resolve_modes: u32,
+    /// Whether this snapshot can resolve a stored multisampled stencil surface
+    /// (`research/docs/23` §3.3, v60). Defaults to `false`: no provider
+    /// executes the stencil resolve today, so a pass that states one is
+    /// refused during admission instead of being silently executed with a
+    /// different filter.
+    pub supports_render_stencil_resolve: bool,
+    /// The stencil resolve filters this snapshot admits, as a bitmask with
+    /// bit `i` = [`StencilResolveFilter`] code `i`. `0` means the snapshot
+    /// cannot resolve at all; the field stays at that default for a snapshot
+    /// whose bit above is false. The mask rather than a single bit is the
+    /// device-gated design: a device may execute
+    /// [`StencilResolveFilter::Sample0`] but not
+    /// [`StencilResolveFilter::DepthResolvedSample`], so a one-bit declaration
+    /// would admit filters the device refuses.
+    pub stencil_resolve_modes: u32,
     /// Instances this snapshot admits in one render pass. `0` means the
     /// snapshot cannot instance at all; the field stays at that default for a
     /// snapshot whose bit above is false, so a caller reading the limit
@@ -6307,6 +6422,7 @@ impl ProviderCapabilities {
             || self.declares_instancing_support()
             || self.declares_multisample_support()
             || self.declares_depth_resolve_support()
+            || self.declares_stencil_resolve_support()
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -6346,6 +6462,16 @@ impl ProviderCapabilities {
     /// would be lost on the wire.
     pub fn declares_depth_resolve_support(&self) -> bool {
         self.supports_render_depth_resolve || self.depth_resolve_modes != 0
+    }
+
+    /// Whether any stencil-resolve bit differs from its default. Part of the
+    /// render bits for the same reason
+    /// [`ProviderCapabilities::declares_depth_resolve_support`] is: a snapshot
+    /// that declared stencil resolve support without declaring render would
+    /// otherwise keep sending the legacy capability payload, and the two bits
+    /// would be lost on the wire.
+    pub fn declares_stencil_resolve_support(&self) -> bool {
+        self.supports_render_stencil_resolve || self.stencil_resolve_modes != 0
     }
 
     /// Whether any present bit differs from its default.
@@ -6801,6 +6927,31 @@ impl ProviderCapabilities {
                         ));
                 }
             }
+            // The stencil resolve is the fifth pass-level bit this snapshot
+            // answers (`research/docs/23` §3.3, v60), with the depth resolve's
+            // own question order: the capability bit comes before the
+            // per-filter mask, so a snapshot that cannot resolve at all
+            // refuses the shape instead of reporting a filter detail about
+            // work it would not execute.
+            if let Some(resolve) = pass.stencil_resolve {
+                if !self.supports_render_stencil_resolve {
+                    return Err(capability_error("render_stencil_resolve_unsupported"));
+                }
+                let mask = 1u32 << u32::from(resolve.filter.code());
+                if self.stencil_resolve_modes & mask == 0 {
+                    return Err(
+                        capability_error("render_stencil_resolve_filter_unsupported")
+                            .with_field(
+                                "filter",
+                                FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                            )
+                            .with_field(
+                                "modes",
+                                FieldValue::Unsigned(u64::from(self.stencil_resolve_modes)),
+                            ),
+                    );
+                }
+            }
             if let Some(indices) = &pass.indices {
                 if !self.supported_index_formats.contains(&indices.format) {
                     return Err(capability_error("index_format_unsupported").with_field(
@@ -7177,6 +7328,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MultisampleDepthStoreUnsupported
         | E::MultisampleStencilStoreUnsupported
         | E::DepthResolveWithoutStoredDepth { .. }
+        | E::StencilResolveWithoutStoredStencil { .. }
+        | E::StencilResolveWithoutDepthResolve
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
@@ -8647,6 +8800,24 @@ pub enum ContractError {
     DepthResolveWithoutStoredDepth {
         store: Option<u8>,
     },
+    /// The pass states a stencil resolve without the stored multisampled
+    /// stencil surface it reduces (`research/docs/23` §3.3, v60). A resolve
+    /// only means something beside a multisample raster whose stencil
+    /// attachment is stored, so any other shape — no raster, no stencil
+    /// attachment, or a stencil attachment the pass does not keep — is refused
+    /// instead of silently ignored. The `store` field carries the stencil
+    /// attachment's store decision when the attachment exists; `None` means the
+    /// pass opens no stencil attachment at all.
+    StencilResolveWithoutStoredStencil {
+        store: Option<StoreOp>,
+    },
+    /// The pass states the stencil resolve filter
+    /// [`StencilResolveFilter::DepthResolvedSample`] without a depth resolve to
+    /// name the sample (`research/docs/23` §3.3, v60). The filter is the
+    /// stencil of whichever sample the depth resolve selected, so without one
+    /// the sample is undefined and the filter is refused instead of silently
+    /// degrading to sample zero.
+    StencilResolveWithoutDepthResolve,
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -9229,6 +9400,16 @@ impl fmt::Display for ContractError {
                 "a depth resolve needs a multisample raster that stores its depth surface: \
                  the pass states the resolve without the stored depth attachment \
                  (depth store code {store:?})"
+            ),
+            Self::StencilResolveWithoutStoredStencil { store } => write!(
+                formatter,
+                "a stencil resolve needs a multisample raster that stores its stencil \
+                 surface: the pass states the resolve without the stored stencil attachment \
+                 (stencil store code {store:?})"
+            ),
+            Self::StencilResolveWithoutDepthResolve => formatter.write_str(
+                "the depthResolvedSample stencil resolve names the sample the depth resolve \
+                 selected, so the pass has to state a depth resolve beside it",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -10558,6 +10739,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -10824,6 +11006,8 @@ mod tests {
             max_render_sample_count: 0,
             supports_render_depth_resolve: false,
             depth_resolve_modes: 0,
+            supports_render_stencil_resolve: false,
+            stencil_resolve_modes: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -13812,6 +13996,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -14026,6 +14211,40 @@ mod tests {
             stored_stencil.validate(),
             Err(ContractError::MultisampleStencilStoreUnsupported)
         );
+        // Keeping the stencil surface is admitted from v60 on, through the
+        // stencil resolve the pass then has to state: the resolve is how a
+        // four-sample stencil surface's texels become observable
+        // (`research/docs/23` §3.3, v60).
+        let mut resolved_stencil = stored_stencil.clone();
+        resolved_stencil.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        resolved_stencil
+            .validate()
+            .expect("a stored multisampled stencil surface with a resolve is well formed");
+        // The resolve without the stored surface it reduces is refused; the
+        // `store` field carries the stencil attachment's store decision when
+        // the attachment exists and stays `None` when the pass opens none at
+        // all.
+        let mut resolve_without_store = with_stencil.clone();
+        resolve_without_store.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        assert_eq!(
+            resolve_without_store.validate(),
+            Err(ContractError::StencilResolveWithoutStoredStencil { store: None })
+        );
+        // The depthResolvedSample filter names the sample the depth resolve
+        // selected, so a pass that states it without a depth resolve is
+        // refused instead of silently degrading to sample zero.
+        let mut drs_without_depth = resolved_stencil.clone();
+        drs_without_depth.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::DepthResolvedSample,
+        });
+        assert_eq!(
+            drs_without_depth.validate(),
+            Err(ContractError::StencilResolveWithoutDepthResolve)
+        );
         let mut combined = with_stencil.clone();
         combined.depth = Some(depth_attachment());
         combined.depth_test = Some(DepthTest {
@@ -14038,6 +14257,40 @@ mod tests {
                 surface: "combined depth-stencil surface",
             })
         );
+        // The combined depth-stencil surface is admitted from v60 on through
+        // a stencil resolve: the depthResolvedSample filter needs the stored
+        // depth resolve whose selected sample it names, which is the reviewed
+        // combined shape (`research/docs/23` §3.3, v60).
+        let mut combined_resolved = combined.clone();
+        {
+            let stencil = combined_resolved
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = Some(StoreOp::Store);
+            stencil.identity = Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(951),
+            });
+            let depth = combined_resolved
+                .depth
+                .as_mut()
+                .expect("the fixture opens a depth attachment");
+            depth.store = Some(DepthStoreOp::Store);
+            depth.identity = Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            });
+        }
+        combined_resolved.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Min,
+        });
+        combined_resolved.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::DepthResolvedSample,
+        });
+        combined_resolved
+            .validate()
+            .expect("the combined depth-stencil resolve shape is well formed");
         // The present action stays refused.
         let mut with_present = pass.clone();
         with_present.present = Some(PresentDescriptor {
@@ -14078,6 +14331,16 @@ mod tests {
             assert_eq!(DepthResolveFilter::from_code(filter.code()), Some(filter));
         }
         assert_eq!(DepthResolveFilter::from_code(3), None);
+        // The stencil resolve filters are the closed two-value family whose
+        // codes double as the capability mask's bit positions: Sample0 /
+        // DepthResolvedSample = 0/1, and any third code is a decoder refusal.
+        assert_eq!(StencilResolveFilter::ADMITTED.len(), 2);
+        assert_eq!(StencilResolveFilter::Sample0.code(), 0);
+        assert_eq!(StencilResolveFilter::DepthResolvedSample.code(), 1);
+        for filter in StencilResolveFilter::ADMITTED {
+            assert_eq!(StencilResolveFilter::from_code(filter.code()), Some(filter));
+        }
+        assert_eq!(StencilResolveFilter::from_code(2), None);
     }
 
     /// The reviewed `2x2` depth surface in its pre-v43 shape: rail-owned, kept
@@ -14917,6 +15180,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -15246,6 +15510,90 @@ mod tests {
         pool
     }
 
+    /// The multisample fixture extended with a stored stencil surface and its
+    /// resolve filter (`research/docs/23` §3.3, v60). The stencil surface
+    /// keeps the reviewed v47 state, one byte wide.
+    fn stencil_resolve_trace() -> ComputeTrace {
+        let mut value = multisample_trace();
+        // The stored stencil surface names a landing the trace has to
+        // declare, exactly as the stored depth surface's view is declared
+        // (`research/docs/23` §3.3, v49).
+        // The stencil surface is one byte per texel, so its 2x2 landing is
+        // four bytes — the depth landing's 16 divided by the depth texel's
+        // four (`research/docs/23` §3.3, v49/v60).
+        let landing = BufferView {
+            length: 4,
+            source: BufferSource::OwnedBytes(vec![0; 4]),
+            ..landing_view(952, 941)
+        };
+        value.pipelines[0]
+            .contract
+            .buffer_bindings
+            .push(BufferBindingContract {
+                metal_binding: 1,
+                access: landing.access,
+                footprint: FootprintProof::Affine {
+                    accesses: Vec::new(),
+                },
+            });
+        let Some(TracePass::Compute(pass)) = value.passes.first_mut() else {
+            panic!("the fixture opens with a compute pass");
+        };
+        pass.buffers.push(BufferView {
+            metal_binding: 1,
+            ..landing
+        });
+        let pass = render_entry(&mut value);
+        pass.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::clear(0),
+            store: Some(StoreOp::Store),
+            identity: Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(941),
+                view_id: ViewId::new(952),
+            }),
+        });
+        pass.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::IncrementWrap,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        pass.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        value
+    }
+
+    /// The multisample snapshot extended with the two stencil-resolve bits,
+    /// admitting [`StencilResolveFilter::Sample0`] only — the device-gated
+    /// shape a rail that executes just one filter reports
+    /// (`research/docs/23` §3.3, v60).
+    fn stencil_resolve_capabilities() -> ProviderCapabilities {
+        let mut provider = multisample_capabilities();
+        provider.supports_render_stencil_resolve = true;
+        provider.stencil_resolve_modes = 1u32 << u32::from(StencilResolveFilter::Sample0.code());
+        provider
+    }
+
+    /// The vertex-input pool plus the allocation the stored stencil surface
+    /// names as its landing (`research/docs/23` §3.3, v60).
+    fn stencil_resolve_resources() -> ResourceTableSnapshot {
+        let mut pool = vertex_input_resources();
+        pool.insert_allocation(AllocationRecord {
+            allocation_id: AllocationId::new(941),
+            owner_epoch: DeviceEpoch::new(1),
+            size: 4,
+        })
+        .unwrap();
+        pool
+    }
+
     #[test]
     fn multisample_bits_gate_the_pass() {
         let value = multisample_trace();
@@ -15343,6 +15691,57 @@ mod tests {
         multisample_capabilities()
             .admit(&plain, &depth_resolve_resources())
             .expect("the pre-v57 raster keeps admitting without a declaration");
+    }
+
+    #[test]
+    fn stencil_resolve_bits_gate_the_pass_and_the_filter() {
+        let value = stencil_resolve_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(stencil_resolve_capabilities().declares_render_support());
+        // The two bits are part of the render question on purpose: a snapshot
+        // that declared them without declaring render would lose them on the
+        // wire, the failure `declares_render_support` documents.
+        let mut only_stencil_resolve = capabilities();
+        only_stencil_resolve.supports_render_stencil_resolve = true;
+        only_stencil_resolve.stencil_resolve_modes = 0b11;
+        assert!(only_stencil_resolve.declares_stencil_resolve_support());
+        assert!(only_stencil_resolve.declares_render_support());
+        assert!(!multisample_capabilities().declares_stencil_resolve_support());
+
+        stencil_resolve_capabilities()
+            .admit(&value, &stencil_resolve_resources())
+            .expect("a snapshot that declares the resolve bits admits the resolving pass");
+
+        // The resolve is refused by name when the snapshot does not declare
+        // the capability, and by the per-filter mask when the device reports
+        // modes that do not include the filter the pass states.
+        let no_resolve = multisample_capabilities();
+        assert_eq!(
+            no_resolve
+                .admit(&value, &stencil_resolve_resources())
+                .unwrap_err()
+                .slug,
+            "render_stencil_resolve_unsupported"
+        );
+        let mut narrow = stencil_resolve_capabilities();
+        narrow.stencil_resolve_modes =
+            1u32 << u32::from(StencilResolveFilter::DepthResolvedSample.code());
+        let refusal = narrow
+            .admit(&value, &stencil_resolve_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_stencil_resolve_filter_unsupported");
+        assert_eq!(refusal.fields.get("filter"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            refusal.fields.get("modes"),
+            Some(&FieldValue::Unsigned(0b10))
+        );
+
+        // A pass that never resolves never reaches the check: the absent
+        // field is the shape every earlier increment published.
+        let plain = multisample_trace();
+        multisample_capabilities()
+            .admit(&plain, &stencil_resolve_resources())
+            .expect("the pre-v60 raster keeps admitting without a declaration");
     }
 
     #[test]
