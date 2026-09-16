@@ -18,7 +18,8 @@ use metal_api_core::provider::{
     PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
     ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-    StagedLease, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace, ViewId,
+    StagedLease, StorageMode, SubmissionId, TerminalState, TracePass, ValidatedComputeTrace,
+    ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -27,7 +28,7 @@ use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, S
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
@@ -190,9 +191,19 @@ impl Drop for BorrowedRetains {
 /// advertises it and refused otherwise. Callers can explicitly release
 /// registered pipelines and completion records.
 pub struct VulkanComputeProvider {
-    executor: Arc<VulkanExecutor>,
-    epoch: DeviceEpoch,
-    capabilities: ProviderCapabilities,
+    /// The current device owner. Rebuild replaces the whole executor with a
+    /// freshly created device, so the field sits behind a mutex: every
+    /// submission path reads the current owner, and a rebuild must not strand
+    /// the `Arc` clones those paths hold. The dead owner stays alive exactly
+    /// as long as those clones do.
+    executor: Mutex<Arc<VulkanExecutor>>,
+    /// Current device epoch, kept as the raw counter so `rebuild_after_device_loss`
+    /// can advance it through `&self`. `device_epoch()` is the only reader that
+    /// materializes the typed value, so the two cannot drift.
+    epoch: AtomicU64,
+    /// Device-owned capability snapshot, recomputed on rebuild because a fresh
+    /// device can answer a different limits/format/fault snapshot.
+    capabilities: Mutex<ProviderCapabilities>,
     next_pipeline: AtomicU64,
     next_submission: AtomicU64,
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
@@ -207,6 +218,38 @@ pub struct VulkanComputeProvider {
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
     borrowed: Arc<BorrowedLeaseRegistry>,
+}
+
+/// The provider-side capability snapshot for one device owner.
+///
+/// [`VulkanExecutor::provider_capabilities`] answers the device's own limits;
+/// this overlay adds the provider-shaped windows (`max_passes`, ranged
+/// aliasing, staged leases and, when the device advertises
+/// `VK_EXT_external_memory_host`, borrowed no-copy leases). Both
+/// [`VulkanComputeProvider::with_executor`] and the rebuild path run it, so a
+/// fresh device never keeps a stale snapshot from the dead one.
+fn build_provider_capabilities(executor: &VulkanExecutor) -> ProviderCapabilities {
+    let mut capabilities = executor.provider_capabilities();
+    capabilities.max_passes = 8;
+    // Ranged aliasing is admitted: every pool entry owns its own device
+    // buffer, so two disjoint views of one allocation never share GPU
+    // bytes. A pass binding one view cannot observe another view's writes
+    // because each view's footprint proof bounds its accesses inside its
+    // own half-open range, and admission rejects overlapping ranges
+    // outright. Writeback stays byte-exact per view (the offset is
+    // re-based onto the allocation), and the reserved allocation is still
+    // exclusive for the commit-to-completion window.
+    capabilities.alias_mode = AliasMode::DistinctViews;
+    if !capabilities
+        .storage_modes
+        .contains(&StorageMode::StagedLease)
+    {
+        capabilities.storage_modes.push(StorageMode::StagedLease);
+    }
+    if executor.context.external_memory_host_alignment() > 0 {
+        capabilities.storage_modes.push(StorageMode::BorrowedNoCopy);
+    }
+    capabilities
 }
 
 impl VulkanComputeProvider {
@@ -225,30 +268,11 @@ impl VulkanComputeProvider {
     /// Use the same device and queue lock as an existing snapshot executor.
     pub fn with_executor(executor: Arc<VulkanExecutor>) -> Result<Self, ProviderError> {
         let epoch = allocate_device_epoch()?;
-        let mut capabilities = executor.provider_capabilities();
-        capabilities.max_passes = 8;
-        // Ranged aliasing is admitted: every pool entry owns its own device
-        // buffer, so two disjoint views of one allocation never share GPU
-        // bytes. A pass binding one view cannot observe another view's writes
-        // because each view's footprint proof bounds its accesses inside its
-        // own half-open range, and admission rejects overlapping ranges
-        // outright. Writeback stays byte-exact per view (the offset is
-        // re-based onto the allocation), and the reserved allocation is still
-        // exclusive for the commit-to-completion window.
-        capabilities.alias_mode = AliasMode::DistinctViews;
-        if !capabilities
-            .storage_modes
-            .contains(&StorageMode::StagedLease)
-        {
-            capabilities.storage_modes.push(StorageMode::StagedLease);
-        }
-        if executor.context.external_memory_host_alignment() > 0 {
-            capabilities.storage_modes.push(StorageMode::BorrowedNoCopy);
-        }
+        let capabilities = build_provider_capabilities(&executor);
         Ok(Self {
-            executor,
-            epoch,
-            capabilities,
+            executor: Mutex::new(executor),
+            epoch: AtomicU64::new(epoch.get()),
+            capabilities: Mutex::new(capabilities),
             next_pipeline: AtomicU64::new(1),
             next_submission: AtomicU64::new(1),
             pipelines: Mutex::new(BTreeMap::new()),
@@ -273,6 +297,126 @@ impl VulkanComputeProvider {
         self
     }
 
+    /// Rebuild the device in place after a confirmed device loss.
+    ///
+    /// The one precondition is the exact terminal state the core lifecycle
+    /// keeps: `DeviceLost`. A usable context, an abandonment-exhausted
+    /// context, or a provider that still carries a completion outbox is
+    /// refused fail-closed (`rebuild_requires_device_loss` /
+    /// `rebuild_with_completion_outbox`) instead of being partially rebuilt.
+    /// The outbox refusal is deliberate: the outbox is scoped to the dead
+    /// epoch, and silently publishing fresh-epoch tokens into it would break
+    /// its `device_epoch` contract.
+    ///
+    /// On success the provider owns a brand-new `vk::Device`, queues and
+    /// capability snapshot, and its `DeviceEpoch` has advanced. Every
+    /// registration bound to the dead device is dropped — pipelines, render
+    /// pipelines, present-target images, completion records and the
+    /// last-submission observations — because Vulkan invalidates every device
+    /// child with the device. Old-epoch completion tokens keep their existing
+    /// `device_epoch_mismatch` refusal and old-epoch leases their existing
+    /// `lease_epoch_mismatch` refusal; neither is silently re-admitted. The
+    /// caller re-registers pipelines and re-validates the trace, exactly as
+    /// it would for a freshly created provider.
+    pub fn rebuild_after_device_loss(&self) -> Result<(), ProviderError> {
+        // Fail closed before touching anything: rebuild is only the repair for
+        // a terminal `DeviceLost`, and the outbox is epoch-scoped state that
+        // cannot survive the epoch advance.
+        {
+            let executor = self.lock_executor()?;
+            let lifecycle = executor.context.lock_lifecycle();
+            if !lifecycle.ended_by_device_loss() {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "rebuild_requires_device_loss",
+                )
+                .with_field(
+                    "terminal",
+                    FieldValue::Text(terminal_state_name(lifecycle.state()).to_owned()),
+                ));
+            }
+            if self.completion_outbox.is_some() {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Resource,
+                    "rebuild_with_completion_outbox",
+                )
+                .with_detail(
+                    "the completion outbox is scoped to the dead device epoch; recreate the \
+                     provider with a fresh outbox instead",
+                ));
+            }
+        }
+
+        // Build the replacement before mutating anything: if the new device
+        // cannot be created, the provider stays exactly as it was (terminal
+        // and refusing), so the refusal still names a failed rebuild.
+        let fresh = VulkanExecutor::new().map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Resource,
+                "rebuild_device_initialization_failed",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let epoch = allocate_device_epoch()?;
+        let capabilities = build_provider_capabilities(&fresh);
+
+        // Install the fresh owner and the advanced epoch. Terminal states are
+        // monotonic, so the precondition above cannot have unwound between the
+        // check and the swap; poisoning here is recovered the same way the
+        // lifecycle lock is, because a panic must not leave the owner stranded
+        // on a dead device.
+        {
+            let mut executor = self
+                .executor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *executor = fresh;
+        }
+        self.epoch.store(epoch.get(), Ordering::Relaxed);
+        *self
+            .capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = capabilities;
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.render_pipelines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.present_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.heap_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.icb_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        // The retirement worker captured the dead context when it spawned;
+        // closing the channel lets it drain and exit so a future deferred
+        // submission spawns a worker bound to the new device instead.
+        {
+            let mut retire = self
+                .retire_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *retire = None;
+        }
+        Ok(())
+    }
+
     /// Build the explicitly declared heap-aliasing test snapshot.
     ///
     /// This exists only for the heap-aliasing hazard fixture (`research/docs/25`
@@ -283,7 +427,10 @@ impl VulkanComputeProvider {
     /// through a bypass. Nothing else in the snapshot changes, so the fixture
     /// still fails closed if it accidentally loses this marker.
     pub fn with_heap_aliasing_test_snapshot(mut self) -> Self {
-        self.capabilities.supports_heap_aliasing = true;
+        self.capabilities
+            .get_mut()
+            .expect("provider owns its capability snapshot")
+            .supports_heap_aliasing = true;
         self
     }
 
@@ -347,13 +494,13 @@ impl VulkanComputeProvider {
         mut self,
         outbox: Arc<CompletionOutbox>,
     ) -> Result<Self, ProviderError> {
-        if outbox.device_epoch() != self.epoch {
+        if outbox.device_epoch() != self.device_epoch() {
             return Err(refusal(
                 ProviderPhase::Resolve,
                 ProviderErrorClass::Args,
                 "completion_outbox_epoch_mismatch",
             )
-            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field("expected", FieldValue::Unsigned(self.device_epoch().get()))
             .with_field("actual", FieldValue::Unsigned(outbox.device_epoch().get())));
         }
         self.completion_outbox = Some(outbox);
@@ -373,11 +520,14 @@ impl VulkanComputeProvider {
     }
 
     pub fn device_epoch(&self) -> DeviceEpoch {
-        self.epoch
+        DeviceEpoch::new(self.epoch.load(Ordering::Relaxed))
     }
 
-    pub fn device_name(&self) -> &str {
-        self.executor.device_name()
+    pub fn device_name(&self) -> String {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .device_name()
+            .to_owned()
     }
 
     /// Report whether this provider can still admit new work.
@@ -385,12 +535,18 @@ impl VulkanComputeProvider {
     /// Health and admission are the same query on the same lifecycle, so a
     /// provider that reports `Usable` here also admits the next submission.
     pub fn health(&self) -> ProviderHealth {
-        self.executor.context.health()
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .context
+            .health()
     }
 
     /// Report `(abandoned submissions, abandoned bytes)` for this context.
     pub fn abandonment_stats(&self) -> (u64, u64) {
-        self.executor.context.abandonment_stats()
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .context
+            .abandonment_stats()
     }
 
     /// Translate and register a function. The logical digest is a caller-issued
@@ -424,7 +580,7 @@ impl VulkanComputeProvider {
             })?;
         self.ensure_usable()?;
         let metadata = CompiledComputePipeline {
-            device_epoch: self.epoch,
+            device_epoch: self.device_epoch(),
             pipeline_id: PipelineId::new(next_identity(
                 &self.next_pipeline,
                 "pipeline_identity_exhausted",
@@ -446,7 +602,7 @@ impl VulkanComputeProvider {
         let registered = RegisteredPipeline {
             metadata: metadata.clone(),
             artifact: Arc::new(VulkanPipelineArtifact {
-                context: Arc::clone(&self.executor.context),
+                context: Arc::clone(&self.lock_executor()?.context),
                 translated,
             }),
         };
@@ -502,7 +658,7 @@ impl VulkanComputeProvider {
             .with_detail(error.to_string())
         })?;
         let metadata = CompiledComputePipeline {
-            device_epoch: self.epoch,
+            device_epoch: self.device_epoch(),
             pipeline_id: PipelineId::new(next_identity(
                 &self.next_pipeline,
                 "pipeline_identity_exhausted",
@@ -534,7 +690,7 @@ impl VulkanComputeProvider {
         &self,
         metadata: &CompiledComputePipeline,
     ) -> Result<(), ProviderError> {
-        check_epoch(self.epoch, metadata.device_epoch)?;
+        check_epoch(self.device_epoch(), metadata.device_epoch)?;
         let mut registrations = self
             .render_pipelines
             .lock()
@@ -814,8 +970,9 @@ impl VulkanComputeProvider {
                     None
                 };
                 let target = self.present_target(present, attachment)?;
+                let executor = self.lock_executor()?;
                 let texels = render::execute_present_render(
-                    &self.executor.context,
+                    &executor.context,
                     &planned.stages,
                     &planned.pass,
                     &target,
@@ -979,10 +1136,11 @@ impl VulkanComputeProvider {
                 },
                 None => None,
             };
+            let executor = self.lock_executor()?;
             let readback = match trace.indirect.as_deref() {
                 Some(payload) => {
                     let readback = render::execute_indirect_render_pass(
-                        &self.executor.context,
+                        &executor.context,
                         &planned.stages,
                         &planned.pass,
                         &payload.command,
@@ -1000,7 +1158,7 @@ impl VulkanComputeProvider {
                     readback
                 }
                 None => render::execute_render_pass(
-                    &self.executor.context,
+                    &executor.context,
                     &planned.stages,
                     &planned.pass,
                     &previous,
@@ -1066,7 +1224,7 @@ impl VulkanComputeProvider {
             return Ok(Arc::clone(existing));
         }
         let mut image = render::PresentTargetImage::create(
-            Arc::clone(&self.executor.context),
+            Arc::clone(&self.lock_executor()?.context),
             attachment.format,
             attachment.width,
             attachment.height,
@@ -1097,7 +1255,9 @@ impl VulkanComputeProvider {
     /// rail. Smoke tests use it to prove a presenting case reports one of each.
     #[doc(hidden)]
     pub fn present_counts(&self) -> (usize, usize) {
-        self.executor.present_counts()
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .present_counts()
     }
 
     fn retire(&self, pending: PendingExecution) {
@@ -1107,7 +1267,12 @@ impl VulkanComputeProvider {
         };
         let sender = slot.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<PendingExecution>();
-            let context = Arc::clone(&self.executor.context);
+            let context = Arc::clone(
+                &self
+                    .lock_executor()
+                    .expect("executor lock poisoned")
+                    .context,
+            );
             let outbox = self.completion_outbox.clone();
             let _ = std::thread::Builder::new()
                 .name("vulkan-provider-retire".into())
@@ -1289,7 +1454,13 @@ impl VulkanComputeProvider {
 
     fn sync_completion_health(&self) {
         if let Some(outbox) = &self.completion_outbox {
-            sync_context_health(&self.executor.context, outbox);
+            sync_context_health(
+                &self
+                    .lock_executor()
+                    .expect("executor lock poisoned")
+                    .context,
+                outbox,
+            );
         }
     }
 
@@ -1313,11 +1484,20 @@ impl VulkanComputeProvider {
             )
             .with_detail(error.to_string())
         })?;
-        check_epoch(self.epoch, token.device_epoch)
+        check_epoch(self.device_epoch(), token.device_epoch)
     }
 
     fn ensure_usable(&self) -> Result<(), ProviderError> {
-        ensure_context_usable(&self.executor.context)
+        ensure_context_usable(&self.lock_executor()?.context)
+    }
+
+    /// Lock the current device owner for one read or write.
+    ///
+    /// Rebuild swaps the owner in place, so every submission path must read the
+    /// owner through this guard instead of a copy taken earlier. Poisoning is a
+    /// registry failure, not a signal to keep going on a possibly dead device.
+    fn lock_executor(&self) -> Result<MutexGuard<'_, Arc<VulkanExecutor>>, ProviderError> {
+        self.executor.lock().map_err(|_| registry_poisoned())
     }
 }
 
@@ -1452,13 +1632,13 @@ impl VulkanComputeProvider {
 
 impl LeaseImporter for VulkanComputeProvider {
     fn import_staged_lease(&self, staged: StagedLease) -> Result<(), ProviderError> {
-        if staged.reservation.lease.owner_epoch != self.epoch {
+        if staged.reservation.lease.owner_epoch != self.device_epoch() {
             return Err(refusal(
                 ProviderPhase::Resolve,
                 ProviderErrorClass::Args,
                 "lease_epoch_mismatch",
             )
-            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field("expected", FieldValue::Unsigned(self.device_epoch().get()))
             .with_field(
                 "actual",
                 FieldValue::Unsigned(staged.reservation.lease.owner_epoch.get()),
@@ -1474,17 +1654,20 @@ impl LeaseImporter for VulkanComputeProvider {
 
 impl NoCopyLeaseImporter for VulkanComputeProvider {
     fn no_copy_alignment(&self) -> u64 {
-        self.executor.context.external_memory_host_alignment()
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .context
+            .external_memory_host_alignment()
     }
 
     unsafe fn import_borrowed_lease(&self, borrowed: BorrowedLease) -> Result<(), ProviderError> {
-        if borrowed.reservation.lease.owner_epoch != self.epoch {
+        if borrowed.reservation.lease.owner_epoch != self.device_epoch() {
             return Err(refusal(
                 ProviderPhase::Resolve,
                 ProviderErrorClass::Args,
                 "lease_epoch_mismatch",
             )
-            .with_field("expected", FieldValue::Unsigned(self.epoch.get()))
+            .with_field("expected", FieldValue::Unsigned(self.device_epoch().get()))
             .with_field(
                 "actual",
                 FieldValue::Unsigned(borrowed.reservation.lease.owner_epoch.get()),
@@ -1516,7 +1699,7 @@ impl NoCopyLeaseImporter for VulkanComputeProvider {
 
 impl PipelineProvider for VulkanComputeProvider {
     fn device_epoch(&self) -> DeviceEpoch {
-        self.epoch
+        DeviceEpoch::new(self.epoch.load(Ordering::Relaxed))
     }
 
     fn compile(
@@ -1531,7 +1714,7 @@ impl PipelineProvider for VulkanComputeProvider {
             )
             .with_detail(error.to_string())
         })?;
-        let device = Device::new(self.executor.clone());
+        let device = Device::new(self.lock_executor()?.clone());
         let library = match request.source {
             ShaderSource::SanitizedLl(source) => device.new_library_with_air(source),
             ShaderSource::BinaryAir(bytes) => device.new_library_with_binary_air(bytes),
@@ -1563,7 +1746,7 @@ impl PipelineProvider for VulkanComputeProvider {
     }
 
     fn release_pipeline(&self, metadata: &CompiledComputePipeline) -> Result<(), ProviderError> {
-        check_epoch(self.epoch, metadata.device_epoch)?;
+        check_epoch(self.device_epoch(), metadata.device_epoch)?;
         let mut pipelines = self.pipelines.lock().map_err(|_| registry_poisoned())?;
         let registered = pipelines
             .get(&metadata.pipeline_id)
@@ -1586,7 +1769,10 @@ impl PipelineProvider for VulkanComputeProvider {
 
 impl ComputeProvider for VulkanComputeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        self.capabilities.clone()
+        self.capabilities
+            .lock()
+            .expect("capability lock poisoned")
+            .clone()
     }
 
     fn health(&self) -> ProviderHealth {
@@ -1606,26 +1792,28 @@ impl ComputeProvider for VulkanComputeProvider {
         &self,
         tiers: &[QueuePriority],
     ) -> Result<Vec<QueuePriority>, ProviderError> {
-        let installed = queue_priorities_for_device(self.executor.queue_count(), tiers);
-        self.executor
-            .set_queue_priorities(&installed)
-            .map_err(|error| {
-                refusal(
-                    ProviderPhase::Resolve,
-                    ProviderErrorClass::Internal,
-                    "queue_priorities_refused",
-                )
-                .with_detail(error.to_string())
-            })?;
+        let executor = self.lock_executor()?;
+        let installed = queue_priorities_for_device(executor.queue_count(), tiers);
+        executor.set_queue_priorities(&installed).map_err(|error| {
+            refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Internal,
+                "queue_priorities_refused",
+            )
+            .with_detail(error.to_string())
+        })?;
         Ok(installed)
     }
 
     fn submit(&self, admitted: ValidatedComputeTrace) -> Result<ProviderSubmission, ProviderError> {
         let trace = admitted.trace();
-        check_epoch(self.epoch, trace.device_epoch)?;
+        check_epoch(self.device_epoch(), trace.device_epoch)?;
         // A ValidatedComputeTrace may have been admitted against another
         // capability snapshot. Only the receiving owner can authorize execution.
-        self.capabilities.admit(trace, admitted.resources())?;
+        self.capabilities
+            .lock()
+            .map_err(|_| registry_poisoned())?
+            .admit(trace, admitted.resources())?;
         // The indirect dispatch the compute rail replays, resolved and shape
         // checked before any compute resource exists. The render rail owns the
         // draw half; `None` here means the compute sequence dispatches directly.
@@ -1709,7 +1897,7 @@ impl ComputeProvider for VulkanComputeProvider {
                 &self.next_submission,
                 "submission_identity_exhausted",
             )?),
-            device_epoch: self.epoch,
+            device_epoch: self.device_epoch(),
         };
         let alignment = self.no_copy_alignment();
         // Owned views of one allocation share a single device buffer, so the
@@ -1802,7 +1990,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     let bytes = self.staging.view_bytes(
                         *lease_id,
                         resource,
-                        self.epoch,
+                        self.device_epoch(),
                         admitted.resources(),
                     )?;
                     buffers.push(PoolBinding::Owned(BufferBinding { index, bytes }));
@@ -1818,7 +2006,7 @@ impl ComputeProvider for VulkanComputeProvider {
                     let view = self.borrowed.view_pointer(
                         *lease_id,
                         resource,
-                        self.epoch,
+                        self.device_epoch(),
                         admitted.resources(),
                     )?;
                     let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
@@ -1850,16 +2038,16 @@ impl ComputeProvider for VulkanComputeProvider {
             .with_detail(error.to_string())
         })?;
         if self.async_execution {
-            let queue_index = self.executor.context.pick_queue();
+            let executor = self.lock_executor()?.clone();
+            let queue_index = executor.context.pick_queue();
             let pending = {
-                let _execution = self
-                    .executor
+                let _execution = executor
                     .context
                     .lock_queue(queue_index)
                     .map_err(|_| registry_poisoned())?;
-                ensure_executor_usable(&self.executor)?;
+                ensure_executor_usable(&executor)?;
                 PendingExecution::submit(
-                    &self.executor.context,
+                    &executor.context,
                     queue_index,
                     &artifacts,
                     &buffers,
@@ -1933,8 +2121,9 @@ impl ComputeProvider for VulkanComputeProvider {
                 writebacks: Vec::new(),
             });
         }
+        let executor = self.lock_executor()?.clone();
         let result = execute_on_context(
-            &self.executor,
+            &executor,
             &artifacts,
             &buffers,
             &dispatches,
@@ -2318,6 +2507,16 @@ fn registry_poisoned() -> ProviderError {
         ProviderErrorClass::Internal,
         "provider_registry_poisoned",
     )
+}
+
+/// The refusal-field name of one terminal state, so a caller can read which
+/// non-loss state refused a rebuild without matching on the enum itself.
+fn terminal_state_name(state: TerminalState) -> &'static str {
+    match state {
+        TerminalState::Usable => "usable",
+        TerminalState::Exhausted { .. } => "abandonment_exhausted",
+        TerminalState::DeviceLost => "device_lost",
+    }
 }
 
 fn unknown_pipeline(id: PipelineId) -> ProviderError {
