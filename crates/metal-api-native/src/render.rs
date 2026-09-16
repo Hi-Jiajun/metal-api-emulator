@@ -50,11 +50,11 @@ use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
-    ContractError, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
-    IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, SampleCount, StencilTest, StoreOp, TracePass, VertexFormat,
-    VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    ContractError, DepthResolveFilter, DepthStoreOp, DepthTest, FieldValue, IndexBufferBinding,
+    IndexFormat, IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode,
+    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, SampleCount, StencilTest, StoreOp, TracePass,
+    VertexFormat, VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -615,6 +615,53 @@ pub(crate) fn multisample_capability_bits() -> MultisampleCapabilityBits {
     MultisampleCapabilityBits {
         supports_render_multisample: true,
         max_render_sample_count: MAX_RENDER_SAMPLE_COUNT,
+    }
+}
+
+/// The depth-resolve bits the provider declares, in one value so the macOS
+/// capability snapshot and the host-side tests cannot drift
+/// (`research/docs/23` §3.3, v57c).
+///
+/// The mode mask is the contract's per-filter bit layout: bit `i` =
+/// [`DepthResolveFilter`] code `i` (`metal-api-core`:
+/// `ProviderCapabilities::depth_resolve_modes`). Only the Sample0 bit is
+/// declared in this increment — Min/Max stay undeclared until an Apple
+/// Paravirtual run measures whether the device actually executes them, so a
+/// Min/Max request is refused at admission instead of claiming an unmeasured
+/// semantic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DepthResolveCapabilityBits {
+    pub(crate) supports_render_depth_resolve: bool,
+    pub(crate) depth_resolve_modes: u32,
+}
+
+/// The Sample0 mode bit, spelled once so the probe and the snapshot cannot
+/// disagree about which filter the rail admits.
+pub(crate) const DEPTH_RESOLVE_SAMPLE0_BIT: u32 = 1u32 << DepthResolveFilter::Sample0.code();
+
+/// The depth-resolve bits derived from the device itself, queried exactly once
+/// when the provider is created (`native.rs`).
+///
+/// `metal` 0.33 models depth32-float resolve as a macOS platform fact:
+/// `depth32_float_capabilities` reports `Resolve` for every macOS feature set
+/// (its `device.rs`, and the SDK has no finer per-device selector), while the
+/// crate's `supports_msaa_depth_resolve` is iOS-gated and says false on macOS.
+/// The feature-set API is deprecated in the SDK, so the probe asks the modern
+/// `supportsFamily:` question for the Apple family the provider's admission
+/// already requires — a real device query rather than a compile-time constant,
+/// combined with the platform fact the crate models. The filter mask stays
+/// fail-closed at Sample0 because Min/Max execution on Apple Paravirtual is
+/// not yet measured (`research/docs/23` §3.3, v57c).
+#[cfg(target_os = "macos")]
+pub(crate) fn device_depth_resolve_capability_bits(device: &Device) -> DepthResolveCapabilityBits {
+    let supports = device.supports_family(metal::MTLGPUFamily::Apple4);
+    DepthResolveCapabilityBits {
+        supports_render_depth_resolve: supports,
+        depth_resolve_modes: if supports {
+            DEPTH_RESOLVE_SAMPLE0_BIT
+        } else {
+            0
+        },
     }
 }
 
@@ -1294,6 +1341,11 @@ pub(crate) struct RenderPlan<'a> {
     /// The rail-owned depth attachment this pass opens, or `None` for a pass
     /// with no depth surface (`research/docs/23` §3.3, v36).
     pub(crate) depth: Option<PlannedDepth>,
+    /// The depth resolve a multisampled pass states, carried as the filter the
+    /// encoder sets on the depth attachment (`research/docs/23` §3.3, v57c).
+    /// `None` is every pass that does not resolve — the pre-v57 shapes and the
+    /// single-sample stored depth.
+    pub(crate) depth_resolve: Option<DepthResolveFilter>,
     /// The rail-owned stencil attachment this pass opens, or `None` for a pass
     /// with no stencil surface (`research/docs/23` §3.3, v47).
     pub(crate) stencil: Option<PlannedStencil>,
@@ -1411,6 +1463,7 @@ pub(crate) struct PlannedAttachment<'a> {
 /// request.
 pub(crate) fn plan<'a>(
     request: &OffscreenRenderRequest<'a>,
+    depth_resolve_modes: u32,
 ) -> Result<RenderPlan<'a>, ProviderError> {
     let attachments = &request.pass.color_attachments;
     // The rail's own extent-equality gate comes before the contract's viewport
@@ -1674,6 +1727,32 @@ pub(crate) fn plan<'a>(
             initial,
         });
     }
+    // The depth resolve (`research/docs/23` §3.3, v57c) only means something
+    // beside a multisample raster that keeps its depth surface: the resolve is
+    // the reduction of the stored four-sample texels, so a resolve without
+    // both is refused instead of silently ignored. The core contract refuses
+    // the same shape with `DepthResolveWithoutStoredDepth`; this is the
+    // value-level second line of defence for a directly-constructed request,
+    // in the same place the Vulkan rail re-asserts it.
+    if request.pass.depth_resolve.is_some() {
+        let stored = request.pass.multisample.is_some()
+            && request
+                .pass
+                .depth
+                .as_ref()
+                .is_some_and(|depth| depth.store == Some(DepthStoreOp::Store));
+        if !stored {
+            let store = request
+                .pass
+                .depth
+                .as_ref()
+                .and_then(|depth| depth.store)
+                .map(DepthStoreOp::code);
+            return Err(contract_refusal(
+                ContractError::DepthResolveWithoutStoredDepth { store },
+            ));
+        }
+    }
     let module = module.expect("the source check above refused a shape without a module");
     Ok(RenderPlan {
         source: module.source,
@@ -1694,24 +1773,46 @@ pub(crate) fn plan<'a>(
         // not execute.
         multisample: match request.pass.multisample {
             Some(multisample) if multisample.sample_count == SampleCount::Four => {
-                // A multisampled depth surface is rail-owned in this increment
-                // (`research/docs/23` §3.3, v53): keeping it would need the
-                // depth resolve filter, so a directly-constructed request that
-                // asks for one is refused here exactly as the contract refuses
-                // it.
+                // A stored multisampled depth surface is admitted from v57c on,
+                // through the resolve the pass then has to state: its texels
+                // are only observable as the resolve's reduction, so a stored
+                // surface without one stays refused, and a filter the device
+                // does not report is refused by the same per-filter question
+                // the capability snapshot answered (`research/docs/23` §3.3,
+                // v57c).
                 if request
                     .pass
                     .depth
                     .as_ref()
                     .is_some_and(|depth| depth.store == Some(DepthStoreOp::Store))
                 {
-                    return Err(
-                        capability_refusal("render_multisample_depth_store_unsupported")
+                    match request.pass.depth_resolve {
+                        Some(resolve) => {
+                            let mask = 1u32 << u32::from(resolve.filter.code());
+                            if depth_resolve_modes & mask == 0 {
+                                return Err(capability_refusal(
+                                    "render_depth_resolve_filter_unsupported",
+                                )
+                                .with_field(
+                                    "filter",
+                                    FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                                )
+                                .with_field(
+                                    "modes",
+                                    FieldValue::Unsigned(u64::from(depth_resolve_modes)),
+                                ));
+                            }
+                        }
+                        None => {
+                            return Err(capability_refusal(
+                                "render_multisample_depth_store_unsupported",
+                            )
                             .with_detail(
-                            "a multisampled depth surface cannot be kept yet: the depth resolve \
-                             filters are a later increment",
-                        ),
-                    );
+                                "a multisampled depth surface cannot be kept without a depth \
+                                 resolve",
+                            ));
+                        }
+                    }
                 }
                 // The stencil sibling's two refusals (`research/docs/23` §3.3,
                 // v55): a kept stencil surface needs the stencil resolve, and a
@@ -1760,6 +1861,7 @@ pub(crate) fn plan<'a>(
             // naming a landing identity.
             store: depth.store,
         }),
+        depth_resolve: request.pass.depth_resolve.map(|resolve| resolve.filter),
         stencil: request.pass.stencil.as_ref().map(|stencil| PlannedStencil {
             width: u32::try_from(stencil.width).unwrap_or(u32::MAX),
             height: u32::try_from(stencil.height).unwrap_or(u32::MAX),
@@ -2171,6 +2273,7 @@ pub(crate) fn plan_trace<'a>(
     trace: &'a ComputeTrace,
     pool: &'a [BufferView],
     contracts: &'a BTreeMap<PipelineId, RenderPipelineContract>,
+    depth_resolve_modes: u32,
 ) -> Result<Vec<TraceRenderPlan<'a>>, ProviderError> {
     if !trace.has_render_passes() {
         return Ok(Vec::new());
@@ -2302,13 +2405,16 @@ pub(crate) fn plan_trace<'a>(
             },
             None => None,
         };
-        let plan_of_pass = plan(&OffscreenRenderRequest {
-            pass,
-            pipeline: contract,
-            source: reviewed_module(&contract.vertex_layout, &contract.color_formats)
-                .map_or("", |module| module.source),
-            initial: previous,
-        })?;
+        let plan_of_pass = plan(
+            &OffscreenRenderRequest {
+                pass,
+                pipeline: contract,
+                source: reviewed_module(&contract.vertex_layout, &contract.color_formats)
+                    .map_or("", |module| module.source),
+                initial: previous,
+            },
+            depth_resolve_modes,
+        )?;
         let present = pass.present.as_ref().map(|descriptor| {
             let sentinel = descriptor.target.initial.sentinel().map(|texel| {
                 let texels = usize::try_from(
@@ -2399,7 +2505,13 @@ pub(crate) fn execute_offscreen_render(
     queue: &CommandQueue,
     request: &OffscreenRenderRequest<'_>,
 ) -> Result<RenderReadback, ProviderError> {
-    let planned = plan(request)?;
+    // The depth-resolve modes the rail re-asserts come from the same device
+    // probe the capability snapshot published, so a directly-constructed
+    // request is refused by the same mask admission used.
+    let planned = plan(
+        request,
+        device_depth_resolve_capability_bits(device).depth_resolve_modes,
+    )?;
     encode_offscreen_render(device, queue, &planned)
 }
 
@@ -2573,11 +2685,33 @@ fn encode_into_and_readback(
     // The texture and the depth-stencil state stay in these locals until the
     // readback below: the pass descriptor and the encoder reference them, and
     // the rail's objects are autoreleased at the end of the pool.
+    // A resolving pass names two depth textures: the four-sample surface the
+    // fragments land in (private, never read back) and the single-sample
+    // landing the resolve writes — the v43 shared-storage readback texture,
+    // which is what the readback below observes (`research/docs/23` §3.3,
+    // v57c). Every non-resolving shape keeps the one texture `depth_texture`
+    // builds, exactly as before.
+    let depth_resolving = planned.depth_resolve.is_some();
     let depth_target = planned
         .depth
         .as_ref()
-        .map(|depth| depth_texture(device, depth, planned.multisample))
+        .map(|depth| {
+            if depth_resolving {
+                multisample_depth_surface(device, depth)
+            } else {
+                depth_texture(device, depth, planned.multisample)
+            }
+        })
         .transpose()?;
+    let depth_resolve_target = if depth_resolving {
+        planned
+            .depth
+            .as_ref()
+            .map(|depth| depth_texture(device, depth, None))
+            .transpose()?
+    } else {
+        None
+    };
     if let (Some(depth), Some(texture)) = (&planned.depth, &depth_target) {
         let attachment = pass
             .depth_attachment()
@@ -2591,14 +2725,28 @@ fn encode_into_and_readback(
             None => attachment.set_load_action(MTLLoadAction::Load),
         }
         // The store action is the pass's own statement
-        // (`research/docs/23` §3.3, v43): a storing surface has to survive the
-        // pass for its texels to leave it, and every pre-v43 shape discards the
-        // rail-owned surface with the pass.
-        attachment.set_store_action(if depth.storing() {
-            MTLStoreAction::Store
-        } else {
-            MTLStoreAction::DontCare
+        // (`research/docs/23` §3.3, v43/v57c): a resolving stored surface
+        // lands in its resolve target through `.multisampleResolve`, a stored
+        // single-sample surface keeps its own texels, and every other shape
+        // discards the rail-owned surface with the pass.
+        attachment.set_store_action(match (depth.storing(), planned.depth_resolve) {
+            (true, Some(_)) => MTLStoreAction::MultisampleResolve,
+            (true, None) => MTLStoreAction::Store,
+            (false, _) => MTLStoreAction::DontCare,
         });
+        // The two depth-resolve fields are a `metal` 0.33 binding gap: the
+        // depth attachment descriptor has no setter for them, so the rail
+        // sends the two selectors itself. The filter ordinal is the contract's
+        // code (`MTLMultisampleDepthResolveFilterSample0/Min/Max` = 0/1/2),
+        // and the resolve target is the single-sample landing above.
+        if let (Some(filter), Some(landing)) =
+            (planned.depth_resolve, depth_resolve_target.as_ref())
+        {
+            unsafe {
+                let _: () = msg_send![attachment, setResolveTexture: Some(landing.as_ref())];
+                let _: () = msg_send![attachment, setDepthResolveFilter: u64::from(filter.code())];
+            }
+        }
     }
     // The stencil attachment is rail-owned in the same way (`research/docs/23`
     // §3.3, v47): created when the plan declares one, opened with the plan's
@@ -2853,8 +3001,14 @@ fn encode_into_and_readback(
     // region is the pass's own extent, which the contract holds to the colour
     // attachments'. A discarded or absent surface keeps its bytes on the
     // device and reads nothing back.
-    let depth = match (&planned.depth, &depth_target) {
-        (Some(depth), Some(texture)) if depth.storing() => Some(read_texels(texture, planned)?),
+    // A resolving pass observes the resolve target — the single-sample landing
+    // `depth_resolve_target` holds — while every non-resolving stored surface
+    // is read back from its own texture (`research/docs/23` §3.3, v43/v57c).
+    let depth = match (&planned.depth, &depth_target, &depth_resolve_target) {
+        (Some(depth), _, Some(landing)) if depth.storing() => Some(read_texels(landing, planned)?),
+        (Some(depth), Some(texture), None) if depth.storing() => {
+            Some(read_texels(texture, planned)?)
+        }
         _ => None,
     };
     // The stored stencil surface's texels leave through the same `getBytes`
@@ -3052,6 +3206,40 @@ fn depth_texture(
         unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
     if pointer.is_null() {
         return Err(resource_refusal("metal_render_depth_allocation_failed"));
+    }
+    Ok(unsafe { Texture::from_ptr(pointer) })
+}
+
+/// The four-sample depth surface a resolving pass renders into
+/// (`research/docs/23` §3.3, v57c).
+///
+/// The resolve's landing is the single-sample shared texture
+/// [`depth_texture`] builds for a stored surface, so this surface is never
+/// read back and stays private — the same reason the four-sample colour
+/// surfaces are private in the Swift oracle. Metal refuses an encoder whose
+/// depth texture's sample count disagrees with `rasterSampleCount`, so the two
+/// come from one decision exactly as the non-resolving multisampled surface
+/// does.
+#[cfg(target_os = "macos")]
+fn multisample_depth_surface(
+    device: &Device,
+    depth: &PlannedDepth,
+) -> Result<Texture, ProviderError> {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2Multisample);
+    descriptor.set_sample_count(4);
+    descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
+    descriptor.set_width(u64::from(depth.width));
+    descriptor.set_height(u64::from(depth.height));
+    descriptor.set_mipmap_level_count(1);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(MTLStorageMode::Private);
+    let pointer: *mut metal::MTLTexture =
+        unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
+    if pointer.is_null() {
+        return Err(resource_refusal(
+            "metal_render_multisample_depth_allocation_failed",
+        ));
     }
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
@@ -3379,11 +3567,12 @@ mod tests {
         CompletionPolicy, ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch,
         Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
         IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
-        IndirectCommandRange, InitialState, LeaseId, OperationId, PipelineContract, PresentTarget,
-        ProviderCapabilities, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest,
-        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode,
-        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        IndirectCommandRange, InitialState, LeaseId, MultisampleDepthResolve, MultisampleState,
+        OperationId, PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
+        RenderDepthAttachment, RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity,
+        ResourceTableSnapshot, SemanticDigest, StencilCompare, StencilFormat, StencilLoadOp,
+        StencilOp, StencilTest, StorageMode, VertexAttribute, VertexBufferLayout, VertexLayout,
+        ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -3459,7 +3648,7 @@ mod tests {
     fn plan_pass<'a>(
         request: &OffscreenRenderRequest<'a>,
     ) -> Result<RenderPlan<'a>, ProviderError> {
-        plan(request)
+        plan(request, 0)
     }
 
     /// The refusal of a (source, entry pair) triple the rail does not review.
@@ -3680,7 +3869,7 @@ mod tests {
     fn plan_accepts_the_dual_shape_and_plans_two_attachments() {
         let pass = dual_pass();
         let pipeline = dual_pipeline();
-        let planned = plan(&dual_request(&pass, &pipeline)).unwrap();
+        let planned = plan(&dual_request(&pass, &pipeline), 0).unwrap();
         assert_eq!(
             planned.module_path,
             "conformance/shaders/quad_indexed_2x2_dual.metal"
@@ -3712,7 +3901,7 @@ mod tests {
         let mut pass = dual_pass();
         pass.color_attachments[1].store = StoreOp::DontCare;
         let pipeline = dual_pipeline();
-        let planned = plan(&dual_request(&pass, &pipeline)).unwrap();
+        let planned = plan(&dual_request(&pass, &pipeline), 0).unwrap();
         let [first, second] = planned.attachments.as_slice() else {
             panic!("the dual shape renders two attachments");
         };
@@ -3793,7 +3982,7 @@ mod tests {
             source: REVIEWED_DEPTH_ONLY_SOURCE,
             initial: Vec::new(),
         };
-        let planned = plan(&request).expect("the zero-colour depth pass plans");
+        let planned = plan(&request, 0).expect("the zero-colour depth pass plans");
         assert!(
             planned.attachments.is_empty(),
             "a pass with no colour attachment plans no colour readback"
@@ -3810,7 +3999,7 @@ mod tests {
             source: REVIEWED_DEPTH_SOURCE,
             ..request
         };
-        let error = plan(&mismatched).expect_err("the pair module is not this shape's module");
+        let error = plan(&mismatched, 0).expect_err("the pair module is not this shape's module");
         assert_eq!(error.slug, "native_render_source_not_reviewed");
     }
 
@@ -3826,7 +4015,7 @@ mod tests {
     fn plan_admits_a_stencil_pass_and_plans_the_reviewed_state() {
         let pass = stencil_pass();
         let pipeline = stencil_pipeline();
-        let planned = plan(&stencil_request(&pass, &pipeline)).expect("the stencil pass plans");
+        let planned = plan(&stencil_request(&pass, &pipeline), 0).expect("the stencil pass plans");
         // The colour attachment is the raster, the stencil surface the second
         // one beside it: the pair module is what this shape compiles.
         assert_eq!(planned.extent, [2, 2]);
@@ -3865,7 +4054,7 @@ mod tests {
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
         pass.stencil_test = Some(STENCIL_TEST);
         assert_eq!(
-            plan(&milestone_request(&pass, &milestone_pipeline(), None))
+            plan(&milestone_request(&pass, &milestone_pipeline(), None), 0)
                 .unwrap_err()
                 .slug,
             "trace_contract_invalid"
@@ -3879,6 +4068,101 @@ mod tests {
         );
     }
 
+    /// One pass whose stored multisampled depth surface states the resolve the
+    /// device admits (`research/docs/23` §3.3, v57c).
+    fn depth_resolving_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: DEPTH_STORE_ALLOCATION,
+                view_id: DEPTH_STORE_VIEW,
+            }),
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        pass
+    }
+
+    /// The v57c shape: a stored multisampled depth surface whose resolve the
+    /// device mask admits plans, and the plan carries the filter the encoder
+    /// sets on the depth attachment (`research/docs/23` §3.3, v57c).
+    #[test]
+    fn plan_admits_a_stored_multisampled_depth_resolve_in_the_device_mask() {
+        let pass = depth_resolving_pass();
+        let pipeline = milestone_pipeline();
+        let planned = plan(
+            &milestone_request(&pass, &pipeline, None),
+            DEPTH_RESOLVE_SAMPLE0_BIT,
+        )
+        .expect("a stored multisampled depth resolve the device admits plans");
+        assert_eq!(planned.multisample, Some(SampleCount::Four));
+        assert_eq!(planned.depth_resolve, Some(DepthResolveFilter::Sample0));
+        let depth = planned
+            .depth
+            .expect("the resolving pass opens its depth surface");
+        assert_eq!(depth.store, Some(DepthStoreOp::Store));
+    }
+
+    /// The device mask is the per-filter question the capability snapshot
+    /// answered: a resolve whose filter the device does not report is refused
+    /// by name before any Metal object exists, exactly as the Vulkan rail
+    /// refuses it (`research/docs/23` §3.3, v57c).
+    #[test]
+    fn plan_refuses_a_depth_resolve_filter_the_device_does_not_report() {
+        let mut pass = depth_resolving_pass();
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Min,
+        });
+        let pipeline = milestone_pipeline();
+        let refused = plan(
+            &milestone_request(&pass, &pipeline, None),
+            DEPTH_RESOLVE_SAMPLE0_BIT,
+        )
+        .expect_err("a Min resolve outside the Sample0-only mask is refused");
+        assert_eq!(refused.slug, "render_depth_resolve_filter_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("filter"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(
+            refused.fields.get("modes"),
+            Some(&FieldValue::Unsigned(u64::from(DEPTH_RESOLVE_SAMPLE0_BIT)))
+        );
+    }
+
+    /// A stored multisampled depth surface without its resolve keeps the
+    /// pre-v57c refusal: the surface's texels are only observable as the
+    /// resolve's reduction, so keeping them without one stays impossible
+    /// (`research/docs/23` §3.3, v57c). The core contract refuses the shape
+    /// first, so the plan reports the contract's own spelling.
+    #[test]
+    fn plan_refuses_a_stored_multisampled_depth_without_a_resolve() {
+        let mut pass = depth_resolving_pass();
+        pass.depth_resolve = None;
+        let pipeline = milestone_pipeline();
+        let refused = plan(
+            &milestone_request(&pass, &pipeline, None),
+            DEPTH_RESOLVE_SAMPLE0_BIT,
+        )
+        .expect_err("a stored multisampled depth without a resolve is refused");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::MultisampleDepthStoreUnsupported)
+        );
+    }
+
     /// The v20 load increment (`research/docs/23` §3.1): a `LoadOp::DontCare`
     /// attachment plans as `MTLLoadAction::DontCare` with no preset bytes, so
     /// the encoder neither reads nor overwrites the pre-pass contents.
@@ -3886,7 +4170,7 @@ mod tests {
     fn plan_admits_a_dont_care_load_and_presets_nothing() {
         let pass = milestone_pass(LoadOp::DontCare);
         let pipeline = milestone_pipeline();
-        let planned = plan(&milestone_request(&pass, &pipeline, None)).unwrap();
+        let planned = plan(&milestone_request(&pass, &pipeline, None), 0).unwrap();
         assert_eq!(planned.attachments.len(), 1);
         assert_eq!(planned.attachments[0].load, RenderLoadAction::DontCare);
         assert_eq!(
@@ -3904,7 +4188,7 @@ mod tests {
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
         pass.color_attachments[0].store = StoreOp::DontCare;
         let pipeline = milestone_pipeline();
-        let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+        let error = plan(&milestone_request(&pass, &pipeline, None), 0).unwrap_err();
         assert_eq!(error.slug, "trace_contract_invalid");
         assert_eq!(error.class, ProviderErrorClass::Args);
     }
@@ -3921,7 +4205,7 @@ mod tests {
         }
         let mut pipeline = dual_pipeline();
         pipeline.color_formats = vec![AttachmentFormat::Rgba8Unorm; maximum + 1];
-        let error = plan(&dual_request(&pass, &pipeline)).unwrap_err();
+        let error = plan(&dual_request(&pass, &pipeline), 0).unwrap_err();
         // Core admission owns the ceiling now that the rail's own maximum is
         // the contract's: the wider pass is refused as a trace-contract shape
         // before the rail's gate can see it (`attachment_count_unsupported`).
@@ -3950,7 +4234,7 @@ mod tests {
     fn plan_refuses_attachments_that_disagree_about_the_extent() {
         let mut pass = dual_pass();
         pass.color_attachments[1].height = 1;
-        let error = plan(&dual_request(&pass, &dual_pipeline())).unwrap_err();
+        let error = plan(&dual_request(&pass, &dual_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_attachment_extent_mismatch");
         assert_eq!(error.class, ProviderErrorClass::Args);
         assert_eq!(
@@ -3985,7 +4269,7 @@ mod tests {
             mode: PresentMode::Fifo,
             acquire: AcquirePolicy::Blocking,
         });
-        let error = plan(&dual_request(&pass, &dual_pipeline())).unwrap_err();
+        let error = plan(&dual_request(&pass, &dual_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_attachment_count_unsupported");
         assert_eq!(
             error.fields.get("attachments"),
@@ -4025,7 +4309,7 @@ mod tests {
                 write: true,
             });
             let pipeline = milestone_pipeline();
-            let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+            let error = plan(&milestone_request(&pass, &pipeline, None), 0).unwrap_err();
             assert_eq!(error.slug, "render_present_depth_unsupported");
             assert_eq!(error.class, ProviderErrorClass::Capability);
             assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -4071,7 +4355,7 @@ mod tests {
             });
             pass.stencil_test = Some(STENCIL_TEST);
             let pipeline = milestone_pipeline();
-            let error = plan(&milestone_request(&pass, &pipeline, None)).unwrap_err();
+            let error = plan(&milestone_request(&pass, &pipeline, None), 0).unwrap_err();
             assert_eq!(error.slug, "render_present_stencil_unsupported");
             assert_eq!(error.class, ProviderErrorClass::Capability);
             assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -5321,7 +5605,7 @@ mod tests {
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
         let planned =
-            plan_trace(&trace, &pool, &contracts).expect("the reviewed present pass plans");
+            plan_trace(&trace, &pool, &contracts, 0).expect("the reviewed present pass plans");
         assert_eq!(planned.len(), 1);
         let [planned] = planned.as_slice() else {
             panic!("the present trace carries one render pass");
@@ -5358,7 +5642,7 @@ mod tests {
         let (trace, _) = milestone_trace(LoadOp::Clear(sentinel()));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed pass plans");
+        let planned = plan_trace(&trace, &pool, &contracts, 0).expect("the reviewed pass plans");
         assert_eq!(planned.len(), 1);
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
@@ -5398,7 +5682,7 @@ mod tests {
         compute_only
             .passes
             .retain(|pass| pass.as_compute().is_some());
-        assert!(plan_trace(&compute_only, &pool, &contracts)
+        assert!(plan_trace(&compute_only, &pool, &contracts, 0)
             .expect("a compute-only trace plans nothing")
             .is_empty());
     }
@@ -5412,7 +5696,7 @@ mod tests {
         let (trace, _) = milestone_trace(LoadOp::Load);
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("the declaring view's own bytes are what a load uploads");
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
@@ -5435,7 +5719,7 @@ mod tests {
         let (trace, _) = milestone_trace(LoadOp::DontCare);
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("the declaring view lands the writeback; only the bytes are absent");
         let [planned] = planned.as_slice() else {
             panic!("the milestone trace carries one render pass");
@@ -5460,7 +5744,7 @@ mod tests {
             })
             .expect("the milestone trace declares the attachment view");
         view.source = BufferSource::StagedLease(LeaseId::new(5));
-        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "attachment_load_op_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -5485,7 +5769,7 @@ mod tests {
         };
         pass.color_attachments[0].view_id = ViewId::new(8);
         let pool = vec![declaration_pass().buffers[0].clone()];
-        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "render_attachment_landing_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -5503,7 +5787,7 @@ mod tests {
             panic!("the fixture ends with its render pass");
         };
         pass.color_attachments[0].view_id = ViewId::new(8);
-        let error = plan_trace(&loading, &pool, &milestone_contracts()).unwrap_err();
+        let error = plan_trace(&loading, &pool, &milestone_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "render_attachment_landing_unsupported");
     }
 
@@ -5516,7 +5800,7 @@ mod tests {
         let trace = depth_store_trace(Some(DepthStoreOp::Store));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("the stored depth surface lands in its declaring view");
         let [planned] = planned.as_slice() else {
             panic!("the depth trace carries one render pass");
@@ -5552,6 +5836,48 @@ mod tests {
         assert_eq!(depth.bytes, DEPTH_STORE_TEXEL.repeat(4));
     }
 
+    /// The v57c trace shape: the stored depth pair over a four-sample raster
+    /// whose resolve the device mask admits. The stored surface's landing is
+    /// the same v43 view — the resolve target is a rail-owned texture, not a
+    /// second trace identity — and a mask without the filter bit refuses the
+    /// pass at plan time, before any Metal object exists
+    /// (`research/docs/23` §3.3, v57c).
+    #[test]
+    fn plan_trace_plans_a_resolving_depth_pass_when_the_device_mask_admits_it() {
+        let mut trace = depth_store_trace(Some(DepthStoreOp::Store));
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the fixture ends with its render pass");
+        };
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts, DEPTH_RESOLVE_SAMPLE0_BIT)
+            .expect("the resolving pass plans in the admitted mask");
+        let [planned] = planned.as_slice() else {
+            panic!("the depth trace carries one render pass");
+        };
+        assert_eq!(planned.plan.multisample, Some(SampleCount::Four));
+        assert_eq!(
+            planned.plan.depth_resolve,
+            Some(DepthResolveFilter::Sample0)
+        );
+        let landing = planned
+            .depth_landing
+            .expect("the stored depth surface names its v43 landing");
+        assert_eq!(landing.view_id, DEPTH_STORE_VIEW);
+        assert_eq!(landing.allocation_id, DEPTH_STORE_ALLOCATION);
+
+        // The same trace through a mask without the Sample0 bit is refused by
+        // the per-filter question the capability snapshot answered.
+        let refused = plan_trace(&trace, &pool, &contracts, 0).unwrap_err();
+        assert_eq!(refused.slug, "render_depth_resolve_filter_unsupported");
+    }
+
     /// The two shapes that state no store keep the surface rail-owned: no
     /// landing is resolved, and a readback that carries no depth texels adds no
     /// second writeback — the pre-v43 byte shape exactly
@@ -5576,7 +5902,7 @@ mod tests {
         pass.color_attachments[0].store = StoreOp::DontCare;
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("a pass whose only landing is its depth surface plans");
         let [planned] = planned.as_slice() else {
             panic!("the depth trace carries one render pass");
@@ -5612,7 +5938,7 @@ mod tests {
             let trace = depth_store_trace(store);
             let pool = trace.serial_resources().expect("admitted serial pool");
             let contracts = milestone_contracts();
-            let planned = plan_trace(&trace, &pool, &contracts)
+            let planned = plan_trace(&trace, &pool, &contracts, 0)
                 .expect("a discarded depth surface needs no landing");
             let [planned] = planned.as_slice() else {
                 panic!("the depth trace carries one render pass");
@@ -5670,7 +5996,7 @@ mod tests {
         // alone declares, so the stored depth surface is the only landing left
         // without a view.
         let pool = vec![declaration_pass().buffers[0].clone()];
-        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "render_depth_landing_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -5694,7 +6020,7 @@ mod tests {
         let trace = stencil_store_trace(Some(StoreOp::Store));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = stencil_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("the stored stencil surface lands in its declaring view");
         let [planned] = planned.as_slice() else {
             panic!("the stencil trace carries one render pass");
@@ -5740,7 +6066,7 @@ mod tests {
             let trace = stencil_store_trace(store);
             let pool = trace.serial_resources().expect("admitted serial pool");
             let contracts = stencil_contracts();
-            let planned = plan_trace(&trace, &pool, &contracts)
+            let planned = plan_trace(&trace, &pool, &contracts, 0)
                 .expect("a discarded stencil surface needs no landing");
             let [planned] = planned.as_slice() else {
                 panic!("the stencil trace carries one render pass");
@@ -5798,7 +6124,7 @@ mod tests {
         // alone declares, so the stored stencil surface is the only landing
         // left without a view.
         let pool = vec![declaration_pass().buffers[0].clone()];
-        let error = plan_trace(&trace, &pool, &stencil_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &stencil_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "render_stencil_landing_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -5840,7 +6166,7 @@ mod tests {
         let (legal, _) = milestone_trace(LoadOp::Clear(sentinel()));
         let pool = legal.serial_resources().expect("admitted serial pool");
         assert_eq!(
-            plan_trace(&legal, &pool, &milestone_contracts())
+            plan_trace(&legal, &pool, &milestone_contracts(), 0)
                 .unwrap()
                 .len(),
             1
@@ -5969,7 +6295,7 @@ mod tests {
     fn plan_translates_the_indexed_layout_into_a_descriptor_plan() {
         let pass = quad_pass();
         let pipeline = quad_pipeline();
-        let planned = plan(&quad_request(&pass, &pipeline)).expect("the reviewed pass plans");
+        let planned = plan(&quad_request(&pass, &pipeline), 0).expect("the reviewed pass plans");
 
         assert_eq!(planned.source, REVIEWED_VERTEX_SOURCE);
         assert_eq!(
@@ -6050,7 +6376,7 @@ mod tests {
         // storage mode it arrived with is part of the refusal.
         let mut leased_pass = quad_pass();
         leased_pass.vertex_buffers[0].source = BufferSource::StagedLease(LeaseId::new(5));
-        let error = plan(&quad_request(&leased_pass, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&leased_pass, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_vertex_buffer_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -6068,7 +6394,7 @@ mod tests {
         let mut borrowed_pass = quad_pass();
         borrowed_pass.indices.as_mut().unwrap().view.source =
             BufferSource::BorrowedNoCopy(LeaseId::new(6));
-        let error = plan(&quad_request(&borrowed_pass, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&borrowed_pass, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_index_buffer_unsupported");
         assert_eq!(
             error.fields.get("storage_mode"),
@@ -6092,7 +6418,7 @@ mod tests {
         // 24 bytes cover three of the four vertices the index values select.
         let mut short_stream = quad_pass();
         shorten(&mut short_stream.vertex_buffers[0], 24);
-        let error = plan(&quad_request(&short_stream, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&short_stream, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_index_value_out_of_range");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(
@@ -6114,7 +6440,7 @@ mod tests {
         non_indexed.indices = None;
         non_indexed.vertices = 4;
         shorten(&mut non_indexed.vertex_buffers[0], 24);
-        let error = plan(&quad_request(&non_indexed, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&non_indexed, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_vertex_footprint_unsupported");
         assert_eq!(
             error.fields.get("required_bytes"),
@@ -6124,7 +6450,7 @@ mod tests {
         // 10 bytes cannot hold the six `uint16` indices.
         let mut short_indices = quad_pass();
         shorten(&mut short_indices.indices.as_mut().unwrap().view, 10);
-        let error = plan(&quad_request(&short_indices, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&short_indices, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_index_footprint_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(
@@ -6141,7 +6467,7 @@ mod tests {
                 .flat_map(u16::to_le_bytes)
                 .collect(),
         );
-        let error = plan(&quad_request(&out_of_range, &quad_pipeline())).unwrap_err();
+        let error = plan(&quad_request(&out_of_range, &quad_pipeline()), 0).unwrap_err();
         assert_eq!(error.slug, "render_index_value_out_of_range");
         assert_eq!(
             error.fields.get("highest_index"),
@@ -6167,7 +6493,7 @@ mod tests {
     fn an_indexed_vertex_id_draw_is_bounded_by_the_modules_positions() {
         let (trace, pool) = vertex_id_indexed_trace([0, 1, 2]);
         let contracts = milestone_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("three indices over three generated positions plan");
         let [planned] = planned.as_slice() else {
             panic!("the computed milestone trace carries one render pass");
@@ -6180,7 +6506,7 @@ mod tests {
         // The fourth position the module does not carry is refused by value,
         // before a driver would read it.
         let (trace, pool) = vertex_id_indexed_trace([0, 1, 9]);
-        let error = plan_trace(&trace, &pool, &milestone_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &milestone_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "render_index_value_out_of_range");
         assert_eq!(
             error.fields.get("highest_index"),
@@ -6204,7 +6530,7 @@ mod tests {
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = quad_contracts();
         let planned =
-            plan_trace(&trace, &pool, &contracts).expect("the reviewed indexed pass plans");
+            plan_trace(&trace, &pool, &contracts, 0).expect("the reviewed indexed pass plans");
         assert_eq!(planned.len(), 1);
         let [planned] = planned.as_slice() else {
             panic!("the vertex-input trace carries one render pass");
@@ -6244,7 +6570,8 @@ mod tests {
         let (trace, _) = dual_trace(LoadOp::Clear(sentinel()));
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = dual_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed dual pass plans");
+        let planned =
+            plan_trace(&trace, &pool, &contracts, 0).expect("the reviewed dual pass plans");
         let [planned] = planned.as_slice() else {
             panic!("the dual trace carries one render pass");
         };
@@ -6282,7 +6609,8 @@ mod tests {
         pass.color_attachments[1].store = StoreOp::DontCare;
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = dual_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts).expect("the reviewed dual pass plans");
+        let planned =
+            plan_trace(&trace, &pool, &contracts, 0).expect("the reviewed dual pass plans");
         let [planned] = planned.as_slice() else {
             panic!("the dual trace carries one render pass");
         };
@@ -6315,7 +6643,7 @@ mod tests {
         let (trace, _) = dual_trace(LoadOp::Load);
         let pool = trace.serial_resources().expect("admitted serial pool");
         let contracts = dual_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts)
+        let planned = plan_trace(&trace, &pool, &contracts, 0)
             .expect("each declaring view's own bytes are what a load uploads");
         let [planned] = planned.as_slice() else {
             panic!("the dual trace carries one render pass");
@@ -6348,7 +6676,7 @@ mod tests {
             .expect("the dual trace declares the second attachment view");
         view.source = BufferSource::StagedLease(LeaseId::new(5));
         let contracts = dual_contracts();
-        let error = plan_trace(&trace, &pool, &contracts).unwrap_err();
+        let error = plan_trace(&trace, &pool, &contracts, 0).unwrap_err();
         assert_eq!(error.slug, "attachment_load_op_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -6390,7 +6718,7 @@ mod tests {
         );
 
         let contracts = quad_contracts();
-        let planned = plan_trace(&trace, &pool, &contracts).expect("the draw plans");
+        let planned = plan_trace(&trace, &pool, &contracts, 0).expect("the draw plans");
         let [planned] = planned.as_slice() else {
             panic!("the vertex-input trace carries one render pass");
         };
@@ -6421,7 +6749,7 @@ mod tests {
             range: IndirectCommandRange { start: 0, count: 1 },
         }));
         let pool = trace.serial_resources().expect("admitted serial pool");
-        let error = plan_trace(&trace, &pool, &quad_contracts()).unwrap_err();
+        let error = plan_trace(&trace, &pool, &quad_contracts(), 0).unwrap_err();
         assert_eq!(error.slug, "icb_command_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
@@ -6499,7 +6827,7 @@ mod tests {
             source: REVIEWED_SOURCE,
             ..quad_request(&pass, &pipeline)
         };
-        let error = plan(&crossed).unwrap_err();
+        let error = plan(&crossed, 0).unwrap_err();
         assert_eq!(error.slug, "native_render_source_not_reviewed");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Compile);

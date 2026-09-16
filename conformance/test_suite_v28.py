@@ -122,6 +122,10 @@ MSAA_STENCIL_ID = "msaa_stencil_pair_4x4"
 # texel, so the colour observation is the v43 pair's and the stored depth
 # observation is the resolved 0.5 (`0000003f`).
 MSAA_DEPTH_RESOLVE_ID = "msaa_depth_resolve_sample0_4x4"
+# The v57c Min probe: the same geometry and the `min` filter, run on the Swift
+# oracle alone to measure whether Apple Paravirtual executes the filter. The
+# committed expectation is provisional (`research/docs/23` §3.3, v57c).
+MSAA_DEPTH_RESOLVE_MIN_PROBE_ID = "msaa_depth_resolve_min_probe_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -146,10 +150,13 @@ MSAA_DEPTH_INDEX = 14
 MSAA_STENCIL_INDEX = 15
 # The v57 depth-resolve fixture is the newest case.
 MSAA_DEPTH_RESOLVE_INDEX = 16
+# The v57c Min probe follows it.
+MSAA_DEPTH_RESOLVE_MIN_PROBE_INDEX = 17
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
-                  MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID, MSAA_DEPTH_RESOLVE_ID)
+                  MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID, MSAA_DEPTH_RESOLVE_ID,
+                  MSAA_DEPTH_RESOLVE_MIN_PROBE_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -306,11 +313,16 @@ MSAA_DEPTH_RAILS = ALL_RAILS
 # (`research/docs/23` §3.3, v55/v56).
 MSAA_STENCIL_RAILS = ALL_RAILS
 # The depth resolve is device-gated: this increment's Lavapipe device reports
-# `SAMPLE_ZERO` only, so the reviewed fixture states `sample0` and its marker
-# names the Vulkan rail alone. The native and object rails keep their
-# fail-closed "cannot resolve" snapshots, so they must refuse the case rather
-# than report it (`research/docs/23` §3.3, v57).
-MSAA_DEPTH_RESOLVE_RAILS = ("vulkan",)
+# `SAMPLE_ZERO` only, and the native rail declares Sample0 alone, so the
+# reviewed fixture states `sample0` and its marker names the Vulkan rail and
+# the two native trace rails. The object rails keep their fail-closed "cannot
+# resolve" snapshots, so they must refuse the case rather than report it
+# (`research/docs/23` §3.3, v57c).
+MSAA_DEPTH_RESOLVE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+# The Min probe names the Swift oracle alone: it is the first Apple
+# Paravirtual measurement of the `min` filter, and its committed expectation is
+# provisional until that CI run confirms it (`research/docs/23` §3.3, v57c).
+MSAA_DEPTH_RESOLVE_MIN_PROBE_RAILS = ("native-metal",)
 MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The v57 fixture's two observations: the colour pair's near tint sixteen
@@ -318,6 +330,13 @@ MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # endian) sixteen times — the v43 stored depth pair's own bytes.
 MSAA_DEPTH_RESOLVE_EXPECTED = MSAA_DEPTH_EXPECTED
 MSAA_DEPTH_RESOLVE_DEPTH = DEPTH_STORE_EXPECTED
+# The Min probe carries the same two observations for now: its geometry is the
+# stored depth pair's own — the near triangle covers every sample — so the Min
+# reduction lands the near depth everywhere. This expectation is provisional:
+# it pins "the Min path executes and lands the near depth", not "Min differs
+# from Sample0", and macOS CI is what will confirm or correct it.
+MSAA_DEPTH_RESOLVE_MIN_PROBE_EXPECTED = MSAA_DEPTH_RESOLVE_EXPECTED
+MSAA_DEPTH_RESOLVE_MIN_PROBE_DEPTH = MSAA_DEPTH_RESOLVE_DEPTH
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
 # `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
@@ -497,6 +516,21 @@ def msaa_depth_resolve_marker(suite, rail):
     return rail in MSAA_DEPTH_RESOLVE_RAILS
 
 
+def msaa_depth_resolve_min_probe_marker(suite, rail):
+    """Point the v57c Min probe at `rail` when that rail owes it, and elsewhere when not.
+
+    The probe is the Swift oracle's own measurement of the `min` filter, so its
+    committed marker names `native-metal` alone: a capture on that rail is owed
+    both landings with the provisional near-depth expectation, and one on any
+    other rail has to leave the case out entirely, because that rail refuses or
+    does not execute the Min resolve (`research/docs/23` §3.3, v57c). Returns
+    whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_DEPTH_RESOLVE_MIN_PROBE_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_DEPTH_RESOLVE_MIN_PROBE_RAILS else [other_rail(rail)])
+    return rail in MSAA_DEPTH_RESOLVE_MIN_PROBE_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -602,6 +636,35 @@ def msaa_depth_resolve_result(provider_backend=True, copy_in=3, copy_out=3):
         "allocations": [
             {"allocation": ATTACHMENT[0], "bytes_hex": MSAA_DEPTH_RESOLVE_EXPECTED},
             {"allocation": DEPTH_STORE_ALLOCATION, "bytes_hex": MSAA_DEPTH_RESOLVE_DEPTH},
+        ],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_depth_resolve_min_probe_result(provider_backend=True, copy_in=3, copy_out=3):
+    """The v57c Min probe's landing: the colour pair plus the resolved depth.
+
+    The same two surfaces and channel shape as the Sample0 fixture, with the
+    provisional Min expectation in place of the Sample0 one. The oracle rail
+    reports no provider copy counts; a provider capture would owe the stored
+    depth pair's three and three (`research/docs/23` §3.3, v57c).
+    """
+    result = {
+        "id": MSAA_DEPTH_RESOLVE_MIN_PROBE_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [
+            {"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+             "offset": ATTACHMENT[2], "bytes_hex": MSAA_DEPTH_RESOLVE_MIN_PROBE_EXPECTED},
+            {"allocation": DEPTH_STORE_ALLOCATION, "view": DEPTH_STORE_VIEW,
+             "offset": 0, "bytes_hex": MSAA_DEPTH_RESOLVE_MIN_PROBE_DEPTH},
+        ],
+        "allocations": [
+            {"allocation": ATTACHMENT[0],
+             "bytes_hex": MSAA_DEPTH_RESOLVE_MIN_PROBE_EXPECTED},
+            {"allocation": DEPTH_STORE_ALLOCATION,
+             "bytes_hex": MSAA_DEPTH_RESOLVE_MIN_PROBE_DEPTH},
         ],
     }
     if provider_backend:
@@ -863,6 +926,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_depth_resolve_min_probe = msaa_depth_resolve_min_probe_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -898,6 +962,9 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_depth_resolve_min_probe:
+                report["results"].append(
+                    msaa_depth_resolve_min_probe_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -926,6 +993,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_depth_resolve_min_probe = msaa_depth_resolve_min_probe_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -959,6 +1027,9 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_depth_resolve_min_probe:
+                report["results"].append(
+                    msaa_depth_resolve_min_probe_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -975,6 +1046,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_depth_resolve_min_probe = msaa_depth_resolve_min_probe_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -1010,6 +1082,9 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_depth_resolve_min_probe:
+                report["results"].append(
+                    msaa_depth_resolve_min_probe_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -1194,7 +1269,8 @@ class ScissorObservationTests(unittest.TestCase):
         for case in self.suite["render_cases"]:
             expectation = plan[case["id"]]
             counts = (len(expectation.touched), len(expectation.written))
-            if case["id"] in (DEPTH_STORE_ID, STENCIL_STORE_ID, MSAA_DEPTH_RESOLVE_ID):
+            if case["id"] in (DEPTH_STORE_ID, STENCIL_STORE_ID, MSAA_DEPTH_RESOLVE_ID,
+                              MSAA_DEPTH_RESOLVE_MIN_PROBE_ID):
                 expected = (3, 3)
             elif case["id"] in (DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID):
                 expected = (3, 2)
@@ -2176,6 +2252,7 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_depth_resolve_min_probe = msaa_depth_resolve_min_probe_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -2209,6 +2286,9 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_depth_resolve_min_probe:
+                report["results"].append(
+                    msaa_depth_resolve_min_probe_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -2560,11 +2640,11 @@ class ScissorObservationTests(unittest.TestCase):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_reports_the_msaa_depth_resolve_case_on_every_rail_its_marker_names(self):
-        # The marker is the rule, and it is the device gate: the Vulkan rail's
-        # snapshot declares the `sample0` filter on Lavapipe, every other rail
-        # stays fail-closed, so only a capture on `vulkan` owes the two
-        # landings and a capture on any other rail has to leave the case out
-        # (`research/docs/23` §3.3, v57).
+        # The marker is the rule, and it is the device gate: the Vulkan rail
+        # declares the `sample0` filter on Lavapipe and the two native trace
+        # rails declare it on macOS, so a capture on any of the three owes the
+        # two landings and a capture on any other rail has to leave the case
+        # out (`research/docs/23` §3.3, v57c).
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             owes = msaa_depth_resolve_marker(suite, rail)
@@ -2575,6 +2655,62 @@ class ScissorObservationTests(unittest.TestCase):
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
             report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_pins_the_msaa_depth_resolve_min_probe_fixture(self):
+        case = self.suite["render_cases"][MSAA_DEPTH_RESOLVE_MIN_PROBE_INDEX]
+        self.assertEqual(case["id"], MSAA_DEPTH_RESOLVE_MIN_PROBE_ID)
+        self.assertEqual(case["multisample"], {"sample_count": 4})
+        self.assertEqual(case["depth_resolve"], {"filter": "min"})
+        self.assertNotIn("coverage", case)
+        self.assertEqual(case["depth"]["format"], "depth32float")
+        self.assertEqual(case["depth"]["store"], "store")
+        self.assertEqual(case["depth"]["allocation"], DEPTH_STORE_ALLOCATION)
+        self.assertEqual(case["depth"]["view"], DEPTH_STORE_VIEW)
+        self.assertEqual(case["depth"]["expected_hex"],
+                         MSAA_DEPTH_RESOLVE_MIN_PROBE_DEPTH)
+        self.assertEqual(case["depth_test"], {"compare": "less", "write": True})
+        self.assertEqual(case["expected_hex"], MSAA_DEPTH_RESOLVE_MIN_PROBE_EXPECTED)
+        self.assertEqual(case["capture_rails"], list(MSAA_DEPTH_RESOLVE_MIN_PROBE_RAILS))
+
+    def test_v28_plans_the_msaa_depth_resolve_min_probe_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[MSAA_DEPTH_RESOLVE_MIN_PROBE_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(MSAA_DEPTH_RESOLVE_MIN_PROBE_EXPECTED)),
+                          ((DEPTH_STORE_ALLOCATION, DEPTH_STORE_VIEW, 0),
+                           bytes.fromhex(MSAA_DEPTH_RESOLVE_MIN_PROBE_DEPTH))])
+        self.assertEqual(list(expectation.attachment),
+                         [ATTACHMENT, DEPTH_STORE_ATTACHMENT])
+        self.assertEqual(expectation.touched, {900, 920, 940})
+        self.assertEqual(expectation.written, {900, 920, 940})
+        self.assertEqual(expectation.rails,
+                         frozenset(MSAA_DEPTH_RESOLVE_MIN_PROBE_RAILS))
+
+    def test_v28_reports_the_msaa_depth_resolve_min_probe_on_every_rail_its_marker_names(self):
+        # The Min probe is the Swift oracle's own measurement: its marker names
+        # `native-metal` alone, so only a capture on that rail owes the two
+        # provisional landings and a capture on any other rail has to leave the
+        # case out (`research/docs/23` §3.3, v57c).
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = msaa_depth_resolve_min_probe_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != MSAA_DEPTH_RESOLVE_MIN_PROBE_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(
+                msaa_depth_resolve_min_probe_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if owes:
                     compare.validate_capture(suite, digest, report, rail)
