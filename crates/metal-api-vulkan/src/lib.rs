@@ -289,7 +289,16 @@ impl VulkanExecutor {
     /// readback. `VulkanComputeProvider` adds staged and, when
     /// `VK_EXT_external_memory_host` is present, borrowed no-copy leases.
     pub fn provider_capabilities(&self) -> ProviderCapabilities {
-        provider::capabilities_from_limits(&self.context.properties.limits)
+        let mut capabilities = provider::capabilities_from_limits(&self.context.properties.limits);
+        // The two depth-resolve bits are the device's own answer, overlaid on
+        // the limits-derived snapshot: the mask carries exactly the admitted
+        // filters the device reports, and the capability bit is the mask's
+        // non-empty form, so a device without any admitted filter keeps both
+        // bits fail-closed (`research/docs/23` §3.3, v57).
+        capabilities.depth_resolve_modes =
+            provider::depth_resolve_mode_mask(self.context.depth_resolve_modes);
+        capabilities.supports_render_depth_resolve = capabilities.depth_resolve_modes != 0;
+        capabilities
     }
 
     /// Simulate a confirmed device loss for lifecycle tests.
@@ -626,6 +635,12 @@ pub(crate) struct VulkanContext {
     queue_submissions: Vec<AtomicUsize>,
     queue_in_flight: Vec<AtomicUsize>,
     properties: vk::PhysicalDeviceProperties,
+    /// The depth resolve modes the device reports through
+    /// `VK_KHR_depth_stencil_resolve` (`research/docs/23` §3.3, v57). The
+    /// capability snapshot below maps them onto the contract's closed filter
+    /// family; the raw flags stay here so the render rail's admission can
+    /// answer the same per-filter question the snapshot answered.
+    depth_resolve_modes: vk::ResolveModeFlags,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
     queue_locks: Vec<Mutex<()>>,
@@ -785,6 +800,16 @@ impl VulkanContext {
         }
         let queue_count = queues.len();
         let properties = unsafe { instance.get_physical_device_properties(physical) };
+        // The depth resolve modes the device reports (`research/docs/23` §3.3,
+        // v57): `VK_KHR_depth_stencil_resolve` is core from 1.2 and the
+        // selected device is already 1.3, so the query always runs and a
+        // device that reports no admitted filter simply leaves the flags at
+        // zero, which the capability snapshot maps to "cannot resolve".
+        let mut depth_stencil_resolve = vk::PhysicalDeviceDepthStencilResolveProperties::default();
+        let mut resolve_properties =
+            vk::PhysicalDeviceProperties2::default().push_next(&mut depth_stencil_resolve);
+        unsafe { instance.get_physical_device_properties2(physical, &mut resolve_properties) };
+        let depth_resolve_modes = depth_stencil_resolve.supported_depth_resolve_modes;
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
             .to_string_lossy()
@@ -825,6 +850,7 @@ impl VulkanContext {
             present_presents: AtomicUsize::new(0),
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
+            depth_resolve_modes,
             memory,
             device_name,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
@@ -847,6 +873,15 @@ impl VulkanContext {
         self.lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The contract's admitted depth-resolve filter mask for this device
+    /// (`research/docs/23` §3.3, v57). The render rail's admission reads the
+    /// same mask the capability snapshot published, so a directly-constructed
+    /// request is refused with the same per-filter question the snapshot
+    /// answered.
+    pub(crate) fn admitted_depth_resolve_modes(&self) -> u32 {
+        provider::depth_resolve_mode_mask(self.depth_resolve_modes)
     }
 
     /// Admit one new submission against the lifecycle.

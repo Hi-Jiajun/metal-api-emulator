@@ -229,6 +229,18 @@ private struct MultisampleDefinition: Decodable {
     let sample_count: UInt64
 }
 
+/// The depth resolve one render case states (`research/docs/23` §3.3, v57).
+///
+/// The pass-level filter the two APIs spell differently: the case's own
+/// spelling is the closed family's wire name (`"sample0"`/`"min"`/`"max"`),
+/// and the rails map it onto their own constants. The reviewed fixture states
+/// `"sample0"`, the one filter the Lavapipe device reports; the native rail
+/// keeps its fail-closed "cannot resolve" snapshot in this increment, so the
+/// fixture's marker does not name it.
+private struct DepthResolveDefinition: Decodable {
+    let filter: String
+}
+
 /// The stencil attachment a render case declares (`research/docs/23` §3.3,
 /// v47; the store pair is v49).
 ///
@@ -418,6 +430,13 @@ private struct RenderCaseDefinition: Decodable {
     /// and the load's own colour in the attachment view: its expectation is a
     /// k-of-four mix of the two, which a single-sample raster cannot produce.
     let multisample: MultisampleDefinition?
+    /// The depth resolve a stored multisampled depth surface states
+    /// (`research/docs/23` §3.3, v57), or `nil` for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose depth attachment
+    /// is stored; the reviewed fixture states the `sample0` filter and its
+    /// marker names the Vulkan rail alone, so this oracle validates the shape
+    /// but never runs it.
+    let depth_resolve: DepthResolveDefinition?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -2227,9 +2246,24 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // cover every sample, the near one wins and every texel is one fragment
         // output.
         if let depth = definition.depth {
-            try require(depth.store == nil,
-                        "\(definition.id): a multisampled depth surface is rail-owned: the "
-                        + "depth resolve filters are a later increment")
+            // A stored multisampled depth surface is admitted from v57 on,
+            // through the resolve the case then has to state: its texels are
+            // only observable as the resolve's reduction, so a stored surface
+            // without one is refused, and a resolve beside a discarded surface
+            // is refused too — it is the stored surface's own tail
+            // (`research/docs/23` §3.3, v57).
+            if depth.store != nil {
+                try require(definition.depth_resolve != nil,
+                            "\(definition.id): a stored multisampled depth surface needs its "
+                            + "depth resolve")
+                if let filter = definition.depth_resolve?.filter {
+                    try require(filter == "sample0" || filter == "min" || filter == "max",
+                                "\(definition.id): unsupported depth resolve filter \(filter)")
+                }
+            } else {
+                try require(definition.depth_resolve == nil,
+                            "\(definition.id): a depth resolve needs a stored depth surface")
+            }
             try require(definition.coverage == nil,
                         "\(definition.id): a multisample pass with a depth surface claims no "
                         + "partial coverage")
@@ -2240,6 +2274,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(definition.coverage == nil,
                         "\(definition.id): a multisample pass with a stencil surface claims no "
                         + "partial coverage")
+        } else if definition.depth_resolve != nil {
+            throw OracleError("\(definition.id): a depth resolve needs a stored depth surface")
         } else {
             try require(definition.coverage == "partial",
                         "\(definition.id): the multisample raster has to claim partial coverage")
@@ -3300,9 +3336,11 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             mipmapped: false)
         // A multisampled pass creates its depth surface with the raster's own
         // sample count (`research/docs/23` §3.3, v53): Metal refuses an encoder
-        // whose depth texture disagrees with `rasterSampleCount`, and the
-        // surface is rail-owned — keeping it would need the depth resolve
-        // filter the increment after this one reviews.
+        // whose depth texture disagrees with `rasterSampleCount`. The stored
+        // shape would need the depth resolve the v57 increment reviews, and
+        // this oracle's rail keeps its fail-closed "cannot resolve" snapshot,
+        // so no fixture marker names it for a stored multisampled depth
+        // surface (`research/docs/23` §3.3, v57).
         if let multisample = definition.multisample {
             descriptor.textureType = .type2DMultisample
             descriptor.sampleCount = Int(multisample.sample_count)
@@ -3857,6 +3895,7 @@ private func renderSelfTest() throws -> CaseResult {
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
         multisample: nil,
+        depth_resolve: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -3928,6 +3967,7 @@ private func presentSelfTest() throws -> CaseResult {
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
         multisample: nil,
+        depth_resolve: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4021,6 +4061,7 @@ private func vertexSelfTest() throws -> CaseResult {
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         coverage: nil,
         multisample: nil,
+        depth_resolve: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4118,6 +4159,7 @@ private func mrtSelfTest() throws -> CaseResult {
         expected_hex: nil,
         coverage: nil,
         multisample: nil,
+        depth_resolve: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,

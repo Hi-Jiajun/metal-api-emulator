@@ -1380,7 +1380,7 @@ def _render_plan(plan, suite):
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
                                "depth", "depth_test", "coverage", "cull", "blend",
-                               "stencil", "stencil_test", "multisample"})
+                               "stencil", "stencil_test", "multisample", "depth_resolve"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1517,6 +1517,21 @@ def _render_plan(plan, suite):
                      f"{where}: the only coverage claim is \"partial\"")
             _require(single,
                      f"{where}: the coverage claim is the single-attachment shape")
+        # The depth resolve (`research/docs/23` §3.3, v57) only means something
+        # beside a multisample raster that keeps its depth surface: the resolve
+        # is the reduction of the stored four-sample texels, so any other shape
+        # is refused instead of silently ignored. The filter is the closed
+        # three-value family, and the expectation then follows the depth
+        # pair's own per-texel rule rather than the colour resolve arithmetic.
+        depth_resolve = case.get("depth_resolve")
+        if depth_resolve is not None:
+            _require(case.get("multisample") is not None,
+                     f"{where}: a depth resolve needs a multisample raster")
+            _require(case.get("depth", {}).get("store") is not None,
+                     f"{where}: a depth resolve needs a stored depth surface")
+            _object(depth_resolve, ("filter",), f"{where}.depth_resolve")
+            _require(depth_resolve["filter"] in ("sample0", "min", "max"),
+                     f"{where}.depth_resolve: unsupported depth resolve filter")
         wildcard_texels = case.get("wildcard_texels")
         if wildcard_texels is not None:
             _require(single,
@@ -1561,9 +1576,15 @@ def _render_plan(plan, suite):
             _require(not ("depth" in case and "stencil" in case),
                      f"{where}: the multisample raster opens one depth-stencil surface")
             if "depth" in case:
-                _require(case["depth"].get("store") is None,
-                         f"{where}: a multisampled depth surface is rail-owned: the depth "
-                         "resolve filters are a later increment")
+                # A stored multisampled depth surface is admitted from v57 on,
+                # through the resolve the case then has to state: its texels
+                # are only observable as the resolve's reduction, so a stored
+                # surface without one is refused, and the resolve's filter was
+                # already held to the closed family above.
+                if case["depth"].get("store") is not None:
+                    _require("depth_resolve" in case,
+                             f"{where}: a stored multisampled depth surface needs its "
+                             "depth resolve")
                 _require(coverage is None,
                          f"{where}: a multisample pass with a depth surface claims no partial "
                          "coverage")
