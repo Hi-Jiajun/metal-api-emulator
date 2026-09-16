@@ -1163,8 +1163,26 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     dropped — so it carries neither identity nor expectation, and a fixture
     that half-declares the stored shape is refused rather than read as either
     one.
+
+    The v66 increment opens the depth face beside the stencil one and states
+    the third reviewed stencil state (`research/docs/23` §3.3, v66): an
+    `equal 0` test that *keeps* the value on pass and increments-wraps it on
+    depth failure. Its three oversize triangles carry the same coverage, so
+    the near one writes depth where it passes, the far one's depth failure
+    then writes stencil, and the third one is the test that reads it: the
+    expectation is the covered region's tint, its partially covered column's
+    resolve against the clear colour, and the untouched remainder — and a
+    rail that ignored either face would land the third triangle's tint on all
+    of them.
     """
     quad_indices, stride = 6, 32
+    # The v66 pair draws three oversize triangles with one coverage instead of
+    # the two the other stencil shapes draw (`research/docs/23` §3.3, v66).
+    rail_owned_pair = (case.get("depth") is not None
+                       and "stencil_resolve" not in case)
+    stream_indices, stream_hex = (
+        (9, "000001000200030004000500060007000800") if rail_owned_pair
+        else (quad_indices, "000001000200030004000500"))
     _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
     _require(streams[0]["stride"] == stride,
              f"{where}: the reviewed stencil stream has stride {stride}")
@@ -1266,7 +1284,20 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
         reference = _integer(test["reference"], f"{where}.stencil_test.reference", 0, 255)
         read_mask = _integer(test["read_mask"], f"{where}.stencil_test.read_mask", 0, 255)
         write_mask = _integer(test["write_mask"], f"{where}.stencil_test.write_mask", 0, 255)
-        reviewed_states = (
+        # The v66 rail-owned combined pair is its own reviewed state
+        # (`research/docs/23` §3.3, v66): the equal-zero test that keeps the
+        # value on pass and increments-wraps it on depth failure. Every other
+        # stencil shape keeps the two states below.
+        if rail_owned_pair:
+            _require(test["compare"] == "equal" and test["fail_op"] == "keep"
+                     and test["depth_fail_op"] == "increment_wrap"
+                     and test["pass_op"] == "keep"
+                     and (reference, read_mask, write_mask) == (0, 255, 255),
+                     f"{where}: the rail-owned combined pair's stencil state is the equal-zero "
+                     "test that keeps on pass and increments-wraps on depth failure, with both "
+                     "masks wide open")
+        else:
+            reviewed_states = (
             # v47's equal-zero shape: the near triangle writes 1 where it
             # passes and the far triangle keeps its mask-closed zero.
             test["compare"] == "equal" and test["fail_op"] == "keep"
@@ -1279,11 +1310,11 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
             test["compare"] == "always" and test["fail_op"] == "keep"
             and test["depth_fail_op"] == "keep" and test["pass_op"] == "increment_wrap"
             and (reference, read_mask, write_mask) == (0, 255, 255),
-        )
-        _require(any(reviewed_states),
-                 f"{where}: the reviewed stencil state is one of the two reviewed shapes: an "
-                 "equal-zero test or a depth-differentiated always test, both with both masks "
-                 "on and an increment-wrap pass op")
+            )
+            _require(any(reviewed_states),
+                     f"{where}: the reviewed stencil state is one of the two reviewed shapes: an "
+                     "equal-zero test or a depth-differentiated always test, both with both "
+                     "masks on and an increment-wrap pass op")
     bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
     _require(len(bindings) == 1, f"{where}: the reviewed stencil shape binds one stream")
     binding = bindings[0]
@@ -1291,32 +1322,34 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
             f"{where}.vertex_buffers[0]")
     _require(binding["allocation"] > 0 and binding["view"] > 0,
              f"{where}: zero vertex stream identity")
-    _require(binding["length"] == stride * quad_indices,
-             f"{where}: the reviewed stencil stream is six stride-{stride} vertices")
+    _require(binding["length"] == stride * stream_indices,
+             f"{where}: the reviewed stencil stream is {stream_indices} stride-{stride} "
+             "vertices")
     _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
              == binding["length"],
              f"{where}: the vertex stream bytes do not match its length")
     _require(indices is not None, f"{where}: the reviewed stencil shape is indexed")
     _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
             f"{where}.indices")
-    _require(indices["initial_hex"] == "000001000200030004000500",
-             f"{where}: the reviewed stencil indices are the two reviewed triangles")
+    _require(indices["initial_hex"] == stream_hex,
+             f"{where}: the reviewed stencil indices are the reviewed triangles")
     # The stored stencil attachment, when the case declares one, is the
     # `(allocation, view, expected_texels)` triple the assembly below lands
     # beside the colour attachment; without one the surface is rail-owned and
     # observed by its effect on the colour side only, so the shape declares no
     # landing and the assembly owes it neither a writeback nor an allocation
     # image (`research/docs/23` §3.3, v47/v49).
-    # The combined depth-stencil shape (`research/docs/23` §3.3, v60) opens a
-    # depth surface beside the stencil one: the depth attachment clears to a
-    # value between the two triangles' depths, so the near triangle's depth
-    # pass writes stencil 1 while the far triangle's depth failures leave the
-    # rest at zero. Its stored depth is a second landing, the same triple the
-    # depth pair states.
+    # The combined depth-stencil shape (`research/docs/23` §3.3, v60/v66)
+    # opens a depth surface beside the stencil one. The v60 resolve shape's
+    # depth attachment clears to a value between the two triangles' depths, so
+    # the near triangle's depth pass writes stencil 1 while the far triangle's
+    # depth failures leave the rest at zero, and its stored depth is a second
+    # landing, the same triple the depth pair states. The v66 rail-owned pair
+    # keeps neither face: the depth surface clears to one, both faces are
+    # discarded with the pass, and the only landing is the colour resolve's
+    # own.
     depth_store = None
     if case.get("depth") is not None:
-        _require("stencil_resolve" in case,
-                 f"{where}: the combined depth-stencil shape needs its stencil resolve")
         depth = case["depth"]
         _require(isinstance(depth, dict), f"{where}: a depth attachment is an object")
         allowed = {"format", "width", "height", "load", "clear_depth",
@@ -1324,25 +1357,40 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
         _require(set(depth) - allowed == set(),
                  f"{where}.depth: unexpected fields "
                  + ", ".join(sorted(set(depth) - allowed)))
-        _require(depth["format"] == "depth32float" and depth["load"] == "clear"
-                 and depth.get("clear_depth") == 0.7 and depth.get("store") == "store",
-                 f"{where}: the combined depth surface clears to 0.7 and stores")
-        allocation = _integer(depth["allocation"], f"{where}.depth.allocation")
-        view = _integer(depth["view"], f"{where}.depth.view")
-        _require(allocation > 0 and view > 0,
-                 f"{where}: zero depth attachment identity")
-        expected = _hex(depth["expected_hex"], f"{where}.depth.expected_hex")
-        width = _integer(depth["width"], f"{where}.depth.width", 1)
-        height = _integer(depth["height"], f"{where}.depth.height", 1)
-        _require(len(expected) == width * height * 4,
-                 f"{where}.depth: the expected depth texels do not match the attachment")
-        _require(case.get("depth_test") == {"compare": "less", "write": True},
-                 f"{where}: the combined depth state is a less test with writes on")
-        depth_store = (allocation, view, expected)
+        _require(depth["format"] == "depth32float" and depth["load"] == "clear",
+                 f"{where}: the combined depth surface is a cleared depth32float")
+        if rail_owned_pair:
+            # The v66 pair: the surface is rail-owned, so it carries no store
+            # action, no identity and no expectation, and its clear is the one
+            # the first triangle's `less` test writes over
+            # (`research/docs/23` §3.3, v66).
+            _require(depth.get("clear_depth") == 1.0
+                     and set(depth) == {"format", "width", "height", "load", "clear_depth"},
+                     f"{where}: the rail-owned combined pair clears its depth to one and "
+                     "keeps neither face")
+            _require(case.get("depth_test") == {"compare": "less", "write": True},
+                     f"{where}: the combined pair's depth state is a less test with writes on")
+        else:
+            _require("stencil_resolve" in case,
+                     f"{where}: the combined depth-stencil shape needs its stencil resolve")
+            _require(depth.get("clear_depth") == 0.7 and depth.get("store") == "store",
+                     f"{where}: the combined depth surface clears to 0.7 and stores")
+            allocation = _integer(depth["allocation"], f"{where}.depth.allocation")
+            view = _integer(depth["view"], f"{where}.depth.view")
+            _require(allocation > 0 and view > 0,
+                     f"{where}: zero depth attachment identity")
+            expected = _hex(depth["expected_hex"], f"{where}.depth.expected_hex")
+            width = _integer(depth["width"], f"{where}.depth.width", 1)
+            height = _integer(depth["height"], f"{where}.depth.height", 1)
+            _require(len(expected) == width * height * 4,
+                     f"{where}.depth: the expected depth texels do not match the attachment")
+            _require(case.get("depth_test") == {"compare": "less", "write": True},
+                     f"{where}: the combined depth state is a less test with writes on")
+            depth_store = (allocation, view, expected)
     else:
         _require("stencil" in case or "stencil_test" in case,
                  f"{where}: the reviewed stencil shape carries a stencil surface")
-    return {"vertices": quad_indices, "indices": quad_indices,
+    return {"vertices": stream_indices, "indices": stream_indices,
             "stencil_store": stencil_store, "depth_store": depth_store}
 
 
@@ -1853,12 +1901,19 @@ def _render_plan(plan, suite):
             # both are rail-owned — the pass tests and writes them, but keeping
             # their texels would need a resolve the two APIs spell differently —
             # and the expectation then follows the pair's own uniform rule
-            # instead of the resolve rule. The two surfaces combine only
-            # through a stencil resolve: the combined depth-stencil surface is
-            # the one attachment both resolve targets name.
-            _require(not ("depth" in case and "stencil" in case)
-                     or "stencil_resolve" in case,
-                     f"{where}: the multisample raster opens one depth-stencil surface")
+            # instead of the resolve rule. Opening both faces is the combined
+            # depth-stencil surface — one attachment both faces share — and two
+            # shapes of it are reviewed: the v60 resolve shape, which states
+            # the stencil resolve its stored faces resolve through, and the v66
+            # rail-owned write-then-test pair, whose two faces are discarded
+            # with the pass and whose observation is the colour resolve
+            # (`research/docs/23` §3.3, v60/v66).
+            combined_pair = "depth" in case and "stencil" in case
+            rail_owned_combined = combined_pair and "stencil_resolve" not in case
+            _require(not rail_owned_combined
+                     or (case["depth"].get("store") is None
+                         and case["stencil"].get("store") is None),
+                     f"{where}: the combined depth-stencil pair keeps both faces or neither")
             if "depth" in case:
                 # A stored multisampled depth surface is admitted from v57 on,
                 # through the resolve the case then has to state: its texels
@@ -1876,9 +1931,18 @@ def _render_plan(plan, suite):
                     _require("stencil_resolve" in case,
                              f"{where}: a stored multisampled stencil surface needs its "
                              "stencil resolve")
-                _require(coverage is None,
-                         f"{where}: a multisample pass with a depth surface claims no partial "
-                         "coverage")
+                if rail_owned_combined:
+                    # The v66 pair's whole point is the partially covered
+                    # column: the two faces' tests decide per sample, so the
+                    # case claims the partial coverage its expectation then
+                    # shows (`research/docs/23` §3.3, v66).
+                    _require(coverage == "partial",
+                             f"{where}: the rail-owned combined pair claims the partial "
+                             "coverage it resolves")
+                else:
+                    _require(coverage is None,
+                             f"{where}: a multisample pass with a depth surface claims no "
+                             "partial coverage")
             elif "stencil" in case:
                 # A stored multisampled stencil surface is admitted from v60
                 # on, through the resolve the case then has to state: its
@@ -2069,11 +2133,14 @@ def _render_plan(plan, suite):
                 # single-surface shapes keep the uniform pair rule, and so do
                 # the v61 full-coverage colour-only fixtures — only a raster
                 # that *claims* partial coverage is owed a mixed texel
-                # (`research/docs/23` §3.3, v53/v55/v60/v61).
+                # (`research/docs/23` §3.3, v53/v55/v60/v61/v66).
+                combined_pair = (case.get("depth") is not None
+                                 and case.get("stencil") is not None)
                 if multisample is not None and (
                         (case.get("depth") is None and case.get("stencil") is None
                          and coverage == "partial")
-                        or case.get("stencil_resolve") is not None):
+                        or case.get("stencil_resolve") is not None
+                        or combined_pair):
                     # The multisample resolve (`research/docs/23` §3.3, v51):
                     # every texel is the mean of the samples a primitive
                     # covered, so the expectation has to be a k-of-`sample_count`

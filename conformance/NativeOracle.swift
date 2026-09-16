@@ -703,6 +703,11 @@ private struct ValidatedStencil {
     let height: Int
     let clearValue: UInt32
     let reference: UInt32
+    /// Whether the reviewed state is the v66 rail-owned pair's write-then-test
+    /// state (`research/docs/23` §3.3, v66): the equal-zero test that keeps the
+    /// value on pass and increments-wraps it on depth failure. Every other
+    /// stencil shape keeps the value on depth failure and increments on pass.
+    let depthFailureIncrement: Bool
     /// The stored surface's landing and expectation, or `nil` for the
     /// rail-owned shape every pre-v49 case declares: the pass discards the
     /// texels exactly as `render.rs::stencil_texture` does, so there is no
@@ -2235,12 +2240,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // v60) is the one stencil case that also opens a depth attachment:
             // both surfaces resolve, and the depth resolve is what the
             // `depth_resolved_sample` filter follows. Every other stencil case
-            // carries neither a depth attachment nor a culling or blend state.
+            // carries neither a depth attachment (the v66 rail-owned pair is
+            // the one exception, and its faces are both discarded with the
+            // pass) nor a culling or blend state.
             if definition.stencil_resolve == nil {
-                try require(definition.depth == nil && definition.cull == nil
-                            && definition.blend == nil,
-                            "\(definition.id): the reviewed stencil shape carries no depth "
-                            + "attachment, culling state or blend state")
+                if let depth = definition.depth {
+                    try require(depth.store == nil && depth.allocation == nil
+                                && depth.view == nil && depth.expected_hex == nil,
+                                "\(definition.id): the rail-owned combined pair's depth face "
+                                + "carries no store action, identity or expectation")
+                    try require(definition.depth_resolve == nil,
+                                "\(definition.id): the rail-owned combined pair states no "
+                                + "depth resolve")
+                }
+                try require(definition.cull == nil && definition.blend == nil,
+                            "\(definition.id): the reviewed stencil shape carries no culling "
+                            + "state or blend state")
             } else {
                 try require(definition.depth != nil && definition.depth_resolve != nil
                             && definition.cull == nil && definition.blend == nil,
@@ -2278,8 +2293,14 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(definition.vertices == 3,
                         "\(definition.id): the reviewed blend draw is the three-index triangle")
         } else {
-            try require(definition.vertices == 6,
-                        "\(definition.id): expected the reviewed six-index quad")
+            // The v66 rail-owned combined pair draws its three oversize
+            // triangles through nine indices; every other indexed shape draws
+            // the reviewed six (`research/docs/23` §3.3, v66).
+            let combinedPair = definition.depth != nil && definition.stencil != nil
+                && definition.stencil_resolve == nil
+            let reviewedIndices: UInt64 = combinedPair ? 9 : 6
+            try require(definition.vertices == reviewedIndices,
+                        "\(definition.id): expected the reviewed \(reviewedIndices)-index draw")
         }
         var resolved = [ValidatedVertexStream]()
         for (binding, buffer) in bindings.enumerated() {
@@ -2498,9 +2519,20 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 + "surface")
                 }
             }
-            try require(definition.coverage == nil,
-                        "\(definition.id): a multisample pass with a depth surface claims no "
-                        + "partial coverage")
+            // The v66 rail-owned pair's whole point is its partially covered
+            // column: the two faces' tests decide per sample, so the case has
+            // to claim the partial coverage its expectation then shows. Every
+            // other depth-bearing raster keeps the uniform pair rule
+            // (`research/docs/23` §3.3, v66).
+            if definition.stencil != nil && definition.stencil_resolve == nil {
+                try require(definition.coverage == "partial",
+                            "\(definition.id): the rail-owned combined pair claims the partial "
+                            + "coverage it resolves")
+            } else {
+                try require(definition.coverage == nil,
+                            "\(definition.id): a multisample pass with a depth surface claims no "
+                            + "partial coverage")
+            }
         } else if let stencil = definition.stencil {
             if stencil.store != nil {
                 try require(definition.stencil_resolve != nil,
@@ -2561,11 +2593,18 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         "\(definition.id): the device gate has to name the sample count "
                         + "the case states")
         }
-        try require(definition.depth == nil || definition.stencil == nil
-                    || definition.stencil_resolve != nil,
-                    "\(definition.id): the multisample raster opens one depth-stencil "
-                    + "surface: a combined surface is admitted only through a stencil "
-                    + "resolve")
+        // The combined depth-stencil surface is one attachment both faces
+        // share, and two shapes of it are reviewed: the v60 resolve shape,
+        // which states the stencil resolve its stored faces land through, and
+        // the v66 rail-owned pair, whose two faces are discarded with the pass
+        // (`research/docs/23` §3.3, v60/v66).
+        if definition.depth != nil && definition.stencil != nil
+            && definition.stencil_resolve == nil {
+            try require(definition.depth?.store == nil
+                        && definition.stencil?.store == nil,
+                        "\(definition.id): the combined depth-stencil pair keeps both faces "
+                        + "or neither")
+        }
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves, "
                     + "or states the closed allowed set of a constrained wildcard texel")
@@ -2723,14 +2762,19 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             var texelCount = 0
             // The resolve rule covers the colour-only raster and the combined
             // depth-stencil shape whose stencil half resolves (`research/docs/23`
-            // §3.3, v51/v60); the single-surface masked rasters keep the pair's
-            // uniform rule below, and so do the v61 full-coverage colour-only
-            // fixtures — only a raster that claims partial coverage is owed a
-            // mixed texel (`research/docs/23` §3.3, v61).
+            // §3.3, v51/v60), and the v66 rail-owned pair, whose three
+            // triangles share one partial coverage; the single-surface masked
+            // rasters keep the pair's uniform rule below, and so do the v61
+            // full-coverage colour-only fixtures — only a raster that claims
+            // partial coverage is owed a mixed texel (`research/docs/23` §3.3,
+            // v61/v66).
+            let railOwnedCombined = definition.depth != nil && definition.stencil != nil
+                && definition.stencil_resolve == nil
             if attachment.load == "clear", let multisample = definition.multisample,
                (definition.depth == nil && definition.stencil == nil
                 && definition.coverage == "partial"
-                || definition.stencil_resolve != nil) {
+                || definition.stencil_resolve != nil
+                || railOwnedCombined) {
                 // The multisample resolve (`research/docs/23` §3.3, v51): every
                 // texel is the arithmetic mean of the samples a primitive
                 // covered, so the expectation has to be a k-of-`sample_count`
@@ -3239,16 +3283,33 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // their fixtures' two primitives differ: the first passes against the
         // cleared zero and writes one while the second drops, and the combined
         // pair splits through the depth test.
-        try require((test.compare == "equal" || test.compare == "always")
-                    && test.reference == 0
-                    && test.read_mask == 255
-                    && test.write_mask == 255
-                    && test.fail_op == "keep"
-                    && test.depth_fail_op == "keep"
-                    && test.pass_op == "increment_wrap",
-                    "\(definition.id): the reviewed stencil state is the equal-zero test or "
-                    + "the combined shape's always test, both with both masks wide open, "
-                    + "keeping both failure outcomes and incrementing-wrapping on pass")
+        // The v66 rail-owned pair carries its own state
+        // (`research/docs/23` §3.3, v66): the equal-zero test keeps the value
+        // on pass and increments-wraps it on depth failure, which is what makes
+        // the third triangle fail against the value the second one wrote.
+        if definition.depth != nil && definition.stencil_resolve == nil {
+            try require(test.compare == "equal"
+                        && test.reference == 0
+                        && test.read_mask == 255
+                        && test.write_mask == 255
+                        && test.fail_op == "keep"
+                        && test.depth_fail_op == "increment_wrap"
+                        && test.pass_op == "keep",
+                        "\(definition.id): the rail-owned combined pair's stencil state is the "
+                        + "equal-zero test that keeps on pass and increments-wraps on depth "
+                        + "failure, with both masks wide open")
+        } else {
+            try require((test.compare == "equal" || test.compare == "always")
+                        && test.reference == 0
+                        && test.read_mask == 255
+                        && test.write_mask == 255
+                        && test.fail_op == "keep"
+                        && test.depth_fail_op == "keep"
+                        && test.pass_op == "increment_wrap",
+                        "\(definition.id): the reviewed stencil state is the equal-zero test or "
+                        + "the combined shape's always test, both with both masks wide open, "
+                        + "keeping both failure outcomes and incrementing-wrapping on pass")
+        }
         // The stencil store pair (`research/docs/23` §3.3, v49) is all-or-
         // nothing, mirroring the contract's `StencilStoreIdentityMismatch` and
         // the depth sibling's own rule: the rail-owned shape every pre-v49 case
@@ -3303,6 +3364,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         validatedStencil = ValidatedStencil(width: stencil.width, height: stencil.height,
                                             clearValue: clearValue, reference: test.reference,
+                                            depthFailureIncrement: definition.depth != nil
+                                                && definition.stencil_resolve == nil,
                                             store: stencilStore)
     } else {
         validatedStencil = nil
@@ -4105,14 +4168,20 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         depthStencilDescriptor.depthCompareFunction = depth.isLess ? .less : .always
         depthStencilDescriptor.isDepthWriteEnabled = depth.write
         // The combined shape carries the stencil half in the one depth-stencil
-        // descriptor: the reviewed always test that increments on depth pass
-        // and keeps on depth fail (`research/docs/23` §3.3, v60).
+        // descriptor. The v60 resolve shape's state is the always test that
+        // increments on depth pass and keeps on depth fail; the v66 rail-owned
+        // pair's state is the equal-zero test that keeps on pass and
+        // increments-wraps on depth failure — the write the third triangle
+        // then fails against (`research/docs/23` §3.3, v60/v66).
         if let stencil = fixture.stencil {
             let stencilDescriptor = MTLStencilDescriptor()
-            stencilDescriptor.stencilCompareFunction = .always
+            stencilDescriptor.stencilCompareFunction =
+                stencil.depthFailureIncrement ? .equal : .always
             stencilDescriptor.stencilFailureOperation = .keep
-            stencilDescriptor.depthFailureOperation = .keep
-            stencilDescriptor.depthStencilPassOperation = .incrementWrap
+            stencilDescriptor.depthFailureOperation =
+                stencil.depthFailureIncrement ? .incrementWrap : .keep
+            stencilDescriptor.depthStencilPassOperation =
+                stencil.depthFailureIncrement ? .keep : .incrementWrap
             stencilDescriptor.readMask = 255
             stencilDescriptor.writeMask = 255
             depthStencilDescriptor.frontFaceStencil = stencilDescriptor

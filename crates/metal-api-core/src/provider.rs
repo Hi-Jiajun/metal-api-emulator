@@ -2735,17 +2735,25 @@ impl RenderPassDescriptor {
                 }
             }
             // The stencil surface beside the raster (`research/docs/23` §3.3,
-            // v55/v60) is the depth surface's sibling one byte wide: the pass
-            // may test and write it, and keeping its texels needs the stencil
-            // resolve the pass then has to state. A stored surface without one
-            // keeps the v55 refusal, and a combined depth-stencil surface is
-            // admitted from v60 on only through a stencil resolve — the shape
-            // whose resolve targets both faces name the one combined surface.
+            // v55/v60/v66) is the depth surface's sibling one byte wide: the
+            // pass may test and write it, and keeping its texels needs the
+            // stencil resolve the pass then has to state. Opening both faces
+            // at once is the combined depth-stencil shape: one surface carries
+            // both aspects, so the two faces' store decisions have to agree —
+            // either both stay rail-owned with no resolve of their own (the
+            // v66 write-then-test pair, whose observation is the colour
+            // resolve), or both are kept through the two resolves the v60
+            // shape states. A stored face without its resolve keeps the v55
+            // refusal below, and a lopsided pair — one face kept, the other
+            // dropped — is refused by name instead of being read as either.
             if let Some(stencil) = &self.stencil {
-                if self.depth.is_some() && self.stencil_resolve.is_none() {
-                    return Err(ContractError::MultisampleSurfaceUnsupported {
-                        surface: "combined depth-stencil surface",
-                    });
+                if let Some(depth) = &self.depth {
+                    if depth.is_stored() != stencil.is_stored() {
+                        return Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+                            depth_stored: depth.is_stored(),
+                            stencil_stored: stencil.is_stored(),
+                        });
+                    }
                 }
                 if stencil.store == Some(StoreOp::Store) && self.stencil_resolve.is_none() {
                     return Err(ContractError::MultisampleStencilStoreUnsupported);
@@ -7368,6 +7376,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MultisamplePresentSourceMismatch { .. }
         | E::MultisampleDepthStoreUnsupported
         | E::MultisampleStencilStoreUnsupported
+        | E::MultisampleCombinedSurfaceUnsupported { .. }
         | E::DepthResolveWithoutStoredDepth { .. }
         | E::StencilResolveWithoutStoredStencil { .. }
         | E::StencilResolveWithoutDepthResolve
@@ -8818,7 +8827,10 @@ pub enum ContractError {
     /// (`research/docs/23` §3.3, v51). The first multisample increment
     /// executes colour-only offscreen passes; a multisampled depth or stencil
     /// surface is the increment that reviews the depth resolve filters both
-    /// APIs spell differently.
+    /// APIs spell differently. The v53/v55/v66 increments admit both sibling
+    /// surfaces, so the variant currently has **no construction point** — only
+    /// the error-class/slug mapping and its `Display` arm remain, the same
+    /// retained shape [`ContractError::TextureBindingUnsupported`] has.
     MultisampleSurfaceUnsupported {
         surface: &'static str,
     },
@@ -8844,6 +8856,19 @@ pub enum ContractError {
     /// resolve, and the increment that reviews that resolve is the one that can
     /// admit a stored surface here.
     MultisampleStencilStoreUnsupported,
+    /// The pass opens both faces of the combined depth-stencil surface with
+    /// disagreeing store decisions (`research/docs/23` §3.3, v66). The two
+    /// faces share one surface, so the only reviewed shapes keep both faces
+    /// together: either neither is stored — the rail-owned write-then-test
+    /// pair, observed through the colour resolve — or both are stored through
+    /// their own resolves (v60). One face kept while the other is dropped
+    /// would leave the shared surface's ownership ambiguous, so it is refused
+    /// by name. The two fields carry what each face stated, which is the
+    /// disagreement itself.
+    MultisampleCombinedSurfaceUnsupported {
+        depth_stored: bool,
+        stencil_stored: bool,
+    },
     /// The pass states a depth resolve without the stored multisampled depth
     /// surface it reduces (`research/docs/23` §3.3, v57). A resolve only means
     /// something beside a multisample raster whose depth attachment is stored,
@@ -9451,6 +9476,16 @@ impl fmt::Display for ContractError {
             Self::MultisampleStencilStoreUnsupported => formatter.write_str(
                 "a multisample raster cannot keep its stencil surface yet: the stencil \
                  resolve is a later increment",
+            ),
+            Self::MultisampleCombinedSurfaceUnsupported {
+                depth_stored,
+                stencil_stored,
+            } => write!(
+                formatter,
+                "the two faces of a combined depth-stencil surface have to agree on their \
+                 store decisions: the pass states depth stored = {depth_stored} and stencil \
+                 stored = {stencil_stored}, and the reviewed shapes keep both faces \
+                 rail-owned or store both through their resolves"
             ),
             Self::DepthResolveWithoutStoredDepth { store } => write!(
                 formatter,
@@ -14308,10 +14343,59 @@ mod tests {
             compare: CompareFunction::Less,
             write: true,
         });
+        // Opening both faces with neither kept is the v66 write-then-test
+        // pair: one surface carries both aspects, both stay rail-owned, and
+        // the observation is the colour resolve
+        // (`research/docs/23` §3.3, v66).
+        combined
+            .validate()
+            .expect("the rail-owned combined depth-stencil pair is well formed");
+        // The two faces share one surface, so a lopsided pair — one face kept
+        // while the other is dropped — is refused by name in both directions
+        // instead of being read as either reviewed shape
+        // (`research/docs/23` §3.3, v66).
+        let mut lopsided_depth = combined.clone();
+        {
+            let depth = lopsided_depth
+                .depth
+                .as_mut()
+                .expect("the fixture opens a depth attachment");
+            depth.store = Some(DepthStoreOp::Store);
+            depth.identity = Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            });
+        }
+        lopsided_depth.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
         assert_eq!(
-            combined.validate(),
-            Err(ContractError::MultisampleSurfaceUnsupported {
-                surface: "combined depth-stencil surface",
+            lopsided_depth.validate(),
+            Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+                depth_stored: true,
+                stencil_stored: false,
+            })
+        );
+        let mut lopsided_stencil = combined.clone();
+        {
+            let stencil = lopsided_stencil
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = Some(StoreOp::Store);
+            stencil.identity = Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(951),
+            });
+        }
+        lopsided_stencil.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        assert_eq!(
+            lopsided_stencil.validate(),
+            Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+                depth_stored: false,
+                stencil_stored: true,
             })
         );
         // The combined depth-stencil surface is admitted from v60 on through
