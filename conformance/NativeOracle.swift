@@ -163,6 +163,18 @@ private struct DepthTestDefinition: Decodable {
     let write: Bool
 }
 
+/// The culling state a render case declares (`research/docs/23` §3.3, v39).
+///
+/// The fields mirror `metal_api_core::provider::RenderPassCull`: the refusal
+/// mode (`"none"`, `"front"`, `"back"`) and the winding that names a front face
+/// (`"clockwise"`, `"counter_clockwise"`). Metal states both on the encoder
+/// (`setCullMode` / `setFrontFacingWinding`), and a case that declares nothing
+/// keeps the default every earlier case has: no culling.
+private struct CullDefinition: Decodable {
+    let mode: String
+    let winding: String
+}
+
 /// One attribute of a render case's vertex stream.
 ///
 /// The fields mirror `metal_api_core::provider::VertexAttribute`: the
@@ -305,6 +317,12 @@ private struct RenderCaseDefinition: Decodable {
     /// depth attachment, and the reviewed depth case states a `less` test with
     /// writes on (`research/docs/23` §3.3, v36).
     let depth_test: DepthTestDefinition?
+    /// The pass's culling state, or `nil` for no culling — the shape every
+    /// pre-v39 case declares (`metal_api_core::provider::RenderPassDescriptor::cull`,
+    /// `research/docs/23` §3.3, v39). The reviewed cull case culls back faces
+    /// with a counter-clockwise front, so exactly the counter-clockwise copy of
+    /// its two opposite-order triangles survives.
+    let cull: CullDefinition?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -1421,7 +1439,9 @@ private func reviewedInstancedModule() -> ReviewedRenderModule {
 /// offset 16, with a stage pair that forwards the tint to the attachment. The
 /// solid modules cannot stand in for it: the position is a caller-held
 /// attribute rather than `vertex_id`, two attributes share one vertex, and the
-/// fragment stage stores the tint the vertex stage forwarded.
+/// fragment stage stores the tint the vertex stage forwarded. The cull pair
+/// (`research/docs/23` §3.3, v39) draws the same stream shape with its own
+/// encoder state, so this one module serves both reviewed pair fixtures.
 private func reviewedDepthModule() -> ReviewedRenderModule {
     ReviewedRenderModule(
         vertex_entry: "render_depth_pair_vertex",
@@ -1441,11 +1461,11 @@ private func reviewedDepthModule() -> ReviewedRenderModule {
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
 /// single-attachment case whose one stream carries two attributes draws the
-/// depth module, a single-attachment case whose two-stream layout steps per
-/// instance draws the instanced module, a single-attachment case with any
-/// other layout the indexed one, and an indexed case with two `rgba8_unorm`
-/// attachments the dual one. A shape no module was reviewed for is refused
-/// instead of matched approximately.
+/// pair module the depth and cull fixtures share, a single-attachment case
+/// whose two-stream layout steps per instance draws the instanced module, a
+/// single-attachment case with any other layout the indexed one, and an
+/// indexed case with two `rgba8_unorm` attachments the dual one. A shape no
+/// module was reviewed for is refused instead of matched approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
     let attachments = try colorAttachments(definition)
     // The 8-bit UNORM modules are layout-agnostic: the same store lands in
@@ -1470,7 +1490,8 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
     // single-stream layout carrying two attributes: a `float32x3` position and
     // a `float32x4` tint sharing one stride-32 vertex. The reviewed equality
     // check below pins the rest of the layout, so this selection only has to
-    // find the shape's own module.
+    // find the shape's own module; the cull pair (`§3.3`, v39) carries the
+    // same layout and so selects the same module.
     case (let layout?, 1) where layout.buffers.count == 1
         && layout.buffers[0].attributes.count == 2:
         return reviewedDepthModule()
@@ -1629,12 +1650,33 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         try require(layout.buffers == reviewedBuffers,
                     "\(definition.id): the vertex layout is not the reviewed one")
+        // The reviewed cull pair (`research/docs/23` §3.3, v39) shares the
+        // depth fixture's module and stream shape, and the culling state is
+        // classified first, exactly as `conformance/compare.py` and
+        // `provider-capture.rs::render_geometry` order the same two rules: the
+        // pair shapes are mutually exclusive, so a case that declares both is
+        // refused by the cull rule rather than silently read as the depth
+        // fixture.
+        if let cull = definition.cull {
+            try require(layout.buffers.count == 1
+                        && layout.buffers[0].attributes.count == 2,
+                        "\(definition.id): the reviewed cull stream is one stride-32 "
+                        + "stream with two attributes")
+            try require(cull.mode == "back" && cull.winding == "counter_clockwise",
+                        "\(definition.id): the reviewed cull state is back faces with a "
+                        + "counter-clockwise front")
+            try require(definition.depth == nil,
+                        "\(definition.id): the reviewed cull shape carries no depth attachment")
+        }
         // The reviewed depth shape (`research/docs/23` §3.3, v36) is the
         // two-attribute stream, and no rail was reviewed against drawing it
         // *without* its depth pair: the surface is what the case exists to
         // exercise, exactly as `render.rs::reviewed_depth_geometry` refuses a
-        // depth-shaped draw that carries no attachment.
-        if layout.buffers.count == 1 && layout.buffers[0].attributes.count == 2 {
+        // depth-shaped draw that carries no attachment. The cull pair above
+        // draws the same stream shape with its own state, so only a cull-less
+        // case is the depth fixture.
+        if definition.cull == nil,
+           layout.buffers.count == 1 && layout.buffers[0].attributes.count == 2 {
             try require(definition.depth != nil,
                         "\(definition.id): the reviewed depth shape carries a depth attachment")
         }
@@ -2672,6 +2714,17 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         encoder.setDepthStencilState(state)
     }
+    // Culling is encoder state too (`research/docs/23` §3.3, v39): the mode and
+    // the winding are the pass's own, and a pass without the state keeps
+    // Metal's defaults (cull none, counter-clockwise front) exactly. The
+    // validation above pinned the reviewed pair to a back-face cull with a
+    // counter-clockwise front.
+    if definition.cull != nil {
+        encoder.setCullMode(.back)
+        // `setFrontFacingWinding(_:)` was renamed to `setFrontFacing(_:)`; the
+        // ObjC selector behind it is the same state the contract names.
+        encoder.setFrontFacing(.counterClockwise)
+    }
     // The viewport is explicit because the contract carries it, even though the
     // first increment only accepts the attachment-covering default.
     encoder.setViewport(MTLViewport(originX: 0, originY: 0,
@@ -2844,6 +2897,7 @@ private func renderSelfTest() throws -> CaseResult {
         // case has (`research/docs/23` §3.3, v36).
         depth: nil,
         depth_test: nil,
+        cull: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
@@ -2907,6 +2961,7 @@ private func presentSelfTest() throws -> CaseResult {
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
+        cull: nil,
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
         capture_rails: ["native-metal"])
@@ -2994,6 +3049,7 @@ private func vertexSelfTest() throws -> CaseResult {
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
+        cull: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
@@ -3085,6 +3141,7 @@ private func mrtSelfTest() throws -> CaseResult {
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
+        cull: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])

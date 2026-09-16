@@ -156,6 +156,7 @@ fn render_pass(
     height: u64,
 ) -> RenderPassDescriptor {
     RenderPassDescriptor {
+        cull: None,
         depth: None,
         depth_test: None,
         base_vertex: 0,
@@ -580,6 +581,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 },
             }),
             TracePass::Render(RenderPassDescriptor {
+                cull: None,
                 depth: None,
                 depth_test: None,
                 base_vertex: 0,
@@ -763,6 +765,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 SECOND_SCRATCH_ALLOCATION,
             )),
             TracePass::Render(RenderPassDescriptor {
+                cull: None,
                 depth: None,
                 depth_test: None,
                 base_vertex: 0,

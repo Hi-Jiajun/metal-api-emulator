@@ -6,16 +6,17 @@ use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
     BufferView, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
-    CompletionPolicy, ComputePass, ComputeTrace, DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch,
-    Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
-    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
-    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
-    RenderDepthAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    SemanticDigest, ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, VertexStep, ViewId, PROVIDER_SCHEMA_VERSION,
+    CompletionPolicy, ComputePass, ComputeTrace, CullMode, DepthFormat, DepthLoadOp, DepthTest,
+    DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId,
+    HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
+    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
+    ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -990,6 +991,15 @@ fn register_render_pipeline(
             (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
             reviewed_depth_layout(),
         ),
+        // The cull shape compiles the same reviewed pair module: the positions
+        // and tints are the reviewed ones, and the culling state is what picks
+        // which triangle survives (`research/docs/23` §3.3, v39).
+        RenderGeometry::CullPair => (
+            (DEPTH_VERTEX_ENTRY, DEPTH_FRAGMENT_ENTRY),
+            (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+            (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
+            reviewed_depth_layout(),
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
@@ -1209,6 +1219,10 @@ struct RenderCase {
     /// nothing tests it" (`research/docs/23` §3.3, v36).
     #[serde(default)]
     depth_test: Option<DepthTestDefinition>,
+    /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
+    /// or absent for "keep every triangle".
+    #[serde(default)]
+    cull: Option<CullDefinition>,
     /// The coverage claim (`research/docs/23` §3.3, v38): `"partial"` says the
     /// draw covers only part of the attachment, so the expectation mixes the
     /// fragment output with the colour the pass started from. Absent means the
@@ -1227,6 +1241,14 @@ struct RenderCase {
 /// every pre-v31 fixture means.
 fn default_instance_count() -> u64 {
     1
+}
+
+/// The culling state a render case draws with (`research/docs/23` §3.3, v39).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CullDefinition {
+    mode: String,
+    winding: String,
 }
 
 /// The depth attachment a render case opens (`research/docs/23` §3.3, v36).
@@ -2298,6 +2320,10 @@ enum RenderGeometry {
     /// triangles at different z, each carrying its own tint, drawn with a
     /// depth attachment and a `less` test.
     DepthPair,
+    /// The reviewed cull pair (`research/docs/23` §3.3, v39): the same pair
+    /// module over two oversize triangles at one z whose vertex orders are
+    /// opposite, so the pass's cull state decides which tint survives.
+    CullPair,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -2555,6 +2581,121 @@ fn reviewed_depth_stream_hex() -> String {
     expected
 }
 
+/// The reviewed cull stream (`research/docs/23` §3.3, v39): the same oversize
+/// triangle twice, at one depth. The first copy's vertex order is clockwise in
+/// framebuffer coordinates and the second copy's is its reverse, so a pass that
+/// culls back faces with a counter-clockwise front keeps exactly the second
+/// one. Each copy carries its own tint, which is what makes the surviving one
+/// visible.
+const CULL_PAIR_POSITIONS_HEX: [&str; 6] = [
+    // (-1, -1, 0.5), (3, -1, 0.5), (-1, 3, 0.5)
+    "000080bf000080bf0000003f",
+    "00004040000080bf0000003f",
+    "000080bf000040400000003f",
+    // The same three corners in reverse order: (3, -1), (-1, 3), (-1, -1)
+    "00004040000080bf0000003f",
+    "000080bf000040400000003f",
+    "000080bf000080bf0000003f",
+];
+
+fn reviewed_cull_stream_hex() -> String {
+    let mut expected = String::new();
+    for (vertex, position) in CULL_PAIR_POSITIONS_HEX.iter().enumerate() {
+        expected.push_str(position);
+        expected.push_str("00000000");
+        expected.push_str(if vertex < 3 {
+            DEPTH_PAIR_RED_HEX
+        } else {
+            DEPTH_PAIR_GREEN_HEX
+        });
+    }
+    expected
+}
+
+/// Pin the reviewed cull shape (`research/docs/23` §3.3, v39).
+///
+/// The layout, the two opposite-order triangles, the culling state and the
+/// expectation are the whole review surface: the pass has to cull back faces
+/// with a counter-clockwise front face, the stream has to be the two reviewed
+/// copies of the oversize triangle, and the expectation is the tint of the
+/// copy that survives — the green one, whose reversed order is the
+/// counter-clockwise (front) one under that state. The reflected derivation
+/// matters: the first copy's order is clockwise in the framebuffer, which is
+/// what the local control run reads back (the first copy's red never lands).
+fn reviewed_cull_geometry(
+    case: &RenderCase,
+    layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    let stream = &layout.buffers[0];
+    if layout.buffers.len() != 1
+        || stream.stride != DEPTH_STRIDE
+        || stream.step != "per_vertex"
+        || stream.attributes.len() != 2
+    {
+        return Err(format!(
+            "{where_}: the reviewed cull stream is one stride-{DEPTH_STRIDE} stream with two attributes"
+        )
+        .into());
+    }
+    let position = &stream.attributes[0];
+    if position.location != 0 || position.offset != 0 || position.format != "float32x3" {
+        return Err(format!(
+            "{where_}: the reviewed cull position is location 0, offset 0, float32x3"
+        )
+        .into());
+    }
+    let tint = &stream.attributes[1];
+    if tint.location != 1 || tint.offset != 16 || tint.format != "float32x4" {
+        return Err(format!(
+            "{where_}: the reviewed cull tint is location 1, offset 16, float32x4"
+        )
+        .into());
+    }
+    let Some(cull) = &case.cull else {
+        return Err(format!("{where_}: the reviewed cull shape carries a culling state").into());
+    };
+    if cull.mode != "back" || cull.winding != "counter_clockwise" {
+        return Err(format!(
+            "{where_}: the reviewed cull state is a back-face cull with a counter-clockwise front"
+        )
+        .into());
+    }
+    if case.depth.is_some() {
+        return Err(
+            format!("{where_}: the reviewed cull shape carries no depth attachment").into(),
+        );
+    }
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the reviewed cull shape binds one stream").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    if buffer.length != DEPTH_STRIDE * 6 {
+        return Err(format!(
+            "{where_}: the reviewed cull stream is six stride-{DEPTH_STRIDE} vertices"
+        )
+        .into());
+    }
+    if buffer.initial_hex != reviewed_cull_stream_hex() {
+        return Err(format!(
+            "{where_}: the reviewed cull stream is the two opposite-order triangles"
+        )
+        .into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed cull shape is indexed").into());
+    };
+    if indices.initial_hex != "000001000200030004000500" {
+        return Err(
+            format!("{where_}: the reviewed cull indices are the two reviewed triangles").into(),
+        );
+    }
+    Ok(RenderGeometry::CullPair)
+}
+
 /// Pin the reviewed depth shape (`research/docs/23` §3.3, v36).
 ///
 /// The layout, the two triangles, the depth attachment's shape and the depth
@@ -2788,6 +2929,13 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     // reviewed position stream at binding 0, the per-instance tint at binding
     // 1, and exactly the two instances the reviewed module's `instance_id`
     // shift was written for (`research/docs/23` §3.3, v31).
+    // The two reviewed pair shapes are mutually exclusive, and the culling one
+    // is checked first so a case that declares both is classified as the cull
+    // shape and refused by its own rule (`research/docs/23` §3.3, v39); the
+    // depth shape is the one that opens a depth attachment.
+    if case.cull.is_some() {
+        return reviewed_cull_geometry(case, layout, where_);
+    }
     if case.depth.is_some() {
         return reviewed_depth_geometry(case, layout, where_);
     }
@@ -2979,6 +3127,17 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::CullPair => {
+            if case.vertices != 6 {
+                return Err(format!("{where_}: the reviewed cull pair draws six indices").into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a cull case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::DepthPair => {
             if case.vertices != 6 {
                 return Err(format!("{where_}: the reviewed depth pair draws six indices").into());
@@ -3054,6 +3213,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // (`research/docs/23` §3.3, v34).
         RenderGeometry::BaseVertexQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
         RenderGeometry::DepthPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+        RenderGeometry::CullPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -4720,6 +4880,29 @@ fn heap_segment(
     })
 }
 
+/// The culling state one render case declares (`research/docs/23` §3.3, v39).
+fn case_cull(case: &RenderCase) -> Result<Option<RenderPassCull>> {
+    let Some(cull) = &case.cull else {
+        return Ok(None);
+    };
+    let mode = match cull.mode.as_str() {
+        "none" => CullMode::None,
+        "front" => CullMode::Front,
+        "back" => CullMode::Back,
+        other => {
+            return Err(format!("render case {}: unsupported cull mode {other:?}", case.id).into())
+        }
+    };
+    let winding = match cull.winding.as_str() {
+        "clockwise" => Winding::Clockwise,
+        "counter_clockwise" => Winding::CounterClockwise,
+        other => {
+            return Err(format!("render case {}: unsupported winding {other:?}", case.id).into())
+        }
+    };
+    Ok(Some(RenderPassCull { mode, winding }))
+}
+
 /// The depth attachment and depth state one render case declares
 /// (`research/docs/23` §3.3, v36).
 ///
@@ -4808,6 +4991,7 @@ fn run_render_case(
 ) -> Result<CaseResult> {
     let attachments = render_attachment_shapes(case)?;
     let (depth_attachment, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
+    let cull = case_cull(case)?;
     // The declaring pass's own resource table: one backing image and one
     // `AllocationRecord` per allocation (`docs/23` §4.1).
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -5010,6 +5194,10 @@ fn run_render_case(
         // surface" (`research/docs/23` §3.3, v36).
         depth: depth_attachment,
         depth_test,
+        // The reviewed cull fixture declares the state; every other case leaves
+        // it absent, which the rails execute as "keep every triangle"
+        // (`research/docs/23` §3.3, v39).
+        cull,
         present,
     }));
 
