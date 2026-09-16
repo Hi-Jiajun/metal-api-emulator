@@ -985,7 +985,7 @@ def _render_plan(plan, suite):
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
-                               "depth", "depth_test"})
+                               "depth", "depth_test", "coverage"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1061,6 +1061,18 @@ def _render_plan(plan, suite):
         # that may legitimately be unclaimed. The list has to leave at least one
         # texel observed and at least one wild, or the fixture would prove
         # "everything" or "nothing" rather than a partial coverage.
+        # The coverage claim (`research/docs/23` §3.3, v38): a clearing pass
+        # whose draw covers only part of the attachment may say so, and the
+        # comparison then reads every texel as "the fragment output or the
+        # clear colour, and both have to appear". The default stays the
+        # milestone's stricter rule — every texel is the output — because a
+        # fixture that says nothing claims everything.
+        coverage = case.get("coverage")
+        if coverage is not None:
+            _require(coverage == "partial",
+                     f"{where}: the only coverage claim is \"partial\"")
+            _require(single,
+                     f"{where}: the coverage claim is the single-attachment shape")
         wildcard_texels = case.get("wildcard_texels")
         if wildcard_texels is not None:
             _require(single,
@@ -1205,7 +1217,27 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
-                if scissor is None:
+                if coverage == "partial":
+                    # The draw covers part of the attachment: every texel is
+                    # the fragment output or the colour the pass started from,
+                    # and both have to appear, or the fixture would claim
+                    # either "everything" or "nothing"
+                    # (`research/docs/23` §3.3, v38).
+                    drawn = 0
+                    kept = 0
+                    for index, chunk in enumerate(texels):
+                        if chunk == texel:
+                            drawn += 1
+                        elif chunk == clear:
+                            kept += 1
+                        else:
+                            raise CaptureError(
+                                f"{attachment_where}: texel {index} has to be the "
+                                "fragment output or the clear colour")
+                    _require(0 < drawn < len(texels) and kept > 0,
+                             f"{attachment_where}: a partial coverage claim needs both "
+                             "drawn and clear texels")
+                elif scissor is None:
                     if vertex_input and vertex_input.get("instanced"):
                         # The instanced fixture covers each half of the
                         # attachment with its own instance tint

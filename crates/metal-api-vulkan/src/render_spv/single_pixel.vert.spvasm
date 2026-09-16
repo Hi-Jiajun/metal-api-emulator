@@ -1,3 +1,10 @@
+; 探针自身也按 v38 的对齐约定表达：它在 Metal NDC 里塌到 (-1, +1)（Metal 的左上角），
+; 末尾的 OpFNegate 再把它翻成 Vulkan 的 (-1, -1)，所以它在 2×2 视口里仍然只覆盖
+; framebuffer 的第一个 texel（这正是 render.rs 的 partial-attachment 测试断言的）。
+; 坐标约定：本模块的输出 y 被取反（OpFNegate），使 NDC 的 +y 与 Apple Metal 的
+; Metal NDC 约定一致（Metal 的 NDC +y 向上、Vulkan 的 NDC +y 向下）。两轨因此对同一份
+; fixture 得到同一张 framebuffer 图像：内容对称的 fixture 字节不变，非对称 fixture 也不再
+; 被镜像（research/docs/23 §3.3，v38）。
 ; 本文件是 single_pixel.vert.spv 的可读源，供渲染轨道的清屏测试使用。复现命令：
 ;   spirv-as --target-env vulkan1.0 single_pixel.vert.spvasm -o single_pixel.vert.spv
 ; 顶点为 (-1,-1) (0.4,-1) (-1,0.4)：2x2 视口下只包含像素 (0,0) 的中心 (-0.5,-0.5)，
@@ -31,6 +38,8 @@
       %glpos = OpVariable %_ptr_Output_PerVertex Output
     %float_n1 = OpConstant %float -1
  %float_edge = OpConstant %float 0.4
+%float_neg_edge = OpConstant %float -0.4
+     %float_p1 = OpConstant %float 1
      %float_0 = OpConstant %float 0
      %float_1 = OpConstant %float 1
       %int_0 = OpConstant %int 0
@@ -42,9 +51,10 @@
   %is_middle = OpIEqual %bool %ix %int_1
       %middle_x = OpSelect %float %is_middle %float_n1 %float_edge
         %first_x = OpSelect %float %is_top %float_n1 %middle_x
-     %middle_y = OpSelect %float %is_middle %float_edge %float_n1
-        %first_y = OpSelect %float %is_top %float_n1 %middle_y
-        %pos = OpCompositeConstruct %v4float %first_x %first_y %float_0 %float_1
+     %middle_y = OpSelect %float %is_middle %float_neg_edge %float_p1
+        %first_y = OpSelect %float %is_top %float_p1 %middle_y
+        %flipped_first_y = OpFNegate %float %first_y
+        %pos = OpCompositeConstruct %v4float %first_x %flipped_first_y %float_0 %float_1
   %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
                OpStore %glpos_ptr %pos
                OpReturn

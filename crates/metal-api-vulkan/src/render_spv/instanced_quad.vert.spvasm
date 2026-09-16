@@ -1,3 +1,7 @@
+; 坐标约定：本模块的输出 y 被取反（OpFNegate），使 NDC 的 +y 与 Apple Metal 的
+; Metal NDC 约定一致（Metal 的 NDC +y 向上、Vulkan 的 NDC +y 向下）。两轨因此对同一份
+; fixture 得到同一张 framebuffer 图像：内容对称的 fixture 字节不变，非对称 fixture 也不再
+; 被镜像（research/docs/23 §3.3，v38）。
 ; 本文件是 instanced_quad.vert.spv 的可读源（research/docs/23 §3.3，v31 实例化步进）。
 ; 复现命令：
 ;   spirv-as --target-env vulkan1.0 instanced_quad.vert.spvasm -o instanced_quad.vert.spv
@@ -63,7 +67,8 @@
     %is_first = OpIEqual %bool %iid_value %int_0
        %shift = OpSelect %float %is_first %float_neg_half %float_half
    %shifted_x = OpFAdd %float %scaled_x %shift
-       %pos4 = OpCompositeConstruct %v4float %shifted_x %y %float_0 %float_1
+       %flipped_y = OpFNegate %float %y
+        %pos4 = OpCompositeConstruct %v4float %shifted_x %flipped_y %float_0 %float_1
   %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
                OpStore %glpos_ptr %pos4
                OpStore %tint_out %tint
