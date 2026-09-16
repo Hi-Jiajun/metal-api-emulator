@@ -175,6 +175,24 @@ private struct CullDefinition: Decodable {
     let winding: String
 }
 
+/// The blend state a render case declares (`research/docs/23` §3.3, v40).
+///
+/// The fields mirror `metal_api_core::provider::BlendAttachment`: the source
+/// and destination factors of the RGB and of the alpha channel, plus the
+/// operation that combines them. Each factor is a wire spelling (`"zero"`,
+/// `"one"`, `"source_alpha"`, `"one_minus_source_alpha"`) and the operation is
+/// `"add"`. Metal states all five on one pipeline colour attachment
+/// (`sourceRGBBlendFactor`, `destinationAlphaBlendFactor`, …) rather than on
+/// the encoder, and a case that declares nothing keeps the semantics every
+/// earlier case has: the fragment output lands unblended.
+private struct BlendAttachmentDefinition: Decodable {
+    let source_rgb: String
+    let destination_rgb: String
+    let source_alpha: String
+    let destination_alpha: String
+    let operation: String
+}
+
 /// One attribute of a render case's vertex stream.
 ///
 /// The fields mirror `metal_api_core::provider::VertexAttribute`: the
@@ -323,6 +341,15 @@ private struct RenderCaseDefinition: Decodable {
     /// with a counter-clockwise front, so exactly the counter-clockwise copy of
     /// its two opposite-order triangles survives.
     let cull: CullDefinition?
+    /// The pass's blend state, or `nil` for the fragment output landing
+    /// unblended — the semantics every case before v40 has
+    /// (`metal_api_core::provider::RenderPassDescriptor::blend`,
+    /// `research/docs/23` §3.3, v40). Metal states the state on the colour
+    /// attachment of the pipeline descriptor rather than on the encoder, and
+    /// the reviewed blend case blends source alpha against
+    /// one-minus-source-alpha with an add over a cleared-to-zero attachment,
+    /// so a rail that ignored the state would store the tint itself.
+    let blend: [BlendAttachmentDefinition]?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -1650,11 +1677,43 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         try require(layout.buffers == reviewedBuffers,
                     "\(definition.id): the vertex layout is not the reviewed one")
+        // The reviewed blend shape (`research/docs/23` §3.3, v40) is the third
+        // pair shape: the same two-attribute stream and module as the depth and
+        // culling fixtures, this time with the blend state stated and neither a
+        // depth attachment nor a culling state. Like
+        // `conformance/compare.py::_blend_declaration` and
+        // `provider-capture.rs::render_geometry`, the blend rule is classified
+        // ahead of the other two, so a case that declares more than one of the
+        // three pair shapes is refused by the shape it claims rather than
+        // silently read as another fixture.
+        if let blend = definition.blend {
+            try require(layout.buffers.count == 1
+                        && layout.buffers[0].attributes.count == 2,
+                        "\(definition.id): the reviewed blend stream is one stride-32 "
+                        + "stream with two attributes")
+            try require(definition.depth == nil && definition.cull == nil,
+                        "\(definition.id): the reviewed blend shape carries neither a depth "
+                        + "attachment nor a culling state")
+            try require(blend.count == 1,
+                        "\(definition.id): the reviewed blend shape states one attachment")
+            let state = blend[0]
+            try require(state.source_rgb == "source_alpha"
+                        && state.destination_rgb == "one_minus_source_alpha"
+                        && state.source_alpha == "source_alpha"
+                        && state.destination_alpha == "one_minus_source_alpha"
+                        && state.operation == "add",
+                        "\(definition.id): the reviewed blend state is source alpha against "
+                        + "one-minus-source-alpha with an add")
+            try require(definition.attachment != nil && definition.attachments == nil,
+                        "\(definition.id): the reviewed blend shape is the single-attachment "
+                        + "shape")
+        }
         // The reviewed cull pair (`research/docs/23` §3.3, v39) shares the
         // depth fixture's module and stream shape, and the culling state is
-        // classified first, exactly as `conformance/compare.py` and
-        // `provider-capture.rs::render_geometry` order the same two rules: the
-        // pair shapes are mutually exclusive, so a case that declares both is
+        // classified ahead of the depth shape, exactly as
+        // `conformance/compare.py` and
+        // `provider-capture.rs::render_geometry` order the same rules: the pair
+        // shapes are mutually exclusive, so a case that declares both is
         // refused by the cull rule rather than silently read as the depth
         // fixture.
         if let cull = definition.cull {
@@ -1672,10 +1731,10 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         // two-attribute stream, and no rail was reviewed against drawing it
         // *without* its depth pair: the surface is what the case exists to
         // exercise, exactly as `render.rs::reviewed_depth_geometry` refuses a
-        // depth-shaped draw that carries no attachment. The cull pair above
-        // draws the same stream shape with its own state, so only a cull-less
-        // case is the depth fixture.
-        if definition.cull == nil,
+        // depth-shaped draw that carries no attachment. The two pair shapes
+        // above draw the same stream shape under their own states, so only a
+        // cull-less, blend-less case is the depth fixture.
+        if definition.cull == nil, definition.blend == nil,
            layout.buffers.count == 1 && layout.buffers[0].attributes.count == 2 {
             try require(definition.depth != nil,
                         "\(definition.id): the reviewed depth shape carries a depth attachment")
@@ -1689,9 +1748,17 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): one binding per reviewed stream")
         // The reviewed indexed fixture draws six `uint16` indices over the four
         // stream vertices, which is what makes the expectation a covered 2x2
-        // attachment rather than a partially drawn one.
-        try require(definition.vertices == 6,
-                    "\(definition.id): expected the reviewed six-index quad")
+        // attachment rather than a partially drawn one. The reviewed blend
+        // shape (`research/docs/23` §3.3, v40) is the exception: its one
+        // oversize triangle is drawn through three indices over the three
+        // vertices its stream carries.
+        if definition.blend != nil {
+            try require(definition.vertices == 3,
+                        "\(definition.id): the reviewed blend draw is the three-index triangle")
+        } else {
+            try require(definition.vertices == 6,
+                        "\(definition.id): expected the reviewed six-index quad")
+        }
         var resolved = [ValidatedVertexStream]()
         for (binding, buffer) in bindings.enumerated() {
             try require(buffer.view > 0 && buffer.allocation > 0,
@@ -2635,6 +2702,27 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         pipelineDescriptor.colorAttachments[index].pixelFormat =
             fixture.attachments[index].pixelFormat
     }
+    // A pass that states blend state states it here, on its pipeline's colour
+    // attachment (`research/docs/23` §3.3, v40): Metal keeps the factors and
+    // the operation in the pipeline descriptor rather than on the encoder,
+    // exactly as `render.rs::metal_blend_factor` / `metal_blend_operation`
+    // state them on `MTLRenderPipelineColorAttachmentDescriptor`. The
+    // validation above admitted exactly one state — one colour attachment
+    // blending source alpha against one-minus-source-alpha with an add — so
+    // the reviewed state below is that shape by construction, and every pre-v40
+    // case leaves blending at Metal's own default (off).
+    if definition.blend != nil {
+        guard let color = pipelineDescriptor.colorAttachments[0] else {
+            throw OracleError("\(definition.id): cannot reach the blended colour attachment")
+        }
+        color.isBlendingEnabled = true
+        color.rgbBlendOperation = .add
+        color.alphaBlendOperation = .add
+        color.sourceRGBBlendFactor = .sourceAlpha
+        color.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        color.sourceAlphaBlendFactor = .sourceAlpha
+        color.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    }
     // A pass that opens a depth attachment compiles its pipeline against that
     // attachment's format; every pre-v36 case declares none
     // (`research/docs/23` §3.3, v36).
@@ -2898,6 +2986,7 @@ private func renderSelfTest() throws -> CaseResult {
         depth: nil,
         depth_test: nil,
         cull: nil,
+        blend: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
@@ -2962,6 +3051,7 @@ private func presentSelfTest() throws -> CaseResult {
         depth: nil,
         depth_test: nil,
         cull: nil,
+        blend: nil,
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
         capture_rails: ["native-metal"])
@@ -3050,6 +3140,7 @@ private func vertexSelfTest() throws -> CaseResult {
         depth: nil,
         depth_test: nil,
         cull: nil,
+        blend: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
@@ -3142,6 +3233,7 @@ private func mrtSelfTest() throws -> CaseResult {
         depth: nil,
         depth_test: nil,
         cull: nil,
+        blend: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])

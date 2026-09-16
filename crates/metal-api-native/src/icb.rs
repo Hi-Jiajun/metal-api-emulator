@@ -308,6 +308,7 @@ mod tests {
 
     fn render_pass() -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,

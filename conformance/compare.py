@@ -656,6 +656,12 @@ def _vertex_input_declaration(case, where):
     # is checked first, so a case that declares both is refused by the cull
     # rule rather than silently read as the depth fixture
     # (`research/docs/23` §3.3, v39).
+    # The three reviewed pair shapes are mutually exclusive, and the blending
+    # one is checked first so a case that declares more than one is refused by
+    # the shape it claims rather than read as another fixture
+    # (`research/docs/23` §3.3, v40).
+    if case.get("blend") is not None:
+        return _blend_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("cull") is not None:
         return _cull_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("depth") is not None:
@@ -809,6 +815,73 @@ def _instanced_declaration(case, streams, vertex_buffers, indices, where):
                  f"{where}: index {position // width} names vertex {index} outside the quad")
     return {"vertices": quad_vertices, "indices": quad_indices, "instanced": True,
             "tints": tints}
+
+
+def _blend_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed blend shape (`research/docs/23` §3.3, v40).
+
+    The same reviewed pair module the depth and culling fixtures compile: one
+    stream whose vertices carry a `float32x3` position at offset 0 and a
+    `float32x4` tint at offset 16 (stride thirty-two), this time as one oversize
+    triangle whose tint is `(64/255, 128/255, 192/255, 128/255)`. With the
+    reviewed blend state — source alpha against one-minus-source-alpha, added —
+    over a cleared-to-zero attachment the stored texel is `20406040`: a rail
+    that ignored the state would store the tint itself, and one that swapped the
+    factors would store the clear colour.
+    """
+    stride = 32
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == stride,
+             f"{where}: the reviewed blend stream has stride {stride}")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 2, f"{where}: the reviewed blend stream has two attributes")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x3"),
+             f"{where}: the reviewed blend position is location 0, offset 0, float32x3")
+    _object(attributes[1], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[1]")
+    _require((attributes[1]["location"], attributes[1]["offset"], attributes[1]["format"])
+             == (1, 16, "float32x4"),
+             f"{where}: the reviewed blend tint is location 1, offset 16, float32x4")
+    _require(case.get("depth") is None and case.get("cull") is None,
+             f"{where}: the reviewed blend shape carries neither a depth attachment nor a "
+             "culling state")
+    blend = case.get("blend")
+    _require(isinstance(blend, list), f"{where}: the blend state is a list")
+    _require(len(blend) == 1, f"{where}: the reviewed blend shape states one attachment")
+    attachment = blend[0]
+    _require(isinstance(attachment, dict), f"{where}.blend[0]: expected an object")
+    _require(set(attachment) == {"source_rgb", "destination_rgb", "source_alpha",
+                                 "destination_alpha", "operation"},
+             f"{where}.blend[0]: expected the five blend fields")
+    _require((attachment["source_rgb"], attachment["destination_rgb"],
+              attachment["source_alpha"], attachment["destination_alpha"],
+              attachment["operation"])
+             == ("source_alpha", "one_minus_source_alpha", "source_alpha",
+                 "one_minus_source_alpha", "add"),
+             f"{where}: the reviewed blend state is source alpha against "
+             "one-minus-source-alpha with an add")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed blend shape binds one stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require(binding["length"] == stride * 3,
+             f"{where}: the reviewed blend stream is three stride-{stride} vertices")
+    _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
+             == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    _require(indices is not None, f"{where}: the reviewed blend shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["initial_hex"] == "000001000200",
+             f"{where}: the reviewed blend indices are the reviewed triangle")
+    return {"vertices": 3, "indices": 3}
 
 
 def _cull_declaration(case, streams, vertex_buffers, indices, where):
@@ -1047,7 +1120,7 @@ def _render_plan(plan, suite):
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
-                               "depth", "depth_test", "coverage", "cull"})
+                               "depth", "depth_test", "coverage", "cull", "blend"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case

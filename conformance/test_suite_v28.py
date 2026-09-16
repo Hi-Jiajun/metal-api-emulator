@@ -33,6 +33,7 @@ BASE_VERTEX_ID = "base_vertex_quad_4x4"
 DEPTH_ID = "depth_pair_4x4"
 ALIGNMENT_ID = "top_half_quad_4x4"
 CULL_ID = "cull_back_half_quad_4x4"
+BLEND_ID = "blend_alpha_quad_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -99,6 +100,13 @@ ALIGNMENT_RAILS = ALL_RAILS
 # the later red-to-green order instead — the copies are ordered so the ignored
 # state lands the other tint.
 CULL_EXPECTED = INSTANCE_TINTS[1] * 16
+# The v40 fixture: one oversize triangle whose tint carries alpha 128/255,
+# blended over a cleared-to-zero attachment with source-alpha against
+# one-minus-source-alpha. The stored texel is (32, 64, 96, 64) = `20406040`;
+# a rail that ignored the blend state would store the tint's own bytes
+# (`4080c080`).
+BLEND_EXPECTED = "20406040" * 16
+BLEND_RAILS = TRACE_RAILS
 CULL_RAILS = TRACE_RAILS
 
 
@@ -201,6 +209,19 @@ def cull_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
+def blend_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": BLEND_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": BLEND_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": BLEND_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
 def counted_declaring(suite, digest, rail):
     report = synthetic_report(suite, digest, rail)
     if rail != "native-metal":
@@ -273,6 +294,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
                 report["results"].append(cull_result(rail != "native-metal"))
+            if rail in BLEND_RAILS:
+                report["results"].append(blend_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -296,6 +319,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
                 report["results"].append(cull_result(rail != "native-metal"))
+            if rail in BLEND_RAILS:
+                report["results"].append(blend_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -321,6 +346,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
                 report["results"].append(cull_result(rail != "native-metal"))
+            if rail in BLEND_RAILS:
+                report["results"].append(blend_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -357,6 +384,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
+        report["results"].append(blend_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -470,6 +498,36 @@ class ScissorObservationTests(unittest.TestCase):
                          [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
                            bytes.fromhex(CULL_EXPECTED))])
 
+    def test_v28_pins_the_blend_fixture(self):
+        case = self.suite["render_cases"][7]
+        self.assertEqual(case["id"], BLEND_ID)
+        self.assertEqual(case["blend"][0]["source_rgb"], "source_alpha")
+        self.assertEqual(case["blend"][0]["destination_rgb"], "one_minus_source_alpha")
+        self.assertEqual(case["attachment"]["clear_hex"], "00000000")
+        self.assertEqual(case["expected_hex"], BLEND_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(BLEND_RAILS))
+
+    def test_v28_plans_the_blend_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[BLEND_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(BLEND_EXPECTED))])
+
+    def test_v28_refuses_a_blend_state_that_is_not_the_reviewed_one(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][7]["blend"][0]["destination_rgb"] = "one"
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed blend state is source alpha against"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_blend_case_that_also_culls(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][7]["cull"] = {"mode": "back", "winding": "counter_clockwise"}
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "carries neither a depth attachment nor a culling state"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
     def test_v28_refuses_a_cull_state_that_is_not_the_reviewed_one(self):
         broken = copy.deepcopy(self.suite)
         broken["render_cases"][6]["cull"]["winding"] = "clockwise"
@@ -547,6 +605,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
+        report["results"].append(blend_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -576,6 +635,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
                 report["results"].append(cull_result(rail != "native-metal"))
+            if rail in BLEND_RAILS:
+                report["results"].append(blend_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):

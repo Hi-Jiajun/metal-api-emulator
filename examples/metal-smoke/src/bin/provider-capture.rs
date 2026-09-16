@@ -4,19 +4,20 @@ use metal_api_core::provider::queue_priorities_for_device;
 #[cfg(unix)]
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
-    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
-    BufferView, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
-    CompletionPolicy, ComputePass, ComputeTrace, CullMode, DepthFormat, DepthLoadOp, DepthTest,
-    DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId,
-    HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
-    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest,
-    ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
+    BlendOperation, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction,
+    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
+    CullMode, DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind,
+    DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
+    IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor,
+    IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode,
+    PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode, StoreOp, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -991,6 +992,16 @@ fn register_render_pipeline(
             (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
             reviewed_depth_layout(),
         ),
+        // The blend shape compiles the same reviewed pair module: the tint's
+        // alpha is what the blend state scales, and the oversize triangle
+        // covers the attachment so the stored texels are the blend's own
+        // result (`research/docs/23` §3.3, v40).
+        RenderGeometry::BlendTriangle => (
+            (DEPTH_VERTEX_ENTRY, DEPTH_FRAGMENT_ENTRY),
+            (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+            (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
+            reviewed_depth_layout(),
+        ),
         // The cull shape compiles the same reviewed pair module: the positions
         // and tints are the reviewed ones, and the culling state is what picks
         // which triangle survives (`research/docs/23` §3.3, v39).
@@ -1223,6 +1234,11 @@ struct RenderCase {
     /// or absent for "keep every triangle".
     #[serde(default)]
     cull: Option<CullDefinition>,
+    /// The blend state the pass draws with (`research/docs/23` §3.3, v40), one
+    /// entry per colour attachment in location order, or absent for "write the
+    /// fragment output".
+    #[serde(default)]
+    blend: Option<Vec<BlendAttachmentDefinition>>,
     /// The coverage claim (`research/docs/23` §3.3, v38): `"partial"` says the
     /// draw covers only part of the attachment, so the expectation mixes the
     /// fragment output with the colour the pass started from. Absent means the
@@ -1241,6 +1257,17 @@ struct RenderCase {
 /// every pre-v31 fixture means.
 fn default_instance_count() -> u64 {
     1
+}
+
+/// One colour attachment's blend state (`research/docs/23` §3.3, v40).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlendAttachmentDefinition {
+    source_rgb: String,
+    destination_rgb: String,
+    source_alpha: String,
+    destination_alpha: String,
+    operation: String,
 }
 
 /// The culling state a render case draws with (`research/docs/23` §3.3, v39).
@@ -2324,6 +2351,10 @@ enum RenderGeometry {
     /// module over two oversize triangles at one z whose vertex orders are
     /// opposite, so the pass's cull state decides which tint survives.
     CullPair,
+    /// The reviewed blend triangle (`research/docs/23` §3.3, v40): the pair
+    /// module over one oversize triangle whose tint carries an alpha below one,
+    /// so the pass's blend state is what the attachment's bytes measure.
+    BlendTriangle,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -2581,6 +2612,15 @@ fn reviewed_depth_stream_hex() -> String {
     expected
 }
 
+/// The reviewed blend fixture (`research/docs/23` §3.3, v40): one oversize
+/// triangle whose tint is `(64/255, 128/255, 192/255, 128/255)`. With the
+/// reviewed blend state — source alpha against one-minus-source-alpha — over a
+/// cleared-to-zero attachment, the stored texel is
+/// `(32, 64, 96, 64)`, and none of those four values sits on a half-integer
+/// UNORM tie (`research/docs/23` §3.5): the four products are 32.125, 64.25,
+/// 96.376 and 64.25 before rounding.
+const BLEND_PAIR_TINT_HEX: &str = "8180803e8180003fc1c0403f8180003f";
+
 /// The reviewed cull stream (`research/docs/23` §3.3, v39): the same oversize
 /// triangle twice, at one depth. The first copy's vertex order is clockwise in
 /// framebuffer coordinates and the second copy's is its reverse, so a pass that
@@ -2694,6 +2734,109 @@ fn reviewed_cull_geometry(
         );
     }
     Ok(RenderGeometry::CullPair)
+}
+
+/// Pin the reviewed blend shape (`research/docs/23` §3.3, v40).
+///
+/// The layout and module are the reviewed pair's; the shape adds one oversize
+/// triangle whose tint is the reviewed four bytes, the reviewed blend state, a
+/// cleared-to-zero attachment and the expectation those two imply. The state is
+/// what the bytes measure: a rail that ignored it would store the tint itself
+/// (`4080c080`), and one that swapped the factors would store the clear colour.
+fn reviewed_blend_geometry(
+    case: &RenderCase,
+    layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    let stride = DEPTH_STRIDE;
+    let stream = &layout.buffers[0];
+    if layout.buffers.len() != 1
+        || stream.stride != stride
+        || stream.step != "per_vertex"
+        || stream.attributes.len() != 2
+    {
+        return Err(format!(
+            "{where_}: the reviewed blend stream is one stride-{stride} stream with two attributes"
+        )
+        .into());
+    }
+    let position = &stream.attributes[0];
+    if position.location != 0 || position.offset != 0 || position.format != "float32x3" {
+        return Err(format!(
+            "{where_}: the reviewed blend position is location 0, offset 0, float32x3"
+        )
+        .into());
+    }
+    let tint = &stream.attributes[1];
+    if tint.location != 1 || tint.offset != 16 || tint.format != "float32x4" {
+        return Err(format!(
+            "{where_}: the reviewed blend tint is location 1, offset 16, float32x4"
+        )
+        .into());
+    }
+    if case.depth.is_some() || case.cull.is_some() {
+        return Err(format!(
+            "{where_}: the reviewed blend shape carries neither a depth attachment nor a culling state"
+        )
+        .into());
+    }
+    let Some(blend) = &case.blend else {
+        return Err(format!("{where_}: the reviewed blend shape carries a blend state").into());
+    };
+    let [attachment] = blend.as_slice() else {
+        return Err(format!("{where_}: the reviewed blend shape states one attachment").into());
+    };
+    if (
+        attachment.source_rgb.as_str(),
+        attachment.destination_rgb.as_str(),
+        attachment.source_alpha.as_str(),
+        attachment.destination_alpha.as_str(),
+        attachment.operation.as_str(),
+    ) != (
+        "source_alpha",
+        "one_minus_source_alpha",
+        "source_alpha",
+        "one_minus_source_alpha",
+        "add",
+    ) {
+        return Err(format!(
+            "{where_}: the reviewed blend state is source alpha against one-minus-source-alpha with an add"
+        )
+        .into());
+    }
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the reviewed blend shape binds one stream").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    if buffer.length != stride * 3 {
+        return Err(format!(
+            "{where_}: the reviewed blend stream is three stride-{stride} vertices"
+        )
+        .into());
+    }
+    // One oversize triangle: the reviewed position bytes followed by the
+    // reviewed tint, with the alignment padding the layout declares.
+    let mut expected = String::new();
+    for position in &CULL_PAIR_POSITIONS_HEX[..3] {
+        expected.push_str(position);
+        expected.push_str("00000000");
+        expected.push_str(BLEND_PAIR_TINT_HEX);
+    }
+    if buffer.initial_hex != expected {
+        return Err(format!("{where_}: the reviewed blend stream is the reviewed triangle").into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed blend shape is indexed").into());
+    };
+    if indices.initial_hex != "000001000200" {
+        return Err(
+            format!("{where_}: the reviewed blend indices are the reviewed triangle").into(),
+        );
+    }
+    Ok(RenderGeometry::BlendTriangle)
 }
 
 /// Pin the reviewed depth shape (`research/docs/23` §3.3, v36).
@@ -2933,6 +3076,9 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     // is checked first so a case that declares both is classified as the cull
     // shape and refused by its own rule (`research/docs/23` §3.3, v39); the
     // depth shape is the one that opens a depth attachment.
+    if case.blend.is_some() {
+        return reviewed_blend_geometry(case, layout, where_);
+    }
     if case.cull.is_some() {
         return reviewed_cull_geometry(case, layout, where_);
     }
@@ -3127,6 +3273,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::BlendTriangle => {
+            if case.vertices != 3 {
+                return Err(
+                    format!("{where_}: the reviewed blend triangle draws three indices").into(),
+                );
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a blend case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::CullPair => {
             if case.vertices != 6 {
                 return Err(format!("{where_}: the reviewed cull pair draws six indices").into());
@@ -3214,6 +3373,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         RenderGeometry::BaseVertexQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
         RenderGeometry::DepthPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::CullPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+        RenderGeometry::BlendTriangle => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -4903,6 +5063,48 @@ fn case_cull(case: &RenderCase) -> Result<Option<RenderPassCull>> {
     Ok(Some(RenderPassCull { mode, winding }))
 }
 
+/// The blend state one render case declares (`research/docs/23` §3.3, v40).
+fn case_blend(case: &RenderCase) -> Result<Option<RenderPassBlend>> {
+    let Some(definitions) = &case.blend else {
+        return Ok(None);
+    };
+    let mut attachments = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let factor = |name: &str| -> Result<BlendFactor> {
+            Ok(match name {
+                "zero" => BlendFactor::Zero,
+                "one" => BlendFactor::One,
+                "source_alpha" => BlendFactor::SourceAlpha,
+                "one_minus_source_alpha" => BlendFactor::OneMinusSourceAlpha,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported blend factor {other:?}",
+                        case.id
+                    )
+                    .into())
+                }
+            })
+        };
+        attachments.push(BlendAttachment {
+            source_rgb: factor(&definition.source_rgb)?,
+            destination_rgb: factor(&definition.destination_rgb)?,
+            source_alpha: factor(&definition.source_alpha)?,
+            destination_alpha: factor(&definition.destination_alpha)?,
+            operation: match definition.operation.as_str() {
+                "add" => BlendOperation::Add,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported blend operation {other:?}",
+                        case.id
+                    )
+                    .into())
+                }
+            },
+        });
+    }
+    Ok(Some(RenderPassBlend { attachments }))
+}
+
 /// The depth attachment and depth state one render case declares
 /// (`research/docs/23` §3.3, v36).
 ///
@@ -4992,6 +5194,7 @@ fn run_render_case(
     let attachments = render_attachment_shapes(case)?;
     let (depth_attachment, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
     let cull = case_cull(case)?;
+    let blend = case_blend(case)?;
     // The declaring pass's own resource table: one backing image and one
     // `AllocationRecord` per allocation (`docs/23` §4.1).
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -5198,6 +5401,7 @@ fn run_render_case(
         // it absent, which the rails execute as "keep every triangle"
         // (`research/docs/23` §3.3, v39).
         cull,
+        blend,
         present,
     }));
 

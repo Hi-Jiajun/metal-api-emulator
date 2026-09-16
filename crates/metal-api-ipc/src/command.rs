@@ -1415,18 +1415,19 @@ mod tests {
         MAX_SUPPORTED_PRESENT_MODES, MAX_TAGGED_TRACE_PASSES,
     };
     use metal_api_core::provider::{
-        AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess,
-        BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
-        CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
-        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DeviceEpoch,
-        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor,
-        HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
-        IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-        IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-        LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
-        PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-        ProviderSubmission, QueuePriority, RenderAttachment, RenderPassCull, RenderPassDescriptor,
+        AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment,
+        BlendFactor, BlendOperation, BufferAccess, BufferBindingContract, BufferLease,
+        BufferSource, BufferView, BufferWriteback, ClearColor, CompiledComputePipeline,
+        CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputePass,
+        ComputeProvider, ComputeTrace, CullMode, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+        FootprintProof, FunctionIdentity, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
+        HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+        IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
+        IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
+        OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
+        PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+        RenderAttachment, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
         RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
         StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
         TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
@@ -1584,6 +1585,7 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -2218,13 +2220,14 @@ mod tests {
             "an offscreen pass carries no present bit"
         );
 
-        // An unknown feature bit is a decoder refusal rather than a section the
-        // decoder silently skips.
+        // The feature byte is full as of v40, so the fail-closed probe is an
+        // unknown *pass tag*: a decoder refuses the frame instead of reading
+        // the payload as one of the kinds it knows.
         let mut patched = frame.clone();
-        patched[extended[0] + 1] |= 0x80;
+        patched[extended[0]] = 0x7f;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x81
+            Err(CodecError::UnknownPassTag(0x7f))
         ));
     }
 
@@ -2349,12 +2352,13 @@ mod tests {
             "a single-instance pass carries no instancing bit"
         );
 
-        // An unknown feature bit stays a decoder refusal.
+        // The feature byte is full as of v40, so an unknown pass tag is the
+        // fail-closed probe this fixture keeps.
         let mut patched = frame.clone();
-        patched[extended_index + 1] |= 0x80;
+        patched[extended_index] = 0x7e;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x89
+            Err(CodecError::UnknownPassTag(0x7e))
         ));
     }
 
@@ -2411,12 +2415,13 @@ mod tests {
             .expect("the plain pass keeps the vertex-only feature byte");
         assert_eq!(plain_frame[tag + 1] & 0x10, 0x00, "no base-vertex bit");
 
-        // An unknown feature bit stays a decoder refusal.
+        // The feature byte is full as of v40, so an unknown pass tag is the
+        // fail-closed probe this fixture keeps.
         let mut patched = frame.clone();
-        patched[tag + 1] |= 0x80;
+        patched[tag] = 0x7d;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x91
+            Err(CodecError::UnknownPassTag(0x7d))
         ));
     }
 
@@ -2472,6 +2477,52 @@ mod tests {
         // them. An unknown *feature* bit stays a decoder refusal, which the
         // base-vertex fixture pins for the same kind of section.
         let _ = tag;
+    }
+
+    /// A render trace whose pass blends its single attachment with the
+    /// reviewed factors (`research/docs/23` §3.3, v40).
+    fn blend_trace() -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![BlendAttachment {
+                source_rgb: BlendFactor::SourceAlpha,
+                destination_rgb: BlendFactor::OneMinusSourceAlpha,
+                source_alpha: BlendFactor::SourceAlpha,
+                destination_alpha: BlendFactor::OneMinusSourceAlpha,
+                operation: BlendOperation::Add,
+            }],
+        });
+        trace
+    }
+
+    #[test]
+    fn a_blend_pass_carries_its_own_feature_bit_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: blend_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert!(
+            frame.windows(2).any(|pair| pair == [0x10, 0x81]),
+            "the blending pass carries the vertex-input and blend bits"
+        );
+
+        // A pass that blends nothing keeps the pre-v40 bytes.
+        let plain = vertex_input_trace();
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(
+            plain_frame.windows(2).any(|pair| pair == [0x10, 0x01]),
+            "the plain pass keeps the vertex-only feature byte"
+        );
+        assert!(!plain_frame.windows(2).any(|pair| pair == [0x10, 0x81]));
     }
 
     #[test]

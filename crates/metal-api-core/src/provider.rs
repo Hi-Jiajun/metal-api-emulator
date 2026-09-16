@@ -1789,6 +1789,101 @@ pub struct DepthTest {
     pub write: bool,
 }
 
+/// The blend factors this increment admits (`research/docs/23` §3.3, v40).
+///
+/// Four values, because they are the ones the reviewed fixture needs and the
+/// ones both rails name identically: Metal's `MTLBlendFactor` and Vulkan's
+/// `VkBlendFactor` agree on all of them. The list stays closed so admitting a
+/// fifth is a deliberate wire-visible change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SourceAlpha,
+    OneMinusSourceAlpha,
+}
+
+impl BlendFactor {
+    pub const ADMITTED: [Self; 4] = [
+        Self::Zero,
+        Self::One,
+        Self::SourceAlpha,
+        Self::OneMinusSourceAlpha,
+    ];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::SourceAlpha => 2,
+            Self::OneMinusSourceAlpha => 3,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Zero),
+            1 => Some(Self::One),
+            2 => Some(Self::SourceAlpha),
+            3 => Some(Self::OneMinusSourceAlpha),
+            _ => None,
+        }
+    }
+}
+
+/// The blend operation this increment admits. One value: the reviewed fixture
+/// adds, and every other operation needs its own parity evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlendOperation {
+    Add,
+}
+
+impl BlendOperation {
+    pub const ADMITTED: [Self; 1] = [Self::Add];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Add => 0,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Add),
+            _ => None,
+        }
+    }
+}
+
+/// One colour attachment's blend state (`research/docs/23` §3.3, v40).
+///
+/// The four factors are stated separately for the colour and alpha channels,
+/// exactly as Metal's `MTLRenderPipelineColorAttachmentDescriptor` and Vulkan's
+/// `VkPipelineColorBlendAttachmentState` do; the operation is shared, because
+/// the increment admits one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlendAttachment {
+    pub source_rgb: BlendFactor,
+    pub destination_rgb: BlendFactor,
+    pub source_alpha: BlendFactor,
+    pub destination_alpha: BlendFactor,
+    pub operation: BlendOperation,
+}
+
+/// The blend state a pass's draw runs with (`research/docs/23` §3.3, v40).
+///
+/// One entry per colour attachment, in location order, so a multi-target pass
+/// states each target's own blend the way both APIs index it. The state is the
+/// *pipeline's* in both APIs — Metal puts it on the colour attachment
+/// descriptor of the pipeline, Vulkan on the pipeline's blend state — which is
+/// why it hangs off the pass here: both rails build their pipeline from the
+/// pass's own plan, so one description serves them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderPassBlend {
+    /// One entry per colour attachment, in location order.
+    pub attachments: Vec<BlendAttachment>,
+}
+
 /// Which triangles a pass discards (`research/docs/23` §3.3, v39).
 ///
 /// Metal's `MTLCullMode` and Vulkan's `VkCullModeFlags` reduced to the one
@@ -1972,6 +2067,10 @@ pub struct RenderPassDescriptor {
     /// triangle" — the shape every earlier increment published
     /// (`research/docs/23` §3.3, v39).
     pub cull: Option<RenderPassCull>,
+    /// The blend state the pass's draw runs with, or `None` for "write the
+    /// fragment output" — the shape every earlier increment published
+    /// (`research/docs/23` §3.3, v40).
+    pub blend: Option<RenderPassBlend>,
     /// The depth attachment this pass opens, or `None` for a pass with no
     /// depth surface at all (`research/docs/23` §3.3, v36). When present,
     /// [`Self::depth_test`] says what the fragments do with it.
@@ -2121,6 +2220,17 @@ impl RenderPassDescriptor {
                 return Err(ContractError::DepthExtentMismatch {
                     viewport: [width, height],
                     depth: [depth.width, depth.height],
+                });
+            }
+        }
+        // The blend state is indexed by colour location: one entry per
+        // attachment and no more, so a pass cannot state a target's blend for a
+        // location it does not render to (`research/docs/23` §3.3, v40).
+        if let Some(blend) = &self.blend {
+            if blend.attachments.len() != self.color_attachments.len() {
+                return Err(ContractError::BlendAttachmentCountMismatch {
+                    blend: blend.attachments.len(),
+                    attachments: self.color_attachments.len(),
                 });
             }
         }
@@ -6134,7 +6244,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::BaseVertexRequiresIndices { .. }
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
-        | E::DepthTestWithoutAttachment => {
+        | E::DepthTestWithoutAttachment
+        | E::BlendAttachmentCountMismatch { .. } => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
         // Presentation contract, Step 1. The three first-increment narrowings
@@ -7574,6 +7685,12 @@ pub enum ContractError {
     /// The pass declares depth state but carries no depth attachment
     /// (`research/docs/23` §3.3, v36).
     DepthTestWithoutAttachment,
+    /// The pass's blend list does not carry one entry per colour attachment
+    /// (`research/docs/23` §3.3, v40).
+    BlendAttachmentCountMismatch {
+        blend: usize,
+        attachments: usize,
+    },
     ViewportExtentMismatch {
         viewport: [u32; 2],
         attachment: [u64; 2],
@@ -8085,6 +8202,13 @@ impl fmt::Display for ContractError {
             Self::DepthTestWithoutAttachment => write!(
                 formatter,
                 "a depth test needs a depth attachment: there is nothing to test against"
+            ),
+            Self::BlendAttachmentCountMismatch {
+                blend,
+                attachments,
+            } => write!(
+                formatter,
+                "the blend list carries {blend} entries for {attachments} colour attachments"
             ),
             Self::ViewportExtentMismatch {
                 viewport,
@@ -9354,6 +9478,7 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -12599,6 +12724,7 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -13331,6 +13457,7 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,

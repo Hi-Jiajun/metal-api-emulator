@@ -584,6 +584,84 @@
         "vulkan",
         "native-metal-provider"
       ]
+    },
+    {
+      "id": "blend_alpha_quad_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_depth_pair_vertex",
+      "fragment_entry": "render_depth_pair_tint",
+      "metal": {
+        "path": "shaders/depth_pair_4x4.metal",
+        "sha256": "726b6fe282e3ad91f5e4df826ed709dafd53d8a8beac06087490e54656720271"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 32,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x3"
+              },
+              {
+                "location": 1,
+                "offset": 16,
+                "format": "float32x4"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1600,
+          "view": 1610,
+          "offset": 0,
+          "length": 96,
+          "initial_hex": "000080bf000080bf0000003f000000008180803e8180003fc1c0403f8180003f00004040000080bf0000003f000000008180803e8180003fc1c0403f8180003f000080bf000040400000003f000000008180803e8180003fc1c0403f8180003f"
+        }
+      ],
+      "indices": {
+        "allocation": 1620,
+        "view": 1630,
+        "offset": 0,
+        "length": 6,
+        "initial_hex": "000001000200",
+        "format": "uint16"
+      },
+      "vertices": 3,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "blend": [
+        {
+          "source_rgb": "source_alpha",
+          "destination_rgb": "one_minus_source_alpha",
+          "source_alpha": "source_alpha",
+          "destination_alpha": "one_minus_source_alpha",
+          "operation": "add"
+        }
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "00000000",
+        "store": "store"
+      },
+      "expected_hex": "20406040204060402040604020406040204060402040604020406040204060402040604020406040204060402040604020406040204060402040604020406040",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider"
+      ]
     }
   ]
 }

@@ -11,22 +11,23 @@ use crate::codec::CodecError;
 use crate::command::{CommandRequest, CommandResponse};
 use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
-    AttachmentFormat, BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView,
-    BufferWriteback, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
-    CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode,
-    DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
-    FieldValue, FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId,
-    HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
-    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-    RenderDepthAttachment, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
-    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    Winding, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    AttachmentFormat, BlendAttachment, BlendFactor, BlendOperation, BufferAccess,
+    BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
+    CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode, DepthFormat,
+    DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
+    FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId, HeapPayload,
+    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
+    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment, RenderPassBlend,
+    RenderPassCull, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -146,6 +147,16 @@ const RENDER_FEATURE_INSTANCING: u8 = 0x08;
 /// exactly what they were, and the decoder reads the missing section as the
 /// zero offset the older frames meant.
 const RENDER_FEATURE_BASE_VERTEX: u8 = 0x10;
+/// The blend state (`research/docs/23` §3.3, v40): one `(source rgb, destination
+/// rgb, source alpha, destination alpha, operation)` block per colour
+/// attachment, appended after every earlier optional section. A pass that
+/// blends nothing — every shape published before v40 — never sets the bit, so
+/// its bytes stay exactly what they were.
+///
+/// This is the feature byte's last free bit: a later optional section needs
+/// either a second feature byte or a tag of its own, and this comment is where
+/// that decision has to be made.
+const RENDER_FEATURE_BLEND: u8 = 0x80;
 /// The culling state (`research/docs/23` §3.3, v39): one mode byte and one
 /// winding byte after every earlier optional section. A pass that culls
 /// nothing — every shape published before v39 — never sets the bit, so its
@@ -164,7 +175,8 @@ const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
     | RENDER_FEATURE_INSTANCING
     | RENDER_FEATURE_BASE_VERTEX
     | RENDER_FEATURE_DEPTH
-    | RENDER_FEATURE_CULL;
+    | RENDER_FEATURE_CULL
+    | RENDER_FEATURE_BLEND;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1937,12 +1949,14 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // v39): only a pass that culls something takes the extended
                 // kind and appends its state.
                 let has_cull = pass.cull.is_some();
+                let has_blend = pass.blend.is_some();
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
                     || has_base_vertex
                     || has_depth
                     || has_cull
+                    || has_blend
                 {
                     encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
@@ -1967,6 +1981,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if has_cull {
                         features |= RENDER_FEATURE_CULL;
+                    }
+                    if has_blend {
+                        features |= RENDER_FEATURE_BLEND;
                     }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
@@ -1993,6 +2010,16 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if let Some(cull) = &pass.cull {
                         encoder.u8(cull.mode.code());
                         encoder.u8(cull.winding.code());
+                    }
+                    if let Some(blend) = &pass.blend {
+                        encoder.u64(blend.attachments.len() as u64);
+                        for attachment in &blend.attachments {
+                            encoder.u8(attachment.source_rgb.code());
+                            encoder.u8(attachment.destination_rgb.code());
+                            encoder.u8(attachment.source_alpha.code());
+                            encoder.u8(attachment.destination_alpha.code());
+                            encoder.u8(attachment.operation.code());
+                        }
                     }
                     continue;
                 }
@@ -2359,9 +2386,14 @@ fn get_trace_tagged(
             // decoder refusal, so a future section cannot be skipped silently.
             PASS_KIND_RENDER_EXT => {
                 let features = decoder.u8()?;
-                if features & !RENDER_FEATURE_KNOWN != 0 {
-                    return Err(CodecError::UnknownRenderFeature(features));
-                }
+                // As of v40 every bit of the feature byte is known, so there is
+                // no unknown bit left for a decoder to refuse: the next
+                // optional section needs a second byte or a tag of its own, and
+                // the *tag* refusals (`UnknownPassTag`) are what keep a frame
+                // this decoder predates from being read as one it knows.
+                // `RENDER_FEATURE_KNOWN` stays as the record of the byte's
+                // contents for that decision.
+                let _ = RENDER_FEATURE_KNOWN;
                 let mut pass = get_render_pass(decoder, false)?;
                 if features & RENDER_FEATURE_VERTEX_INPUT != 0 {
                     get_vertex_input(decoder, &mut pass)?;
@@ -2387,6 +2419,61 @@ fn get_trace_tagged(
                     let (depth, test) = get_depth_block(decoder)?;
                     pass.depth = Some(depth);
                     pass.depth_test = test;
+                }
+                if features & RENDER_FEATURE_BLEND != 0 {
+                    let count = usize::try_from(decoder.u64()?).map_err(|_| {
+                        CodecError::TruncatedPayload {
+                            needed: usize::MAX,
+                            remaining: decoder.remaining(),
+                        }
+                    })?;
+                    if count > MAX_COLOR_ATTACHMENTS {
+                        return Err(CodecError::ColorAttachmentCount {
+                            count,
+                            maximum: MAX_COLOR_ATTACHMENTS,
+                        });
+                    }
+                    let mut attachments = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let source_rgb = BlendFactor::from_code(decoder.u8()?).ok_or(
+                            CodecError::UnknownEnumValue {
+                                field: "blend source rgb factor",
+                                value: 0,
+                            },
+                        )?;
+                        let destination_rgb = BlendFactor::from_code(decoder.u8()?).ok_or(
+                            CodecError::UnknownEnumValue {
+                                field: "blend destination rgb factor",
+                                value: 0,
+                            },
+                        )?;
+                        let source_alpha = BlendFactor::from_code(decoder.u8()?).ok_or(
+                            CodecError::UnknownEnumValue {
+                                field: "blend source alpha factor",
+                                value: 0,
+                            },
+                        )?;
+                        let destination_alpha = BlendFactor::from_code(decoder.u8()?).ok_or(
+                            CodecError::UnknownEnumValue {
+                                field: "blend destination alpha factor",
+                                value: 0,
+                            },
+                        )?;
+                        let operation = BlendOperation::from_code(decoder.u8()?).ok_or(
+                            CodecError::UnknownEnumValue {
+                                field: "blend operation",
+                                value: 0,
+                            },
+                        )?;
+                        attachments.push(BlendAttachment {
+                            source_rgb,
+                            destination_rgb,
+                            source_alpha,
+                            destination_alpha,
+                            operation,
+                        });
+                    }
+                    pass.blend = Some(RenderPassBlend { attachments });
                 }
                 if features & RENDER_FEATURE_CULL != 0 {
                     let mode =
@@ -2485,6 +2572,7 @@ fn get_render_pass(
         None
     };
     Ok(RenderPassDescriptor {
+        blend: None,
         cull: None,
         pipeline,
         color_attachments,
