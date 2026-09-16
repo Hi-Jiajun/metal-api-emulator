@@ -2238,6 +2238,106 @@
         "native-metal-provider-objects"
       ],
       "requires_sample_count": 8
+    },
+    {
+      "id": "msaa_ds_pair_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_depth_pair_vertex",
+      "fragment_entry": "render_depth_pair_tint",
+      "metal": {
+        "path": "shaders/depth_pair_4x4.metal",
+        "sha256": "726b6fe282e3ad91f5e4df826ed709dafd53d8a8beac06087490e54656720271"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 32,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x3"
+              },
+              {
+                "location": 1,
+                "offset": 16,
+                "format": "float32x4"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1300,
+          "view": 1310,
+          "offset": 0,
+          "length": 288,
+          "initial_hex": "0000803e000080bf0000003f000000000000803f00000000000000000000803f0000803e000040400000003f000000000000803f00000000000000000000803f000040c0000080bf0000003f000000000000803f00000000000000000000803f0000803e000080bf6666663f00000000000000000000803f000000000000803f0000803e000040406666663f00000000000000000000803f000000000000803f000040c0000080bf6666663f00000000000000000000803f000000000000803f0000803e000080bfcdcccc3e0000000000000000000000000000803f0000803f0000803e00004040cdcccc3e0000000000000000000000000000803f0000803f000040c0000080bfcdcccc3e0000000000000000000000000000803f0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1320,
+        "view": 1330,
+        "offset": 0,
+        "length": 18,
+        "initial_hex": "000001000200030004000500060007000800",
+        "format": "uint16"
+      },
+      "vertices": 9,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "multisample": {
+        "sample_count": 4
+      },
+      "depth": {
+        "format": "depth32float",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_depth": 1.0
+      },
+      "depth_test": {
+        "compare": "less",
+        "write": true
+      },
+      "stencil": {
+        "format": "stencil8",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_value": 0
+      },
+      "stencil_test": {
+        "compare": "equal",
+        "reference": 0,
+        "read_mask": 255,
+        "write_mask": 255,
+        "fail_op": "keep",
+        "depth_fail_op": "increment_wrap",
+        "pass_op": "keep"
+      },
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223445",
+        "store": "store"
+      },
+      "expected_hex": "ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445ff0000ffff0000ff88111aa211223445",
+      "coverage": "partial",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider"
+      ]
     }
   ]
 }

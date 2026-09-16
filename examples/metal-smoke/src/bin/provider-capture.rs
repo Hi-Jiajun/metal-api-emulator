@@ -3248,6 +3248,58 @@ fn reviewed_depth_resolve_edge_stream_hex() -> String {
     expected
 }
 
+/// The reviewed rail-owned combined depth-stencil pair's stream
+/// (`research/docs/23` §3.3, v66): three copies of the v51 edge triangle —
+/// the half-plane one whose vertical edge sits at `x = 0.25` NDC — at
+/// `z = 0.5` (red), `z = 0.9` (green) and `z = 0.4` (blue). The one shared
+/// coverage is what makes the two faces' tests decide per sample: the first
+/// triangle's depth pass writes depth, the second triangle's depth failure
+/// writes stencil, and the third is tested against it.
+///
+/// The first triangle's tint is the reviewed red, whose channels are all zero
+/// or one: the colour observation's every byte is then either the tint, the
+/// clear, or the exact two-of-four mean of the two — no channel sits on a
+/// rounding tie, which is what keeps the expectation independent of a driver's
+/// UNORM conversion rule.
+const COMBINED_PAIR_POSITIONS_HEX: [&str; 9] = [
+    // The half-plane triangle (0.25, -1), (0.25, 3), (-3, -1) at z = 0.5.
+    "0000803e000080bf0000003f",
+    "0000803e000040400000003f",
+    "000040c0000080bf0000003f",
+    // The same triangle at z = 0.9 (0x3f666666).
+    "0000803e000080bf6666663f",
+    "0000803e000040406666663f",
+    "000040c0000080bf6666663f",
+    // The same triangle at z = 0.4 (0x3ecccccd).
+    "0000803e000080bfcdcccc3e",
+    "0000803e00004040cdcccc3e",
+    "000040c0000080bfcdcccc3e",
+];
+/// The third reviewed tint, as the `float32x4` bytes the stream carries:
+/// `(0, 0, 1, 1)` for the triangle that tests the stencil the second one
+/// wrote. The first two reuse the reviewed depth pair's own red and green.
+const COMBINED_PAIR_BLUE_HEX: &str = "00000000000000000000803f0000803f";
+/// The reviewed combined pair's index buffer: the nine vertices in triangle
+/// order.
+const COMBINED_PAIR_INDICES_HEX: &str = "000001000200030004000500060007000800";
+
+/// The reviewed combined pair's stream, reassembled vertex by vertex: each
+/// vertex is its `float32x3` position at offset 0, the four padding bytes that
+/// align the tint to offset 16, and its triangle's `float32x4` tint there.
+fn reviewed_combined_pair_stream_hex() -> String {
+    let mut expected = String::new();
+    for (vertex, position) in COMBINED_PAIR_POSITIONS_HEX.iter().enumerate() {
+        expected.push_str(position);
+        expected.push_str("00000000");
+        expected.push_str(match vertex / 3 {
+            0 => DEPTH_PAIR_RED_HEX,
+            1 => DEPTH_PAIR_GREEN_HEX,
+            _ => COMBINED_PAIR_BLUE_HEX,
+        });
+    }
+    expected
+}
+
 /// The reviewed blend fixture (`research/docs/23` §3.3, v40): one oversize
 /// triangle whose tint is `(64/255, 128/255, 192/255, 128/255)`. With the
 /// reviewed blend state — source alpha against one-minus-source-alpha — over a
@@ -3491,16 +3543,13 @@ fn reviewed_depth_geometry(
     // The stencil sibling masks with a stencil attachment instead of a depth
     // one (`research/docs/23` §3.3, v47): the same pair stream, one rail-owned
     // `stencil8` surface, and exactly the reviewed state. The two surfaces
-    // combine only through a stencil resolve — the one attachment both resolve
-    // targets name — so a case that declares both without one is refused
-    // rather than classified as either (`research/docs/23` §3.3, v60).
+    // combine through the combined depth-stencil surface — one attachment both
+    // faces share — in either of the two reviewed shapes: the v60 resolve
+    // shape, which states the stencil resolve its stored faces land through,
+    // or the v66 rail-owned write-then-test pair. A case that declares both
+    // with a lopsided store decision is refused rather than classified as
+    // either (`research/docs/23` §3.3, v60/v66).
     if case.stencil.is_some() {
-        if case.depth.is_some() && case.stencil_resolve.is_none() {
-            return Err(format!(
-                "{where_}: the combined depth-stencil shape needs its stencil resolve"
-            )
-            .into());
-        }
         if case.stencil_test.is_none() {
             return Err(
                 format!("{where_}: the reviewed stencil shape carries a stencil test").into(),
@@ -3523,6 +3572,31 @@ fn reviewed_depth_geometry(
         let Some(test) = &case.stencil_test else {
             unreachable!("the presence rule above proved the state is there");
         };
+        // The v66 rail-owned pair's write-then-test state (`research/docs/23`
+        // §3.3, v66) is its own reviewed shape: the equal-zero test keeps the
+        // value on pass and increments-wraps it on depth failure, so the
+        // second triangle's depth failure is what the third triangle then
+        // fails against. It is classified before the single-surface states,
+        // and the rest of its review (stream, indices, both faces' clears and
+        // the shared coverage) lives in `reviewed_combined_pair_geometry`.
+        if case.depth.is_some() && case.stencil_resolve.is_none() {
+            let reviewed_state = test.compare == "equal"
+                && test.reference == 0
+                && test.read_mask == 0xff
+                && test.write_mask == 0xff
+                && test.fail_op == "keep"
+                && test.depth_fail_op == "increment_wrap"
+                && test.pass_op == "keep";
+            if !reviewed_state {
+                return Err(format!(
+                    "{where_}: the rail-owned combined pair's stencil state is the equal-zero \
+                     test that keeps on pass and increments-wraps on depth failure, with both \
+                     masks wide open"
+                )
+                .into());
+            }
+            return reviewed_combined_pair_geometry(case, where_);
+        }
         let reviewed_state = (test.compare == "equal"
             || (test.compare == "always"
                 && case.depth.is_some()
@@ -3787,6 +3861,99 @@ fn reviewed_depth_geometry(
         return Err(
             format!("{where_}: the reviewed depth indices are the two reviewed triangles").into(),
         );
+    }
+    Ok(RenderGeometry::DepthPair)
+}
+
+/// Pin the v66 rail-owned combined depth-stencil pair (`research/docs/23`
+/// §3.3, v66).
+///
+/// The whole review surface is the three oversize triangles with their one
+/// coverage, the two rail-owned faces behind the one combined attachment and
+/// the pair's own clears: the depth face opens from one, the stencil face from
+/// zero, neither states a store action, an identity or an expectation — the
+/// surfaces leave with the pass — and the two tests are the reviewed `less`
+/// test with writes on and the write-then-test stencil state the caller already
+/// pinned. Anything else describes a shape no rail has been reviewed against.
+fn reviewed_combined_pair_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
+    let Some(depth) = &case.depth else {
+        return Err(format!("{where_}: the combined pair opens its depth face").into());
+    };
+    let Some(stencil) = &case.stencil else {
+        return Err(format!("{where_}: the combined pair opens its stencil face").into());
+    };
+    if depth.format != "depth32float"
+        || depth.load != "clear"
+        || depth.clear_depth != Some(DEPTH_CLEAR)
+    {
+        return Err(format!(
+            "{where_}: the combined pair's depth face is a depth32float surface cleared to one"
+        )
+        .into());
+    }
+    if stencil.format != "stencil8" || stencil.load != "clear" || stencil.clear_value != Some(0) {
+        return Err(format!(
+            "{where_}: the combined pair's stencil face is a stencil8 surface cleared to zero"
+        )
+        .into());
+    }
+    if depth.width != 4 || depth.height != 4 || stencil.width != 4 || stencil.height != 4 {
+        return Err(format!("{where_}: the combined pair's faces are 4x4 texels").into());
+    }
+    // Both faces share one surface and both are rail-owned: neither may name a
+    // store action, an identity or a landing (`research/docs/23` §3.3, v66).
+    if depth.store.is_some()
+        || depth.allocation.is_some()
+        || depth.view.is_some()
+        || depth.expected_hex.is_some()
+        || stencil.store.is_some()
+        || stencil.allocation.is_some()
+        || stencil.view.is_some()
+        || stencil.expected_hex.is_some()
+    {
+        return Err(format!(
+            "{where_}: the combined pair's faces are rail-owned and carry no store action, \
+             identity or expectation"
+        )
+        .into());
+    }
+    if case
+        .depth_test
+        .as_ref()
+        .is_none_or(|test| test.compare != "less" || !test.write)
+    {
+        return Err(format!(
+            "{where_}: the combined pair's depth state is a less test with writes on"
+        )
+        .into());
+    }
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the combined pair binds one stream").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    if buffer.length != DEPTH_STRIDE * 9 {
+        return Err(format!(
+            "{where_}: the reviewed combined pair stream is nine stride-{DEPTH_STRIDE} vertices"
+        )
+        .into());
+    }
+    if buffer.initial_hex != reviewed_combined_pair_stream_hex() {
+        return Err(format!(
+            "{where_}: the reviewed combined pair stream is the three reviewed triangles"
+        )
+        .into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed combined pair is indexed").into());
+    };
+    if indices.initial_hex != COMBINED_PAIR_INDICES_HEX {
+        return Err(format!(
+            "{where_}: the reviewed combined pair indices are the three reviewed triangles"
+        )
+        .into());
     }
     Ok(RenderGeometry::DepthPair)
 }
@@ -4214,8 +4381,17 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             }
         }
         RenderGeometry::DepthPair => {
-            if case.vertices != 6 {
-                return Err(format!("{where_}: the reviewed depth pair draws six indices").into());
+            // The reviewed depth, stencil and resolve pairs draw the two
+            // triangles' six indices; the v66 rail-owned combined pair draws
+            // its three triangles' nine (`research/docs/23` §3.3, v66).
+            let combined_pair =
+                case.depth.is_some() && case.stencil.is_some() && case.stencil_resolve.is_none();
+            let reviewed_indices = if combined_pair { 9 } else { 6 };
+            if case.vertices != reviewed_indices {
+                return Err(format!(
+                    "{where_}: the reviewed depth pair draws {reviewed_indices} indices"
+                )
+                .into());
             }
             if case.present.is_some() || case.icb.is_some() {
                 return Err(format!(
@@ -4494,16 +4670,29 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        // The two surfaces stay mutually exclusive until the stencil resolve
-        // admits the combined shape (`research/docs/23` §3.3, v55/v60): a
-        // combined depth-stencil surface is the one texture both resolve
-        // targets name, so a raster that opens both without a stencil resolve
-        // is refused rather than silently narrowed to one of them.
-        if case.depth.is_some() && case.stencil.is_some() && case.stencil_resolve.is_none() {
-            return Err(format!(
-                "{where_}: the multisample raster opens one depth-stencil surface"
-            )
-            .into());
+        // The two surfaces open together as the combined depth-stencil shape
+        // (`research/docs/23` §3.3, v60/v66): one attachment both faces share,
+        // in either of the two reviewed shapes — the v60 resolve shape, whose
+        // two stored faces land through their resolves, or the v66 rail-owned
+        // write-then-test pair. A lopsided pair is refused rather than
+        // silently narrowed to one of the faces.
+        let combined_pair = case.depth.is_some() && case.stencil.is_some();
+        if combined_pair && case.stencil_resolve.is_none() {
+            let depth_stored = case
+                .depth
+                .as_ref()
+                .is_some_and(|depth| depth.store.is_some());
+            let stencil_stored = case
+                .stencil
+                .as_ref()
+                .is_some_and(|stencil| stencil.store.is_some());
+            if depth_stored || stencil_stored {
+                return Err(format!(
+                    "{where_}: the combined depth-stencil pair keeps both faces or neither, \
+                     and a kept face needs its resolve"
+                )
+                .into());
+            }
         }
         // A present action beside the raster is admitted from v62 on: the
         // pass resolves into the attachment view and the present hands that
@@ -4583,7 +4772,19 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                     format!("{where_}: a multisampled depth surface needs its test").into(),
                 );
             }
-            if case.coverage.is_some() {
+            if combined_pair && case.stencil_resolve.is_none() {
+                // The v66 rail-owned pair's whole point is its partially
+                // covered column: the two faces' tests decide per sample, so
+                // the case has to claim the partial coverage its expectation
+                // then shows (`research/docs/23` §3.3, v66).
+                if case.coverage.as_deref() != Some("partial") {
+                    return Err(format!(
+                        "{where_}: the rail-owned combined pair claims the partial coverage it \
+                         resolves"
+                    )
+                    .into());
+                }
+            } else if case.coverage.is_some() {
                 return Err(format!(
                     "{where_}: a multisample pass with a depth surface claims no partial coverage"
                 )
@@ -4919,8 +5120,18 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             // fragment output on every texel, and a mixed
                             // texel would claim a raster the fixture does not
                             // describe (`research/docs/23` §3.3, v61).
-                            if (case.depth.is_some() || case.stencil.is_some())
+                            // The v66 rail-owned combined pair is the exception
+                            // to the masked pair's uniform rule: its three
+                            // triangles share one partial coverage, so the
+                            // mixed column carries the same k-of-`sample_count`
+                            // resolve a partially covered colour-only raster
+                            // does (`research/docs/23` §3.3, v66).
+                            let combined_pair = case.depth.is_some()
+                                && case.stencil.is_some()
+                                && case.stencil_resolve.is_none();
+                            if ((case.depth.is_some() || case.stencil.is_some())
                                 && case.stencil_resolve.is_none()
+                                && !combined_pair)
                                 || (case.depth.is_none()
                                     && case.stencil.is_none()
                                     && case.coverage.as_deref() != Some("partial"))
@@ -8932,6 +9143,14 @@ mod tests {
         let colour_only = object_state_families(&render_case("msaa_edge_4x4"));
         assert_eq!(colour_only, vec!["multisample"]);
         assert!(object_entry_admits(&colour_only));
+
+        // The v66 combined pair declares three families at once, and no object
+        // entry carries both faces beside the raster: the object rails refuse
+        // it by name, which is why its marker names the three trace rails
+        // (`research/docs/23` §3.3, v66).
+        let combined_pair = object_state_families(&render_case("msaa_ds_pair_4x4"));
+        assert_eq!(combined_pair, vec!["multisample", "depth", "stencil"]);
+        assert!(!object_entry_admits(&combined_pair));
 
         // The v54 review's worst case: a raster plus a vertex offset. No entry
         // carries both, so the object rail refuses it by name instead of

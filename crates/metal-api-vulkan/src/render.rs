@@ -929,10 +929,12 @@ fn prepare_render_request<'a>(
         // created with the pass's own sample count. Keeping either surface's
         // texels is admitted from v57/v60 through the resolve the pass then
         // has to state. A pass that opens both surfaces together is the
-        // combined depth-stencil shape this rail executes from v60 on
-        // (`research/docs/23` §3.3, v60): one `D32_SFLOAT_S8_UINT` attachment
-        // both faces share, opened from the reviewed clears with both faces
-        // stored through their resolves.
+        // combined depth-stencil shape: one attachment both faces share, opened
+        // from the reviewed clears. Two shapes of it are executed — the v60
+        // resolve shape, which stores both faces through their resolves, and
+        // the v66 rail-owned pair, which keeps neither face and observes the
+        // colour resolve — so the two faces' store decisions have to agree
+        // exactly as the contract states them.
         if let (Some(depth), Some(stencil)) = (&pass.depth, &pass.stencil) {
             if !matches!(depth.load, DepthLoadOp::Clear(_))
                 || !matches!(stencil.load, StencilLoadOp::Clear(_))
@@ -945,16 +947,19 @@ fn prepare_render_request<'a>(
                         ),
                 );
             }
-            if depth.store != Some(DepthStoreOp::Store)
-                || stencil.store != Some(StoreOp::Store)
-                || pass.depth_resolve.is_none()
-                || pass.stencil_resolve.is_none()
-            {
+            let rail_owned = !depth.is_stored() && !stencil.is_stored();
+            let resolved = depth.is_stored()
+                && stencil.is_stored()
+                && pass.depth_resolve.is_some()
+                && pass.stencil_resolve.is_some();
+            if !rail_owned && !resolved {
                 return Err(
                     capability_refusal("render_combined_depth_stencil_store_unsupported")
                         .with_detail(
-                            "the combined depth-stencil shape stores both faces through their \
-                             two resolves, which is the only combined shape this rail executes",
+                            "the combined depth-stencil shape keeps both faces or neither: \
+                             both rail-owned with no resolve, or both stored through their \
+                             two resolves, which are the only combined shapes this rail \
+                             executes",
                         ),
                 );
             }
@@ -1700,6 +1705,54 @@ pub(crate) fn format_supports_multisample_depth_attachment(
     }
 }
 
+/// The combined depth-stencil formats this rail admits, in preference order
+/// (`research/docs/23` §3.3, v60/v66).
+///
+/// `D32_SFLOAT_S8_UINT` is the reviewed combined format: its depth aspect is
+/// the same four-byte `depth32float` texel the single-face depth shape reads
+/// back, so the v60 stored shape's copy-out is the depth channel's own.
+/// `D24_UNORM_S8_UINT` is the fallback for the v66 rail-owned pair — neither
+/// face leaves the pass, so no byte layout has to agree with the depth
+/// channel — and a device that answers neither refuses the combined shape by
+/// name.
+pub(crate) const COMBINED_DEPTH_STENCIL_FORMATS: [vk::Format; 2] = [
+    vk::Format::D32_SFLOAT_S8_UINT,
+    vk::Format::D24_UNORM_S8_UINT,
+];
+
+/// The first reviewed combined format the `supports` predicate answers, or
+/// `None` when it answers none (`research/docs/23` §3.3, v66).
+///
+/// The preference order is the constant above; keeping the choice a pure
+/// function of the predicate is what lets the order be tested without a
+/// device, while the probe itself stays the per-device question
+/// `vkGetPhysicalDeviceImageFormatProperties` answers.
+pub(crate) fn first_supported_combined_format(
+    mut supports: impl FnMut(vk::Format) -> bool,
+) -> Option<vk::Format> {
+    COMBINED_DEPTH_STENCIL_FORMATS
+        .into_iter()
+        .find(|format| supports(*format))
+}
+
+/// The first combined format the device admits at this raster's sample count,
+/// or `None` when it answers none of the reviewed formats
+/// (`research/docs/23` §3.3, v66).
+///
+/// The probe is the depth surface's own question one format list over: the
+/// combined attachment is created with these samples and used as a
+/// `DEPTH_STENCIL_ATTACHMENT`, so `vkGetPhysicalDeviceImageFormatProperties`
+/// is what answers whether the pair is executable.
+pub(crate) fn combined_depth_stencil_format(
+    context: &VulkanContext,
+    tiling: vk::ImageTiling,
+    samples: vk::SampleCountFlags,
+) -> Option<vk::Format> {
+    first_supported_combined_format(|format| {
+        format_supports_multisample_depth_attachment(context, format, tiling, samples)
+    })
+}
+
 /// The largest of the reviewed two-, four- and eight-sample rasters the
 /// device's whole framebuffer admits, or `None` when it admits none of them
 /// (`research/docs/23` §3.3, v51/v61).
@@ -1987,8 +2040,11 @@ pub(crate) fn execute_offscreen_render(
         // The depth surface beside the raster is created with the same sample
         // count (`research/docs/23` §3.3, v53), so the device has to admit the
         // depth combination at the raster's own count before the first depth
-        // image exists.
+        // image exists. A pass that opens both faces creates the one combined
+        // surface instead, so its own question below is the one that runs
+        // (`research/docs/23` §3.3, v60/v66).
         if request.depth.is_some()
+            && request.stencil.is_none()
             && !format_supports_multisample_depth_attachment(
                 context,
                 vk::Format::D32_SFLOAT,
@@ -2014,8 +2070,10 @@ pub(crate) fn execute_offscreen_render(
         }
         // The stencil surface's own sample-count question, through the same
         // `DEPTH_STENCIL_ATTACHMENT` probe the depth surface uses
-        // (`research/docs/23` §3.3, v55/v61).
+        // (`research/docs/23` §3.3, v55/v61). The combined pass asks its own
+        // format's question below instead.
         if request.stencil.is_some()
+            && request.depth.is_none()
             && !format_supports_multisample_depth_attachment(
                 context,
                 vk::Format::S8_UINT,
@@ -2040,36 +2098,56 @@ pub(crate) fn execute_offscreen_render(
                 ));
         }
         // The combined surface's own sample-count question
-        // (`research/docs/23` §3.3, v60): one `D32_SFLOAT_S8_UINT` attachment
-        // carries both faces, so the device has to admit that combination
-        // before the combined image exists.
-        if request.depth.is_some()
-            && request.stencil.is_some()
-            && !format_supports_multisample_depth_attachment(
-                context,
-                vk::Format::D32_SFLOAT_S8_UINT,
-                tiling,
-                samples,
-            )
-        {
-            return Err(attachment_format_refusal()
-                .with_field(
-                    "vk_format",
-                    FieldValue::Unsigned(vk::Format::D32_SFLOAT_S8_UINT.as_raw() as u64),
-                )
-                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
-                .with_field(
-                    "missing_feature",
-                    FieldValue::Text(format!(
-                        "depth_stencil_attachment_samples_{}",
-                        samples.as_raw()
-                    )),
-                )
-                .with_detail(
-                    "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
-                     combination this raster states for the DEPTH_STENCIL_ATTACHMENT usage \
-                     of D32_SFLOAT_S8_UINT",
-                ));
+        // (`research/docs/23` §3.3, v60/v66): one attachment carries both
+        // faces, so the device has to admit one of the reviewed combined
+        // formats at this raster's sample count before the combined image
+        // exists. The stored shape reads its depth aspect back as
+        // `depth32float`, so it needs the four-byte format; the v66
+        // rail-owned pair is the shape the packed fallback exists for.
+        if request.depth.is_some() && request.stencil.is_some() {
+            let Some(combined_format) = combined_depth_stencil_format(context, tiling, samples)
+            else {
+                return Err(attachment_format_refusal()
+                    .with_field(
+                        "vk_format",
+                        FieldValue::Unsigned(vk::Format::D32_SFLOAT_S8_UINT.as_raw() as u64),
+                    )
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field(
+                        "missing_feature",
+                        FieldValue::Text(format!(
+                            "depth_stencil_attachment_samples_{}",
+                            samples.as_raw()
+                        )),
+                    )
+                    .with_detail(
+                        "vkGetPhysicalDeviceImageFormatProperties reports no sample-count \
+                         combination this raster states for the DEPTH_STENCIL_ATTACHMENT usage \
+                         of either reviewed combined depth-stencil format",
+                    ));
+            };
+            let storing = request.depth.as_ref().is_some_and(|depth| depth.storing())
+                || request
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|stencil| stencil.storing());
+            if storing && combined_format != vk::Format::D32_SFLOAT_S8_UINT {
+                return Err(attachment_format_refusal()
+                    .with_field(
+                        "vk_format",
+                        FieldValue::Unsigned(combined_format.as_raw() as u64),
+                    )
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field(
+                        "missing_feature",
+                        FieldValue::Text("transfer_src".to_owned()),
+                    )
+                    .with_detail(
+                        "the stored combined depth-stencil shape reads its depth aspect back \
+                         as depth32float, so only D32_SFLOAT_S8_UINT carries a landing this \
+                         rail's depth channel observes",
+                    ));
+            }
         }
     }
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
@@ -2154,9 +2232,42 @@ pub(crate) fn execute_offscreen_render(
     // The combined depth-stencil shape (`research/docs/23` §3.3, v60): Vulkan
     // binds one attachment for both faces, so a pass that opens both creates
     // the one `D32_SFLOAT_S8_UINT` surface and its one resolve landing instead
-    // of the two single-face surfaces the branches below build.
+    // of the two single-face surfaces the branches below build. From v66 on
+    // the rail-owned pair is the same surface without a landing: neither face
+    // is stored, so the surface's texels leave with the pass and the colour
+    // resolve is the whole observation.
     if let (Some(depth), Some(stencil)) = (&request.depth, &request.stencil) {
-        objects.create_combined_depth_stencil(width, height, samples)?;
+        // The format is the device's answer to the same question the gates
+        // above asked, re-asserted here so a directly-constructed request
+        // cannot reach `vkCreateImage` with a format the pair was not reviewed
+        // against (`research/docs/23` §3.3, v66).
+        let combined_format =
+            combined_depth_stencil_format(context, tiling, samples).ok_or_else(|| {
+                attachment_format_refusal()
+                    .with_field(
+                        "vk_format",
+                        FieldValue::Unsigned(vk::Format::D32_SFLOAT_S8_UINT.as_raw() as u64),
+                    )
+                    .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                    .with_field(
+                        "missing_feature",
+                        FieldValue::Text(format!(
+                            "depth_stencil_attachment_samples_{}",
+                            samples.as_raw()
+                        )),
+                    )
+                    .with_detail(
+                        "the combined depth-stencil image needs a format the device admits at \
+                         this raster's sample count",
+                    )
+            })?;
+        objects.create_combined_depth_stencil(
+            width,
+            height,
+            samples,
+            combined_format,
+            request.depth_resolve.is_some() && request.stencil_resolve.is_some(),
+        )?;
         if depth.storing() {
             objects.create_depth_readback(byte_length)?;
         }
@@ -2951,6 +3062,12 @@ struct DepthObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// The `VkFormat` the image was created with (`research/docs/23` §3.3,
+    /// v66): `D32_SFLOAT` for every single-face depth surface, and whichever
+    /// reviewed combined format the device answered for a pass that opens both
+    /// faces. The render pass's own attachment description restates it, so the
+    /// description cannot disagree with the image the framebuffer binds.
+    format: vk::Format,
     /// Whether the pass opens the image from the attachment layout a previous
     /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
     loading: bool,
@@ -3384,6 +3501,7 @@ impl<'a> OffscreenObjects<'a> {
             image,
             memory,
             view,
+            format: vk::Format::D32_SFLOAT,
             loading,
             samples,
             resolve: resolve_objects,
@@ -3513,23 +3631,29 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     /// Create the combined depth-stencil surface of a pass that opens both
-    /// faces and resolves both (`research/docs/23` §3.3, v60).
+    /// faces (`research/docs/23` §3.3, v60/v66).
     ///
     /// Vulkan binds one attachment for both faces, so the two surfaces this
-    /// function builds share one `D32_SFLOAT_S8_UINT` image and one resolve
-    /// landing: the depth half owns both backings, the stencil half marks
-    /// `shares_backing` and lets the depth half free them. Both faces open
-    /// from a clear — the reviewed combined shape — so a loading combined
-    /// surface is refused by `prepare_render_request` before this runs.
+    /// function builds share one combined image: the depth half owns the
+    /// backing, the stencil half marks `shares_backing` and lets the depth
+    /// half free it. The `resolve` flag is the pass's own store decision: the
+    /// v60 shape keeps both faces, so the one single-sample landing both
+    /// resolves reduce into is built and shared the same way; the v66
+    /// rail-owned pair keeps neither face, so no landing exists and both
+    /// surfaces end with no resolve target. Both faces open from a clear —
+    /// every reviewed combined shape does — so a loading combined surface is
+    /// refused by `prepare_render_request` before this runs.
     fn create_combined_depth_stencil(
         &mut self,
         width: u32,
         height: u32,
         samples: vk::SampleCountFlags,
+        format: vk::Format,
+        resolve: bool,
     ) -> Result<(), ProviderError> {
         let combined_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT_S8_UINT)
+            .format(format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -3557,24 +3681,51 @@ impl<'a> OffscreenObjects<'a> {
         let depth_view = crate::create_depth_stencil_image_view(
             self.context,
             combined_image,
-            vk::Format::D32_SFLOAT_S8_UINT,
+            format,
             "combined depth",
         )
         .map_err(|error| execution_refusal("create combined depth view", &error.detail))?;
         let stencil_view = crate::create_stencil_image_view(
             self.context,
             combined_image,
-            vk::Format::D32_SFLOAT_S8_UINT,
+            format,
             "combined stencil",
         )
         .map_err(|error| execution_refusal("create combined stencil view", &error.detail))?;
+        if !resolve {
+            // The v66 rail-owned pair: one surface, no landing, both faces
+            // discarded with the pass (`research/docs/23` §3.3, v66).
+            self.depth = Some(DepthObjects {
+                image: combined_image,
+                memory: combined_memory,
+                view: depth_view,
+                format,
+                loading: false,
+                samples,
+                resolve: None,
+                readback: None,
+                mapping: None,
+            });
+            self.stencil = Some(StencilObjects {
+                image: combined_image,
+                memory: combined_memory,
+                view: stencil_view,
+                loading: false,
+                samples,
+                resolve: None,
+                readback: None,
+                mapping: None,
+                shares_backing: true,
+            });
+            return Ok(());
+        }
         // The one single-sample landing both resolves reduce into: a
-        // `D32_SFLOAT_S8_UINT` image whose depth and stencil aspects are the
-        // two readback sources, exactly as the two surfaces' own aspects are
-        // the two faces of the four-sample attachment.
+        // combined-format image whose depth and stencil aspects are the two
+        // readback sources, exactly as the two surfaces' own aspects are the
+        // two faces of the four-sample attachment.
         let resolve_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT_S8_UINT)
+            .format(format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -3601,14 +3752,14 @@ impl<'a> OffscreenObjects<'a> {
         let depth_resolve_view = crate::create_depth_stencil_image_view(
             self.context,
             resolve_image,
-            vk::Format::D32_SFLOAT_S8_UINT,
+            format,
             "combined depth resolve",
         )
         .map_err(|error| execution_refusal("create combined depth resolve view", &error.detail))?;
         let stencil_resolve_view = crate::create_stencil_image_view(
             self.context,
             resolve_image,
-            vk::Format::D32_SFLOAT_S8_UINT,
+            format,
             "combined stencil resolve",
         )
         .map_err(|error| {
@@ -3618,6 +3769,7 @@ impl<'a> OffscreenObjects<'a> {
             image: combined_image,
             memory: combined_memory,
             view: depth_view,
+            format,
             loading: false,
             samples,
             resolve: Some(DepthResolveObjects {
@@ -3898,19 +4050,27 @@ impl<'a> OffscreenObjects<'a> {
                 let combined = stencil.is_some();
                 if combined {
                     // The combined depth-stencil attachment
-                    // (`research/docs/23` §3.3, v60): one
-                    // `D32_SFLOAT_S8_UINT` surface both faces share, so its
-                    // two load operations open the two aspects from the
-                    // reviewed clear. Its four-sample contents are consumed by
-                    // the two resolves inside the subpass, so it is never
-                    // stored; the combined resolve target below carries the
-                    // pass's store decision.
+                    // (`research/docs/23` §3.3, v60/v66): one surface both
+                    // faces share, so its two load operations open the two
+                    // aspects from the reviewed clear. In the v60 shape its
+                    // four-sample contents are consumed by the two resolves
+                    // inside the subpass and the combined resolve target below
+                    // carries the pass's store decision; in the v66 rail-owned
+                    // pair neither face is kept, so the attachment simply
+                    // discards both aspects and there is no target below.
                     let samples = self
                         .depth
                         .as_ref()
                         .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
+                    // The format is the one the image was created with, so the
+                    // description cannot disagree with the framebuffer's view
+                    // (`research/docs/23` §3.3, v66).
+                    let format = self
+                        .depth
+                        .as_ref()
+                        .map_or(vk::Format::D32_SFLOAT_S8_UINT, |objects| objects.format);
                     return vk::AttachmentDescription2::default()
-                        .format(vk::Format::D32_SFLOAT_S8_UINT)
+                        .format(format)
                         .samples(samples)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -3975,12 +4135,16 @@ impl<'a> OffscreenObjects<'a> {
             .chain(depth_resolve.map(|_| {
                 if stencil.is_some() {
                     // The combined resolve target (`research/docs/23` §3.3,
-                    // v60): one single-sample `D32_SFLOAT_S8_UINT` image both
+                    // v60): one single-sample combined-format image both
                     // resolves reduce into. Its load operations are
                     // `DONT_CARE` by construction and it ends in
                     // `TRANSFER_SRC_OPTIMAL` for both copy-outs.
+                    let format = self
+                        .depth
+                        .as_ref()
+                        .map_or(vk::Format::D32_SFLOAT_S8_UINT, |objects| objects.format);
                     return vk::AttachmentDescription2::default()
-                        .format(vk::Format::D32_SFLOAT_S8_UINT)
+                        .format(format)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .load_op(vk::AttachmentLoadOp::DONT_CARE)
                         .store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -7072,6 +7236,111 @@ mod tests {
             Ok(_) => panic!("the rail must refuse the filter without the depth resolve it names"),
         };
         assert_eq!(refused.slug, "trace_contract_invalid");
+    }
+
+    /// The v66 rail-owned combined pair: one multisampled raster that opens
+    /// both faces of the one combined surface, keeps neither, and states no
+    /// resolve (`research/docs/23` §3.3, v66).
+    fn rail_owned_combined_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: None,
+            identity: None,
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::clear(0),
+            store: None,
+            identity: None,
+        });
+        pass.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::IncrementWrap,
+            pass_op: StencilOp::Keep,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        pass
+    }
+
+    #[test]
+    fn prepare_render_request_admits_the_rail_owned_combined_pair() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = rail_owned_combined_pass();
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the fixture describes the reviewed single-attachment shape");
+        let request = prepare_render_request(&stages, &pass, &[None], 0, 0)
+            .expect("the rail-owned combined pair is well formed");
+        assert!(request.depth.is_some() && request.stencil.is_some());
+        assert!(request.depth_resolve.is_none() && request.stencil_resolve.is_none());
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_a_lopsided_combined_pair() {
+        // The two faces share one surface, so the rail re-asserts the
+        // contract's agreement rule for a directly-constructed request: a pair
+        // that keeps one face while dropping the other is refused by name
+        // (`research/docs/23` §3.3, v66).
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = rail_owned_combined_pass();
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            }),
+        });
+        pass.depth_resolve = Some(MultisampleDepthResolve {
+            filter: DepthResolveFilter::Sample0,
+        });
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a pair that keeps one face"),
+        };
+        assert_eq!(
+            refused.slug,
+            "render_combined_depth_stencil_store_unsupported"
+        );
+    }
+
+    #[test]
+    fn the_reviewed_combined_format_order_prefers_the_four_byte_one() {
+        // The format list's order is the review's own decision
+        // (`research/docs/23` §3.3, v66): the four-byte `D32_SFLOAT_S8_UINT`
+        // first, because the stored v60 shape reads its depth aspect back as
+        // `depth32float`, and the packed `D24_UNORM_S8_UINT` as the rail-owned
+        // pair's fallback.
+        assert_eq!(
+            first_supported_combined_format(|_| true).map(|format| format.as_raw()),
+            Some(vk::Format::D32_SFLOAT_S8_UINT.as_raw())
+        );
+        assert_eq!(
+            first_supported_combined_format(|format| format == vk::Format::D24_UNORM_S8_UINT)
+                .map(|format| format.as_raw()),
+            Some(vk::Format::D24_UNORM_S8_UINT.as_raw())
+        );
+        assert!(first_supported_combined_format(|_| false).is_none());
     }
 
     /// The reviewed dual shape end to end on one draw: both 2×2

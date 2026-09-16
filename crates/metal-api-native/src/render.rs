@@ -1948,19 +1948,27 @@ pub(crate) fn plan<'a>(
                 }
                 // The stencil sibling (`research/docs/23` §3.3, v55/v60): a
                 // kept stencil surface needs the stencil resolve, and a
-                // combined depth-stencil surface is admitted only through a
-                // stencil resolve — the one texture both resolve targets name.
-                if request.pass.depth.is_some()
-                    && request.pass.stencil.is_some()
-                    && request.pass.stencil_resolve.is_none()
-                {
-                    return Err(
-                        capability_refusal("render_stencil_combined_surface_unsupported")
-                            .with_detail(
-                                "the multisample raster opens one depth-stencil surface: a \
-                                 combined surface is admitted only through a stencil resolve",
-                            ),
-                    );
+                // combined depth-stencil surface is one texture both faces
+                // share, so its two store decisions have to agree: both
+                // rail-owned with no resolve — the v66 write-then-test pair —
+                // or both kept through their resolves, the v60 shape
+                // (`research/docs/23` §3.3, v60/v66).
+                if let (Some(depth), Some(stencil)) = (&request.pass.depth, &request.pass.stencil) {
+                    let rail_owned = !depth.is_stored() && !stencil.is_stored();
+                    let resolved = depth.is_stored()
+                        && stencil.is_stored()
+                        && request.pass.depth_resolve.is_some()
+                        && request.pass.stencil_resolve.is_some();
+                    if !rail_owned && !resolved {
+                        return Err(capability_refusal(
+                            "render_stencil_combined_surface_unsupported",
+                        )
+                        .with_detail(
+                            "the multisample raster opens one depth-stencil surface: \
+                                     the two faces keep both or neither — both rail-owned with \
+                                     no resolve, or both stored through their resolves",
+                        ));
+                    }
                 }
                 if request
                     .pass
@@ -4455,6 +4463,78 @@ mod tests {
         )
         .expect_err("a stencil resolve outside the mask is refused");
         assert_eq!(refused.slug, "render_stencil_resolve_filter_unsupported");
+    }
+
+    /// The v66 rail-owned combined pair plans: one combined surface carries
+    /// both faces, neither is kept, and the plan carries no resolve — the
+    /// write-then-test shape whose third triangle fails against the value the
+    /// second one's depth failure wrote (`research/docs/23` §3.3, v66).
+    #[test]
+    fn plan_admits_the_rail_owned_combined_pair() {
+        let mut pass = combined_stencil_resolving_pass();
+        pass.depth_resolve = None;
+        pass.stencil_resolve = None;
+        {
+            let depth = pass
+                .depth
+                .as_mut()
+                .expect("the fixture opens a depth attachment");
+            depth.load = DepthLoadOp::clear(1.0);
+            depth.store = None;
+            depth.identity = None;
+        }
+        {
+            let stencil = pass
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = None;
+            stencil.identity = None;
+        }
+        pass.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::IncrementWrap,
+            pass_op: StencilOp::Keep,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        let pipeline = milestone_pipeline();
+        let planned = plan(&milestone_request(&pass, &pipeline, None), 0, 0)
+            .expect("the rail-owned combined pair plans");
+        assert_eq!(planned.multisample, Some(SampleCount::Four));
+        assert_eq!(planned.depth_resolve, None);
+        assert_eq!(planned.stencil_resolve, None);
+    }
+
+    /// A pair that keeps one face while dropping the other is refused by name
+    /// rather than read as either reviewed shape (`research/docs/23` §3.3,
+    /// v66).
+    #[test]
+    fn plan_refuses_a_lopsided_combined_pair() {
+        let mut pass = combined_stencil_resolving_pass();
+        // The stencil half drops its store and its resolve while the depth
+        // half keeps both: the one surface's two faces disagree.
+        pass.stencil_resolve = None;
+        {
+            let stencil = pass
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = None;
+            stencil.identity = None;
+        }
+        let pipeline = milestone_pipeline();
+        let refused = plan(
+            &milestone_request(&pass, &pipeline, None),
+            DEPTH_RESOLVE_SAMPLE0_BIT,
+            0,
+        )
+        .expect_err("a lopsided combined pair is refused");
+        // The contract owns the agreement rule, so the plan reports its own
+        // spelling before the rail's re-assert can run.
+        assert_eq!(refused.slug, "trace_contract_invalid");
     }
 
     /// The v57c shape: a stored multisampled depth surface whose resolve the
