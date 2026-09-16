@@ -138,12 +138,19 @@ private struct RenderAttachmentDefinition: Decodable {
     let expected_hex: String?
 }
 
-/// The depth attachment a render case declares (`research/docs/23` §3.3, v36).
+/// The depth attachment a render case declares (`research/docs/23` §3.3,
+/// v36; the store pair is v43).
 ///
 /// The fields mirror `metal_api_core::provider::RenderDepthAttachment`: the
 /// format spelling, the extent and the load operation with the depth a clear
 /// starts from. The surface is rail-owned — no trace identity and no readback
-/// — so the case names no view for it.
+/// — so the default shape names no view for it, and the three fields below
+/// stay absent with the store action (fail-closed).
+///
+/// A case that stores the depth surface (`research/docs/23` §3.3, v43) states
+/// all four of them: the store action, the identity its texels land in and the
+/// bytes the readback has to show there. The depth texels travel through the
+/// same writeback channel a colour attachment uses.
 private struct DepthAttachmentDefinition: Decodable {
     let format: String
     let width: Int
@@ -151,6 +158,23 @@ private struct DepthAttachmentDefinition: Decodable {
     let load: String
     /// The depth a `"clear"` load starts from; absent for any other load.
     let clear_depth: Double?
+    /// The pass's depth store action (`research/docs/23` §3.3, v43). The only
+    /// spelling this increment admits is `"store"`, which is what makes the
+    /// texels observable; a surface the pass discards is the *absent* field
+    /// rather than a second spelling, so no `"dontcare"` arm exists here.
+    let store: String?
+    /// The allocation the stored depth texels land in, present exactly when
+    /// `store` is.
+    let allocation: UInt64?
+    /// The view inside that allocation the landing covers, present exactly
+    /// when `store` is.
+    let view: UInt64?
+    /// The reviewed depth texels, present exactly when `store` is: an image in
+    /// the surface's own `depth32float` texel layout, compared byte for byte
+    /// against the readback like a colour attachment's expectation. It has to
+    /// differ from the clear image, or "the pass stored the texels" and "it
+    /// never wrote depth" would read the same.
+    let expected_hex: String?
 }
 
 /// The depth state a render case declares (`research/docs/23` §3.3, v36).
@@ -459,16 +483,33 @@ private struct ValidatedRenderAttachment {
 }
 
 /// The reviewed depth pair a case carries (`research/docs/23` §3.3, v36): the
-/// rail-owned `depth32float` surface's extent, the depth its clear starts from
-/// and the `less` test with writes on. The review above already forced these to
-/// the reviewed values, so the runner only has to state them on the pass
-/// descriptor and on the encoder's depth-stencil state.
+/// `depth32float` surface's extent, the depth its clear starts from and the
+/// `less` test with writes on. The review above already forced these to the
+/// reviewed values, so the runner only has to state them on the pass
+/// descriptor and on the encoder's depth-stencil state. The optional store
+/// pair (`§3.3`, v43) says whether the texels outlive the pass and where they
+/// land.
 private struct ValidatedDepth {
     let width: Int
     let height: Int
     let clearDepth: Double
     let isLess: Bool
     let write: Bool
+    /// The stored surface's landing and expectation, or `nil` for the
+    /// rail-owned shape every pre-v43 case declares: the pass discards the
+    /// texels exactly as `render.rs::depth_texture` does, so there is no
+    /// readback, no writeback and no allocation observation.
+    let store: ValidatedDepthStore?
+}
+
+/// The landing a stored depth surface names (`research/docs/23` §3.3, v43):
+/// the allocation and view the depth texels land in at offset zero, and the
+/// bytes the readback has to show there. The observation travels through the
+/// same writeback / allocation channel a colour attachment uses.
+private struct ValidatedDepthStore {
+    let allocation: UInt64
+    let view: UInt64
+    let expected: Data
 }
 
 private struct SuiteDefinition: Decodable {
@@ -880,6 +921,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "\(definition.id): expected a 64-byte read buffer at 0 and a write buffer at 1")
+    case "render_declaring_depth_store":
+        // v43's declaring case: the reviewed copy_word_with_witness kernel
+        // reads one word from each of the two declaring views — the colour
+        // attachment's 64 bytes and the depth attachment's 64 bytes, which
+        // travel through the same writeback channel (`research/docs/23` §3.3,
+        // v43) — and writes both into its 4-byte output view.
+        try require(definition.entry == "copy_word_with_witness"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3, "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 64 },
+                    "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
+                    + "and a 64-byte read buffer at 2")
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
          "alias_disjoint_pair", "alias_disjoint_pair_reversed":
         try require(definition.entry == "copy_word"
@@ -1250,7 +1306,7 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v27":
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v28":
-        expectedIDs = ["render_declaring_quad_extent"]
+        expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2252,9 +2308,61 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         try require(test.compare == "less" && test.write,
                     "\(definition.id): the reviewed depth state is a less test with writes on")
+        // The depth store pair (`research/docs/23` §3.3, v43) is all-or-
+        // nothing, mirroring the contract's `DepthStoreIdentityMismatch`: the
+        // rail-owned shape every pre-v43 case declares states none of the four
+        // fields, and a storing surface states the action, its identity and
+        // what the readback has to show. An expectation that equals the clear
+        // image is refused because it could not tell "the pass stored the
+        // depth texels" from "it never wrote depth" (`docs/23` §3.3, v43).
+        let depthStore: ValidatedDepthStore?
+        if let spelling = depth.store {
+            try require(spelling == "store",
+                        "\(definition.id): the only stored depth spelling is \"store\"")
+            guard let allocation = depth.allocation,
+                  let view = depth.view,
+                  let expectedHex = depth.expected_hex else {
+                throw OracleError("\(definition.id): a stored depth attachment needs its store "
+                                  + "action, its identity and an expectation")
+            }
+            try require(allocation > 0 && view > 0,
+                        "\(definition.id): zero depth attachment identity")
+            let expected = try decodeHex(expectedHex,
+                                         context: "\(definition.id) expected depth texels")
+            try require(expected.count == depth.width * depth.height * 4,
+                        "\(definition.id): expected depth texel bytes do not match the depth "
+                        + "attachment")
+            // The clear image the surface starts from (`float32` 1.0 is
+            // `0000803f` in memory order, once per texel) is exactly what a
+            // pass that never stored its depth would read back.
+            var clearImage = Data()
+            clearImage.reserveCapacity(depth.width * depth.height * 4)
+            for _ in 0..<(depth.width * depth.height) {
+                clearImage.append(contentsOf: [0x00, 0x00, 0x80, 0x3f])
+            }
+            try require(expected != clearImage,
+                        "\(definition.id): the expected depth texels equal the clear depth")
+            // The depth landing is a resource of its own: a colour attachment
+            // already names these identities, and sharing one would make the
+            // colour readback and the depth readback the same landing
+            // (`research/docs/23` §3.3, v43).
+            for attachment in attachments {
+                try require(allocation != attachment.allocation && view != attachment.view,
+                            "\(definition.id): the depth attachment reuses the colour "
+                            + "attachment's identity")
+            }
+            depthStore = ValidatedDepthStore(allocation: allocation, view: view,
+                                             expected: expected)
+        } else {
+            try require(depth.allocation == nil && depth.view == nil && depth.expected_hex == nil,
+                        "\(definition.id): a discarded depth attachment carries no identity "
+                        + "or expectation")
+            depthStore = nil
+        }
         validatedDepth = ValidatedDepth(width: depth.width, height: depth.height,
                                         clearDepth: clearDepth,
-                                        isLess: test.compare == "less", write: test.write)
+                                        isLess: test.compare == "less", write: test.write,
+                                        store: depthStore)
     } else {
         validatedDepth = nil
     }
@@ -2288,6 +2396,17 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
             sha256: "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc")
         slots = [BufferSlotDefinition(binding: 0, access: "read", length: 4),
                  BufferSlotDefinition(binding: 1, access: "write", length: 4)]
+    case "copy_word_with_witness":
+        // v43's declaring kernel reads the whole word of the colour view and of
+        // the depth view, which is why both declaring slots are the reviewed
+        // 64-byte attachment views (`research/docs/23` §3.3, v43).
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_copy_word_with_witness.ll",
+            sha256: "f24e33124da1c228bf4766d32496d8d7ede4fc29d8e6c582c889a36343dfc18e")
+        metal = SourceDefinition(path: "shaders/copy_word_with_witness.metal",
+            sha256: "c116fec300f1369069fbcf19d5fbb95e8c5ad07475757c19930075a19ad4367a")
+        slots = [BufferSlotDefinition(binding: 0, access: "read", length: 64),
+                 BufferSlotDefinition(binding: 1, access: "write", length: 4),
+                 BufferSlotDefinition(binding: 2, access: "read", length: 64)]
     case "kernel_dispatch_threads_boundary_barrier":
         air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
             sha256: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
@@ -2616,11 +2735,15 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         targets.append(target)
     }
-    // The depth surface is the rail's own texture (`research/docs/23` §3.3,
-    // v36): no trace identity and no readback, so private storage is enough
-    // and the pass discards it after the draw, exactly as
-    // `render.rs::depth_texture` creates it. The local keeps the texture alive
-    // until the encoder's own reference takes over.
+    // The depth surface is the rail's own texture for the shape every pre-v43
+    // case declares (`research/docs/23` §3.3, v36): no trace identity and no
+    // readback, so private storage is enough and the pass discards it after
+    // the draw, exactly as `render.rs::depth_texture` creates it. A case that
+    // stores the surface (`§3.3`, v43) reads its texels back on the CPU, and
+    // `getBytes` cannot read a private texture (Apple's `MTLTexture`
+    // documentation): that shape allocates shared storage, the same reason its
+    // colour attachments do. The local keeps the texture alive until the
+    // encoder's own reference takes over.
     var depthTarget: MTLTexture?
     if let depth = fixture.depth {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
@@ -2629,7 +2752,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             height: depth.height,
             mipmapped: false)
         descriptor.usage = .renderTarget
-        descriptor.storageMode = .private
+        descriptor.storageMode = depth.store == nil ? .private : .shared
         guard let texture = device.makeTexture(descriptor: descriptor) else {
             throw OracleError("\(definition.id): cannot allocate the depth attachment")
         }
@@ -2767,10 +2890,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
     }
-    // The pass opens the rail-owned depth surface with its own load operation
-    // and discards it after the draw (`research/docs/23` §3.3, v36): nothing
-    // reads the depth texels back, so `dontCare` is the store action, exactly
-    // as `render.rs` opens the plan's depth attachment.
+    // The pass opens the depth surface with its own load operation
+    // (`research/docs/23` §3.3, v36) and keeps it only when the case says so
+    // (`§3.3`, v43): a stored surface lands in the identity its case states,
+    // and the rail-owned shape every pre-v43 case declares discards its texels
+    // with the pass — `dontCare` is that store action, exactly as `render.rs`
+    // opens the plan's depth attachment.
     if let depth = fixture.depth {
         guard let texture = depthTarget, let attachment = pass.depthAttachment else {
             throw OracleError("\(definition.id): cannot reach the depth attachment")
@@ -2778,7 +2903,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.texture = texture
         attachment.loadAction = .clear
         attachment.clearDepth = depth.clearDepth
-        attachment.storeAction = .dontCare
+        attachment.storeAction = depth.store == nil ? .dontCare : .store
     }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
@@ -2938,6 +3063,47 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         writebacks.append(Writeback(allocation: attachment.allocation, view: attachment.view,
                                     offset: 0, bytes_hex: hex(observed)))
         allocations.append(AllocationResult(allocation: attachment.allocation,
+                                             bytes_hex: hex(observed)))
+    }
+    // A stored depth surface reports its texels through the same channel
+    // (`research/docs/23` §3.3, v43): one writeback for the depth view at
+    // offset zero and one allocation observation, in the surface's own
+    // `depth32float` texel layout. It is appended after the colour
+    // attachments, which is the report's `(allocation, view)` order for this
+    // shape — a case's colour landing (900/910) sorts before its depth landing
+    // (940/950). The comparison reports the first differing byte and both
+    // sides, the same shape the colour readback above uses.
+    if let depth = fixture.depth, let store = depth.store {
+        guard let texture = depthTarget else {
+            throw OracleError("\(definition.id): the stored depth attachment left the pass")
+        }
+        var observed = Data(count: depth.width * depth.height * 4)
+        observed.withUnsafeMutableBytes { bytes in
+            if let destination = bytes.baseAddress {
+                texture.getBytes(destination,
+                                 bytesPerRow: depth.width * 4,
+                                 from: MTLRegionMake2D(0, 0, depth.width, depth.height),
+                                 mipmapLevel: 0)
+            }
+        }
+        try require(observed.count == store.expected.count,
+                    "\(definition.id): the depth attachment read back \(observed.count) bytes "
+                    + "against the reviewed expectation's \(store.expected.count)")
+        var differing: Int?
+        for (offset, pair) in zip(store.expected, observed).enumerated() {
+            if pair.0 != pair.1 {
+                differing = offset
+                break
+            }
+        }
+        if let differing {
+            throw OracleError("\(definition.id): depth texels \(hex(observed)) do not match "
+                              + "the reviewed expectation \(hex(store.expected)) "
+                              + "(first differing byte at offset \(differing))")
+        }
+        writebacks.append(Writeback(allocation: store.allocation, view: store.view,
+                                    offset: 0, bytes_hex: hex(observed)))
+        allocations.append(AllocationResult(allocation: store.allocation,
                                              bytes_hex: hex(observed)))
     }
     return CaseResult(id: definition.id, completion: "CompletedVisible",

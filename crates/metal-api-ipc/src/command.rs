@@ -1417,9 +1417,10 @@ mod tests {
     use metal_api_core::provider::{
         AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment,
         BlendFactor, BlendOperation, BufferAccess, BufferBindingContract, BufferLease,
-        BufferSource, BufferView, BufferWriteback, ClearColor, CompiledComputePipeline,
-        CompletionDisposition, CompletionPolicy, CompletionReadback, CompletionToken, ComputePass,
-        ComputeProvider, ComputeTrace, CullMode, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+        BufferSource, BufferView, BufferWriteback, ClearColor, CompareFunction,
+        CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
+        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
+        DepthLoadOp, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
         FootprintProof, FunctionIdentity, HeapDescriptor, HeapId, HeapPayload, HeapPlacement,
         HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
         IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
@@ -1427,13 +1428,13 @@ mod tests {
         OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
         PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
         ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-        RenderAttachment, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-        RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
-        StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
-        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
-        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
-        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
-        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend,
+        RenderPassCull, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+        Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp,
+        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+        TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat,
+        VertexLayout, ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
+        MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2523,6 +2524,156 @@ mod tests {
             "the plain pass keeps the vertex-only feature byte"
         );
         assert!(!plain_frame.windows(2).any(|pair| pair == [0x10, 0x81]));
+    }
+
+    /// A render trace whose pass opens the rail-owned depth attachment in the
+    /// pre-v43 shape: no store action and no landing, which is what every frame
+    /// published before v43 means (`research/docs/23` §3.3, v36).
+    fn depth_trace() -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 4,
+            height: 4,
+            load: DepthLoadOp::clear(1.0),
+            store: None,
+            identity: None,
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        trace
+    }
+
+    /// The same pass with the v43 pair: the surface survives the pass and the
+    /// trace names where its texels land (`research/docs/23` §3.3, v43).
+    fn depth_store_trace() -> ComputeTrace {
+        let mut trace = depth_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        let Some(depth) = pass.depth.as_mut() else {
+            panic!("the fixture opens a depth attachment");
+        };
+        depth.store = Some(DepthStoreOp::Store);
+        depth.identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(950),
+        });
+        trace
+    }
+
+    #[test]
+    fn a_depth_store_pass_takes_the_wide_feature_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: depth_store_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The wide tag is followed by the big-endian feature word: the narrow
+        // byte it repeats — vertex input and depth, `0x21` — stays its *last*
+        // byte, and the two bits the store action and the identity travel
+        // under live in the byte before it, so `0x0321` reads as `03 21`.
+        let wide = frame
+            .windows(3)
+            .enumerate()
+            .skip(10)
+            .find(|(_, window)| *window == [0x11, 0x03, 0x21])
+            .map(|(index, _)| index)
+            .expect("the storing pass takes the wide tag");
+        assert_eq!(frame[wide], 0x11);
+
+        // A pass that keeps nothing keeps the pre-v43 bytes exactly: the same
+        // vertex-input and depth bits, under the narrow tag.
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: depth_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(
+            plain_frame.windows(2).any(|pair| pair == [0x10, 0x21]),
+            "the discarded depth pass keeps the narrow tag and its feature byte"
+        );
+        assert!(
+            !plain_frame.windows(2).any(|pair| pair == [0x11, 0x03]),
+            "a pass with no wide section never takes the wide tag"
+        );
+    }
+
+    #[test]
+    fn wide_depth_features_without_a_depth_attachment_or_with_unknown_bits_are_refused() {
+        let request = CommandRequest::Submit {
+            trace: depth_store_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let wide = frame
+            .windows(3)
+            .enumerate()
+            .skip(10)
+            .find(|(_, window)| *window == [0x11, 0x03, 0x21])
+            .map(|(index, _)| index)
+            .expect("the storing pass takes the wide tag");
+
+        // An unknown high bit is a decoder refusal, exactly as an unknown pass
+        // tag is: a section this decoder cannot read stops the frame rather
+        // than being skipped to reach the sections after it.
+        let mut unknown = frame.clone();
+        unknown[wide + 1] = 0x07;
+        let refused = CommandCodec::decode_request(&unknown);
+        assert!(
+            matches!(refused, Err(CodecError::UnknownRenderFeature(0x0400))),
+            "an unknown wide bit has to be refused, got {refused:?}"
+        );
+
+        // The store action and the identity describe the depth attachment: a
+        // word that names them without the depth bit names a surface the pass
+        // never opens, and the decoder refuses it before reading a section.
+        let mut orphaned = frame;
+        orphaned[wide + 2] = 0x01;
+        assert!(
+            matches!(
+                CommandCodec::decode_request(&orphaned),
+                Err(CodecError::DepthFeatureWithoutAttachment(0x0300))
+            ),
+            "a wide depth feature without a depth block has to be refused"
+        );
+    }
+
+    #[test]
+    fn a_pass_that_both_culls_and_blends_round_trips_in_the_declared_section_order() {
+        // The encoder writes culling before blending, in the order the two
+        // feature bits are declared (`research/docs/23` §3.3, v39/v40). No
+        // fixture states both, so the decoder walked them in the other order
+        // until v43 — a latent disagreement this round trip pins shut.
+        let mut trace = cull_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![BlendAttachment {
+                source_rgb: BlendFactor::SourceAlpha,
+                destination_rgb: BlendFactor::OneMinusSourceAlpha,
+                source_alpha: BlendFactor::SourceAlpha,
+                destination_alpha: BlendFactor::OneMinusSourceAlpha,
+                operation: BlendOperation::Add,
+            }],
+        });
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert!(
+            frame.windows(2).any(|pair| pair == [0x10, 0xC1]),
+            "the pass carries the vertex-input, cull and blend bits"
+        );
     }
 
     #[test]

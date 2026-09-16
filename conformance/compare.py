@@ -941,7 +941,7 @@ def _cull_declaration(case, streams, vertex_buffers, indices, where):
 
 
 def _depth_declaration(case, streams, vertex_buffers, indices, where):
-    """Pin the reviewed depth pair (`research/docs/23` §3.3, v36).
+    """Pin the reviewed depth pair (`research/docs/23` §3.3, v36 and v43).
 
     One stream whose vertices carry a `float32x3` position at offset 0 and a
     `float32x4` tint at offset 16 (stride thirty-two), two oversize triangles at
@@ -950,6 +950,15 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
     two overlap — which is the whole attachment — so the expectation is the
     near tint sixteen times; a rail that dropped the attachment, the clear or
     the test would show the far one.
+
+    The v43 increment upgrades that attachment from a surface the pass owns and
+    drops to a resource the caller keeps: with a `store` action the fixture also
+    names the allocation and the view the texels land in and the texels it
+    expects there, and the comparison observes them through the same writeback
+    and allocation channel the colour side uses. A depth attachment without one
+    is the v36 shape — cleared, tested against and discarded — so it carries
+    neither identity nor expectation, and a fixture that half-declares the
+    stored shape is refused rather than read as either one.
     """
     quad_indices, stride = 6, 32
     _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
@@ -971,11 +980,14 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
     depth = case.get("depth")
     _require(isinstance(depth, dict), f"{where}: a depth attachment is an object")
     # The clear value rides on the `load: "clear"` arm, so the field set is the
-    # one the fixture uses rather than a fixed key list.
-    _require(set(depth) - {"format", "width", "height", "load", "clear_depth"} == set(),
+    # one the fixture uses rather than a fixed key list. The store increment
+    # adds the three fields of an observable depth landing (`research/docs/23`
+    # §3.3, v43).
+    store_fields = {"store", "allocation", "view", "expected_hex"}
+    allowed = {"format", "width", "height", "load", "clear_depth"} | store_fields
+    _require(set(depth) - allowed == set(),
              f"{where}.depth: unexpected fields "
-             + ", ".join(sorted(set(depth) - {"format", "width", "height", "load",
-                                              "clear_depth"})))
+             + ", ".join(sorted(set(depth) - allowed)))
     for field in ("format", "width", "height", "load"):
         _require(field in depth, f"{where}.depth: missing field {field}")
     _require(depth["format"] == "depth32float",
@@ -984,6 +996,54 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
              f"{where}: the reviewed depth attachment is cleared")
     _require(depth.get("clear_depth") == 1.0,
              f"{where}: the reviewed depth clear is one")
+    # Either the pass drops the attachment after testing against it — the only
+    # shape before v43 — or it stores it, and then the identity and the expected
+    # texels are what makes the landing observable. The two arms are mutually
+    # exclusive in both directions: an identity without an action would be an
+    # observation nobody claims, and an action without an identity an
+    # observation nobody can read.
+    store = depth.get("store")
+    if store is None:
+        _require(not (store_fields & set(depth)),
+                 f"{where}: a discarded depth attachment carries no identity or expectation")
+        depth_store = None
+    else:
+        _require(store == "store",
+                 f"{where}.depth: unsupported depth store op {store!r}")
+        missing = [field for field in ("allocation", "view", "expected_hex")
+                   if field not in depth]
+        _require(not missing,
+                 f"{where}: a stored depth attachment needs its store action, its "
+                 "identity and an expectation")
+        allocation = _integer(depth["allocation"], f"{where}.depth.allocation")
+        view = _integer(depth["view"], f"{where}.depth.view")
+        _require(allocation > 0 and view > 0,
+                 f"{where}: zero depth attachment identity")
+        expected = _hex(depth["expected_hex"], f"{where}.depth.expected_hex")
+        _require(depth["expected_hex"] == expected.hex(),
+                 f"{where}.depth.expected_hex: the expectation has to be lowercase bytes")
+        width = _integer(depth["width"], f"{where}.depth.width", 1)
+        height = _integer(depth["height"], f"{where}.depth.height", 1)
+        _require(len(expected) == width * height * 4,
+                 f"{where}.depth: the expected depth texels do not match the attachment")
+        # The falsifiability rule the colour side states for its clear colour:
+        # clean depth texels are exactly what a pass that never stored the
+        # attachment leaves behind, so an expectation equal to them could not
+        # tell "stored" from "dropped".
+        _require(expected != struct.pack("<f", depth["clear_depth"]) * (width * height),
+                 f"{where}: the expected depth texels equal the clear depth")
+        # The depth attachment is a second resource of the same pass, so it
+        # cannot be the colour attachment under another name
+        # (`research/docs/23` §3.3, v43).
+        colours = [case["attachment"]] if "attachment" in case \
+            else case.get("attachments", [])
+        _require(all(not isinstance(colour, dict)
+                     or (colour.get("allocation") != allocation
+                         and colour.get("view") != view)
+                     for colour in colours),
+                 f"{where}.depth: the depth resource has to differ from the colour "
+                 "attachment")
+        depth_store = (allocation, view, expected)
     test = case.get("depth_test")
     _require(isinstance(test, dict), f"{where}: a depth test is an object")
     _object(test, ("compare", "write"), f"{where}.depth_test")
@@ -1006,7 +1066,11 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
             f"{where}.indices")
     _require(indices["initial_hex"] == "000001000200030004000500",
              f"{where}: the reviewed depth indices are the two reviewed triangles")
-    return {"vertices": quad_indices, "indices": quad_indices}
+    # The stored depth attachment, when the case declares one, is the
+    # `(allocation, view, expected_texels)` triple the assembly below lands
+    # beside the colour attachment (`research/docs/23` §3.3, v43).
+    return {"vertices": quad_indices, "indices": quad_indices,
+            "depth_store": depth_store}
 
 
 def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
@@ -1577,6 +1641,43 @@ def _render_plan(plan, suite):
             identities.append((allocation, view, offset, len(expected)))
             written.add(allocation)
         touched = set(plan[declaring][1])
+        # The stored depth attachment (`research/docs/23` §3.3, v43) lands
+        # through the channel the colour attachments already use: one writeback
+        # under the depth view and one allocation image. Its view is declared by
+        # the declaring pass exactly as a colour attachment's is — the reviewed
+        # declaring kernel carries a third *read* binding for it — so the same
+        # three questions are asked here: the declaring case declares that one
+        # view, it only reads it (a compute write would race the store), and the
+        # declaration's byte range is the depth extent the attachment restates.
+        # The allocation image is the declaring case's own image with the landing
+        # overlaid, which is what makes the guard bytes around the view part of
+        # the comparison rather than something the fixture could forget.
+        if vertex_input is not None and vertex_input.get("depth_store") is not None:
+            depth_allocation, depth_view, depth_expected = vertex_input["depth_store"]
+            declared = [buffer for buffer in by_id[declaring]["buffers"]
+                        if buffer["allocation"] == depth_allocation
+                        and buffer["view"] == depth_view]
+            _require(len(declared) == 1,
+                     f"{where}: the declaring case has to declare exactly the depth "
+                     "attachment view")
+            declared = declared[0]
+            _require(declared["access"] == "read",
+                     f"{where}: the declaring pass must only read the depth attachment view")
+            _require(declared["length"] == len(depth_expected),
+                     f"{where}: the depth view's byte range disagrees with the attachment")
+            _require(_hex(declared.get("initial_hex"), f"{where} declared depth bytes")
+                     != depth_expected,
+                     f"{where}: the declared depth view's bytes equal the expectation")
+            image = bytearray(plan[declaring][1][depth_allocation])
+            _require(len(image) == declared["allocation_size"],
+                     f"{where}: inconsistent depth allocation size")
+            image[declared["offset"]:declared["offset"] + len(depth_expected)] = depth_expected
+            images[depth_allocation] = bytes(image)
+            writes.append(((depth_allocation, depth_view, declared["offset"]), depth_expected))
+            identities.append((depth_allocation, depth_view, declared["offset"],
+                               len(depth_expected)))
+            written.add(depth_allocation)
+            touched.add(depth_allocation)
         # The wildcard mask is stated once per observed attachment, in the
         # absolute byte offsets of its allocation, so the writeback comparison
         # and the allocation-image comparison read the same set.
@@ -1593,7 +1694,11 @@ def _render_plan(plan, suite):
             touched=touched,
             written=written,
             rails=frozenset(rails),
-            attachment=identities[0] if single else identities,
+            # The single-attachment shape declares one landing, so one identity
+            # is the whole review surface. A case that also stores its depth
+            # attachment observes two resources, and then the identity list is
+            # what has to cover both (`research/docs/23` §3.3, v43).
+            attachment=identities[0] if single and len(identities) == 1 else identities,
             present=present,
             icb=icb,
             wildcards=wildcards)

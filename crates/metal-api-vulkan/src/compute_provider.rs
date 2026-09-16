@@ -872,9 +872,56 @@ impl VulkanComputeProvider {
                 previous.push(source);
                 views.push(view);
             }
-            let texels = match trace.indirect.as_deref() {
+            // The stored depth attachment's landing view, resolved before the
+            // pass runs for the same reason the colour ones are: the bytes it
+            // receives have to be named by the trace, and a storing surface
+            // without a declaration is refused instead of executed
+            // (`research/docs/23` §3.3, v43).
+            let depth_view = match planned.pass.depth.as_ref() {
+                Some(depth) => match (depth.store, depth.identity) {
+                    (Some(metal_api_core::provider::DepthStoreOp::Store), Some(identity)) => {
+                        if !host_readback {
+                            // A trace that publishes no readback keeps its depth
+                            // texels on the device, exactly as a colour
+                            // attachment does, and needs no landing view.
+                            None
+                        } else {
+                            Some(
+                                pool.iter()
+                                    .find(|view| {
+                                        view.view_id == identity.view_id
+                                            && view.allocation_id == identity.allocation_id
+                                    })
+                                    .ok_or_else(|| {
+                                        refusal(
+                                    ProviderPhase::Resolve,
+                                    ProviderErrorClass::Capability,
+                                    "render_depth_landing_unsupported",
+                                )
+                                .with_field(
+                                    "view",
+                                    FieldValue::Unsigned(identity.view_id.get()),
+                                )
+                                .with_field(
+                                    "allocation",
+                                    FieldValue::Unsigned(identity.allocation_id.get()),
+                                )
+                                .with_detail(
+                                    "a stored depth attachment's texels land through the buffer \
+                                     writeback channel, and this trace declares no buffer view \
+                                     covering the attachment",
+                                )
+                                    })?,
+                            )
+                        }
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            let readback = match trace.indirect.as_deref() {
                 Some(payload) => {
-                    let texels = render::execute_indirect_render_pass(
+                    let readback = render::execute_indirect_render_pass(
                         &self.executor.context,
                         &planned.stages,
                         &planned.pass,
@@ -890,7 +937,7 @@ impl VulkanComputeProvider {
                         payload.range.count,
                         1,
                     );
-                    texels
+                    readback
                 }
                 None => render::execute_render_pass(
                     &self.executor.context,
@@ -899,7 +946,7 @@ impl VulkanComputeProvider {
                     &previous,
                 )?,
             };
-            for (view, texels) in views.into_iter().zip(texels) {
+            for (view, texels) in views.into_iter().zip(readback.attachments) {
                 // `None` is the discarded attachment: no bytes, no writeback,
                 // whatever the view resolution above produced (`docs/23`
                 // §3.6, v19).
@@ -912,6 +959,17 @@ impl VulkanComputeProvider {
                         bytes,
                     });
                 }
+            }
+            // The depth landing follows the colour ones, in the same channel
+            // and in the same (allocation, view) order the writeback contract
+            // states (`research/docs/23` §3.3, v43).
+            if let (Some(view), Some(texels)) = (depth_view, readback.depth) {
+                writebacks.push(BufferWriteback {
+                    view_id: view.view_id,
+                    allocation_id: view.allocation_id,
+                    offset: view.offset,
+                    bytes: texels,
+                });
             }
         }
         Ok(writebacks)

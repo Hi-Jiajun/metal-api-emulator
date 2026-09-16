@@ -31,10 +31,10 @@
 use ash::vk;
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
-    CompareFunction, CullMode, DepthTest, FieldValue, IndexFormat, IndirectCommandDescriptor,
-    LoadOp, ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp, VertexBufferLayout,
-    VertexFormat, VertexStep, Winding,
+    CompareFunction, CullMode, DepthStoreOp, DepthTest, FieldValue, IndexFormat,
+    IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
+    StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -321,7 +321,7 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 }
 
 /// The depth attachment one offscreen pass opens (`research/docs/23` §3.3,
-/// v36).
+/// v36/v43).
 pub(crate) struct OffscreenDepthAttachment {
     /// Extent in texels; core admission already held it to the colour
     /// attachments' own extent.
@@ -332,6 +332,19 @@ pub(crate) struct OffscreenDepthAttachment {
     /// The pass's depth state, or `None` for "the attachment exists and
     /// nothing tests it".
     pub test: Option<DepthTest>,
+    /// The store action the trace stated, or `None` for the pre-v43 shape
+    /// (`research/docs/23` §3.3, v43). A storing surface is the only one this
+    /// rail reads back: it ends the render pass in `TRANSFER_SRC_OPTIMAL`, gets
+    /// its own readback buffer, and its texels leave through the same
+    /// `vkCmdCopyImageToBuffer` the colour attachments use.
+    pub store: Option<DepthStoreOp>,
+}
+
+impl OffscreenDepthAttachment {
+    /// Whether the pass keeps this surface — and therefore reads it back.
+    fn storing(&self) -> bool {
+        self.store == Some(DepthStoreOp::Store)
+    }
 }
 
 /// One colour attachment of an offscreen render request.
@@ -576,7 +589,9 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
 }
 
 /// Execute one admitted render pass and return, in location order, each stored
-/// attachment's tightly packed texel bytes and `None` for each discarded one.
+/// attachment's tightly packed texel bytes and `None` for each discarded one,
+/// plus the stored depth surface's own texels when the pass keeps it
+/// (`research/docs/23` §3.3, v43).
 ///
 /// This is the trace-side entry point of the rail: the pass's shape rules were
 /// already checked by core admission, so what is left here is the agreement
@@ -594,7 +609,7 @@ pub(crate) fn execute_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     previous: &[Option<&[u8]>],
-) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
+) -> Result<OffscreenReadback, ProviderError> {
     let request = prepare_render_request(stages, pass, previous)?;
     execute_offscreen_render(context, &request)
 }
@@ -850,6 +865,7 @@ fn prepare_render_request<'a>(
         height: u32::try_from(depth.height).unwrap_or(u32::MAX),
         clear: depth.load.clear_depth(),
         test: pass.depth_test,
+        store: depth.store,
     });
     let request = OffscreenRenderRequest {
         attachments,
@@ -1015,7 +1031,7 @@ pub(crate) fn execute_indirect_render_pass(
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
     previous: &[Option<&[u8]>],
-) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
+) -> Result<OffscreenReadback, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
             vertex_count,
@@ -1211,10 +1227,24 @@ pub(crate) fn admit_color_attachment(
 /// at-least-one-store gates are re-run here for a directly-constructed request,
 /// so the fail-closed shape does not depend on the caller having gone through
 /// `prepare_render_request`.
+/// The texels one offscreen pass hands back (`research/docs/23` §3.3, v43).
+///
+/// `attachments` carries one entry per colour attachment, in location order,
+/// with `None` for each discarded one — the shape the readback channel had
+/// before the depth attachment could be observed. `depth` carries the stored
+/// depth surface's own tightly packed `depth32float` texels, or `None` when the
+/// pass discards its depth attachment (which is what every pre-v43 trace
+/// states).
+#[derive(Debug)]
+pub(crate) struct OffscreenReadback {
+    pub attachments: Vec<Option<Vec<u8>>>,
+    pub depth: Option<Vec<u8>>,
+}
+
 pub(crate) fn execute_offscreen_render(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
-) -> Result<Vec<Option<Vec<u8>>>, ProviderError> {
+) -> Result<OffscreenReadback, ProviderError> {
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
     if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
@@ -1345,8 +1375,18 @@ pub(crate) fn execute_offscreen_render(
     if let Some(depth) = &request.depth {
         // The depth image is created before the render pass that names it, and
         // its `Load`/clear choice is settled by the image's own load operation
-        // (`research/docs/23` §3.3, v36).
-        objects.create_depth(depth.width, depth.height, depth.clear.is_none())?;
+        // (`research/docs/23` §3.3, v36). A pass that keeps the surface also
+        // creates the readback destination its texels land in, before the
+        // render pass is built from the same decision (v43).
+        objects.create_depth(
+            depth.width,
+            depth.height,
+            depth.clear.is_none(),
+            depth.storing(),
+        )?;
+        if depth.storing() {
+            objects.create_depth_readback(byte_length)?;
+        }
     }
     objects.create_render_pass(&vk_formats, request.depth.as_ref())?;
     objects.create_framebuffer(width, height)?;
@@ -1405,7 +1445,9 @@ pub(crate) fn execute_offscreen_render(
 
     // One readback record per stored attachment: `copy_out` equals the stored
     // attachment count, so a caller can observe that a stored location really
-    // left the device and that a discarded one produced no bytes at all.
+    // left the device and that a discarded one produced no bytes at all. A
+    // stored depth surface adds its own record on top of that count, through
+    // the same copy-out channel (`research/docs/23` §3.3, v43).
     let mut results = Vec::with_capacity(request.attachments.len());
     let mut mappings = readback_mappings.into_iter();
     for attachment in &request.attachments {
@@ -1421,7 +1463,11 @@ pub(crate) fn execute_offscreen_render(
             results.push(None);
         }
     }
-    Ok(results)
+    let depth = objects.depth_readback_bytes(byte_length as usize, context)?;
+    Ok(OffscreenReadback {
+        attachments: results,
+        depth,
+    })
 }
 
 /// One provider-owned presentable target image (`research/docs/24` §3.6).
@@ -1806,6 +1852,29 @@ pub(crate) fn execute_present_render(
     if attachment.store == StoreOp::DontCare {
         return Err(render_all_attachments_discarded_refusal());
     }
+    // A present pass renders into the provider-owned target alone: it opens no
+    // depth surface, so a trace that names one — stored or not — asks for a
+    // state this shape cannot execute. Refusing here keeps the depth attachment
+    // from being silently dropped instead of opened, which is what the
+    // offscreen path would do with it (`research/docs/23` §3.3, v43).
+    if let Some(depth) = &request.depth {
+        return Err(capability_refusal("render_present_depth_unsupported")
+            .with_field(
+                "store",
+                FieldValue::Text(
+                    match depth.store {
+                        Some(DepthStoreOp::Store) => "store",
+                        Some(DepthStoreOp::DontCare) => "dontcare",
+                        None => "unstated",
+                    }
+                    .to_owned(),
+                ),
+            )
+            .with_detail(
+                "the present rail renders into one provider-owned colour target and opens no \
+                 depth surface",
+            ));
+    }
     let [width, height] = request.extent;
     if width == 0 || height == 0 {
         return Err(contract_refusal("render attachment has a zero dimension"));
@@ -1969,6 +2038,13 @@ struct DepthObjects {
     /// Whether the pass opens the image from the attachment layout a previous
     /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
     loading: bool,
+    /// The host-visible buffer this pass's depth texels land in, present
+    /// exactly when the pass stores the surface (`research/docs/23` §3.3, v43).
+    /// A discarded surface is never copied out, so it needs no destination.
+    readback: Option<ReadbackObjects>,
+    /// The mapping of [`Self::readback`], as the pointer the host reads after
+    /// the fence signals — the same shape a colour attachment's readback has.
+    mapping: Option<usize>,
 }
 
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
@@ -2075,20 +2151,22 @@ impl<'a> OffscreenObjects<'a> {
     /// reads its pre-pass contents (`docs/23` §3.1, v20);
     /// `DEVICE_LOCAL` is the memory class the probe used for every
     /// optimal-tiling candidate.
-    /// Create the rail-owned depth image of a pass that declares one.
+    /// Create the depth image of a pass that declares one.
     ///
-    /// The image is a `D32_SFLOAT` depth attachment with no transfer usage and
-    /// no readback: nothing observes it in this increment, so the render pass
-    /// is free to leave it in its attachment layout after the pass
-    /// (`research/docs/23` §3.3, v36). `Load` opens it from the attachment
-    /// layout a previous pass left it in — which only a trace that wrote it in
-    /// the same submission can rely on — and a clear opens it from
-    /// `UNDEFINED`.
+    /// The image is a `D32_SFLOAT` depth attachment. A pass that keeps the
+    /// surface (`research/docs/23` §3.3, v43) also asks for `TRANSFER_SRC`,
+    /// because its texels leave through `vkCmdCopyImageToBuffer`; a discarded
+    /// surface needs no transfer usage and stays in its attachment layout after
+    /// the pass, exactly as every pre-v43 depth image did. `Load` opens the
+    /// image from the attachment layout a previous pass left it in — which only
+    /// a trace that wrote it in the same submission can rely on — and a clear
+    /// opens it from `UNDEFINED`.
     fn create_depth(
         &mut self,
         width: u32,
         height: u32,
         loading: bool,
+        storing: bool,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -2102,7 +2180,14 @@ impl<'a> OffscreenObjects<'a> {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .usage(
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | if storing {
+                        vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    },
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let (image, memory, _) = crate::allocate_image_backing(
@@ -2120,6 +2205,8 @@ impl<'a> OffscreenObjects<'a> {
             memory,
             view,
             loading,
+            readback: None,
+            mapping: None,
         });
         Ok(())
     }
@@ -2244,11 +2331,17 @@ impl<'a> OffscreenObjects<'a> {
                     .final_layout(final_layout)
             })
             .chain(depth.map(|_| {
-                // The depth attachment: never stored (nothing reads it back),
-                // opened from `UNDEFINED` for a clear and from the attachment
-                // layout for a load, and left in the attachment layout after
-                // the pass (`research/docs/23` §3.3, v36).
+                // The depth attachment: opened from `UNDEFINED` for a clear and
+                // from the attachment layout for a load
+                // (`research/docs/23` §3.3, v36). A pass that states no store
+                // action discards the surface and leaves it in its attachment
+                // layout; a storing pass ends in `TRANSFER_SRC_OPTIMAL`, so the
+                // copy-out below runs without a further barrier (v43).
                 let loading = self.depth.as_ref().is_some_and(|objects| objects.loading);
+                let storing = self
+                    .depth
+                    .as_ref()
+                    .is_some_and(|objects| objects.readback.is_some());
                 vk::AttachmentDescription::default()
                     .format(vk::Format::D32_SFLOAT)
                     .samples(vk::SampleCountFlags::TYPE_1)
@@ -2257,7 +2350,11 @@ impl<'a> OffscreenObjects<'a> {
                     } else {
                         vk::AttachmentLoadOp::CLEAR
                     })
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .store_op(if storing {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    })
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(if loading {
@@ -2265,7 +2362,11 @@ impl<'a> OffscreenObjects<'a> {
                     } else {
                         vk::ImageLayout::UNDEFINED
                     })
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .final_layout(if storing {
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    } else {
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                    })
             }))
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
@@ -2320,6 +2421,10 @@ impl<'a> OffscreenObjects<'a> {
             // The depth clear and the test's depth writes are their own access
             // class: the same pair the colour side states, named for the
             // early/late fragment tests (`research/docs/23` §3.3, v36).
+            let storing_depth = self
+                .depth
+                .as_ref()
+                .is_some_and(|objects| objects.readback.is_some());
             dependencies.push(
                 vk::SubpassDependency::default()
                     .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -2343,9 +2448,17 @@ impl<'a> OffscreenObjects<'a> {
                         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                             | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     )
-                    .dst_stage_mask(vk::PipelineStageFlags::HOST)
+                    // A storing surface hands its depth writes on to the
+                    // transfer stage the copy-out runs in; a discarded one has
+                    // nothing to hand on, so the dependency only has to witness
+                    // the pass (`research/docs/23` §3.3, v43).
+                    .dst_stage_mask(vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TRANSFER)
                     .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::empty()),
+                    .dst_access_mask(if storing_depth {
+                        vk::AccessFlags::TRANSFER_READ
+                    } else {
+                        vk::AccessFlags::empty()
+                    }),
             );
         }
         let info = vk::RenderPassCreateInfo::default()
@@ -2648,20 +2761,71 @@ impl<'a> OffscreenObjects<'a> {
     ///
     /// Returns the persistent mapping of the readback memory.
     fn create_readback(&mut self, byte_length: u64) -> Result<usize, ProviderError> {
+        let (objects, mapping) = Self::allocate_readback(self.context, byte_length)?;
+        self.readbacks.push(objects);
+        Ok(mapping)
+    }
+
+    /// The depth attachment's own readback destination
+    /// (`research/docs/23` §3.3, v43).
+    ///
+    /// The stored depth surface lands through the same staging shape a colour
+    /// attachment uses, but it is not part of `readbacks`: that list is zipped
+    /// with the colour attachments in location order, and the depth copy is
+    /// recorded separately after them. Returns the mapping the host reads once
+    /// the fence signals.
+    fn create_depth_readback(&mut self, byte_length: u64) -> Result<usize, ProviderError> {
+        let (objects, mapping) = Self::allocate_readback(self.context, byte_length)?;
+        let depth = self.depth.as_mut().ok_or_else(|| {
+            contract_refusal("a depth readback needs the depth attachment it copies out of")
+        })?;
+        depth.readback = Some(objects);
+        depth.mapping = Some(mapping);
+        Ok(mapping)
+    }
+
+    /// The stored depth surface's texels, copied out of the readback mapping
+    /// once the fence has signalled (`research/docs/23` §3.3, v43).
+    ///
+    /// `None` for a pass whose depth attachment has no readback — either no
+    /// depth attachment at all or one the trace discards, which is the shape
+    /// every pre-v43 frame states.
+    fn depth_readback_bytes(
+        &self,
+        byte_length: usize,
+        context: &VulkanContext,
+    ) -> Result<Option<Vec<u8>>, ProviderError> {
+        let Some(mapping) = self.depth.as_ref().and_then(|depth| depth.mapping) else {
+            return Ok(None);
+        };
+        let texels =
+            unsafe { std::slice::from_raw_parts(mapping as *const u8, byte_length).to_vec() };
+        context.record_buffer_readback();
+        context.record_buffer_readback_bytes(texels.len());
+        Ok(Some(texels))
+    }
+
+    /// Create one `TRANSFER_DST` host-visible buffer and map it, without
+    /// attaching it to any list: the colour path pushes it into `readbacks`,
+    /// the depth path keeps it beside the depth image.
+    fn allocate_readback(
+        context: &VulkanContext,
+        byte_length: u64,
+    ) -> Result<(ReadbackObjects, usize), ProviderError> {
         let info = vk::BufferCreateInfo::default()
             .size(byte_length)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { self.context.device.create_buffer(&info, None) }
+        let buffer = unsafe { context.device.create_buffer(&info, None) }
             .map_err(|error| execution_refusal("create readback buffer", &error.to_string()))?;
-        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match self.context.memory_type(
+        let requirements = unsafe { context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match context.memory_type(
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         ) {
             Ok(index) => index,
             Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                unsafe { context.device.destroy_buffer(buffer, None) };
                 return Err(execution_refusal(
                     "find readback memory type",
                     &error.to_string(),
@@ -2671,20 +2835,20 @@ impl<'a> OffscreenObjects<'a> {
         let allocation = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type);
-        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+        let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
             Ok(memory) => memory,
             Err(error) => {
-                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                unsafe { context.device.destroy_buffer(buffer, None) };
                 return Err(execution_refusal(
                     "allocate readback memory",
                     &error.to_string(),
                 ));
             }
         };
-        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+        if let Err(error) = unsafe { context.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
-                self.context.device.destroy_buffer(buffer, None);
-                self.context.device.free_memory(memory, None);
+                context.device.destroy_buffer(buffer, None);
+                context.device.free_memory(memory, None);
             }
             return Err(execution_refusal(
                 "bind readback memory",
@@ -2692,24 +2856,20 @@ impl<'a> OffscreenObjects<'a> {
             ));
         }
         let mapping = match unsafe {
-            self.context.device.map_memory(
-                memory,
-                0,
-                requirements.size,
-                vk::MemoryMapFlags::empty(),
-            )
+            context
+                .device
+                .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
         } {
             Ok(mapping) => mapping as usize,
             Err(error) => {
                 unsafe {
-                    self.context.device.destroy_buffer(buffer, None);
-                    self.context.device.free_memory(memory, None);
+                    context.device.destroy_buffer(buffer, None);
+                    context.device.free_memory(memory, None);
                 }
                 return Err(execution_refusal("map readback memory", &error.to_string()));
             }
         };
-        self.readbacks.push(ReadbackObjects { buffer, memory });
-        Ok(mapping)
+        Ok((ReadbackObjects { buffer, memory }, mapping))
     }
 
     /// Encode one `VkDrawIndirectCommand` into a host-visible
@@ -3288,6 +3448,40 @@ impl<'a> OffscreenObjects<'a> {
                     readback.buffer,
                     std::slice::from_ref(&copy),
                 );
+            }
+        }
+        // The stored depth attachment's own copy, after the colour ones and
+        // with the depth aspect (`research/docs/23` §3.3, v43). The render
+        // pass already left the image in `TRANSFER_SRC_OPTIMAL`, so the copy
+        // needs no barrier of its own; a discarded surface has no readback
+        // buffer and is not copied at all.
+        if let Some(depth) = &self.depth {
+            if let Some(readback) = &depth.readback {
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                unsafe {
+                    self.context.device.cmd_copy_image_to_buffer(
+                        self.command,
+                        depth.image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        readback.buffer,
+                        std::slice::from_ref(&copy),
+                    );
+                }
             }
         }
         unsafe { self.context.device.end_command_buffer(self.command) }
@@ -3935,7 +4129,10 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("the 2x2 {format:?} render pass executes: {error:?}"));
-        let texels = blobs.remove(0).expect("a stored attachment reads back");
+        let texels = blobs
+            .attachments
+            .remove(0)
+            .expect("a stored attachment reads back");
         eprintln!(
             "{format:?} readback: {} (first texel: {})",
             hex(&texels),
@@ -4287,7 +4484,10 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("the partial {format:?} pass executes: {error:?}"));
-            let texels = blobs.remove(0).expect("a stored attachment reads back");
+            let texels = blobs
+                .attachments
+                .remove(0)
+                .expect("a stored attachment reads back");
             eprintln!(
                 "{format:?} partial readback: {} (clear {clear_texel:02x?}, stored {stored_texel:02x?})",
                 hex(&texels)
@@ -4563,11 +4763,11 @@ mod tests {
         .expect("the reviewed dual pass executes");
         let (uploads_after, readbacks_after) = context.buffer_copy_counts();
 
-        assert_eq!(blobs.len(), 2, "one readback per attachment");
-        let location_0 = blobs[0]
+        assert_eq!(blobs.attachments.len(), 2, "one readback per attachment");
+        let location_0 = blobs.attachments[0]
             .as_ref()
             .expect("location 0 is stored and reads back");
-        let location_1 = blobs[1]
+        let location_1 = blobs.attachments[1]
             .as_ref()
             .expect("location 1 is stored and reads back");
         eprintln!("location 0: {}", hex(location_0));
@@ -4629,11 +4829,18 @@ mod tests {
         .expect("the reviewed store-plus-discard pass executes");
         let (uploads_after, readbacks_after) = context.buffer_copy_counts();
 
-        assert_eq!(blobs.len(), 2, "one result entry per attachment");
-        let stored = blobs[0]
+        assert_eq!(
+            blobs.attachments.len(),
+            2,
+            "one result entry per attachment"
+        );
+        let stored = blobs.attachments[0]
             .as_ref()
             .expect("location 0 is stored and reads back");
-        assert_eq!(blobs[1], None, "the discarded location reads back nothing");
+        assert_eq!(
+            blobs.attachments[1], None,
+            "the discarded location reads back nothing"
+        );
         eprintln!("stored location: {}", hex(stored));
         assert_eq!(*stored, EXPECTED_RGBA8_TEXELS.repeat(4));
         assert_eq!(
@@ -4691,12 +4898,12 @@ mod tests {
         )
         .expect("the load-plus-discard pass executes");
 
-        let stored = blobs[0]
+        let stored = blobs.attachments[0]
             .as_ref()
             .expect("location 0 is stored and reads back");
         assert_eq!(*stored, EXPECTED_RGBA8_TEXELS.repeat(4));
         assert_eq!(
-            blobs[1], None,
+            blobs.attachments[1], None,
             "the loaded location is discarded after the draw"
         );
     }
@@ -4913,7 +5120,9 @@ mod tests {
         )
         .expect("the reviewed single-attachment DontCare pass executes");
         let (uploads_after, readbacks_after) = context.buffer_copy_counts();
-        let texels = blobs[0].as_ref().expect("the stored attachment reads back");
+        let texels = blobs.attachments[0]
+            .as_ref()
+            .expect("the stored attachment reads back");
         eprintln!("dont_care readback: {}", hex(texels));
         assert_eq!(*texels, EXPECTED_RGBA8_TEXELS.repeat(4));
         assert_eq!(
@@ -4952,6 +5161,86 @@ mod tests {
         assert_eq!(
             refused.fields.get("load_op"),
             Some(&FieldValue::Text("dont_care".to_owned()))
+        );
+    }
+
+    /// A stored depth attachment lands its own texels through the readback
+    /// channel (`research/docs/23` §3.3, v43).
+    ///
+    /// The pass clears the surface to one and then draws the milestone's
+    /// full-screen triangle with a `less` test and depth writes on, so every
+    /// texel the draw covers takes the triangle's own depth (`0.0`) and the
+    /// stored bytes are `00000000` rather than the clear's `0000803f`. A rail
+    /// that opened the surface but never copied it out would hand back `None`,
+    /// and one that skipped the depth write would hand back the clear value:
+    /// both are distinguishable from the expected bytes.
+    ///
+    /// The discarded shape is measured in the same test: it still opens the
+    /// surface — the pre-v43 shape — and hands nothing back, which is what the
+    /// absence of the wide sections means.
+    #[test]
+    fn a_stored_depth_attachment_reads_back_its_own_texels() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let request = |store: Option<DepthStoreOp>| OffscreenRenderRequest {
+            blend: None,
+            cull: None,
+            depth: Some(OffscreenDepthAttachment {
+                width: 2,
+                height: 2,
+                clear: Some(1.0),
+                test: Some(DepthTest {
+                    compare: CompareFunction::Less,
+                    write: true,
+                }),
+                store,
+            }),
+            base_vertex: 0,
+            scissor: None,
+            attachments: vec![OffscreenColorAttachment {
+                format: AttachmentFormat::Rgba8Unorm,
+                store: StoreOp::Store,
+                load: LoadOp::Clear(ClearColor::new([CLEAR_SENTINEL; 4])),
+                previous: None,
+            }],
+            extent: [2, 2],
+            vertex: milestone_vertex(),
+            vertex_streams: Vec::new(),
+            draw: DrawShape::Milestone,
+            instance_count: 1,
+            index_stream: None,
+            indirect: None,
+        };
+
+        let readback = execute_offscreen_render(&context, &request(Some(DepthStoreOp::Store)))
+            .expect("the depth-storing pass executes");
+        let depth = readback
+            .depth
+            .expect("a stored depth attachment reads back its texels");
+        eprintln!("stored depth readback: {}", hex(&depth));
+        assert_eq!(depth.len(), 16, "one four-byte texel per pixel");
+        assert_eq!(depth, 0.0_f32.to_le_bytes().repeat(4));
+        assert_ne!(
+            depth,
+            1.0_f32.to_le_bytes().repeat(4),
+            "the stored texels are the draw's depth, not the clear value"
+        );
+        assert_eq!(
+            readback.attachments[0].as_deref(),
+            Some(EXPECTED_RGBA8_TEXELS.repeat(4).as_slice()),
+            "the colour landing is unchanged by the depth readback"
+        );
+
+        let discarded = execute_offscreen_render(&context, &request(None))
+            .expect("the discarded-depth pass executes");
+        assert_eq!(
+            discarded.depth, None,
+            "a pass that states no store action hands back no depth bytes"
+        );
+        assert_eq!(
+            discarded.attachments[0].as_deref(),
+            Some(EXPECTED_RGBA8_TEXELS.repeat(4).as_slice())
         );
     }
 

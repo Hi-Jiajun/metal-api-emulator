@@ -1743,6 +1743,61 @@ impl DepthLoadOp {
     }
 }
 
+/// What a pass does with its depth attachment once the draw is over
+/// (`research/docs/23` §3.3, v43).
+///
+/// The pair is the two implementations' common vocabulary: Metal states it as
+/// the depth attachment descriptor's `MTLStoreAction` and Vulkan as the depth
+/// attachment reference's `storeOp`. A pre-v43 trace states nothing at all —
+/// the `store` field of [`RenderDepthAttachment`] stays `None` rather than
+/// implying one of these arms, because the surface those traces opened was
+/// rail-owned and disappeared with the pass. The discarded arm below is the
+/// explicit spelling of that same shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepthStoreOp {
+    /// Discard the attachment's contents when the pass ends.
+    DontCare,
+    /// Keep the attachment's contents, which is what makes them observable.
+    Store,
+}
+
+impl DepthStoreOp {
+    pub const ADMITTED: [Self; 2] = [Self::DontCare, Self::Store];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::DontCare => 0,
+            Self::Store => 1,
+        }
+    }
+
+    /// Inverse of [`DepthStoreOp::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::DontCare),
+            1 => Some(Self::Store),
+            _ => None,
+        }
+    }
+}
+
+/// The resource identity of a stored depth attachment
+/// (`research/docs/23` §3.3, v43).
+///
+/// The colour side states the same pair on every attachment it renders to
+/// ([`RenderAttachment`]); the depth side states it here, and only for the
+/// shape whose bytes land somewhere: a depth attachment that is discarded with
+/// its pass has no landing to name, so it keeps the pre-v43 rail-owned
+/// description with no identity at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderDepthIdentity {
+    /// The allocation the stored depth texels land in.
+    pub allocation_id: AllocationId,
+    /// The view inside that allocation the landing covers.
+    pub view_id: ViewId,
+}
+
 /// How one depth comparison treats a fragment (`research/docs/23` §3.3, v36).
 ///
 /// Two values, because the reviewed fixture needs exactly these: `Less` is the
@@ -1966,14 +2021,20 @@ pub struct RenderPassCull {
 }
 
 /// The depth attachment one render pass carries (`research/docs/23` §3.3,
-/// v36).
+/// v36/v43).
 ///
 /// The first depth increment's attachment is **rail-owned**: it has no view or
 /// allocation identity in the trace's resource table and no observation
-/// channel, because nothing reads it back yet. What a trace states is the shape
-/// the rails have to create and open: the format, the extent and the load
-/// operation. A depth readback channel is a later increment, and it is what
-/// would add the identity fields this one deliberately leaves out.
+/// channel, because nothing reads it back. What a trace states is the shape the
+/// rails have to create and open: the format, the extent and the load
+/// operation. The readback increment (v43) adds exactly two fields to that
+/// description — how long the surface has to survive the pass ([`store`]) and,
+/// for the shape that keeps it, where its texels land ([`identity`]) — and
+/// leaves the pre-v43 description byte-identical by making both `None` the
+/// shape every earlier trace means.
+///
+/// [`store`]: RenderDepthAttachment::store
+/// [`identity`]: RenderDepthAttachment::identity
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderDepthAttachment {
     /// The only format this increment admits ([`DepthFormat::ADMITTED`]).
@@ -1984,7 +2045,43 @@ pub struct RenderDepthAttachment {
     pub height: u64,
     /// How the pass establishes the attachment's contents.
     pub load: DepthLoadOp,
+    /// The store action the pass asks for, or `None` for the pre-v43 shape
+    /// (`research/docs/23` §3.3, v43): the rail-owned surface disappears with
+    /// the pass, exactly as [`DepthStoreOp::DontCare`] states it explicitly.
+    ///
+    /// A storing surface needs an [`identity`](Self::identity) as well, and an
+    /// identity needs a storing surface: the pair is all-or-nothing, because
+    /// "keep these texels" without a landing is unobservable and a landing
+    /// without a store op has no bytes to compare.
+    pub store: Option<DepthStoreOp>,
+    /// The stored surface's resource identity, present exactly when the trace
+    /// observes the texels (`research/docs/23` §3.3, v43). The bytes land
+    /// through the same writeback channel a colour attachment uses: one
+    /// [`BufferWriteback`] for the view at its own offset inside the
+    /// allocation, in the surface's own `depth32float` texel layout.
+    pub identity: Option<RenderDepthIdentity>,
 }
+
+impl RenderDepthAttachment {
+    /// Tightly packed byte extent of the depth surface, in the same
+    /// texel-level unit [`RenderAttachment::expected_bytes`] uses: one four-byte
+    /// `depth32float` texel per pixel.
+    pub fn expected_bytes(&self) -> Result<u64, ContractError> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|texels| texels.checked_mul(DEPTH_BYTES_PER_TEXEL))
+            .ok_or(ContractError::ArithmeticOverflow("depth attachment bytes"))
+    }
+
+    /// Whether the pass keeps this surface, which is what makes it observable.
+    pub fn is_stored(&self) -> bool {
+        self.store == Some(DepthStoreOp::Store)
+    }
+}
+
+/// `VK_FORMAT_D32_SFLOAT` and `MTLPixelFormatDepth32Float` both carry one
+/// four-byte texel, which is what makes the depth readback a flat byte extent.
+pub const DEPTH_BYTES_PER_TEXEL: u64 = 4;
 
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
@@ -2221,6 +2318,33 @@ impl RenderPassDescriptor {
                     viewport: [width, height],
                     depth: [depth.width, depth.height],
                 });
+            }
+            // The store action and the identity are one decision in two
+            // fields (`research/docs/23` §3.3, v43): a surface the pass keeps
+            // has to say where its texels land, and an identity without a
+            // storing surface has no bytes to compare. The pre-v43 shape —
+            // both absent — stays the empty statement, and the explicit
+            // discard without an identity is the same shape spelled out.
+            match (depth.store, depth.identity) {
+                (None, None) | (Some(DepthStoreOp::DontCare), None) => {}
+                (None, Some(_))
+                | (Some(DepthStoreOp::Store), None)
+                | (Some(DepthStoreOp::DontCare), Some(_)) => {
+                    return Err(ContractError::DepthStoreIdentityMismatch {
+                        store: depth.store.map(DepthStoreOp::code),
+                        identity: depth.identity.is_some(),
+                    });
+                }
+                (Some(DepthStoreOp::Store), Some(identity)) => {
+                    if identity.allocation_id.is_zero() {
+                        return Err(ContractError::InvalidIdentity(
+                            "depth attachment allocation id",
+                        ));
+                    }
+                    if identity.view_id.is_zero() {
+                        return Err(ContractError::InvalidIdentity("depth attachment view id"));
+                    }
+                }
             }
         }
         // The blend state is indexed by colour location: one entry per
@@ -4365,6 +4489,45 @@ impl DeclaredView {
             }
         }
     }
+
+    /// Whether this declaration describes the shape a stored depth attachment
+    /// restates (`research/docs/23` §3.3, v43), or the refusal that names the
+    /// disagreement.
+    ///
+    /// Only a buffer declaration can cover a depth landing: the attachment's
+    /// texels leave through the byte-keyed writeback channel, so the view they
+    /// land in has to be a byte range of its own. A texture declaration of the
+    /// same identity therefore never covers it — the depth surface's texels
+    /// would have no offset to start at — and the refusal is the same
+    /// byte-count disagreement a shorter buffer declaration gets.
+    fn admit_depth_extent(
+        self,
+        pass_index: usize,
+        depth: &RenderDepthAttachment,
+        view: ViewId,
+    ) -> Result<(), ContractError> {
+        let expected = depth.expected_bytes()?;
+        match self {
+            Self::Buffer { length, .. } => {
+                if expected == length {
+                    Ok(())
+                } else {
+                    Err(ContractError::AttachmentExtentMismatch {
+                        pass_index,
+                        view,
+                        expected,
+                        declared: length,
+                    })
+                }
+            }
+            Self::Texture { .. } => Err(ContractError::AttachmentExtentMismatch {
+                pass_index,
+                view,
+                expected,
+                declared: self.extent_bytes(),
+            }),
+        }
+    }
 }
 
 impl ComputeTrace {
@@ -4538,6 +4701,100 @@ impl ComputeTrace {
         Ok(())
     }
 
+    /// Resolve one render attachment's view against the trace's own
+    /// declarations, and refuse every hazard the serial execution order cannot
+    /// express (`research/docs/23` §3.6).
+    ///
+    /// Shared by the colour and depth attachments, because both land their
+    /// bytes in a declared view and therefore answer the same questions: is the
+    /// view declared at all, does the declaration sit in the attachment's own
+    /// allocation, does it cover the attachment's extent (the caller's
+    /// `admit_extent` states which unit that is — colour texels for one,
+    /// `depth32float`'s four-byte texels for the other), and does any compute
+    /// pass write, or — after the store — even read those same bytes. The
+    /// hazard comparison is by byte range rather than identity, whichever view
+    /// the compute pass goes through (`research/docs/14` §3.2, review item M3,
+    /// 2026-09-14).
+    fn admit_attachment_view(
+        declared: &BTreeMap<ViewId, Vec<DeclaredView>>,
+        pool: &mut BTreeSet<ViewId>,
+        pass_index: usize,
+        view: ViewId,
+        allocation: AllocationId,
+        admit_extent: &dyn Fn(DeclaredView) -> Result<(), ContractError>,
+    ) -> Result<(), ContractError> {
+        let Some(declarations) = declared.get(&view) else {
+            return Err(ContractError::AttachmentViewUnknown {
+                pass_index,
+                view,
+                allocation,
+            });
+        };
+        for declaration in declarations {
+            if declaration.allocation_id() != allocation {
+                return Err(ContractError::AttachmentViewAllocationMismatch {
+                    pass_index,
+                    view,
+                    declared: declaration.allocation_id(),
+                    referenced: allocation,
+                });
+            }
+            admit_extent(*declaration)?;
+        }
+        let ranges = declarations
+            .iter()
+            .map(|declaration| declaration.byte_range())
+            .collect::<Vec<_>>();
+        for (compute_view, others) in declared {
+            for other in others {
+                if !other.is_writable() {
+                    continue;
+                }
+                if ranges
+                    .iter()
+                    .any(|range| range.overlaps(&other.byte_range()))
+                {
+                    return Err(ContractError::AttachmentComputeConflict {
+                        pass_index,
+                        view,
+                        compute_view: *compute_view,
+                        compute_pass: other.pass_index(),
+                    });
+                }
+            }
+        }
+        // The read half of the same question, answered by the contract's own
+        // execution order: every compute pass runs before every render pass, so
+        // a compute pass *after* this render pass that binds overlapping bytes
+        // would see bytes the trace's order does not give it. Writes are
+        // already refused above, whichever side of the render pass they are on.
+        for (compute_view, others) in declared {
+            for other in others {
+                if other.pass_index() <= pass_index {
+                    continue;
+                }
+                if ranges
+                    .iter()
+                    .any(|range| range.overlaps(&other.byte_range()))
+                {
+                    return Err(ContractError::RenderPassOrderUnsupported {
+                        pass_index,
+                        compute_pass: other.pass_index(),
+                        view,
+                        compute_view: *compute_view,
+                    });
+                }
+            }
+        }
+        if pool.insert(view) && pool.len() > MAX_SERIAL_RESOURCES {
+            return Err(ContractError::SerialResourceLimit {
+                requested: pool.len(),
+                maximum: MAX_SERIAL_RESOURCES,
+            });
+        }
+        Ok(())
+    }
+
     /// Validate the serial resource-reuse subset supported by command-buffer
     /// providers. Each pass binds a subset of the complete logical view pool,
     /// and may select another registered pipeline or permute its bound views.
@@ -4634,83 +4891,42 @@ impl ComputeTrace {
             .copied()
             .collect::<BTreeSet<ViewId>>();
         for (pass_index, attachment) in self.attachments() {
-            let Some(declarations) = declared.get(&attachment.view_id) else {
-                return Err(ContractError::AttachmentViewUnknown {
-                    pass_index,
-                    view: attachment.view_id,
-                    allocation: attachment.allocation_id,
-                });
+            Self::admit_attachment_view(
+                &declared,
+                &mut pool,
+                pass_index,
+                attachment.view_id,
+                attachment.allocation_id,
+                &|declaration| declaration.admit_extent(pass_index, attachment),
+            )?;
+        }
+        // A stored depth attachment that names where its texels land is a
+        // landing like any colour attachment (`research/docs/23` §3.3, v43):
+        // the same four questions are asked of it — is its view declared in the
+        // trace, does the declaration sit in the attachment's allocation, does
+        // it cover the depth surface's own byte extent, and does any compute
+        // pass touch those bytes. What differs is only the extent arithmetic
+        // (`depth32float`'s four bytes per texel) and the declaration the
+        // reviewed fixture uses: the declaring pass *reads* the depth view, so
+        // its kernel carries a third read binding.
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            let Some(render) = pass.as_render() else {
+                continue;
             };
-            for declaration in declarations {
-                if declaration.allocation_id() != attachment.allocation_id {
-                    return Err(ContractError::AttachmentViewAllocationMismatch {
-                        pass_index,
-                        view: attachment.view_id,
-                        declared: declaration.allocation_id(),
-                        referenced: attachment.allocation_id,
-                    });
-                }
-                declaration.admit_extent(pass_index, attachment)?;
-            }
-            // The attachment's own byte range is the one its declaration
-            // describes, and the hazard is any compute write of the same
-            // allocation that overlaps it — whichever view that write goes
-            // through. Identity equality would miss a sibling view and would
-            // have to be re-derived for every shape, so the comparison reuses
-            // the range comparator (`research/docs/14` §3.2, review item M3,
-            // 2026-09-14).
-            let ranges = declarations
-                .iter()
-                .map(|declaration| declaration.byte_range())
-                .collect::<Vec<_>>();
-            for (compute_view, others) in &declared {
-                for other in others {
-                    if !other.is_writable() {
-                        continue;
-                    }
-                    if ranges
-                        .iter()
-                        .any(|range| range.overlaps(&other.byte_range()))
-                    {
-                        return Err(ContractError::AttachmentComputeConflict {
-                            pass_index,
-                            view: attachment.view_id,
-                            compute_view: *compute_view,
-                            compute_pass: other.pass_index(),
-                        });
-                    }
-                }
-            }
-            // The read half of the same question, answered by the contract's own
-            // execution order: every compute pass runs before every render pass,
-            // so a compute pass *after* this render pass that binds overlapping
-            // bytes would see bytes the trace's order does not give it. Writes
-            // are already refused above, whichever side of the render pass they
-            // are on.
-            for (compute_view, others) in &declared {
-                for other in others {
-                    if other.pass_index() <= pass_index {
-                        continue;
-                    }
-                    if ranges
-                        .iter()
-                        .any(|range| range.overlaps(&other.byte_range()))
-                    {
-                        return Err(ContractError::RenderPassOrderUnsupported {
-                            pass_index,
-                            compute_pass: other.pass_index(),
-                            view: attachment.view_id,
-                            compute_view: *compute_view,
-                        });
-                    }
-                }
-            }
-            if pool.insert(attachment.view_id) && pool.len() > MAX_SERIAL_RESOURCES {
-                return Err(ContractError::SerialResourceLimit {
-                    requested: pool.len(),
-                    maximum: MAX_SERIAL_RESOURCES,
-                });
-            }
+            let Some(identity) = render.depth.as_ref().and_then(|depth| depth.identity) else {
+                continue;
+            };
+            let Some(depth) = render.depth.as_ref() else {
+                continue;
+            };
+            Self::admit_attachment_view(
+                &declared,
+                &mut pool,
+                pass_index,
+                identity.view_id,
+                identity.allocation_id,
+                &|declaration| declaration.admit_depth_extent(pass_index, depth, identity.view_id),
+            )?;
         }
         // Render vertex and index buffers declare their own bytes, so the only
         // questions left are the ones an ordering rule answers: no compute
@@ -4813,6 +5029,31 @@ impl ComputeTrace {
         }
         for (_, attachment) in self.attachments() {
             let Some(&position) = positions.get(&attachment.view_id) else {
+                continue;
+            };
+            let resource = &mut resources[position];
+            resource.access = match resource.access {
+                BufferAccess::Unused => BufferAccess::Write,
+                BufferAccess::Read => BufferAccess::ReadWrite,
+                BufferAccess::Write | BufferAccess::ReadWrite => resource.access,
+            };
+        }
+        // A stored depth attachment is a landing too (`research/docs/23` §3.3,
+        // v43): its view leaves through the same byte-keyed writeback channel,
+        // so the view it was declared with has to be writable before the pool
+        // is uploaded — exactly as a colour attachment's view is. A depth
+        // attachment a trace discards has no landing and keeps whatever access
+        // its declaration stated.
+        for pass in self.render_passes() {
+            let Some(identity) = pass
+                .depth
+                .as_ref()
+                .filter(|depth| depth.is_stored())
+                .and_then(|depth| depth.identity)
+            else {
+                continue;
+            };
+            let Some(&position) = positions.get(&identity.view_id) else {
                 continue;
             };
             let resource = &mut resources[position];
@@ -6245,6 +6486,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
+        | E::DepthStoreIdentityMismatch { .. }
         | E::BlendAttachmentCountMismatch { .. } => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
@@ -7685,6 +7927,17 @@ pub enum ContractError {
     /// The pass declares depth state but carries no depth attachment
     /// (`research/docs/23` §3.3, v36).
     DepthTestWithoutAttachment,
+    /// The pass's depth store action and depth identity disagree
+    /// (`research/docs/23` §3.3, v43).
+    ///
+    /// `store` is the wire code of the stated store action, or `None` when the
+    /// trace states none at all; `identity` is whether the depth attachment
+    /// named a landing. The two are one decision: `Store` needs a landing, and
+    /// a landing needs `Store`.
+    DepthStoreIdentityMismatch {
+        store: Option<u8>,
+        identity: bool,
+    },
     /// The pass's blend list does not carry one entry per colour attachment
     /// (`research/docs/23` §3.3, v40).
     BlendAttachmentCountMismatch {
@@ -8202,6 +8455,13 @@ impl fmt::Display for ContractError {
             Self::DepthTestWithoutAttachment => write!(
                 formatter,
                 "a depth test needs a depth attachment: there is nothing to test against"
+            ),
+            Self::DepthStoreIdentityMismatch { store, identity } => write!(
+                formatter,
+                "a depth store action (code {:?}) and a depth identity ({}) have to be stated \
+                 together: a stored surface needs a landing, and a landing needs a stored surface",
+                store,
+                if *identity { "present" } else { "absent" }
             ),
             Self::BlendAttachmentCountMismatch {
                 blend,
@@ -12777,6 +13037,127 @@ mod tests {
         );
     }
 
+    /// The reviewed `2x2` depth surface in its pre-v43 shape: rail-owned, kept
+    /// by nobody, named by nothing (`research/docs/23` §3.3, v36).
+    fn depth_attachment() -> RenderDepthAttachment {
+        RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: None,
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn depth_store_and_identity_are_one_decision_in_two_fields() {
+        let mut pass = render_pass();
+        pass.depth = Some(depth_attachment());
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        pass.validate()
+            .expect("the pre-v43 depth shape is well formed");
+
+        // The explicit discard is the pre-v43 shape spelled out: no landing,
+        // and nothing to compare afterwards.
+        let mut discarded = pass.clone();
+        discarded
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .store = Some(DepthStoreOp::DontCare);
+        discarded
+            .validate()
+            .expect("an explicitly discarded depth surface is well formed");
+
+        // A stored surface needs a landing: keeping texels nobody can name is
+        // exactly the observation this increment exists to make possible.
+        let mut storing_without_landing = discarded.clone();
+        storing_without_landing
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .store = Some(DepthStoreOp::Store);
+        assert_eq!(
+            storing_without_landing.validate(),
+            Err(ContractError::DepthStoreIdentityMismatch {
+                store: Some(DepthStoreOp::Store.code()),
+                identity: false,
+            })
+        );
+
+        // And a landing needs a stored surface: a discarded attachment has no
+        // bytes for the named view to carry.
+        let mut landing_without_store = pass.clone();
+        landing_without_store
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(950),
+        });
+        assert_eq!(
+            landing_without_store.validate(),
+            Err(ContractError::DepthStoreIdentityMismatch {
+                store: None,
+                identity: true,
+            })
+        );
+
+        // The pair together is the observed shape.
+        let mut observed = pass.clone();
+        {
+            let depth = observed
+                .depth
+                .as_mut()
+                .expect("the fixture opens a depth attachment");
+            depth.store = Some(DepthStoreOp::Store);
+            depth.identity = Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            });
+        }
+        observed
+            .validate()
+            .expect("a stored and named depth surface is well formed");
+
+        // The identity carries the same non-zero rule every other identity
+        // follows.
+        let mut zero_allocation = observed.clone();
+        zero_allocation
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(0),
+            view_id: ViewId::new(950),
+        });
+        assert_eq!(
+            zero_allocation.validate(),
+            Err(ContractError::InvalidIdentity(
+                "depth attachment allocation id"
+            ))
+        );
+
+        let mut zero_view = observed;
+        zero_view
+            .depth
+            .as_mut()
+            .expect("the fixture opens a depth attachment")
+            .identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(0),
+        });
+        assert_eq!(
+            zero_view.validate(),
+            Err(ContractError::InvalidIdentity("depth attachment view id"))
+        );
+    }
+
     #[test]
     fn render_pass_refuses_a_zero_sized_viewport_or_attachment() {
         let mut pass = render_pass();
@@ -14009,6 +14390,131 @@ mod tests {
         assert_eq!(
             compute_only.serial_resources().unwrap()[0].access,
             BufferAccess::Write
+        );
+    }
+
+    /// A stored depth attachment that names its landing is a landing like a
+    /// colour attachment (`research/docs/23` §3.3, v43): its view has to be
+    /// declared by the trace, the declaration has to cover the depth surface's
+    /// own byte extent, and a compute pass may read it but never write it.
+    ///
+    /// The reviewed fixture's declaring pass *reads* the depth view — that is
+    /// why its kernel carries a third read binding — so the admissible shape
+    /// here is the read declaration, and the two refusals below are what keep a
+    /// trace from naming a view it does not have or racing the store.
+    #[test]
+    fn a_stored_depth_attachment_resolves_its_own_declared_view() {
+        let depth = RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(11),
+                view_id: ViewId::new(8),
+            }),
+        };
+        let with_depth = |identity: Option<RenderDepthIdentity>, view: BufferView| {
+            let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+            // The declaring pass binds the depth view beside the colour
+            // attachment's own view, exactly as the reviewed kernel's three
+            // bindings do.
+            value.pipelines[0]
+                .contract
+                .buffer_bindings
+                .push(BufferBindingContract {
+                    metal_binding: 1,
+                    access: view.access,
+                    footprint: FootprintProof::Affine {
+                        accesses: Vec::new(),
+                    },
+                });
+            let Some(TracePass::Compute(pass)) = value.passes.first_mut() else {
+                panic!("the fixture opens with a compute pass");
+            };
+            pass.buffers.push(BufferView {
+                metal_binding: 1,
+                ..view
+            });
+            let Some(TracePass::Render(render)) = value.passes.last_mut() else {
+                panic!("the fixture closes with a render pass");
+            };
+            render.depth = Some(RenderDepthAttachment {
+                identity,
+                ..depth.clone()
+            });
+            value
+        };
+
+        // The declared shape admits, and the pool records the depth landing as
+        // writable: the pass stores into it.
+        let value = with_depth(depth.identity, landing_view(8, 11));
+        value
+            .validate_serial_buffer_reuse()
+            .expect("a declared depth landing is the reviewed shape");
+        let pool = value.serial_resources().unwrap();
+        let recorded = pool
+            .iter()
+            .find(|view| view.view_id == ViewId::new(8))
+            .expect("the depth view joins the pool");
+        assert_eq!(recorded.access, BufferAccess::ReadWrite);
+
+        // A depth landing nothing declares names a resource the submission does
+        // not have.
+        let undeclared = with_depth(
+            Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(12),
+                view_id: ViewId::new(13),
+            }),
+            landing_view(8, 11),
+        );
+        assert_eq!(
+            undeclared.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentViewUnknown {
+                pass_index: 1,
+                view: ViewId::new(13),
+                allocation: AllocationId::new(12),
+            })
+        );
+
+        // A declaration shorter than the depth extent cannot carry the stored
+        // texels.
+        let short = with_depth(
+            depth.identity,
+            BufferView {
+                length: 8,
+                source: BufferSource::OwnedBytes(vec![0; 8]),
+                ..landing_view(8, 11)
+            },
+        );
+        assert_eq!(
+            short.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentExtentMismatch {
+                pass_index: 1,
+                view: ViewId::new(8),
+                expected: 16,
+                declared: 8,
+            })
+        );
+
+        // A compute pass that *writes* the depth landing races the store, the
+        // same hazard a colour attachment's landing has.
+        let racing = with_depth(
+            depth.identity,
+            BufferView {
+                access: BufferAccess::Write,
+                ..landing_view(8, 11)
+            },
+        );
+        assert_eq!(
+            racing.validate_serial_buffer_reuse(),
+            Err(ContractError::AttachmentComputeConflict {
+                pass_index: 1,
+                view: ViewId::new(8),
+                compute_view: ViewId::new(8),
+                compute_pass: 0,
+            })
         );
     }
 

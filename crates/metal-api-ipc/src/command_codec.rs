@@ -15,18 +15,19 @@ use metal_api_core::provider::{
     BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
     CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
     CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode, DepthFormat,
-    DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
-    FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId, HeapPayload,
-    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
-    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment, RenderPassBlend,
-    RenderPassCull, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-    Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    DepthLoadOp, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+    FieldValue, FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId,
+    HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
+    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
+    SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
     MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
@@ -177,6 +178,40 @@ const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
     | RENDER_FEATURE_DEPTH
     | RENDER_FEATURE_CULL
     | RENDER_FEATURE_BLEND;
+
+/// A render pass that carries a section invented after the narrow feature byte
+/// was full (`research/docs/23` §3.3, v43).
+///
+/// [`PASS_KIND_RENDER_EXT`]'s byte had every bit assigned by v40, when blending
+/// took the last free one, so the next optional section needed either a second
+/// byte or a tag of its own. This tag is that second byte: it is followed by a
+/// big-endian `u16` feature word whose **low byte repeats every meaning** the
+/// narrow tag's byte has and whose high byte carries the sections invented
+/// after it. A decoder that predates this tag answers
+/// [`CodecError::UnknownPassTag`] for the tag itself, so a wide frame cannot be
+/// read as a narrow one, and an encoder that needs no wide section keeps
+/// writing the narrow tag — every pre-v43 frame keeps its exact bytes.
+const PASS_KIND_RENDER_EXT_WIDE: u8 = 0x11;
+
+/// The wide feature word's first bit (`research/docs/23` §3.3, v43): the pass
+/// states its depth attachment's store action, one byte after the depth block
+/// and before every later section. A pass that keeps nothing never sets it, so
+/// the narrow frames keep their bytes exactly.
+const RENDER_WIDE_FEATURE_DEPTH_STORE: u16 = 0x0100;
+
+/// The wide feature word's second bit (`research/docs/23` §3.3, v43): the
+/// pass's depth attachment is a caller-held resource, and its `allocation` and
+/// `view` follow — after the depth block and after the store action when that
+/// one is present. The identity is what the stored texels land on, so it is
+/// only written for the shape that keeps them.
+const RENDER_WIDE_FEATURE_DEPTH_RESOURCE: u16 = 0x0200;
+
+/// Every bit of the wide feature word this version knows. The low byte is the
+/// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
+/// an unknown pass tag is, so a future section cannot be skipped silently.
+const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
+    | RENDER_WIDE_FEATURE_DEPTH_STORE
+    | RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1950,6 +1985,20 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // kind and appends its state.
                 let has_cull = pass.cull.is_some();
                 let has_blend = pass.blend.is_some();
+                // The depth store action and the depth identity are the first
+                // sections that do not fit the narrow feature byte
+                // (`docs/23` §3.3, v43): both travel under the wide tag, whose
+                // word has a second byte for exactly this purpose, and neither
+                // is ever written by a frame that only needs narrow bits.
+                let has_depth_store = pass
+                    .depth
+                    .as_ref()
+                    .is_some_and(|depth| depth.store.is_some());
+                let has_depth_resource = pass
+                    .depth
+                    .as_ref()
+                    .is_some_and(|depth| depth.identity.is_some());
+                let wide = has_depth_store || has_depth_resource;
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
@@ -1957,8 +2006,8 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     || has_depth
                     || has_cull
                     || has_blend
+                    || wide
                 {
-                    encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
                     } else {
@@ -1985,7 +2034,23 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if has_blend {
                         features |= RENDER_FEATURE_BLEND;
                     }
-                    encoder.u8(features);
+                    if wide {
+                        // The wide word's low byte is the narrow byte, so a
+                        // decoder reads both tags through one section walker
+                        // and only the extra bits differ.
+                        let mut wide_features = u16::from(features);
+                        if has_depth_store {
+                            wide_features |= RENDER_WIDE_FEATURE_DEPTH_STORE;
+                        }
+                        if has_depth_resource {
+                            wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOURCE;
+                        }
+                        encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
+                        encoder.u16(wide_features);
+                    } else {
+                        encoder.u8(PASS_KIND_RENDER_EXT);
+                        encoder.u8(features);
+                    }
                     put_render_pass(encoder, pass, false)?;
                     if has_vertex_input {
                         put_vertex_input(encoder, pass)?;
@@ -2006,6 +2071,17 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if let Some(depth) = &pass.depth {
                         put_depth_block(encoder, depth, pass.depth_test.as_ref())?;
+                        // The two wide sections follow the depth block, in the
+                        // order their bits are declared: the store action
+                        // first, then the identity the storing shape lands on
+                        // (`docs/23` §3.3, v43).
+                        if let Some(store) = depth.store {
+                            encoder.u8(store.code());
+                        }
+                        if let Some(identity) = &depth.identity {
+                            encoder.u64(identity.allocation_id.get());
+                            encoder.u64(identity.view_id.get());
+                        }
                     }
                     if let Some(cull) = &pass.cull {
                         encoder.u8(cull.mode.code());
@@ -2385,110 +2461,29 @@ fn get_trace_tagged(
             // after the base payload. A bit this version does not know is a
             // decoder refusal, so a future section cannot be skipped silently.
             PASS_KIND_RENDER_EXT => {
+                // As of v40 every bit of the narrow byte is known, so there is
+                // no unknown bit left for a decoder to refuse there: the next
+                // optional section needed a second byte or a tag of its own,
+                // and v43 chose the wide tag below. `RENDER_FEATURE_KNOWN`
+                // stays as the record of the narrow byte's contents for that
+                // decision.
                 let features = decoder.u8()?;
-                // As of v40 every bit of the feature byte is known, so there is
-                // no unknown bit left for a decoder to refuse: the next
-                // optional section needs a second byte or a tag of its own, and
-                // the *tag* refusals (`UnknownPassTag`) are what keep a frame
-                // this decoder predates from being read as one it knows.
-                // `RENDER_FEATURE_KNOWN` stays as the record of the byte's
-                // contents for that decision.
-                let _ = RENDER_FEATURE_KNOWN;
-                let mut pass = get_render_pass(decoder, false)?;
-                if features & RENDER_FEATURE_VERTEX_INPUT != 0 {
-                    get_vertex_input(decoder, &mut pass)?;
+                TracePass::Render(get_render_ext_pass(decoder, u16::from(features))?)
+            }
+            // The wide kind carries a `u16` feature word whose low byte is the
+            // narrow byte above (`docs/23` §3.3, v43). Its high bits name the
+            // sections the narrow byte had no room for, so the two tags share
+            // one section walker and only the masks differ. An unknown high bit
+            // is refused here exactly as an unknown tag is: a section this
+            // decoder does not know cannot be skipped to reach the ones after
+            // it.
+            PASS_KIND_RENDER_EXT_WIDE => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
                 }
-                if features & RENDER_FEATURE_PRESENT != 0 {
-                    pass.present = Some(get_present_descriptor(decoder)?);
-                }
-                if features & RENDER_FEATURE_SCISSOR != 0 {
-                    pass.scissor = Some([
-                        decoder.u32()?,
-                        decoder.u32()?,
-                        decoder.u32()?,
-                        decoder.u32()?,
-                    ]);
-                }
-                if features & RENDER_FEATURE_INSTANCING != 0 {
-                    pass.instance_count = decoder.u32()?;
-                }
-                if features & RENDER_FEATURE_BASE_VERTEX != 0 {
-                    pass.base_vertex = decoder.u32()?;
-                }
-                if features & RENDER_FEATURE_DEPTH != 0 {
-                    let (depth, test) = get_depth_block(decoder)?;
-                    pass.depth = Some(depth);
-                    pass.depth_test = test;
-                }
-                if features & RENDER_FEATURE_BLEND != 0 {
-                    let count = usize::try_from(decoder.u64()?).map_err(|_| {
-                        CodecError::TruncatedPayload {
-                            needed: usize::MAX,
-                            remaining: decoder.remaining(),
-                        }
-                    })?;
-                    if count > MAX_COLOR_ATTACHMENTS {
-                        return Err(CodecError::ColorAttachmentCount {
-                            count,
-                            maximum: MAX_COLOR_ATTACHMENTS,
-                        });
-                    }
-                    let mut attachments = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let source_rgb = BlendFactor::from_code(decoder.u8()?).ok_or(
-                            CodecError::UnknownEnumValue {
-                                field: "blend source rgb factor",
-                                value: 0,
-                            },
-                        )?;
-                        let destination_rgb = BlendFactor::from_code(decoder.u8()?).ok_or(
-                            CodecError::UnknownEnumValue {
-                                field: "blend destination rgb factor",
-                                value: 0,
-                            },
-                        )?;
-                        let source_alpha = BlendFactor::from_code(decoder.u8()?).ok_or(
-                            CodecError::UnknownEnumValue {
-                                field: "blend source alpha factor",
-                                value: 0,
-                            },
-                        )?;
-                        let destination_alpha = BlendFactor::from_code(decoder.u8()?).ok_or(
-                            CodecError::UnknownEnumValue {
-                                field: "blend destination alpha factor",
-                                value: 0,
-                            },
-                        )?;
-                        let operation = BlendOperation::from_code(decoder.u8()?).ok_or(
-                            CodecError::UnknownEnumValue {
-                                field: "blend operation",
-                                value: 0,
-                            },
-                        )?;
-                        attachments.push(BlendAttachment {
-                            source_rgb,
-                            destination_rgb,
-                            source_alpha,
-                            destination_alpha,
-                            operation,
-                        });
-                    }
-                    pass.blend = Some(RenderPassBlend { attachments });
-                }
-                if features & RENDER_FEATURE_CULL != 0 {
-                    let mode =
-                        CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
-                            field: "cull mode",
-                            value: 0,
-                        })?;
-                    let winding =
-                        Winding::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
-                            field: "front-facing winding",
-                            value: 0,
-                        })?;
-                    pass.cull = Some(RenderPassCull { mode, winding });
-                }
-                TracePass::Render(pass)
+                TracePass::Render(get_render_ext_pass(decoder, features)?)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
@@ -2537,6 +2532,143 @@ fn get_compute_pass(decoder: &mut Decoder<'_>) -> Result<ComputePass, CodecError
         dispatch: get_dispatch(decoder)?,
         textures,
     })
+}
+
+/// Decode one extended render pass's optional sections, driven by the feature
+/// word its tag carried (`research/docs/23` §3.3).
+///
+/// Both extended tags walk the same sections in the same order — vertex input,
+/// present, scissor, instancing, base vertex, depth, depth store, depth
+/// identity, cull, blend — and differ only in the width of the word that says
+/// which are present: [`PASS_KIND_RENDER_EXT`] hands its byte widened to this
+/// `u16`, [`PASS_KIND_RENDER_EXT_WIDE`] the word itself. The two wide sections
+/// are read where the encoder writes them, immediately after the depth block
+/// and before culling.
+///
+/// A wide feature that narrows the depth attachment without a depth section is
+/// refused rather than read as a frame with an attachment: the store action and
+/// the identity describe a surface this pass never opens.
+fn get_render_ext_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let mut pass = get_render_pass(decoder, false)?;
+    if features & u16::from(RENDER_FEATURE_VERTEX_INPUT) != 0 {
+        get_vertex_input(decoder, &mut pass)?;
+    }
+    if features & u16::from(RENDER_FEATURE_PRESENT) != 0 {
+        pass.present = Some(get_present_descriptor(decoder)?);
+    }
+    if features & u16::from(RENDER_FEATURE_SCISSOR) != 0 {
+        pass.scissor = Some([
+            decoder.u32()?,
+            decoder.u32()?,
+            decoder.u32()?,
+            decoder.u32()?,
+        ]);
+    }
+    if features & u16::from(RENDER_FEATURE_INSTANCING) != 0 {
+        pass.instance_count = decoder.u32()?;
+    }
+    if features & u16::from(RENDER_FEATURE_BASE_VERTEX) != 0 {
+        pass.base_vertex = decoder.u32()?;
+    }
+    if features & u16::from(RENDER_FEATURE_DEPTH) != 0 {
+        let (depth, test) = get_depth_block(decoder)?;
+        pass.depth = Some(depth);
+        pass.depth_test = test;
+    }
+    let depth_features =
+        features & (RENDER_WIDE_FEATURE_DEPTH_STORE | RENDER_WIDE_FEATURE_DEPTH_RESOURCE);
+    if depth_features != 0 && pass.depth.is_none() {
+        return Err(CodecError::DepthFeatureWithoutAttachment(depth_features));
+    }
+    if features & RENDER_WIDE_FEATURE_DEPTH_STORE != 0 {
+        let code = decoder.u8()?;
+        let store = DepthStoreOp::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "depth store action",
+            value: code,
+        })?;
+        // The presence check above proved the attachment is there; the
+        // `ok_or` keeps this arm total rather than adding a second unwrap.
+        let depth = pass
+            .depth
+            .as_mut()
+            .ok_or(CodecError::DepthFeatureWithoutAttachment(depth_features))?;
+        depth.store = Some(store);
+    }
+    if features & RENDER_WIDE_FEATURE_DEPTH_RESOURCE != 0 {
+        let allocation_id = AllocationId::new(decoder.u64()?);
+        let view_id = ViewId::new(decoder.u64()?);
+        let depth = pass
+            .depth
+            .as_mut()
+            .ok_or(CodecError::DepthFeatureWithoutAttachment(depth_features))?;
+        depth.identity = Some(RenderDepthIdentity {
+            allocation_id,
+            view_id,
+        });
+    }
+    if features & u16::from(RENDER_FEATURE_CULL) != 0 {
+        let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+            field: "cull mode",
+            value: 0,
+        })?;
+        let winding = Winding::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+            field: "front-facing winding",
+            value: 0,
+        })?;
+        pass.cull = Some(RenderPassCull { mode, winding });
+    }
+    if features & u16::from(RENDER_FEATURE_BLEND) != 0 {
+        let count = usize::try_from(decoder.u64()?).map_err(|_| CodecError::TruncatedPayload {
+            needed: usize::MAX,
+            remaining: decoder.remaining(),
+        })?;
+        if count > MAX_COLOR_ATTACHMENTS {
+            return Err(CodecError::ColorAttachmentCount {
+                count,
+                maximum: MAX_COLOR_ATTACHMENTS,
+            });
+        }
+        let mut attachments = Vec::with_capacity(count);
+        for _ in 0..count {
+            let source_rgb =
+                BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "blend source rgb factor",
+                    value: 0,
+                })?;
+            let destination_rgb =
+                BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "blend destination rgb factor",
+                    value: 0,
+                })?;
+            let source_alpha =
+                BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "blend source alpha factor",
+                    value: 0,
+                })?;
+            let destination_alpha =
+                BlendFactor::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "blend destination alpha factor",
+                    value: 0,
+                })?;
+            let operation =
+                BlendOperation::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "blend operation",
+                    value: 0,
+                })?;
+            attachments.push(BlendAttachment {
+                source_rgb,
+                destination_rgb,
+                source_alpha,
+                destination_alpha,
+                operation,
+            });
+        }
+        pass.blend = Some(RenderPassBlend { attachments });
+    }
+    Ok(pass)
 }
 
 fn get_render_pass(
@@ -2684,6 +2816,11 @@ fn get_depth_block(
             width,
             height,
             load,
+            // The base block never carries the v43 sections: the store action
+            // and the identity travel under the wide tag's own bits, so a frame
+            // that states neither decodes to exactly the pre-v43 value.
+            store: None,
+            identity: None,
         },
         test,
     ))

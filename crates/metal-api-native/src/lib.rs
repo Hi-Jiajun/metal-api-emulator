@@ -136,6 +136,13 @@ const MRT_DECLARE: &str = include_str!("../../../conformance/shaders/mrt_declare
 #[cfg(any(target_os = "macos", test))]
 const MRT_DECLARE4: &str = include_str!("../../../conformance/shaders/mrt_declare4.metal");
 
+/// The v43 depth-declaring pass (`research/docs/23` §3.3, v43): the reviewed
+/// copy over three bindings, where the third *read* declares the depth
+/// attachment's own view so the render pass that stores it has a landing.
+#[cfg(any(target_os = "macos", test))]
+const COPY_WORD_WITH_WITNESS: &str =
+    include_str!("../../../conformance/shaders/copy_word_with_witness.metal");
+
 /// Exact byte equality is essential: a matching entry name or digest cannot
 /// establish the footprint of caller-supplied source.
 #[cfg(any(target_os = "macos", test))]
@@ -181,6 +188,17 @@ fn bounded_contract(request: &PipelineCompileRequest) -> Result<PipelineContract
             vec![
                 binding(0, BufferAccess::Read, static_word()),
                 binding(1, BufferAccess::Write, static_word()),
+            ],
+        ),
+        // The v43 declaring pass reads the colour attachment's view and the
+        // depth attachment's own view, and writes the reviewed output view
+        // (`research/docs/23` §3.3, v43).
+        ("copy_word_with_witness", COPY_WORD_WITH_WITNESS) => (
+            [1, 1, 1],
+            vec![
+                binding(0, BufferAccess::Read, static_word()),
+                binding(1, BufferAccess::Write, static_word()),
+                binding(2, BufferAccess::Read, static_word()),
             ],
         ),
         ("kernel_dispatch_threads_boundary_barrier", INDEXED) => (
@@ -426,6 +444,7 @@ mod tests {
     fn only_exact_source_and_entry_can_claim_a_fixture_contract() {
         for (entry, source) in [
             ("copy_word", COPY),
+            ("copy_word_with_witness", COPY_WORD_WITH_WITNESS),
             ("kernel_dispatch_threads_boundary_barrier", INDEXED),
             ("transform_3d", TRANSFORM),
             ("mix_3d", MIX),
