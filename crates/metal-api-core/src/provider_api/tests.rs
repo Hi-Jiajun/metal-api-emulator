@@ -2156,6 +2156,8 @@ fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
                 width: 4,
                 height: 2,
                 load: RenderDepthLoad::Clear(1.0),
+                store: None,
+                identity: None,
             },
             Some(RenderDepthTest {
                 compare: contract::CompareFunction::Less,
@@ -2188,6 +2190,8 @@ fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
                 width: 2,
                 height: 2,
                 load: RenderDepthLoad::Clear(1.0),
+                store: None,
+                identity: None,
             },
             Some(RenderDepthTest {
                 compare: contract::CompareFunction::Less,
@@ -2211,6 +2215,118 @@ fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
     let test = pass.depth_test.expect("the pass tests depths");
     assert_eq!(test.compare, contract::CompareFunction::Less);
     assert!(test.write);
+
+    // v44: the recording can keep the surface and name where its texels land,
+    // and the recorded pass carries exactly that pair — the same two fields the
+    // trace contract validates, because the object API's depth surface is one
+    // description rather than a second one (`research/docs/23` §3.3, v43/v44).
+    let stored = device.new_command_queue().command_buffer();
+    {
+        let mut declaring_encoder = stored.compute_command_encoder().unwrap();
+        declaring_encoder
+            .set_compute_pipeline_state(&declaring)
+            .unwrap();
+        declaring_encoder.set_buffer(0, &view).unwrap();
+        declaring_encoder.set_buffer(1, &scratch_view).unwrap();
+        dispatch(&mut declaring_encoder).unwrap();
+        declaring_encoder.end_encoding().unwrap();
+    }
+    let mut encoder = stored.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    let identity = contract::RenderDepthIdentity {
+        allocation_id: scratch_view.allocation_id(),
+        view_id: scratch_view.view_id(),
+    };
+    encoder
+        .draw_indexed_primitives_with_depth(
+            &[RenderColorAttachment {
+                view: &view,
+                format: AttachmentFormat::Rgba8Unorm,
+                load: RenderAttachmentLoad::Clear([0xfe; 4]),
+                store: StoreOp::Store,
+            }],
+            2,
+            2,
+            6,
+            1,
+            RenderDepthAttachment {
+                width: 2,
+                height: 2,
+                load: RenderDepthLoad::Clear(1.0),
+                store: Some(contract::DepthStoreOp::Store),
+                identity: Some(identity),
+            },
+            Some(RenderDepthTest {
+                compare: contract::CompareFunction::Less,
+                write: true,
+            }),
+            None,
+        )
+        .expect("a recording that keeps its depth surface is the v44 shape");
+    encoder.end_encoding().unwrap();
+    stored.commit().unwrap();
+
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let depth = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .and_then(|pass| pass.depth.clone())
+        .expect("the recorded pass opens a depth surface");
+    assert_eq!(depth.store, Some(contract::DepthStoreOp::Store));
+    assert_eq!(depth.identity, Some(identity));
+
+    // The pair is still one decision: keeping the surface without naming a
+    // landing is refused when the pass is recorded, exactly as the trace
+    // contract refuses it.
+    let mut encoder = device
+        .new_command_queue()
+        .command_buffer()
+        .render_command_encoder()
+        .unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    let refused = encoder
+        .draw_indexed_primitives_with_depth(
+            &[RenderColorAttachment {
+                view: &view,
+                format: AttachmentFormat::Rgba8Unorm,
+                load: RenderAttachmentLoad::Clear([0xfe; 4]),
+                store: StoreOp::Store,
+            }],
+            2,
+            2,
+            6,
+            1,
+            RenderDepthAttachment {
+                width: 2,
+                height: 2,
+                load: RenderDepthLoad::Clear(1.0),
+                store: Some(contract::DepthStoreOp::Store),
+                identity: None,
+            },
+            Some(RenderDepthTest {
+                compare: contract::CompareFunction::Less,
+                write: true,
+            }),
+            None,
+        )
+        .expect_err("a stored depth surface needs its landing");
+    assert_eq!(
+        refused,
+        ContractError::DepthStoreIdentityMismatch {
+            store: Some(contract::DepthStoreOp::Store.code()),
+            identity: false,
+        }
+        .into()
+    );
 }
 
 #[test]
