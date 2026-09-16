@@ -4526,6 +4526,55 @@ mod tests {
     /// landing is resolved, and a readback that carries no depth texels adds no
     /// second writeback — the pre-v43 byte shape exactly
     /// (`research/docs/23` §3.3, v43).
+    ///
+    /// The depth-only shape is the same pass with every colour attachment
+    /// discarding (`research/docs/23` §3.3, v45): the plan still carries the
+    /// colour attachment — it renders, its bytes disappear — and the stored
+    /// depth surface is the whole observation, so the readback is a depth one
+    /// and nothing else.
+    #[test]
+    fn plan_trace_plans_a_depth_only_pass() {
+        let mut trace = depth_store_trace(Some(DepthStoreOp::Store));
+        let pass = trace
+            .passes
+            .iter_mut()
+            .find_map(|pass| match pass {
+                TracePass::Render(pass) => Some(pass),
+                TracePass::Compute(_) => None,
+            })
+            .expect("the fixture carries a render pass");
+        pass.color_attachments[0].store = StoreOp::DontCare;
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace(&trace, &pool, &contracts)
+            .expect("a pass whose only landing is its depth surface plans");
+        let [planned] = planned.as_slice() else {
+            panic!("the depth trace carries one render pass");
+        };
+        assert_eq!(
+            planned.plan.attachments[0].store,
+            RenderStoreAction::DontCare
+        );
+        let landing = planned
+            .depth_landing
+            .expect("the stored depth surface is the pass's landing");
+        assert_eq!(landing.view_id, DEPTH_STORE_VIEW);
+        // The readback carries no colour texels — the discarded attachment
+        // lands nothing — and the depth texels become the pass's one
+        // writeback, in the depth view the trace declared.
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: Vec::new(),
+            depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
+        });
+        let [depth] = writebacks.as_slice() else {
+            panic!("a depth-only pass lands exactly one writeback");
+        };
+        assert_eq!(depth.view_id, DEPTH_STORE_VIEW);
+        assert_eq!(depth.allocation_id, DEPTH_STORE_ALLOCATION);
+        assert_eq!(depth.bytes, DEPTH_STORE_TEXEL.repeat(4));
+    }
+
+    /// The discard shapes that state no depth store keep the pre-v45 refusal.
     #[test]
     fn plan_trace_keeps_a_discarded_depth_attachment_out_of_the_writebacks() {
         for store in [None, Some(DepthStoreOp::DontCare)] {

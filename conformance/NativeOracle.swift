@@ -1908,19 +1908,47 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                           + "buffer are declared together")
     }
     let attachments = try colorAttachments(definition)
+    // Whether the pass's landing is its stored depth attachment is what the two
+    // colour rules below read, so the depth section's store action is consulted
+    // before the attachments are classified. The depth review at the end of
+    // this function is what pins that action's spelling, identity and
+    // expectation — a half-declared store is refused there — which is the same
+    // split `conformance/compare.py` makes when it parses the depth declaration
+    // ahead of the attachment list and then states the two rules
+    // (`research/docs/23` §3.3, v43/v45).
+    let depthLanding = definition.depth?.store != nil
     // One expectation per attachment, in location order: the single form
     // carries it at the case level, the MRT form on each attachment entry. A
     // discarded attachment carries none at all — its bytes disappear from the
     // observable surface, so there is nothing to compare (`research/docs/23`
-    // §3.6, v19).
+    // §3.6, v19). The single-attachment discard is the v45 depth-only shape,
+    // and it is the one single-attachment case whose expectation is absent: the
+    // pass drops the colour bytes and the depth surface its own section names
+    // is the whole observation. A single-attachment discard without that
+    // landing, and a depth-only shape that still spells a case-level
+    // expectation, are both refused — the wording the MRT discard arm uses
+    // (`conformance/compare.py` reports the same two refusals the same way).
     let expectedHexes: [String?]
     if definition.attachment != nil {
-        guard let top = definition.expected_hex else {
+        let discards = attachments[0].store == "dontcare"
+        if let top = definition.expected_hex {
+            try require(!discards,
+                        "\(definition.id): a discarded attachment carries no expectation")
+            try require(attachments[0].expected_hex == nil,
+                        "\(definition.id): a single attachment carries no expected_hex")
+            expectedHexes = [top]
+        } else if discards {
+            try require(depthLanding,
+                        "\(definition.id): a discarded attachment carries no expectation")
+            // The single form states its expectation at the case level, so an
+            // entry-level one is the MRT spelling and stays refused here, the
+            // same fields rule the MRT branch of the comparison states.
+            try require(attachments[0].expected_hex == nil,
+                        "\(definition.id): a single attachment carries no expected_hex")
+            expectedHexes = [nil]
+        } else {
             throw OracleError("\(definition.id): a single attachment needs expected_hex")
         }
-        try require(attachments[0].expected_hex == nil,
-                    "\(definition.id): a single attachment carries no expected_hex")
-        expectedHexes = [top]
     } else {
         try require(definition.expected_hex == nil,
                     "\(definition.id): an attachment list carries its own expected_hex")
@@ -1977,8 +2005,13 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     // The v19 pass-level rule core admission states as
     // `AllRenderAttachmentsDiscarded`: at least one attachment has to stay on
     // the observable surface, or "nothing landed" would pass as "landed
-    // correctly".
-    try require(attachments.contains { $0.store == "store" },
+    // correctly". A stored depth attachment is a landing too (`research/docs/23`
+    // §3.3, v43/v45): the depth-only shape discards every colour attachment and
+    // keeps the depth surface, and the depth texels are then the whole
+    // comparison, the alternative `conformance/compare.py` states once its
+    // depth declaration is parsed. The depth review below is what pins the
+    // identity and the expectation that make that landing observable.
+    try require(attachments.contains { $0.store == "store" } || depthLanding,
                 "\(definition.id): every colour attachment discards, leaving no observable landing point")
     var validatedAttachments = [ValidatedRenderAttachment]()
     for (index, attachment) in attachments.enumerated() {

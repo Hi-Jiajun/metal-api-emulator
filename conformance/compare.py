@@ -1191,7 +1191,8 @@ def _render_plan(plan, suite):
         _require(single != multiple,
                  f"{where}: exactly one of attachment and attachments is required")
         if single:
-            _require("expected_hex" in case, f"{where}: missing fields expected_hex")
+            _require("expected_hex" in case or "depth" in case,
+                     f"{where}: missing fields expected_hex")
         else:
             _require("expected_hex" not in case,
                      f"{where}: an attachment list carries its own expected_hex")
@@ -1227,6 +1228,15 @@ def _render_plan(plan, suite):
                  f"{where}: the vertex and fragment entries have to differ")
 
         vertex_input = _vertex_input_declaration(case, where)
+        # The single attachment form spells its expectation at the case level —
+        # unless the pass's landing is its stored depth attachment, which is the
+        # v45 depth-only shape: the colour attachment still renders, its bytes
+        # disappear, and the depth texels are the whole observation. The depth
+        # declaration above is what tells the two apart, so this rule can only
+        # be stated once that declaration is parsed.
+        depth_landing = vertex_input is not None and vertex_input.get("depth_store") is not None
+        if single and not depth_landing:
+            _require("expected_hex" in case, f"{where}: missing fields expected_hex")
         if vertex_input is None:
             _require(case["vertices"] == 3, f"{where}: expected the full-screen triangle")
             _require(not multiple,
@@ -1348,10 +1358,15 @@ def _render_plan(plan, suite):
             # pinned — the pass still performs the load — only the byte
             # comparison disappears.
             if store == "dontcare":
-                _require(not single,
+                _require(not single or depth_landing,
                          f"{attachment_where}: a discarded attachment carries no expectation")
                 _require("expected_hex" not in attachment,
                          f"{attachment_where}: a discarded attachment carries no expected_hex")
+                if single:
+                    # The depth-only shape: the case-level expectation must stay
+                    # absent too, so nothing claims bytes the pass discards.
+                    _require("expected_hex" not in case,
+                             f"{attachment_where}: a discarded attachment carries no expectation")
                 load = attachment.get("load")
                 if load == "clear":
                     clear = _hex(attachment.get("clear_hex"), f"{attachment_where}.clear_hex")
@@ -1555,8 +1570,11 @@ def _render_plan(plan, suite):
         # Core admission refuses an all-discarded pass
         # (`AllRenderAttachmentsDiscarded`), so the suite has to keep at least
         # one attachment on the observable surface or "nothing landed" would
-        # pass as "landed correctly".
-        _require(expected_bytes,
+        # pass as "landed correctly". A stored depth attachment is a landing too
+        # (`research/docs/23` §3.3, v43/v45): the depth-only shape discards every
+        # colour attachment and keeps the depth surface, and the depth texels are
+        # then the whole comparison.
+        _require(expected_bytes or depth_landing,
                  f"{where}: every colour attachment discards, leaving no observable landing point")
         # The two reviewed MRT locations write two different byte strings, so a
         # dual case whose locations read back the same texels could not show
@@ -1565,13 +1583,17 @@ def _render_plan(plan, suite):
         if multiple and len(expected_bytes) >= 2:
             _require(len(set(expected_bytes)) == len(expected_bytes),
                      f"{where}: the attachments read back the same texels")
-        texel = expected_bytes[0][:4]
+        texel = expected_bytes[0][:4] if expected_bytes else None
 
         # The present section is optional: a case without it is the v13 case and
         # must not grow a present observation in a capture (the exact-set rule
         # `validate_capture` applies to every result).
         present = None
         if "present" in case:
+            # A present action hands a *stored* colour attachment on, so a case
+            # whose only landing is its depth surface cannot carry one.
+            _require(texel is not None,
+                     f"{where}: a present action needs a stored colour attachment")
             present = _present_declaration(case["present"], texel, where)
 
         # The indirect section is optional too: a case that carries it replays
