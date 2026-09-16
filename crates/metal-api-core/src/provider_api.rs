@@ -3051,6 +3051,65 @@ impl RenderCommandEncoder {
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
+    /// Record the stencil-bearing sibling of
+    /// [`Self::draw_indexed_primitives_with_multisample`]
+    /// (`research/docs/23` §3.3, v55/v56).
+    ///
+    /// The depth sibling's rule one byte wide: the recording carries the
+    /// pass-wide four-sample raster and the rail-owned stencil surface the pass
+    /// tests and writes. The contract's own admission refuses a stored stencil
+    /// surface (the stencil resolve is a later increment), a single-sample
+    /// state, a combined depth-stencil surface and a present action, and this
+    /// entry refuses them at recording time where they are its own arguments.
+    /// Every other rule is [`Self::draw_indexed_primitives_with_stencil`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_multisample_stencil(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        stencil: RenderStencilAttachment,
+        stencil_test: Option<RenderStencilTest>,
+        multisample: contract::MultisampleState,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if multisample.sample_count == contract::SampleCount::One {
+            return Err(ContractError::SingleSampleMultisampleState.into());
+        }
+        if stencil.store == Some(StoreOp::Store) {
+            return Err(ContractError::MultisampleStencilStoreUnsupported.into());
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: Some(stencil),
+            stencil_test,
+            multisample: Some(multisample),
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
     /// Record a multi-attachment render pass through the bound index buffer,
     /// run once per instance (`research/docs/23` §3.3, v31/v32).
     ///

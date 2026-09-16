@@ -1327,24 +1327,36 @@ fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
     families
 }
 
-/// Whether one object-API recording entry carries every family a case declares.
+/// The family sets the reviewed object-API entries carry, spelled once so the
+/// admission table and its test cannot drift (the v54 review's N3).
 ///
-/// The reviewed entries each carry one family, and the v54 increment's combined
-/// entry carries the raster plus the depth surface. Every other combination
-/// would be recorded through an entry that silently drops the rest — the
-/// failure mode the v54 review found (`base_vertex` disappearing from the
-/// multisampled depth entry) — so the object rail refuses it by name instead.
+/// Each reviewed entry carries one family, and the two combined entries carry a
+/// raster plus one surface (`multisample+depth` since v54, `multisample+stencil`
+/// since v56). Every other combination would be recorded through an entry that
+/// silently drops the rest — the failure mode the v54 review found — so the
+/// object rail refuses it by name instead.
+const REVIEWED_FAMILY_SETS: &[&[&str]] = &[
+    &[],
+    &["multisample"],
+    &["depth"],
+    &["stencil"],
+    &["blend"],
+    &["cull"],
+    &["base_vertex"],
+    &["multisample", "depth"],
+    &["multisample", "stencil"],
+];
+
+/// Whether one object-API recording entry carries every family a case declares.
 fn object_entry_admits(families: &[&str]) -> bool {
-    matches!(
-        families,
-        [] | ["multisample"]
-            | ["depth"]
-            | ["stencil"]
-            | ["blend"]
-            | ["cull"]
-            | ["base_vertex"]
-            | ["multisample", "depth"]
-    )
+    REVIEWED_FAMILY_SETS.contains(&families)
+}
+
+/// Whether an entry that carries no state family at all — an indirect replay or
+/// the `vertex_id` milestone — may record this case
+/// (`research/docs/23` §3.3, v54 review N1).
+fn object_entry_carries_no_state(families: &[&str]) -> bool {
+    families.is_empty()
 }
 
 /// The pass-wide multisample state a case states, in the contract's own shape
@@ -7098,9 +7110,22 @@ fn run_object_render_case(
         }
         None => None,
     };
+    let families = object_state_families(case);
     if let Some(icb) = &icb {
         // An indirect draw replays one attachment: the MRT shape and the ICB
-        // shape are mutually exclusive, which `validate_render_case` pins.
+        // shape are mutually exclusive, which `validate_render_case` pins. The
+        // entry itself carries no state family at all, so a case that declares
+        // one is refused here instead of having it silently dropped — the
+        // sibling of the guard the indexed ladder states below
+        // (`research/docs/23` §3.3, v54 review N1).
+        if !object_entry_carries_no_state(&families) {
+            return Err(format!(
+                "render case {}: an indirect replay carries no state, but the case declares \
+                 {families:?}",
+                case.id
+            )
+            .into());
+        }
         render.draw_indirect(
             icb,
             recorded[0].view,
@@ -7117,7 +7142,6 @@ fn run_object_render_case(
         // through the first matching entry with the rest silently dropped —
         // the failure mode the v54 review found (`research/docs/23` §3.3, v54
         // review H1/M1).
-        let families = object_state_families(case);
         if !object_entry_admits(&families) {
             return Err(format!(
                 "render case {}: the object rails have no single entry for the declared state \
@@ -7248,20 +7272,14 @@ fn run_object_render_case(
             // opens a depth surface takes the combined entry (`§3.3`, v53/v54)
             // — the rail-owned surface the pass tests and writes, never keeps.
             //
-            // A stencil surface beside the raster is refused by the contract
-            // (`MultisampleSurfaceUnsupported`), and the recording entries
-            // would silently drop it: refusing here keeps this rail from
-            // recording a pass the other rails would never execute.
-            if case.stencil.is_some() {
-                return Err(format!(
-                    "render case {}: a multisample raster does not execute a stencil surface",
-                    case.id
-                )
-                .into());
-            }
+            // A stencil surface beside the raster takes the combined entry
+            // from v56 on (`research/docs/23` §3.3, v55/v56); the contract's
+            // own admission already refused a stored surface and a combined
+            // depth-stencil surface.
             let (depth, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
-            match depth {
-                Some(depth) => {
+            let (stencil, stencil_test) = case_stencil(case, &format!("render case {}", case.id))?;
+            match (depth, stencil) {
+                (Some(depth), _) => {
                     let object_depth = objects::RenderDepthAttachment {
                         width: depth.width,
                         height: depth.height,
@@ -7290,7 +7308,43 @@ fn run_object_render_case(
                         present,
                     )?;
                 }
-                None => {
+                (None, Some(stencil)) => {
+                    let object_stencil = objects::RenderStencilAttachment {
+                        width: stencil.width,
+                        height: stencil.height,
+                        load: match stencil.load {
+                            metal_api_core::provider::StencilLoadOp::Clear(value) => {
+                                objects::RenderStencilLoad::Clear(value)
+                            }
+                            metal_api_core::provider::StencilLoadOp::Load => {
+                                objects::RenderStencilLoad::Load
+                            }
+                        },
+                        store: stencil.store,
+                        identity: None,
+                    };
+                    let object_stencil_test = stencil_test.map(|test| objects::RenderStencilTest {
+                        compare: test.compare,
+                        fail_op: test.fail_op,
+                        depth_fail_op: test.depth_fail_op,
+                        pass_op: test.pass_op,
+                        read_mask: test.read_mask,
+                        write_mask: test.write_mask,
+                        reference: test.reference,
+                    });
+                    render.draw_indexed_primitives_with_multisample_stencil(
+                        &recorded,
+                        width,
+                        height,
+                        index_count,
+                        u32::try_from(case.instance_count)?,
+                        object_stencil,
+                        object_stencil_test,
+                        multisample,
+                        present,
+                    )?;
+                }
+                (None, None) => {
                     render.draw_indexed_primitives_with_multisample(
                         &recorded,
                         width,
@@ -7389,7 +7443,18 @@ fn run_object_render_case(
     } else {
         // The milestone's `vertex_id` triangle binds no stream and no index
         // buffer, so it is the one shape that records through the
-        // single-attachment `draw_render_pass` entry point.
+        // single-attachment `draw_render_pass` entry point. Like an indirect
+        // replay, that entry carries no state family, so a case that declares
+        // one is refused rather than narrowed (`research/docs/23` §3.3, v54
+        // review N1).
+        if !object_entry_carries_no_state(&families) {
+            return Err(format!(
+                "render case {}: the vertex_id milestone carries no state, but the case \
+                 declares {families:?}",
+                case.id
+            )
+            .into());
+        }
         render.draw_render_pass(
             recorded[0].view,
             recorded[0].format,
@@ -8027,6 +8092,48 @@ mod tests {
         let families = object_state_families(&blended);
         assert_eq!(families, vec!["stencil", "blend"]);
         assert!(!object_entry_admits(&families));
+
+        // The admission table itself, over every subset of the six families
+        // (the v54 review's N3): a widening in the implementation that this
+        // list does not state fails the "everything else is refused" half.
+        let reviewed: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["multisample"],
+            vec!["depth"],
+            vec!["stencil"],
+            vec!["blend"],
+            vec!["cull"],
+            vec!["base_vertex"],
+            vec!["multisample", "depth"],
+            vec!["multisample", "stencil"],
+        ];
+        let all = [
+            "multisample",
+            "depth",
+            "stencil",
+            "blend",
+            "cull",
+            "base_vertex",
+        ];
+        for mask in 0..(1_u32 << all.len()) {
+            let subset: Vec<&str> = all
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, family)| *family)
+                .collect();
+            let expected = reviewed.contains(&subset);
+            assert_eq!(
+                object_entry_admits(&subset),
+                expected,
+                "the admission table disagrees about {subset:?}"
+            );
+        }
+        // The two state-free entries admit exactly the empty family list.
+        assert!(object_entry_carries_no_state(&[]));
+        for family in all {
+            assert!(!object_entry_carries_no_state(&[family]));
+        }
     }
 
     fn suite() -> Suite {
