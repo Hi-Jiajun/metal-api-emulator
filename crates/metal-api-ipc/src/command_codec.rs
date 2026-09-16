@@ -13,20 +13,20 @@ use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
     AttachmentFormat, BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView,
     BufferWriteback, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
-    CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DepthFormat,
-    DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
-    FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId, HeapPayload,
-    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
-    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, MAX_COLOR_ATTACHMENTS,
-    MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode,
+    DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType,
+    FieldValue, FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId,
+    HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
+    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
+    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
+    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    RenderDepthAttachment, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode,
+    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
+    Winding, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -146,6 +146,11 @@ const RENDER_FEATURE_INSTANCING: u8 = 0x08;
 /// exactly what they were, and the decoder reads the missing section as the
 /// zero offset the older frames meant.
 const RENDER_FEATURE_BASE_VERTEX: u8 = 0x10;
+/// The culling state (`research/docs/23` §3.3, v39): one mode byte and one
+/// winding byte after every earlier optional section. A pass that culls
+/// nothing — every shape published before v39 — never sets the bit, so its
+/// bytes stay exactly what they were.
+const RENDER_FEATURE_CULL: u8 = 0x40;
 /// The depth block (`research/docs/23` §3.3, v36): the depth attachment's
 /// format, extent and load operation, followed by the pass's depth state when
 /// it declares one. A pass with no depth attachment — every shape published
@@ -158,7 +163,8 @@ const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
     | RENDER_FEATURE_SCISSOR
     | RENDER_FEATURE_INSTANCING
     | RENDER_FEATURE_BASE_VERTEX
-    | RENDER_FEATURE_DEPTH;
+    | RENDER_FEATURE_DEPTH
+    | RENDER_FEATURE_CULL;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1927,11 +1933,16 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // only a pass that carries a depth attachment takes the
                 // extended kind and appends its shape.
                 let has_depth = pass.depth.is_some();
+                // The culling state follows the same rule (`docs/23` §3.3,
+                // v39): only a pass that culls something takes the extended
+                // kind and appends its state.
+                let has_cull = pass.cull.is_some();
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
                     || has_base_vertex
                     || has_depth
+                    || has_cull
                 {
                     encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
@@ -1954,6 +1965,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if has_depth {
                         features |= RENDER_FEATURE_DEPTH;
                     }
+                    if has_cull {
+                        features |= RENDER_FEATURE_CULL;
+                    }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
                     if has_vertex_input {
@@ -1975,6 +1989,10 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if let Some(depth) = &pass.depth {
                         put_depth_block(encoder, depth, pass.depth_test.as_ref())?;
+                    }
+                    if let Some(cull) = &pass.cull {
+                        encoder.u8(cull.mode.code());
+                        encoder.u8(cull.winding.code());
                     }
                     continue;
                 }
@@ -2370,6 +2388,19 @@ fn get_trace_tagged(
                     pass.depth = Some(depth);
                     pass.depth_test = test;
                 }
+                if features & RENDER_FEATURE_CULL != 0 {
+                    let mode =
+                        CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                            field: "cull mode",
+                            value: 0,
+                        })?;
+                    let winding =
+                        Winding::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                            field: "front-facing winding",
+                            value: 0,
+                        })?;
+                    pass.cull = Some(RenderPassCull { mode, winding });
+                }
                 TracePass::Render(pass)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
@@ -2454,6 +2485,7 @@ fn get_render_pass(
         None
     };
     Ok(RenderPassDescriptor {
+        cull: None,
         pipeline,
         color_attachments,
         viewport,

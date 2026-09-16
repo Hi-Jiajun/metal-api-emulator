@@ -1789,6 +1789,87 @@ pub struct DepthTest {
     pub write: bool,
 }
 
+/// Which triangles a pass discards (`research/docs/23` §3.3, v39).
+///
+/// Metal's `MTLCullMode` and Vulkan's `VkCullModeFlags` reduced to the one
+/// triangle shape this increment draws; `None` keeps every triangle and is what
+/// a pass without the state means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CullMode {
+    /// Keep every triangle.
+    None,
+    /// Drop front-facing triangles.
+    Front,
+    /// Drop back-facing triangles.
+    Back,
+}
+
+impl CullMode {
+    pub const ADMITTED: [Self; 3] = [Self::None, Self::Front, Self::Back];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Front => 1,
+            Self::Back => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Front),
+            2 => Some(Self::Back),
+            _ => None,
+        }
+    }
+}
+
+/// How a triangle's vertices have to appear for it to be front-facing
+/// (`research/docs/23` §3.3, v39).
+///
+/// The orientation is measured in **framebuffer** coordinates, which is what
+/// both APIs state: Metal's `MTLWinding` and Vulkan's `VkFrontFace`. The
+/// v38 alignment is what makes the two rails agree about it, because the
+/// framebuffer is the coordinate system both of them describe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Winding {
+    Clockwise,
+    CounterClockwise,
+}
+
+impl Winding {
+    pub const ADMITTED: [Self; 2] = [Self::Clockwise, Self::CounterClockwise];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Clockwise => 0,
+            Self::CounterClockwise => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Clockwise),
+            1 => Some(Self::CounterClockwise),
+            _ => None,
+        }
+    }
+}
+
+/// The culling state one pass draws with (`research/docs/23` §3.3, v39).
+///
+/// Both fields are the pass's own, mirroring Metal, where `setCullMode` and
+/// `setFrontFacingWinding` are encoder state. The Vulkan rail bakes the same
+/// pair into the per-pass pipeline it builds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderPassCull {
+    /// Which triangles the pass drops.
+    pub mode: CullMode,
+    /// Which orientation counts as front-facing.
+    pub winding: Winding,
+}
+
 /// The depth attachment one render pass carries (`research/docs/23` §3.3,
 /// v36).
 ///
@@ -1887,6 +1968,10 @@ pub struct RenderPassDescriptor {
     /// too short for `base_vertex + highest_index + 1` is refused before any
     /// device object exists.
     pub base_vertex: u32,
+    /// The culling state the pass's draw runs with, or `None` for "keep every
+    /// triangle" — the shape every earlier increment published
+    /// (`research/docs/23` §3.3, v39).
+    pub cull: Option<RenderPassCull>,
     /// The depth attachment this pass opens, or `None` for a pass with no
     /// depth surface at all (`research/docs/23` §3.3, v36). When present,
     /// [`Self::depth_test`] says what the fragments do with it.
@@ -9269,6 +9354,7 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,
@@ -12513,6 +12599,7 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,
@@ -13244,6 +13331,7 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,

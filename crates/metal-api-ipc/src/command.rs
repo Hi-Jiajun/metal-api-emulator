@@ -1418,21 +1418,21 @@ mod tests {
         AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess,
         BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
-        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, DeviceEpoch, Dispatch,
-        DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor, HeapId,
-        HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
+        CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DeviceEpoch,
+        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, HeapDescriptor,
+        HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
         IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
         IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
         LeaseReservation, LoadOp, OperationId, PipelineCompileRequest, PipelineContract,
         PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
         ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-        ProviderSubmission, QueuePriority, RenderAttachment, RenderPassDescriptor,
+        ProviderSubmission, QueuePriority, RenderAttachment, RenderPassCull, RenderPassDescriptor,
         RenderPipelineContract, ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource,
         StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
         TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
-        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
-        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS,
-        PROVIDER_SCHEMA_VERSION,
+        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1584,6 +1584,7 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,
@@ -2220,10 +2221,10 @@ mod tests {
         // An unknown feature bit is a decoder refusal rather than a section the
         // decoder silently skips.
         let mut patched = frame.clone();
-        patched[extended[0] + 1] |= 0x40;
+        patched[extended[0] + 1] |= 0x80;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x41
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x81
         ));
     }
 
@@ -2350,10 +2351,10 @@ mod tests {
 
         // An unknown feature bit stays a decoder refusal.
         let mut patched = frame.clone();
-        patched[extended_index + 1] |= 0x40;
+        patched[extended_index + 1] |= 0x80;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x49
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x89
         ));
     }
 
@@ -2412,11 +2413,65 @@ mod tests {
 
         // An unknown feature bit stays a decoder refusal.
         let mut patched = frame.clone();
-        patched[tag + 1] |= 0x40;
+        patched[tag + 1] |= 0x80;
         assert!(matches!(
             CommandCodec::decode_request(&patched),
-            Err(CodecError::UnknownRenderFeature(features)) if features == 0x51
+            Err(CodecError::UnknownRenderFeature(features)) if features == 0x91
         ));
+    }
+
+    /// A render trace whose pass culls back faces with a counter-clockwise
+    /// front (`research/docs/23` §3.3, v39).
+    fn cull_trace() -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.cull = Some(RenderPassCull {
+            mode: CullMode::Back,
+            winding: Winding::CounterClockwise,
+        });
+        trace
+    }
+
+    #[test]
+    fn a_cull_pass_carries_its_own_feature_bit_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: cull_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        let tag = frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .find(|(_, pair)| *pair == [0x10, 0x41])
+            .map(|(index, _)| index)
+            .expect("the culling pass carries the vertex-input and cull bits");
+
+        // A pass that culls nothing keeps the pre-v39 bytes: the bit is what
+        // makes the state travel.
+        let plain = vertex_input_trace();
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        let plain_tag = plain_frame
+            .windows(2)
+            .enumerate()
+            .skip(10)
+            .find(|(_, pair)| *pair == [0x10, 0x01])
+            .map(|(index, _)| index)
+            .expect("the plain pass keeps the vertex-only feature byte");
+        assert_eq!(plain_frame[plain_tag + 1] & 0x40, 0x00, "no cull bit");
+
+        // No cull fixture at this layer: the section is exactly the two bytes
+        // the pass states, and the state's own round trip above is what pins
+        // them. An unknown *feature* bit stays a decoder refusal, which the
+        // base-vertex fixture pins for the same kind of section.
+        let _ = tag;
     }
 
     #[test]

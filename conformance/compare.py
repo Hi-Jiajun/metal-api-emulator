@@ -652,6 +652,12 @@ def _vertex_input_declaration(case, where):
     streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
     if len(streams) == 2:
         return _instanced_declaration(case, streams, vertex_buffers, indices, where)
+    # The two reviewed pair shapes are mutually exclusive and the culling one
+    # is checked first, so a case that declares both is refused by the cull
+    # rule rather than silently read as the depth fixture
+    # (`research/docs/23` §3.3, v39).
+    if case.get("cull") is not None:
+        return _cull_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("depth") is not None:
         return _depth_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("base_vertex", 0) != 0:
@@ -803,6 +809,62 @@ def _instanced_declaration(case, streams, vertex_buffers, indices, where):
                  f"{where}: index {position // width} names vertex {index} outside the quad")
     return {"vertices": quad_vertices, "indices": quad_indices, "instanced": True,
             "tints": tints}
+
+
+def _cull_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed cull pair (`research/docs/23` §3.3, v39).
+
+    The same reviewed pair module the depth fixture compiles: one stream whose
+    vertices carry a `float32x3` position at offset 0 and a `float32x4` tint at
+    offset 16 (stride thirty-two), this time as two copies of one oversize
+    triangle whose vertex orders are opposite. The pass culls back faces with a
+    counter-clockwise front, so exactly the counter-clockwise copy survives and
+    its tint covers the attachment; a rail that ignored the state would show the
+    other copy (the later one wins when both draw).
+    """
+    quad_indices, stride = 6, 32
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == stride,
+             f"{where}: the reviewed cull stream has stride {stride}")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 2, f"{where}: the reviewed cull stream has two attributes")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x3"),
+             f"{where}: the reviewed cull position is location 0, offset 0, float32x3")
+    _object(attributes[1], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[1]")
+    _require((attributes[1]["location"], attributes[1]["offset"], attributes[1]["format"])
+             == (1, 16, "float32x4"),
+             f"{where}: the reviewed cull tint is location 1, offset 16, float32x4")
+    cull = case.get("cull")
+    _require(isinstance(cull, dict), f"{where}: a culling state is an object")
+    _require(set(cull) == {"mode", "winding"},
+             f"{where}.cull: expected fields mode, winding")
+    _require((cull["mode"], cull["winding"]) == ("back", "counter_clockwise"),
+             f"{where}: the reviewed cull state is back faces with a counter-clockwise front")
+    _require(case.get("depth") is None,
+             f"{where}: the reviewed cull shape carries no depth attachment")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed cull shape binds one stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require(binding["length"] == stride * quad_indices,
+             f"{where}: the reviewed cull stream is six stride-{stride} vertices")
+    _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
+             == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    _require(indices is not None, f"{where}: the reviewed cull shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["initial_hex"] == "000001000200030004000500",
+             f"{where}: the reviewed cull indices are the two reviewed triangles")
+    return {"vertices": quad_indices, "indices": quad_indices}
 
 
 def _depth_declaration(case, streams, vertex_buffers, indices, where):
@@ -985,7 +1047,7 @@ def _render_plan(plan, suite):
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
-                               "depth", "depth_test", "coverage"})
+                               "depth", "depth_test", "coverage", "cull"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case

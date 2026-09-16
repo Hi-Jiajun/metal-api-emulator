@@ -52,8 +52,9 @@ use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
     ContractError, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, StoreOp,
-    TracePass, VertexFormat, VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    ProviderErrorClass, ProviderPhase, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
+    FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
@@ -65,14 +66,16 @@ use foreign_types::ForeignType;
 use metal::{
     Buffer, CommandQueue, CompileOptions, DepthStencilDescriptor, Device,
     IndirectCommandBufferDescriptor, MTLClearColor, MTLCommandBufferStatus, MTLCompareFunction,
-    MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLCullMode, MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
     MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport,
-    NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
+    MTLWinding, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
     RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
-use metal_api_core::provider::CompareFunction;
+use metal_api_core::provider::{
+    CompareFunction, CullMode as ContractCullMode, Winding as ContractWinding,
+};
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
 
@@ -1203,6 +1206,9 @@ pub(crate) struct RenderPlan<'a> {
     /// The pass's scissor rectangle, or `None` for the whole viewport
     /// (`research/docs/23` §3.3, v29).
     pub(crate) scissor: Option<[u32; 4]>,
+    /// The pass's culling state, or `None` for "keep every triangle"
+    /// (`research/docs/23` §3.3, v39).
+    pub(crate) cull: Option<RenderPassCull>,
     /// The rail-owned depth attachment this pass opens, or `None` for a pass
     /// with no depth surface (`research/docs/23` §3.3, v36).
     pub(crate) depth: Option<PlannedDepth>,
@@ -1452,6 +1458,7 @@ pub(crate) fn plan<'a>(
         extent,
         viewport: request.pass.viewport,
         scissor: request.pass.scissor,
+        cull: request.pass.cull,
         depth: request.pass.depth.as_ref().map(|depth| PlannedDepth {
             width: u32::try_from(depth.width).unwrap_or(u32::MAX),
             height: u32::try_from(depth.height).unwrap_or(u32::MAX),
@@ -2126,6 +2133,20 @@ fn encode_into_and_readback(
     if let Some(state) = &depth_stencil_state {
         encoder.set_depth_stencil_state(state);
     }
+    // Culling is encoder state too (`research/docs/23` §3.3, v39): the mode and
+    // the winding are the pass's own, and a pass without the state keeps
+    // Metal's defaults (cull none, counter-clockwise front) exactly.
+    if let Some(cull) = &planned.cull {
+        encoder.set_cull_mode(match cull.mode {
+            ContractCullMode::None => MTLCullMode::None,
+            ContractCullMode::Front => MTLCullMode::Front,
+            ContractCullMode::Back => MTLCullMode::Back,
+        });
+        encoder.set_front_facing_winding(match cull.winding {
+            ContractWinding::Clockwise => MTLWinding::Clockwise,
+            ContractWinding::CounterClockwise => MTLWinding::CounterClockwise,
+        });
+    }
     // The vertex streams the plan resolved, bound at the same indices the
     // pipeline's `MTLVertexDescriptor` names. The MTLBuffers are kept for the
     // whole call: they have to outlive the encoder that reads them, and the
@@ -2574,6 +2595,7 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,
@@ -3362,6 +3384,7 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            cull: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,

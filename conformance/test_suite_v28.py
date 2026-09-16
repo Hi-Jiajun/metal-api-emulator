@@ -32,6 +32,7 @@ WILDCARD_ID = "dontcare_scissor_half_4x4"
 BASE_VERTEX_ID = "base_vertex_quad_4x4"
 DEPTH_ID = "depth_pair_4x4"
 ALIGNMENT_ID = "top_half_quad_4x4"
+CULL_ID = "cull_back_half_quad_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -92,6 +93,13 @@ DEPTH_RAILS = ALL_RAILS
 # the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
 # framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
 ALIGNMENT_RAILS = ALL_RAILS
+# The v39 fixture: two copies of one oversize triangle whose vertex orders are
+# opposite, drawn with `cull: back` and a counter-clockwise front. The green
+# (counter-clockwise) copy survives; a rail that ignored the state would show
+# the later red-to-green order instead — the copies are ordered so the ignored
+# state lands the other tint.
+CULL_EXPECTED = INSTANCE_TINTS[1] * 16
+CULL_RAILS = TRACE_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -180,6 +188,19 @@ def alignment_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
+def cull_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": CULL_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": CULL_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": CULL_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
 def counted_declaring(suite, digest, rail):
     report = synthetic_report(suite, digest, rail)
     if rail != "native-metal":
@@ -250,6 +271,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
+            if rail in CULL_RAILS:
+                report["results"].append(cull_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -271,6 +294,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
+            if rail in CULL_RAILS:
+                report["results"].append(cull_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -294,6 +319,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
+            if rail in CULL_RAILS:
+                report["results"].append(cull_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -329,6 +356,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
         report["results"].append(alignment_result())
+        report["results"].append(cull_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -428,6 +456,37 @@ class ScissorObservationTests(unittest.TestCase):
                          [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
                            bytes.fromhex(ALIGNMENT_EXPECTED))])
 
+    def test_v28_pins_the_cull_fixture(self):
+        case = self.suite["render_cases"][6]
+        self.assertEqual(case["id"], CULL_ID)
+        self.assertEqual(case["cull"], {"mode": "back", "winding": "counter_clockwise"})
+        self.assertEqual(case["expected_hex"], CULL_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(CULL_RAILS))
+
+    def test_v28_plans_the_cull_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[CULL_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(CULL_EXPECTED))])
+
+    def test_v28_refuses_a_cull_state_that_is_not_the_reviewed_one(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][6]["cull"]["winding"] = "clockwise"
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed cull state is back faces"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_cull_case_that_also_opens_a_depth_surface(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][6]["depth"] = {"format": "depth32float", "width": 4,
+                                              "height": 4, "load": "clear",
+                                              "clear_depth": 1.0}
+        broken["render_cases"][6]["depth_test"] = {"compare": "less", "write": True}
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed cull shape carries no depth attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
     def test_v28_refuses_a_partial_claim_that_covers_everything(self):
         broken = copy.deepcopy(self.suite)
         broken["render_cases"][5]["expected_hex"] = OUTPUT * 16
@@ -487,6 +546,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
         report["results"].append(alignment_result())
+        report["results"].append(cull_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -514,6 +574,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
+            if rail in CULL_RAILS:
+                report["results"].append(cull_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
