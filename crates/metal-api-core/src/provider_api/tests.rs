@@ -2012,6 +2012,92 @@ fn an_instanced_draw_records_the_instance_count_and_refuses_zero() {
 }
 
 #[test]
+fn a_base_vertex_draw_records_the_offset_and_needs_an_index_buffer() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_multi(&provider, vec![AttachmentFormat::Rgba8Unorm]);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let target = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let view = target.view(0, 16).unwrap();
+    let scratch = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let scratch_view = scratch.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+    let index = device
+        .new_buffer_with_bytes(vec![0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let index_view = index.view(0, 16).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &view).unwrap();
+        encoder.set_buffer(1, &scratch_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+
+    // The offset is an indexed-draw parameter, so an encoder without an index
+    // buffer is refused before any pass is recorded — the same rule the
+    // contract states as `BaseVertexRequiresIndices`
+    // (`research/docs/23` §3.3, v34/v35).
+    assert_eq!(
+        encoder.draw_indexed_primitives_base_vertex(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            6,
+            1,
+            1,
+            None,
+        ),
+        Err(Error::MissingIndexBuffer)
+    );
+
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    encoder
+        .draw_indexed_primitives_base_vertex(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            6,
+            1,
+            1,
+            None,
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let pass = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the recorded draw is a render pass");
+    assert_eq!(pass.base_vertex, 1);
+    assert_eq!(pass.instance_count, 1);
+    assert_eq!(pass.vertices, 6);
+    assert!(pass.indices.is_some());
+}
+
+#[test]
 fn an_indexed_draw_records_two_attachments_through_the_shared_path() {
     let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
     let device = Device::new(provider.clone());

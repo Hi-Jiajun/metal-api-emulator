@@ -5233,17 +5233,6 @@ fn run_object_render_case(
             present,
         )?;
     } else if let Some((index, format)) = &object_index {
-        // The object API's indexed draws have no base-vertex entry point yet,
-        // so a case that asks for one is refused rather than recorded with
-        // offset zero — which would draw a different pass
-        // (`research/docs/23` §3.3, v34).
-        if case.base_vertex != 0 {
-            return Err(format!(
-                "render case {}: the object rails have no base-vertex draw yet",
-                case.id
-            )
-            .into());
-        }
         for (binding, stream) in object_streams.iter().enumerate() {
             render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
         }
@@ -5254,7 +5243,21 @@ fn run_object_render_case(
         // pre-v32 entry point and its bytes, while the reviewed instanced case
         // takes the second one.
         let index_count = u32::try_from(case.vertices)?;
-        if case.instance_count > 1 {
+        if case.base_vertex != 0 {
+            // The offset belongs to the draw call, exactly as Metal's
+            // `drawIndexedPrimitives(…:baseVertex:baseInstance:)` spells it
+            // (`research/docs/23` §3.3, v35): a zero-offset case keeps the
+            // pre-v35 entry points and their bytes.
+            render.draw_indexed_primitives_base_vertex_with_attachments(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                u32::try_from(case.base_vertex)?,
+                u32::try_from(case.instance_count)?,
+                present,
+            )?;
+        } else if case.instance_count > 1 {
             render.draw_indexed_primitives_instanced_with_attachments(
                 &recorded,
                 attachments[0].0.width,
