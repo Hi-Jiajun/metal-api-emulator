@@ -1537,8 +1537,9 @@ def _render_plan(plan, suite):
         # first increment reviews one shape — a single colour attachment opened
         # from a clear, four samples, no depth or stencil surface, no present
         # action, no ICB and no wildcard texels — and its expectation follows
-        # the resolve rule instead of the coverage rule below. The trace rail
-        # executes it first; the object API entry is the increment after it.
+        # the resolve rule instead of the coverage rule below. Every rail the
+        # marker names executes it: the trace rails since v51, the object rails
+        # since the v52 recording entry (`research/docs/23` §3.3, v51/v52).
         multisample = case.get("multisample")
         if multisample is not None:
             _require(single,
@@ -1560,11 +1561,6 @@ def _render_plan(plan, suite):
                      "an ICB")
             _require(wildcard_texels is None,
                      f"{where}: the multisample raster claims every texel it resolves")
-            rails = _list(case["capture_rails"], f"{where}.capture_rails")
-            _require(not any(rail.endswith("-objects") for rail in rails
-                             if isinstance(rail, str)),
-                     f"{where}: the multisample raster is the trace rail's first increment: "
-                     "the object API entry is the increment after it")
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):

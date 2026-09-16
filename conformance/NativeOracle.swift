@@ -2226,9 +2226,6 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     + "stencil surface")
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves")
-        try require(!definition.capture_rails.contains { $0.hasSuffix("-objects") },
-                    "\(definition.id): the multisample raster is the trace rail's first "
-                    + "increment: the object API entry is the increment after it")
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents
