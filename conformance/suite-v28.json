@@ -1691,7 +1691,9 @@
       },
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
       ],
       "multisample": {
         "sample_count": 4
@@ -1780,7 +1782,9 @@
       },
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
-        "vulkan"
+        "vulkan",
+        "native-metal",
+        "native-metal-provider"
       ],
       "multisample": {
         "sample_count": 4

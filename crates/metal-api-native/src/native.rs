@@ -227,9 +227,10 @@ impl NativeMetalProvider {
             // The depth-resolve bits come from the device probe
             // (`render::device_depth_resolve_capability_bits`,
             // `research/docs/23` §3.3, v57c): the snapshot publishes the
-            // Sample0 bit when the device answers the Apple-family question,
-            // and Min/Max stay undeclared until an Apple Paravirtual run
-            // measures them.
+            // Sample0|Min|Max bits when the device answers the Apple-family
+            // question — the v57e `--depth-resolve-selftest` run measured the
+            // Apple Paravirtual device executing all three filters
+            // (`f4d70e4`, CI run `35112569688`).
             let depth_resolve_bits = render::device_depth_resolve_capability_bits(&device);
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
@@ -318,9 +319,10 @@ impl NativeMetalProvider {
                 // `storeAction = .multisampleResolve` and lands the Sample0
                 // reduction in the v43 shared-storage readback texture. The
                 // bits come from the device probe
-                // (`render::device_depth_resolve_capability_bits`); Min/Max
-                // stay undeclared until an Apple Paravirtual run measures them
-                // (`research/docs/23` §3.3, v57c).
+                // (`render::device_depth_resolve_capability_bits`); the v57e
+                // self-test measured Min and Max on the Apple Paravirtual
+                // device, so the mask also carries those two bits from v57f
+                // on (`research/docs/23` §3.3, v57c/v57e).
                 supports_render_depth_resolve: depth_resolve_bits.supports_render_depth_resolve,
                 depth_resolve_modes: depth_resolve_bits.depth_resolve_modes,
                 // The present bits come from the same rail value as the render

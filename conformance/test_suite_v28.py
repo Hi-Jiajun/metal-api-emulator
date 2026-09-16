@@ -333,13 +333,22 @@ MSAA_STENCIL_RAILS = ALL_RAILS
 # resolve" snapshots, so they must refuse the case rather than report it
 # (`research/docs/23` §3.3, v57c).
 MSAA_DEPTH_RESOLVE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
-# The device-gated pair names the Vulkan trace rail alone: the RTX 5060
-# reports Min and Max and Lavapipe reports Sample0 alone, so the pair is the
-# mask-gated observation that tells the two devices apart. The native rails
-# stay out until an Apple device proves the filters (`research/docs/23` §3.3,
-# v57d).
-MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ("vulkan",)
-MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ("vulkan",)
+# The device-gated pair named the Vulkan trace rail alone through v57d: the
+# RTX 5060 reports Min and Max and Lavapipe reports Sample0 alone, so the pair
+# is the mask-gated observation that tells the two devices apart. The v57e
+# depth-resolve self-test then measured the Apple Paravirtual device executing
+# all three filters (`f4d70e4`, CI run `35112569688`), so v57f widens the
+# marker to the three trace rails — an object-rail capture still omits the
+# pair, and the device mask still decides presence (`research/docs/23` §3.3,
+# v57d/v57f).
+MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ("vulkan", "native-metal", "native-metal-provider")
+# The mask the three trace rails publish once the device proves the filters:
+# Sample0|Min|Max, bit `i` = filter code `i`. The v57e self-test is the native
+# half of that proof, and the RTX 5060 reports the same value, so the per-rail
+# synthetic captures declare it on the rails that own the edge pair
+# (`research/docs/23` §3.3, v57f).
+DEPTH_RESOLVE_ALL_FILTERS_BITS = (1 << 0) | (1 << 1) | (1 << 2)
 MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The v57 fixture's two observations: the colour pair's near tint sixteen
@@ -542,10 +551,11 @@ def msaa_depth_resolve_marker(suite, rail):
 def msaa_depth_resolve_min_edge_marker(suite, rail):
     """Point the v57d Min edge case at `rail` when that rail owes it, and elsewhere when not.
 
-    The case's committed marker names the Vulkan trace rail alone; the marker
-    only decides which rail *owns* the case, and the device mask then decides
-    presence (`research/docs/23` §3.3, v57d). Returns whether `rail` owes the
-    case.
+    The v57f marker names the three trace rails — the v57e self-test measured
+    the Apple Paravirtual device executing Min, so the native rails own the
+    case. The marker only decides which rail *owns* the case, and the device
+    mask then decides presence (`research/docs/23` §3.3, v57d/v57f). Returns
+    whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else [other_rail(rail)])
@@ -555,8 +565,8 @@ def msaa_depth_resolve_min_edge_marker(suite, rail):
 def msaa_depth_resolve_max_edge_marker(suite, rail):
     """Point the v57d Max edge case at `rail` when that rail owes it, and elsewhere when not.
 
-    The same marker shape as the Min sibling (`research/docs/23` §3.3, v57d).
-    Returns whether `rail` owes the case.
+    The same v57f marker shape as the Min sibling (`research/docs/23` §3.3,
+    v57d/v57f). Returns whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS else [other_rail(rail)])
@@ -993,7 +1003,10 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
-            report = counted_declaring(suite, digest, rail)
+            report = counted_declaring(
+                suite, digest, rail,
+                depth_resolve_modes=(DEPTH_RESOLVE_ALL_FILTERS_BITS
+                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0))
             report["results"].append(render_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
@@ -1026,6 +1039,12 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_min_edge_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_max_edge_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -1056,7 +1075,10 @@ class ScissorObservationTests(unittest.TestCase):
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
-            report = counted_declaring(suite, digest, rail)
+            report = counted_declaring(
+                suite, digest, rail,
+                depth_resolve_modes=(DEPTH_RESOLVE_ALL_FILTERS_BITS
+                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0))
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
@@ -1087,6 +1109,12 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_min_edge_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_max_edge_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -2715,11 +2743,13 @@ class ScissorObservationTests(unittest.TestCase):
                         compare.validate_capture(suite, digest, report, rail)
 
     def test_v28_pins_the_msaa_depth_resolve_edge_fixtures(self):
-        for index, case_id, resolve_filter, depth_hex, gate in (
+        for index, case_id, resolve_filter, depth_hex, gate, rails in (
                 (MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX, MSAA_DEPTH_RESOLVE_MIN_EDGE_ID,
-                 "min", MSAA_DEPTH_RESOLVE_MIN_EDGE_DEPTH, "min"),
+                 "min", MSAA_DEPTH_RESOLVE_MIN_EDGE_DEPTH, "min",
+                 MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS),
                 (MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
-                 "max", MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH, "max")):
+                 "max", MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH, "max",
+                 MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS)):
             with self.subTest(case=case_id):
                 case = self.suite["render_cases"][index]
                 self.assertEqual(case["id"], case_id)
@@ -2735,7 +2765,7 @@ class ScissorObservationTests(unittest.TestCase):
                 self.assertEqual(case["depth"]["expected_hex"], depth_hex)
                 self.assertEqual(case["depth_test"], {"compare": "less", "write": True})
                 self.assertEqual(case["expected_hex"], MSAA_DEPTH_RESOLVE_MIN_EDGE_EXPECTED)
-                self.assertEqual(case["capture_rails"], ["vulkan"])
+                self.assertEqual(case["capture_rails"], list(rails))
                 # The stream is the device-gated pair: the near triangle's
                 # right edge at x = 0.25 NDC and red tints on both triangles,
                 # so the colour side stays uniform and only the depth resolve
@@ -2752,9 +2782,11 @@ class ScissorObservationTests(unittest.TestCase):
 
     def test_v28_plans_the_msaa_depth_resolve_edge_fixtures(self):
         plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
-        for case_id, depth_hex, gate in (
-                (MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MIN_EDGE_DEPTH, "min"),
-                (MSAA_DEPTH_RESOLVE_MAX_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH, "max")):
+        for case_id, depth_hex, gate, rails in (
+                (MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MIN_EDGE_DEPTH, "min",
+                 MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS),
+                (MSAA_DEPTH_RESOLVE_MAX_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH, "max",
+                 MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS)):
             with self.subTest(case=case_id):
                 expectation = plan[case_id]
                 self.assertEqual(expectation.writes,
@@ -2766,7 +2798,7 @@ class ScissorObservationTests(unittest.TestCase):
                                  [ATTACHMENT, DEPTH_RESOLVE_ATTACHMENT])
                 self.assertEqual(expectation.touched, {900, 920, 960})
                 self.assertEqual(expectation.written, {900, 920, 960})
-                self.assertEqual(expectation.rails, frozenset(("vulkan",)))
+                self.assertEqual(expectation.rails, frozenset(rails))
                 self.assertEqual(expectation.filter, gate)
 
     def test_v28_refuses_a_device_gate_that_does_not_name_the_resolve_filter(self):
@@ -2795,14 +2827,19 @@ class ScissorObservationTests(unittest.TestCase):
 
     def test_v28_the_marker_still_owns_the_edge_resolve_cases(self):
         # The marker is the rail half and the mask the device half of one
-        # question: a non-vulkan capture has to omit the case even when its
-        # mask carries the filter's bit, and reporting it anyway is refused
-        # (`research/docs/23` §3.3, v57d).
-        for index, result_builder, bit in (
-                (MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX, msaa_depth_resolve_min_edge_result, 2),
-                (MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX, msaa_depth_resolve_max_edge_result, 4)):
+        # question: a capture on a rail the marker does not name has to omit
+        # the case even when its mask carries the filter's bit, and reporting
+        # it anyway is refused. The v57f marker names the three trace rails,
+        # so only the two object-rail captures refuse (`research/docs/23`
+        # §3.3, v57d/v57f).
+        for index, marker, result_builder, bit in (
+                (MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX, msaa_depth_resolve_min_edge_marker,
+                 msaa_depth_resolve_min_edge_result, 2),
+                (MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX, msaa_depth_resolve_max_edge_marker,
+                 msaa_depth_resolve_max_edge_result, 4)):
             for rail in ALL_RAILS:
                 suite = copy.deepcopy(self.suite)
+                owes = marker(suite, rail)
                 for position, case in enumerate(suite["render_cases"]):
                     if position != index:
                         case["capture_rails"] = [other_rail(rail)]
@@ -2812,7 +2849,7 @@ class ScissorObservationTests(unittest.TestCase):
                                            depth_resolve_modes=bit)
                 report["results"].append(result_builder(rail != "native-metal"))
                 with self.subTest(case=suite["render_cases"][index]["id"], rail=rail):
-                    if rail == "vulkan":
+                    if owes:
                         compare.validate_capture(suite, digest, report, rail)
                     else:
                         with self.assertRaisesRegex(

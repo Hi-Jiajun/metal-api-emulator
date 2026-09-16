@@ -441,9 +441,9 @@ private struct RenderCaseDefinition: Decodable {
     /// §3.3, v57d): the case appears in a capture if and only if the device's
     /// declared mask carries the named filter's bit. The marker still decides
     /// which rails own the case; the gate is the device-side half of the same
-    /// question, and this oracle's declared mask carries Sample0 alone, so a
-    /// Min/Max-gated case is absent from every oracle capture until an Apple
-    /// device proves the filter.
+    /// question. The v57e self-test proved Apple Paravirtual executes Min and
+    /// Max, so this oracle's mask carries all three bits and a Min/Max-gated
+    /// case the marker names is present in the oracle capture.
     let requires_depth_resolve_filter: String?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
@@ -717,12 +717,13 @@ private struct CaseResult: Encodable {
 }
 
 /// The depth resolve capability mask this oracle declares
-/// (`research/docs/23` §3.3, v57c/v57d): bit `i` is the filter whose wire
-/// code is `i`, and the snapshot probes the Apple-family question once and
-/// declares Sample0 alone. Min/Max stay undeclared until an Apple Paravirtual
-/// run measures them, so a Min/Max-gated case is absent from every oracle
-/// capture under the presence-iff-bit rule.
-private let nativeDepthResolveModes: UInt64 = 1 << 0
+/// (`research/docs/23` §3.3, v57c/v57d/v57f): bit `i` is the filter whose wire
+/// code is `i`. The v57e `--depth-resolve-selftest` run measured the Apple
+/// Paravirtual device executing all three filters — the mixed column lands
+/// `min=0000003f` and `max=6666663f` (`f4d70e4`, CI run `35112569688`) — so
+/// the mask declares Sample0|Min|Max and the two edge cases the marker names
+/// are present in every oracle capture under the presence-iff-bit rule.
+private let nativeDepthResolveModes: UInt64 = (1 << 0) | (1 << 1) | (1 << 2)
 
 private struct SuiteResult: Encodable {
     let schema_version: UInt64
