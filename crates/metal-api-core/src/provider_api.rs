@@ -2985,6 +2985,72 @@ impl RenderCommandEncoder {
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
+    /// Record the depth-bearing sibling of
+    /// [`Self::draw_indexed_primitives_with_multisample`]
+    /// (`research/docs/23` §3.3, v53/v54).
+    ///
+    /// The recording carries both halves the trace contract states: the
+    /// pass-wide four-sample raster and the rail-owned depth surface the pass
+    /// tests and writes. The surface is one description, exactly as the
+    /// v37/v44 entries state theirs, and the contract's own admission refuses
+    /// the shapes this increment does not review — a stored depth surface
+    /// beside the raster (the depth resolve filters are a later increment), a
+    /// single-sample state, a stencil surface and a present action. Every other
+    /// rule is [`Self::draw_indexed_primitives_with_depth`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_multisample_depth(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        depth: RenderDepthAttachment,
+        depth_test: Option<RenderDepthTest>,
+        multisample: contract::MultisampleState,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        // The single-sample state is what the absent field means, exactly as
+        // the colour-only entry states it (`research/docs/23` §3.3, v51).
+        if multisample.sample_count == contract::SampleCount::One {
+            return Err(ContractError::SingleSampleMultisampleState.into());
+        }
+        // A multisampled depth surface is rail-owned in this increment: keeping
+        // it would need the depth resolve filters, so the recording refuses the
+        // stored shape with the contract's own error rather than recording a
+        // pass admission would refuse.
+        if depth.store == Some(contract::DepthStoreOp::Store) {
+            return Err(ContractError::MultisampleDepthStoreUnsupported.into());
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: Some(depth),
+            depth_test,
+            stencil: None,
+            stencil_test: None,
+            multisample: Some(multisample),
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
     /// Record a multi-attachment render pass through the bound index buffer,
     /// run once per instance (`research/docs/23` §3.3, v31/v32).
     ///
