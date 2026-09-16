@@ -1425,16 +1425,17 @@ mod tests {
         HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
         IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
         IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-        LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState, OperationId,
-        PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider, PresentDescriptor,
-        PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-        ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-        RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment,
+        LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState,
+        MultisampleStencilResolve, OperationId, PipelineCompileRequest, PipelineContract,
+        PipelineId, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
+        ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+        ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
+        RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+        RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
         ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource,
-        StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest,
-        StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource,
-        TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
+        StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter,
+        StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
+        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
         VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
         FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
         MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
@@ -1592,6 +1593,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             stencil: None,
             stencil_test: None,
@@ -2627,18 +2629,23 @@ mod tests {
             .map(|(index, _)| index)
             .expect("the storing pass takes the wide tag");
 
-        // An unknown high bit is a decoder refusal, exactly as an unknown pass
-        // tag is: a section this decoder cannot read stops the frame rather
-        // than being skipped to reach the sections after it.
+        // `0x83` sets the stencil resolve bit (`0x8000`, v60) beside the
+        // known depth ones. The wide word's high byte is now full, so no
+        // unknown high bit exists to refuse: the stencil resolve bit names a
+        // stencil surface the pass never opens, and the decoder refuses the
+        // orphaned resolve exactly as it refuses the depth store and identity
+        // bits (`research/docs/23` §3.3, v60).
         let mut unknown = frame.clone();
         // The wide word is big-endian, so the high byte is the first one after
-        // the tag; `0x83` sets the next unknown bit (`0x8000`, the depth
-        // resolve took `0x4000` in v57) beside the known depth ones (`0x0321`).
+        // the tag, beside the known depth ones (`0x0321`).
         unknown[wide + 1] = 0x83;
         let refused = CommandCodec::decode_request(&unknown);
         assert!(
-            matches!(refused, Err(CodecError::UnknownRenderFeature(0x8000))),
-            "an unknown wide bit has to be refused, got {refused:?}"
+            matches!(
+                refused,
+                Err(CodecError::DepthFeatureWithoutAttachment(0x8000))
+            ),
+            "a stencil resolve bit without a stencil block has to be refused, got {refused:?}"
         );
 
         // The store action and the identity describe the depth attachment: a
@@ -2746,6 +2753,160 @@ mod tests {
         assert!(plain_frame
             .windows(3)
             .any(|window| window == [0x11, 0x03, 0x21]));
+    }
+
+    /// A render trace whose pass states the four-sample raster, keeps its
+    /// stencil surface and resolves it with a named filter
+    /// (`research/docs/23` §3.3, v60).
+    fn stencil_resolve_trace() -> ComputeTrace {
+        let mut trace = stencil_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        {
+            let stencil = pass
+                .stencil
+                .as_mut()
+                .expect("the fixture opens a stencil attachment");
+            stencil.store = Some(StoreOp::Store);
+            stencil.identity = Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(941),
+                view_id: ViewId::new(951),
+            });
+        }
+        pass.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        trace
+    }
+
+    #[test]
+    fn a_stencil_resolve_pass_takes_the_final_wide_bit_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: stencil_resolve_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The wide word's high byte carries the depth store/resource, stencil,
+        // stencil store/resource, multisample and stencil resolve bits; with
+        // the resolve bit (`0x80`) set the high byte is full
+        // (`research/docs/23` §3.3, v60).
+        assert!(
+            frame
+                .windows(3)
+                .any(|window| window[0] == 0x11 && window[1] & 0x80 != 0 && window[2] == 0x21),
+            "the stencil resolve pass carries the eighth and final wide bit"
+        );
+
+        // A pass that never resolves keeps the pre-v60 bytes: the same
+        // fixture without the filter is refused by the contract's validate
+        // (stored multisampled stencil without a resolve), but its frame has
+        // no stencil resolve bit.
+        let mut plain = stencil_resolve_trace();
+        let Some(TracePass::Render(pass)) = plain.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stencil_resolve = None;
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(!plain_frame
+            .windows(3)
+            .any(|window| window[0] == 0x11 && window[1] & 0x80 != 0));
+    }
+
+    #[test]
+    fn stencil_resolve_frames_round_trip_every_admitted_filter() {
+        // The v60 wire carries one filter code per pass, so each of the two
+        // admitted filters has to survive its own round trip. The
+        // depthResolvedSample filter names the sample the depth resolve
+        // selected, so its fixture states a depth resolve beside it.
+        for (filter, code) in [
+            (StencilResolveFilter::Sample0, 0x00),
+            (StencilResolveFilter::DepthResolvedSample, 0x01),
+        ] {
+            let mut trace = stencil_resolve_trace();
+            let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+                panic!("the fixture is a render pass");
+            };
+            pass.stencil_resolve = Some(MultisampleStencilResolve { filter });
+            if filter == StencilResolveFilter::DepthResolvedSample {
+                pass.depth = Some(RenderDepthAttachment {
+                    format: DepthFormat::Depth32Float,
+                    width: 4,
+                    height: 4,
+                    load: DepthLoadOp::clear(1.0),
+                    store: Some(DepthStoreOp::Store),
+                    identity: Some(RenderDepthIdentity {
+                        allocation_id: AllocationId::new(940),
+                        view_id: ViewId::new(950),
+                    }),
+                });
+                pass.depth_test = Some(DepthTest {
+                    compare: CompareFunction::Less,
+                    write: true,
+                });
+                pass.depth_resolve = Some(MultisampleDepthResolve {
+                    filter: DepthResolveFilter::Min,
+                });
+            }
+            let request = CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            };
+            let frame = CommandCodec::encode_request(&request).unwrap();
+            assert_eq!(
+                CommandCodec::decode_request(&frame).unwrap(),
+                request,
+                "the {filter:?} filter survives the round trip"
+            );
+            // The filter byte follows the multisample count (and, for the
+            // depthResolvedSample filter, the depth resolve's own filter
+            // byte), so each admitted code travels in its own byte.
+            assert!(frame.contains(&code), "the {filter:?} filter code travels");
+        }
+    }
+
+    #[test]
+    fn stencil_resolve_frames_refuse_unknown_filter_codes() {
+        let request = CommandRequest::Submit {
+            trace: stencil_resolve_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+
+        // The filter code travels one byte after the multisample count, which
+        // itself follows the stencil block, its store action and its
+        // identity. The contract admits codes 0/1 only, so a third code is a
+        // decoder refusal rather than a filter the caller did not ask for.
+        let mut patched = frame.clone();
+        // The stencil identity (allocation 941, view 951) travels as two
+        // big-endian `u64`s; the ten-byte run ends that identity with the
+        // four-sample count (`0x01`) followed by the Sample0 filter code
+        // (`0x00`), so its last byte is the filter the decode would read.
+        let filter = frame
+            .windows(10)
+            .enumerate()
+            .skip(10)
+            .find(|(_, window)| {
+                *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB7, 0x01, 0x00]
+            })
+            .map(|(index, _)| index + 9)
+            .expect("the stencil identity precedes the multisample count and the filter");
+        patched[filter] = 0x03;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched),
+            Err(CodecError::UnknownEnumValue {
+                field: "stencil resolve filter",
+                value: 0x03,
+            })
+        ));
     }
 
     /// A render trace whose pass states the pass-wide four-sample raster
@@ -3112,10 +3273,10 @@ mod tests {
             .windows(6)
             .rposition(|window| window == [0x04, 0x01, 0x00, 0x00, 0x00, 0x04])
             .expect("the multisample tail carries its presence tag, its bool and its count");
-        patched[tag] = 0x10;
+        patched[tag] = 0x11;
         assert!(matches!(
             CommandCodec::decode_response(&patched),
-            Err(CodecError::UnknownCapabilityTail(0x10))
+            Err(CodecError::UnknownCapabilityTail(0x11))
         ));
     }
 
@@ -3190,10 +3351,90 @@ mod tests {
             .windows(6)
             .rposition(|window| window == [0x08, 0x01, 0x00, 0x00, 0x00, 0x05])
             .expect("the depth-resolve tail carries its presence tag, its bool and its mask");
-        patched[tag] = 0x10;
+        patched[tag] = 0x11;
         assert!(matches!(
             CommandCodec::decode_response(&patched),
-            Err(CodecError::UnknownCapabilityTail(0x10))
+            Err(CodecError::UnknownCapabilityTail(0x11))
+        ));
+    }
+
+    #[test]
+    fn stencil_resolve_capability_bits_round_trip_and_extend_the_depth_resolve_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_depth_resolve = true;
+        capabilities.depth_resolve_modes = 0b101;
+        assert!(!capabilities.declares_stencil_resolve_support());
+        let plain = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(capabilities.declares_render_support());
+        assert_eq!(
+            CommandCodec::decode_response(&plain).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_stencil_resolve = true;
+        capabilities.stencil_resolve_modes = 0b11;
+        assert!(capabilities.declares_stencil_resolve_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The stencil-resolve block is the extended payload's newest optional
+        // section: one presence tag, one bool and one `u32` bitmask. A
+        // snapshot that declares no stencil-resolve bit keeps the shorter
+        // frame; one that declares stencil resolving but nothing earlier still
+        // writes the heap/ICB half the decoder reads by position before the
+        // tag (31 bytes), so the difference is that half plus this block
+        // (`research/docs/23` §3.3, v60).
+        assert_eq!(frame.len(), plain.len() + 6);
+
+        // The block is positional: a snapshot that declares it *without* the
+        // vertex-input, instancing, multisample and depth-resolve bits writes
+        // the presence tag directly after the heap/ICB half, and the decoder
+        // has to read it there.
+        let mut only_stencil_resolve = fake_capabilities();
+        only_stencil_resolve.supports_render_passes = true;
+        only_stencil_resolve.max_color_attachments = 1;
+        only_stencil_resolve.max_attachment_dimension = [2, 2];
+        only_stencil_resolve.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        only_stencil_resolve.supports_render_stencil_resolve = true;
+        only_stencil_resolve.stencil_resolve_modes = 0b10;
+        let only_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: only_stencil_resolve.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: only_stencil_resolve,
+            }
+        );
+
+        // A decoder that predates the section refuses a tag this version does
+        // not know rather than reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .windows(6)
+            .rposition(|window| window == [0x10, 0x01, 0x00, 0x00, 0x00, 0x03])
+            .expect("the stencil-resolve tail carries its presence tag, its bool and its mask");
+        patched[tag] = 0x12;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched),
+            Err(CodecError::UnknownCapabilityTail(0x12))
         ));
     }
 
@@ -4119,6 +4360,8 @@ mod tests {
                     max_render_sample_count: 0,
                     supports_render_depth_resolve: false,
                     depth_resolve_modes: 0,
+                    supports_render_stencil_resolve: false,
+                    stencil_resolve_modes: 0,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -4488,6 +4731,8 @@ mod tests {
             max_render_sample_count: 0,
             supports_render_depth_resolve: false,
             depth_resolve_modes: 0,
+            supports_render_stencil_resolve: false,
+            stencil_resolve_modes: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

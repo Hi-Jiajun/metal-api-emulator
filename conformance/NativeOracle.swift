@@ -241,6 +241,16 @@ private struct DepthResolveDefinition: Decodable {
     let filter: String
 }
 
+/// The stencil resolve one render case states (`research/docs/23` §3.3, v60).
+///
+/// The pass-level filter Metal spells as a two-value family: `"sample0"` takes
+/// sample zero and `"depth_resolved_sample"` takes the sample the depth
+/// resolve selected. The reviewed pair states one of each beside the
+/// combined depth-stencil surface.
+private struct StencilResolveDefinition: Decodable {
+    let filter: String
+}
+
 /// The stencil attachment a render case declares (`research/docs/23` §3.3,
 /// v47; the store pair is v49).
 ///
@@ -445,6 +455,18 @@ private struct RenderCaseDefinition: Decodable {
     /// Max, so this oracle's mask carries all three bits and a Min/Max-gated
     /// case the marker names is present in the oracle capture.
     let requires_depth_resolve_filter: String?
+    /// The stencil resolve a stored multisampled stencil surface states
+    /// (`research/docs/23` §3.3, v60), or `nil` for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose stencil
+    /// attachment is stored; the `depth_resolved_sample` filter additionally
+    /// names the sample the depth resolve selected.
+    let stencil_resolve: StencilResolveDefinition?
+    /// The device gate one stencil-resolve case may state
+    /// (`research/docs/23` §3.3, v60): the case appears in a capture if and
+    /// only if the device's declared mask carries the named filter's bit. The
+    /// v59 self-test proved Apple Paravirtual executes both filters, so this
+    /// oracle's mask carries both bits.
+    let requires_stencil_resolve_filter: String?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -725,6 +747,16 @@ private struct CaseResult: Encodable {
 /// are present in every oracle capture under the presence-iff-bit rule.
 private let nativeDepthResolveModes: UInt64 = (1 << 0) | (1 << 1) | (1 << 2)
 
+/// The stencil resolve capability mask this oracle declares
+/// (`research/docs/23` §3.3, v60): bit `i` is the filter whose wire code is
+/// `i`. The v59 `--stencil-resolve-selftest` run measured the Apple
+/// Paravirtual device executing both filters — the mixed column lands
+/// `depth_resolved_sample(min)=01` and `depth_resolved_sample(max)=00`
+/// (`2b877b8`, CI run `35120171655`) — so the mask declares
+/// Sample0|DepthResolvedSample and the gated case the marker names is present
+/// in every oracle capture under the presence-iff-bit rule.
+private let nativeStencilResolveModes: UInt64 = (1 << 0) | (1 << 1)
+
 private struct SuiteResult: Encodable {
     let schema_version: UInt64
     let suite: String
@@ -732,6 +764,7 @@ private struct SuiteResult: Encodable {
     let backend: String
     let allocation_observation: String
     let depth_resolve_modes: UInt64
+    let stencil_resolve_modes: UInt64
     let device: String
     let platform: String
     let results: [CaseResult]
@@ -1196,6 +1229,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 16 },
                     "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
                     + "and a 16-byte read buffer at 2")
+    case "render_declaring_stencil_resolve":
+        // v60's declaring case: the four-binding sibling of the reviewed
+        // `copy_word_with_witness` kernel, whose third and fourth bindings are
+        // the combined shape's two landings — the depth view (64 bytes) and the
+        // stencil view (16 bytes), both read (`research/docs/23` §3.3, v60).
+        try require(definition.entry == "copy_word_with_witnesses"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 4, "\(definition.id): expected four buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 3 && $0.access == "read" && $0.length == 16 },
+                    "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1, "
+                    + "a 64-byte read buffer at 2 and a 16-byte read buffer at 3")
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
          "alias_disjoint_pair", "alias_disjoint_pair_reversed":
         try require(definition.entry == "copy_word"
@@ -1572,7 +1620,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v28":
         expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store",
-                       "render_declaring_depth_resolve", "render_declaring_stencil_store"]
+                       "render_declaring_depth_resolve", "render_declaring_stencil_store",
+                       "render_declaring_stencil_resolve"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2119,10 +2168,22 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         && layout.buffers[0].attributes.count == 2,
                         "\(definition.id): the reviewed stencil stream is one stride-32 "
                         + "stream with two attributes")
-            try require(definition.depth == nil && definition.cull == nil
-                        && definition.blend == nil,
-                        "\(definition.id): the reviewed stencil shape carries no depth "
-                        + "attachment, culling state or blend state")
+            // The combined depth-stencil resolve shape (`research/docs/23` §3.3,
+            // v60) is the one stencil case that also opens a depth attachment:
+            // both surfaces resolve, and the depth resolve is what the
+            // `depth_resolved_sample` filter follows. Every other stencil case
+            // carries neither a depth attachment nor a culling or blend state.
+            if definition.stencil_resolve == nil {
+                try require(definition.depth == nil && definition.cull == nil
+                            && definition.blend == nil,
+                            "\(definition.id): the reviewed stencil shape carries no depth "
+                            + "attachment, culling state or blend state")
+            } else {
+                try require(definition.depth != nil && definition.depth_resolve != nil
+                            && definition.cull == nil && definition.blend == nil,
+                            "\(definition.id): the combined stencil-resolve shape opens both "
+                            + "surfaces with their resolves and no culling or blend state")
+            }
         }
         // The reviewed depth shape (`research/docs/23` §3.3, v36) is the
         // two-attribute stream, and no rail was reviewed against drawing it
@@ -2359,13 +2420,36 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                 try require(definition.depth_resolve == nil,
                             "\(definition.id): a depth resolve needs a stored depth surface")
             }
+            // The combined shape's stencil half states the same stored
+            // surface rule its single-surface sibling does
+            // (`research/docs/23` §3.3, v60).
+            if let stencil = definition.stencil {
+                if stencil.store != nil {
+                    try require(definition.stencil_resolve != nil,
+                                "\(definition.id): a stored multisampled stencil surface needs "
+                                + "its stencil resolve")
+                } else {
+                    try require(definition.stencil_resolve == nil,
+                                "\(definition.id): a stencil resolve needs a stored stencil "
+                                + "surface")
+                }
+            }
             try require(definition.coverage == nil,
                         "\(definition.id): a multisample pass with a depth surface claims no "
                         + "partial coverage")
         } else if let stencil = definition.stencil {
-            try require(stencil.store == nil,
-                        "\(definition.id): a multisampled stencil surface is rail-owned: the "
-                        + "stencil resolve is a later increment")
+            if stencil.store != nil {
+                try require(definition.stencil_resolve != nil,
+                            "\(definition.id): a stored multisampled stencil surface needs its "
+                            + "stencil resolve")
+                if let filter = definition.stencil_resolve?.filter {
+                    try require(filter == "sample0" || filter == "depth_resolved_sample",
+                                "\(definition.id): unsupported stencil resolve filter \(filter)")
+                }
+            } else {
+                try require(definition.stencil_resolve == nil,
+                            "\(definition.id): a stencil resolve needs a stored stencil surface")
+            }
             try require(definition.coverage == nil,
                         "\(definition.id): a multisample pass with a stencil surface claims no "
                         + "partial coverage")
@@ -2374,6 +2458,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         } else {
             try require(definition.coverage == "partial",
                         "\(definition.id): the multisample raster has to claim partial coverage")
+        }
+        // The depthResolvedSample filter names the sample the depth resolve
+        // selected, so a case that states it without one is refused
+        // (`research/docs/23` §3.3, v60).
+        if definition.stencil_resolve?.filter == "depth_resolved_sample" {
+            try require(definition.depth_resolve != nil,
+                        "\(definition.id): the depth_resolved_sample stencil resolve names "
+                        + "the sample the depth resolve selects, so the case has to state a "
+                        + "depth resolve")
         }
         // The device gate (`research/docs/23` §3.3, v57d): a case that
         // requires a filter has to state the resolve whose filter it names —
@@ -2388,9 +2481,11 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         "\(definition.id): the device gate has to name the resolve filter "
                         + "the case states")
         }
-        try require(definition.depth == nil || definition.stencil == nil,
+        try require(definition.depth == nil || definition.stencil == nil
+                    || definition.stencil_resolve != nil,
                     "\(definition.id): the multisample raster opens one depth-stencil "
-                    + "surface: a combined surface is a later increment")
+                    + "surface: a combined surface is admitted only through a stencil "
+                    + "resolve")
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves")
         // The reviewed multisample shapes carry no vertex offset, and the
@@ -2499,8 +2594,13 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // the previous bytes are decoded, below.
             let texel = Data(texels.prefix(4))
             var texelCount = 0
+            // The resolve rule covers the colour-only raster and the combined
+            // depth-stencil shape whose stencil half resolves (`research/docs/23`
+            // §3.3, v51/v60); the single-surface masked rasters keep the pair's
+            // uniform rule below.
             if attachment.load == "clear", let multisample = definition.multisample,
-               definition.depth == nil, definition.stencil == nil {
+               (definition.depth == nil && definition.stencil == nil
+                || definition.stencil_resolve != nil) {
                 // The multisample resolve (`research/docs/23` §3.3, v51): every
                 // texel is the arithmetic mean of the samples a primitive
                 // covered, so the expectation has to be a k-of-`sample_count`
@@ -2810,8 +2910,14 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): the reviewed depth attachment is a depth32float")
         try require(depth.load == "clear",
                     "\(definition.id): the reviewed depth attachment is cleared")
-        guard let clearDepth = depth.clear_depth, clearDepth == 1.0 else {
-            throw OracleError("\(definition.id): the reviewed depth clear is 1.0")
+        // The depth pair clears to one; the combined depth-stencil shape
+        // clears to 0.7, which is the value its two resolves have to pick
+        // between (`research/docs/23` §3.3, v60). Any other clear describes a
+        // shape no rail was reviewed against.
+        let reviewedClear = definition.stencil_resolve != nil ? 0.7 : 1.0
+        guard let clearDepth = depth.clear_depth, clearDepth == reviewedClear else {
+            throw OracleError(
+                "\(definition.id): the reviewed depth clear is \(reviewedClear)")
         }
         // The depth attachment is a second raster with the pass's own extent
         // (`research/docs/23` §3.3, v36): the two have to agree, the same rule
@@ -2936,23 +3042,23 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         guard let test = definition.stencil_test else {
             throw OracleError("\(definition.id): the reviewed stencil shape carries a stencil test")
         }
-        // The reviewed stencil state (`research/docs/23` §3.3, v47): an `equal`
-        // test against reference zero, with both masks wide open, that keeps
-        // both failure outcomes and increments — with wraparound — on pass.
-        // That is the state that makes the fixture's two primitives differ:
-        // the first one passes against the cleared zero and writes one, and the
-        // second one is tested against that one and dropped. Any other
-        // spelling describes a state no rail has been reviewed against.
-        try require(test.compare == "equal"
+        // The reviewed stencil states (`research/docs/23` §3.3, v47/v60): the
+        // v47 equal-zero test whose pass op increments-wraps, and the v60
+        // combined shape's always test that increments on depth pass and keeps
+        // on depth fail — both with both masks wide open. The two states make
+        // their fixtures' two primitives differ: the first passes against the
+        // cleared zero and writes one while the second drops, and the combined
+        // pair splits through the depth test.
+        try require((test.compare == "equal" || test.compare == "always")
                     && test.reference == 0
                     && test.read_mask == 255
                     && test.write_mask == 255
                     && test.fail_op == "keep"
                     && test.depth_fail_op == "keep"
                     && test.pass_op == "increment_wrap",
-                    "\(definition.id): the reviewed stencil state is an equal test against "
-                    + "reference zero with both masks wide open that keeps both failure "
-                    + "outcomes and increments-wraps on pass")
+                    "\(definition.id): the reviewed stencil state is the equal-zero test or "
+                    + "the combined shape's always test, both with both masks wide open, "
+                    + "keeping both failure outcomes and incrementing-wrapping on pass")
         // The stencil store pair (`research/docs/23` §3.3, v49) is all-or-
         // nothing, mirroring the contract's `StencilStoreIdentityMismatch` and
         // the depth sibling's own rule: the rail-owned shape every pre-v49 case
@@ -3052,6 +3158,19 @@ private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throw
         slots = [BufferSlotDefinition(binding: 0, access: "read", length: 64),
                  BufferSlotDefinition(binding: 1, access: "write", length: 4),
                  BufferSlotDefinition(binding: 2, access: "read", length: 64)]
+    case "copy_word_with_witnesses":
+        // v60's declaring kernel reads the whole word of the colour view, the
+        // depth landing view and the stencil landing view, which is why the
+        // three read slots are the three attachment views the combined render
+        // pass stores into (`research/docs/23` §3.3, v60).
+        air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_copy_word_with_witnesses.ll",
+            sha256: "a06dcfcf052e51a8b30e42942bee50d620f53e5cca3107bb6779e0d42f43c37e")
+        metal = SourceDefinition(path: "shaders/copy_word_with_witnesses.metal",
+            sha256: "256da53df3f30d52f0b864d545d015bdaa7e8e45c055f4eb9e1f8a1c3963a335")
+        slots = [BufferSlotDefinition(binding: 0, access: "read", length: 64),
+                 BufferSlotDefinition(binding: 1, access: "write", length: 4),
+                 BufferSlotDefinition(binding: 2, access: "read", length: 64),
+                 BufferSlotDefinition(binding: 3, access: "read", length: 16)]
     case "kernel_dispatch_threads_boundary_barrier":
         air = SourceDefinition(path: "../examples/metal-smoke/shaders/kernel_dispatch_threads_boundary_barrier.ll",
             sha256: "95076cf4199734f848fd6d761dce13addc7b55354b4d8ee2be16e59287ea5945")
@@ -3438,7 +3557,10 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     var depthTarget: MTLTexture?
     if let depth = fixture.depth {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .depth32Float,
+            // The combined shape's two faces share one `depth32Float_stencil8`
+            // texture; the single-face depth shape keeps `depth32Float`
+            // (`research/docs/23` §3.3, v60).
+            pixelFormat: fixture.stencil != nil ? .depth32Float_stencil8 : .depth32Float,
             width: depth.width,
             height: depth.height,
             mipmapped: false)
@@ -3493,6 +3615,14 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // reference takes over.
     var stencilTarget: MTLTexture?
     if let stencil = fixture.stencil {
+        // The combined shape reuses the depth texture the branch above built:
+        // Metal binds one texture to both attachment descriptors.
+        if fixture.depth != nil {
+            stencilTarget = depthTarget
+            guard stencilTarget != nil else {
+                throw OracleError("\(definition.id): cannot share the combined surface")
+            }
+        } else {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .stencil8,
             width: stencil.width,
@@ -3512,6 +3642,26 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         texture.label = "native oracle: \(definition.id) stencil"
         stencilTarget = texture
+        }
+    }
+    // The single-sample landing a stencil resolve writes into
+    // (`research/docs/23` §3.3, v60): the v49 shared-storage readback texture,
+    // one `stencil8` byte per texel, observed by the readback below exactly as
+    // a stored non-resolving surface observes its own texture.
+    var stencilResolveTarget: MTLTexture?
+    if let stencil = fixture.stencil, definition.stencil_resolve != nil {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .stencil8,
+            width: stencil.width,
+            height: stencil.height,
+            mipmapped: false)
+        descriptor.usage = .renderTarget
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the stencil resolve target")
+        }
+        texture.label = "native oracle: \(definition.id) stencil resolve"
+        stencilResolveTarget = texture
     }
     // The two stage entries come from the one reviewed module; `loadSuite`
     // already proved the identity, so only the lookup can still fail.
@@ -3607,13 +3757,15 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // attachment's format; every pre-v36 case declares none
     // (`research/docs/23` §3.3, v36).
     if fixture.depth != nil {
-        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+        pipelineDescriptor.depthAttachmentPixelFormat =
+            fixture.stencil != nil ? .depth32Float_stencil8 : .depth32Float
     }
     // The stencil sibling (`research/docs/23` §3.3, v47): a pass that opens a
     // stencil attachment compiles its pipeline against that attachment's
     // format, exactly as the depth branch above states the depth format.
     if fixture.stencil != nil {
-        pipelineDescriptor.stencilAttachmentPixelFormat = .stencil8
+        pipelineDescriptor.stencilAttachmentPixelFormat =
+            fixture.depth != nil ? .depth32Float_stencil8 : .stencil8
     }
     // The pipeline's raster sample count follows the pass's own multisample
     // state (`research/docs/23` §3.3, v51): Metal refuses a pipeline whose
@@ -3725,7 +3877,25 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.texture = texture
         attachment.loadAction = .clear
         attachment.clearStencil = stencil.clearValue
-        attachment.storeAction = stencil.store == nil ? .dontCare : .store
+        // A resolving stored surface lands through `.multisampleResolve` in
+        // the single-sample target above, with the filter the case named
+        // (`research/docs/23` §3.3, v60); every other stored shape keeps its
+        // own texels, and a discarded surface disappears with the pass.
+        if let resolve = definition.stencil_resolve, let landing = stencilResolveTarget {
+            attachment.storeAction = .multisampleResolve
+            attachment.resolveTexture = landing
+            switch resolve.filter {
+            case "sample0":
+                attachment.stencilResolveFilter = .sample0
+            case "depth_resolved_sample":
+                attachment.stencilResolveFilter = .depthResolvedSample
+            default:
+                throw OracleError(
+                    "\(definition.id): unsupported stencil resolve filter \(resolve.filter)")
+            }
+        } else {
+            attachment.storeAction = stencil.store == nil ? .dontCare : .store
+        }
     }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
@@ -3744,6 +3914,21 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         let depthStencilDescriptor = MTLDepthStencilDescriptor()
         depthStencilDescriptor.depthCompareFunction = depth.isLess ? .less : .always
         depthStencilDescriptor.isDepthWriteEnabled = depth.write
+        // The combined shape carries the stencil half in the one depth-stencil
+        // descriptor: the reviewed always test that increments on depth pass
+        // and keeps on depth fail (`research/docs/23` §3.3, v60).
+        if let stencil = fixture.stencil {
+            let stencilDescriptor = MTLStencilDescriptor()
+            stencilDescriptor.stencilCompareFunction = .always
+            stencilDescriptor.stencilFailureOperation = .keep
+            stencilDescriptor.depthFailureOperation = .keep
+            stencilDescriptor.depthStencilPassOperation = .incrementWrap
+            stencilDescriptor.readMask = 255
+            stencilDescriptor.writeMask = 255
+            depthStencilDescriptor.frontFaceStencil = stencilDescriptor
+            depthStencilDescriptor.backFaceStencil = stencilDescriptor
+            encoder.setStencilReferenceValue(stencil.reference)
+        }
         guard let state = device.makeDepthStencilState(descriptor: depthStencilDescriptor) else {
             throw OracleError("\(definition.id): cannot create the depth-stencil state")
         }
@@ -3756,7 +3941,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // value travels with the encoder rather than the descriptor. The depth half
     // of the descriptor keeps Metal's own defaults, exactly as a pass without a
     // depth attachment does.
-    if let stencil = fixture.stencil {
+    if let stencil = fixture.stencil, fixture.depth == nil {
         let stencilDescriptor = MTLStencilDescriptor()
         stencilDescriptor.stencilCompareFunction = .equal
         stencilDescriptor.stencilFailureOperation = .keep
@@ -3976,7 +4161,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // (940/951). The comparison reports the first differing byte and both
     // sides, the same shape the colour and depth readbacks above use.
     if let stencil = fixture.stencil, let store = stencil.store {
-        guard let texture = stencilTarget else {
+        // A resolving pass observes the single-sample landing its resolve
+        // wrote; every non-resolving stored surface is read back from its own
+        // texture (`research/docs/23` §3.3, v49/v60).
+        let readbackTexture = definition.stencil_resolve != nil
+            ? stencilResolveTarget : stencilTarget
+        guard let texture = readbackTexture else {
             throw OracleError("\(definition.id): the stored stencil attachment left the pass")
         }
         var observed = Data(count: stencil.width * stencil.height)
@@ -4051,6 +4241,8 @@ private func renderSelfTest() throws -> CaseResult {
         multisample: nil,
         depth_resolve: nil,
         requires_depth_resolve_filter: nil,
+        stencil_resolve: nil,
+        requires_stencil_resolve_filter: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -4124,6 +4316,8 @@ private func presentSelfTest() throws -> CaseResult {
         multisample: nil,
         depth_resolve: nil,
         requires_depth_resolve_filter: nil,
+        stencil_resolve: nil,
+        requires_stencil_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4219,6 +4413,8 @@ private func vertexSelfTest() throws -> CaseResult {
         multisample: nil,
         depth_resolve: nil,
         requires_depth_resolve_filter: nil,
+        stencil_resolve: nil,
+        requires_stencil_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4318,6 +4514,8 @@ private func mrtSelfTest() throws -> CaseResult {
         multisample: nil,
         depth_resolve: nil,
         requires_depth_resolve_filter: nil,
+        stencil_resolve: nil,
+        requires_stencil_resolve_filter: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -4755,6 +4953,8 @@ private func resolvePairFixture(id: String) throws -> ValidatedRender {
         // participates.
         depth_resolve: DepthResolveDefinition(filter: "sample0"),
         requires_depth_resolve_filter: nil,
+        stencil_resolve: nil,
+        requires_stencil_resolve_filter: nil,
         wildcard_texels: nil,
         depth: DepthAttachmentDefinition(
             format: "depth32float", width: 4, height: 4, load: "clear",
@@ -5353,11 +5553,18 @@ private func capture(_ suite: ValidatedSuite) throws -> SuiteResult {
                 continue
             }
         }
+        if let gate = fixture.definition.requires_stencil_resolve_filter {
+            let bit: UInt64 = gate == "depth_resolved_sample" ? 2 : 0
+            if nativeStencilResolveModes & bit == 0 {
+                continue
+            }
+        }
         results.append(try runRenderCase(fixture, device: device, queue: queue))
     }
     return SuiteResult(schema_version: 1, suite: suite.name, suite_sha256: suite.sha256,
         backend: "native-metal", allocation_observation: "gpu-buffer-readback",
         depth_resolve_modes: nativeDepthResolveModes,
+        stencil_resolve_modes: nativeStencilResolveModes,
         device: device.name, platform: eligibility.platform, results: results)
 }
 

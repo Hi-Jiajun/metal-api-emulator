@@ -298,6 +298,15 @@ impl VulkanExecutor {
         capabilities.depth_resolve_modes =
             provider::depth_resolve_mode_mask(self.context.depth_resolve_modes);
         capabilities.supports_render_depth_resolve = capabilities.depth_resolve_modes != 0;
+        // The two stencil-resolve bits are the device's own answer, overlaid
+        // the same way the depth pair is: the mask carries exactly the
+        // admitted filters the device reports, and the capability bit is the
+        // mask's non-empty form (`research/docs/23` §3.3, v60). Vulkan has no
+        // stencil mode for Metal's depthResolvedSample, so only the Sample0
+        // bit can ever appear.
+        capabilities.stencil_resolve_modes =
+            provider::stencil_resolve_mode_mask(self.context.stencil_resolve_modes);
+        capabilities.supports_render_stencil_resolve = capabilities.stencil_resolve_modes != 0;
         capabilities
     }
 
@@ -641,6 +650,25 @@ pub(crate) struct VulkanContext {
     /// family; the raw flags stay here so the render rail's admission can
     /// answer the same per-filter question the snapshot answered.
     depth_resolve_modes: vk::ResolveModeFlags,
+    /// The stencil resolve modes the device reports through
+    /// `VK_KHR_depth_stencil_resolve` (`research/docs/23` §3.3, v60). The
+    /// capability snapshot below maps them onto the contract's closed filter
+    /// family; the raw flags stay here so the render rail's admission can
+    /// answer the same per-filter question the snapshot answered.
+    stencil_resolve_modes: vk::ResolveModeFlags,
+    /// Whether the device lets the depth and stencil resolve modes differ
+    /// (`research/docs/23` §3.3, v60): `independent_resolve` is the raw
+    /// property the render rail reads when a pass resolves only its stencil
+    /// surface, because a device that reports `false` requires both modes to
+    /// agree. The v60 fixtures resolve both faces, so the rail never needs to
+    /// branch on it; the probe record stays beside its sibling for the next
+    /// increment that reviews a stencil-only resolve.
+    #[allow(dead_code)]
+    independent_resolve: bool,
+    /// Whether the device lets one resolve mode be `NONE` while the other is
+    /// not (`research/docs/23` §3.3, v60): a stencil-only resolve states
+    /// `depthResolveMode = NONE`, which a device that reports `false` refuses.
+    independent_resolve_none: bool,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
     queue_locks: Vec<Mutex<()>>,
@@ -810,6 +838,9 @@ impl VulkanContext {
             vk::PhysicalDeviceProperties2::default().push_next(&mut depth_stencil_resolve);
         unsafe { instance.get_physical_device_properties2(physical, &mut resolve_properties) };
         let depth_resolve_modes = depth_stencil_resolve.supported_depth_resolve_modes;
+        let stencil_resolve_modes = depth_stencil_resolve.supported_stencil_resolve_modes;
+        let independent_resolve = depth_stencil_resolve.independent_resolve != 0;
+        let independent_resolve_none = depth_stencil_resolve.independent_resolve_none != 0;
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
             .to_string_lossy()
@@ -851,6 +882,9 @@ impl VulkanContext {
             queue_in_flight: (0..queue_count).map(|_| AtomicUsize::new(0)).collect(),
             properties,
             depth_resolve_modes,
+            stencil_resolve_modes,
+            independent_resolve,
+            independent_resolve_none,
             memory,
             device_name,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
@@ -882,6 +916,15 @@ impl VulkanContext {
     /// answered.
     pub(crate) fn admitted_depth_resolve_modes(&self) -> u32 {
         provider::depth_resolve_mode_mask(self.depth_resolve_modes)
+    }
+
+    /// The contract's admitted stencil-resolve filter mask for this device
+    /// (`research/docs/23` §3.3, v60). The render rail's admission reads the
+    /// same mask the capability snapshot published, so a directly-constructed
+    /// request is refused with the same per-filter question the snapshot
+    /// answered.
+    pub(crate) fn admitted_stencil_resolve_modes(&self) -> u32 {
+        provider::stencil_resolve_mode_mask(self.stencil_resolve_modes)
     }
 
     /// Admit one new submission against the lifecycle.
@@ -2332,6 +2375,33 @@ fn create_stencil_image_view(
         .format(format)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::STENCIL,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { context.device.create_image_view(&info, None) }
+        .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
+}
+
+/// The combined view of a `D32_SFLOAT_S8_UINT` attachment: one 2D,
+/// single-mip, single-layer view over **both** the depth and the stencil
+/// aspect, which is what a combined depth-stencil attachment names in the
+/// render pass (`research/docs/23` §3.3, v60). The two aspect-only views above
+/// serve the single-surface shapes; the combined shape binds this one view to
+/// the one attachment both faces share.
+fn create_depth_stencil_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,

@@ -89,6 +89,10 @@ STENCIL_DECLARING_ID = "render_declaring_stencil_store"
 # kernel whose third *read* binding is the pair's own depth landing view, so
 # both edge cases resolve against one declared resource.
 DEPTH_RESOLVE_DECLARING_ID = "render_declaring_depth_resolve"
+# The declaring case of the v60 pair: the same declaring kernel with a fourth
+# *read* binding, so both the depth and the stencil landing of the combined
+# shape are declared by one compute pass (`research/docs/23` §3.3, v60).
+STENCIL_RESOLVE_DECLARING_ID = "render_declaring_stencil_resolve"
 # The reviewed depth resource of the v43 fixture: the allocation and the view
 # the stored texels land in, and the view's whole extent.
 DEPTH_STORE_ALLOCATION = 940
@@ -105,6 +109,9 @@ STENCIL_STORE_ATTACHMENT = (STENCIL_STORE_ALLOCATION, STENCIL_STORE_VIEW, 0, 16)
 DEPTH_RESOLVE_ALLOCATION = 960
 DEPTH_RESOLVE_VIEW = 961
 DEPTH_RESOLVE_ATTACHMENT = (DEPTH_RESOLVE_ALLOCATION, DEPTH_RESOLVE_VIEW, 0, 64)
+# The reviewed stencil landing of the v60 combined pair: the v49 stencil
+# allocation with its own view, one byte per texel.
+STENCIL_RESOLVE_VIEW = 952
 ALIGNMENT_ID = "top_half_quad_4x4"
 CULL_ID = "cull_back_half_quad_4x4"
 BLEND_ID = "blend_alpha_quad_4x4"
@@ -139,6 +146,11 @@ MSAA_DEPTH_RESOLVE_ID = "msaa_depth_resolve_sample0_4x4"
 # could not show (`research/docs/23` §3.3, v57d).
 MSAA_DEPTH_RESOLVE_MIN_EDGE_ID = "msaa_depth_resolve_min_edge_4x4"
 MSAA_DEPTH_RESOLVE_MAX_EDGE_ID = "msaa_depth_resolve_max_edge_4x4"
+# The v60 pair: the same edge geometry over a combined depth-stencil surface,
+# whose stencil resolve reduces the near triangle's stencil 1 and the far
+# triangle's stencil 0 (`research/docs/23` §3.3, v60).
+MSAA_STENCIL_RESOLVE_SAMPLE0_ID = "msaa_stencil_resolve_sample0_4x4"
+MSAA_STENCIL_RESOLVE_DRS_ID = "msaa_stencil_resolve_drs_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -166,11 +178,15 @@ MSAA_DEPTH_RESOLVE_INDEX = 16
 # The v57d device-gated pair follows it.
 MSAA_DEPTH_RESOLVE_MIN_EDGE_INDEX = 17
 MSAA_DEPTH_RESOLVE_MAX_EDGE_INDEX = 18
+# The v60 stencil-resolve pair follows it.
+MSAA_STENCIL_RESOLVE_SAMPLE0_INDEX = 19
+MSAA_STENCIL_RESOLVE_DRS_INDEX = 20
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
                   MSAA_ID, MSAA_DEPTH_ID, MSAA_STENCIL_ID, MSAA_DEPTH_RESOLVE_ID,
-                  MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID)
+                  MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
+                  MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -344,6 +360,14 @@ MSAA_DEPTH_RESOLVE_RAILS = ALL_RAILS
 # presence (`research/docs/23` §3.3, v57d/v57f/v58).
 MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ALL_RAILS
 MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ALL_RAILS
+# The v60 Sample0 case names every rail: the trace rails execute the combined
+# shape from this increment on, and the object rails follow the same recorded
+# state (`research/docs/23` §3.3, v60).
+MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS = ALL_RAILS
+# The DepthResolvedSample case names the two native trace rails alone: Vulkan
+# has no stencil mode for Metal's depth-following filter, so its rail refuses
+# the filter and the mask never carries its bit (`research/docs/23` §3.3, v60).
+MSAA_STENCIL_RESOLVE_DRS_RAILS = ("native-metal", "native-metal-provider")
 # The mask the rails publish once the device proves the filters: Sample0|Min|
 # Max, bit `i` = filter code `i`. The v57e self-test is the native half of
 # that proof, and the RTX 5060 reports the same value; the v57f marker named
@@ -351,6 +375,11 @@ MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ALL_RAILS
 # synthetic captures declare the mask on every rail that owns the edge pair
 # (`research/docs/23` §3.3, v57f/v58).
 DEPTH_RESOLVE_ALL_FILTERS_BITS = (1 << 0) | (1 << 1) | (1 << 2)
+# The stencil mask the native rails publish on the v59 evidence: Sample0 |
+# DepthResolvedSample, bit `i` = filter code `i`. The Vulkan rail has no mode
+# for DepthResolvedSample, so its mask carries Sample0 alone
+# (`research/docs/23` §3.3, v60).
+STENCIL_RESOLVE_ALL_FILTERS_BITS = (1 << 0) | (1 << 1)
 MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The v57 fixture's two observations: the colour pair's near tint sixteen
@@ -371,6 +400,23 @@ MSAA_DEPTH_RESOLVE_MAX_EDGE_EXPECTED = MSAA_DEPTH_RESOLVE_EXPECTED
 # expectations differ exactly where the filters differ.
 MSAA_DEPTH_RESOLVE_MIN_EDGE_DEPTH = ("0000003f" * 3 + "6666663f") * 4
 MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH = ("0000003f" * 2 + "6666663f" * 2) * 4
+# The v60 pair's three observations. The combined depth clear is 0.7 between
+# the two triangles' depths, so the near triangle's depth pass writes stencil 1
+# while the far triangle's depth failures leave the rest at zero: the Sample0
+# stencil landing reads 01 in columns 0-2 (its third-column sample 0 is near)
+# and 00 in column 3, and its depth landing reads 0.5 in columns 0-2 and the
+# 0.7 clear in column 3. The DepthResolvedSample landing follows the Max depth
+# resolve: columns 2-3 take the far sample's stencil 00 and depth 0.7, which is
+# the split that makes the pair falsifiable (`research/docs/23` §3.3, v60).
+MSAA_STENCIL_RESOLVE_SAMPLE0_STENCIL = "01010100" * 4
+MSAA_STENCIL_RESOLVE_SAMPLE0_DEPTH = ("0000003f" * 3 + "3333333f") * 4
+MSAA_STENCIL_RESOLVE_DRS_STENCIL = "01010000" * 4
+MSAA_STENCIL_RESOLVE_DRS_DEPTH = ("0000003f" * 2 + "3333333f" * 2) * 4
+# The combined pair's colour observation: the near triangle covers columns
+# 0-1 fully, its edge splits column 2 in half, and the far triangle's depth
+# failures leave column 3 at the clear — so column 2 carries the 2-of-4 mix of
+# the red tint and the clear (`research/docs/23` §3.3, v60).
+MSAA_STENCIL_RESOLVE_COLOUR = ("ff0000ff" * 2 + "88111aa2" + "11223445") * 4
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
 # `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
@@ -577,6 +623,30 @@ def msaa_depth_resolve_max_edge_marker(suite, rail):
     return rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS
 
 
+def msaa_stencil_resolve_sample0_marker(suite, rail):
+    """Point the v60 Sample0 case at `rail` when that rail owes it.
+
+    The combined shape is executed by the three trace rails; the object rails
+    record no stencil-resolve entry yet, so the marker stays at the trace three
+    (`research/docs/23` §3.3, v60). Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_STENCIL_RESOLVE_SAMPLE0_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS else [other_rail(rail)])
+    return rail in MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS
+
+
+def msaa_stencil_resolve_drs_marker(suite, rail):
+    """Point the v60 DepthResolvedSample case at `rail` when that rail owes it.
+
+    The case names the two native trace rails — Vulkan has no stencil mode for
+    the depth-following filter — and the device mask then decides presence
+    (`research/docs/23` §3.3, v60). Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_STENCIL_RESOLVE_DRS_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else [other_rail(rail)])
+    return rail in MSAA_STENCIL_RESOLVE_DRS_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -740,6 +810,69 @@ def msaa_depth_resolve_max_edge_result(provider_backend=True, copy_in=3, copy_ou
              "bytes_hex": MSAA_DEPTH_RESOLVE_MAX_EDGE_EXPECTED},
             {"allocation": DEPTH_RESOLVE_ALLOCATION,
              "bytes_hex": MSAA_DEPTH_RESOLVE_MAX_EDGE_DEPTH},
+        ],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_stencil_resolve_sample0_result(provider_backend=True, copy_in=4, copy_out=4):
+    """The v60 Sample0 landing: colour, resolved depth and resolved stencil.
+
+    The combined shape's three landings — the colour pair's near tint, the
+    depth resolve's 0.5/0.7 columns and the stencil resolve's 01/00 columns —
+    and the declaring pass declares all three resources, so a provider capture
+    owes four copies in and four out (`research/docs/23` §3.3, v60).
+    """
+    result = {
+        "id": MSAA_STENCIL_RESOLVE_SAMPLE0_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [
+            {"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+             "offset": ATTACHMENT[2], "bytes_hex": MSAA_STENCIL_RESOLVE_COLOUR},
+            {"allocation": DEPTH_RESOLVE_ALLOCATION, "view": DEPTH_RESOLVE_VIEW,
+             "offset": 0, "bytes_hex": MSAA_STENCIL_RESOLVE_SAMPLE0_DEPTH},
+            {"allocation": STENCIL_STORE_ALLOCATION, "view": STENCIL_RESOLVE_VIEW,
+             "offset": 0, "bytes_hex": MSAA_STENCIL_RESOLVE_SAMPLE0_STENCIL},
+        ],
+        "allocations": [
+            {"allocation": ATTACHMENT[0], "bytes_hex": MSAA_STENCIL_RESOLVE_COLOUR},
+            {"allocation": DEPTH_RESOLVE_ALLOCATION,
+             "bytes_hex": MSAA_STENCIL_RESOLVE_SAMPLE0_DEPTH},
+            {"allocation": STENCIL_STORE_ALLOCATION,
+             "bytes_hex": MSAA_STENCIL_RESOLVE_SAMPLE0_STENCIL},
+        ],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_stencil_resolve_drs_result(provider_backend=True, copy_in=4, copy_out=4):
+    """The v60 DepthResolvedSample landing: the Max-selected stencil split.
+
+    The same three landings with the Max depth resolve: columns 2-3 take the
+    far sample's stencil 00 and depth 0.7, which is the split that makes the
+    filter falsifiable against Sample0 (`research/docs/23` §3.3, v60).
+    """
+    result = {
+        "id": MSAA_STENCIL_RESOLVE_DRS_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [
+            {"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+             "offset": ATTACHMENT[2], "bytes_hex": MSAA_STENCIL_RESOLVE_COLOUR},
+            {"allocation": DEPTH_RESOLVE_ALLOCATION, "view": DEPTH_RESOLVE_VIEW,
+             "offset": 0, "bytes_hex": MSAA_STENCIL_RESOLVE_DRS_DEPTH},
+            {"allocation": STENCIL_STORE_ALLOCATION, "view": STENCIL_RESOLVE_VIEW,
+             "offset": 0, "bytes_hex": MSAA_STENCIL_RESOLVE_DRS_STENCIL},
+        ],
+        "allocations": [
+            {"allocation": ATTACHMENT[0], "bytes_hex": MSAA_STENCIL_RESOLVE_COLOUR},
+            {"allocation": DEPTH_RESOLVE_ALLOCATION,
+             "bytes_hex": MSAA_STENCIL_RESOLVE_DRS_DEPTH},
+            {"allocation": STENCIL_STORE_ALLOCATION,
+             "bytes_hex": MSAA_STENCIL_RESOLVE_DRS_STENCIL},
         ],
     }
     if provider_backend:
@@ -930,9 +1063,11 @@ def blend_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
-def counted_declaring(suite, digest, rail, depth_resolve_modes=0):
+def counted_declaring(suite, digest, rail, depth_resolve_modes=0,
+                      stencil_resolve_modes=0):
     report = synthetic_report(suite, digest, rail,
-                              depth_resolve_modes=depth_resolve_modes)
+                              depth_resolve_modes=depth_resolve_modes,
+                              stencil_resolve_modes=stencil_resolve_modes)
     if rail != "native-metal":
         for result in report["results"]:
             # The v43 declaring case reads one more view than its v27 sibling:
@@ -942,10 +1077,14 @@ def counted_declaring(suite, digest, rail, depth_resolve_modes=0):
             # same shape with the one-byte-per-texel stencil view in place of
             # the depth one (`research/docs/23` §3.3, v49), and the v57d
             # declaring case is the depth shape again with its own landing
-            # view (`research/docs/23` §3.3, v57d).
-            result["copy_in"] = (3 if result["id"] in (DEPTH_DECLARING_ID,
-                                                       STENCIL_DECLARING_ID,
-                                                       DEPTH_RESOLVE_DECLARING_ID) else 2)
+            # view (`research/docs/23` §3.3, v57d), and the v60 declaring case
+            # declares both landings (`research/docs/23` §3.3, v60).
+            result["copy_in"] = (
+                4 if result["id"] == STENCIL_RESOLVE_DECLARING_ID
+                else 3 if result["id"] in (DEPTH_DECLARING_ID,
+                                           STENCIL_DECLARING_ID,
+                                           DEPTH_RESOLVE_DECLARING_ID)
+                else 2)
             result["copy_out"] = 1
     return report
 
@@ -1005,12 +1144,16 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_stencil_resolve_sample0 = msaa_stencil_resolve_sample0_marker(suite, rail)
+            owes_stencil_resolve_drs = msaa_stencil_resolve_drs_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(
                 suite, digest, rail,
                 depth_resolve_modes=(DEPTH_RESOLVE_ALL_FILTERS_BITS
-                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0))
+                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0),
+                stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
+                                       if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(render_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
@@ -1049,6 +1192,12 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
                 report["results"].append(
                     msaa_depth_resolve_max_edge_result(rail != "native-metal"))
+            if owes_stencil_resolve_sample0:
+                report["results"].append(
+                    msaa_stencil_resolve_sample0_result(rail != "native-metal"))
+            if owes_stencil_resolve_drs:
+                report["results"].append(
+                    msaa_stencil_resolve_drs_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -1077,12 +1226,16 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_stencil_resolve_sample0 = msaa_stencil_resolve_sample0_marker(suite, rail)
+            owes_stencil_resolve_drs = msaa_stencil_resolve_drs_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(
                 suite, digest, rail,
                 depth_resolve_modes=(DEPTH_RESOLVE_ALL_FILTERS_BITS
-                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0))
+                                     if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS else 0),
+                stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
+                                       if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
@@ -1119,6 +1272,12 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
                 report["results"].append(
                     msaa_depth_resolve_max_edge_result(rail != "native-metal"))
+            if owes_stencil_resolve_sample0:
+                report["results"].append(
+                    msaa_stencil_resolve_sample0_result(rail != "native-metal"))
+            if owes_stencil_resolve_drs:
+                report["results"].append(
+                    msaa_stencil_resolve_drs_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -1135,9 +1294,17 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_stencil_resolve_sample0 = msaa_stencil_resolve_sample0_marker(suite, rail)
+            owes_stencil_resolve_drs = msaa_stencil_resolve_drs_marker(suite, rail)
+            msaa_depth_resolve_min_edge_marker(suite, rail)
+            msaa_depth_resolve_max_edge_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
-            report = counted_declaring(suite, digest, rail)
+            report = counted_declaring(
+                suite, digest, rail,
+                depth_resolve_modes=DEPTH_RESOLVE_ALL_FILTERS_BITS,
+                stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
+                                       if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(render_result(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
@@ -1170,6 +1337,18 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_stencil_resolve_sample0:
+                report["results"].append(
+                    msaa_stencil_resolve_sample0_result(rail != "native-metal"))
+            if owes_stencil_resolve_drs:
+                report["results"].append(
+                    msaa_stencil_resolve_drs_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_min_edge_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_max_edge_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -1216,6 +1395,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(msaa_depth_result())
         report["results"].append(msaa_stencil_result())
         report["results"].append(msaa_depth_resolve_result())
+        report["results"].append(msaa_stencil_resolve_sample0_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -1358,6 +1538,12 @@ class ScissorObservationTests(unittest.TestCase):
                               MSAA_DEPTH_RESOLVE_MIN_EDGE_ID,
                               MSAA_DEPTH_RESOLVE_MAX_EDGE_ID):
                 expected = (3, 3)
+            elif case["id"] in (MSAA_STENCIL_RESOLVE_SAMPLE0_ID,
+                                MSAA_STENCIL_RESOLVE_DRS_ID):
+                # The combined shape's two extra landings touch and write two
+                # more allocations on top of the declaring pass's two and two
+                # (`research/docs/23` §3.3, v60).
+                expected = (4, 4)
             elif case["id"] in (DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID):
                 expected = (3, 2)
             else:
@@ -1893,13 +2079,16 @@ class ScissorObservationTests(unittest.TestCase):
         self.assertEqual(expectation.written, {900, 920})
 
     def test_v28_refuses_a_stencil_test_that_is_not_the_reviewed_one(self):
-        for field, value in (("compare", "always"), ("pass_op", "keep")):
+        # `always` is the v60 combined shape's own compare, so a third value
+        # exercises the refusal; a keep pass op stays outside both reviewed
+        # shapes (`research/docs/23` §3.3, v47/v60).
+        for field, value in (("compare", "less"), ("pass_op", "keep")):
             broken = copy.deepcopy(self.suite)
             broken["render_cases"][STENCIL_INDEX]["stencil_test"][field] = value
             with self.subTest(field=field):
                 with self.assertRaisesRegex(
                         compare.CaptureError,
-                        "the reviewed stencil state is an equal-zero test"):
+                        "the reviewed stencil state is one of the two reviewed shapes"):
                     compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_stencil_clear_that_is_not_the_reviewed_one(self):
@@ -1938,7 +2127,7 @@ class ScissorObservationTests(unittest.TestCase):
             with self.subTest(case=case["id"]):
                 with self.assertRaisesRegex(
                         compare.CaptureError,
-                        "the reviewed stencil shape carries no depth attachment"):
+                        "the combined depth-stencil shape needs its stencil resolve"):
                     compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_pins_the_stencil_store_fixture(self):
@@ -2338,9 +2527,17 @@ class ScissorObservationTests(unittest.TestCase):
             owes_stencil = stencil_marker(suite, rail)
             owes_stencil_store = stencil_store_marker(suite, rail)
             owes_depth_resolve = msaa_depth_resolve_marker(suite, rail)
+            owes_stencil_resolve_sample0 = msaa_stencil_resolve_sample0_marker(suite, rail)
+            owes_stencil_resolve_drs = msaa_stencil_resolve_drs_marker(suite, rail)
+            msaa_depth_resolve_min_edge_marker(suite, rail)
+            msaa_depth_resolve_max_edge_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
-            report = counted_declaring(suite, digest, rail)
+            report = counted_declaring(
+                suite, digest, rail,
+                depth_resolve_modes=DEPTH_RESOLVE_ALL_FILTERS_BITS,
+                stencil_resolve_modes=(STENCIL_RESOLVE_ALL_FILTERS_BITS
+                                       if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else 0))
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
@@ -2371,6 +2568,18 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(msaa_stencil_result(rail != "native-metal"))
             if owes_depth_resolve:
                 report["results"].append(msaa_depth_resolve_result(rail != "native-metal"))
+            if owes_stencil_resolve_sample0:
+                report["results"].append(
+                    msaa_stencil_resolve_sample0_result(rail != "native-metal"))
+            if owes_stencil_resolve_drs:
+                report["results"].append(
+                    msaa_stencil_resolve_drs_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_min_edge_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
+                report["results"].append(
+                    msaa_depth_resolve_max_edge_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -2607,10 +2816,9 @@ class ScissorObservationTests(unittest.TestCase):
                            bytes.fromhex(MSAA_STENCIL_EXPECTED))])
 
     def test_v28_refuses_a_msaa_stencil_surface_that_is_stored(self):
-        # A multisampled stencil surface's texels are only observable through a
-        # resolve, and the reviewed shape is the rail-owned one, so a case that
-        # keeps the surface is refused rather than compared
-        # (`research/docs/23` §3.3, v55).
+        # A multisampled stencil surface's texels are only observable through
+        # a resolve, so a case that keeps the surface without stating one is
+        # refused rather than compared (`research/docs/23` §3.3, v55/v60).
         broken = copy.deepcopy(self.suite)
         stencil = broken["render_cases"][MSAA_STENCIL_INDEX]["stencil"]
         stencil["store"] = "store"
@@ -2619,7 +2827,7 @@ class ScissorObservationTests(unittest.TestCase):
         stencil["expected_hex"] = "01" * 16
         with self.assertRaisesRegex(
                 compare.CaptureError,
-                "a multisampled stencil surface is rail-owned"):
+                "a stored multisampled stencil surface needs its stencil resolve"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_msaa_stencil_case_that_claims_partial_coverage(self):

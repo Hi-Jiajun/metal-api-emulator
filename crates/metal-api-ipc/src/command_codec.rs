@@ -20,17 +20,17 @@ use metal_api_core::provider::{
     HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
     IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
-    MultisampleDepthResolve, MultisampleState, OperationId, PipelineCompileRequest,
-    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
-    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
-    ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
+    MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
+    PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor, PresentMode,
+    PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
+    ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
     Retryability, SampleCount, SemanticDigest, ShaderSource, StagedLease, StencilCompare,
-    StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, SubmissionId,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
+    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
+    Winding, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -239,6 +239,15 @@ const RENDER_WIDE_FEATURE_MULTISAMPLE: u16 = 0x2000;
 /// never sets it, so every pre-v57 frame keeps its exact bytes.
 const RENDER_WIDE_FEATURE_DEPTH_RESOLVE: u16 = 0x4000;
 
+/// The wide feature word's eighth and final bit (`research/docs/23` §3.3,
+/// v60): the pass resolves its stored multisampled stencil surface, one
+/// filter code after the depth-resolve section and before culling. A pass that
+/// never resolves never sets it, so every pre-v60 frame keeps its exact
+/// bytes. With this bit the high byte is full: the next optional section needs
+/// a new mechanism — a second wide word behind a tag, or a v2 frame — rather
+/// than a ninth bit.
+const RENDER_WIDE_FEATURE_STENCIL_RESOLVE: u16 = 0x8000;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -249,7 +258,8 @@ const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
     | RENDER_WIDE_FEATURE_STENCIL_STORE
     | RENDER_WIDE_FEATURE_STENCIL_RESOURCE
     | RENDER_WIDE_FEATURE_MULTISAMPLE
-    | RENDER_WIDE_FEATURE_DEPTH_RESOLVE;
+    | RENDER_WIDE_FEATURE_DEPTH_RESOLVE
+    | RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -360,6 +370,17 @@ const CAPABILITY_MULTISAMPLE_TAIL: u8 = 0x04;
 /// resolve but none of the earlier blocks still keeps the decoder's position
 /// rules unambiguous.
 const CAPABILITY_DEPTH_RESOLVE_TAIL: u8 = 0x08;
+
+/// Presence tag of the capability tail's stencil-resolve block
+/// (`research/docs/23` §3.3, v60).
+///
+/// The block follows the depth-resolve block when the snapshot declares
+/// either stencil-resolve bit, and carries the bool plus the filter bitmask
+/// (bit `i` = [`StencilResolveFilter`] code `i`). It is a separate tagged
+/// section for the same reason the four blocks before it are: a snapshot that
+/// declares stencil resolve but none of the earlier blocks still keeps the
+/// decoder's position rules unambiguous.
+const CAPABILITY_STENCIL_RESOLVE_TAIL: u8 = 0x10;
 
 /// Maximum number of bytes one present target's sentinel may carry.
 ///
@@ -2079,13 +2100,19 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // never sets the bit, and the contract refuses the bit without
                 // the stored multisampled depth surface it reduces.
                 let has_depth_resolve = pass.depth_resolve.is_some();
+                // The stencil resolve is the stored stencil surface's own tail
+                // (`research/docs/23` §3.3, v60): a pass that never resolves
+                // never sets the bit, and the contract refuses the bit without
+                // the stored multisampled stencil surface it reduces.
+                let has_stencil_resolve = pass.stencil_resolve.is_some();
                 let wide = has_depth_store
                     || has_depth_resource
                     || has_stencil
                     || has_stencil_store
                     || has_stencil_resource
                     || has_multisample
-                    || has_depth_resolve;
+                    || has_depth_resolve
+                    || has_stencil_resolve;
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
@@ -2146,6 +2173,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         }
                         if has_depth_resolve {
                             wide_features |= RENDER_WIDE_FEATURE_DEPTH_RESOLVE;
+                        }
+                        if has_stencil_resolve {
+                            wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
                         }
                         encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
                         encoder.u16(wide_features);
@@ -2209,6 +2239,13 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     // decoder walks (`research/docs/23` §3.3, v57): one
                     // filter code.
                     if let Some(resolve) = &pass.depth_resolve {
+                        encoder.u8(resolve.filter.code());
+                    }
+                    // The stencil resolve section follows the depth resolve
+                    // section and precedes culling, in the same order the
+                    // decoder walks (`research/docs/23` §3.3, v60): one
+                    // filter code.
+                    if let Some(resolve) = &pass.stencil_resolve {
                         encoder.u8(resolve.filter.code());
                     }
                     if let Some(cull) = &pass.cull {
@@ -2807,6 +2844,25 @@ fn get_render_ext_pass(
         })?;
         pass.depth_resolve = Some(MultisampleDepthResolve { filter });
     }
+    // The stencil resolve section follows the depth resolve section and
+    // precedes culling (`research/docs/23` §3.3, v60): one filter code,
+    // refused when it names a filter this version does not know. The bit
+    // describes the stencil attachment's resolve, so a frame that sets it
+    // without a stencil section names a surface the pass never opens and is
+    // refused like the stencil store and resource bits are.
+    if features & RENDER_WIDE_FEATURE_STENCIL_RESOLVE != 0 {
+        if pass.stencil.is_none() {
+            return Err(CodecError::DepthFeatureWithoutAttachment(
+                RENDER_WIDE_FEATURE_STENCIL_RESOLVE,
+            ));
+        }
+        let code = decoder.u8()?;
+        let filter = StencilResolveFilter::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "stencil resolve filter",
+            value: code,
+        })?;
+        pass.stencil_resolve = Some(MultisampleStencilResolve { filter });
+    }
     if features & u16::from(RENDER_FEATURE_CULL) != 0 {
         let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
             field: "cull mode",
@@ -2911,6 +2967,10 @@ fn get_render_pass(
         // filter, exactly as a pass that never resolves does
         // (`research/docs/23` §3.3, v57).
         depth_resolve: None,
+        // A frame without the wide stencil resolve bit states the API default
+        // filter, exactly as a pass that never resolves does
+        // (`research/docs/23` §3.3, v60).
+        stencil_resolve: None,
         stencil: None,
         stencil_test: None,
         pipeline,
@@ -3950,6 +4010,12 @@ fn put_capabilities(
         // guard is what keeps the declaration from being silently dropped
         // (`research/docs/23` §3.3, v57).
         || capabilities.declares_depth_resolve_support()
+        // The stencil-resolve block follows the same rule: a snapshot that
+        // declares only the two stencil-resolve bits still has to write the
+        // heap/ICB half the decoder reads by position before the tag, and this
+        // guard is what keeps the declaration from being silently dropped
+        // (`research/docs/23` §3.3, v60).
+        || capabilities.declares_stencil_resolve_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -4023,6 +4089,14 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_DEPTH_RESOLVE_TAIL);
             encoder.bool(capabilities.supports_render_depth_resolve);
             encoder.u32(capabilities.depth_resolve_modes);
+        }
+        // The stencil-resolve block is the tail's newest section and follows
+        // the depth-resolve half when the snapshot declares either of its two
+        // bits (`research/docs/23` §3.3, v60).
+        if capabilities.declares_stencil_resolve_support() {
+            encoder.u8(CAPABILITY_STENCIL_RESOLVE_TAIL);
+            encoder.bool(capabilities.supports_render_stencil_resolve);
+            encoder.u32(capabilities.stencil_resolve_modes);
         }
     }
     Ok(())
@@ -4113,6 +4187,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // caller did not state (`research/docs/23` §3.3, v57).
         supports_render_depth_resolve: false,
         depth_resolve_modes: 0,
+        // A legacy payload cannot have declared the stencil resolve either:
+        // both bits take the "cannot resolve" defaults, so a legacy provider is
+        // refused a resolving pass instead of executing it with a filter the
+        // caller did not state (`research/docs/23` §3.3, v60).
+        supports_render_stencil_resolve: false,
+        stencil_resolve_modes: 0,
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
         // here (`docs/24` §4.2): a decoder that predates the present tag reads
@@ -4225,14 +4305,15 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_indirect_commands.push(kind);
     }
     capabilities.supported_indirect_commands = supported_indirect_commands;
-    // The vertex-input, instancing, multisample and depth-resolve blocks are
-    // the tail's four optional sections (`research/docs/23` §3.3, v31/v51/v57):
-    // each is read only when bytes remain, and each carries its own tag, so a
-    // snapshot that declares depth resolve without the three blocks before it
-    // writes its own tag directly and one that declares none keeps the shorter
-    // frame. The walk stays ordered — each section is only read where the
-    // encoder writes it — rather than a tag-keyed loop, so a frame that
-    // reorders the sections is refused instead of silently accepted.
+    // The vertex-input, instancing, multisample, depth-resolve and
+    // stencil-resolve blocks are the tail's five optional sections
+    // (`research/docs/23` §3.3, v31/v51/v57/v60): each is read only when
+    // bytes remain, and each carries its own tag, so a snapshot that declares
+    // stencil resolve without the four blocks before it writes its own tag
+    // directly and one that declares none keeps the shorter frame. The walk
+    // stays ordered — each section is only read where the encoder writes it —
+    // rather than a tag-keyed loop, so a frame that reorders the sections is
+    // refused instead of silently accepted.
     if decoder.remaining() == 0 {
         return Ok(capabilities);
     }
@@ -4283,6 +4364,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
     if tag != CAPABILITY_INSTANCING_TAIL
         && tag != CAPABILITY_MULTISAMPLE_TAIL
         && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
+        && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
     {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
@@ -4293,7 +4375,10 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
-        if tag != CAPABILITY_MULTISAMPLE_TAIL && tag != CAPABILITY_DEPTH_RESOLVE_TAIL {
+        if tag != CAPABILITY_MULTISAMPLE_TAIL
+            && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
+            && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
+        {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
     }
@@ -4304,14 +4389,32 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
+        if tag != CAPABILITY_DEPTH_RESOLVE_TAIL && tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
+            return Err(CodecError::UnknownCapabilityTail(tag));
+        }
     }
     // The depth-resolve block is the tail's fourth optional section
     // (`research/docs/23` §3.3, v57): it follows the multisample block when
-    // present, and reads the bool plus the filter bitmask.
-    if tag != CAPABILITY_DEPTH_RESOLVE_TAIL {
+    // present, and reads the bool plus the filter bitmask. A snapshot that
+    // declares stencil resolve without depth resolve skips it.
+    if tag == CAPABILITY_DEPTH_RESOLVE_TAIL {
+        capabilities.supports_render_depth_resolve = decoder.bool()?;
+        capabilities.depth_resolve_modes = decoder.u32()?;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        tag = decoder.u8()?;
+        if tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
+            return Err(CodecError::UnknownCapabilityTail(tag));
+        }
+    }
+    // The stencil-resolve block is the tail's fifth and newest optional
+    // section (`research/docs/23` §3.3, v60): it follows the depth-resolve
+    // block when present, and reads the bool plus the filter bitmask.
+    if tag != CAPABILITY_STENCIL_RESOLVE_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.supports_render_depth_resolve = decoder.bool()?;
-    capabilities.depth_resolve_modes = decoder.u32()?;
+    capabilities.supports_render_stencil_resolve = decoder.bool()?;
+    capabilities.stencil_resolve_modes = decoder.u32()?;
     Ok(capabilities)
 }

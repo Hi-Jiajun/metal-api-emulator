@@ -2399,6 +2399,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,

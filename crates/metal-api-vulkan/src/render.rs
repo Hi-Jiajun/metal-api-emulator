@@ -31,11 +31,12 @@
 use ash::vk;
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
-    CompareFunction, CullMode, DepthResolveFilter, DepthStoreOp, DepthTest, FieldValue,
-    IndexFormat, IndirectCommandDescriptor, LoadOp, MultisampleDepthResolve, MultisampleState,
-    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, Retryability, SampleCount, StencilCompare,
-    StencilOp, StencilTest, StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
+    CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest,
+    FieldValue, IndexFormat, IndirectCommandDescriptor, LoadOp, MultisampleDepthResolve,
+    MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
+    SampleCount, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
+    StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -374,6 +375,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// become observable, so the request carries the filter the observation
     /// reduces with.
     pub depth_resolve: Option<MultisampleDepthResolve>,
+    /// The stencil resolve a stored multisampled stencil surface states
+    /// (`research/docs/23` §3.3, v60), or `None` for a pass that resolves
+    /// nothing. Only legal beside a multisample raster whose stencil
+    /// attachment is stored: the resolve is how a four-sample stencil
+    /// surface's texels become observable, so the request carries the filter
+    /// the observation reduces with.
+    pub stencil_resolve: Option<MultisampleStencilResolve>,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -744,6 +752,7 @@ pub(crate) fn execute_render_pass(
         pass,
         previous,
         context.admitted_depth_resolve_modes(),
+        context.admitted_stencil_resolve_modes(),
     )?;
     execute_offscreen_render(context, &request)
 }
@@ -761,6 +770,7 @@ fn prepare_render_request<'a>(
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a [u8]>],
     depth_resolve_modes: u32,
+    stencil_resolve_modes: u32,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
     stages
         .contract
@@ -828,6 +838,57 @@ fn prepare_render_request<'a>(
             ));
         }
     }
+    // The stencil resolve (`research/docs/23` §3.3, v60) is the depth
+    // resolve's sibling one byte wide: it only means something beside a
+    // multisample raster that keeps its stencil surface, and the
+    // `DepthResolvedSample` filter names the sample the depth resolve
+    // selected. The core contract refuses the same shapes with
+    // `StencilResolveWithoutStoredStencil` and
+    // `StencilResolveWithoutDepthResolve`; this is the value-level second
+    // line of defence for a directly-constructed request.
+    if let Some(resolve) = pass.stencil_resolve {
+        let stored = pass.multisample.is_some()
+            && pass
+                .stencil
+                .as_ref()
+                .is_some_and(|stencil| stencil.store == Some(StoreOp::Store));
+        if !stored {
+            let store = pass.stencil.as_ref().and_then(|stencil| stencil.store);
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::StencilResolveWithoutStoredStencil {
+                    store,
+                }
+                .to_string(),
+            ));
+        }
+        if resolve.filter == StencilResolveFilter::DepthResolvedSample
+            && pass.depth_resolve.is_none()
+        {
+            return Err(contract_refusal(
+                &metal_api_core::provider::ContractError::StencilResolveWithoutDepthResolve
+                    .to_string(),
+            ));
+        }
+        // The Vulkan rail has no stencil mode for Metal's
+        // `DepthResolvedSample`, so the only admitted filter is Sample0 and the
+        // per-filter question the capability snapshot answered refuses the
+        // rest here for a directly-constructed request
+        // (`research/docs/23` §3.3, v60).
+        let mask = 1u32 << u32::from(resolve.filter.code());
+        if stencil_resolve_modes & mask == 0 {
+            return Err(
+                capability_refusal("render_stencil_resolve_filter_unsupported")
+                    .with_field(
+                        "filter",
+                        FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                    )
+                    .with_field(
+                        "modes",
+                        FieldValue::Unsigned(u64::from(stencil_resolve_modes)),
+                    ),
+            );
+        }
+    }
     // The multisample raster (`research/docs/23` §3.3, v51) is executed as a
     // four-sample pass whose resolve target is the attachment view itself. Core
     // admission already holds the shape (`RenderPassDescriptor::validate`);
@@ -857,21 +918,39 @@ fn prepare_render_request<'a>(
             ));
         }
         // The depth surface beside the raster is admitted from v53 on
-        // (`research/docs/23` §3.3, v53) and the stencil surface from v55: both
-        // are created with the pass's own sample count and stay rail-owned,
-        // because keeping either surface's texels would need the resolve the
-        // increments after this one review. The two surfaces stay mutually
-        // exclusive — a combined depth-stencil surface is its own increment —
-        // and a stored surface of either kind is refused, which the contract
-        // refuses too and this rail re-asserts for a directly-constructed
-        // request.
-        if pass.stencil.is_some() && pass.depth.is_some() {
-            return Err(
-                capability_refusal("render_stencil_combined_surface_unsupported").with_detail(
-                    "the multisample raster opens one depth-stencil surface: a combined \
-                     surface is a later increment",
-                ),
-            );
+        // (`research/docs/23` §3.3, v53) and the stencil surface from v55, both
+        // created with the pass's own sample count. Keeping either surface's
+        // texels is admitted from v57/v60 through the resolve the pass then
+        // has to state. A pass that opens both surfaces together is the
+        // combined depth-stencil shape this rail executes from v60 on
+        // (`research/docs/23` §3.3, v60): one `D32_SFLOAT_S8_UINT` attachment
+        // both faces share, opened from the reviewed clears with both faces
+        // stored through their resolves.
+        if let (Some(depth), Some(stencil)) = (&pass.depth, &pass.stencil) {
+            if !matches!(depth.load, DepthLoadOp::Clear(_))
+                || !matches!(stencil.load, StencilLoadOp::Clear(_))
+            {
+                return Err(
+                    capability_refusal("render_combined_depth_stencil_load_unsupported")
+                        .with_detail(
+                            "the combined depth-stencil shape opens both faces from a clear: \
+                             a loading combined surface is a later increment",
+                        ),
+                );
+            }
+            if depth.store != Some(DepthStoreOp::Store)
+                || stencil.store != Some(StoreOp::Store)
+                || pass.depth_resolve.is_none()
+                || pass.stencil_resolve.is_none()
+            {
+                return Err(
+                    capability_refusal("render_combined_depth_stencil_store_unsupported")
+                        .with_detail(
+                            "the combined depth-stencil shape stores both faces through their \
+                             two resolves, which is the only combined shape this rail executes",
+                        ),
+                );
+            }
         }
         if let Some(depth) = &pass.depth {
             if depth.store == Some(DepthStoreOp::Store) {
@@ -912,12 +991,39 @@ fn prepare_render_request<'a>(
         }
         if let Some(stencil) = &pass.stencil {
             if stencil.store == Some(StoreOp::Store) {
-                return Err(
-                    capability_refusal("render_multisample_stencil_store_unsupported").with_detail(
-                        "a multisampled stencil surface cannot be kept yet: the stencil \
-                         resolve is a later increment",
-                    ),
-                );
+                // The stored surface is admitted from v60 on, through the
+                // resolve the pass then has to state: its texels are only
+                // observable as the resolve's reduction, so a stored surface
+                // without one stays refused, and a filter the device does not
+                // report is refused by the same per-filter question the
+                // capability snapshot answered (`research/docs/23` §3.3, v60).
+                match pass.stencil_resolve {
+                    Some(resolve) => {
+                        let mask = 1u32 << u32::from(resolve.filter.code());
+                        if stencil_resolve_modes & mask == 0 {
+                            return Err(capability_refusal(
+                                "render_stencil_resolve_filter_unsupported",
+                            )
+                            .with_field(
+                                "filter",
+                                FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                            )
+                            .with_field(
+                                "modes",
+                                FieldValue::Unsigned(u64::from(stencil_resolve_modes)),
+                            ));
+                        }
+                    }
+                    None => {
+                        return Err(capability_refusal(
+                            "render_multisample_stencil_store_unsupported",
+                        )
+                        .with_detail(
+                            "a multisampled stencil surface cannot be kept without a stencil \
+                             resolve",
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1167,6 +1273,10 @@ fn prepare_render_request<'a>(
         // stated it (`research/docs/23` §3.3, v57); the shape and per-filter
         // refusals above already ran.
         depth_resolve: pass.depth_resolve,
+        // The stencil resolve filter travels with the request exactly as the
+        // trace stated it (`research/docs/23` §3.3, v60); the shape and
+        // per-filter refusals above already ran.
+        stencil_resolve: pass.stencil_resolve,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
@@ -1377,6 +1487,7 @@ pub(crate) fn execute_indirect_render_pass(
         pass,
         previous,
         context.admitted_depth_resolve_modes(),
+        context.admitted_stencil_resolve_modes(),
     )?;
     request.indirect = Some(replay);
     execute_offscreen_render(context, &request)
@@ -1745,6 +1856,62 @@ pub(crate) fn execute_offscreen_render(
                 }
             }
         }
+        if request
+            .stencil
+            .as_ref()
+            .is_some_and(OffscreenStencilAttachment::storing)
+        {
+            // A stencil-only resolve states `depthResolveMode = NONE` beside a
+            // non-NONE stencil mode; a device whose
+            // `independentResolveNone` is false requires the two to be both
+            // NONE or both non-NONE, so the rail refuses the shape instead of
+            // submitting a render pass the device rejects
+            // (`research/docs/23` §3.3, v60).
+            if request.depth_resolve.is_none() && !context.independent_resolve_none {
+                return Err(
+                    capability_refusal("render_stencil_resolve_independent_unsupported")
+                        .with_detail(
+                            "this device resolves the stencil face only together with the depth \
+                     face; a stencil-only resolve needs a device whose \
+                     independentResolveNone is true",
+                        ),
+                );
+            }
+            // The stored surface is admitted from v60 on, through the resolve
+            // the request then has to state (`research/docs/23` §3.3, v60):
+            // the same shape and per-filter questions `prepare_render_request`
+            // asked, re-asserted here for a hand-built request that skipped
+            // it.
+            match request.stencil_resolve {
+                Some(resolve) => {
+                    let mask = 1u32 << u32::from(resolve.filter.code());
+                    if context.admitted_stencil_resolve_modes() & mask == 0 {
+                        return Err(capability_refusal(
+                            "render_stencil_resolve_filter_unsupported",
+                        )
+                        .with_field(
+                            "filter",
+                            FieldValue::Unsigned(u64::from(resolve.filter.code())),
+                        )
+                        .with_field(
+                            "modes",
+                            FieldValue::Unsigned(u64::from(
+                                context.admitted_stencil_resolve_modes(),
+                            )),
+                        ));
+                    }
+                }
+                None => {
+                    return Err(
+                        capability_refusal("render_multisample_stencil_store_unsupported")
+                            .with_detail(
+                                "a multisampled stencil surface cannot be kept without a \
+                                 stencil resolve",
+                            ),
+                    )
+                }
+            }
+        }
         for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
             if !format_supports_multisample_color_attachment(context, *vk_format, tiling) {
                 return Err(attachment_format_refusal()
@@ -1813,6 +1980,33 @@ pub(crate) fn execute_offscreen_render(
                 .with_detail(
                     "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
                      DEPTH_STENCIL_ATTACHMENT combination for S8_UINT",
+                ));
+        }
+        // The combined surface's own four-sample question
+        // (`research/docs/23` §3.3, v60): one `D32_SFLOAT_S8_UINT` attachment
+        // carries both faces, so the device has to admit that combination
+        // before the combined image exists.
+        if request.depth.is_some()
+            && request.stencil.is_some()
+            && !format_supports_multisample_depth_attachment(
+                context,
+                vk::Format::D32_SFLOAT_S8_UINT,
+                tiling,
+            )
+        {
+            return Err(attachment_format_refusal()
+                .with_field(
+                    "vk_format",
+                    FieldValue::Unsigned(vk::Format::D32_SFLOAT_S8_UINT.as_raw() as u64),
+                )
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("depth_stencil_attachment_samples_4".to_owned()),
+                )
+                .with_detail(
+                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
+                     DEPTH_STENCIL_ATTACHMENT combination for D32_SFLOAT_S8_UINT",
                 ));
         }
     }
@@ -1895,7 +2089,19 @@ pub(crate) fn execute_offscreen_render(
             samples,
         )?;
     }
-    if let Some(depth) = &request.depth {
+    // The combined depth-stencil shape (`research/docs/23` §3.3, v60): Vulkan
+    // binds one attachment for both faces, so a pass that opens both creates
+    // the one `D32_SFLOAT_S8_UINT` surface and its one resolve landing instead
+    // of the two single-face surfaces the branches below build.
+    if let (Some(depth), Some(stencil)) = (&request.depth, &request.stencil) {
+        objects.create_combined_depth_stencil(width, height, samples)?;
+        if depth.storing() {
+            objects.create_depth_readback(byte_length)?;
+        }
+        if stencil.storing() {
+            objects.create_stencil_readback(stencil_byte_length)?;
+        }
+    } else if let Some(depth) = &request.depth {
         // The depth image is created before the render pass that names it, and
         // its `Load`/clear choice is settled by the image's own load operation
         // (`research/docs/23` §3.3, v36). A pass that keeps the surface also
@@ -1914,21 +2120,7 @@ pub(crate) fn execute_offscreen_render(
         if depth.storing() {
             objects.create_depth_readback(byte_length)?;
         }
-    }
-    if let Some(stencil) = &request.stencil {
-        // The first stencil increment executes a stencil-only surface beside
-        // the colour attachments (`research/docs/23` §3.3, v47). A pass that
-        // opens a depth attachment *and* a stencil attachment in the same
-        // submission would need a combined depth-stencil format, which is a
-        // later increment: refusing beats binding one surface twice.
-        if request.depth.is_some() {
-            return Err(
-                capability_refusal("render_stencil_combined_surface_unsupported").with_detail(
-                    "the first stencil increment opens a stencil-only attachment; a combined \
-                     depth-stencil surface is a later increment",
-                ),
-            );
-        }
+    } else if let Some(stencil) = &request.stencil {
         // The stencil image is created before the render pass that names it,
         // and a pass that keeps the surface also creates the readback
         // destination its texels land in, exactly as the depth path does since
@@ -1939,6 +2131,10 @@ pub(crate) fn execute_offscreen_render(
             stencil.clear.is_none(),
             stencil.storing(),
             samples,
+            // A stored multisampled stencil surface states its resolve
+            // filter; every other shape carries none
+            // (`research/docs/23` §3.3, v60).
+            request.stencil_resolve.map(|resolve| resolve.filter),
         )?;
         if stencil.storing() {
             objects.create_stencil_readback(stencil_byte_length)?;
@@ -1951,6 +2147,9 @@ pub(crate) fn execute_offscreen_render(
         // A stored multisampled depth surface states its resolve filter; every
         // other pass carries none (`research/docs/23` §3.3, v57).
         request.depth_resolve.map(|resolve| resolve.filter),
+        // A stored multisampled stencil surface states its resolve filter;
+        // every other pass carries none (`research/docs/23` §3.3, v60).
+        request.stencil_resolve.map(|resolve| resolve.filter),
     )?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
@@ -2006,6 +2205,10 @@ pub(crate) fn execute_offscreen_render(
         // same request field for its clear-value placeholder and copy-out
         // source (`research/docs/23` §3.3, v57).
         request.depth_resolve.map(|resolve| resolve.filter),
+        // The stencil resolve filter the subpass was built with; `record`
+        // reads the same request field for its clear-value placeholder and
+        // copy-out source (`research/docs/23` §3.3, v60).
+        request.stencil_resolve.map(|resolve| resolve.filter),
         request.scissor,
         width,
         height,
@@ -2417,6 +2620,7 @@ pub(crate) fn execute_present_render(
         pass,
         &previous,
         context.admitted_depth_resolve_modes(),
+        context.admitted_stencil_resolve_modes(),
     )?;
     let [attachment] = request.attachments.as_slice() else {
         return Err(contract_refusal(
@@ -2509,7 +2713,7 @@ pub(crate) fn execute_present_render(
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout);
-    objects.create_render_pass(&[vk_format], None, None, None)?;
+    objects.create_render_pass(&[vk_format], None, None, None, None)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -2530,6 +2734,7 @@ pub(crate) fn execute_present_render(
     objects.create_command_pool(queue_index)?;
     objects.record(
         std::slice::from_ref(attachment),
+        None,
         None,
         None,
         None,
@@ -2705,6 +2910,12 @@ struct StencilObjects {
     /// states a multisample raster, which the render pass's own description
     /// restates so the two cannot disagree.
     samples: vk::SampleCountFlags,
+    /// The single-sample image a stored multisampled stencil surface resolves
+    /// into (`research/docs/23` §3.3, v60), or `None` for a surface that
+    /// resolves nothing — every pre-v60 stencil surface and every
+    /// single-sample stored one. The resolve target is what the copy-out
+    /// reads and what the trace observes as the stencil view.
+    resolve: Option<StencilResolveObjects>,
     /// The host-visible buffer this pass's stencil texels land in, present
     /// exactly when the pass stores the surface (`research/docs/23` §3.3,
     /// v49). A discarded surface is never copied out, so it needs no
@@ -2714,6 +2925,31 @@ struct StencilObjects {
     /// the fence signals — the same shape the depth and colour attachments'
     /// readbacks have.
     mapping: Option<usize>,
+    /// Whether the image and memory behind this surface are shared with the
+    /// depth sibling of a combined depth-stencil attachment
+    /// (`research/docs/23` §3.3, v60). The combined shape creates one backing
+    /// image the two faces share; the depth half owns it, so this half marks
+    /// the flag and skips the free.
+    shares_backing: bool,
+}
+
+/// The single-sample resolve target of a stored multisampled stencil
+/// attachment (`research/docs/23` §3.3, v60).
+///
+/// The depth sibling's shape for the stencil aspect: the four-sample
+/// surface's stencil texels reduce into this `S8_UINT` image inside the
+/// subpass, and the copy-out reads the resolve target rather than the
+/// multisampled surface.
+struct StencilResolveObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// Whether the resolve image and its memory are shared with the depth
+    /// sibling's resolve of a combined depth-stencil attachment
+    /// (`research/docs/23` §3.3, v60). The combined shape resolves both faces
+    /// into one `D32_SFLOAT_S8_UINT` landing; the depth half owns it, so this
+    /// half marks the flag and skips the free.
+    shares_backing: bool,
 }
 
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
@@ -2983,7 +3219,14 @@ impl<'a> OffscreenObjects<'a> {
         loading: bool,
         storing: bool,
         samples: vk::SampleCountFlags,
+        resolve: Option<StencilResolveFilter>,
     ) -> Result<(), ProviderError> {
+        // A resolving pass keeps its stencil surface through the
+        // single-sample resolve target, so the four-sample image itself is
+        // never copied out; the resolve target below carries the transfer
+        // usage instead, the same split the multisampled colour attachment
+        // states (`research/docs/23` §3.3, v60).
+        let resolving = resolve.is_some();
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::S8_UINT)
@@ -2998,7 +3241,7 @@ impl<'a> OffscreenObjects<'a> {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                    | if storing {
+                    | if storing && !resolving {
                         vk::ImageUsageFlags::TRANSFER_SRC
                     } else {
                         vk::ImageUsageFlags::empty()
@@ -3016,14 +3259,200 @@ impl<'a> OffscreenObjects<'a> {
         let view =
             crate::create_stencil_image_view(self.context, image, vk::Format::S8_UINT, "stencil")
                 .map_err(|error| execution_refusal("create stencil view", &error.detail))?;
+        // The resolve target of a stored multisampled stencil surface
+        // (`research/docs/23` §3.3, v60): one single-sample `S8_UINT` image
+        // created beside its four-sample sibling, so the render pass and the
+        // framebuffer can name both. It carries `TRANSFER_SRC` because it is
+        // the surface the copy-out reads; the filter itself is the subpass's
+        // resolve state, not an image property, so the image carries no
+        // filter field.
+        let resolve_objects = if resolving {
+            let resolve_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::S8_UINT)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let (resolve_image, resolve_memory, _) = crate::allocate_image_backing(
+                self.context,
+                &resolve_info,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                "stencil resolve",
+            )
+            .map_err(|error| execution_refusal("create stencil resolve image", &error.detail))?;
+            let resolve_view = crate::create_stencil_image_view(
+                self.context,
+                resolve_image,
+                vk::Format::S8_UINT,
+                "stencil resolve",
+            )
+            .map_err(|error| execution_refusal("create stencil resolve view", &error.detail))?;
+            Some(StencilResolveObjects {
+                image: resolve_image,
+                memory: resolve_memory,
+                view: resolve_view,
+                shares_backing: false,
+            })
+        } else {
+            None
+        };
         self.stencil = Some(StencilObjects {
             image,
             memory,
             view,
             loading,
             samples,
+            resolve: resolve_objects,
             readback: None,
             mapping: None,
+            shares_backing: false,
+        });
+        Ok(())
+    }
+
+    /// Create the combined depth-stencil surface of a pass that opens both
+    /// faces and resolves both (`research/docs/23` §3.3, v60).
+    ///
+    /// Vulkan binds one attachment for both faces, so the two surfaces this
+    /// function builds share one `D32_SFLOAT_S8_UINT` image and one resolve
+    /// landing: the depth half owns both backings, the stencil half marks
+    /// `shares_backing` and lets the depth half free them. Both faces open
+    /// from a clear — the reviewed combined shape — so a loading combined
+    /// surface is refused by `prepare_render_request` before this runs.
+    fn create_combined_depth_stencil(
+        &mut self,
+        width: u32,
+        height: u32,
+        samples: vk::SampleCountFlags,
+    ) -> Result<(), ProviderError> {
+        let combined_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT_S8_UINT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (combined_image, combined_memory, _) = crate::allocate_image_backing(
+            self.context,
+            &combined_info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "combined depth-stencil",
+        )
+        .map_err(|error| execution_refusal("create combined depth-stencil image", &error.detail))?;
+        // The framebuffer binds one view per attachment: the combined
+        // attachment's view covers both aspects, which is what
+        // `create_depth_stencil_image_view` builds. The stencil half keeps an
+        // aspect-only view for its own identity; the copy-outs read the
+        // images' aspects directly and never use a view.
+        let depth_view = crate::create_depth_stencil_image_view(
+            self.context,
+            combined_image,
+            vk::Format::D32_SFLOAT_S8_UINT,
+            "combined depth",
+        )
+        .map_err(|error| execution_refusal("create combined depth view", &error.detail))?;
+        let stencil_view = crate::create_stencil_image_view(
+            self.context,
+            combined_image,
+            vk::Format::D32_SFLOAT_S8_UINT,
+            "combined stencil",
+        )
+        .map_err(|error| execution_refusal("create combined stencil view", &error.detail))?;
+        // The one single-sample landing both resolves reduce into: a
+        // `D32_SFLOAT_S8_UINT` image whose depth and stencil aspects are the
+        // two readback sources, exactly as the two surfaces' own aspects are
+        // the two faces of the four-sample attachment.
+        let resolve_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT_S8_UINT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (resolve_image, resolve_memory, _) = crate::allocate_image_backing(
+            self.context,
+            &resolve_info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "combined depth-stencil resolve",
+        )
+        .map_err(|error| {
+            execution_refusal("create combined depth-stencil resolve image", &error.detail)
+        })?;
+        let depth_resolve_view = crate::create_depth_stencil_image_view(
+            self.context,
+            resolve_image,
+            vk::Format::D32_SFLOAT_S8_UINT,
+            "combined depth resolve",
+        )
+        .map_err(|error| execution_refusal("create combined depth resolve view", &error.detail))?;
+        let stencil_resolve_view = crate::create_stencil_image_view(
+            self.context,
+            resolve_image,
+            vk::Format::D32_SFLOAT_S8_UINT,
+            "combined stencil resolve",
+        )
+        .map_err(|error| {
+            execution_refusal("create combined stencil resolve view", &error.detail)
+        })?;
+        self.depth = Some(DepthObjects {
+            image: combined_image,
+            memory: combined_memory,
+            view: depth_view,
+            loading: false,
+            samples,
+            resolve: Some(DepthResolveObjects {
+                image: resolve_image,
+                memory: resolve_memory,
+                view: depth_resolve_view,
+            }),
+            readback: None,
+            mapping: None,
+        });
+        self.stencil = Some(StencilObjects {
+            image: combined_image,
+            memory: combined_memory,
+            view: stencil_view,
+            loading: false,
+            samples,
+            resolve: Some(StencilResolveObjects {
+                image: resolve_image,
+                memory: resolve_memory,
+                view: stencil_resolve_view,
+                shares_backing: true,
+            }),
+            readback: None,
+            mapping: None,
+            shares_backing: true,
         });
         Ok(())
     }
@@ -3181,6 +3610,7 @@ impl<'a> OffscreenObjects<'a> {
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
         depth_resolve: Option<DepthResolveFilter>,
+        stencil_resolve: Option<StencilResolveFilter>,
     ) -> Result<(), ProviderError> {
         // The multisampled shape (`research/docs/23` §3.3, v51) lists two
         // attachment descriptions per colour location — the four-sample
@@ -3254,6 +3684,30 @@ impl<'a> OffscreenObjects<'a> {
                     }),
             )
             .chain(depth.map(|_| {
+                let combined = stencil.is_some();
+                if combined {
+                    // The combined depth-stencil attachment
+                    // (`research/docs/23` §3.3, v60): one
+                    // `D32_SFLOAT_S8_UINT` surface both faces share, so its
+                    // two load operations open the two aspects from the
+                    // reviewed clear. Its four-sample contents are consumed by
+                    // the two resolves inside the subpass, so it is never
+                    // stored; the combined resolve target below carries the
+                    // pass's store decision.
+                    let samples = self
+                        .depth
+                        .as_ref()
+                        .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
+                    return vk::AttachmentDescription2::default()
+                        .format(vk::Format::D32_SFLOAT_S8_UINT)
+                        .samples(samples)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .stencil_load_op(vk::AttachmentLoadOp::CLEAR)
+                        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
+                        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                }
                 // The depth attachment: opened from `UNDEFINED` for a clear and
                 // from the attachment layout for a load
                 // (`research/docs/23` §3.3, v36). A pass that states no store
@@ -3308,6 +3762,22 @@ impl<'a> OffscreenObjects<'a> {
                     })
             }))
             .chain(depth_resolve.map(|_| {
+                if stencil.is_some() {
+                    // The combined resolve target (`research/docs/23` §3.3,
+                    // v60): one single-sample `D32_SFLOAT_S8_UINT` image both
+                    // resolves reduce into. Its load operations are
+                    // `DONT_CARE` by construction and it ends in
+                    // `TRANSFER_SRC_OPTIMAL` for both copy-outs.
+                    return vk::AttachmentDescription2::default()
+                        .format(vk::Format::D32_SFLOAT_S8_UINT)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                        .stencil_store_op(vk::AttachmentStoreOp::STORE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
+                        .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                }
                 // The depth resolve target (`research/docs/23` §3.3, v57): a
                 // single-sample `D32_SFLOAT` image the four-sample surface's
                 // depth texels reduce into. Its load operation is `DONT_CARE`
@@ -3339,6 +3809,15 @@ impl<'a> OffscreenObjects<'a> {
                     .stencil
                     .as_ref()
                     .is_some_and(|objects| objects.readback.is_some());
+                // A resolving pass's four-sample contents are consumed by the
+                // stencil resolve inside the subpass, so the multisampled
+                // image itself is never stored; the resolve target below
+                // carries the pass's store decision
+                // (`research/docs/23` §3.3, v60).
+                let resolving = self
+                    .stencil
+                    .as_ref()
+                    .is_some_and(|objects| objects.resolve.is_some());
                 // The stencil surface is created with the raster's own sample
                 // count when the pass states one (`research/docs/23` §3.3,
                 // v55), so the description restates what the image was built
@@ -3359,7 +3838,7 @@ impl<'a> OffscreenObjects<'a> {
                             vk::AttachmentLoadOp::CLEAR
                         },
                     )
-                    .stencil_store_op(if storing {
+                    .stencil_store_op(if storing && !resolving {
                         vk::AttachmentStoreOp::STORE
                     } else {
                         vk::AttachmentStoreOp::DONT_CARE
@@ -3371,12 +3850,34 @@ impl<'a> OffscreenObjects<'a> {
                             vk::ImageLayout::UNDEFINED
                         },
                     )
-                    .final_layout(if storing {
+                    .final_layout(if storing && !resolving {
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL
                     } else {
                         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                     })
             }))
+            .chain(
+                stencil_resolve
+                    .and(stencil.filter(|_| depth.is_none()))
+                    .map(|_| {
+                        // The stencil resolve target (`research/docs/23` §3.3,
+                        // v60): a single-sample `S8_UINT` image the
+                        // four-sample surface's stencil texels reduce into.
+                        // Its load operation is `DONT_CARE` by construction —
+                        // the resolve writes every texel — and it ends in
+                        // `TRANSFER_SRC_OPTIMAL` for the copy-out, exactly as
+                        // a stored single-sample stencil attachment does.
+                        vk::AttachmentDescription2::default()
+                            .format(vk::Format::S8_UINT)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .stencil_store_op(vk::AttachmentStoreOp::STORE)
+                            .initial_layout(vk::ImageLayout::UNDEFINED)
+                            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    }),
+            )
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
             .map(|index| {
@@ -3423,18 +3924,31 @@ impl<'a> OffscreenObjects<'a> {
         // The depth resolve reference (`research/docs/23` §3.3, v57): the
         // single-sample landing follows the four-sample depth surface, which
         // itself follows both halves of the colour list, so its index is one
-        // past the depth reference's.
+        // past the depth reference's. The stencil-only resolve takes the same
+        // slot — the pass opens one depth-stencil surface, so the stencil
+        // landing is one past the stencil surface's own reference
+        // (`research/docs/23` §3.3, v60).
         let depth_resolve_ref = depth_resolve.map(|_| {
             vk::AttachmentReference2::default()
                 .attachment((self.attachments.len() * if multisampled { 2 } else { 1 } + 1) as u32)
                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         });
-        // The depth resolve state the subpass carries (`research/docs/23`
-        // §3.3, v57): the filter is the pass's own statement and the resolve
-        // reference is the single-sample landing above. The stencil slot stays
-        // `NONE` — this increment reviews depth resolve only — and the struct
-        // lives beside the subpass so its pNext chain stays valid for the
-        // `create_render_pass2` call.
+        // The resolve reference of a stencil-only resolving pass: the
+        // single-sample `S8_UINT` landing follows the four-sample stencil
+        // surface, whose own reference occupies the depth slot, so its index
+        // is one past that slot's (`research/docs/23` §3.3, v60).
+        let stencil_resolve_ref = stencil_resolve.map(|_| {
+            vk::AttachmentReference2::default()
+                .attachment((self.attachments.len() * if multisampled { 2 } else { 1 } + 1) as u32)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        });
+        // The depth-stencil resolve state the subpass carries
+        // (`research/docs/23` §3.3, v57/v60): the filter is the pass's own
+        // statement and the resolve reference is the single-sample landing
+        // above. Depth and stencil resolve are mutually exclusive on this rail
+        // (the combined surface is refused), so one slot states its filter
+        // while the other stays `NONE`; the struct lives beside the subpass so
+        // its pNext chain stays valid for the `create_render_pass2` call.
         let mut depth_stencil_resolve = vk::SubpassDescriptionDepthStencilResolve::default();
         if let (Some(resolve), Some(depth_resolve_ref)) = (depth_resolve, &depth_resolve_ref) {
             depth_stencil_resolve = depth_stencil_resolve
@@ -3446,6 +3960,26 @@ impl<'a> OffscreenObjects<'a> {
                 .stencil_resolve_mode(vk::ResolveModeFlags::NONE)
                 .depth_stencil_resolve_attachment(depth_resolve_ref);
         }
+        if let (Some(_), Some(stencil_resolve_ref)) = (stencil_resolve, &stencil_resolve_ref) {
+            depth_stencil_resolve = depth_stencil_resolve
+                // The combined shape resolves both faces into the one landing:
+                // the depth slot keeps its own filter, and the stencil slot
+                // takes the only admitted stencil filter, Sample0, mapped onto
+                // the device's SAMPLE_ZERO mode. The stencil-only shape has no
+                // depth face, so its depth slot is `NONE`
+                // (`research/docs/23` §3.3, v60).
+                .depth_resolve_mode(if let Some(resolve) = depth_resolve {
+                    match resolve {
+                        DepthResolveFilter::Sample0 => vk::ResolveModeFlags::SAMPLE_ZERO,
+                        DepthResolveFilter::Min => vk::ResolveModeFlags::MIN,
+                        DepthResolveFilter::Max => vk::ResolveModeFlags::MAX,
+                    }
+                } else {
+                    vk::ResolveModeFlags::NONE
+                })
+                .stencil_resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                .depth_stencil_resolve_attachment(stencil_resolve_ref);
+        }
         let mut subpass = vk::SubpassDescription2::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs);
@@ -3455,7 +3989,7 @@ impl<'a> OffscreenObjects<'a> {
         if let Some(depth_ref) = &depth_ref {
             subpass = subpass.depth_stencil_attachment(depth_ref);
         }
-        if depth_resolve.is_some() {
+        if depth_resolve.is_some() || stencil_resolve.is_some() {
             subpass = subpass.push_next(&mut depth_stencil_resolve);
         }
         let subpasses = [subpass];
@@ -3575,11 +4109,20 @@ impl<'a> OffscreenObjects<'a> {
                 views.push(resolve.view);
             }
         }
-        if let Some(stencil) = &self.stencil {
-            // The stencil view follows the depth view in the render pass's own
-            // order; a stencil-only pass has no depth view to precede it
-            // (`research/docs/23` §3.3, v47).
-            views.push(stencil.view);
+        if self.depth.is_none() {
+            if let Some(stencil) = &self.stencil {
+                // The stencil view follows the depth view in the render pass's own
+                // order; a stencil-only pass has no depth view to precede it
+                // (`research/docs/23` §3.3, v47).
+                views.push(stencil.view);
+                // The stencil resolve target follows its four-sample sibling in
+                // the render pass's own order (`research/docs/23` §3.3, v60): a
+                // resolving pass names both, and every other stencil pass adds
+                // nothing here.
+                if let Some(resolve) = &stencil.resolve {
+                    views.push(resolve.view);
+                }
+            }
         }
         let info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
@@ -4316,6 +4859,7 @@ impl<'a> OffscreenObjects<'a> {
         depth: Option<&OffscreenDepthAttachment>,
         stencil: Option<&OffscreenStencilAttachment>,
         depth_resolve: Option<DepthResolveFilter>,
+        stencil_resolve: Option<StencilResolveFilter>,
         scissor: Option<[u32; 4]>,
         width: u32,
         height: u32,
@@ -4369,7 +4913,13 @@ impl<'a> OffscreenObjects<'a> {
                 // depth load op is not `CLEAR`.
                 depth_stencil: vk::ClearDepthStencilValue {
                     depth: depth.clear.unwrap_or(1.0),
-                    stencil: 0,
+                    // The combined attachment clears both aspects with one
+                    // value: the stencil face's own clear travels here when
+                    // the pass opens both faces (`research/docs/23` §3.3,
+                    // v60).
+                    stencil: stencil
+                        .and_then(|surface| surface.clear)
+                        .map_or(0, u32::from),
                 },
             });
             if depth_resolve.is_some() {
@@ -4399,6 +4949,19 @@ impl<'a> OffscreenObjects<'a> {
                     stencil: u32::from(stencil.clear.unwrap_or(0)),
                 },
             });
+            if stencil_resolve.is_some() {
+                // The placeholder the stencil resolve attachment's own index
+                // needs: its load op is `DONT_CARE`, so the value is never
+                // read — the same rule the depth resolve placeholder states —
+                // but the array still has to reach the attachment count
+                // (`research/docs/23` §3.3, v60).
+                clear_values.push(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 0.0,
+                        stencil: 0,
+                    },
+                });
+            }
         }
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -4736,6 +5299,16 @@ impl<'a> OffscreenObjects<'a> {
         // exclusive in this increment, so the two copies never share a pass.
         if let Some(stencil) = &self.stencil {
             if let Some(readback) = &stencil.readback {
+                // A resolving pass's bytes are the resolve target's, not the
+                // four-sample image's, which the subpass consumed
+                // (`research/docs/23` §3.3, v60). The render pass already left
+                // the resolve image in `TRANSFER_SRC_OPTIMAL`, so the copy
+                // needs no barrier of its own — the same rule the stored
+                // single-sample attachment states (v49).
+                let source = stencil
+                    .resolve
+                    .as_ref()
+                    .map_or(stencil.image, |resolve| resolve.image);
                 let copy = vk::BufferImageCopy::default()
                     .buffer_offset(0)
                     .buffer_row_length(0)
@@ -4755,7 +5328,7 @@ impl<'a> OffscreenObjects<'a> {
                 unsafe {
                     self.context.device.cmd_copy_image_to_buffer(
                         self.command,
-                        stencil.image,
+                        source,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         readback.buffer,
                         std::slice::from_ref(&copy),
@@ -4875,13 +5448,29 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 }
             }
             if let Some(stencil) = &self.stencil {
+                // The combined shape shares one backing image and one resolve
+                // landing with the depth half, which owns both; the shared
+                // halves therefore only destroy their own aspect views and
+                // leave the backings to the depth half
+                // (`research/docs/23` §3.3, v60).
                 if stencil.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(stencil.view, None);
                 }
-                if stencil.image != vk::Image::null() {
+                if let Some(resolve) = &stencil.resolve {
+                    if resolve.view != vk::ImageView::null() {
+                        self.context.device.destroy_image_view(resolve.view, None);
+                    }
+                    if resolve.image != vk::Image::null() && !resolve.shares_backing {
+                        self.context.device.destroy_image(resolve.image, None);
+                    }
+                    if resolve.memory != vk::DeviceMemory::null() && !resolve.shares_backing {
+                        self.context.device.free_memory(resolve.memory, None);
+                    }
+                }
+                if stencil.image != vk::Image::null() && !stencil.shares_backing {
                     self.context.device.destroy_image(stencil.image, None);
                 }
-                if stencil.memory != vk::DeviceMemory::null() {
+                if stencil.memory != vk::DeviceMemory::null() && !stencil.shares_backing {
                     self.context.device.free_memory(stencil.memory, None);
                 }
             }
@@ -5172,7 +5761,8 @@ mod tests {
     use super::*;
     use metal_api_core::provider::{
         AllocationId, DepthFormat, DepthLoadOp, PipelineId, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, VertexLayout, ViewId,
+        RenderDepthAttachment, RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity,
+        StencilFormat, StencilLoadOp, VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -5293,6 +5883,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -5435,6 +6026,7 @@ mod tests {
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
+                stencil_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -5728,6 +6320,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -5796,6 +6389,7 @@ mod tests {
                     blend: None,
                     multisample: None,
                     depth_resolve: None,
+                    stencil_resolve: None,
                     cull: None,
                     depth: None,
                     base_vertex: 0,
@@ -5944,6 +6538,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -6039,7 +6634,7 @@ mod tests {
             .expect("the fixture describes one format per location");
         let previous = vec![None; maximum + 1];
 
-        let refused = match prepare_render_request(&stages, &pass, &previous, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &previous, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pass beyond the ceiling"),
         };
@@ -6092,7 +6687,7 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], 0b1)
+        let request = prepare_render_request(&stages, &pass, &[None], 0b1, 0)
             .expect("a stored multisampled depth resolve the device admits is well formed");
         assert_eq!(
             request.depth_resolve.map(|resolve| resolve.filter),
@@ -6104,7 +6699,7 @@ mod tests {
     fn prepare_render_request_refuses_a_depth_resolve_filter_the_device_does_not_report() {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = depth_resolving_pass();
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0b10) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0b10, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
         };
@@ -6121,11 +6716,102 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let mut pass = depth_resolving_pass();
         pass.depth_resolve = None;
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
         assert_eq!(refused.slug, "render_multisample_depth_store_unsupported");
+    }
+
+    /// A stored multisampled stencil surface whose resolve the device mask
+    /// admits (`research/docs/23` §3.3, v60).
+    fn stencil_resolving_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::clear(0),
+            store: Some(StoreOp::Store),
+            identity: Some(RenderStencilIdentity {
+                allocation_id: AllocationId::new(941),
+                view_id: ViewId::new(951),
+            }),
+        });
+        pass.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::IncrementWrap,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        pass.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::Sample0,
+        });
+        pass
+    }
+
+    #[test]
+    fn prepare_render_request_admits_a_stored_multisampled_stencil_resolve_in_the_device_mask() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = stencil_resolving_pass();
+        stages
+            .contract
+            .validate_against(&pass)
+            .expect("the fixture describes the reviewed single-attachment shape");
+        let request = prepare_render_request(&stages, &pass, &[None], 0, 0b1)
+            .expect("a stored multisampled stencil resolve the device admits is well formed");
+        assert_eq!(
+            request.stencil_resolve.map(|resolve| resolve.filter),
+            Some(StencilResolveFilter::Sample0)
+        );
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_a_stencil_resolve_filter_the_device_does_not_report() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = stencil_resolving_pass();
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b10) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
+        };
+        assert_eq!(refused.slug, "render_stencil_resolve_filter_unsupported");
+        assert_eq!(refused.fields.get("filter"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            refused.fields.get("modes"),
+            Some(&FieldValue::Unsigned(0b10))
+        );
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_a_stored_multisampled_stencil_without_a_resolve() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = stencil_resolving_pass();
+        pass.stencil_resolve = None;
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b1) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
+        };
+        assert_eq!(refused.slug, "render_multisample_stencil_store_unsupported");
+    }
+
+    #[test]
+    fn prepare_render_request_refuses_the_depth_resolved_sample_without_a_depth_resolve() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let mut pass = stencil_resolving_pass();
+        pass.stencil_resolve = Some(MultisampleStencilResolve {
+            filter: StencilResolveFilter::DepthResolvedSample,
+        });
+        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b1) {
+            Err(error) => error,
+            Ok(_) => panic!("the rail must refuse the filter without the depth resolve it names"),
+        };
+        assert_eq!(refused.slug, "trace_contract_invalid");
     }
 
     /// The reviewed dual shape end to end on one draw: both 2×2
@@ -6143,6 +6829,7 @@ mod tests {
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
+                stencil_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -6212,6 +6899,7 @@ mod tests {
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
+                stencil_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -6285,6 +6973,7 @@ mod tests {
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
+                stencil_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -6337,6 +7026,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -6428,6 +7118,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             stencil: None,
@@ -6500,7 +7191,7 @@ mod tests {
             .validate_against(&pass)
             .expect("the pipeline compiles one format per location");
 
-        let refused = match prepare_render_request(&stages, &pass, &[None, None], 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[None, None], 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("attachments of one pass share one extent"),
         };
@@ -6576,6 +7267,7 @@ mod tests {
                 blend: None,
                 multisample: None,
                 depth_resolve: None,
+                stencil_resolve: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -6627,10 +7319,10 @@ mod tests {
             .expect("the DontCare pass is a legal core shape now");
 
         // Without bytes the shape plans; with bytes it is refused by name.
-        prepare_render_request(&stages, &pass, &[None], 0)
+        prepare_render_request(&stages, &pass, &[None], 0, 0)
             .expect("a DontCare attachment with no previous bytes plans");
         let previous: [u8; 16] = [0x11; 16];
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
         };
@@ -6665,6 +7357,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: Some(OffscreenDepthAttachment {
                 width: 2,
@@ -6748,6 +7441,7 @@ mod tests {
             blend: None,
             multisample: None,
             depth_resolve: None,
+            stencil_resolve: None,
             cull: None,
             depth: None,
             stencil: Some(OffscreenStencilAttachment {
