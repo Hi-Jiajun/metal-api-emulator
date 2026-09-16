@@ -7135,6 +7135,12 @@ impl ProviderCapabilities {
     /// An empty placement list is a no-op, which keeps the pre-heap admission
     /// path unchanged; a non-empty list is refused with `heap_unsupported`
     /// before any resource action when the snapshot has no heap bits.
+    ///
+    /// Aliasing is the capability half of the heap shape (`docs/25` §7.1): a
+    /// heap that declares `allows_aliasing` is refused here unless the
+    /// snapshot also declares `supports_heap_aliasing`, and a snapshot that
+    /// keeps the fail-closed `false` default refuses every overlap with the
+    /// same `heap_alias_unsupported` slug the first increment published.
     pub fn admit_heap_placements(
         &self,
         heap: &HeapDescriptor,
@@ -7161,6 +7167,10 @@ impl ProviderCapabilities {
                 "storage_mode",
                 FieldValue::Text(format!("{:?}", heap.storage_mode)),
             ));
+        }
+        if heap.allows_aliasing && !self.supports_heap_aliasing {
+            return Err(capability_error("heap_alias_unsupported")
+                .with_field("placements", FieldValue::Unsigned(placements.len() as u64)));
         }
         validate_heap_placements(heap, placements).map_err(contract_error_refusal)?;
         for placement in placements {
@@ -7697,9 +7707,15 @@ impl HeapResource {
 
 /// A first-increment heap descriptor (`research/docs/25` §4.2).
 ///
-/// The first increment is fixed-size and refuses aliasing: those are the
-/// `docs/25` §9 item 2 and §7.1 choices, expressed here as "the field exists
-/// but the value is refused" rather than by a missing field.
+/// The first increment is fixed-size. `allows_aliasing` declares that this
+/// heap's placements may overlap, but declaring it is not enough to execute
+/// it: whether a provider can back the aliased shape is an admission
+/// capability (`docs/25` §7.1), so a snapshot that keeps
+/// [`ProviderCapabilities::supports_heap_aliasing`] at its `false` default
+/// refuses every aliasing heap before execution. Keeping the decision on the
+/// admission gate instead of the value type is what lets an explicitly
+/// declared aliasing test snapshot exercise the shape while production stays
+/// fail closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeapDescriptor {
     /// Total byte size of the heap. Zero means "no heap".
@@ -7708,20 +7724,19 @@ pub struct HeapDescriptor {
     /// the existing three-value [`StorageMode`] closure.
     pub storage_mode: StorageMode,
     /// Whether resources placed in this heap may alias overlapping byte
-    /// ranges. The first increment refuses `true` (`docs/25` §7.1).
+    /// ranges. This is the heap's own declaration; a provider snapshot only
+    /// executes it when [`ProviderCapabilities::supports_heap_aliasing`] is
+    /// also true.
     pub allows_aliasing: bool,
 }
 
 impl HeapDescriptor {
     /// Structural validation. Whether a provider can back this heap at all is
-    /// admission's question; this only refuses shapes the first increment does
-    /// not define.
+    /// admission's question, and the same holds for whether it can execute
+    /// aliasing; this only refuses shapes no provider could ever back.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.size == 0 {
             return Err(ContractError::ZeroLength("heap size"));
-        }
-        if self.allows_aliasing {
-            return Err(ContractError::HeapAliasingUnsupported);
         }
         Ok(())
     }
@@ -7804,8 +7819,12 @@ impl HeapPlacement {
 
 /// Validate a complete set of placements for one heap.
 ///
-/// The first increment refuses aliasing, so any two overlapping placements are
-/// rejected. Placement order and alignment are provider concerns.
+/// Overlapping placements are only well formed when the heap declares
+/// `allows_aliasing`; a heap that refuses aliasing still rejects every overlap
+/// here. Whether a provider can execute an aliased heap is the capability
+/// question [`ProviderCapabilities::admit_heap_placements`] answers, so this
+/// function stays a structural rule. Placement order and alignment are
+/// provider concerns.
 pub fn validate_heap_placements(
     heap: &HeapDescriptor,
     placements: &[HeapPlacement],
@@ -7814,16 +7833,18 @@ pub fn validate_heap_placements(
     for placement in placements {
         placement.validate_against(heap)?;
     }
-    for (index, first) in placements.iter().enumerate() {
-        for second in &placements[index + 1..] {
-            if first.overlaps(second) {
-                return Err(ContractError::HeapPlacementOverlap {
-                    heap: heap_id_of(first, second),
-                    first_offset: first.offset,
-                    first_size: first.resource.byte_size(),
-                    second_offset: second.offset,
-                    second_size: second.resource.byte_size(),
-                });
+    if !heap.allows_aliasing {
+        for (index, first) in placements.iter().enumerate() {
+            for second in &placements[index + 1..] {
+                if first.overlaps(second) {
+                    return Err(ContractError::HeapPlacementOverlap {
+                        heap: heap_id_of(first, second),
+                        first_offset: first.offset,
+                        first_size: first.resource.byte_size(),
+                        second_offset: second.offset,
+                        second_size: second.resource.byte_size(),
+                    });
+                }
             }
         }
     }
@@ -17497,6 +17518,12 @@ mod tests {
         provider
     }
 
+    fn heap_aliasing_capabilities() -> ProviderCapabilities {
+        let mut provider = heap_capabilities();
+        provider.supports_heap_aliasing = true;
+        provider
+    }
+
     fn icb_capabilities() -> ProviderCapabilities {
         let mut provider = capabilities();
         provider.supports_indirect_command_buffers = true;
@@ -17551,15 +17578,15 @@ mod tests {
         placement(1, 0, 4).validate_against(&heap_desc).unwrap();
         validate_heap_placements(&heap_desc, &[placement(1, 0, 4), placement(1, 8, 4)]).unwrap();
 
-        assert_eq!(
-            HeapDescriptor {
-                size: 16,
-                storage_mode: StorageMode::OwnedBytes,
-                allows_aliasing: true,
-            }
-            .validate(),
-            Err(ContractError::HeapAliasingUnsupported)
-        );
+        // Declaring aliasing is well formed; the capability decision belongs
+        // to admission rather than to the value type.
+        HeapDescriptor {
+            size: 16,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: true,
+        }
+        .validate()
+        .unwrap();
         assert_eq!(
             heap(0).validate(),
             Err(ContractError::ZeroLength("heap size"))
@@ -17583,6 +17610,15 @@ mod tests {
                 second_size: 8,
             })
         );
+        // The same overlapping pair is structurally fine once the heap
+        // declares aliasing; the snapshot capability is the remaining gate.
+        let aliasing_desc = HeapDescriptor {
+            size: 16,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: true,
+        };
+        validate_heap_placements(&aliasing_desc, &[placement(1, 0, 8), placement(1, 4, 8)])
+            .unwrap();
         assert_eq!(
             placement(1, 3, 4).validate_alignment(4),
             Err(ContractError::HeapPlacementMisaligned {
@@ -17634,6 +17670,25 @@ mod tests {
                 .slug,
             "heap_placement_overflow"
         );
+        // An aliasing descriptor against a snapshot that keeps the fail-closed
+        // capability default is refused with the first increment's slug.
+        let aliasing = HeapDescriptor {
+            size: 16,
+            storage_mode: StorageMode::OwnedBytes,
+            allows_aliasing: true,
+        };
+        assert_eq!(
+            heap_capabilities()
+                .admit_heap_placements(&aliasing, &[placement(1, 0, 8), placement(1, 8, 8)], 4)
+                .unwrap_err()
+                .slug,
+            "heap_alias_unsupported"
+        );
+        // The explicitly aliasing-capable snapshot admits the overlapping
+        // shape that the default snapshot refused.
+        heap_aliasing_capabilities()
+            .admit_heap_placements(&aliasing, &[placement(1, 0, 8), placement(1, 4, 8)], 4)
+            .unwrap();
         assert_eq!(
             heap_capabilities()
                 .admit_heap_placements(&heap, &[placement(1, 3, 4)], 4)

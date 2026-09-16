@@ -48,3 +48,7 @@ counterparts for per-pipeline binding-order and access-role tests.
 
 `conformance/shaders/copy_3d.ll` and `copy_3d.metal` are owned synthetic source
 counterparts for a two-buffer producer/consumer stage over resource subsets.
+
+`conformance/shaders/copy_16.ll` and `copy_16.metal` are owned synthetic source
+counterparts for a one-dimensional 16-word (64-byte) copy whose invocation
+index selects the word, used by the heap-aliasing hazard fixture.

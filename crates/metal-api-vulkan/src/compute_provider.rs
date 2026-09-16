@@ -273,6 +273,20 @@ impl VulkanComputeProvider {
         self
     }
 
+    /// Build the explicitly declared heap-aliasing test snapshot.
+    ///
+    /// This exists only for the heap-aliasing hazard fixture (`research/docs/25`
+    /// §7.1): the production capability snapshot built by [`Self::with_executor`]
+    /// keeps `supports_heap_aliasing = false`, and every production caller must
+    /// keep using that snapshot. The fixture flips exactly this one capability
+    /// bit so the aliasing shape reaches execution through real admission, not
+    /// through a bypass. Nothing else in the snapshot changes, so the fixture
+    /// still fails closed if it accidentally loses this marker.
+    pub fn with_heap_aliasing_test_snapshot(mut self) -> Self {
+        self.capabilities.supports_heap_aliasing = true;
+        self
+    }
+
     pub fn async_execution(&self) -> bool {
         self.async_execution
     }

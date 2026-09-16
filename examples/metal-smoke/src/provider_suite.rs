@@ -139,6 +139,7 @@ pub fn run_provider_suite(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn E
     run_object_concurrent_enqueue()?;
     run_device_lifecycle()?;
     run_heap_placement(Arc::clone(&executor))?;
+    run_heap_aliasing_hazard(Arc::clone(&executor))?;
     let unknown_token = CompletionToken {
         submission_id: SubmissionId::new(u64::MAX),
         device_epoch: provider.device_epoch(),
@@ -3652,6 +3653,357 @@ fn run_heap_placement(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error
     println!("PASS provider_heap_refusals count=heap_placement_mismatch size=heap_placement_mismatch overflow=heap_placement_overflow overlap=heap_alias_unsupported");
     release_case(&provider, &pipeline, &result)?;
     Ok(())
+}
+
+/// The heap-aliasing hazard evidence chain (`research/docs/25` §7.1): one
+/// slab holds two placements that overlap the same `[0, 64)` byte range, one
+/// pass writes the reviewed `copy_16` pattern through placement A, and the
+/// second pass reads placement B and lands what it observed in a third
+/// placement. The observation equals A's pattern only if B truly reads the
+/// aliased bytes; the control moves B to a disjoint offset and observes B's
+/// own sentinel instead, which is what makes the first read falsifiable.
+fn run_heap_aliasing_hazard(executor: Arc<VulkanExecutor>) -> Result<(), Box<dyn Error>> {
+    let provider = VulkanComputeProvider::with_executor(Arc::clone(&executor))
+        .map_err(provider_error)?
+        .with_heap_aliasing_test_snapshot();
+    let production =
+        VulkanComputeProvider::with_executor(Arc::clone(&executor)).map_err(provider_error)?;
+    let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
+    let function = device
+        .new_library_with_air(include_str!("../shaders/kernel_copy_16.ll"))?
+        .function("copy_16")?;
+    let pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"heap_aliasing".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let dispatch = Dispatch {
+        kind: DispatchKind::ThreadsExact,
+        grid: [16, 1, 1],
+        threads_per_threadgroup: [1, 1, 1],
+    };
+
+    let written = [0x67u8, 0x45, 0x23, 0x01];
+    let written_64 = written.repeat(16);
+    let b_initial_64 = vec![0xabu8; 64];
+    let observation_initial_64 = vec![0xcdu8; 64];
+
+    // Hazard shape: A and B occupy the exact same slab bytes; INPUT and the
+    // observation buffer are the two non-overlapping placements the heap
+    // mapping still requires (every owned allocation is placed).
+    let (trace, resources) = make_heap_aliasing_trace(
+        &pipeline,
+        800,
+        dispatch,
+        HeapPayload {
+            descriptor: HeapDescriptor {
+                size: 4096,
+                storage_mode: StorageMode::OwnedBytes,
+                allows_aliasing: true,
+            },
+            placements: vec![
+                HeapPlacement {
+                    heap_id: HeapId::new(62),
+                    offset: 384,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(62),
+                    offset: 0,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(62),
+                    offset: 0,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(62),
+                    offset: 256,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+            ],
+        },
+        written_64.clone(),
+        b_initial_64.clone(),
+        observation_initial_64.clone(),
+    )?;
+
+    // The production snapshot keeps `supports_heap_aliasing = false` and
+    // refuses the same shape before any device work.
+    expect_refusal(
+        production
+            .capabilities()
+            .validate_trace(trace.clone(), resources.clone()),
+        "heap_alias_unsupported",
+    )?;
+
+    let result = submit_and_wait_aliasing(&provider, &trace, resources)?;
+    let (aliased, a_landing) = aliasing_observation(&trace, &result)?;
+    if a_landing != written_64 {
+        return Err(format!(
+            "placement A did not retain its own writes: {}",
+            hex_bytes(&a_landing)
+        )
+        .into());
+    }
+    let observation = aliased;
+    if observation != written_64 {
+        return Err(format!(
+            "aliased read did not observe the written pattern: {}",
+            hex_bytes(&observation)
+        )
+        .into());
+    }
+    let placements = provider.heap_placement_observations();
+    if placements.len() != 4
+        || placements[0].heap_id != HeapId::new(62)
+        || placements[0].allocation_id != AllocationId::new(100)
+        || placements[0].offset != 384
+        || placements[1].heap_id != HeapId::new(62)
+        || placements[1].allocation_id != AllocationId::new(101)
+        || placements[1].offset != 0
+        || placements[2].allocation_id != AllocationId::new(102)
+        || placements[2].offset != 0
+        || placements[3].allocation_id != AllocationId::new(103)
+        || placements[3].offset != 256
+    {
+        return Err(
+            format!("aliasing heap placement observations are wrong: {placements:?}").into(),
+        );
+    }
+    println!(
+        "PASS provider_heap_aliasing_hazard heap=62 same_slab=true offsets=0,0,256,384 observation={}",
+        hex_bytes(&written_64)
+    );
+    release_case(&provider, &pipeline, &result)?;
+
+    // Control: B moves to a disjoint slab offset, so the read must observe
+    // B's own sentinel rather than A's writes.
+    let control_pipeline = provider
+        .compile_pipeline(
+            &function,
+            SemanticDigest::new("metal-smoke-fixture-v1", b"heap_aliasing_control".to_vec())?,
+        )
+        .map_err(provider_error)?;
+    let (control, control_resources) = make_heap_aliasing_trace(
+        &control_pipeline,
+        801,
+        dispatch,
+        HeapPayload {
+            descriptor: HeapDescriptor {
+                size: 4096,
+                storage_mode: StorageMode::OwnedBytes,
+                allows_aliasing: false,
+            },
+            placements: vec![
+                HeapPlacement {
+                    heap_id: HeapId::new(63),
+                    offset: 384,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(63),
+                    offset: 0,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(63),
+                    offset: 128,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+                HeapPlacement {
+                    heap_id: HeapId::new(63),
+                    offset: 256,
+                    resource: HeapResource::Buffer { byte_size: 64 },
+                },
+            ],
+        },
+        written_64.clone(),
+        b_initial_64.clone(),
+        observation_initial_64,
+    )?;
+    let control_result = submit_and_wait_aliasing(&provider, &control, control_resources)?;
+    let (control_observation, control_a) = aliasing_observation(&control, &control_result)?;
+    if control_a != written_64 {
+        return Err(format!(
+            "control placement A did not retain its own writes: {}",
+            hex_bytes(&control_a)
+        )
+        .into());
+    }
+    if control_observation != b_initial_64 {
+        return Err(format!(
+            "disjoint control read observed the wrong bytes: {}",
+            hex_bytes(&control_observation)
+        )
+        .into());
+    }
+    println!(
+        "PASS provider_heap_aliasing_control heap=63 offsets=0,128,256,384 observation={}",
+        hex_bytes(&control_observation)
+    );
+    release_case(&provider, &control_pipeline, &control_result)?;
+    Ok(())
+}
+
+/// One two-pass serial trace for the aliasing hazard: pass 1 reads INPUT and
+/// writes A, pass 2 reads B and writes OBS. Every owned allocation is placed
+/// in the heap because the provider maps placements to the trace's owned
+/// allocations in ascending order (100, 101, 102, 103); A and B may therefore
+/// overlap `[0, 64)` while INPUT and OBS stay at disjoint offsets.
+fn make_heap_aliasing_trace(
+    pipeline: &CompiledComputePipeline,
+    operation: u64,
+    dispatch: Dispatch,
+    heap: HeapPayload,
+    input: Vec<u8>,
+    b_initial: Vec<u8>,
+    observation_initial: Vec<u8>,
+) -> Result<(ComputeTrace, ResourceTableSnapshot), Box<dyn Error>> {
+    let pass = |buffers: Vec<BufferView>| {
+        TracePass::Compute(ComputePass {
+            pipeline: pipeline.pipeline_id,
+            buffers,
+            dispatch,
+            textures: Vec::new(),
+        })
+    };
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: pipeline.device_epoch,
+        operation_id: OperationId::new(operation),
+        pipelines: vec![pipeline.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            pass(vec![
+                BufferView {
+                    view_id: ViewId::new(203),
+                    metal_binding: 4,
+                    allocation_id: AllocationId::new(100),
+                    offset: 0,
+                    length: 64,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(input),
+                },
+                BufferView {
+                    view_id: ViewId::new(204),
+                    metal_binding: 9,
+                    allocation_id: AllocationId::new(101),
+                    offset: 0,
+                    length: 64,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(vec![0x5au8; 64]),
+                },
+            ]),
+            pass(vec![
+                BufferView {
+                    view_id: ViewId::new(205),
+                    metal_binding: 4,
+                    allocation_id: AllocationId::new(102),
+                    offset: 0,
+                    length: 64,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(b_initial),
+                },
+                BufferView {
+                    view_id: ViewId::new(206),
+                    metal_binding: 9,
+                    allocation_id: AllocationId::new(103),
+                    offset: 0,
+                    length: 64,
+                    access: BufferAccess::Write,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(observation_initial),
+                },
+            ]),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: Some(Box::new(heap)),
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [(100, 64), (101, 64), (102, 64), (103, 64)] {
+        resources.insert_allocation(AllocationRecord {
+            allocation_id: AllocationId::new(allocation),
+            owner_epoch: trace.device_epoch,
+            size,
+        })?;
+    }
+    Ok((trace, resources))
+}
+
+/// Admit and run the aliasing trace with its own resource snapshot, then wait
+/// for the visible terminal state (the generic helper rebuilds the snapshot
+/// from pass zero only, which would drop the pass-two allocations).
+fn submit_and_wait_aliasing(
+    provider: &VulkanComputeProvider,
+    trace: &ComputeTrace,
+    resources: ResourceTableSnapshot,
+) -> Result<ProviderSubmission, Box<dyn Error>> {
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .map_err(provider_error)?;
+    let result = provider.submit(admitted).map_err(provider_error)?;
+    result.validate_for_trace(trace)?;
+    let CompletionDisposition::CompletedVisible { token } = result.completion else {
+        return Err(format!("host readback did not complete: {:?}", result.completion).into());
+    };
+    let waited = provider
+        .wait(token, Duration::ZERO)
+        .map_err(provider_error)?;
+    if waited != (CompletionDisposition::CompletedVisible { token }) {
+        return Err(format!("completed token did not stay visible: {waited:?}").into());
+    }
+    Ok(result)
+}
+
+/// The 64-byte observation the aliasing trace's second pass landed in the
+/// third placement (the single writable view across both passes).
+fn aliasing_observation(
+    trace: &ComputeTrace,
+    result: &ProviderSubmission,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    let view = trace.passes[1]
+        .as_compute()
+        .expect("second pass is a compute pass")
+        .buffers
+        .iter()
+        .find(|view| view.metal_binding == 9)
+        .ok_or("observation binding is missing from the second pass")?;
+    let a_view = trace.passes[0]
+        .as_compute()
+        .expect("first pass is a compute pass")
+        .buffers
+        .iter()
+        .find(|view| view.metal_binding == 9)
+        .ok_or("placement A binding is missing from the first pass")?;
+    let observation = result
+        .writebacks
+        .iter()
+        .find(|writeback| writeback.view_id == view.view_id)
+        .ok_or("aliasing observation writeback is missing")?;
+    if observation.allocation_id != view.allocation_id || observation.offset != 0 {
+        return Err(format!("aliasing observation identity mismatch: {observation:?}").into());
+    }
+    let a = result
+        .writebacks
+        .iter()
+        .find(|writeback| writeback.view_id == a_view.view_id)
+        .ok_or("placement A writeback is missing")?;
+    if a.allocation_id != a_view.allocation_id || a.offset != 0 {
+        return Err(format!("placement A writeback identity mismatch: {a:?}").into());
+    }
+    Ok((observation.bytes.clone(), a.bytes.clone()))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn make_trace(
