@@ -1320,6 +1320,25 @@ def _inside_scissor(index, width, scissor):
     return x <= column < x + scissor_width and y <= row < y + scissor_height
 
 
+def _resolve_texel(fragment, clear, covered, samples):
+    """The resolve of one texel's samples (`research/docs/23` §3.3, v51).
+
+    `covered` of `samples` samples carry the fragment output and the rest the
+    colour the pass started from, so each resolved channel is their arithmetic
+    mean. A mean that is not exactly representable answers `None` rather than a
+    rounded byte: the fixture has to choose colours whose mixes divide exactly,
+    which is what keeps the expectation independent of a driver's rounding rule
+    — the reviewed case's channels are all chosen that way.
+    """
+    resolved = bytearray()
+    for channel in range(4):
+        total = fragment[channel] * covered + clear[channel] * (samples - covered)
+        if total % samples:
+            return None
+        resolved.append(total // samples)
+    return bytes(resolved)
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -1361,7 +1380,7 @@ def _render_plan(plan, suite):
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
                                "depth", "depth_test", "coverage", "cull", "blend",
-                               "stencil", "stencil_test"})
+                               "stencil", "stencil_test", "multisample"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1514,6 +1533,38 @@ def _render_plan(plan, suite):
             wildcard_texels = sorted(seen_texels)
             _require(definitions[0].get("store", "store") == "store",
                      f"{where}: a wildcard list needs a stored attachment")
+        # The pass-wide multisample raster (`research/docs/23` §3.3, v51): the
+        # first increment reviews one shape — a single colour attachment opened
+        # from a clear, four samples, no depth or stencil surface, no present
+        # action, no ICB and no wildcard texels — and its expectation follows
+        # the resolve rule instead of the coverage rule below. The trace rail
+        # executes it first; the object API entry is the increment after it.
+        multisample = case.get("multisample")
+        if multisample is not None:
+            _require(single,
+                     f"{where}: the multisample raster is the single-attachment shape")
+            _object(multisample, ("sample_count",), f"{where}.multisample")
+            _require(_integer(multisample["sample_count"],
+                              f"{where}.multisample.sample_count", 1) == 4,
+                     f"{where}: the reviewed multisample raster is four samples")
+            _require(coverage == "partial",
+                     f"{where}: the multisample raster has to claim partial coverage")
+            _require(case["attachment"].get("load") == "clear",
+                     f"{where}: the reviewed multisample pass opens its attachment from a "
+                     "clear")
+            _require("depth" not in case and "stencil" not in case,
+                     f"{where}: the reviewed multisample pass opens no depth or stencil "
+                     "surface")
+            _require("present" not in case and "icb" not in case,
+                     f"{where}: a multisample case carries neither a present action nor "
+                     "an ICB")
+            _require(wildcard_texels is None,
+                     f"{where}: the multisample raster claims every texel it resolves")
+            rails = _list(case["capture_rails"], f"{where}.capture_rails")
+            _require(not any(rail.endswith("-objects") for rail in rails
+                             if isinstance(rail, str)),
+                     f"{where}: the multisample raster is the trace rail's first increment: "
+                     "the object API entry is the increment after it")
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):
@@ -1654,7 +1705,33 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
-                if coverage == "partial":
+                if multisample is not None:
+                    # The multisample resolve (`research/docs/23` §3.3, v51):
+                    # every texel is the mean of the samples a primitive
+                    # covered, so the expectation has to be a k-of-`sample_count`
+                    # mix of the fragment output and the clear colour — and both
+                    # extremes and at least one partial mix have to appear, or
+                    # the fixture would claim a raster a single-sample pass could
+                    # produce (`_resolve_texel` refuses a mix that is not exactly
+                    # representable).
+                    samples = multisample["sample_count"]
+                    covered_seen = set()
+                    for index, chunk in enumerate(texels):
+                        for covered in range(samples + 1):
+                            if chunk == _resolve_texel(texel, clear, covered, samples):
+                                covered_seen.add(covered)
+                                break
+                        else:
+                            raise CaptureError(
+                                f"{attachment_where}: texel {index} is not the resolve of "
+                                f"any coverage of the {samples}-sample raster")
+                    _require(any(0 < covered < samples for covered in covered_seen),
+                             f"{attachment_where}: a multisample expectation needs at "
+                             "least one partially covered texel")
+                    _require(0 in covered_seen and samples in covered_seen,
+                             f"{attachment_where}: a multisample expectation needs both "
+                             "a fully covered and an uncovered texel")
+                elif coverage == "partial":
                     # The draw covers part of the attachment: every texel is
                     # the fragment output or the colour the pass started from,
                     # and both have to appear, or the fixture would claim

@@ -220,6 +220,10 @@ impl NativeMetalProvider {
             // the stream count that rail translates.
             let vertex_bits = render::vertex_input_capability_bits();
             let instancing_bits = render::instancing_capability_bits();
+            // The multisample bits come from the same rail value (`research/docs/23`
+            // §3.3, v51): the plan holds the raster to the one count the encoder
+            // builds, and this snapshot publishes exactly that count.
+            let multisample_bits = render::multisample_capability_bits();
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
@@ -293,6 +297,15 @@ impl NativeMetalProvider {
                 // `render::instancing_capability_bits`.
                 supports_render_instancing: instancing_bits.supports_render_instancing,
                 max_render_instances: instancing_bits.max_render_instances,
+                // Multisampling is executed by this rail as of v51: the plan
+                // carries the pass-wide raster, the encoder creates one
+                // four-sample texture per colour location and resolves it into
+                // the attachment's own texture, both proved on the host before
+                // a device object exists (`research/docs/23` §3.3). The flip
+                // condition is the reviewed `msaa_edge_4x4` case on the Apple
+                // rail, recorded on `render::multisample_capability_bits`.
+                supports_render_multisample: multisample_bits.supports_render_multisample,
+                max_render_sample_count: multisample_bits.max_render_sample_count,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).

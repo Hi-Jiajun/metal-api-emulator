@@ -2302,6 +2302,62 @@ pub struct RenderStencilIdentity {
 /// texel, which is what makes the stencil surface's extent a flat byte count.
 pub const STENCIL_BYTES_PER_TEXEL: u64 = 1;
 
+/// How many samples one multisampled render pass rasterizes per texel
+/// (`research/docs/23` §3.3, v51).
+///
+/// The admitted set is the one shape the first multisample increment reviews:
+/// the four-sample raster both Rails spell `MTLSampleCount4`/`TYPE_4`, whose
+/// standard sample positions are what makes a partially covered texel resolve
+/// to exactly the samples the primitive covered. `One` exists so the wire has a
+/// code for "not multisampled" without a second field; a pass that *states* it
+/// is refused, because the absent state already means single-sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleCount {
+    One,
+    Four,
+}
+
+impl SampleCount {
+    pub const ADMITTED: [Self; 2] = [Self::One, Self::Four];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::One => 0,
+            Self::Four => 1,
+        }
+    }
+
+    /// Inverse of [`SampleCount::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::One),
+            1 => Some(Self::Four),
+            _ => None,
+        }
+    }
+
+    /// The sample count in Vulkan's and Metal's own spelling.
+    pub const fn samples(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Four => 4,
+        }
+    }
+}
+
+/// The multisample state one render pass states (`research/docs/23` §3.3, v51).
+///
+/// The state is pass-wide rather than per-attachment on purpose: both APIs
+/// state the sample count once for the whole raster, and every colour
+/// attachment of the pass shares it. The single-sample shape is the *absent*
+/// field — a trace that never multisamples keeps its pre-v51 bytes exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MultisampleState {
+    /// Samples per texel, in the state the pass-wide raster is built with.
+    pub sample_count: SampleCount,
+}
+
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
@@ -2387,6 +2443,19 @@ pub struct RenderPassDescriptor {
     /// fragment output" — the shape every earlier increment published
     /// (`research/docs/23` §3.3, v40).
     pub blend: Option<RenderPassBlend>,
+    /// The multisample state the pass's raster is built with, or `None` for
+    /// the single-sample raster every earlier increment published
+    /// (`research/docs/23` §3.3, v51). When present, the pass rasterizes into
+    /// a four-sample surface per colour attachment and resolves the covered
+    /// samples into the attachment view itself, which is what the trace
+    /// observes: a texel whose samples disagree carries the coverage-weighted
+    /// mix of the fragment output and the load's own colour.
+    ///
+    /// The first multisample increment executes colour-only offscreen passes:
+    /// a depth or stencil attachment beside it, and a present action behind
+    /// it, are both refused by [`Self::validate`] until the increments that
+    /// review those shapes.
+    pub multisample: Option<MultisampleState>,
     /// The depth attachment this pass opens, or `None` for a pass with no
     /// depth surface at all (`research/docs/23` §3.3, v36). When present,
     /// [`Self::depth_test`] says what the fragments do with it.
@@ -2470,6 +2539,36 @@ impl RenderPassDescriptor {
             .is_some_and(RenderDepthAttachment::is_stored);
         if !stored_colour && !stored_depth {
             return Err(ContractError::AllRenderAttachmentsDiscarded);
+        }
+        // The multisample state (`research/docs/23` §3.3, v51) is the pass-wide
+        // raster decision, so this is the one place its shape is held: the
+        // sample count has to be a multisampled one, the pass has to have
+        // colour attachments for the resolve to land in, and the first
+        // increment reviews neither a depth/stencil surface nor a present
+        // action beside the multisampled raster.
+        if let Some(multisample) = self.multisample {
+            match multisample.sample_count {
+                SampleCount::One => {
+                    return Err(ContractError::SingleSampleMultisampleState);
+                }
+                SampleCount::Four => {}
+            }
+            if self.color_attachments.is_empty() {
+                return Err(ContractError::MultisampleWithoutColorAttachment);
+            }
+            if self.depth.is_some() {
+                return Err(ContractError::MultisampleSurfaceUnsupported {
+                    surface: "depth attachment",
+                });
+            }
+            if self.stencil.is_some() {
+                return Err(ContractError::MultisampleSurfaceUnsupported {
+                    surface: "stencil attachment",
+                });
+            }
+            if self.present.is_some() {
+                return Err(ContractError::MultisamplePresentUnsupported);
+            }
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
             return Err(ContractError::VertexBufferLimitExceeded {
@@ -5989,6 +6088,16 @@ pub struct ProviderCapabilities {
     /// gates [`VertexStep::PerInstance`] bindings, because a per-instance
     /// stream is only meaningful for a draw that runs more than one instance.
     pub supports_render_instancing: bool,
+    /// Whether this snapshot can execute the multisampled pass of
+    /// `research/docs/23` §3.3 (v51). Defaults to `false`: a pass that states
+    /// a multisample raster is refused during admission instead of being
+    /// silently executed as a single-sample draw.
+    pub supports_render_multisample: bool,
+    /// Samples this snapshot admits in one render pass. `0` means the snapshot
+    /// cannot multisample at all; the field stays at that default for a
+    /// snapshot whose bit above is false, so a caller reading the limit
+    /// without checking the bit cannot read one as an admission.
+    pub max_render_sample_count: u32,
     /// Instances this snapshot admits in one render pass. `0` means the
     /// snapshot cannot instance at all; the field stays at that default for a
     /// snapshot whose bit above is false, so a caller reading the limit
@@ -6066,6 +6175,7 @@ impl ProviderCapabilities {
             || self.declares_heap_support()
             || self.declares_icb_support()
             || self.declares_instancing_support()
+            || self.declares_multisample_support()
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -6086,6 +6196,15 @@ impl ProviderCapabilities {
     /// would be lost on the wire.
     pub fn declares_instancing_support(&self) -> bool {
         self.supports_render_instancing || self.max_render_instances != 0
+    }
+
+    /// Whether any multisample bit differs from its default. Part of the render
+    /// bits for the same reason [`ProviderCapabilities::declares_instancing_support`]
+    /// is: a snapshot that declared multisample support without declaring
+    /// render would otherwise keep sending the legacy capability payload, and
+    /// the two bits would be lost on the wire.
+    pub fn declares_multisample_support(&self) -> bool {
+        self.supports_render_multisample || self.max_render_sample_count != 0
     }
 
     /// Whether any present bit differs from its default.
@@ -6489,6 +6608,32 @@ impl ProviderCapabilities {
                         ));
                 }
             }
+            // The multisample state is the third pass-level bit this snapshot
+            // answers (`research/docs/23` §3.3, v51). A single-sample pass
+            // never reaches the check: `None` is the shape every earlier
+            // increment published, so a snapshot that does not declare
+            // multisampling keeps admitting it without a declaration.
+            if let Some(multisample) = pass.multisample {
+                if !self.supports_render_multisample {
+                    return Err(
+                        capability_error("render_multisample_unsupported").with_field(
+                            "sample_count",
+                            FieldValue::Unsigned(u64::from(multisample.sample_count.samples())),
+                        ),
+                    );
+                }
+                if multisample.sample_count.samples() > self.max_render_sample_count {
+                    return Err(capability_error("render_sample_count_limit")
+                        .with_field(
+                            "requested",
+                            FieldValue::Unsigned(u64::from(multisample.sample_count.samples())),
+                        )
+                        .with_field(
+                            "maximum",
+                            FieldValue::Unsigned(u64::from(self.max_render_sample_count)),
+                        ));
+                }
+            }
             if let Some(indices) = &pass.indices {
                 if !self.supported_index_formats.contains(&indices.format) {
                     return Err(capability_error("index_format_unsupported").with_field(
@@ -6858,6 +7003,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::ViewportExtentMismatch { .. }
         | E::ScissorOutOfBounds { .. }
         | E::BaseVertexRequiresIndices { .. }
+        | E::SingleSampleMultisampleState
+        | E::MultisampleWithoutColorAttachment
+        | E::MultisampleSurfaceUnsupported { .. }
+        | E::MultisamplePresentUnsupported
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
@@ -8282,6 +8431,28 @@ pub enum ContractError {
     /// observable landing point: discarding the whole pass would let "nothing
     /// landed" pass as "landed correctly" (`docs/23` §3.6, v19).
     AllRenderAttachmentsDiscarded,
+    /// The pass states a multisample raster of one sample
+    /// (`research/docs/23` §3.3, v51). Single-sample is what the *absent*
+    /// state already means, so spelling it out is refused rather than admitted
+    /// as a second encoding of the same shape.
+    SingleSampleMultisampleState,
+    /// The pass states a multisample raster but carries no colour attachment
+    /// for the resolve to land in (`research/docs/23` §3.3, v51).
+    MultisampleWithoutColorAttachment,
+    /// The pass states a multisample raster beside the named surface
+    /// (`research/docs/23` §3.3, v51). The first multisample increment
+    /// executes colour-only offscreen passes; a multisampled depth or stencil
+    /// surface is the increment that reviews the depth resolve filters both
+    /// APIs spell differently.
+    MultisampleSurfaceUnsupported {
+        surface: &'static str,
+    },
+    /// The pass states a multisample raster and hands its attachment on to a
+    /// present action (`research/docs/23` §3.3, v51). The present path
+    /// transitions the attachment it renders into, and which of the two
+    /// surfaces of a resolved pass that is has to be a deliberate increment
+    /// rather than an implication.
+    MultisamplePresentUnsupported,
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -8834,6 +9005,22 @@ impl fmt::Display for ContractError {
             Self::AllRenderAttachmentsDiscarded => formatter.write_str(
                 "render pass discards every colour attachment and keeps no depth attachment, \
                  leaving no observable landing point",
+            ),
+            Self::SingleSampleMultisampleState => formatter.write_str(
+                "a multisample state of one sample is what the absent state means: a pass \
+                 either states a multisampled raster or states none",
+            ),
+            Self::MultisampleWithoutColorAttachment => formatter.write_str(
+                "a multisample raster needs a colour attachment to resolve into",
+            ),
+            Self::MultisampleSurfaceUnsupported { surface } => write!(
+                formatter,
+                "a multisample raster beside a {surface} is outside the first multisample \
+                 increment: it executes colour-only offscreen passes"
+            ),
+            Self::MultisamplePresentUnsupported => formatter.write_str(
+                "a multisample raster with a present action is outside the first multisample \
+                 increment: the resolved surface's presentation is a later increment",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -10161,6 +10348,7 @@ mod tests {
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -10423,6 +10611,8 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_instancing: false,
             max_render_instances: 0,
+            supports_render_multisample: false,
+            max_render_sample_count: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -13409,6 +13599,7 @@ mod tests {
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -13461,6 +13652,106 @@ mod tests {
             contract_error_refusal(ContractError::EmptyAttachmentList).slug,
             "trace_contract_invalid"
         );
+    }
+
+    #[test]
+    fn the_multisample_state_is_one_pass_wide_raster_decision() {
+        // The absent state is the single-sample raster every pre-v51 pass ran,
+        // so the fixture without it is already well formed.
+        let mut pass = render_pass();
+        pass.validate()
+            .expect("the single-sample raster is the absent state");
+
+        // Stating single-sample is refused: it is the same shape the absent
+        // field spells, and admitting it would make two encodings for one
+        // raster.
+        let mut stated = pass.clone();
+        stated.multisample = Some(MultisampleState {
+            sample_count: SampleCount::One,
+        });
+        assert_eq!(
+            stated.validate(),
+            Err(ContractError::SingleSampleMultisampleState)
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::SingleSampleMultisampleState).slug,
+            "trace_contract_invalid"
+        );
+
+        // The four-sample raster is the reviewed shape: the pass keeps its one
+        // colour attachment and resolves into it.
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        pass.validate()
+            .expect("the four-sample raster is well formed");
+
+        // The first multisample increment reviews neither a depth nor a
+        // stencil surface beside the raster, and no present action behind it.
+        let mut with_depth = pass.clone();
+        with_depth.depth = Some(depth_attachment());
+        with_depth.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        assert_eq!(
+            with_depth.validate(),
+            Err(ContractError::MultisampleSurfaceUnsupported {
+                surface: "depth attachment",
+            })
+        );
+        let mut with_stencil = pass.clone();
+        with_stencil.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 2,
+            height: 2,
+            load: StencilLoadOp::clear(0),
+            store: None,
+            identity: None,
+        });
+        with_stencil.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::IncrementWrap,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        assert_eq!(
+            with_stencil.validate(),
+            Err(ContractError::MultisampleSurfaceUnsupported {
+                surface: "stencil attachment",
+            })
+        );
+        let mut with_present = pass.clone();
+        with_present.present = Some(PresentDescriptor {
+            target: PresentTarget {
+                allocation_id: AllocationId::new(9),
+                view_id: ViewId::new(7),
+                format: AttachmentFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                image_count: 1,
+                initial: InitialState::Undefined,
+            },
+            source: ViewId::new(7),
+            mode: PresentMode::Fifo,
+            acquire: AcquirePolicy::Blocking,
+        });
+        assert_eq!(
+            with_present.validate(),
+            Err(ContractError::MultisamplePresentUnsupported)
+        );
+
+        // A colour-only pass that states the raster is the admitted shape.
+        assert_eq!(SampleCount::ADMITTED.len(), 2);
+        assert_eq!(SampleCount::One.samples(), 1);
+        assert_eq!(SampleCount::Four.samples(), 4);
+        for count in SampleCount::ADMITTED {
+            assert_eq!(SampleCount::from_code(count.code()), Some(count));
+        }
+        assert_eq!(SampleCount::from_code(2), None);
     }
 
     /// The reviewed `2x2` depth surface in its pre-v43 shape: rail-owned, kept
@@ -14298,6 +14589,7 @@ mod tests {
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -14535,6 +14827,73 @@ mod tests {
         provider.supports_render_instancing = true;
         provider.max_render_instances = 4;
         provider
+    }
+
+    /// The attachment fixture extended with the pass-wide four-sample raster
+    /// (`research/docs/23` §3.3, v51).
+    fn multisample_trace() -> ComputeTrace {
+        let mut value = vertex_input_trace();
+        render_entry(&mut value).multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        value
+    }
+
+    /// The vertex-input snapshot extended with the two multisample bits.
+    fn multisample_capabilities() -> ProviderCapabilities {
+        let mut provider = vertex_input_capabilities();
+        provider.supports_render_multisample = true;
+        provider.max_render_sample_count = 4;
+        provider
+    }
+
+    #[test]
+    fn multisample_bits_gate_the_pass() {
+        let value = multisample_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(multisample_capabilities().declares_render_support());
+        // The two bits are part of the render question on purpose: a snapshot
+        // that declared them without declaring render would lose them on the
+        // wire, the failure `declares_render_support` documents.
+        let mut only_multisample = capabilities();
+        only_multisample.supports_render_multisample = true;
+        only_multisample.max_render_sample_count = 4;
+        assert!(only_multisample.declares_multisample_support());
+        assert!(only_multisample.declares_render_support());
+        assert!(!vertex_input_capabilities().declares_multisample_support());
+
+        multisample_capabilities()
+            .admit(&value, &vertex_input_resources())
+            .expect("a snapshot that declares the multisample bits admits the raster");
+
+        // The raster is refused by name when the snapshot does not declare the
+        // bit, and by its declared ceiling when it asks for more samples than
+        // the snapshot admits.
+        let no_multisample = vertex_input_capabilities();
+        assert_eq!(
+            no_multisample
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_multisample_unsupported"
+        );
+        let mut narrow = multisample_capabilities();
+        narrow.max_render_sample_count = 2;
+        assert_eq!(
+            narrow
+                .admit(&value, &vertex_input_resources())
+                .unwrap_err()
+                .slug,
+            "render_sample_count_limit"
+        );
+
+        // A single-sample pass never reaches the check: the absent state is the
+        // shape every earlier increment published.
+        let mut single = vertex_input_trace();
+        render_entry(&mut single).multisample = None;
+        vertex_input_capabilities()
+            .admit(&single, &vertex_input_resources())
+            .expect("the pre-v51 raster keeps admitting without a declaration");
     }
 
     #[test]

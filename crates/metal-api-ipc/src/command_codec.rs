@@ -20,14 +20,14 @@ use metal_api_core::provider::{
     HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
     IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
-    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
-    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    MultisampleState, OperationId, PipelineCompileRequest, PipelineContract, PipelineId,
+    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
+    RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease, StencilCompare,
-    StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, SubmissionId,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource, StagedLease,
+    StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp,
+    SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
     MAX_COLOR_ATTACHMENTS, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
@@ -226,6 +226,12 @@ const RENDER_WIDE_FEATURE_STENCIL_STORE: u16 = 0x0800;
 /// only written for the shape that keeps them.
 const RENDER_WIDE_FEATURE_STENCIL_RESOURCE: u16 = 0x1000;
 
+/// The wide feature word's sixth bit (`research/docs/23` §3.3, v51): the pass
+/// states a pass-wide multisample raster, one sample count code after the
+/// stencil sections and before culling. A pass that never multisamples never
+/// sets it, so every pre-v51 frame keeps its exact bytes.
+const RENDER_WIDE_FEATURE_MULTISAMPLE: u16 = 0x2000;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -234,7 +240,8 @@ const RENDER_WIDE_FEATURE_KNOWN: u16 = RENDER_FEATURE_KNOWN as u16
     | RENDER_WIDE_FEATURE_DEPTH_RESOURCE
     | RENDER_WIDE_FEATURE_STENCIL
     | RENDER_WIDE_FEATURE_STENCIL_STORE
-    | RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
+    | RENDER_WIDE_FEATURE_STENCIL_RESOURCE
+    | RENDER_WIDE_FEATURE_MULTISAMPLE;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -324,6 +331,16 @@ const CAPABILITY_VERTEX_INPUT_TAIL: u8 = 0x01;
 /// a snapshot that declares instancing but no vertex input still keeps the
 /// decoder's position rules unambiguous.
 const CAPABILITY_INSTANCING_TAIL: u8 = 0x02;
+
+/// Presence tag of the capability tail's multisample block
+/// (`research/docs/23` §3.3, v51).
+///
+/// The block follows the instancing block when the snapshot declares either
+/// multisample bit, and carries the bit plus the snapshot's sample ceiling. It
+/// is a separate tagged section for the same reason the two blocks before it
+/// are: a snapshot that declares multisampling but neither vertex input nor
+/// instancing still keeps the decoder's position rules unambiguous.
+const CAPABILITY_MULTISAMPLE_TAIL: u8 = 0x04;
 
 /// Maximum number of bytes one present target's sentinel may carry.
 ///
@@ -2035,11 +2052,15 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     .stencil
                     .as_ref()
                     .is_some_and(|stencil| stencil.identity.is_some());
+                // The multisample state is the pass's own, so its bit is the
+                // pass's own statement too (`research/docs/23` §3.3, v51).
+                let has_multisample = pass.multisample.is_some();
                 let wide = has_depth_store
                     || has_depth_resource
                     || has_stencil
                     || has_stencil_store
-                    || has_stencil_resource;
+                    || has_stencil_resource
+                    || has_multisample;
                 if has_vertex_input
                     || pass.scissor.is_some()
                     || has_instancing
@@ -2095,6 +2116,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         if has_stencil_resource {
                             wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOURCE;
                         }
+                        if has_multisample {
+                            wide_features |= RENDER_WIDE_FEATURE_MULTISAMPLE;
+                        }
                         encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
                         encoder.u16(wide_features);
                     } else {
@@ -2145,6 +2169,12 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                             encoder.u64(identity.allocation_id.get());
                             encoder.u64(identity.view_id.get());
                         }
+                    }
+                    // The multisample section follows the stencil sections and
+                    // precedes culling, in the same order the decoder walks
+                    // (`research/docs/23` §3.3, v51): one sample count code.
+                    if let Some(multisample) = &pass.multisample {
+                        encoder.u8(multisample.sample_count.code());
                     }
                     if let Some(cull) = &pass.cull {
                         encoder.u8(cull.mode.code());
@@ -2712,6 +2742,17 @@ fn get_render_ext_pass(
             view_id,
         });
     }
+    // The multisample section sits between the stencil sections and culling
+    // (`research/docs/23` §3.3, v51): one sample count code, refused when it
+    // names a count this version does not know.
+    if features & RENDER_WIDE_FEATURE_MULTISAMPLE != 0 {
+        let code = decoder.u8()?;
+        let sample_count = SampleCount::from_code(code).ok_or(CodecError::UnknownEnumValue {
+            field: "multisample sample count",
+            value: code,
+        })?;
+        pass.multisample = Some(MultisampleState { sample_count });
+    }
     if features & u16::from(RENDER_FEATURE_CULL) != 0 {
         let mode = CullMode::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
             field: "cull mode",
@@ -2809,6 +2850,9 @@ fn get_render_pass(
     Ok(RenderPassDescriptor {
         blend: None,
         cull: None,
+        // A frame without the wide multisample bit runs the single-sample
+        // raster every pre-v51 frame ran (`research/docs/23` §3.3, v51).
+        multisample: None,
         stencil: None,
         stencil_test: None,
         pipeline,
@@ -3835,6 +3879,13 @@ fn put_capabilities(
         || capabilities.declares_icb_support()
         || capabilities.declares_vertex_input_support()
         || capabilities.declares_instancing_support()
+        // A snapshot that declares multisampling but none of the blocks before
+        // it still has to write the heap/ICB half, because the decoder reads
+        // that half by position before the multisample tag
+        // (`research/docs/23` §3.3, v51). Leaving this out would drop the two
+        // bits on the wire entirely — the exact "declared a bit that travels
+        // as the old bytes" failure the comment above names.
+        || capabilities.declares_multisample_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -3892,6 +3943,14 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_INSTANCING_TAIL);
             encoder.bool(capabilities.supports_render_instancing);
             encoder.u32(capabilities.max_render_instances);
+        }
+        // The multisample block is the tail's newest section and follows the
+        // instancing half when the snapshot declares either of its two bits
+        // (`research/docs/23` §3.3, v51).
+        if capabilities.declares_multisample_support() {
+            encoder.u8(CAPABILITY_MULTISAMPLE_TAIL);
+            encoder.bool(capabilities.supports_render_multisample);
+            encoder.u32(capabilities.max_render_sample_count);
         }
     }
     Ok(())
@@ -3970,6 +4029,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         // (`research/docs/23` §3.3, v31).
         supports_render_instancing: false,
         max_render_instances: 0,
+        // A legacy payload cannot have declared multisampling either: the two
+        // bits take the "cannot multisample" defaults, so a legacy provider is
+        // refused a multisampled pass instead of executing it as a
+        // single-sample draw (`research/docs/23` §3.3, v51).
+        supports_render_multisample: false,
+        max_render_sample_count: 0,
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
         // here (`docs/24` §4.2): a decoder that predates the present tag reads
@@ -4082,15 +4147,21 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_indirect_commands.push(kind);
     }
     capabilities.supported_indirect_commands = supported_indirect_commands;
-    // The vertex-input block and the instancing block are the tail's two
-    // optional sections (`research/docs/23` §3.3, v31): each is read only when
-    // bytes remain, and each carries its own tag, so a snapshot that declares
-    // instancing without vertex input writes the second tag directly and one
-    // that declares neither keeps the shorter frame.
+    // The vertex-input, instancing and multisample blocks are the tail's three
+    // optional sections (`research/docs/23` §3.3, v31/v51): each is read only
+    // when bytes remain, and each carries its own tag, so a snapshot that
+    // declares multisampling without the two blocks before it writes its own
+    // tag directly and one that declares none keeps the shorter frame. The
+    // walk stays ordered — each section is only read where the encoder writes
+    // it — rather than a tag-keyed loop, so a frame that reorders the sections
+    // is refused instead of silently accepted.
     if decoder.remaining() == 0 {
         return Ok(capabilities);
     }
-    let tag = decoder.u8()?;
+    // The walk stays ordered — each section is read exactly where the encoder
+    // writes it — so the tag is the mutable cursor the optional blocks move
+    // forward rather than a chain of shadows.
+    let mut tag = decoder.u8()?;
     if tag == CAPABILITY_VERTEX_INPUT_TAIL {
         capabilities.max_vertex_buffers = decoder.u32()?;
         let vertex_format_count = usize::try_from(decoder.u64()?).map_err(|_| {
@@ -4129,14 +4200,23 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         if decoder.remaining() == 0 {
             return Ok(capabilities);
         }
-        let tag = decoder.u8()?;
-        if tag != CAPABILITY_INSTANCING_TAIL {
-            return Err(CodecError::UnknownCapabilityTail(tag));
-        }
-    } else if tag != CAPABILITY_INSTANCING_TAIL {
+        tag = decoder.u8()?;
+    }
+    if tag != CAPABILITY_INSTANCING_TAIL && tag != CAPABILITY_MULTISAMPLE_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.supports_render_instancing = decoder.bool()?;
-    capabilities.max_render_instances = decoder.u32()?;
+    if tag == CAPABILITY_INSTANCING_TAIL {
+        capabilities.supports_render_instancing = decoder.bool()?;
+        capabilities.max_render_instances = decoder.u32()?;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        let next = decoder.u8()?;
+        if next != CAPABILITY_MULTISAMPLE_TAIL {
+            return Err(CodecError::UnknownCapabilityTail(next));
+        }
+    }
+    capabilities.supports_render_multisample = decoder.bool()?;
+    capabilities.max_render_sample_count = decoder.u32()?;
     Ok(capabilities)
 }

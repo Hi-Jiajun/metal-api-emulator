@@ -1425,17 +1425,18 @@ mod tests {
         HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
         IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload,
         IndirectCommandRange, InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp,
-        OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PipelineProvider,
-        PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
-        ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
-        RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend,
-        RenderPassCull, RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment,
-        ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
-        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp,
-        SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-        TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat,
-        VertexLayout, ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
-        MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        MultisampleState, OperationId, PipelineCompileRequest, PipelineContract, PipelineId,
+        PipelineProvider, PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities,
+        ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission,
+        QueuePriority, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
+        RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+        RenderStencilAttachment, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
+        ShaderSource, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
+        StencilTest, StorageMode, StoreOp, SubmissionId, TextureAccess, TextureFormat,
+        TextureSource, TextureType, TextureView, TracePass, ValidatedComputeTrace, VertexAttribute,
+        VertexBufferLayout, VertexFormat, VertexLayout, ViewId, Winding,
+        FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
+        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1588,6 +1589,7 @@ mod tests {
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
             blend: None,
+            multisample: None,
             cull: None,
             stencil: None,
             stencil_test: None,
@@ -2627,10 +2629,13 @@ mod tests {
         // tag is: a section this decoder cannot read stops the frame rather
         // than being skipped to reach the sections after it.
         let mut unknown = frame.clone();
-        unknown[wide + 1] = 0x3f;
+        // The wide word is big-endian, so the high byte is the first one after
+        // the tag; `0x43` sets the next unknown bit (`0x4000`) beside the
+        // known depth ones (`0x0321`).
+        unknown[wide + 1] = 0x43;
         let refused = CommandCodec::decode_request(&unknown);
         assert!(
-            matches!(refused, Err(CodecError::UnknownRenderFeature(0x2000))),
+            matches!(refused, Err(CodecError::UnknownRenderFeature(0x4000))),
             "an unknown wide bit has to be refused, got {refused:?}"
         );
 
@@ -2708,6 +2713,50 @@ mod tests {
         assert!(plain_frame
             .windows(3)
             .any(|window| window == [0x11, 0x03, 0x21]));
+    }
+
+    /// A render trace whose pass states the pass-wide four-sample raster
+    /// (`research/docs/23` §3.3, v51).
+    fn multisample_trace() -> ComputeTrace {
+        let mut trace = vertex_input_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.multisample = Some(MultisampleState {
+            sample_count: SampleCount::Four,
+        });
+        trace
+    }
+
+    #[test]
+    fn a_multisample_pass_takes_the_wide_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: multisample_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The wide word's low byte is still the narrow byte (vertex input,
+        // `0x01`); the high byte carries the multisample bit, so the pair reads
+        // `20 01` — the wide word travels big-endian (`research/docs/23` §3.3,
+        // v51).
+        assert!(
+            frame.windows(3).any(|window| window == [0x11, 0x20, 0x01]),
+            "the multisample pass carries the sixth wide bit"
+        );
+
+        // A pass that never states the raster keeps the pre-v51 bytes: the
+        // same fixture without the state carries the narrow feature byte.
+        let plain = vertex_input_trace();
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(plain_frame.windows(2).any(|pair| pair == [0x10, 0x01]));
+        assert!(!plain_frame
+            .windows(3)
+            .any(|window| window == [0x11, 0x20, 0x01]));
     }
 
     #[test]
@@ -2814,6 +2863,84 @@ mod tests {
         assert!(matches!(
             CommandCodec::decode_response(&patched),
             Err(CodecError::UnknownCapabilityTail(0x03))
+        ));
+    }
+
+    #[test]
+    fn multisample_capability_bits_round_trip_and_extend_the_instancing_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        assert!(!capabilities.declares_multisample_support());
+        let plain = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert!(capabilities.declares_render_support());
+        assert_eq!(
+            CommandCodec::decode_response(&plain).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_multisample = true;
+        capabilities.max_render_sample_count = 4;
+        assert!(capabilities.declares_multisample_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        // The multisample block is the extended payload's newest optional
+        // section: one presence tag, one bool and one `u32`. A snapshot that
+        // declares no multisample bit keeps the shorter frame; one that
+        // declares only multisampling still writes the heap/ICB half the
+        // decoder reads by position before the tag (31 bytes: two bools, a
+        // `u64`, a `u32` and two length-prefixed empty lists), so the
+        // difference is that half plus this block
+        // (`research/docs/23` §3.3, v51).
+        assert_eq!(frame.len(), plain.len() + 31 + 6);
+
+        // The block is positional: a snapshot that declares it *without* the
+        // vertex-input and instancing bits writes the presence tag directly
+        // after the heap/ICB half, and the decoder has to read it there.
+        let mut only_multisample = fake_capabilities();
+        only_multisample.supports_render_passes = true;
+        only_multisample.max_color_attachments = 1;
+        only_multisample.max_attachment_dimension = [2, 2];
+        only_multisample.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        only_multisample.supports_render_multisample = true;
+        only_multisample.max_render_sample_count = 4;
+        let only_frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: only_multisample.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&only_frame).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: only_multisample,
+            }
+        );
+
+        // A decoder that predates the section refuses the tag rather than
+        // reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .windows(6)
+            .rposition(|window| window == [0x04, 0x01, 0x00, 0x00, 0x00, 0x04])
+            .expect("the multisample tail carries its presence tag, its bool and its count");
+        patched[tag] = 0x08;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched),
+            Err(CodecError::UnknownCapabilityTail(0x08))
         ));
     }
 
@@ -3735,6 +3862,8 @@ mod tests {
                     supported_index_formats: Vec::new(),
                     supports_render_instancing: false,
                     max_render_instances: 0,
+                    supports_render_multisample: false,
+                    max_render_sample_count: 0,
                     supports_presentation: false,
                     max_present_targets: 0,
                     supported_present_modes: Vec::new(),
@@ -4100,6 +4229,8 @@ mod tests {
             supported_index_formats: Vec::new(),
             supports_render_instancing: false,
             max_render_instances: 0,
+            supports_render_multisample: false,
+            max_render_sample_count: 0,
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),

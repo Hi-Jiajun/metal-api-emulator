@@ -905,6 +905,11 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
+            // The object API records no multisample state yet
+            // (`research/docs/23` §3.3, v51): the pass-wide raster state is the
+            // trace rail's first increment, and the recording entry that
+            // carries it is the increment after it.
+            multisample: None,
             // The blend state is the pass's own, exactly as the culling and
             // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
             blend: self.draw.blend.clone(),

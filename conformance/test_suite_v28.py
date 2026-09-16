@@ -98,6 +98,13 @@ STENCIL_STORE_ATTACHMENT = (STENCIL_STORE_ALLOCATION, STENCIL_STORE_VIEW, 0, 16)
 ALIGNMENT_ID = "top_half_quad_4x4"
 CULL_ID = "cull_back_half_quad_4x4"
 BLEND_ID = "blend_alpha_quad_4x4"
+# The v51 fixture: one colour attachment opened from a clear, rendered with a
+# four-sample raster and resolved into the attachment view itself. The quad's
+# right edge sits halfway through the third texel column, so exactly two of that
+# column's four samples are covered and the resolved texel is the arithmetic
+# mean of the fragment output and the clear colour — a byte pattern a
+# single-sample raster cannot produce.
+MSAA_ID = "msaa_edge_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -113,9 +120,13 @@ STENCIL_STORE_INDEX = 9
 ALIGNMENT_INDEX = 10
 CULL_INDEX = 11
 BLEND_INDEX = 12
+# The v51 multisample fixture is the newest case, so every earlier position is
+# unchanged and the new one is last.
+MSAA_INDEX = 13
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
-                  STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID)
+                  STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
+                  MSAA_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -256,6 +267,18 @@ BLEND_RAILS = ALL_RAILS
 # `draw_indexed_primitives_with_cull` is the object API's own culling entry, so
 # its marker names all five rails.
 CULL_RAILS = ALL_RAILS
+# The v51 multisample raster is the trace rail's first increment: the object API
+# records no pass-wide raster state yet, so its marker names the three rails
+# that execute the trace (`research/docs/23` §3.3, v51).
+MSAA_RAILS = TRACE_RAILS
+# The reviewed multisample expectation: the fragment output where the quad
+# covers every sample, the clear colour where it covers none, and the
+# `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
+MSAA_CLEAR = "22446689"
+MSAA_MIXED = "316293c4"
+MSAA_EXPECTED = "".join(
+    OUTPUT if (index % 4) < 2 else (MSAA_MIXED if (index % 4) == 2 else MSAA_CLEAR)
+    for index in range(16))
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -369,6 +392,20 @@ def stencil_store_marker(suite, rail):
     return rail in STENCIL_STORE_RAILS
 
 
+def msaa_marker(suite, rail):
+    """Point the v51 case at `rail` when that rail owes it, and elsewhere when not.
+
+    The multisample case is the trace rail's first increment, so its committed
+    marker names the three trace rails and not the two object rails: a capture
+    on a rail the marker names is owed the resolved attachment's own landing,
+    and one on any other rail has to leave the case out entirely
+    (`research/docs/23` §3.3, v51). Returns whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_RAILS else [other_rail(rail)])
+    return rail in MSAA_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -389,6 +426,25 @@ def base_vertex_result(provider_backend=True, copy_in=2, copy_out=2):
         "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
                         "offset": ATTACHMENT[2], "bytes_hex": BASE_VERTEX_EXPECTED}],
         "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": BASE_VERTEX_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v51 landing: the resolve target's own bytes.
+
+    The pass observes one resource — the attachment view the four-sample raster
+    resolves into — so the writeback, the allocation image and the provider
+    counts are the colour side's own shape (`research/docs/23` §3.3, v51).
+    """
+    result = {
+        "id": MSAA_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -675,6 +731,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(cull_result(rail != "native-metal"))
             if rail in BLEND_RAILS:
                 report["results"].append(blend_result(rail != "native-metal"))
+            if rail in MSAA_RAILS:
+                report["results"].append(msaa_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -727,6 +785,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(cull_result(rail != "native-metal"))
             if rail in BLEND_RAILS:
                 report["results"].append(blend_result(rail != "native-metal"))
+            if rail in MSAA_RAILS:
+                report["results"].append(msaa_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -769,6 +829,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(cull_result(rail != "native-metal"))
             if rail in BLEND_RAILS:
                 report["results"].append(blend_result(rail != "native-metal"))
+            if rail in MSAA_RAILS:
+                report["results"].append(msaa_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -811,6 +873,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
+        report["results"].append(msaa_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -1905,6 +1968,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
+        report["results"].append(msaa_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -1951,6 +2015,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(cull_result(rail != "native-metal"))
             if rail in BLEND_RAILS:
                 report["results"].append(blend_result(rail != "native-metal"))
+            if rail in MSAA_RAILS:
+                report["results"].append(msaa_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -1999,6 +2065,107 @@ class ScissorObservationTests(unittest.TestCase):
         broken["render_cases"][0]["expected_hex"] = OUTPUT * 16
         with self.assertRaisesRegex(compare.CaptureError,
                                     "has to be the clear colour under the declared scissor"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_pins_the_msaa_fixture(self):
+        case = self.suite["render_cases"][MSAA_INDEX]
+        self.assertEqual(case["id"], MSAA_ID)
+        self.assertEqual(case["multisample"], {"sample_count": 4})
+        self.assertEqual(case["coverage"], "partial")
+        self.assertEqual(case["attachment"]["load"], "clear")
+        self.assertEqual(case["attachment"]["clear_hex"], MSAA_CLEAR)
+        self.assertEqual(case["expected_hex"], MSAA_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(MSAA_RAILS))
+
+    def test_v28_plans_the_msaa_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[MSAA_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(MSAA_EXPECTED))])
+
+    def test_v28_refuses_a_multisample_state_that_is_not_four(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_INDEX]["multisample"]["sample_count"] = 2
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed multisample raster is four samples"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_multisample_case_without_the_coverage_claim(self):
+        broken = copy.deepcopy(self.suite)
+        del broken["render_cases"][MSAA_INDEX]["coverage"]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the multisample raster has to claim partial coverage"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_multisample_case_with_a_loading_attachment(self):
+        broken = copy.deepcopy(self.suite)
+        attachment = broken["render_cases"][MSAA_INDEX]["attachment"]
+        attachment["load"] = "load"
+        attachment["initial_hex"] = MSAA_CLEAR * 16
+        del attachment["clear_hex"]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed multisample pass opens its attachment"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_multisample_case_that_widens_to_an_attachment_list(self):
+        broken = copy.deepcopy(self.suite)
+        case = broken["render_cases"][MSAA_INDEX]
+        case["attachments"] = [case.pop("attachment")]
+        case["attachments"][0]["expected_hex"] = case.pop("expected_hex")
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the reviewed MRT shapes are two to four attachments"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_multisample_expectation_that_is_not_a_resolve(self):
+        # A single-sample raster can only produce the fragment output or the
+        # clear colour, so an expectation without the 2-of-4 mix is refused:
+        # that mix is the one byte pattern this fixture exists to observe.
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_INDEX]["expected_hex"] = "".join(
+            OUTPUT if (index % 4) < 2 else MSAA_CLEAR for index in range(16))
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "needs at least one partially covered texel"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_multisample_expectation_of_a_wrong_byte(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_INDEX]["expected_hex"] = (
+            MSAA_EXPECTED.replace(MSAA_MIXED, "316293c5", 1))
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "is not the resolve of any coverage"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_reports_the_msaa_case_on_every_rail_its_marker_names(self):
+        # The marker is the rule: the three trace rails owe the resolve
+        # target's landing, and the two object rails have to leave the case out
+        # rather than report a run they do not own (`research/docs/23` §3.3,
+        # v51).
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = msaa_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != MSAA_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(msaa_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_refuses_a_msaa_case_that_names_an_object_rail(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_INDEX]["capture_rails"] = list(ALL_RAILS)
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "the object API entry is the increment after it"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
 
