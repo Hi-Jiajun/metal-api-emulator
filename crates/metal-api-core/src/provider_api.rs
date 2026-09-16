@@ -888,6 +888,13 @@ impl RenderTarget {
                 compare: test.compare,
                 write: test.write,
             }),
+            // The object API records no stencil surface yet (`research/docs/23`
+            // §3.3, v47): the trace and native rails execute the reviewed
+            // stencil fixture, and the object entries that carry the state are
+            // the next increment — so a recording always states these two
+            // fields as absent, exactly as it did before they existed.
+            stencil: None,
+            stencil_test: None,
             scissor: self.scissor,
             pipeline: pipeline_id,
             color_attachments,

@@ -312,6 +312,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(1),
             color_attachments: vec![RenderAttachment {

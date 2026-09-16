@@ -666,6 +666,13 @@ def _vertex_input_declaration(case, where):
         return _blend_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("cull") is not None:
         return _cull_declaration(case, streams, vertex_buffers, indices, where)
+    # The stencil pair is the depth fixture's geometry with a `stencil8` surface
+    # in place of the depth one, and the two are mutually exclusive: this rule
+    # is checked before the depth rule, so a case that declares both is refused
+    # by the shape it claims rather than read as either one
+    # (`research/docs/23` §3.3, v47).
+    if case.get("stencil") is not None or case.get("stencil_test") is not None:
+        return _stencil_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("depth") is not None:
         return _depth_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("base_vertex", 0) != 0:
@@ -1075,6 +1082,107 @@ def _depth_declaration(case, streams, vertex_buffers, indices, where):
             "depth_store": depth_store}
 
 
+def _stencil_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed stencil pair (`research/docs/23` §3.3, v47).
+
+    The same reviewed pair module and the same two oversize triangles the depth
+    fixture draws — the near one at `z = 0.5` (red) and the far one at
+    `z = 0.9` (green) — this time over a cleared `stencil8` attachment with an
+    `equal` test against zero whose pass op increments and wraps. The near
+    triangle meets the cleared zero, passes and stores the incremented value;
+    the far one then meets that stored value and fails, so it is discarded and
+    the near tint covers the whole attachment: the expectation is the red texel
+    sixteen times, and a rail that ignored the stencil state would show the
+    green one, exactly as it would for the depth pair.
+
+    The attachment is rail-owned, the shape the first depth increment published
+    (`research/docs/23` §3.3, v36): the pass opens it, masks with it and lets it
+    disappear, so the fixture states its format, extent and clear value and
+    carries no identity and no readback. The *test* is optional — a pass may
+    open the surface without testing against it — but a test without the
+    attachment it reads describes nothing, so that half-declared shape is
+    refused rather than read as a pass whose fragments are all discarded.
+    """
+    quad_indices, stride = 6, 32
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == stride,
+             f"{where}: the reviewed stencil stream has stride {stride}")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 2, f"{where}: the reviewed stencil stream has two attributes")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x3"),
+             f"{where}: the reviewed stencil position is location 0, offset 0, float32x3")
+    _object(attributes[1], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[1]")
+    _require((attributes[1]["location"], attributes[1]["offset"], attributes[1]["format"])
+             == (1, 16, "float32x4"),
+             f"{where}: the reviewed stencil tint is location 1, offset 16, float32x4")
+    _require(case.get("depth") is None,
+             f"{where}: the reviewed stencil shape carries no depth attachment")
+    stencil = case.get("stencil")
+    # A stencil test without the attachment it reads has nothing to test
+    # against (`research/docs/23` §3.3, v47), so the half-declared shape is
+    # refused rather than read as a pass whose state is inert.
+    _require(isinstance(stencil, dict),
+             f"{where}: a stencil test needs the stencil attachment it reads")
+    # The clear value rides on the `load: "clear"` arm, so the field set is the
+    # one the fixture uses rather than a fixed key list.
+    allowed = {"format", "width", "height", "load", "clear_value"}
+    _require(set(stencil) - allowed == set(),
+             f"{where}.stencil: unexpected fields "
+             + ", ".join(sorted(set(stencil) - allowed)))
+    for field in ("format", "width", "height", "load", "clear_value"):
+        _require(field in stencil, f"{where}.stencil: missing field {field}")
+    _require(stencil["format"] == "stencil8",
+             f"{where}: the reviewed stencil attachment is stencil8")
+    _require(stencil["load"] == "clear",
+             f"{where}: the reviewed stencil attachment is cleared")
+    clear_value = _integer(stencil["clear_value"], f"{where}.stencil.clear_value", 0, 255)
+    _require(clear_value == 0, f"{where}: the reviewed stencil clear is zero")
+    test = case.get("stencil_test")
+    if test is not None:
+        # The reviewed state is the one fixture's, whole: `equal` against the
+        # value the attachment is cleared to, both masks fully on, and a pass op
+        # that increments and wraps. A rail that ignored any of those would land
+        # the far triangle's tint instead of the near one's, so the state is
+        # pinned as one shape rather than as individually checked fields
+        # (`research/docs/23` §3.3, v47).
+        _object(test, ("compare", "reference", "read_mask", "write_mask", "fail_op",
+                       "depth_fail_op", "pass_op"), f"{where}.stencil_test")
+        reference = _integer(test["reference"], f"{where}.stencil_test.reference", 0, 255)
+        read_mask = _integer(test["read_mask"], f"{where}.stencil_test.read_mask", 0, 255)
+        write_mask = _integer(test["write_mask"], f"{where}.stencil_test.write_mask", 0, 255)
+        _require(test["compare"] == "equal" and test["fail_op"] == "keep"
+                 and test["depth_fail_op"] == "keep" and test["pass_op"] == "increment_wrap"
+                 and (reference, read_mask, write_mask) == (0, 255, 255),
+                 f"{where}: the reviewed stencil state is an equal-zero test with both "
+                 "masks on that increments and wraps on pass")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed stencil shape binds one stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require(binding["length"] == stride * quad_indices,
+             f"{where}: the reviewed stencil stream is six stride-{stride} vertices")
+    _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
+             == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    _require(indices is not None, f"{where}: the reviewed stencil shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["initial_hex"] == "000001000200030004000500",
+             f"{where}: the reviewed stencil indices are the two reviewed triangles")
+    # The stencil attachment is rail-owned and observed by its effect on the
+    # colour side only, so the shape declares no landing and the assembly below
+    # owes it neither a writeback nor an allocation image.
+    return {"vertices": quad_indices, "indices": quad_indices}
+
+
 def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
     """Pin the reviewed base-vertex shape (`research/docs/23` §3.3, v34).
 
@@ -1186,7 +1294,8 @@ def _render_plan(plan, suite):
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
                                "instance_count", "wildcard_texels", "base_vertex",
-                               "depth", "depth_test", "coverage", "cull", "blend"})
+                               "depth", "depth_test", "coverage", "cull", "blend",
+                               "stencil", "stencil_test"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1356,6 +1465,13 @@ def _render_plan(plan, suite):
                 _require(case["depth"].get("width") == width
                          and case["depth"].get("height") == height,
                          f"{attachment_where}: the depth attachment has to match the "
+                         "colour extent")
+            # The stencil attachment is a raster with the pass's own extent, the
+            # same rule the depth surface states (`research/docs/23` §3.3, v47).
+            if case.get("stencil") is not None:
+                _require(case["stencil"].get("width") == width
+                         and case["stencil"].get("height") == height,
+                         f"{attachment_where}: the stencil attachment has to match the "
                          "colour extent")
             if scissor is not None:
                 x, y, scissor_width, scissor_height = scissor

@@ -34,7 +34,8 @@ use metal_api_core::provider::{
     CompareFunction, CullMode, DepthStoreOp, DepthTest, FieldValue, IndexFormat,
     IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
-    StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
+    StencilCompare, StencilOp, StencilTest, StoreOp, VertexBufferLayout, VertexFormat, VertexStep,
+    Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -300,6 +301,28 @@ fn solid_fragment_stage(
     Ok((module, entry))
 }
 
+/// One contract stencil comparison as the `VkCompareOp` it names
+/// (`research/docs/23` §3.3, v47).
+///
+/// The two admitted values are the two both APIs spell identically, so the
+/// mapping is total over the contract's own list.
+fn vk_stencil_compare(compare: StencilCompare) -> vk::CompareOp {
+    match compare {
+        StencilCompare::Equal => vk::CompareOp::EQUAL,
+        StencilCompare::Always => vk::CompareOp::ALWAYS,
+    }
+}
+
+/// One contract stencil operation as the `VkStencilOp` it names
+/// (`research/docs/23` §3.3, v47).
+fn vk_stencil_op(operation: StencilOp) -> vk::StencilOp {
+    match operation {
+        StencilOp::Keep => vk::StencilOp::KEEP,
+        StencilOp::Replace => vk::StencilOp::REPLACE,
+        StencilOp::IncrementWrap => vk::StencilOp::INCREMENT_AND_WRAP,
+    }
+}
+
 /// One offscreen render pass to execute.
 ///
 /// The shape mirrors `metal_api_core::provider::RenderPassDescriptor` for the
@@ -340,6 +363,11 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// rail-owned: it has no trace identity and is never read back, so what it
     /// carries is the shape the rail creates and opens.
     pub depth: Option<OffscreenDepthAttachment>,
+    /// The stencil attachment this pass opens, or `None` for a pass with no
+    /// stencil surface (`research/docs/23` §3.3, v47). Rail-owned like the
+    /// depth surface: the rail creates it, clears it and lets it go with the
+    /// pass.
+    pub stencil: Option<OffscreenStencilAttachment>,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
     /// The caller-held vertex streams the pass binds, in binding order
@@ -383,6 +411,25 @@ impl OffscreenDepthAttachment {
     fn storing(&self) -> bool {
         self.store == Some(DepthStoreOp::Store)
     }
+}
+
+/// The stencil attachment one offscreen pass opens (`research/docs/23` §3.3,
+/// v47).
+///
+/// Rail-owned like the first depth increment's surface: the reviewed fixture
+/// masks with it — the stored values decide which primitives survive — and
+/// nothing reads it back, so what it carries is the shape the rail creates and
+/// opens plus the state its draw tests and writes with.
+pub(crate) struct OffscreenStencilAttachment {
+    /// Extent in texels; core admission already held it to the colour
+    /// attachments' own extent.
+    pub width: u32,
+    pub height: u32,
+    /// `Some(value)` for a clear load, `None` for `Load`.
+    pub clear: Option<u8>,
+    /// The pass's stencil state, or `None` for "the attachment exists and
+    /// nothing tests it".
+    pub test: Option<StencilTest>,
 }
 
 /// One colour attachment of an offscreen render request.
@@ -697,11 +744,13 @@ fn prepare_render_request<'a>(
     }
     // The reviewed pair module is executed only by the fixtures whose state the
     // review covers: the depth fixture states a depth attachment and a test,
-    // the cull fixture a culling state, and the blend fixture a blend state. A
-    // pass that states none of them is a shape no review covered
-    // (`research/docs/23` §3.3, v36/v39/v40).
+    // the stencil fixture a stencil attachment and a test, the cull fixture a
+    // culling state, and the blend fixture a blend state. A pass that states
+    // none of them is a shape no review covered
+    // (`research/docs/23` §3.3, v36/v39/v40/v47).
     if vertex_stage_is_depth(&stages.contract.vertex_entry, &stages.vertex_spirv)
         && (pass.depth.is_none() || pass.depth_test.is_none())
+        && pass.stencil.is_none()
         && pass.cull.is_none()
         && pass.blend.is_none()
     {
@@ -931,9 +980,22 @@ fn prepare_render_request<'a>(
         test: pass.depth_test,
         store: depth.store,
     });
+    // The stencil attachment is rail-owned (`research/docs/23` §3.3, v47): the
+    // rail creates the surface, clears it with the value the trace states and
+    // arms the draw with the state the pass declares.
+    let stencil = pass
+        .stencil
+        .as_ref()
+        .map(|stencil| OffscreenStencilAttachment {
+            width: u32::try_from(stencil.width).unwrap_or(u32::MAX),
+            height: u32::try_from(stencil.height).unwrap_or(u32::MAX),
+            clear: stencil.load.clear_value(),
+            test: pass.stencil_test,
+        });
     let request = OffscreenRenderRequest {
         attachments,
         depth,
+        stencil,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
@@ -1454,7 +1516,27 @@ pub(crate) fn execute_offscreen_render(
             objects.create_depth_readback(byte_length)?;
         }
     }
-    objects.create_render_pass(&vk_formats, request.depth.as_ref())?;
+    if let Some(stencil) = &request.stencil {
+        // The first stencil increment executes a stencil-only surface beside
+        // the colour attachments (`research/docs/23` §3.3, v47). A pass that
+        // opens a depth attachment *and* a stencil attachment in the same
+        // submission would need a combined depth-stencil format, which is a
+        // later increment: refusing beats binding one surface twice.
+        if request.depth.is_some() {
+            return Err(
+                capability_refusal("render_stencil_combined_surface_unsupported").with_detail(
+                    "the first stencil increment opens a stencil-only attachment; a combined \
+                     depth-stencil surface is a later increment",
+                ),
+            );
+        }
+        objects.create_stencil(stencil.width, stencil.height, stencil.clear.is_none())?;
+    }
+    objects.create_render_pass(
+        &vk_formats,
+        request.depth.as_ref(),
+        request.stencil.as_ref(),
+    )?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -1463,6 +1545,7 @@ pub(crate) fn execute_offscreen_render(
         &fragment_entry,
         &request.vertex_streams,
         request.depth.as_ref(),
+        request.stencil.as_ref(),
         request.cull,
         request.blend.as_ref(),
     )?;
@@ -1503,6 +1586,7 @@ pub(crate) fn execute_offscreen_render(
     objects.record(
         &request.attachments,
         request.depth.as_ref(),
+        request.stencil.as_ref(),
         request.scissor,
         width,
         height,
@@ -1972,7 +2056,7 @@ pub(crate) fn execute_present_render(
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout);
-    objects.create_render_pass(&[vk_format], None)?;
+    objects.create_render_pass(&[vk_format], None, None)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -1983,6 +2067,7 @@ pub(crate) fn execute_present_render(
         None,
         None,
         None,
+        None,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
@@ -1990,7 +2075,14 @@ pub(crate) fn execute_present_render(
     objects.instance_count = request.instance_count;
     objects.base_vertex = request.base_vertex;
     objects.create_command_pool(queue_index)?;
-    objects.record(std::slice::from_ref(attachment), None, None, width, height)?;
+    objects.record(
+        std::slice::from_ref(attachment),
+        None,
+        None,
+        None,
+        width,
+        height,
+    )?;
     objects.submit_and_wait(queue_index)?;
 
     let texels = unsafe {
@@ -2045,6 +2137,10 @@ struct OffscreenObjects<'a> {
     /// (`research/docs/23` §3.3, v36). `None` for every pre-v36 pass, which is
     /// why the render pass, framebuffer and pipeline below all branch on it.
     depth: Option<DepthObjects>,
+    /// The rail-owned stencil image of a pass that declares one
+    /// (`research/docs/23` §3.3, v47). `None` for every pre-v47 pass, which is
+    /// why the render pass, framebuffer and pipeline below all branch on it.
+    stencil: Option<StencilObjects>,
     /// Whether this scope created every `attachments` image/memory/view and
     /// must destroy them on Drop. A present pass borrows the provider-owned
     /// [`PresentTargetImage`] instead, so its per-pass scope must not destroy
@@ -2113,6 +2209,22 @@ struct DepthObjects {
     mapping: Option<usize>,
 }
 
+/// The Vulkan objects one rail-owned stencil attachment owns
+/// (`research/docs/23` §3.3, v47).
+///
+/// The depth sibling's shape without a readback: the reviewed fixture masks
+/// with the surface and never observes its bytes, so the rail creates the
+/// image, clears it with the value the trace states and lets it go with the
+/// pass.
+struct StencilObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// Whether the pass opens the image from the attachment layout a previous
+    /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
+    loading: bool,
+}
+
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
 ///
 /// `load_op` and `initial_layout` travel with the attachment because both feed
@@ -2150,6 +2262,7 @@ impl<'a> OffscreenObjects<'a> {
             context,
             attachments: Vec::new(),
             depth: None,
+            stencil: None,
             owns_attachments: true,
             present: false,
             render_pass: vk::RenderPass::null(),
@@ -2277,6 +2390,54 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Create the rail-owned stencil image of a pass that declares one
+    /// (`research/docs/23` §3.3, v47).
+    ///
+    /// The image is a `VK_FORMAT_S8_UINT` stencil attachment opened from
+    /// `UNDEFINED` for a clear and from the attachment layout for a load. It
+    /// carries `DEPTH_STENCIL_ATTACHMENT` alone: nothing reads the surface
+    /// back in this increment, exactly as the first depth increment's image
+    /// carried no transfer usage.
+    fn create_stencil(
+        &mut self,
+        width: u32,
+        height: u32,
+        loading: bool,
+    ) -> Result<(), ProviderError> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::S8_UINT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, _) = crate::allocate_image_backing(
+            self.context,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "stencil",
+        )
+        .map_err(|error| execution_refusal("create stencil image", &error.detail))?;
+        let view =
+            crate::create_stencil_image_view(self.context, image, vk::Format::S8_UINT, "stencil")
+                .map_err(|error| execution_refusal("create stencil view", &error.detail))?;
+        self.stencil = Some(StencilObjects {
+            image,
+            memory,
+            view,
+            loading,
+        });
+        Ok(())
+    }
+
     fn create_attachment(
         &mut self,
         format: vk::Format,
@@ -2373,6 +2534,7 @@ impl<'a> OffscreenObjects<'a> {
         &mut self,
         formats: &[vk::Format],
         depth: Option<&OffscreenDepthAttachment>,
+        stencil: Option<&OffscreenStencilAttachment>,
     ) -> Result<(), ProviderError> {
         let attachments = self
             .attachments
@@ -2434,6 +2596,35 @@ impl<'a> OffscreenObjects<'a> {
                         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                     })
             }))
+            .chain(stencil.filter(|_| depth.is_none()).map(|_| {
+                // The rail-owned stencil attachment (`research/docs/23` §3.3,
+                // v47): a `S8_UINT` surface whose *stencil* load and store
+                // operations carry the pass's decision — the depth aspect's
+                // pair is `DONT_CARE` for a format that has no depth aspect.
+                // A clearing pass opens it from `UNDEFINED`, a loading one from
+                // the attachment layout a previous pass left it in.
+                vk::AttachmentDescription::default()
+                    .format(vk::Format::S8_UINT)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .stencil_load_op(
+                        if self.stencil.as_ref().is_some_and(|objects| objects.loading) {
+                            vk::AttachmentLoadOp::LOAD
+                        } else {
+                            vk::AttachmentLoadOp::CLEAR
+                        },
+                    )
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(
+                        if self.stencil.as_ref().is_some_and(|objects| objects.loading) {
+                            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                        } else {
+                            vk::ImageLayout::UNDEFINED
+                        },
+                    )
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            }))
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
             .map(|index| {
@@ -2444,11 +2635,22 @@ impl<'a> OffscreenObjects<'a> {
             .collect::<Vec<_>>();
         // The depth reference follows the colour references, so its attachment
         // index is the colour count (`research/docs/23` §3.3, v36).
-        let depth_ref = depth.map(|_| {
-            vk::AttachmentReference::default()
-                .attachment(self.attachments.len() as u32)
-                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-        });
+        // The stencil attachment takes the same reference slot as the depth one
+        // when it is the only depth-stencil surface the pass opens; the two are
+        // mutually exclusive in this increment (`research/docs/23` §3.3, v47).
+        let depth_ref = depth
+            .and(Some(()))
+            .or_else(|| stencil.map(|_| ()))
+            .map(|_| {
+                vk::AttachmentReference::default()
+                    // The depth-stencil surface always follows the colour
+                    // attachments: a pass carries one such reference and the one
+                    // surface behind it, so the index is the colour count in both
+                    // the depth and the stencil-only case (`research/docs/23` §3.3,
+                    // v36/v47).
+                    .attachment(self.attachments.len() as u32)
+                    .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            });
         let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_refs);
@@ -2483,7 +2685,7 @@ impl<'a> OffscreenObjects<'a> {
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::HOST_READ)
         });
-        if depth.is_some() {
+        if depth.is_some() || stencil.is_some() {
             // The depth clear and the test's depth writes are their own access
             // class: the same pair the colour side states, named for the
             // early/late fragment tests (`research/docs/23` §3.3, v36).
@@ -2548,6 +2750,12 @@ impl<'a> OffscreenObjects<'a> {
             // (`research/docs/23` §3.3, v36).
             views.push(depth.view);
         }
+        if let Some(stencil) = &self.stencil {
+            // The stencil view follows the depth view in the render pass's own
+            // order; a stencil-only pass has no depth view to precede it
+            // (`research/docs/23` §3.3, v47).
+            views.push(stencil.view);
+        }
         let info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(&views)
@@ -2572,6 +2780,7 @@ impl<'a> OffscreenObjects<'a> {
         fragment_entry: &CStr,
         vertex_streams: &[VertexStream<'_>],
         depth: Option<&OffscreenDepthAttachment>,
+        stencil: Option<&OffscreenStencilAttachment>,
         cull: Option<RenderPassCull>,
         blend: Option<&RenderPassBlend>,
     ) -> Result<(), ProviderError> {
@@ -2711,18 +2920,42 @@ impl<'a> OffscreenObjects<'a> {
         // attachment: Vulkan refuses a depth-stencil state on a subpass with no
         // depth reference, and a pre-v36 pass has none
         // (`research/docs/23` §3.3, v36).
-        let depth_state = depth.map(|attachment| {
-            vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(attachment.test.is_some())
-                .depth_write_enable(attachment.test.is_some_and(|test| test.write))
-                .depth_compare_op(match attachment.test.map(|test| test.compare) {
-                    Some(CompareFunction::Less) => vk::CompareOp::LESS,
-                    // `Always` is also what an attachment with no test states:
-                    // the pass still clears it, and every fragment passes.
-                    Some(CompareFunction::Always) | None => vk::CompareOp::ALWAYS,
-                })
+        // The depth-stencil state is built when the pass opens *either*
+        // surface (`research/docs/23` §3.3, v36/v47): a stencil-only pass has
+        // no depth test to state, and its stencil test still has to be armed —
+        // so the two halves are filled from whichever attachment exists, with
+        // the other disabled.
+        let depth_state = (depth.is_some() || stencil.is_some()).then(|| {
+            let stencil_test = stencil.and_then(|stencil| stencil.test);
+            let op_state = |test: StencilTest| {
+                vk::StencilOpState::default()
+                    .fail_op(vk_stencil_op(test.fail_op))
+                    .pass_op(vk_stencil_op(test.pass_op))
+                    .depth_fail_op(vk_stencil_op(test.depth_fail_op))
+                    .compare_op(vk_stencil_compare(test.compare))
+                    .compare_mask(u32::from(test.read_mask))
+                    .write_mask(u32::from(test.write_mask))
+                    .reference(u32::from(test.reference))
+            };
+            let mut state = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(depth.is_some_and(|attachment| attachment.test.is_some()))
+                .depth_write_enable(
+                    depth.is_some_and(|attachment| attachment.test.is_some_and(|test| test.write)),
+                )
+                .depth_compare_op(
+                    match depth.and_then(|attachment| attachment.test.map(|t| t.compare)) {
+                        Some(CompareFunction::Less) => vk::CompareOp::LESS,
+                        // `Always` is also what an attachment with no test states:
+                        // the pass still clears it, and every fragment passes.
+                        Some(CompareFunction::Always) | None => vk::CompareOp::ALWAYS,
+                    },
+                )
                 .depth_bounds_test_enable(false)
-                .stencil_test_enable(false)
+                .stencil_test_enable(stencil_test.is_some());
+            if let Some(test) = stencil_test {
+                state = state.front(op_state(test)).back(op_state(test));
+            }
+            state
         });
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -3204,6 +3437,7 @@ impl<'a> OffscreenObjects<'a> {
         &mut self,
         attachments: &[OffscreenColorAttachment<'_>],
         depth: Option<&OffscreenDepthAttachment>,
+        stencil: Option<&OffscreenStencilAttachment>,
         scissor: Option<[u32; 4]>,
         width: u32,
         height: u32,
@@ -3240,6 +3474,19 @@ impl<'a> OffscreenObjects<'a> {
                     depth: depth.clear.unwrap_or(1.0),
                     stencil: 0,
                 },
+            }))
+            .chain(stencil.filter(|_| depth.is_none()).map(|stencil| {
+                // The stencil entry follows the colour entries when the pass
+                // opens no depth surface — the two share one reference slot,
+                // so a pass never carries both entries (`research/docs/23`
+                // §3.3, v47). Vulkan ignores it when the stencil load op is
+                // not `CLEAR`.
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 0.0,
+                        stencil: u32::from(stencil.clear.unwrap_or(0)),
+                    },
+                }
             }))
             .collect::<Vec<_>>();
         let render_area = vk::Rect2D {
@@ -3647,6 +3894,17 @@ impl<'a> Drop for OffscreenObjects<'a> {
                     self.context.device.free_memory(depth.memory, None);
                 }
             }
+            if let Some(stencil) = &self.stencil {
+                if stencil.view != vk::ImageView::null() {
+                    self.context.device.destroy_image_view(stencil.view, None);
+                }
+                if stencil.image != vk::Image::null() {
+                    self.context.device.destroy_image(stencil.image, None);
+                }
+                if stencil.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(stencil.memory, None);
+                }
+            }
             if self.owns_attachments {
                 for attachment in &self.attachments {
                     if attachment.view != vk::ImageView::null() {
@@ -4040,6 +4298,8 @@ mod tests {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(11),
             color_attachments: vec![RenderAttachment {
@@ -4178,6 +4438,7 @@ mod tests {
                 cull: None,
                 depth: None,
                 base_vertex: 0,
+                stencil: None,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format,
@@ -4467,6 +4728,7 @@ mod tests {
             blend: None,
             cull: None,
             depth: None,
+            stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::R32Uint,
@@ -4533,6 +4795,7 @@ mod tests {
                     cull: None,
                     depth: None,
                     base_vertex: 0,
+                    stencil: None,
                     scissor: None,
                     attachments: vec![OffscreenColorAttachment {
                         format,
@@ -4677,6 +4940,7 @@ mod tests {
             blend: None,
             cull: None,
             depth: None,
+            stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
@@ -4802,6 +5066,7 @@ mod tests {
                 cull: None,
                 depth: None,
                 base_vertex: 0,
+                stencil: None,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4868,6 +5133,7 @@ mod tests {
                 cull: None,
                 depth: None,
                 base_vertex: 0,
+                stencil: None,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4938,6 +5204,7 @@ mod tests {
                 cull: None,
                 depth: None,
                 base_vertex: 0,
+                stencil: None,
                 scissor: None,
                 attachments: vec![
                     OffscreenColorAttachment {
@@ -4986,6 +5253,7 @@ mod tests {
             blend: None,
             cull: None,
             depth: None,
+            stencil: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
@@ -5074,6 +5342,7 @@ mod tests {
             blend: None,
             cull: None,
             depth: None,
+            stencil: None,
             scissor: None,
             attachments: vec![
                 OffscreenColorAttachment {
@@ -5220,6 +5489,7 @@ mod tests {
                 cull: None,
                 depth: None,
                 base_vertex: 0,
+                stencil: None,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
                     format: AttachmentFormat::Rgba8Unorm,
@@ -5314,6 +5584,7 @@ mod tests {
                 }),
                 store,
             }),
+            stencil: None,
             base_vertex: 0,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {

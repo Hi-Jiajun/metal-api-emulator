@@ -1429,8 +1429,9 @@ mod tests {
         PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
         ProviderErrorClass, ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority,
         RenderAttachment, RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend,
-        RenderPassCull, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
-        Retryability, SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp,
+        RenderPassCull, RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment,
+        ResourceTableSnapshot, Retryability, SemanticDigest, ShaderSource, StagedLease,
+        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp,
         SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
         TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat,
         VertexLayout, ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
@@ -1588,6 +1589,8 @@ mod tests {
         RenderPassDescriptor {
             blend: None,
             cull: None,
+            stencil: None,
+            stencil_test: None,
             depth: None,
             depth_test: None,
             base_vertex: 0,
@@ -2624,10 +2627,10 @@ mod tests {
         // tag is: a section this decoder cannot read stops the frame rather
         // than being skipped to reach the sections after it.
         let mut unknown = frame.clone();
-        unknown[wide + 1] = 0x07;
+        unknown[wide + 1] = 0x0f;
         let refused = CommandCodec::decode_request(&unknown);
         assert!(
-            matches!(refused, Err(CodecError::UnknownRenderFeature(0x0400))),
+            matches!(refused, Err(CodecError::UnknownRenderFeature(0x0800))),
             "an unknown wide bit has to be refused, got {refused:?}"
         );
 
@@ -2643,6 +2646,66 @@ mod tests {
             ),
             "a wide depth feature without a depth block has to be refused"
         );
+    }
+
+    /// A render trace whose pass opens a rail-owned stencil attachment and
+    /// tests it (`research/docs/23` §3.3, v47): the state the reviewed
+    /// increment's fixture uses, so the wire's byte shape is pinned by the same
+    /// value the rails execute.
+    fn stencil_trace() -> ComputeTrace {
+        let mut trace = depth_store_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stencil = Some(RenderStencilAttachment {
+            format: StencilFormat::Stencil8,
+            width: 4,
+            height: 4,
+            load: StencilLoadOp::clear(0),
+        });
+        pass.stencil_test = Some(StencilTest {
+            compare: StencilCompare::Equal,
+            fail_op: StencilOp::Keep,
+            depth_fail_op: StencilOp::Keep,
+            pass_op: StencilOp::IncrementWrap,
+            read_mask: 0xff,
+            write_mask: 0xff,
+            reference: 0,
+        });
+        trace
+    }
+
+    #[test]
+    fn a_stencil_pass_takes_the_wide_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: stencil_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The wide word's low byte is still the narrow byte (vertex input and
+        // depth, `0x21`); the high byte carries the store, identity and stencil
+        // bits, so the pair reads `07 21`.
+        assert!(
+            frame
+                .windows(3)
+                .enumerate()
+                .skip(10)
+                .any(|(_, window)| window == [0x11, 0x07, 0x21]),
+            "the stencil pass carries the third wide bit"
+        );
+
+        // A pass that opens no stencil attachment keeps the pre-v47 bytes: the
+        // depth-store fixture's own word has no stencil bit.
+        let plain = depth_store_trace();
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: plain,
+            resources: resources(),
+        })
+        .unwrap();
+        assert!(plain_frame
+            .windows(3)
+            .any(|window| window == [0x11, 0x03, 0x21]));
     }
 
     #[test]
