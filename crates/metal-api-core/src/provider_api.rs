@@ -681,6 +681,41 @@ pub struct RenderDepthTest {
     pub write: bool,
 }
 
+/// The stencil surface one recorded pass opens (`research/docs/23` §3.3,
+/// v47/v48).
+///
+/// The depth surface's sibling one byte wide: rail-owned like it, so what a
+/// caller states is the extent and how the pass establishes the surface's
+/// contents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderStencilAttachment {
+    pub width: u64,
+    pub height: u64,
+    pub load: RenderStencilLoad,
+}
+
+/// How a recorded pass establishes its stencil surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderStencilLoad {
+    /// Clear every stencil texel to this value.
+    Clear(u8),
+    /// Keep the surface's previous contents.
+    Load,
+}
+
+/// The stencil state a recorded pass tests and writes with
+/// (`research/docs/23` §3.3, v47/v48).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderStencilTest {
+    pub compare: contract::StencilCompare,
+    pub fail_op: contract::StencilOp,
+    pub depth_fail_op: contract::StencilOp,
+    pub pass_op: contract::StencilOp,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub reference: u8,
+}
+
 /// The draw one recorded render pass replays: the counts, plus the views of the
 /// streams and index buffer it reads.
 ///
@@ -725,6 +760,12 @@ struct RenderDraw {
     depth: Option<RenderDepthAttachment>,
     /// The depth state the pass tests with, or `None` for no test.
     depth_test: Option<RenderDepthTest>,
+    /// The stencil surface this pass opens, or `None` for a pass with no
+    /// stencil surface — the shape every draw the object API could record
+    /// before v48 had (`research/docs/23` §3.3, v47/v48).
+    stencil: Option<RenderStencilAttachment>,
+    /// The stencil state the pass tests and writes with, or `None` for no test.
+    stencil_test: Option<RenderStencilTest>,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -775,6 +816,8 @@ impl RenderDraw {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         }
     }
 }
@@ -889,12 +932,31 @@ impl RenderTarget {
                 write: test.write,
             }),
             // The object API records no stencil surface yet (`research/docs/23`
-            // §3.3, v47): the trace and native rails execute the reviewed
-            // stencil fixture, and the object entries that carry the state are
-            // the next increment — so a recording always states these two
-            // fields as absent, exactly as it did before they existed.
-            stencil: None,
-            stencil_test: None,
+            // §3.3, v48): the recording's own surface and state travel straight
+            // into the contract's stencil fields, exactly as the depth pair
+            // above does. A recording that states neither keeps the pre-v48
+            // shape.
+            stencil: self
+                .draw
+                .stencil
+                .map(|stencil| contract::RenderStencilAttachment {
+                    format: contract::StencilFormat::Stencil8,
+                    width: stencil.width,
+                    height: stencil.height,
+                    load: match stencil.load {
+                        RenderStencilLoad::Clear(value) => contract::StencilLoadOp::clear(value),
+                        RenderStencilLoad::Load => contract::StencilLoadOp::Load,
+                    },
+                }),
+            stencil_test: self.draw.stencil_test.map(|test| contract::StencilTest {
+                compare: test.compare,
+                fail_op: test.fail_op,
+                depth_fail_op: test.depth_fail_op,
+                pass_op: test.pass_op,
+                read_mask: test.read_mask,
+                write_mask: test.write_mask,
+                reference: test.reference,
+            }),
             scissor: self.scissor,
             pipeline: pipeline_id,
             color_attachments,
@@ -2570,6 +2632,59 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// that masks its fragments with a stencil test (`research/docs/23` §3.3,
+    /// v47/v48).
+    ///
+    /// The stencil sibling of [`Self::draw_indexed_primitives_with_depth`],
+    /// matching the reviewed stencil fixture's shape: the pass opens the
+    /// rail-owned `stencil8` surface `stencil` describes and tests and writes
+    /// it with `stencil_test`, or opens it with no test when that is `None`.
+    /// Every other rule — the positional attachment list, the pipeline's
+    /// compiled formats, the bound streams and the index buffer — is
+    /// [`Self::draw_indexed_primitives_with_attachments`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_stencil(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        stencil: RenderStencilAttachment,
+        stencil_test: Option<RenderStencilTest>,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            blend: None,
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: Some(stencil),
+            stencil_test,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2614,6 +2729,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2657,6 +2774,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: Some(depth),
             depth_test,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2774,6 +2893,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2819,6 +2940,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2869,6 +2992,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2912,6 +3037,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2955,6 +3082,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2995,6 +3124,8 @@ impl RenderCommandEncoder {
             cull: Some(cull),
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3036,6 +3167,8 @@ impl RenderCommandEncoder {
             cull: Some(cull),
             depth: None,
             depth_test: None,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3082,6 +3215,8 @@ impl RenderCommandEncoder {
             cull: None,
             depth: Some(depth),
             depth_test,
+            stencil: None,
+            stencil_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3357,6 +3492,8 @@ impl RenderCommandEncoder {
                 cull: None,
                 depth: None,
                 depth_test: None,
+                stencil: None,
+                stencil_test: None,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {

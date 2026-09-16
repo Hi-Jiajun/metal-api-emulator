@@ -834,7 +834,10 @@
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
         "native-metal",
-        "vulkan"
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ]
     },
     {
