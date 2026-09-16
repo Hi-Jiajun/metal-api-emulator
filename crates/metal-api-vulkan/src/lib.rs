@@ -7608,4 +7608,129 @@ mod tests {
             token.submission_id.get(),
         );
     }
+
+    /// In-place rebuild after a confirmed device loss.
+    ///
+    /// A `VK_ERROR_DEVICE_LOST` from `vkQueueSubmit` terminates the provider;
+    /// [`VulkanComputeProvider::rebuild_after_device_loss`] then swaps in a
+    /// brand-new device and advances the epoch, and a re-registration of the
+    /// same function resubmits the same logical trace with an exact byte
+    /// readback. The old epoch's token stays refused — including one whose
+    /// `SubmissionId` is numerically identical to the new submission's — so
+    /// the `(epoch, submission)` identity cannot be silently reused across the
+    /// rebuild.
+    #[test]
+    fn rebuild_after_device_loss_readmits_the_same_trace_on_a_fresh_device() {
+        let Some(executor) = device_loss_executor() else {
+            return;
+        };
+        let provider =
+            VulkanComputeProvider::with_executor(Arc::clone(&executor)).expect("provider creates");
+        let (trace, resources) = copy_word_trace(&provider, &executor);
+        let old_epoch = provider.device_epoch();
+        assert_eq!(provider.health(), ProviderHealth::Usable);
+
+        // 1. The rebuild entry refuses every non-loss state, fail-closed.
+        let refused = provider
+            .rebuild_after_device_loss()
+            .expect_err("a usable provider refuses the rebuild entry");
+        assert_eq!(refused.slug, "rebuild_requires_device_loss");
+        assert_eq!(
+            refused.fields.get("terminal"),
+            Some(&FieldValue::Text("usable".to_owned()))
+        );
+
+        // 2. The substituted driver answer fails the submission through the
+        //    real loss path, and the lifecycle terminates on `DeviceLost`.
+        executor.inject_driver_device_loss_for_test(DeviceLossPoint::Submit);
+        let error = provider
+            .submit(admitted_trace(&provider, &trace, &resources))
+            .expect_err("the substituted driver answer refuses the submission");
+        assert_eq!(error.class, ProviderErrorClass::DeviceLost);
+        let CompletionDisposition::DeviceLost {
+            token: Some(old_token),
+        } = error.completion
+        else {
+            panic!("the loss error lost its submission token: {error:?}");
+        };
+        assert_eq!(provider.health(), ProviderHealth::DeviceLost);
+        assert_eq!(
+            executor.context.lock_lifecycle().state(),
+            TerminalState::DeviceLost
+        );
+
+        // 3. Rebuild in place: fresh device, advanced epoch, usable again.
+        provider
+            .rebuild_after_device_loss()
+            .expect("the lost provider rebuilds in place");
+        let new_epoch = provider.device_epoch();
+        assert!(
+            new_epoch.get() > old_epoch.get(),
+            "a rebuilt device is a new epoch: {old_epoch:?} -> {new_epoch:?}"
+        );
+        assert_eq!(provider.health(), ProviderHealth::Usable);
+        // The old executor still names the dead device: the provider stopped
+        // sharing it the moment the rebuild installed the fresh owner.
+        assert_eq!(
+            executor.context.lock_lifecycle().state(),
+            TerminalState::DeviceLost
+        );
+
+        // 4. Old-epoch identities are not re-admitted...
+        let refused = provider
+            .release_completion(old_token)
+            .expect_err("an old-epoch completion token must not be reused");
+        assert_eq!(refused.slug, "device_epoch_mismatch");
+        assert_eq!(
+            refused.fields.get("expected"),
+            Some(&FieldValue::Unsigned(new_epoch.get()))
+        );
+        assert_eq!(
+            refused.fields.get("actual"),
+            Some(&FieldValue::Unsigned(old_epoch.get()))
+        );
+        let refused = provider
+            .submit(admitted_trace(&provider, &trace, &resources))
+            .expect_err("an old-epoch trace must not be re-admitted");
+        assert_eq!(refused.slug, "device_epoch_mismatch");
+
+        // 5. ...but the same logical trace, re-registered on the new epoch,
+        //    executes to the exact expected bytes.
+        let (trace, resources) = copy_word_trace(&provider, &executor);
+        let submission = provider
+            .submit(admitted_trace(&provider, &trace, &resources))
+            .expect("the rebuilt provider admits the same logical trace");
+        assert_eq!(provider.health(), ProviderHealth::Usable);
+        let [writeback] = submission.writebacks.as_slice() else {
+            panic!("the rebuilt submission needs exactly one writeback");
+        };
+        assert_eq!(writeback.bytes, 0x6745_2301_u32.to_le_bytes());
+        let CompletionDisposition::CompletedVisible { token: new_token } = submission.completion
+        else {
+            panic!(
+                "the rebuilt submission completed visibly: {:?}",
+                submission.completion
+            );
+        };
+        assert_eq!(new_token.device_epoch, new_epoch);
+        // Submission ids stay monotonic across the rebuild, so replaying the
+        // new submission's id with the old epoch must still be refused: the
+        // `(epoch, submission)` identity is what separates the two devices,
+        // not the submission counter.
+        let stale_same_id = CompletionToken {
+            submission_id: new_token.submission_id,
+            device_epoch: old_epoch,
+        };
+        let refused = provider
+            .release_completion(stale_same_id)
+            .expect_err("a same-id token from the old epoch must not be reused");
+        assert_eq!(refused.slug, "device_epoch_mismatch");
+        eprintln!(
+            "PASS rebuild_after_device_loss old_epoch={} new_epoch={} \
+             old_token_refused=device_epoch_mismatch submission={} readback=exact",
+            old_epoch.get(),
+            new_epoch.get(),
+            new_token.submission_id.get(),
+        );
+    }
 }
