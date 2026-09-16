@@ -1582,6 +1582,13 @@ def _render_plan(plan, suite):
                      "an ICB")
             _require(wildcard_texels is None,
                      f"{where}: the multisample raster claims every texel it resolves")
+            # The trace rails' footprint proof is the only gate that would
+            # notice an offset index span, and no reviewed fixture covers the
+            # shape; the object rail has no entry that carries both. Refusing it
+            # here keeps the fixture gate as strict as the rails
+            # (`research/docs/23` §3.3, v54 review H1).
+            _require(case.get("base_vertex", 0) == 0,
+                     f"{where}: the reviewed multisample shapes carry no base vertex")
         expected_bytes = []
         parsed = []
         for position, attachment in enumerate(definitions):

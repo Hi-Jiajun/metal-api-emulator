@@ -2249,6 +2249,18 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     + "surface: a combined surface is a later increment")
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves")
+        // The reviewed multisample shapes carry no vertex offset, and the
+        // oracle's own footprint proof is the only gate that would notice one
+        // (`research/docs/23` §3.3, v54 review H1); the fixture gate states the
+        // same rule, as does `conformance/compare.py`.
+        try require(definition.base_vertex == nil || definition.base_vertex == 0,
+                    "\(definition.id): the reviewed multisample shapes carry no base vertex")
+        // The trace contract's own rule one line up: a multisampled pass opens
+        // its attachment from a clear, which `conformance/compare.py` states
+        // explicitly (`research/docs/23` §3.3, v54 review L1).
+        try require(definition.attachment?.load == "clear",
+                    "\(definition.id): the reviewed multisample pass opens its attachment "
+                    + "from a clear")
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents

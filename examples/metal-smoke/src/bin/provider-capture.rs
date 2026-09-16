@@ -1296,6 +1296,57 @@ fn default_instance_count() -> u64 {
     1
 }
 
+/// The state families a render case declares, in the reviewer's terms
+/// (`research/docs/23` §3.3, v54 review H1/M1).
+///
+/// One family is one thing an object-API recording entry can carry: a
+/// pass-wide raster, a depth surface, a stencil surface, a blend state, a
+/// culling state or a vertex offset. The counts (`instance_count`, the index
+/// count) are deliberately not families — every indexed entry carries them —
+/// and neither is the indirect payload, which has an entry of its own.
+fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
+    let mut families = Vec::new();
+    if case.multisample.is_some() {
+        families.push("multisample");
+    }
+    if case.depth.is_some() {
+        families.push("depth");
+    }
+    if case.stencil.is_some() {
+        families.push("stencil");
+    }
+    if case.blend.is_some() {
+        families.push("blend");
+    }
+    if case.cull.is_some() {
+        families.push("cull");
+    }
+    if case.base_vertex != 0 {
+        families.push("base_vertex");
+    }
+    families
+}
+
+/// Whether one object-API recording entry carries every family a case declares.
+///
+/// The reviewed entries each carry one family, and the v54 increment's combined
+/// entry carries the raster plus the depth surface. Every other combination
+/// would be recorded through an entry that silently drops the rest — the
+/// failure mode the v54 review found (`base_vertex` disappearing from the
+/// multisampled depth entry) — so the object rail refuses it by name instead.
+fn object_entry_admits(families: &[&str]) -> bool {
+    matches!(
+        families,
+        [] | ["multisample"]
+            | ["depth"]
+            | ["stencil"]
+            | ["blend"]
+            | ["cull"]
+            | ["base_vertex"]
+            | ["multisample", "depth"]
+    )
+}
+
 /// The pass-wide multisample state a case states, in the contract's own shape
 /// (`research/docs/23` §3.3, v51/v52).
 ///
@@ -3922,6 +3973,16 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         if case.wildcard_texels.is_some() {
             return Err(
                 format!("{where_}: the multisample raster claims every texel it resolves").into(),
+            );
+        }
+        // No reviewed fixture covers a multisampled draw whose indices are
+        // offset, and the trace rails' footprint proof is the only thing that
+        // would notice a stream too short for it. Refusing the shape here keeps
+        // the fixture gate as strict as the object rail, which has no entry
+        // that carries both (`research/docs/23` §3.3, v54 review H1).
+        if case.base_vertex != 0 {
+            return Err(
+                format!("{where_}: the reviewed multisample shapes carry no base vertex").into(),
             );
         }
         // The raster's expectation shape depends on what it opens
@@ -7050,6 +7111,21 @@ fn run_object_render_case(
             present,
         )?;
     } else if let Some((index, format)) = &object_index {
+        // The recording ladder's entries each carry one state family (plus the
+        // counts they all take). A case that declares a combination no single
+        // entry carries is refused here by name, instead of being recorded
+        // through the first matching entry with the rest silently dropped —
+        // the failure mode the v54 review found (`research/docs/23` §3.3, v54
+        // review H1/M1).
+        let families = object_state_families(case);
+        if !object_entry_admits(&families) {
+            return Err(format!(
+                "render case {}: the object rails have no single entry for the declared state \
+                 {families:?}",
+                case.id
+            )
+            .into());
+        }
         for (binding, stream) in object_streams.iter().enumerate() {
             render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
         }
@@ -7884,6 +7960,75 @@ fn unhex(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One render case of the reviewed suite, for the object-entry family rules
+    /// (`research/docs/23` §3.3, v54 review H1/M1).
+    fn render_case(id: &str) -> RenderCase {
+        let suite: Suite =
+            serde_json::from_str(include_str!("../../../../conformance/suite-v28.json")).unwrap();
+        suite
+            .render_cases
+            .into_iter()
+            .find(|case| case.id == id)
+            .expect("the reviewed case exists")
+    }
+
+    #[test]
+    fn the_object_entry_family_rules_refuse_every_unreviewed_combination() {
+        // The single-family entries are what the reviewed fixtures use.
+        for id in [
+            "scissor_left_half_4x4",
+            "depth_pair_4x4",
+            "stencil_increment_pair_4x4",
+            "blend_alpha_quad_4x4",
+            "cull_back_half_quad_4x4",
+        ] {
+            let case = render_case(id);
+            let families = object_state_families(&case);
+            assert!(
+                object_entry_admits(&families),
+                "{id} declares one reviewed family: {families:?}"
+            );
+        }
+        // The v54 increment's combined entry carries the raster and the depth
+        // surface, and nothing else.
+        let combined = object_state_families(&render_case("msaa_depth_pair_4x4"));
+        assert_eq!(combined, vec!["multisample", "depth"]);
+        assert!(object_entry_admits(&combined));
+        // The reviewed colour-only raster keeps its own entry.
+        let colour_only = object_state_families(&render_case("msaa_edge_4x4"));
+        assert_eq!(colour_only, vec!["multisample"]);
+        assert!(object_entry_admits(&colour_only));
+
+        // The v54 review's worst case: a raster plus a vertex offset. No entry
+        // carries both, so the object rail refuses it by name instead of
+        // recording a pass with the offset dropped.
+        let mut offset = render_case("msaa_depth_pair_4x4");
+        offset.base_vertex = 1;
+        let families = object_state_families(&offset);
+        assert_eq!(families, vec!["multisample", "depth", "base_vertex"]);
+        assert!(!object_entry_admits(&families));
+
+        // The gate's other hole the review found: a stencil surface plus a
+        // blend state, which the ladder used to record through the stencil
+        // entry with the blend dropped.
+        let mut blended = render_case("blend_alpha_quad_4x4");
+        blended.stencil = Some(StencilAttachmentDefinition {
+            format: "stencil8".into(),
+            width: 4,
+            height: 4,
+            load: "clear".into(),
+            clear_value: Some(0),
+            store: None,
+            allocation: None,
+            view: None,
+            expected_hex: None,
+        });
+        let families = object_state_families(&blended);
+        assert_eq!(families, vec!["stencil", "blend"]);
+        assert!(!object_entry_admits(&families));
+    }
+
     fn suite() -> Suite {
         serde_json::from_str(include_str!("../../../../conformance/suite.json")).unwrap()
     }
