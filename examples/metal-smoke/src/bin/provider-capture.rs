@@ -5309,16 +5309,6 @@ fn run_object_render_case(
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
-    // The object API has no depth attachment entry point yet, so a case that
-    // declares one is refused rather than recorded without the surface — which
-    // would draw a different pass (`research/docs/23` §3.3, v36).
-    if case.depth.is_some() {
-        return Err(format!(
-            "render case {}: the object rails have no depth attachment yet",
-            case.id
-        )
-        .into());
-    }
     let attachments = render_attachment_shapes(case)?;
     let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &declaring.buffers {
@@ -5559,7 +5549,38 @@ fn run_object_render_case(
         // pre-v32 entry point and its bytes, while the reviewed instanced case
         // takes the second one.
         let index_count = u32::try_from(case.vertices)?;
-        if case.base_vertex != 0 {
+        if case.depth.is_some() {
+            // The reviewed depth case opens the surface through the object
+            // API's depth entry (`research/docs/23` §3.3, v36/v37): the pass
+            // descriptor the trace rails carry and the object rail's own draw
+            // entry name the same rail-owned surface and state.
+            let (depth, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
+            let depth = depth.ok_or("a depth case needs a depth attachment")?;
+            let depth = objects::RenderDepthAttachment {
+                width: depth.width,
+                height: depth.height,
+                load: match depth.load {
+                    DepthLoadOp::Clear(bits) => {
+                        objects::RenderDepthLoad::Clear(f32::from_bits(bits))
+                    }
+                    DepthLoadOp::Load => objects::RenderDepthLoad::Load,
+                },
+            };
+            let depth_test = depth_test.map(|test| objects::RenderDepthTest {
+                compare: test.compare,
+                write: test.write,
+            });
+            render.draw_indexed_primitives_with_depth(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                depth,
+                depth_test,
+                present,
+            )?;
+        } else if case.base_vertex != 0 {
             // The offset belongs to the draw call, exactly as Metal's
             // `drawIndexedPrimitives(…:baseVertex:baseInstance:)` spells it
             // (`research/docs/23` §3.3, v35): a zero-offset case keeps the

@@ -639,6 +639,37 @@ struct RenderIndex {
     format: IndexFormat,
 }
 
+/// The depth surface one recorded pass opens (`research/docs/23` §3.3,
+/// v36/v37).
+///
+/// The object API's depth surface is rail-owned, exactly like the trace
+/// contract's: it has no view identity because nothing reads it back, so what a
+/// caller states is the extent and how the pass establishes the surface's
+/// contents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderDepthAttachment {
+    pub width: u64,
+    pub height: u64,
+    pub load: RenderDepthLoad,
+}
+
+/// How a recorded pass establishes its depth surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderDepthLoad {
+    /// Clear every depth texel to this value.
+    Clear(f32),
+    /// Keep the surface's previous contents.
+    Load,
+}
+
+/// The depth state a recorded pass tests and writes with
+/// (`research/docs/23` §3.3, v36/v37).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderDepthTest {
+    pub compare: contract::CompareFunction,
+    pub write: bool,
+}
+
 /// The draw one recorded render pass replays: the counts, plus the views of the
 /// streams and index buffer it reads.
 ///
@@ -669,6 +700,12 @@ struct RenderDraw {
     /// v34). `0` is the shape every object-API draw records today; the field
     /// exists here because the pass it lands in carries it.
     base_vertex: u32,
+    /// The depth surface this pass opens, or `None` for a pass with no depth
+    /// surface — the shape every draw the object API could record before v37
+    /// had (`research/docs/23` §3.3, v36/v37).
+    depth: Option<RenderDepthAttachment>,
+    /// The depth state the pass tests with, or `None` for no test.
+    depth_test: Option<RenderDepthTest>,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -715,6 +752,8 @@ impl RenderDraw {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            depth: None,
+            depth_test: None,
         }
     }
 }
@@ -792,8 +831,25 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
-            depth: None,
-            depth_test: None,
+            // The object API's depth surface states the shape directly: it has
+            // no trace identity, so this is the same rail-owned description the
+            // trace contract carries (`research/docs/23` §3.3, v36/v37).
+            depth: self
+                .draw
+                .depth
+                .map(|depth| contract::RenderDepthAttachment {
+                    format: contract::DepthFormat::Depth32Float,
+                    width: depth.width,
+                    height: depth.height,
+                    load: match depth.load {
+                        RenderDepthLoad::Clear(value) => contract::DepthLoadOp::clear(value),
+                        RenderDepthLoad::Load => contract::DepthLoadOp::Load,
+                    },
+                }),
+            depth_test: self.draw.depth_test.map(|test| contract::DepthTest {
+                compare: test.compare,
+                write: test.write,
+            }),
             scissor: self.scissor,
             pipeline: pipeline_id,
             color_attachments,
@@ -2465,6 +2521,8 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            depth: None,
+            depth_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2505,6 +2563,49 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count,
             base_vertex: 0,
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams that
+    /// opens a depth surface (`research/docs/23` §3.3, v36/v37).
+    ///
+    /// The depth counterpart of
+    /// [`Self::draw_primitives_with_attachments`]: the pass opens the
+    /// rail-owned surface `depth` describes and tests with `depth_test`, or
+    /// opens it with no test when that is `None`. Every other rule — the
+    /// positional attachment list, the pipeline's compiled formats, the bound
+    /// streams — is that entry's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_with_depth(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        instance_count: u32,
+        depth: RenderDepthAttachment,
+        depth_test: Option<RenderDepthTest>,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        Self::admit_draw_counts(vertex_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+            instance_count,
+            base_vertex: 0,
+            depth: Some(depth),
+            depth_test,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2618,6 +2719,8 @@ impl RenderCommandEncoder {
             }),
             instance_count: 1,
             base_vertex: 0,
+            depth: None,
+            depth_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2659,6 +2762,8 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex: 0,
+            depth: None,
+            depth_test: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2705,6 +2810,52 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex,
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// that opens a depth surface (`research/docs/23` §3.3, v36/v37).
+    ///
+    /// The indexed sibling of [`Self::draw_primitives_with_depth`], matching
+    /// the reviewed depth fixture's shape: the draw selects its vertices
+    /// through the bound index buffer and the pass opens the depth surface
+    /// `depth` describes. Every other rule is
+    /// [`Self::draw_indexed_primitives_with_attachments`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_depth(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        depth: RenderDepthAttachment,
+        depth_test: Option<RenderDepthTest>,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            depth: Some(depth),
+            depth_test,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2964,6 +3115,11 @@ impl RenderCommandEncoder {
                 // increment: the replay reads the index values the rail's own
                 // buffer holds (`research/docs/25` §4.3).
                 base_vertex: 0,
+                // An ICB replay opens no depth surface either: the payload has
+                // no depth section, so the replay stays the v20 shape
+                // (`research/docs/25` §4.3, v37).
+                depth: None,
+                depth_test: None,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {

@@ -75,9 +75,10 @@ INSTANCED_RAILS = ALL_RAILS
 # `drawIndexedPrimitives(…:baseVertex:baseInstance:)`, so its marker names all
 # five rails too.
 BASE_VERTEX_RAILS = ALL_RAILS
-# The depth fixture is the trace rails' shape: the object API has no depth
-# attachment entry point yet (`research/docs/23` §3.3, v36).
-DEPTH_RAILS = TRACE_RAILS
+# The depth fixture is the same story from v37 on:
+# `draw_indexed_primitives_with_depth` is the object API's depth-bearing draw
+# entry, so its marker names all five rails too.
+DEPTH_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):

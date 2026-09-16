@@ -1068,7 +1068,8 @@ same fixture run with `compare: "always"` reads back sixteen `00ff00ff` texels
 on Lavapipe, which is the control that makes the red run evidence rather than a
 coincidence.
 
-The fixture's marker names the three trace rails. The object API has no way to
-declare a depth attachment yet, so a case that declares one is refused on those
-rails instead of being recorded without the surface — which would draw a
-different pass.
+Both trace rails and (from v37) both object rails execute the fixture: the
+object API's `draw_primitives_with_depth` and `draw_indexed_primitives_with_depth`
+are the depth-bearing recording entries, and the pass they record carries the
+same rail-owned surface and state the trace contract names. The fixture's
+marker therefore names all five rails.
