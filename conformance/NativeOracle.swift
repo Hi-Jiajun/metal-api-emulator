@@ -138,6 +138,31 @@ private struct RenderAttachmentDefinition: Decodable {
     let expected_hex: String?
 }
 
+/// The depth attachment a render case declares (`research/docs/23` §3.3, v36).
+///
+/// The fields mirror `metal_api_core::provider::RenderDepthAttachment`: the
+/// format spelling, the extent and the load operation with the depth a clear
+/// starts from. The surface is rail-owned — no trace identity and no readback
+/// — so the case names no view for it.
+private struct DepthAttachmentDefinition: Decodable {
+    let format: String
+    let width: Int
+    let height: Int
+    let load: String
+    /// The depth a `"clear"` load starts from; absent for any other load.
+    let clear_depth: Double?
+}
+
+/// The depth state a render case declares (`research/docs/23` §3.3, v36).
+///
+/// The fields mirror `metal_api_core::provider::DepthTest`: the compare
+/// function spelling and whether fragments write depth. Metal states both on
+/// one `MTLDepthStencilDescriptor` per encoder.
+private struct DepthTestDefinition: Decodable {
+    let compare: String
+    let write: Bool
+}
+
 /// One attribute of a render case's vertex stream.
 ///
 /// The fields mirror `metal_api_core::provider::VertexAttribute`: the
@@ -262,6 +287,18 @@ private struct RenderCaseDefinition: Decodable {
     /// makes an unclaimed byte legitimate. An absent list means the case
     /// claims every texel, the semantics every case before v33 has.
     let wildcard_texels: [Int]?
+    /// The rail-owned depth attachment the pass opens, or `nil` for no depth
+    /// surface — the shape every case before v36 declares
+    /// (`metal_api_core::provider::RenderPassDescriptor::depth`,
+    /// `research/docs/23` §3.3, v36). The reviewed depth case clears one
+    /// `depth32float` surface to one, and the surface covers the same render
+    /// area as the colour attachment.
+    let depth: DepthAttachmentDefinition?
+    /// The pass's depth state, or `nil` for no depth state — the shape every
+    /// pre-v36 case declares. A state only exists for a pass that opens a
+    /// depth attachment, and the reviewed depth case states a `less` test with
+    /// writes on (`research/docs/23` §3.3, v36).
+    let depth_test: DepthTestDefinition?
     /// Which capture rails the suite marks this render case executable on. The
     /// oracle validates every render case's metadata, but it only *runs* the
     /// ones its marker names (`conformance/compare.py` refuses a rail that
@@ -282,6 +319,10 @@ private struct ValidatedRender {
     /// The index buffer of an indexed case, with its footprint and index values
     /// already proved against the streams above.
     let indexStream: ValidatedIndexStream?
+    /// The reviewed depth surface and state, or `nil` for the depth-less shape
+    /// every pre-v36 case declares (`research/docs/23` §3.3, v36). The runner
+    /// states these on the pass descriptor and the encoder.
+    let depth: ValidatedDepth?
 }
 
 /// One vertex stream the draw reads: its binding index, stride, advance,
@@ -364,6 +405,19 @@ private struct ValidatedRenderAttachment {
     /// both take it, so the case's expected texels pin which channel order the
     /// attachment is observing.
     let pixelFormat: MTLPixelFormat
+}
+
+/// The reviewed depth pair a case carries (`research/docs/23` §3.3, v36): the
+/// rail-owned `depth32float` surface's extent, the depth its clear starts from
+/// and the `less` test with writes on. The review above already forced these to
+/// the reviewed values, so the runner only has to state them on the pass
+/// descriptor and on the encoder's depth-stencil state.
+private struct ValidatedDepth {
+    let width: Int
+    let height: Int
+    let clearDepth: Double
+    let isLess: Bool
+    let write: Bool
 }
 
 private struct SuiteDefinition: Decodable {
@@ -1355,14 +1409,37 @@ private func reviewedInstancedModule() -> ReviewedRenderModule {
         ])
 }
 
+/// The reviewed depth fixture (`research/docs/23` §3.3, v36): one stride-32
+/// per-vertex stream whose vertices carry a `float32x3` position at offset 0 —
+/// the *caller* chooses each triangle's depth — and a `float32x4` tint at
+/// offset 16, with a stage pair that forwards the tint to the attachment. The
+/// solid modules cannot stand in for it: the position is a caller-held
+/// attribute rather than `vertex_id`, two attributes share one vertex, and the
+/// fragment stage stores the tint the vertex stage forwarded.
+private func reviewedDepthModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_depth_pair_vertex",
+        fragment_entry: "render_depth_pair_tint",
+        metal: RenderSourcePin(path: "shaders/depth_pair_4x4.metal",
+                               sha256: "726b6fe282e3ad91f5e4df826ed709dafd53d8a8beac06087490e54656720271"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 32,
+            step: "per_vertex",
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x3"),
+                         RenderVertexAttributeDefinition(location: 1, offset: 16,
+                                                          format: "float32x4")])])
+}
+
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
-/// single-attachment case whose two-stream layout steps per instance draws the
-/// instanced module, a single-attachment case with any other layout the
-/// indexed one, and an indexed case with two `rgba8_unorm` attachments the
-/// dual one. A shape no module was reviewed for is refused instead of matched
-/// approximately.
+/// single-attachment case whose one stream carries two attributes draws the
+/// depth module, a single-attachment case whose two-stream layout steps per
+/// instance draws the instanced module, a single-attachment case with any
+/// other layout the indexed one, and an indexed case with two `rgba8_unorm`
+/// attachments the dual one. A shape no module was reviewed for is refused
+/// instead of matched approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
     let attachments = try colorAttachments(definition)
     // The 8-bit UNORM modules are layout-agnostic: the same store lands in
@@ -1383,6 +1460,14 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
     switch (definition.vertex_layout, attachments.count) {
     case (nil, 1):
         return reviewedRenderModule()
+    // The reviewed depth shape (`research/docs/23` §3.3, v36) is the one
+    // single-stream layout carrying two attributes: a `float32x3` position and
+    // a `float32x4` tint sharing one stride-32 vertex. The reviewed equality
+    // check below pins the rest of the layout, so this selection only has to
+    // find the shape's own module.
+    case (let layout?, 1) where layout.buffers.count == 1
+        && layout.buffers[0].attributes.count == 2:
+        return reviewedDepthModule()
     case (_?, 1) where attachments[0].format == "r32float":
         return reviewedR32fModule()
     case (_?, 1) where instanced && unorm8(attachments[0].format):
@@ -1538,6 +1623,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         try require(layout.buffers == reviewedBuffers,
                     "\(definition.id): the vertex layout is not the reviewed one")
+        // The reviewed depth shape (`research/docs/23` §3.3, v36) is the
+        // two-attribute stream, and no rail was reviewed against drawing it
+        // *without* its depth pair: the surface is what the case exists to
+        // exercise, exactly as `render.rs::reviewed_depth_geometry` refuses a
+        // depth-shaped draw that carries no attachment.
+        if layout.buffers.count == 1 && layout.buffers[0].attributes.count == 2 {
+            try require(definition.depth != nil,
+                        "\(definition.id): the reviewed depth shape carries a depth attachment")
+        }
         // The draw's vertex offset (`research/docs/23` §3.3, v34): absent means
         // zero, the shape every pre-v34 case draws. It takes part in the
         // footprint proof below, because the vertex a draw reads is
@@ -1968,9 +2062,44 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
        first.prefix(4) == second.prefix(4) {
         throw OracleError("\(definition.id): the two locations read back the same texel")
     }
+    // The depth pair (`research/docs/23` §3.3, v36) is part of the reviewed
+    // shape: one `depth32float` attachment cleared to one, covering the same
+    // render area as the colour attachment, and a `less` test with writes on.
+    // Anything else describes a shape no rail has been reviewed against, and a
+    // state without its attachment — or the reverse — is refused, mirroring
+    // `render.rs::case_depth`.
+    try require(definition.depth != nil || definition.depth_test == nil,
+                "\(definition.id): a depth test needs a depth attachment")
+    let validatedDepth: ValidatedDepth?
+    if let depth = definition.depth {
+        try require(depth.format == "depth32float",
+                    "\(definition.id): the reviewed depth attachment is a depth32float")
+        try require(depth.load == "clear",
+                    "\(definition.id): the reviewed depth attachment is cleared")
+        guard let clearDepth = depth.clear_depth, clearDepth == 1.0 else {
+            throw OracleError("\(definition.id): the reviewed depth clear is 1.0")
+        }
+        // The depth attachment is a second raster with the pass's own extent
+        // (`research/docs/23` §3.3, v36): the two have to agree, the same rule
+        // the viewport states for the colour side.
+        try require(depth.width == attachments[0].width
+                    && depth.height == attachments[0].height,
+                    "\(definition.id): the depth attachment has to match the colour extent")
+        guard let test = definition.depth_test else {
+            throw OracleError("\(definition.id): the reviewed depth shape carries a depth test")
+        }
+        try require(test.compare == "less" && test.write,
+                    "\(definition.id): the reviewed depth state is a less test with writes on")
+        validatedDepth = ValidatedDepth(width: depth.width, height: depth.height,
+                                        clearDepth: clearDepth,
+                                        isLess: test.compare == "less", write: test.write)
+    } else {
+        validatedDepth = nil
+    }
     return ValidatedRender(definition: definition, source: source,
                            attachments: validatedAttachments,
-                           vertexStreams: vertexStreams, indexStream: indexStream)
+                           vertexStreams: vertexStreams, indexStream: indexStream,
+                           depth: validatedDepth)
 }
 
 private func reviewedProgram(_ entry: String, explicitSlots: Bool = false) throws -> ProgramDefinition {
@@ -2325,6 +2454,26 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         targets.append(target)
     }
+    // The depth surface is the rail's own texture (`research/docs/23` §3.3,
+    // v36): no trace identity and no readback, so private storage is enough
+    // and the pass discards it after the draw, exactly as
+    // `render.rs::depth_texture` creates it. The local keeps the texture alive
+    // until the encoder's own reference takes over.
+    var depthTarget: MTLTexture?
+    if let depth = fixture.depth {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float,
+            width: depth.width,
+            height: depth.height,
+            mipmapped: false)
+        descriptor.usage = .renderTarget
+        descriptor.storageMode = .private
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the depth attachment")
+        }
+        texture.label = "native oracle: \(definition.id) depth"
+        depthTarget = texture
+    }
     // The two stage entries come from the one reviewed module; `loadSuite`
     // already proved the identity, so only the lookup can still fail.
     let library = try device.makeLibrary(source: fixture.source, options: nil)
@@ -2391,6 +2540,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         pipelineDescriptor.colorAttachments[index].pixelFormat =
             fixture.attachments[index].pixelFormat
     }
+    // A pass that opens a depth attachment compiles its pipeline against that
+    // attachment's format; every pre-v36 case declares none
+    // (`research/docs/23` §3.3, v36).
+    if fixture.depth != nil {
+        pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
+    }
     let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
     let pass = MTLRenderPassDescriptor()
@@ -2429,6 +2584,19 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             throw OracleError("\(definition.id): unsupported attachment load op \(attachment.load)")
         }
     }
+    // The pass opens the rail-owned depth surface with its own load operation
+    // and discards it after the draw (`research/docs/23` §3.3, v36): nothing
+    // reads the depth texels back, so `dontCare` is the store action, exactly
+    // as `render.rs` opens the plan's depth attachment.
+    if let depth = fixture.depth {
+        guard let texture = depthTarget, let attachment = pass.depthAttachment else {
+            throw OracleError("\(definition.id): cannot reach the depth attachment")
+        }
+        attachment.texture = texture
+        attachment.loadAction = .clear
+        attachment.clearDepth = depth.clearDepth
+        attachment.storeAction = .dontCare
+    }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
     }
@@ -2439,6 +2607,18 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         throw OracleError("\(definition.id): cannot create a render encoder")
     }
     encoder.setRenderPipelineState(pipeline)
+    // Metal's depth state is encoder state (`research/docs/23` §3.3, v36): the
+    // reviewed pair is a `less` compare with writes on, and the descriptor is
+    // where the compare function and the write flag are stated.
+    if let depth = fixture.depth {
+        let depthStencilDescriptor = MTLDepthStencilDescriptor()
+        depthStencilDescriptor.depthCompareFunction = depth.isLess ? .less : .always
+        depthStencilDescriptor.isDepthWriteEnabled = depth.write
+        guard let state = device.makeDepthStencilState(descriptor: depthStencilDescriptor) else {
+            throw OracleError("\(definition.id): cannot create the depth-stencil state")
+        }
+        encoder.setDepthStencilState(state)
+    }
     // The viewport is explicit because the contract carries it, even though the
     // first increment only accepts the attachment-covering default.
     encoder.setViewport(MTLViewport(originX: 0, originY: 0,
@@ -2606,6 +2786,10 @@ private func renderSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         wildcard_texels: nil,
+        // The `vertex_id` shape is depth-less, the semantics every pre-v36
+        // case has (`research/docs/23` §3.3, v36).
+        depth: nil,
+        depth_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one suite-v13 names for it.
         capture_rails: ["native-metal"])
@@ -2666,6 +2850,8 @@ private func presentSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         wildcard_texels: nil,
+        depth: nil,
+        depth_test: nil,
         // The self-test is this rail's own check; it runs directly rather than
         // through a suite marker, so the marker only has to name this rail.
         capture_rails: ["native-metal"])
@@ -2750,6 +2936,8 @@ private func vertexSelfTest() throws -> CaseResult {
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
         wildcard_texels: nil,
+        depth: nil,
+        depth_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])
@@ -2838,6 +3026,8 @@ private func mrtSelfTest() throws -> CaseResult {
         // spelled per attachment the way a suite's MRT case does.
         expected_hex: nil,
         wildcard_texels: nil,
+        depth: nil,
+        depth_test: nil,
         // The self-test runs on this rail by construction; the marker is the
         // same one a suite would name for it.
         capture_rails: ["native-metal"])

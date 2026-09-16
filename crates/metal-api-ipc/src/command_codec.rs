@@ -12,15 +12,16 @@ use crate::command::{CommandRequest, CommandResponse};
 use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
     AttachmentFormat, BufferAccess, BufferBindingContract, BufferLease, BufferSource, BufferView,
-    BufferWriteback, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DeviceEpoch, Dispatch,
-    DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
-    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
-    OperationId, PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor,
-    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
+    BufferWriteback, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
+    CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, DepthFormat,
+    DepthLoadOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FieldValue,
+    FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor, HeapId, HeapPayload,
+    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LeaseId, LeaseReservation, LoadOp, OperationId, PipelineCompileRequest,
+    PipelineContract, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth, ProviderPhase,
+    ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
@@ -145,13 +146,19 @@ const RENDER_FEATURE_INSTANCING: u8 = 0x08;
 /// exactly what they were, and the decoder reads the missing section as the
 /// zero offset the older frames meant.
 const RENDER_FEATURE_BASE_VERTEX: u8 = 0x10;
+/// The depth block (`research/docs/23` §3.3, v36): the depth attachment's
+/// format, extent and load operation, followed by the pass's depth state when
+/// it declares one. A pass with no depth attachment — every shape published
+/// before v36 — never sets the bit, so its bytes stay exactly what they were.
+const RENDER_FEATURE_DEPTH: u8 = 0x20;
 /// Every bit this version knows. An unknown bit is a decoder refusal rather
 /// than a silently skipped section.
 const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
     | RENDER_FEATURE_PRESENT
     | RENDER_FEATURE_SCISSOR
     | RENDER_FEATURE_INSTANCING
-    | RENDER_FEATURE_BASE_VERTEX;
+    | RENDER_FEATURE_BASE_VERTEX
+    | RENDER_FEATURE_DEPTH;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
@@ -1916,7 +1923,16 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // only a draw that offsets its indices takes the extended kind
                 // and appends its own field.
                 let has_base_vertex = pass.base_vertex != 0;
-                if has_vertex_input || pass.scissor.is_some() || has_instancing || has_base_vertex {
+                // The depth block follows the same rule (`docs/23` §3.3, v36):
+                // only a pass that carries a depth attachment takes the
+                // extended kind and appends its shape.
+                let has_depth = pass.depth.is_some();
+                if has_vertex_input
+                    || pass.scissor.is_some()
+                    || has_instancing
+                    || has_base_vertex
+                    || has_depth
+                {
                     encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -1934,6 +1950,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if has_base_vertex {
                         features |= RENDER_FEATURE_BASE_VERTEX;
+                    }
+                    if has_depth {
+                        features |= RENDER_FEATURE_DEPTH;
                     }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
@@ -1953,6 +1972,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if has_base_vertex {
                         encoder.u32(pass.base_vertex);
+                    }
+                    if let Some(depth) = &pass.depth {
+                        put_depth_block(encoder, depth, pass.depth_test.as_ref())?;
                     }
                     continue;
                 }
@@ -2343,6 +2365,11 @@ fn get_trace_tagged(
                 if features & RENDER_FEATURE_BASE_VERTEX != 0 {
                     pass.base_vertex = decoder.u32()?;
                 }
+                if features & RENDER_FEATURE_DEPTH != 0 {
+                    let (depth, test) = get_depth_block(decoder)?;
+                    pass.depth = Some(depth);
+                    pass.depth_test = test;
+                }
                 TracePass::Render(pass)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
@@ -2440,8 +2467,106 @@ fn get_render_pass(
         // are read (`research/docs/23` §3.3, v31/v34).
         instance_count: 1,
         base_vertex: 0,
+        // A frame without the depth bit declares no depth attachment and no
+        // depth state (`research/docs/23` §3.3, v36).
+        depth: None,
+        depth_test: None,
         present,
     })
+}
+
+/// Encode the depth block of an extended render pass: the rail-owned depth
+/// attachment's shape and, when the pass declares one, its depth state.
+///
+/// The attachment travels as `(format, width, height, load)` rather than as a
+/// resource identity, because the first depth increment's attachment is
+/// rail-owned: nothing reads it back yet, and the readback channel is what
+/// would add the identity fields (`research/docs/23` §3.3, v36). The load
+/// operation's clear value is written as its IEEE-754 bits, so a frame is
+/// byte-stable and a decoder reads exactly the value the encoder wrote.
+fn put_depth_block(
+    encoder: &mut Encoder,
+    depth: &RenderDepthAttachment,
+    test: Option<&DepthTest>,
+) -> Result<(), CodecError> {
+    encoder.u8(depth.format.code());
+    encoder.u64(depth.width);
+    encoder.u64(depth.height);
+    match depth.load {
+        DepthLoadOp::Clear(bits) => {
+            encoder.u8(0);
+            encoder.u32(bits);
+        }
+        DepthLoadOp::Load => encoder.u8(1),
+    }
+    match test {
+        Some(test) => {
+            encoder.u8(1);
+            encoder.u8(test.compare.code());
+            encoder.u8(u8::from(test.write));
+        }
+        None => encoder.u8(0),
+    }
+    Ok(())
+}
+
+/// Decode the depth block. An unknown format, compare function or presence byte
+/// is a typed refusal rather than a default.
+fn get_depth_block(
+    decoder: &mut Decoder<'_>,
+) -> Result<(RenderDepthAttachment, Option<DepthTest>), CodecError> {
+    let format = DepthFormat::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+        field: "depth format",
+        value: 0,
+    })?;
+    let width = decoder.u64()?;
+    let height = decoder.u64()?;
+    let load = match decoder.u8()? {
+        0 => DepthLoadOp::Clear(decoder.u32()?),
+        1 => DepthLoadOp::Load,
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "depth load op",
+                value,
+            })
+        }
+    };
+    let test = match decoder.u8()? {
+        0 => None,
+        1 => {
+            let compare =
+                CompareFunction::from_code(decoder.u8()?).ok_or(CodecError::UnknownEnumValue {
+                    field: "depth compare function",
+                    value: 0,
+                })?;
+            let write = match decoder.u8()? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(CodecError::UnknownEnumValue {
+                        field: "depth write enable",
+                        value,
+                    })
+                }
+            };
+            Some(DepthTest { compare, write })
+        }
+        value => {
+            return Err(CodecError::UnknownEnumValue {
+                field: "depth state presence",
+                value,
+            })
+        }
+    };
+    Ok((
+        RenderDepthAttachment {
+            format,
+            width,
+            height,
+            load,
+        },
+        test,
+    ))
 }
 
 /// Decode the vertex-input block of an extended render pass: the bound vertex

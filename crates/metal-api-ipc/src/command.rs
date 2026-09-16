@@ -1584,6 +1584,8 @@ mod tests {
         height: u64,
     ) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: compiled.pipeline_id,
             color_attachments: vec![render_attachment(width, height)],

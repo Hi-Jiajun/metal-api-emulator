@@ -1028,3 +1028,47 @@ fixture's marker therefore names all five rails.
 
 The evidence boundary is §13's: the five-rail CI run (with the Apple half in
 `native-oracle-build`) plus the RTX 5060 capture of the same suite.
+
+## 16. The depth milestone (v36)
+
+`research/docs/23` §3.3 schedules a depth attachment as its own increment. The
+first one is deliberately narrow: a pass may open **one** rail-owned depth
+surface — `depth32float`, the pass's own extent, cleared or loaded — and declare
+the depth state its draw tests and writes with. No depth readback channel, no
+stencil, no depth-only passes:
+
+* the surface is rail-owned. It has no view or allocation identity in the
+  trace's resource table, because nothing observes it yet; the readback channel
+  is what would add those fields. Both rails create it from the declared shape
+  (Vulkan: a `D32_SFLOAT` image and view in the render pass's attachment list,
+  store `DONT_CARE`; native: a private `.depth32Float` texture in the pass's
+  depth attachment, store `.dontCare`);
+* the state is the pass's own, mirroring Metal, where the compare function and
+  the write enable live in the `MTLDepthStencilState` the encoder sets. The
+  Vulkan rail bakes the same pair into the per-pass pipeline it builds, so one
+  description serves both;
+* the extent has to match every colour attachment's, the format is the one
+  admitted value, and a depth state without a depth attachment is
+  `ContractError::DepthTestWithoutAttachment`.
+
+The wire keeps every pre-v36 frame byte-identical: a pass with a depth
+attachment takes the extended render kind plus `RENDER_FEATURE_DEPTH`, whose
+block carries the format, extent, load operation (the clear depth travels as
+its IEEE-754 bits, so a frame is byte-stable) and, when present, the compare
+function and write flag.
+
+The reviewed fixture `depth_pair_4x4` is falsifiable by construction. Its stream
+is two oversize triangles — the same triangle, twice — the first at `z = 0.5`
+tinted red and the second at `z = 0.9` tinted green, drawn in one indexed draw
+into a pass whose depth surface is cleared to one. With `less` and depth writes
+the near triangle wins everywhere the two overlap, which is the whole
+attachment, so the expectation is the red texel sixteen times. A rail that
+dropped the attachment, the clear or the test would show the green one: the
+same fixture run with `compare: "always"` reads back sixteen `00ff00ff` texels
+on Lavapipe, which is the control that makes the red run evidence rather than a
+coincidence.
+
+The fixture's marker names the three trace rails. The object API has no way to
+declare a depth attachment yet, so a case that declares one is refused on those
+rails instead of being recorded without the surface — which would draw a
+different pass.

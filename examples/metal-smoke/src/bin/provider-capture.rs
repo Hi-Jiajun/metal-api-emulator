@@ -5,17 +5,17 @@ use metal_api_core::provider::queue_priorities_for_device;
 use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
-    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    ComputePass, ComputeTrace, DeviceEpoch, Dispatch, DispatchKind, DispatchType, FootprintProof,
-    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
-    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LoadOp, OperationId,
-    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
-    StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    PROVIDER_SCHEMA_VERSION,
+    BufferView, ClearColor, CompareFunction, CompiledComputePipeline, CompletionDisposition,
+    CompletionPolicy, ComputePass, ComputeTrace, DepthFormat, DepthLoadOp, DepthTest, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
+    HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
+    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
+    RenderDepthAttachment, RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot,
+    SemanticDigest, ShaderSource, StorageMode, StoreOp, TextureAccess, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, VertexStep, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -171,6 +171,31 @@ const INSTANCED_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
 /// The two instances the reviewed fixture draws: the pair the module's
 /// `instance_id` shift was reviewed against.
 const INSTANCED_COUNT: u64 = 2;
+
+/// The reviewed depth fixture (`research/docs/23` §3.3, v36): two oversize
+/// triangles, one at `z = 0.5` tinted red and one at `z = 0.9` tinted green,
+/// drawn in one indexed draw into a pass that clears a `depth32float`
+/// attachment to `1.0` and tests `less` with depth writes on. The nearer
+/// triangle wins everywhere they overlap — which is the whole attachment — so
+/// the expectation is the red texel sixteen times; a rail that ignored the
+/// depth attachment, the clear or the test would leave green there.
+const DEPTH_VERTEX_ENTRY: &str = "depth_pair_main";
+const DEPTH_FRAGMENT_ENTRY: &str = "depth_pair_tint_main";
+const DEPTH_MSL_VERTEX_ENTRY: &str = "render_depth_pair_vertex";
+const DEPTH_MSL_FRAGMENT_ENTRY: &str = "render_depth_pair_tint";
+const DEPTH_VERTEX_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "depth_pair.vert.spv"
+));
+const DEPTH_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "depth_pair_tint.frag.spv"
+));
+/// Bytes per depth-pair vertex: `float32x3` at offset 0 and `float32x4` at
+/// offset 16, so the stride is thirty-two.
+const DEPTH_STRIDE: u64 = 32;
+/// The depth the pass clears its attachment to before the draw.
+const DEPTH_CLEAR: f64 = 1.0;
 /// Bytes per instance of the reviewed tint stream: one `float32x4`.
 const INSTANCED_TINT_STRIDE: u64 = 16;
 
@@ -954,6 +979,17 @@ fn register_render_pipeline(
             (QUAD_VERTEX_SPV, QUAD_FRAGMENT_SPV),
             reviewed_quad_layout(),
         ),
+        // The depth pair carries its own reviewed module
+        // (`research/docs/23` §3.3, v36): the position's z decides which
+        // triangle survives, and the tint varying is what makes the surviving
+        // one visible, so neither the solid nor the instanced module can stand
+        // in for it.
+        RenderGeometry::DepthPair => (
+            (DEPTH_VERTEX_ENTRY, DEPTH_FRAGMENT_ENTRY),
+            (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
+            (DEPTH_VERTEX_SPV, DEPTH_FRAGMENT_SPV),
+            reviewed_depth_layout(),
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
@@ -1164,6 +1200,15 @@ struct RenderCase {
     /// base-vertex fixture declares exactly `1` over its five-vertex stream.
     #[serde(default)]
     base_vertex: u64,
+    /// The depth attachment the pass opens, or absent for a pass with no depth
+    /// surface (`research/docs/23` §3.3, v36). The attachment is rail-owned:
+    /// the case states its shape, not a resource identity.
+    #[serde(default)]
+    depth: Option<DepthAttachmentDefinition>,
+    /// The pass's depth state, or absent for "the attachment exists and
+    /// nothing tests it" (`research/docs/23` §3.3, v36).
+    #[serde(default)]
+    depth_test: Option<DepthTestDefinition>,
     /// Texels the case does not claim, in row-major order
     /// (`research/docs/23` §3.3, v33). Only a `dontcare` load may leave bytes
     /// unclaimed — the undefined pre-pass contents are exactly what makes them
@@ -1176,6 +1221,27 @@ struct RenderCase {
 /// every pre-v31 fixture means.
 fn default_instance_count() -> u64 {
     1
+}
+
+/// The depth attachment a render case opens (`research/docs/23` §3.3, v36).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepthAttachmentDefinition {
+    format: String,
+    width: u64,
+    height: u64,
+    load: String,
+    #[serde(default)]
+    clear_depth: Option<f64>,
+}
+
+/// The depth state a render case's draw tests with (`research/docs/23` §3.3,
+/// v36).
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepthTestDefinition {
+    compare: String,
+    write: bool,
 }
 
 /// One vertex layout: the reviewed stream list, in binding order.
@@ -2222,6 +2288,10 @@ enum RenderGeometry {
     /// is a degenerate centre, drawn with `base_vertex: 1` so the four reviewed
     /// corners are the ones the indices reach.
     BaseVertexQuad,
+    /// The reviewed depth pair (`research/docs/23` §3.3, v36): two oversize
+    /// triangles at different z, each carrying its own tint, drawn with a
+    /// depth attachment and a `less` test.
+    DepthPair,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -2420,6 +2490,156 @@ fn reviewed_base_vertex_geometry(
     Ok(RenderGeometry::BaseVertexQuad)
 }
 
+/// The reviewed depth layout (`research/docs/23` §3.3, v36): one stream whose
+/// vertices carry a `float32x3` position (offset 0) and a `float32x4` tint
+/// (offset 16) at stride thirty-two.
+fn reviewed_depth_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![VertexBufferLayout {
+        stride: DEPTH_STRIDE,
+        step: VertexStep::PerVertex,
+        attributes: vec![
+            VertexAttribute {
+                location: 0,
+                offset: 0,
+                format: VertexFormat::Float32x3,
+            },
+            VertexAttribute {
+                location: 1,
+                offset: 16,
+                format: VertexFormat::Float32x4,
+            },
+        ],
+    }])
+}
+
+/// The reviewed depth stream: two oversize triangles, the first at `z = 0.5`
+/// with the red tint and the second at `z = 0.9` with the green one. The bytes
+/// are pinned because the shape *is* the review: the two triangles cover the
+/// same texels, and only their depth differs.
+const DEPTH_PAIR_POSITIONS_HEX: [&str; 6] = [
+    // The oversize triangle (-1, -1), (3, -1), (-1, 3) at z = 0.5.
+    "000080bf000080bf0000003f",
+    "00004040000080bf0000003f",
+    "000080bf000040400000003f",
+    // The same triangle at z = 0.9 (0x3f666666).
+    "000080bf000080bf6666663f",
+    "00004040000080bf6666663f",
+    "000080bf000040406666663f",
+];
+/// The two reviewed tints, as the `float32x4` bytes the stream carries:
+/// `(1, 0, 0, 1)` for the near triangle and `(0, 1, 0, 1)` for the far one.
+const DEPTH_PAIR_RED_HEX: &str = "0000803f00000000000000000000803f";
+const DEPTH_PAIR_GREEN_HEX: &str = "000000000000803f000000000000803f";
+
+/// The reviewed stream, reassembled vertex by vertex: each vertex is its
+/// `float32x3` position at offset 0, the four padding bytes that align the tint
+/// to offset 16, and the triangle's `float32x4` tint there — the exact offsets
+/// the reviewed layout declares.
+fn reviewed_depth_stream_hex() -> String {
+    let mut expected = String::new();
+    for (vertex, position) in DEPTH_PAIR_POSITIONS_HEX.iter().enumerate() {
+        expected.push_str(position);
+        expected.push_str("00000000");
+        expected.push_str(if vertex < 3 {
+            DEPTH_PAIR_RED_HEX
+        } else {
+            DEPTH_PAIR_GREEN_HEX
+        });
+    }
+    expected
+}
+
+/// Pin the reviewed depth shape (`research/docs/23` §3.3, v36).
+///
+/// The layout, the two triangles, the depth attachment's shape and the depth
+/// state are the whole review surface: the attachment has to be the reviewed
+/// `depth32float` extent cleared to one, the test has to be `less` with writes
+/// on, and the stream has to be the two oversize triangles at the reviewed
+/// depths with the reviewed tints. Anything else describes a shape no rail has
+/// been reviewed against.
+fn reviewed_depth_geometry(
+    case: &RenderCase,
+    layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    let stream = &layout.buffers[0];
+    if layout.buffers.len() != 1
+        || stream.stride != DEPTH_STRIDE
+        || stream.step != "per_vertex"
+        || stream.attributes.len() != 2
+    {
+        return Err(format!(
+            "{where_}: the reviewed depth stream is one stride-{DEPTH_STRIDE} stream with two attributes"
+        )
+        .into());
+    }
+    let position = &stream.attributes[0];
+    if position.location != 0 || position.offset != 0 || position.format != "float32x3" {
+        return Err(format!(
+            "{where_}: the reviewed depth position is location 0, offset 0, float32x3"
+        )
+        .into());
+    }
+    let tint = &stream.attributes[1];
+    if tint.location != 1 || tint.offset != 16 || tint.format != "float32x4" {
+        return Err(format!(
+            "{where_}: the reviewed depth tint is location 1, offset 16, float32x4"
+        )
+        .into());
+    }
+    let Some(depth) = &case.depth else {
+        return Err(
+            format!("{where_}: the reviewed depth shape carries a depth attachment").into(),
+        );
+    };
+    if depth.format != "depth32float" || depth.load != "clear" {
+        return Err(
+            format!("{where_}: the reviewed depth attachment is a cleared depth32float").into(),
+        );
+    }
+    if depth.clear_depth != Some(DEPTH_CLEAR) {
+        return Err(format!("{where_}: the reviewed depth clear is {DEPTH_CLEAR}").into());
+    }
+    let Some(test) = &case.depth_test else {
+        return Err(format!("{where_}: the reviewed depth shape carries a depth test").into());
+    };
+    if test.compare != "less" || !test.write {
+        return Err(
+            format!("{where_}: the reviewed depth state is a less test with writes on").into(),
+        );
+    }
+    if case.vertex_buffers.len() != 1 {
+        return Err(format!("{where_}: the reviewed depth shape binds one stream").into());
+    }
+    let buffer = &case.vertex_buffers[0];
+    if buffer.allocation == 0 || buffer.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let required = DEPTH_STRIDE * 6;
+    if buffer.length != required {
+        return Err(format!(
+            "{where_}: the reviewed depth stream is six stride-{DEPTH_STRIDE} vertices"
+        )
+        .into());
+    }
+    // The position and tint bytes share each vertex, so the expectation is
+    // reassembled from the reviewed pieces rather than read off one constant.
+    if buffer.initial_hex != reviewed_depth_stream_hex() {
+        return Err(
+            format!("{where_}: the reviewed depth stream is the two reviewed triangles").into(),
+        );
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed depth shape is indexed").into());
+    };
+    if indices.initial_hex != "000001000200030004000500" {
+        return Err(
+            format!("{where_}: the reviewed depth indices are the two reviewed triangles").into(),
+        );
+    }
+    Ok(RenderGeometry::DepthPair)
+}
+
 /// Pin the reviewed instanced shape (`research/docs/23` §3.3, v31).
 ///
 /// The pair is the whole review surface: the position stream has to be the
@@ -2562,6 +2782,9 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
     // reviewed position stream at binding 0, the per-instance tint at binding
     // 1, and exactly the two instances the reviewed module's `instance_id`
     // shift was written for (`research/docs/23` §3.3, v31).
+    if case.depth.is_some() {
+        return reviewed_depth_geometry(case, layout, where_);
+    }
     if layout.buffers.len() == 2 {
         return reviewed_instanced_geometry(case, layout, where_);
     }
@@ -2750,6 +2973,17 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::DepthPair => {
+            if case.vertices != 6 {
+                return Err(format!("{where_}: the reviewed depth pair draws six indices").into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: a depth case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
         RenderGeometry::BaseVertexQuad => {
             if case.vertices != QUAD_INDICES {
                 return Err(format!(
@@ -2813,6 +3047,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // offset is draw state, so the entries and the layout do not change
         // (`research/docs/23` §3.3, v34).
         RenderGeometry::BaseVertexQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+        RenderGeometry::DepthPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -4431,6 +4666,71 @@ fn heap_segment(
     })
 }
 
+/// The depth attachment and depth state one render case declares
+/// (`research/docs/23` §3.3, v36).
+///
+/// The case's spellings are the reviewed ones: `depth32float`, a `clear` with
+/// its depth or a `load`, and a `less`/`always` compare with an explicit write
+/// flag. A test without an attachment is refused here as well as by the
+/// contract, so the refusal names the case rather than the pass index.
+fn case_depth(
+    case: &RenderCase,
+    where_: &str,
+) -> Result<(Option<RenderDepthAttachment>, Option<DepthTest>)> {
+    let depth = match &case.depth {
+        None => None,
+        Some(depth) => {
+            let format = match depth.format.as_str() {
+                "depth32float" => DepthFormat::Depth32Float,
+                other => return Err(format!("{where_}: unsupported depth format {other:?}").into()),
+            };
+            let load = match depth.load.as_str() {
+                "clear" => {
+                    let clear = depth.clear_depth.ok_or(format!(
+                        "{where_}: a cleared depth attachment needs clear_depth"
+                    ))?;
+                    DepthLoadOp::clear(clear as f32)
+                }
+                "load" => {
+                    if depth.clear_depth.is_some() {
+                        return Err(format!(
+                            "{where_}: a loading depth attachment carries no clear_depth"
+                        )
+                        .into());
+                    }
+                    DepthLoadOp::Load
+                }
+                other => {
+                    return Err(format!("{where_}: unsupported depth load op {other:?}").into())
+                }
+            };
+            Some(RenderDepthAttachment {
+                format,
+                width: depth.width,
+                height: depth.height,
+                load,
+            })
+        }
+    };
+    let test = match &case.depth_test {
+        None => None,
+        Some(test) => Some(DepthTest {
+            compare: match test.compare.as_str() {
+                "less" => CompareFunction::Less,
+                "always" => CompareFunction::Always,
+                other => {
+                    return Err(format!("{where_}: unsupported depth compare {other:?}").into())
+                }
+            },
+            write: test.write,
+        }),
+    };
+    if test.is_some() && depth.is_none() {
+        return Err(format!("{where_}: a depth test needs a depth attachment").into());
+    }
+    Ok((depth, test))
+}
+
 /// Execute one render case on the Vulkan trace rail.
 ///
 /// The trace is the declaring case's own pass followed by the render pass, i.e.
@@ -4453,6 +4753,7 @@ fn run_render_case(
     guard: u8,
 ) -> Result<CaseResult> {
     let attachments = render_attachment_shapes(case)?;
+    let (depth_attachment, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
     // The declaring pass's own resource table: one backing image and one
     // `AllocationRecord` per allocation (`docs/23` §4.1).
     let mut allocations: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -4650,6 +4951,11 @@ fn run_render_case(
         // The reviewed base-vertex fixture declares one; every pre-v34 case
         // leaves the offset at zero (`research/docs/23` §3.3, v34).
         base_vertex: u32::try_from(case.base_vertex)?,
+        // The reviewed depth fixture declares both; every pre-v36 case leaves
+        // them absent, which is the shape the rails execute as "no depth
+        // surface" (`research/docs/23` §3.3, v36).
+        depth: depth_attachment,
+        depth_test,
         present,
     }));
 
@@ -5003,6 +5309,16 @@ fn run_object_render_case(
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
+    // The object API has no depth attachment entry point yet, so a case that
+    // declares one is refused rather than recorded without the surface — which
+    // would draw a different pass (`research/docs/23` §3.3, v36).
+    if case.depth.is_some() {
+        return Err(format!(
+            "render case {}: the object rails have no depth attachment yet",
+            case.id
+        )
+        .into());
+    }
     let attachments = render_attachment_shapes(case)?;
     let mut images = BTreeMap::<u64, Vec<u8>>::new();
     for definition in &declaring.buffers {
