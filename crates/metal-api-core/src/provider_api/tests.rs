@@ -182,6 +182,12 @@ impl ComputeProvider for FakeProvider {
             } else {
                 Vec::new()
             },
+            // The object rails execute the direct vertex-input shape, so the
+            // fixture provider declares the same two instancing bits; the
+            // instanced draw call itself is the next increment's encoder work
+            // (`research/docs/23` §3.3, v31).
+            supports_render_instancing: self.vertex_input,
+            max_render_instances: if self.vertex_input { 4 } else { 0 },
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self
@@ -2421,6 +2427,7 @@ fn render_metadata_multi(
 fn stream_layout(location: u32) -> VertexBufferLayout {
     VertexBufferLayout {
         stride: 8,
+        step: crate::provider::VertexStep::PerVertex,
         attributes: vec![VertexAttribute {
             location,
             offset: 0,

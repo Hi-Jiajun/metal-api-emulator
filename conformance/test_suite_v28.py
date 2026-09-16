@@ -1,12 +1,15 @@
-"""Scissor checks for `suite-v28.json`.
+"""Scissor and instancing checks for `suite-v28.json`.
 
-These are comparator and schema checks, not GPU execution evidence. What they
-pin is the first dynamic-state field the contract carries (`research/docs/23`
-§3.3, v29): a pass may clip its draw to a rectangle, and the comparison then
-knows the coverage exactly — inside the rectangle every texel is the fragment
-output, outside it every texel keeps the clear colour. A scissor that covers the
-whole attachment (or nothing) is refused, because it could not show that the
-rail executed it.
+These are comparator and schema checks, not GPU execution evidence. They pin two
+increments of `research/docs/23` §3.3: the scissor (v29), where a pass clips its
+draw to a rectangle and the comparison then knows the coverage exactly — inside
+the rectangle every texel is the fragment output, outside it every texel keeps
+the clear colour — and the instanced pair (v31), where a per-instance tint
+stream covers each half of the attachment with its own instance's colour, so
+both the instance count and the stream's per-instance step are observable. A
+scissor that covers the whole attachment (or nothing), or an expectation that
+carries one tint twice, is refused: it could not show that the rail executed the
+feature.
 """
 
 import copy
@@ -24,6 +27,7 @@ V28_PATH = CONFORMANCE / "suite-v28.json"
 
 DECLARING_ID = "render_declaring_quad_extent"
 RENDER_ID = "scissor_left_half_4x4"
+INSTANCED_ID = "instanced_pair_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -32,11 +36,18 @@ SCISSOR = [0, 0, 2, 4]
 OUTPUT = "4080c0ff"
 CLEAR = "11223344"
 EXPECTED = "".join(OUTPUT if (index % 4) < 2 else CLEAR for index in range(16))
+# The reviewed instance tints: red for the left half, green for the right.
+INSTANCE_TINTS = ("ff0000ff", "00ff00ff")
+INSTANCED_EXPECTED = "".join(
+    INSTANCE_TINTS[0] if (index % 4) < 2 else INSTANCE_TINTS[1]
+    for index in range(16))
 # Every rail executes the scissor from v30 on: the object API's encoder carries
-# `set_scissor`, so the fixture names all five.
+# `set_scissor`, so the fixture names all five. The instanced pair is the trace
+# rails' shape until the object API gains its own instanced draw call.
 TRACE_RAILS = ("native-metal", "vulkan", "native-metal-provider")
 OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
 ALL_RAILS = TRACE_RAILS + OBJECT_RAILS
+INSTANCED_RAILS = TRACE_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -50,6 +61,27 @@ def render_result(provider_backend=True, copy_in=2, copy_out=2):
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
     return result
+
+
+def instanced_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": INSTANCED_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": INSTANCED_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": INSTANCED_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def other_rail(rail):
+    """A known rail that is not `rail`, for "this capture owes nothing" markers."""
+    for candidate in ALL_RAILS:
+        if candidate != rail:
+            return candidate
+    raise AssertionError("no other rail exists")
 
 
 def counted_declaring(suite, digest, rail):
@@ -75,42 +107,118 @@ class ScissorObservationTests(unittest.TestCase):
         self.assertEqual(case["expected_hex"], EXPECTED)
         self.assertEqual(sorted(case["capture_rails"]), sorted(ALL_RAILS))
 
+    def test_v28_pins_the_instanced_fixture(self):
+        self.assertEqual(self.suite["suite"], "compute-buffer-v28")
+        case = self.suite["render_cases"][1]
+        self.assertEqual(case["id"], INSTANCED_ID)
+        self.assertEqual(case["instance_count"], 2)
+        self.assertEqual([stream["step"] for stream in case["vertex_layout"]["buffers"]],
+                         ["per_vertex", "per_instance"])
+        self.assertEqual(case["attachment"]["clear_hex"], CLEAR)
+        self.assertEqual(case["expected_hex"], INSTANCED_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(INSTANCED_RAILS))
+
     def test_v28_plan_knows_the_coverage(self):
         plan = compare._suite_plan(self.suite)
-        expectation = compare._render_plan(plan, self.suite)[RENDER_ID]
+        render_plan = compare._render_plan(plan, self.suite)
+        expectation = render_plan[RENDER_ID]
         self.assertEqual(expectation.writes,
                          [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
                            bytes.fromhex(EXPECTED))])
         self.assertEqual(expectation.touched, {900, 920})
         self.assertEqual(expectation.written, {900, 920})
+        instanced = render_plan[INSTANCED_ID]
+        self.assertEqual(instanced.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(INSTANCED_EXPECTED))])
+        self.assertEqual(instanced.touched, {900, 920})
+        self.assertEqual(instanced.written, {900, 920})
+        self.assertEqual(instanced.rails, frozenset(INSTANCED_RAILS))
 
     def test_v28_clips_on_every_rail(self):
+        # The scissor case is widened to every rail; the instanced case keeps
+        # its own marker, so each rail reports exactly the render cases it owes.
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
-            for case in suite["render_cases"]:
-                case["capture_rails"] = [rail]
+            suite["render_cases"][0]["capture_rails"] = [rail]
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
             report["results"].append(render_result(rail != "native-metal"))
+            if rail in INSTANCED_RAILS:
+                report["results"].append(instanced_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_instances_on_every_trace_rail(self):
+        for rail in INSTANCED_RAILS:
+            suite = copy.deepcopy(self.suite)
+            # The scissor case names one other rail: this capture owes the
+            # instanced result and nothing else.
+            suite["render_cases"][0]["capture_rails"] = [other_rail(rail)]
+            suite["render_cases"][1]["capture_rails"] = [rail]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(instanced_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
     def test_v28_refuses_a_rail_whose_marker_does_not_name_it(self):
-        # The marker names every rail, so a capture whose marker omits its own
-        # rail is refused rather than compared.
+        # The scissor marker names every rail, so a capture whose marker omits
+        # its own rail is refused rather than compared.
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
-            for case in suite["render_cases"]:
-                case["capture_rails"] = [other for other in ALL_RAILS if other != rail]
+            suite["render_cases"][0]["capture_rails"] = [
+                other for other in ALL_RAILS if other != rail]
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
             report["results"].append(render_result(rail != "native-metal"))
+            if rail in INSTANCED_RAILS:
+                report["results"].append(instanced_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
                     compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_refuses_an_instanced_marker_that_omits_its_rail(self):
+        for rail in INSTANCED_RAILS:
+            suite = copy.deepcopy(self.suite)
+            suite["render_cases"][0]["capture_rails"] = [other_rail(rail)]
+            suite["render_cases"][1]["capture_rails"] = [
+                other for other in INSTANCED_RAILS if other != rail]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(instanced_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                with self.assertRaisesRegex(compare.CaptureError,
+                                            "is not a rail this render case runs on"):
+                    compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_refuses_a_uniform_instanced_expectation(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][1]["expected_hex"] = INSTANCE_TINTS[0] * 16
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "instance tint of its half"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_swapped_instanced_expectation(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][1]["expected_hex"] = "".join(
+            INSTANCE_TINTS[1] if (index % 4) < 2 else INSTANCE_TINTS[0]
+            for index in range(16))
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "instance tint of its half"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_single_instance_instanced_case(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][1]["instance_count"] = 1
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "runs exactly two instances"):
+            compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_scissor_outside_the_attachment(self):
         broken = copy.deepcopy(self.suite)

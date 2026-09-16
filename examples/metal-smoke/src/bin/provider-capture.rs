@@ -14,7 +14,7 @@ use metal_api_core::provider::{
     QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, ShaderSource, StorageMode,
     StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
@@ -142,6 +142,37 @@ const QUAD_VERTICES: u64 = 4;
 const QUAD_INDICES: u64 = 6;
 /// Bytes per vertex of the reviewed stream: one `float32x2`.
 const QUAD_STRIDE: u64 = 8;
+
+/// The reviewed instanced fixture (`research/docs/23` §3.3, v31): the same
+/// indexed quad, drawn once per instance, with a second stream that advances
+/// per *instance* and carries the instance's tint. The vertex stage shifts each
+/// instance's copy by half the viewport with `instance_id`, so instance 0
+/// covers the left half of the attachment and instance 1 the right half; the
+/// two halves carry the two tints, which is what makes "the stream stepped per
+/// instance" observable instead of a value that landed in the same texels
+/// twice.
+///
+/// The Vulkan rail compiles `instanced_quad.vert.spv` /
+/// `instanced_tint.frag.spv`, the native rail compiles
+/// `conformance/shaders/instanced_quad_2x2.metal`, and both name the same
+/// shape: four NDC corners in two triangles, one `float32x4` tint per instance.
+const INSTANCED_VERTEX_ENTRY: &str = "instanced_quad_main";
+const INSTANCED_FRAGMENT_ENTRY: &str = "instanced_tint_main";
+const INSTANCED_MSL_VERTEX_ENTRY: &str = "render_instanced_quad_vertex";
+const INSTANCED_MSL_FRAGMENT_ENTRY: &str = "render_instanced_tint";
+const INSTANCED_VERTEX_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "instanced_quad.vert.spv"
+));
+const INSTANCED_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "instanced_tint.frag.spv"
+));
+/// The two instances the reviewed fixture draws: the pair the module's
+/// `instance_id` shift was reviewed against.
+const INSTANCED_COUNT: u64 = 2;
+/// Bytes per instance of the reviewed tint stream: one `float32x4`.
+const INSTANCED_TINT_STRIDE: u64 = 16;
 
 /// The capture backends a suite may declare a render case executable on. The
 /// vocabulary is `conformance/compare.py`'s `ALLOCATION_OBSERVATIONS`, i.e. the
@@ -903,6 +934,17 @@ fn register_render_pipeline(
             ),
             _ => return Err("the reviewed MRT shapes are one, two and four attachments".into()),
         },
+        // The instanced fixture owns a module pair of its own
+        // (`research/docs/23` §3.3, v31): the vertex stage reads the
+        // per-instance tint and shifts each instance's copy with
+        // `instance_id`, and the fragment stage stores the forwarded tint. The
+        // solid modules cannot stand in for either half.
+        RenderGeometry::InstancedPair => (
+            (INSTANCED_VERTEX_ENTRY, INSTANCED_FRAGMENT_ENTRY),
+            (INSTANCED_MSL_VERTEX_ENTRY, INSTANCED_MSL_FRAGMENT_ENTRY),
+            (INSTANCED_VERTEX_SPV, INSTANCED_FRAGMENT_SPV),
+            reviewed_instanced_layout(),
+        ),
     };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
@@ -1103,6 +1145,17 @@ struct RenderCase {
     /// The index buffer the draw runs through, when the case is indexed.
     #[serde(default)]
     indices: Option<IndexInputDefinition>,
+    /// Instances the draw runs (`research/docs/23` §3.3, v31). Absent means the
+    /// single instance every pre-v31 case draws; the reviewed instanced fixture
+    /// declares exactly two.
+    #[serde(default = "default_instance_count")]
+    instance_count: u64,
+}
+
+/// The instance count a case draws when it says nothing: the single instance
+/// every pre-v31 fixture means.
+fn default_instance_count() -> u64 {
+    1
 }
 
 /// One vertex layout: the reviewed stream list, in binding order.
@@ -1117,7 +1170,18 @@ struct VertexLayoutDefinition {
 #[serde(deny_unknown_fields)]
 struct VertexStreamDefinition {
     stride: u64,
+    /// How often the stream advances: `"per_vertex"` (the default every
+    /// pre-v31 suite leaves implicit) or `"per_instance"` for the reviewed
+    /// instanced fixture (`research/docs/23` §3.3, v31).
+    #[serde(default = "default_vertex_step")]
+    step: String,
     attributes: Vec<VertexAttributeDefinition>,
+}
+
+/// The step a stream declares when the case says nothing about it: the
+/// per-vertex advance every pre-v31 fixture means.
+fn default_vertex_step() -> String {
+    "per_vertex".to_owned()
 }
 
 /// One attribute of a stream, in the contract's own terms.
@@ -1739,8 +1803,20 @@ fn main() -> Result<()> {
     // single-attachment case keeps the pre-MRT pair. Every committed suite
     // carries one render shape today, but the cache refuses to reuse a
     // registration minted for another count rather than guessing.
-    let mut render_pipeline: Option<(Vec<AttachmentFormat>, CompiledComputePipeline)> = None;
-    let mut object_render_pipeline: Option<(Vec<AttachmentFormat>, objects::RenderPipeline)> = None;
+    // The cache is keyed by (formats, geometry): one attachment list can now
+    // carry two different reviewed module pairs — the indexed quad and the
+    // instanced pair — so a registration minted for one geometry must not be
+    // reused for the other (`research/docs/23` §3.3, v31).
+    let mut render_pipeline: Option<(
+        Vec<AttachmentFormat>,
+        RenderGeometry,
+        CompiledComputePipeline,
+    )> = None;
+    let mut object_render_pipeline: Option<(
+        Vec<AttachmentFormat>,
+        RenderGeometry,
+        objects::RenderPipeline,
+    )> = None;
     for (offset, case) in suite.render_cases.iter().enumerate() {
         // A render case is owed only by the rails its marker names: an indirect
         // case names the rails that declare indirect support, and a rail that
@@ -1772,7 +1848,11 @@ fn main() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let object_pipeline = match &object_render_pipeline {
-                Some((formats, pipeline)) if *formats == attachment_formats => pipeline.clone(),
+                Some((formats, cached_geometry, pipeline))
+                    if *formats == attachment_formats && *cached_geometry == geometry =>
+                {
+                    pipeline.clone()
+                }
                 _ => {
                     let registered = register_render_pipeline(
                         &render_registrar,
@@ -1781,8 +1861,9 @@ fn main() -> Result<()> {
                         &attachment_formats,
                     )?;
                     let wrapped = device.render_pipeline(&registered)?;
-                    render_pipeline = Some((attachment_formats.clone(), registered));
-                    object_render_pipeline = Some((attachment_formats.clone(), wrapped.clone()));
+                    render_pipeline = Some((attachment_formats.clone(), geometry, registered));
+                    object_render_pipeline =
+                        Some((attachment_formats.clone(), geometry, wrapped.clone()));
                     wrapped
                 }
             };
@@ -1801,7 +1882,11 @@ fn main() -> Result<()> {
                 .map(|program| pipelines[&(program.entry.clone(), declaring.air_encoding)].clone())
                 .collect::<Vec<_>>();
             let pipeline = match &render_pipeline {
-                Some((formats, pipeline)) if *formats == attachment_formats => pipeline.clone(),
+                Some((formats, cached_geometry, pipeline))
+                    if *formats == attachment_formats && *cached_geometry == geometry =>
+                {
+                    pipeline.clone()
+                }
                 _ => {
                     let registered = register_render_pipeline(
                         &render_registrar,
@@ -1809,7 +1894,8 @@ fn main() -> Result<()> {
                         geometry,
                         &attachment_formats,
                     )?;
-                    render_pipeline = Some((attachment_formats.clone(), registered.clone()));
+                    render_pipeline =
+                        Some((attachment_formats.clone(), geometry, registered.clone()));
                     registered
                 }
             };
@@ -1845,7 +1931,7 @@ fn main() -> Result<()> {
                 .map_err(|error| format!("release pipeline: {error:?}"))?;
         }
     }
-    if let Some((_, pipeline)) = render_pipeline.as_ref() {
+    if let Some((_, _, pipeline)) = render_pipeline.as_ref() {
         release_render_pipeline(&render_registrar, pipeline)?;
     }
     let capture = Capture {
@@ -2108,6 +2194,9 @@ fn validate_suite(suite: &Suite) -> Result<()> {
 enum RenderGeometry {
     Milestone,
     IndexedQuad,
+    /// The reviewed instanced pair (`research/docs/23` §3.3, v31): the same
+    /// indexed quad, a second per-instance tint stream, and two instances.
+    InstancedPair,
 }
 
 /// The colour attachments a render case declares, in location order: the
@@ -2161,12 +2250,176 @@ fn render_attachment_shapes(
 fn reviewed_quad_layout() -> VertexLayout {
     VertexLayout::Buffers(vec![VertexBufferLayout {
         stride: QUAD_STRIDE,
+        step: VertexStep::PerVertex,
         attributes: vec![VertexAttribute {
             location: 0,
             offset: 0,
             format: VertexFormat::Float32x2,
         }],
     }])
+}
+
+/// The reviewed instanced layout (`research/docs/23` §3.3, v31): the same
+/// `float32x2` position stream, plus a `float32x4` tint that advances once per
+/// *instance*.
+fn reviewed_instanced_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![
+        VertexBufferLayout {
+            stride: QUAD_STRIDE,
+            step: VertexStep::PerVertex,
+            attributes: vec![VertexAttribute {
+                location: 0,
+                offset: 0,
+                format: VertexFormat::Float32x2,
+            }],
+        },
+        VertexBufferLayout {
+            stride: INSTANCED_TINT_STRIDE,
+            step: VertexStep::PerInstance,
+            attributes: vec![VertexAttribute {
+                location: 1,
+                offset: 0,
+                format: VertexFormat::Float32x4,
+            }],
+        },
+    ])
+}
+
+/// The reviewed corner bytes of the instanced fixture's position stream: the
+/// same four NDC corners the indexed quad carries, in the same order.
+const INSTANCED_POSITION_HEX: &str =
+    "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f";
+/// The first reviewed instance tint, `(1, 0, 0, 1)` as `float32x4` bytes.
+const INSTANCED_TINT_RED_HEX: &str = "0000803f00000000000000000000803f";
+/// The second reviewed instance tint, `(0, 1, 0, 1)` as `float32x4` bytes.
+const INSTANCED_TINT_GREEN_HEX: &str = "000000000000803f000000000000803f";
+/// The UNORM8 bytes those two tints store in an `rgba8_unorm` attachment. Each
+/// component is exactly `0.0` or `1.0`, so the byte mapping is exact and not a
+/// rounding question; a fixture that disagreed with the tints would fail the
+/// rails' own captures rather than pass here.
+const INSTANCED_TINT_RED_BYTES: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
+const INSTANCED_TINT_GREEN_BYTES: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
+
+/// Pin the reviewed instanced shape (`research/docs/23` §3.3, v31).
+///
+/// The pair is the whole review surface: the position stream has to be the
+/// reviewed quad corners, the second binding has to be a per-instance
+/// `float32x4` tint stream carrying exactly the red and green records, the draw
+/// has to run exactly two instances, and the index buffer has to select the
+/// reviewed quad. Anything else describes a shape no rail has been reviewed
+/// against, so it is refused before a device object exists.
+fn reviewed_instanced_geometry(
+    case: &RenderCase,
+    layout: &VertexLayoutDefinition,
+    where_: &str,
+) -> Result<RenderGeometry> {
+    if case.vertex_buffers.len() != 2 {
+        return Err(format!(
+            "{where_}: the reviewed instanced shape binds two streams and two bindings"
+        )
+        .into());
+    }
+    let position = &layout.buffers[0];
+    if position.stride != QUAD_STRIDE
+        || position.step != "per_vertex"
+        || position.attributes.len() != 1
+    {
+        return Err(format!(
+            "{where_}: the reviewed instanced position stream is one float32x2 at stride {QUAD_STRIDE}"
+        )
+        .into());
+    }
+    let attribute = &position.attributes[0];
+    if attribute.location != 0 || attribute.offset != 0 || attribute.format != "float32x2" {
+        return Err(format!(
+            "{where_}: the reviewed instanced position attribute is location 0, offset 0, float32x2"
+        )
+        .into());
+    }
+    let tint = &layout.buffers[1];
+    if tint.stride != INSTANCED_TINT_STRIDE
+        || tint.step != "per_instance"
+        || tint.attributes.len() != 1
+    {
+        return Err(format!(
+            "{where_}: the reviewed instanced tint stream is one float32x4 at stride \
+             {INSTANCED_TINT_STRIDE}, stepped per instance"
+        )
+        .into());
+    }
+    let attribute = &tint.attributes[0];
+    if attribute.location != 1 || attribute.offset != 0 || attribute.format != "float32x4" {
+        return Err(format!(
+            "{where_}: the reviewed instanced tint attribute is location 1, offset 0, float32x4"
+        )
+        .into());
+    }
+    if case.instance_count != INSTANCED_COUNT {
+        return Err(format!(
+            "{where_}: the reviewed instanced draw runs exactly {INSTANCED_COUNT} instances"
+        )
+        .into());
+    }
+    let positions = &case.vertex_buffers[0];
+    if positions.allocation == 0 || positions.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let required = QUAD_STRIDE * QUAD_VERTICES;
+    if positions.length != required || positions.initial_hex != INSTANCED_POSITION_HEX {
+        return Err(format!(
+            "{where_}: the reviewed instanced position stream is the reviewed quad corners"
+        )
+        .into());
+    }
+    let tints = &case.vertex_buffers[1];
+    if tints.allocation == 0 || tints.view == 0 {
+        return Err(format!("{where_}: zero vertex stream identity").into());
+    }
+    let expected_tints = format!("{INSTANCED_TINT_RED_HEX}{INSTANCED_TINT_GREEN_HEX}");
+    if tints.length != INSTANCED_TINT_STRIDE * INSTANCED_COUNT
+        || tints.initial_hex != expected_tints
+    {
+        return Err(format!(
+            "{where_}: the reviewed instanced tint stream is the reviewed red and green records"
+        )
+        .into());
+    }
+    let Some(indices) = &case.indices else {
+        return Err(format!("{where_}: the reviewed instanced shape is indexed").into());
+    };
+    if indices.allocation == 0 || indices.view == 0 {
+        return Err(format!("{where_}: zero index buffer identity").into());
+    }
+    let width = match indices.format.as_str() {
+        "uint16" => 2_u64,
+        "uint32" => 4,
+        other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
+    };
+    let required = QUAD_INDICES * width;
+    if indices.length != required {
+        return Err(format!(
+            "{where_}: the reviewed instanced index buffer is {QUAD_INDICES} indices wide"
+        )
+        .into());
+    }
+    let bytes = unhex(&indices.initial_hex)?;
+    let width = usize::try_from(width)?;
+    if bytes.len() != usize::try_from(indices.length)? {
+        return Err(format!("{where_}: the index bytes do not match their length").into());
+    }
+    for (position, chunk) in bytes.chunks_exact(width).enumerate() {
+        let index = match width {
+            2 => u64::from(u16::from_le_bytes([chunk[0], chunk[1]])),
+            _ => u64::from(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+        };
+        if index >= QUAD_VERTICES {
+            return Err(format!(
+                "{where_}: index {position} names vertex {index}, outside the reviewed quad"
+            )
+            .into());
+        }
+    }
+    Ok(RenderGeometry::InstancedPair)
 }
 
 /// Classify a render case's geometry and pin the reviewed shape.
@@ -2185,6 +2438,13 @@ fn render_geometry(case: &RenderCase, where_: &str) -> Result<RenderGeometry> {
         }
         return Ok(RenderGeometry::Milestone);
     };
+    // The instanced shape is the one two-stream layout this suite admits: the
+    // reviewed position stream at binding 0, the per-instance tint at binding
+    // 1, and exactly the two instances the reviewed module's `instance_id`
+    // shift was written for (`research/docs/23` §3.3, v31).
+    if layout.buffers.len() == 2 {
+        return reviewed_instanced_geometry(case, layout, where_);
+    }
     if layout.buffers.len() != 1 || case.vertex_buffers.len() != 1 {
         return Err(format!(
             "{where_}: the reviewed vertex-input shape is one stream and one binding"
@@ -2276,19 +2536,23 @@ fn render_inputs(
     if render_geometry(case, where_)? == RenderGeometry::Milestone {
         return Ok((Vec::new(), None));
     }
-    let Some(definition) = case.vertex_buffers.first() else {
-        return Err(format!("{where_}: the reviewed shape is one vertex stream").into());
-    };
-    let vertex = BufferView {
-        view_id: ViewId::new(definition.view),
-        metal_binding: 0,
-        allocation_id: AllocationId::new(definition.allocation),
-        offset: definition.offset,
-        length: definition.length,
-        access: BufferAccess::Read,
-        attribute_stride: None,
-        source: BufferSource::OwnedBytes(unhex(&definition.initial_hex)?),
-    };
+    // One pass view per bound stream, in binding order: the pass is positional
+    // exactly like the pipeline layout, so the entry's position is the
+    // `metal_binding` its view carries
+    // (`research/docs/23` §3.6, v31 for the two-stream shape).
+    let mut vertex_buffers = Vec::with_capacity(case.vertex_buffers.len());
+    for (binding, definition) in case.vertex_buffers.iter().enumerate() {
+        vertex_buffers.push(BufferView {
+            view_id: ViewId::new(definition.view),
+            metal_binding: u32::try_from(binding)?,
+            allocation_id: AllocationId::new(definition.allocation),
+            offset: definition.offset,
+            length: definition.length,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(unhex(&definition.initial_hex)?),
+        });
+    }
     let Some(indices) = &case.indices else {
         return Err(format!("{where_}: the reviewed vertex-input shape is indexed").into());
     };
@@ -2298,7 +2562,7 @@ fn render_inputs(
         other => return Err(format!("{where_}: unsupported index format {other:?}").into()),
     };
     Ok((
-        vec![vertex],
+        vertex_buffers,
         Some(IndexBufferBinding {
             view: BufferView {
                 view_id: ViewId::new(indices.view),
@@ -2363,6 +2627,20 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 .into());
             }
         }
+        RenderGeometry::InstancedPair => {
+            if case.vertices != QUAD_INDICES {
+                return Err(format!(
+                    "{where_}: the reviewed instanced pair draws {QUAD_INDICES} indices per instance"
+                )
+                .into());
+            }
+            if case.present.is_some() || case.icb.is_some() {
+                return Err(format!(
+                    "{where_}: an instanced case carries neither a present action nor an ICB"
+                )
+                .into());
+            }
+        }
     }
     if let Some(present) = &case.present {
         if present.mode != "fifo" {
@@ -2389,6 +2667,11 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     }
     let reviewed_entries = match geometry {
         RenderGeometry::Milestone => (RENDER_MSL_VERTEX_ENTRY, RENDER_MSL_FRAGMENT_ENTRY),
+        // The instanced pair is its own reviewed module
+        // (`research/docs/23` §3.3, v31): the solid fragment stages cannot
+        // stand in for it, because the tint travels through a varying the
+        // reviewed instanced vertex stage is the only one to produce.
+        RenderGeometry::InstancedPair => (INSTANCED_MSL_VERTEX_ENTRY, INSTANCED_MSL_FRAGMENT_ENTRY),
         RenderGeometry::IndexedQuad => match shapes.len() {
             // A single `r32float` attachment takes the reviewed one-component
             // MSL stage; every other single-output shape takes the
@@ -2478,6 +2761,26 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 match attachment.load.as_str() {
                     "clear" => {
                         let texel = &texels[..4];
+                        // The instanced fixture is reviewed against one 4×4
+                        // `rgba8_unorm` attachment, whose two halves are two
+                        // texel columns each (`research/docs/23` §3.3, v31):
+                        // the module's half-width shift only splits the
+                        // attachment evenly at this extent and in this channel
+                        // order.
+                        if geometry == RenderGeometry::InstancedPair {
+                            if attachment.format != "rgba8_unorm" {
+                                return Err(format!(
+                                    "{where_}: the reviewed instanced attachment is rgba8_unorm"
+                                )
+                                .into());
+                            }
+                            if attachment.width != 4 || attachment.height != 4 {
+                                return Err(format!(
+                                    "{where_}: the reviewed instanced attachment is 4x4 texels"
+                                )
+                                .into());
+                            }
+                        }
                         // A scissored pass covers a known rectangle: inside it
                         // the texels are the fragment output and outside it the
                         // clear colour, which is exactly what the comparator
@@ -2525,6 +2828,29 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                                 )
                                 .into());
                             }
+                        } else if geometry == RenderGeometry::InstancedPair {
+                            // The instanced fixture covers each half with its
+                            // own instance tint (`research/docs/23` §3.3,
+                            // v31): the left half has to be the first tint and
+                            // the right half the second, in the reviewed
+                            // order. A uniform expectation could not show the
+                            // per-instance stream stepped at all, and a swapped
+                            // pair would read as "the rails agreed on the wrong
+                            // halves".
+                            for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                let column = index as u64 % attachment.width;
+                                let expected_chunk = if column < attachment.width / 2 {
+                                    INSTANCED_TINT_RED_BYTES
+                                } else {
+                                    INSTANCED_TINT_GREEN_BYTES
+                                };
+                                if chunk != expected_chunk {
+                                    return Err(format!(
+                                        "{where_}: texel {index} has to carry the instance tint of its half"
+                                    )
+                                    .into());
+                                }
+                            }
                         } else if !uniform_texel {
                             return Err(format!(
                                 "{where_}: every texel of a cleared attachment has to be the fragment output"
@@ -2549,6 +2875,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         if clear == texel {
                             return Err(format!(
                                 "{where_}: the clear colour equals the expected texel"
+                            )
+                            .into());
+                        }
+                        if geometry == RenderGeometry::InstancedPair
+                            && clear == INSTANCED_TINT_GREEN_BYTES
+                        {
+                            return Err(format!(
+                                "{where_}: the clear colour equals the second instance tint"
                             )
                             .into());
                         }
@@ -4103,6 +4437,10 @@ fn run_render_case(
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,
+        // The reviewed instanced case carries two; every pre-v31 case leaves
+        // the field at its single-instance default
+        // (`research/docs/23` §3.3, v31).
+        instance_count: u32::try_from(case.instance_count)?,
         present,
     }));
 

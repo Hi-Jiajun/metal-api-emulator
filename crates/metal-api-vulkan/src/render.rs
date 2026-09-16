@@ -33,7 +33,7 @@ use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, ClearColor, FieldValue, IndexFormat,
     IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
     RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp, VertexBufferLayout,
-    VertexFormat,
+    VertexFormat, VertexStep,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -116,6 +116,50 @@ const SOLID_UNORM8_QUAD_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm
 const SOLID_UNORM8_TRIPLE_FRAG_SPV: &[u8] =
     include_bytes!("render_spv/solid_unorm8_triple.frag.spv");
 
+/// The reviewed instanced fixture's vertex stage (`research/docs/23` §3.3,
+/// v31).
+///
+/// The module reads the caller-held quad positions at `Location 0`, the
+/// per-instance tint at `Location 1`, shifts each instance's copy by half the
+/// viewport with the `InstanceIndex` builtin, and forwards the tint to the
+/// fragment stage. The rail pairs it with [`INSTANCED_TINT_FRAG_SPV`] and
+/// nothing else, exactly as it pairs the format list with its own solid
+/// fragment module.
+const INSTANCED_VERTEX_SPV: &[u8] = include_bytes!("render_spv/instanced_quad.vert.spv");
+/// Entry point [`INSTANCED_VERTEX_SPV`] declares.
+const INSTANCED_VERTEX_ENTRY: &str = "instanced_quad_main";
+/// The reviewed fragment stage of the instanced fixture: the vertex stage's
+/// forwarded tint, stored to `Location 0` of the single 8-bit attachment.
+const INSTANCED_TINT_FRAG_SPV: &[u8] = include_bytes!("render_spv/instanced_tint.frag.spv");
+/// Entry point [`INSTANCED_TINT_FRAG_SPV`] declares.
+const INSTANCED_TINT_FRAGMENT_ENTRY: &str = "instanced_tint_main";
+
+/// The fragment stage this rail owns for one request's vertex stage.
+///
+/// `None` means the request's vertex stage is not the reviewed instanced
+/// module, so the fragment half stays the format list's solid module. The
+/// instanced pair is reviewed for the single 8-bit UNORM attachment the
+/// fixture draws into; any other format list is refused rather than rendered
+/// with a store the review never covered.
+fn instanced_fragment_stage(
+    vertex_entry: &str,
+    vertex_spirv: &[u8],
+    formats: &[AttachmentFormat],
+) -> Result<Option<(&'static [u8], &'static str)>, ProviderError> {
+    if vertex_entry != INSTANCED_VERTEX_ENTRY || vertex_spirv != INSTANCED_VERTEX_SPV {
+        return Ok(None);
+    }
+    match formats {
+        [AttachmentFormat::Rgba8Unorm] | [AttachmentFormat::Bgra8Unorm] => Ok(Some((
+            INSTANCED_TINT_FRAG_SPV,
+            INSTANCED_TINT_FRAGMENT_ENTRY,
+        ))),
+        _ => Err(capability_refusal("render_instanced_format_unsupported")
+            .with_field("attachments", FieldValue::Unsigned(formats.len() as u64))
+            .with_detail("the reviewed instanced module draws into one 8-bit UNORM attachment")),
+    }
+}
+
 /// The solid fragment module the offscreen rail builds for a format list.
 ///
 /// The match is exhaustive over [`AttachmentFormat`] and has no default arm: a
@@ -189,6 +233,9 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// The pass's scissor rectangle, or `None` for the whole render area
     /// (`research/docs/23` §3.3, v29).
     pub scissor: Option<[u32; 4]>,
+    /// Instances the draw runs (`research/docs/23` §3.3, v31): the second count
+    /// of `vkCmdDraw`/`vkCmdDrawIndexed`. `1` for every pre-v31 pass.
+    pub instance_count: u32,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -388,9 +435,23 @@ impl RenderStages {
 /// once, and execution re-asks it of the value it was handed, so a
 /// directly-constructed [`RenderStages`] cannot skip the registration gate.
 fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
-    stages.contract.fragment_entry == SOLID_FRAGMENT_ENTRY
-        && solid_fragment_spirv(&stages.contract.color_formats)
-            .is_ok_and(|module| module == stages.fragment_spirv.as_slice())
+    // The instanced fixture owns a second reviewed pair
+    // (`research/docs/23` §3.3, v31): the vertex module that forwards a
+    // per-instance tint selects the tint-storing fragment module, and every
+    // other vertex stage keeps the format list's solid module.
+    let stage = match instanced_fragment_stage(
+        &stages.contract.vertex_entry,
+        &stages.vertex_spirv,
+        &stages.contract.color_formats,
+    ) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => match solid_fragment_spirv(&stages.contract.color_formats) {
+            Ok(module) => (module, SOLID_FRAGMENT_ENTRY),
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    stages.contract.fragment_entry == stage.1 && stages.fragment_spirv.as_slice() == stage.0
 }
 
 /// The refusal for a fragment stage that is not the reviewed module of the
@@ -563,6 +624,31 @@ fn prepare_render_request<'a>(
     // own bytes, so the rail proves the footprint the draw reads and refuses
     // anything the reviewed shape does not cover.
     let streams = resolve_vertex_streams(stages, pass)?;
+    // A per-instance stream's record count is the draw's instance count, so its
+    // footprint is proved against that count instead of the vertex span
+    // (`research/docs/23` §3.3, v31).
+    for (index, stream) in streams.iter().enumerate() {
+        if stream.layout.step != VertexStep::PerInstance {
+            continue;
+        }
+        let required = u64::from(pass.instance_count)
+            .checked_mul(stream.layout.stride)
+            .ok_or_else(|| contract_refusal("vertex buffer footprint overflows u64"))?;
+        if stream.view.length < required {
+            return Err(
+                capability_refusal("render_vertex_buffer_footprint_unsupported")
+                    .with_field("binding", FieldValue::Unsigned(index as u64))
+                    .with_field("step", FieldValue::Text("per_instance".to_owned()))
+                    .with_field(
+                        "instance_count",
+                        FieldValue::Unsigned(u64::from(pass.instance_count)),
+                    )
+                    .with_field("required_bytes", FieldValue::Unsigned(required))
+                    .with_field("declared_bytes", FieldValue::Unsigned(stream.view.length))
+                    .with_detail("a per-instance stream has to cover one record per instance"),
+            );
+        }
+    }
     let (draw, index_stream) = match &pass.indices {
         Some(indices) => {
             let view = &indices.view;
@@ -585,6 +671,11 @@ fn prepare_render_request<'a>(
             }
             let index_values = decode_indices(view, indices.format, pass.vertices)?;
             for stream in &streams {
+                // A per-instance stream is proved against the instance count,
+                // not the index span (`research/docs/23` §3.3, v31).
+                if stream.layout.step == VertexStep::PerInstance {
+                    continue;
+                }
                 let vertex_capacity = stream.view.length / stream.layout.stride;
                 if let Some(index) = index_values
                     .iter()
@@ -614,6 +705,9 @@ fn prepare_render_request<'a>(
         }
         None => {
             for stream in &streams {
+                if stream.layout.step == VertexStep::PerInstance {
+                    continue;
+                }
                 let required = u64::from(pass.vertices)
                     .checked_mul(stream.layout.stride)
                     .ok_or_else(|| contract_refusal("vertex buffer footprint overflows u64"))?;
@@ -647,6 +741,7 @@ fn prepare_render_request<'a>(
     let request = OffscreenRenderRequest {
         attachments,
         scissor: pass.scissor,
+        instance_count: pass.instance_count,
         extent,
         vertex: OffscreenVertexStage {
             entry: &stages.contract.vertex_entry,
@@ -1013,7 +1108,15 @@ pub(crate) fn execute_offscreen_render(
     // carries no fragment module, so this is the only place one is named and
     // there is no pairing left to get wrong. The refusal covers the
     // dual-combination and count shapes before any device call.
-    let fragment_spirv = solid_fragment_spirv(&formats)?;
+    // The instanced fixture is the one exception (`research/docs/23` §3.3,
+    // v31): its reviewed vertex module selects the tint-storing fragment
+    // module, and every other vertex stage keeps the format list's solid
+    // module.
+    let (fragment_spirv, fragment_entry_name) =
+        match instanced_fragment_stage(request.vertex.entry, request.vertex.spirv, &formats)? {
+            Some(pair) => pair,
+            None => (solid_fragment_spirv(&formats)?, SOLID_FRAGMENT_ENTRY),
+        };
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
         .iter()
@@ -1078,7 +1181,7 @@ pub(crate) fn execute_offscreen_render(
     let fragment_words = spirv_words(fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
     let vertex_entry = stage_entry_cstring("vertex", request.vertex.entry)?;
-    let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
+    let fragment_entry = stage_entry_cstring("fragment", fragment_entry_name)?;
 
     let mut objects = OffscreenObjects::new(context);
     for (attachment, vk_format) in request.attachments.iter().zip(&vk_formats) {
@@ -1110,6 +1213,7 @@ pub(crate) fn execute_offscreen_render(
     }
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
+    objects.instance_count = request.instance_count;
     for (index, attachment) in request.attachments.iter().enumerate() {
         if let Some(previous) = attachment.previous {
             objects.create_previous_bytes(index, previous)?;
@@ -1580,6 +1684,7 @@ pub(crate) fn execute_present_render(
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
     objects.draw = request.draw;
+    objects.instance_count = request.instance_count;
     objects.create_command_pool(queue_index)?;
     objects.record(std::slice::from_ref(attachment), None, width, height)?;
     objects.submit_and_wait(queue_index)?;
@@ -1669,6 +1774,9 @@ struct OffscreenObjects<'a> {
     /// How the draw issues: the milestone triangle, a vertex-buffer draw or an
     /// indexed one. An indirect replay replaces it.
     draw: DrawShape,
+    /// Instances a direct draw runs (`research/docs/23` §3.3, v31); `1` for
+    /// every pre-v31 pass.
+    instance_count: u32,
     /// Index width of the caller-held index buffer.
     input_index_type: vk::IndexType,
     command_pool: vk::CommandPool,
@@ -1729,6 +1837,7 @@ impl<'a> OffscreenObjects<'a> {
             input_index_buffer: vk::Buffer::null(),
             input_index_memory: vk::DeviceMemory::null(),
             draw: DrawShape::Milestone,
+            instance_count: 1,
             input_index_type: vk::IndexType::UINT16,
             command_pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
@@ -2012,7 +2121,13 @@ impl<'a> OffscreenObjects<'a> {
                         u32::try_from(stream.layout.stride)
                             .map_err(|_| contract_refusal("vertex stride exceeds u32"))?,
                     )
-                    .input_rate(vk::VertexInputRate::VERTEX),
+                    // The binding's own step (`research/docs/23` §3.3, v31):
+                    // Vulkan core's instance rate advances one record per
+                    // instance, which is exactly the contract's fixed rate.
+                    .input_rate(match stream.layout.step {
+                        VertexStep::PerVertex => vk::VertexInputRate::VERTEX,
+                        VertexStep::PerInstance => vk::VertexInputRate::INSTANCE,
+                    }),
             );
             for attribute in &stream.layout.attributes {
                 attribute_descriptions.push(
@@ -2667,14 +2782,23 @@ impl<'a> OffscreenObjects<'a> {
                             0,
                             self.input_index_type,
                         );
-                        self.context
-                            .device
-                            .cmd_draw_indexed(self.command, index_count, 1, 0, 0, 0);
+                        self.context.device.cmd_draw_indexed(
+                            self.command,
+                            index_count,
+                            self.instance_count,
+                            0,
+                            0,
+                            0,
+                        );
                     }
                     DrawShape::Vertices { vertex_count } => {
-                        self.context
-                            .device
-                            .cmd_draw(self.command, vertex_count, 1, 0, 0);
+                        self.context.device.cmd_draw(
+                            self.command,
+                            vertex_count,
+                            self.instance_count,
+                            0,
+                            0,
+                        );
                     }
                     // The milestone shape binds no stream, and an indirect
                     // replay is a separate arm below.
@@ -2703,9 +2827,17 @@ impl<'a> OffscreenObjects<'a> {
                     std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
             } else if self.indirect_buffer == vk::Buffer::null() {
-                self.context
-                    .device
-                    .cmd_draw(self.command, FULL_SCREEN_TRIANGLE_VERTICES, 1, 0, 0);
+                // The `vertex_id` shape instances the same way the
+                // vertex-buffer arms do (`research/docs/23` §3.3, v31): the
+                // reviewed triangle is replayed once per instance, so a pass
+                // that asks for more than one keeps its own count here too.
+                self.context.device.cmd_draw(
+                    self.command,
+                    FULL_SCREEN_TRIANGLE_VERTICES,
+                    self.instance_count,
+                    0,
+                    0,
+                );
             } else {
                 // The indirect replay reads its counts from the buffer the CPU
                 // encoded above; `stride` is the struct size because the first
@@ -3269,6 +3401,7 @@ mod tests {
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         }
     }
@@ -3397,6 +3530,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                instance_count: 1,
                 index_stream: None,
                 indirect: None,
             },
@@ -3679,6 +3813,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            instance_count: 1,
             index_stream: None,
             indirect: None,
         };
@@ -3739,6 +3874,7 @@ mod tests {
                     vertex: single_pixel_vertex(),
                     vertex_streams: Vec::new(),
                     draw: DrawShape::Milestone,
+                    instance_count: 1,
                     index_stream: None,
                     indirect: None,
                 },
@@ -3876,6 +4012,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            instance_count: 1,
             index_stream: None,
             indirect: None,
         };
@@ -4003,6 +4140,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                instance_count: 1,
                 index_stream: None,
                 indirect: None,
             },
@@ -4064,6 +4202,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                instance_count: 1,
                 index_stream: None,
                 indirect: None,
             },
@@ -4122,6 +4261,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                instance_count: 1,
                 index_stream: None,
                 indirect: None,
             },
@@ -4158,6 +4298,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            instance_count: 1,
             index_stream: None,
             indirect: None,
         };
@@ -4197,6 +4338,7 @@ mod tests {
             vertex: milestone_vertex(),
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
+            instance_count: 1,
             index_stream: None,
             indirect: None,
         };
@@ -4329,6 +4471,7 @@ mod tests {
                 vertex: milestone_vertex(),
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
+                instance_count: 1,
                 index_stream: None,
                 indirect: None,
             },

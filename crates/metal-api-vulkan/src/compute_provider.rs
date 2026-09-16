@@ -2296,6 +2296,7 @@ mod tests {
             vertices: 3,
             vertex_buffers: Vec::new(),
             indices: None,
+            instance_count: 1,
             present: None,
         }
     }

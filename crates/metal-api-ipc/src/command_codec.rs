@@ -24,7 +24,7 @@ use metal_api_core::provider::{
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
     SemanticDigest, ShaderSource, StagedLease, StorageMode, StoreOp, SubmissionId, TextureAccess,
     TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, ViewId, MAX_COLOR_ATTACHMENTS,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, MAX_COLOR_ATTACHMENTS,
     MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
@@ -133,15 +133,33 @@ const RENDER_FEATURE_PRESENT: u8 = 0x02;
 /// The scissor block (`research/docs/23` §3.3, v29): four `u32`s
 /// `[x, y, width, height]` after the base payload.
 const RENDER_FEATURE_SCISSOR: u8 = 0x04;
+/// The instancing tail (`research/docs/23` §3.3, v31): one `u32` instance count
+/// after every earlier optional section. A pass that draws one instance — the
+/// only shape published before v31 — never sets the bit, so its bytes stay
+/// exactly what they were, and the decoder reads the missing section as the
+/// single instance the older frames meant.
+const RENDER_FEATURE_INSTANCING: u8 = 0x08;
 /// Every bit this version knows. An unknown bit is a decoder refusal rather
 /// than a silently skipped section.
-const RENDER_FEATURE_KNOWN: u8 =
-    RENDER_FEATURE_VERTEX_INPUT | RENDER_FEATURE_PRESENT | RENDER_FEATURE_SCISSOR;
+const RENDER_FEATURE_KNOWN: u8 = RENDER_FEATURE_VERTEX_INPUT
+    | RENDER_FEATURE_PRESENT
+    | RENDER_FEATURE_SCISSOR
+    | RENDER_FEATURE_INSTANCING;
 
 /// Pipeline vertex-layout discriminators. `None` keeps the single byte the
 /// pre-vertex pipeline payload wrote; `Buffers` appends the layout block.
 const VERTEX_LAYOUT_NONE: u8 = 0x00;
 const VERTEX_LAYOUT_BUFFERS: u8 = 0x01;
+/// A [`VertexLayout::Buffers`] list whose bindings carry their own step
+/// function (`research/docs/23` §3.3, v31).
+///
+/// The discriminator is a *second* layout tag rather than an extra byte inside
+/// the existing one: a layout whose bindings all step per vertex is what every
+/// pre-v31 frame wrote, so it keeps `VERTEX_LAYOUT_BUFFERS` and its exact
+/// bytes, and only a layout that declares a per-instance stream takes this tag.
+/// A decoder that predates it answers [`CodecError::UnknownEnumValue`] instead
+/// of reading the step byte as a stride.
+const VERTEX_LAYOUT_BUFFERS_STEPPED: u8 = 0x02;
 
 /// Pipeline-table discriminator inside the tagged trace layout.
 ///
@@ -206,6 +224,16 @@ pub const MAX_SUPPORTED_INDEX_FORMATS: usize = 4;
 /// after the heap/ICB half (`research/docs/23` §3.3). A tag rather than a bare
 /// field keeps a future third section from being read as this one.
 const CAPABILITY_VERTEX_INPUT_TAIL: u8 = 0x01;
+
+/// Presence tag of the capability tail's instancing block
+/// (`research/docs/23` §3.3, v31).
+///
+/// The block follows the vertex-input block when the snapshot declares either
+/// instancing bit, and carries the bit plus the snapshot's instance ceiling. It
+/// is a separate tagged section for the same reason the vertex-input block is:
+/// a snapshot that declares instancing but no vertex input still keeps the
+/// decoder's position rules unambiguous.
+const CAPABILITY_INSTANCING_TAIL: u8 = 0x02;
 
 /// Maximum number of bytes one present target's sentinel may carry.
 ///
@@ -1319,7 +1347,17 @@ fn put_vertex_layout(encoder: &mut Encoder, layout: &VertexLayout) -> Result<(),
                     maximum: MAX_VERTEX_BUFFERS,
                 });
             }
-            encoder.u8(VERTEX_LAYOUT_BUFFERS);
+            // Only a layout that declares a per-instance binding takes the
+            // stepped tag; every all-per-vertex layout keeps the pre-v31 bytes
+            // (`research/docs/23` §3.3, v31).
+            let stepped = buffers
+                .iter()
+                .any(|buffer| buffer.step != VertexStep::PerVertex);
+            encoder.u8(if stepped {
+                VERTEX_LAYOUT_BUFFERS_STEPPED
+            } else {
+                VERTEX_LAYOUT_BUFFERS
+            });
             encoder.u64(buffers.len() as u64);
             for buffer in buffers {
                 if buffer.attributes.len() > MAX_VERTEX_ATTRIBUTES {
@@ -1329,6 +1367,9 @@ fn put_vertex_layout(encoder: &mut Encoder, layout: &VertexLayout) -> Result<(),
                     });
                 }
                 encoder.u64(buffer.stride);
+                if stepped {
+                    encoder.u8(buffer.step.code());
+                }
                 encoder.u64(buffer.attributes.len() as u64);
                 for attribute in &buffer.attributes {
                     encoder.u32(attribute.location);
@@ -1404,11 +1445,23 @@ fn get_render_pipeline_contract(
 fn get_vertex_layout(decoder: &mut Decoder<'_>) -> Result<VertexLayout, CodecError> {
     match decoder.u8()? {
         VERTEX_LAYOUT_NONE => Ok(VertexLayout::None),
-        VERTEX_LAYOUT_BUFFERS => {
+        kind @ (VERTEX_LAYOUT_BUFFERS | VERTEX_LAYOUT_BUFFERS_STEPPED) => {
+            // The stepped tag adds one step byte per binding and leaves every
+            // other field in place (`research/docs/23` §3.3, v31).
+            let stepped = kind == VERTEX_LAYOUT_BUFFERS_STEPPED;
             let count = bounded_vertex_buffer_count(decoder.u64()?)?;
             let mut buffers = Vec::with_capacity(count);
             for _ in 0..count {
                 let stride = decoder.u64()?;
+                let step = if stepped {
+                    let code = decoder.u8()?;
+                    VertexStep::from_code(code).ok_or(CodecError::UnknownEnumValue {
+                        field: "vertex step",
+                        value: code,
+                    })?
+                } else {
+                    VertexStep::PerVertex
+                };
                 let attribute_count = bounded_vertex_attribute_count(decoder.u64()?)?;
                 let mut attributes = Vec::with_capacity(attribute_count);
                 for _ in 0..attribute_count {
@@ -1421,7 +1474,11 @@ fn get_vertex_layout(decoder: &mut Decoder<'_>) -> Result<VertexLayout, CodecErr
                         format,
                     });
                 }
-                buffers.push(VertexBufferLayout { stride, attributes });
+                buffers.push(VertexBufferLayout {
+                    stride,
+                    step,
+                    attributes,
+                });
             }
             Ok(VertexLayout::Buffers(buffers))
         }
@@ -1843,7 +1900,12 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                 // (`docs/23` §3.3). Its present half travels as a feature bit,
                 // so the pair stays orthogonal.
                 let has_vertex_input = !pass.vertex_buffers.is_empty() || pass.indices.is_some();
-                if has_vertex_input || pass.scissor.is_some() {
+                // The instancing tail follows the same rule (`docs/23` §3.3,
+                // v31): a single-instance pass is the shape every earlier
+                // increment wrote, so only a multi-instance draw takes the
+                // extended kind and appends its own count.
+                let has_instancing = pass.instance_count != 1;
+                if has_vertex_input || pass.scissor.is_some() || has_instancing {
                     encoder.u8(PASS_KIND_RENDER_EXT);
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -1855,6 +1917,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if pass.scissor.is_some() {
                         features |= RENDER_FEATURE_SCISSOR;
+                    }
+                    if has_instancing {
+                        features |= RENDER_FEATURE_INSTANCING;
                     }
                     encoder.u8(features);
                     put_render_pass(encoder, pass, false)?;
@@ -1868,6 +1933,9 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         for dimension in [x, y, width, height] {
                             encoder.u32(dimension);
                         }
+                    }
+                    if has_instancing {
+                        encoder.u32(pass.instance_count);
                     }
                     continue;
                 }
@@ -2252,6 +2320,9 @@ fn get_trace_tagged(
                         decoder.u32()?,
                     ]);
                 }
+                if features & RENDER_FEATURE_INSTANCING != 0 {
+                    pass.instance_count = decoder.u32()?;
+                }
                 TracePass::Render(pass)
             }
             tag => return Err(CodecError::UnknownPassTag(tag)),
@@ -2343,6 +2414,10 @@ fn get_render_pass(
         vertices,
         vertex_buffers: Vec::new(),
         indices: None,
+        // The single instance every pre-v31 frame drew. A frame that carries
+        // the instancing feature bit overwrites this after the optional
+        // sections are read (`research/docs/23` §3.3, v31).
+        instance_count: 1,
         present,
     })
 }
@@ -3134,6 +3209,7 @@ fn put_capabilities(
     if capabilities.declares_heap_support()
         || capabilities.declares_icb_support()
         || capabilities.declares_vertex_input_support()
+        || capabilities.declares_instancing_support()
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -3183,6 +3259,14 @@ fn put_capabilities(
             for format in &capabilities.supported_index_formats {
                 encoder.u8(format.code());
             }
+        }
+        // The instancing block is the tail's newest section and follows the
+        // vertex-input half when the snapshot declares either of its two bits
+        // (`research/docs/23` §3.3, v31).
+        if capabilities.declares_instancing_support() {
+            encoder.u8(CAPABILITY_INSTANCING_TAIL);
+            encoder.bool(capabilities.supports_render_instancing);
+            encoder.u32(capabilities.max_render_instances);
         }
     }
     Ok(())
@@ -3255,6 +3339,12 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         max_vertex_buffers: 0,
         supported_vertex_formats: Vec::new(),
         supported_index_formats: Vec::new(),
+        // A legacy payload cannot have declared instancing either: both bits
+        // take the "cannot instance" defaults, so a legacy provider is refused
+        // a multi-instance pass instead of executing it once
+        // (`research/docs/23` §3.3, v31).
+        supports_render_instancing: false,
+        max_render_instances: 0,
         // A legacy payload cannot have declared presentation, so the present
         // bits take the same "cannot present" defaults the render bits take
         // here (`docs/24` §4.2): a decoder that predates the present tag reads
@@ -3367,48 +3457,61 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         supported_indirect_commands.push(kind);
     }
     capabilities.supported_indirect_commands = supported_indirect_commands;
-    // The vertex-input block is the tail's last optional section
-    // (`research/docs/23` §3.3). Its presence tag is what keeps a future third
-    // section from being read as this one.
+    // The vertex-input block and the instancing block are the tail's two
+    // optional sections (`research/docs/23` §3.3, v31): each is read only when
+    // bytes remain, and each carries its own tag, so a snapshot that declares
+    // instancing without vertex input writes the second tag directly and one
+    // that declares neither keeps the shorter frame.
     if decoder.remaining() == 0 {
         return Ok(capabilities);
     }
     let tag = decoder.u8()?;
-    if tag != CAPABILITY_VERTEX_INPUT_TAIL {
+    if tag == CAPABILITY_VERTEX_INPUT_TAIL {
+        capabilities.max_vertex_buffers = decoder.u32()?;
+        let vertex_format_count = usize::try_from(decoder.u64()?).map_err(|_| {
+            CodecError::SupportedVertexFormatCount {
+                count: usize::MAX,
+                maximum: MAX_SUPPORTED_VERTEX_FORMATS,
+            }
+        })?;
+        if vertex_format_count > MAX_SUPPORTED_VERTEX_FORMATS {
+            return Err(CodecError::SupportedVertexFormatCount {
+                count: vertex_format_count,
+                maximum: MAX_SUPPORTED_VERTEX_FORMATS,
+            });
+        }
+        let mut supported_vertex_formats = Vec::with_capacity(vertex_format_count);
+        for _ in 0..vertex_format_count {
+            supported_vertex_formats.push(get_vertex_format(decoder)?);
+        }
+        capabilities.supported_vertex_formats = supported_vertex_formats;
+        let index_format_count =
+            usize::try_from(decoder.u64()?).map_err(|_| CodecError::SupportedIndexFormatCount {
+                count: usize::MAX,
+                maximum: MAX_SUPPORTED_INDEX_FORMATS,
+            })?;
+        if index_format_count > MAX_SUPPORTED_INDEX_FORMATS {
+            return Err(CodecError::SupportedIndexFormatCount {
+                count: index_format_count,
+                maximum: MAX_SUPPORTED_INDEX_FORMATS,
+            });
+        }
+        let mut supported_index_formats = Vec::with_capacity(index_format_count);
+        for _ in 0..index_format_count {
+            supported_index_formats.push(get_index_format(decoder)?);
+        }
+        capabilities.supported_index_formats = supported_index_formats;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        let tag = decoder.u8()?;
+        if tag != CAPABILITY_INSTANCING_TAIL {
+            return Err(CodecError::UnknownCapabilityTail(tag));
+        }
+    } else if tag != CAPABILITY_INSTANCING_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.max_vertex_buffers = decoder.u32()?;
-    let vertex_format_count =
-        usize::try_from(decoder.u64()?).map_err(|_| CodecError::SupportedVertexFormatCount {
-            count: usize::MAX,
-            maximum: MAX_SUPPORTED_VERTEX_FORMATS,
-        })?;
-    if vertex_format_count > MAX_SUPPORTED_VERTEX_FORMATS {
-        return Err(CodecError::SupportedVertexFormatCount {
-            count: vertex_format_count,
-            maximum: MAX_SUPPORTED_VERTEX_FORMATS,
-        });
-    }
-    let mut supported_vertex_formats = Vec::with_capacity(vertex_format_count);
-    for _ in 0..vertex_format_count {
-        supported_vertex_formats.push(get_vertex_format(decoder)?);
-    }
-    capabilities.supported_vertex_formats = supported_vertex_formats;
-    let index_format_count =
-        usize::try_from(decoder.u64()?).map_err(|_| CodecError::SupportedIndexFormatCount {
-            count: usize::MAX,
-            maximum: MAX_SUPPORTED_INDEX_FORMATS,
-        })?;
-    if index_format_count > MAX_SUPPORTED_INDEX_FORMATS {
-        return Err(CodecError::SupportedIndexFormatCount {
-            count: index_format_count,
-            maximum: MAX_SUPPORTED_INDEX_FORMATS,
-        });
-    }
-    let mut supported_index_formats = Vec::with_capacity(index_format_count);
-    for _ in 0..index_format_count {
-        supported_index_formats.push(get_index_format(decoder)?);
-    }
-    capabilities.supported_index_formats = supported_index_formats;
+    capabilities.supports_render_instancing = decoder.bool()?;
+    capabilities.max_render_instances = decoder.u32()?;
     Ok(capabilities)
 }

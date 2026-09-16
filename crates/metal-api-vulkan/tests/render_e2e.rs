@@ -171,6 +171,7 @@ fn render_pass(
         vertices: 3,
         vertex_buffers: Vec::new(),
         indices: None,
+        instance_count: 1,
         present: None,
     }
 }
@@ -586,6 +587,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 vertices: 3,
                 vertex_buffers: Vec::new(),
                 indices: None,
+                instance_count: 1,
                 present: None,
             }),
         ],
@@ -769,6 +771,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 vertices: 3,
                 vertex_buffers: Vec::new(),
                 indices: None,
+                instance_count: 1,
                 present: None,
             }),
         ],
@@ -1506,6 +1509,7 @@ fn quad_index_bytes() -> Vec<u8> {
 fn quad_layout() -> VertexLayout {
     VertexLayout::Buffers(vec![VertexBufferLayout {
         stride: 8,
+        step: metal_api_core::provider::VertexStep::PerVertex,
         attributes: vec![VertexAttribute {
             location: 0,
             offset: 0,
