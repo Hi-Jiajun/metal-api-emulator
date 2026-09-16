@@ -1274,6 +1274,14 @@ struct RenderCase {
     /// Lavapipe device reports.
     #[serde(default)]
     depth_resolve: Option<DepthResolveDefinition>,
+    /// The device gate one depth-resolve case may state (`research/docs/23`
+    /// §3.3, v57d): the case appears in a capture if and only if the device
+    /// capability mask carries the named filter's bit. The marker still
+    /// decides which rails own the case; the gate is the device-side half of
+    /// the same question, so a rail whose device lacks the filter skips the
+    /// case instead of running (and refusing) it.
+    #[serde(default)]
+    requires_depth_resolve_filter: Option<String>,
     /// The culling state the pass draws with (`research/docs/23` §3.3, v39),
     /// or absent for "keep every triangle".
     #[serde(default)]
@@ -1881,6 +1889,10 @@ struct Capture {
     suite_sha256: String,
     backend: &'static str,
     allocation_observation: &'static str,
+    /// The device's depth resolve capability mask (`research/docs/23` §3.3,
+    /// v57d): the same bitmask the provider snapshots, bit `i` = filter code
+    /// `i`. The comparator reads the device-gated cases' presence against it.
+    depth_resolve_modes: u32,
     device: String,
     platform: String,
     results: Vec<CaseResult>,
@@ -2244,6 +2256,26 @@ fn main() -> Result<()> {
         {
             continue;
         }
+        // The device gate (`research/docs/23` §3.3, v57d): a case that
+        // requires a depth resolve filter appears in the capture if and only
+        // if the device's capability mask carries that filter's bit. The skip
+        // is the case-level gate — the marker already decided this rail owns
+        // the case, and the device now decides whether it can run it. A rail
+        // whose device lacks the bit omits the result; admission would refuse
+        // the resolve otherwise, and the comparator pins the presence-iff-bit
+        // rule against this observation.
+        if let Some(filter) = &case.requires_depth_resolve_filter {
+            let bit = 1u32
+                << u32::from(match filter.as_str() {
+                    "min" => DepthResolveFilter::Min.code(),
+                    "max" => DepthResolveFilter::Max.code(),
+                    _ => unreachable!("validate_render_case held the gate to min/max"),
+                });
+            if provider.capabilities().depth_resolve_modes & bit == 0 {
+                println!("render case skipped: {} (device lacks {})", case.id, filter);
+                continue;
+            }
+        }
         let declaring = suite
             .cases
             .iter()
@@ -2356,6 +2388,7 @@ fn main() -> Result<()> {
         suite_sha256: identity,
         backend: backend.report_name(api),
         allocation_observation: "host-writeback-landing",
+        depth_resolve_modes: provider.capabilities().depth_resolve_modes,
         device: device_name,
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         results,
@@ -2445,6 +2478,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v28") => &[
             "render_declaring_quad_extent",
             "render_declaring_depth_store",
+            "render_declaring_depth_resolve",
             "render_declaring_stencil_store",
         ],
         _ => return Err("unsupported suite identity/version".into()),
@@ -2909,6 +2943,27 @@ const DEPTH_PAIR_POSITIONS_HEX: [&str; 6] = [
 const DEPTH_PAIR_RED_HEX: &str = "0000803f00000000000000000000803f";
 const DEPTH_PAIR_GREEN_HEX: &str = "000000000000803f000000000000803f";
 
+/// The reviewed device-gated depth-resolve stream (`research/docs/23` §3.3,
+/// v57d): the same `depth32float` pair module over a *different* near
+/// triangle, so the Min and Max reductions of the stored four-sample texels
+/// disagree. The near triangle covers `x <= 0.25` NDC — the v51 edge shape,
+/// which leaves the third texel column half covered — and the far triangle
+/// covers the whole viewport; both carry the red tint, so the colour
+/// observation stays uniform and the two landings differ only in the depth
+/// resolve's own reduction.
+const DEPTH_RESOLVE_EDGE_POSITIONS_HEX: [&str; 6] = [
+    // The half-plane triangle (0.25, -1), (0.25, 3), (-3, -1) at z = 0.5:
+    // its vertical right edge sits at x = 0.25 NDC, the v51 edge fixture's own
+    // boundary, and its hypotenuse stays left of the viewport.
+    "0000803e000080bf0000003f",
+    "0000803e000040400000003f",
+    "000040c0000080bf0000003f",
+    // The oversize full-screen triangle at z = 0.9.
+    "000080bf000080bf6666663f",
+    "00004040000080bf6666663f",
+    "000080bf000040406666663f",
+];
+
 /// The reviewed stream, reassembled vertex by vertex: each vertex is its
 /// `float32x3` position at offset 0, the four padding bytes that align the tint
 /// to offset 16, and the triangle's `float32x4` tint there — the exact offsets
@@ -2923,6 +2978,20 @@ fn reviewed_depth_stream_hex() -> String {
         } else {
             DEPTH_PAIR_GREEN_HEX
         });
+    }
+    expected
+}
+
+/// The device-gated pair stream, reassembled the same way: the near
+/// half-plane triangle and the far full-screen one both carry the red tint,
+/// because the gate's whole point is that the two filters disagree about the
+/// *depth* reduction while every colour texel stays the one uniform output.
+fn reviewed_depth_resolve_edge_stream_hex() -> String {
+    let mut expected = String::new();
+    for position in DEPTH_RESOLVE_EDGE_POSITIONS_HEX {
+        expected.push_str(position);
+        expected.push_str("00000000");
+        expected.push_str(DEPTH_PAIR_RED_HEX);
     }
     expected
 }
@@ -3416,7 +3485,26 @@ fn reviewed_depth_geometry(
     }
     // The position and tint bytes share each vertex, so the expectation is
     // reassembled from the reviewed pieces rather than read off one constant.
-    if buffer.initial_hex != reviewed_depth_stream_hex() {
+    // The device-gated pair (`research/docs/23` §3.3, v57d) is the second
+    // reviewed stream: it is admitted only beside a Min or Max resolve, because
+    // the edge shape exists to make those two reductions disagree — a
+    // full-coverage pair cannot, and Sample0 leaves the review surface as the
+    // pre-v57d fixture.
+    if buffer.initial_hex == reviewed_depth_resolve_edge_stream_hex() {
+        match case
+            .depth_resolve
+            .as_ref()
+            .map(|resolve| resolve.filter.as_str())
+        {
+            Some("min" | "max") => {}
+            _ => {
+                return Err(format!(
+                    "{where_}: the edge depth stream is the min/max device-gated shape"
+                )
+                .into())
+            }
+        }
+    } else if buffer.initial_hex != reviewed_depth_stream_hex() {
         return Err(
             format!("{where_}: the reviewed depth stream is the two reviewed triangles").into(),
         );
@@ -3998,6 +4086,30 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             .is_none_or(|depth| depth.store.as_deref() != Some("store"))
         {
             return Err(format!("{where_}: a depth resolve needs a stored depth surface").into());
+        }
+    }
+    // The device gate (`research/docs/23` §3.3, v57d): a case that requires a
+    // depth resolve filter has to state the resolve whose filter it names —
+    // the gate is the case's own admission condition, not a second spelling of
+    // the filter that could drift away from the pass the rails execute. Only
+    // the two filters a device may lack are gateable: Sample0 is the API's own
+    // baseline, so nothing needs to be measured against it per device.
+    if let Some(filter) = &case.requires_depth_resolve_filter {
+        if !matches!(filter.as_str(), "min" | "max") {
+            return Err(format!(
+                "{where_}: the device gate names the min or max depth resolve filter"
+            )
+            .into());
+        }
+        if case
+            .depth_resolve
+            .as_ref()
+            .is_none_or(|resolve| resolve.filter != *filter)
+        {
+            return Err(format!(
+                "{where_}: the device gate has to name the resolve filter the case states"
+            )
+            .into());
         }
     }
     // The multisample raster (`research/docs/23` §3.3, v51): the first
@@ -5138,7 +5250,9 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // view as a second read, and the 4-byte output view the reviewed
         // kernel writes. One submission therefore declares every view the
         // depth-storing render pass touches (`research/docs/23` §3.3, v43).
-        "render_declaring_depth_store" => (
+        // v57d: the same v43 shape again, declaring the device-gated pair's own
+        // depth landing view so both edge cases resolve against one resource.
+        "render_declaring_depth_store" | "render_declaring_depth_resolve" => (
             "copy_word_with_witness",
             [1, 1, 1],
             [1, 1, 1],
