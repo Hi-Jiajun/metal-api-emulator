@@ -1209,6 +1209,12 @@ struct RenderCase {
     /// nothing tests it" (`research/docs/23` §3.3, v36).
     #[serde(default)]
     depth_test: Option<DepthTestDefinition>,
+    /// The coverage claim (`research/docs/23` §3.3, v38): `"partial"` says the
+    /// draw covers only part of the attachment, so the expectation mixes the
+    /// fragment output with the colour the pass started from. Absent means the
+    /// milestone's stricter rule: every texel is the output.
+    #[serde(default)]
+    coverage: Option<String>,
     /// Texels the case does not claim, in row-major order
     /// (`research/docs/23` §3.3, v33). Only a `dontcare` load may leave bytes
     /// unclaimed — the undefined pre-pass contents are exactly what makes them
@@ -3083,6 +3089,18 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     // the undefined load: a `dontcare` load carries no clear colour and no
     // initial bytes, and its expectation still has to differ from the bytes
     // the declaring case pins for the same view (`docs/23` §13).
+    // The coverage claim (`research/docs/23` §3.3, v38): only the single
+    // attachment shape may make it, and only the one spelling exists.
+    if let Some(coverage) = &case.coverage {
+        if coverage != "partial" {
+            return Err(format!("{where_}: the only coverage claim is \"partial\"").into());
+        }
+        if !single {
+            return Err(
+                format!("{where_}: the coverage claim is the single-attachment shape").into(),
+            );
+        }
+    }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels it does not claim, and only a `dontcare` load has bytes that may
     // legitimately be unclaimed. The list is the single-attachment shape's, it
@@ -3197,7 +3215,43 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         // checks. Without a scissor the milestone's stricter
                         // rule stays: every texel is the output
                         // (`research/docs/23` §3.3, v29).
-                        if let Some([x, y, scissor_width, scissor_height]) = case.scissor {
+                        if case.coverage.as_deref() == Some("partial") {
+                            let clear_colour =
+                                unhex(attachment.clear_hex.as_deref().ok_or(format!(
+                                    "{where_}: a clear attachment needs clear_hex"
+                                ))?)?;
+                            if clear_colour.len() != 4 {
+                                return Err(
+                                    format!("{where_}: a clear colour is four bytes").into()
+                                );
+                            }
+                            // The draw covers part of the attachment: every
+                            // texel is the fragment output or the clear colour,
+                            // and both have to appear
+                            // (`research/docs/23` §3.3, v38).
+                            let mut drawn = 0_usize;
+                            let mut kept = 0_usize;
+                            for chunk in texels.chunks_exact(4) {
+                                if chunk == &texels[..4] {
+                                    drawn += 1;
+                                } else if chunk == clear_colour.as_slice() {
+                                    kept += 1;
+                                } else {
+                                    return Err(format!(
+                                        "{where_}: a partial coverage claim needs every texel \
+                                         to be the fragment output or the clear colour"
+                                    )
+                                    .into());
+                                }
+                            }
+                            if drawn == 0 || kept == 0 {
+                                return Err(format!(
+                                    "{where_}: a partial coverage claim needs both drawn and \
+                                     clear texels"
+                                )
+                                .into());
+                            }
+                        } else if let Some([x, y, scissor_width, scissor_height]) = case.scissor {
                             let texel_bytes = [texel[0], texel[1], texel[2], texel[3]];
                             let clear_bytes =
                                 unhex(attachment.clear_hex.as_deref().ok_or(format!(

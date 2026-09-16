@@ -31,6 +31,7 @@ INSTANCED_ID = "instanced_pair_4x4"
 WILDCARD_ID = "dontcare_scissor_half_4x4"
 BASE_VERTEX_ID = "base_vertex_quad_4x4"
 DEPTH_ID = "depth_pair_4x4"
+ALIGNMENT_ID = "top_half_quad_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -61,6 +62,14 @@ BASE_VERTEX_EXPECTED = OUTPUT * 16
 # wins, so the expectation is the red texel sixteen times; a rail that dropped
 # the depth state would show the green one.
 DEPTH_EXPECTED = INSTANCE_TINTS[0] * 16
+# The v38 fixture: the reviewed quad over the attachment's top half in Metal's
+# NDC convention, with the `partial` coverage claim. The expectation mixes the
+# fragment output (top two rows) with the clear colour (bottom two), and the
+# Vulkan rail's reviewed vertex modules flip y so both rails cover the same
+# framebuffer rows.
+ALIGNMENT_EXPECTED = "".join(
+    OUTPUT if (index // 4) < 2 else CLEAR for index in range(16))
+
 # Every rail executes the scissor from v30 on: the object API's encoder carries
 # `set_scissor`, so the fixture names all five. The instanced pair is the same
 # story from v32 on: `draw_indexed_primitives_instanced_with_attachments` is
@@ -79,6 +88,10 @@ BASE_VERTEX_RAILS = ALL_RAILS
 # `draw_indexed_primitives_with_depth` is the object API's depth-bearing draw
 # entry, so its marker names all five rails too.
 DEPTH_RAILS = ALL_RAILS
+# The alignment fixture names every rail: both trace and object rails execute
+# the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
+# framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
+ALIGNMENT_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -154,6 +167,19 @@ def depth_result(provider_backend=True, copy_in=2, copy_out=2):
     return result
 
 
+def alignment_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": ALIGNMENT_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": ALIGNMENT_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": ALIGNMENT_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
 def counted_declaring(suite, digest, rail):
     report = synthetic_report(suite, digest, rail)
     if rail != "native-metal":
@@ -222,6 +248,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(base_vertex_result(rail != "native-metal"))
             if rail in DEPTH_RAILS:
                 report["results"].append(depth_result(rail != "native-metal"))
+            if rail in ALIGNMENT_RAILS:
+                report["results"].append(alignment_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -241,6 +269,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(base_vertex_result(rail != "native-metal"))
             if rail in DEPTH_RAILS:
                 report["results"].append(depth_result(rail != "native-metal"))
+            if rail in ALIGNMENT_RAILS:
+                report["results"].append(alignment_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -262,6 +292,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(base_vertex_result(rail != "native-metal"))
             if rail in DEPTH_RAILS:
                 report["results"].append(depth_result(rail != "native-metal"))
+            if rail in ALIGNMENT_RAILS:
+                report["results"].append(alignment_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -296,6 +328,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(wildcard_result())
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
+        report["results"].append(alignment_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -380,6 +413,42 @@ class ScissorObservationTests(unittest.TestCase):
                                     "the depth attachment has to match the colour extent"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
+    def test_v28_pins_the_alignment_fixture(self):
+        case = self.suite["render_cases"][5]
+        self.assertEqual(case["id"], ALIGNMENT_ID)
+        self.assertEqual(case["coverage"], "partial")
+        self.assertEqual(case["attachment"]["load"], "clear")
+        self.assertEqual(case["expected_hex"], ALIGNMENT_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(ALIGNMENT_RAILS))
+
+    def test_v28_plans_the_alignment_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[ALIGNMENT_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(ALIGNMENT_EXPECTED))])
+
+    def test_v28_refuses_a_partial_claim_that_covers_everything(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][5]["expected_hex"] = OUTPUT * 16
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "a partial coverage claim needs both drawn and clear"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_texel_that_is_neither_output_nor_clear(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][5]["expected_hex"] = "ff0000ff" + ALIGNMENT_EXPECTED[8:]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "has to be the fragment output or the clear colour"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_coverage_claim_that_is_not_partial(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][5]["coverage"] = "full"
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "the only coverage claim"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
     def test_v28_refuses_a_wildcard_beyond_the_attachment(self):
         broken = copy.deepcopy(self.suite)
         broken["render_cases"][2]["wildcard_texels"] = WILDCARD_TEXELS + [16]
@@ -417,6 +486,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(instanced_result())
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
+        report["results"].append(alignment_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -442,6 +512,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(base_vertex_result(rail != "native-metal"))
             if rail in DEPTH_RAILS:
                 report["results"].append(depth_result(rail != "native-metal"))
+            if rail in ALIGNMENT_RAILS:
+                report["results"].append(alignment_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):

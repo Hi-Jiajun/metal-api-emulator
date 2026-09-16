@@ -444,6 +444,73 @@
         "vulkan-objects",
         "native-metal-provider-objects"
       ]
+    },
+    {
+      "id": "top_half_quad_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_quad_vertex",
+      "fragment_entry": "render_solid_rgba8",
+      "metal": {
+        "path": "shaders/quad_indexed_2x2.metal",
+        "sha256": "aeb662f5d0515ddc4711d821626a72e389506191d11fa03adc9e21ad097379e8"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 8,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x2"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1400,
+          "view": 1410,
+          "offset": 0,
+          "length": 32,
+          "initial_hex": "000080bf000000000000803f00000000000080bf0000803f0000803f0000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1420,
+        "view": 1430,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200010003000200",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "coverage": "partial",
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223344",
+        "store": "store"
+      },
+      "expected_hex": "4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff4080c0ff1122334411223344112233441122334411223344112233441122334411223344",
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
     }
   ]
 }

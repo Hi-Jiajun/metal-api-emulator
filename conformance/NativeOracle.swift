@@ -280,6 +280,12 @@ private struct RenderCaseDefinition: Decodable {
     /// The single-attachment case's expectation. An MRT case leaves this
     /// absent and spells the expectation on each attachment entry instead.
     let expected_hex: String?
+    /// The coverage claim (`research/docs/23` §3.3, v38): `"partial"` says the
+    /// pass's single draw covers only part of the attachment, so the
+    /// expectation states the texels the draw missed as the colour the clear
+    /// load started them from. An absent claim keeps the milestone's rule
+    /// since v13: a clearing pass claims every texel.
+    let coverage: String?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
     /// claim, stated in advance. Only a `dontcare` load may leave texels
@@ -1755,6 +1761,19 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): an attachment list carries its own expected_hex")
         expectedHexes = attachments.map { attachment in attachment.expected_hex }
     }
+    // The coverage claim (`research/docs/23` §3.3, v38): only the
+    // single-attachment shape may make it, and only the one spelling exists —
+    // `"partial"`, meaning the pass's draw covers part of the attachment, so
+    // the expectation mixes the fragment output with the colour the clear load
+    // started from. `conformance/compare.py` and the Rust providers read the
+    // same field the same way, and the default stays the milestone's stricter
+    // rule because a case that says nothing claims every texel.
+    if let coverage = definition.coverage {
+        try require(coverage == "partial",
+                    "\(definition.id): the only coverage claim is \"partial\"")
+        try require(definition.attachment != nil,
+                    "\(definition.id): the coverage claim is the single-attachment shape")
+    }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents
     // of a `dontcare` load are exactly what makes an unclaimed byte
@@ -1836,13 +1855,47 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // What a drawn texel has to be depends on what the pass started
             // from. A clearing pass has nothing to preserve, so every texel
             // has to be the same fragment output (`research/docs/23` §1.3) —
-            // a partially covered attachment cannot be asserted as correct. A
-            // loading pass deliberately keeps the bytes it was handed wherever
-            // the draw missed, so its expectation is classified once the
-            // previous bytes are decoded, below.
+            // a partially covered attachment cannot be asserted as correct
+            // unless the case claims that shape, which the coverage claim below
+            // is. A loading pass deliberately keeps the bytes it was handed
+            // wherever the draw missed, so its expectation is classified once
+            // the previous bytes are decoded, below.
             let texel = Data(texels.prefix(4))
             var texelCount = 0
-            if attachment.load == "clear" {
+            if attachment.load == "clear", definition.coverage == "partial" {
+                // The coverage claim (`research/docs/23` §3.3, v38): the draw
+                // covers part of the attachment, so every texel is either the
+                // fragment output or the colour the clear load started it
+                // from, and both have to appear — a fixture that claimed
+                // "everything" or "nothing" could not show the partial coverage
+                // it declares. The claim stands in place of the scissor and
+                // instanced branches below, the same precedence
+                // `conformance/compare.py` and the Rust providers read.
+                guard let clearHex = attachment.clear_hex else {
+                    throw OracleError("\(definition.id): a clear attachment needs clear_hex")
+                }
+                let clearBytes = try decodeHex(clearHex, context: "\(definition.id) clear colour")
+                try require(clearBytes.count == 4,
+                            "\(definition.id): a clear colour is four bytes")
+                var drawn = 0
+                var kept = 0
+                for offset in stride(from: 0, to: texels.count, by: 4) {
+                    let chunk = Data(texels[offset..<(offset + 4)])
+                    if chunk == texel {
+                        drawn += 1
+                    } else if chunk == clearBytes {
+                        kept += 1
+                    } else {
+                        throw OracleError("\(definition.id): texel \(offset / 4) of a partial "
+                                          + "coverage claim has to be the fragment output or "
+                                          + "the clear colour")
+                    }
+                    texelCount += 1
+                }
+                try require(drawn > 0 && kept > 0,
+                            "\(definition.id): a partial coverage claim needs both drawn "
+                            + "and clear texels")
+            } else if attachment.load == "clear" {
                 // A scissored pass covers a known rectangle: inside it every
                 // texel is the fragment output and outside it every texel is the
                 // clear colour (`research/docs/23` §3.3, v29). Both halves have
@@ -2785,6 +2838,7 @@ private func renderSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        coverage: nil,
         wildcard_texels: nil,
         // The `vertex_id` shape is depth-less, the semantics every pre-v36
         // case has (`research/docs/23` §3.3, v36).
@@ -2849,6 +2903,7 @@ private func presentSelfTest() throws -> CaseResult {
             clear_hex: nil, initial_hex: hex(sentinel), expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        coverage: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -2935,6 +2990,7 @@ private func vertexSelfTest() throws -> CaseResult {
             clear_hex: "fefefefe", initial_hex: nil, expected_hex: nil),
         attachments: nil,
         expected_hex: "4080c0ff4080c0ff4080c0ff4080c0ff",
+        coverage: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
@@ -3025,6 +3081,7 @@ private func mrtSelfTest() throws -> CaseResult {
         // Location 0 first, then location 1: the fixture's own byte strings,
         // spelled per attachment the way a suite's MRT case does.
         expected_hex: nil,
+        coverage: nil,
         wildcard_texels: nil,
         depth: nil,
         depth_test: nil,
