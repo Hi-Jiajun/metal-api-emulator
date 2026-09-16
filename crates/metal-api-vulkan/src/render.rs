@@ -30,10 +30,11 @@
 
 use ash::vk;
 use metal_api_core::provider::{
-    AttachmentFormat, BufferSource, BufferView, ClearColor, CompareFunction, CullMode, DepthTest,
-    FieldValue, IndexFormat, IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass,
-    ProviderPhase, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
-    StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
+    AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
+    CompareFunction, CullMode, DepthTest, FieldValue, IndexFormat, IndirectCommandDescriptor,
+    LoadOp, ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp, VertexBufferLayout,
+    VertexFormat, VertexStep, Winding,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -287,6 +288,10 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// The culling state the pass's pipeline is built with
     /// (`research/docs/23` §3.3, v39), or `None` for "keep every triangle".
     pub cull: Option<RenderPassCull>,
+    /// The blend state the pass's pipeline is built with
+    /// (`research/docs/23` §3.3, v40), or `None` for "write the fragment
+    /// output".
+    pub blend: Option<RenderPassBlend>,
     /// Attachment extent in texels, shared by every entry of
     /// [`Self::attachments`] (`prepare_render_request` refuses a pass whose
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
@@ -630,19 +635,20 @@ fn prepare_render_request<'a>(
             &stages.contract.fragment_entry,
         ));
     }
-    // The reviewed pair module is the one module whose overlapping triangles
-    // are decided by the pass's own state: without a depth test or a cull state
-    // the later triangle would simply win, which is a shape the review never
-    // covered (`research/docs/23` §3.3, v36/v39). The depth fixture states the
-    // first, the cull fixture the second.
+    // The reviewed pair module is executed only by the fixtures whose state the
+    // review covers: the depth fixture states a depth attachment and a test,
+    // the cull fixture a culling state, and the blend fixture a blend state. A
+    // pass that states none of them is a shape no review covered
+    // (`research/docs/23` §3.3, v36/v39/v40).
     if vertex_stage_is_depth(&stages.contract.vertex_entry, &stages.vertex_spirv)
         && (pass.depth.is_none() || pass.depth_test.is_none())
         && pass.cull.is_none()
+        && pass.blend.is_none()
     {
         return Err(
             capability_refusal("render_depth_state_unsupported").with_detail(
-                "the reviewed pair module draws overlapping triangles; a pass without a depth \
-             attachment and test, and without culling, would decide it by submission order",
+                "the reviewed pair module is only executed by the depth, culling and blending \
+             fixtures; a pass that states none of those is a shape no review covered",
             ),
         );
     }
@@ -851,9 +857,10 @@ fn prepare_render_request<'a>(
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
-        // The culling state belongs to the pipeline the rail builds for this
-        // pass (`research/docs/23` §3.3, v39).
+        // The culling and blend states belong to the pipeline the rail builds
+        // for this pass (`research/docs/23` §3.3, v39/v40).
         cull: pass.cull,
+        blend: pass.blend.clone(),
         extent,
         vertex: OffscreenVertexStage {
             entry: &stages.contract.vertex_entry,
@@ -906,6 +913,25 @@ fn resolve_vertex_streams<'a>(
         streams.push(VertexStream { layout, view });
     }
     Ok(streams)
+}
+
+/// One contract blend factor as the `VkBlendFactor` it names. Closed for the
+/// same reason every other translation here is: a factor that gains no arm is a
+/// compile error rather than a silently different one.
+fn vk_blend_factor(factor: BlendFactor) -> vk::BlendFactor {
+    match factor {
+        BlendFactor::Zero => vk::BlendFactor::ZERO,
+        BlendFactor::One => vk::BlendFactor::ONE,
+        BlendFactor::SourceAlpha => vk::BlendFactor::SRC_ALPHA,
+        BlendFactor::OneMinusSourceAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+    }
+}
+
+/// One contract blend operation as the `VkBlendOp` it names.
+fn vk_blend_operation(operation: BlendOperation) -> vk::BlendOp {
+    match operation {
+        BlendOperation::Add => vk::BlendOp::ADD,
+    }
 }
 
 /// The Vulkan index type for one contract index width.
@@ -1332,6 +1358,7 @@ pub(crate) fn execute_offscreen_render(
         &request.vertex_streams,
         request.depth.as_ref(),
         request.cull,
+        request.blend.as_ref(),
     )?;
     // One readback destination per stored attachment; a discarded attachment
     // creates none, because its bytes leave no observable surface to land in
@@ -1818,6 +1845,7 @@ pub(crate) fn execute_present_render(
         &vertex_entry,
         &fragment_entry,
         &request.vertex_streams,
+        None,
         None,
         None,
     )?;
@@ -2366,6 +2394,7 @@ impl<'a> OffscreenObjects<'a> {
         vertex_streams: &[VertexStream<'_>],
         depth: Option<&OffscreenDepthAttachment>,
         cull: Option<RenderPassCull>,
+        blend: Option<&RenderPassBlend>,
     ) -> Result<(), ProviderError> {
         self.vertex_module = unsafe {
             self.context.device.create_shader_module(
@@ -2464,17 +2493,28 @@ impl<'a> OffscreenObjects<'a> {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // One no-blend, all-writes state per colour attachment: the blend
-        // state is indexed by location exactly like the subpass's attachment
-        // references, so a dual-attachment pipeline declares two states and
-        // lets both fragment outputs land.
+        // One blend state per colour attachment, indexed by location exactly
+        // like the subpass's attachment references. A pass that states none
+        // keeps the pre-v40 no-blend, all-writes state
+        // (`research/docs/23` §3.3, v40).
         let blend_attachments = self
             .attachments
             .iter()
-            .map(|_| {
-                vk::PipelineColorBlendAttachmentState::default()
-                    .blend_enable(false)
-                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .enumerate()
+            .map(|(index, _)| {
+                let state = blend.and_then(|blend| blend.attachments.get(index));
+                let mapped = match state {
+                    Some(attachment) => vk::PipelineColorBlendAttachmentState::default()
+                        .blend_enable(true)
+                        .src_color_blend_factor(vk_blend_factor(attachment.source_rgb))
+                        .dst_color_blend_factor(vk_blend_factor(attachment.destination_rgb))
+                        .color_blend_op(vk_blend_operation(attachment.operation))
+                        .src_alpha_blend_factor(vk_blend_factor(attachment.source_alpha))
+                        .dst_alpha_blend_factor(vk_blend_factor(attachment.destination_alpha))
+                        .alpha_blend_op(vk_blend_operation(attachment.operation)),
+                    None => vk::PipelineColorBlendAttachmentState::default().blend_enable(false),
+                };
+                mapped.color_write_mask(vk::ColorComponentFlags::RGBA)
             })
             .collect::<Vec<_>>();
         let blend =
@@ -3736,6 +3776,7 @@ mod tests {
     /// sentinel the coverage assertions look for.
     fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -3873,6 +3914,7 @@ mod tests {
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
+                blend: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -4159,6 +4201,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            blend: None,
             cull: None,
             depth: None,
             scissor: None,
@@ -4223,6 +4266,7 @@ mod tests {
             let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
+                    blend: None,
                     cull: None,
                     depth: None,
                     base_vertex: 0,
@@ -4364,6 +4408,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            blend: None,
             cull: None,
             depth: None,
             scissor: None,
@@ -4487,6 +4532,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                blend: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -4552,6 +4598,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                blend: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -4614,6 +4661,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                blend: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,
@@ -4662,6 +4710,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            blend: None,
             cull: None,
             depth: None,
             scissor: None,
@@ -4697,6 +4746,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            blend: None,
             cull: None,
             depth: None,
             scissor: None,
@@ -4841,6 +4891,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                blend: None,
                 cull: None,
                 depth: None,
                 base_vertex: 0,

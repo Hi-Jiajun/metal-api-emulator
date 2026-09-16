@@ -2281,6 +2281,7 @@ mod tests {
 
     fn ordering_render_pass(view: u64) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,

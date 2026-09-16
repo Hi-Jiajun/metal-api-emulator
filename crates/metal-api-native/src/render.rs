@@ -52,7 +52,7 @@ use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
     ContractError, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassCull, RenderPassDescriptor,
+    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES,
 };
@@ -65,16 +65,18 @@ use foreign_types::ForeignType;
 #[cfg(target_os = "macos")]
 use metal::{
     Buffer, CommandQueue, CompileOptions, DepthStencilDescriptor, Device,
-    IndirectCommandBufferDescriptor, MTLClearColor, MTLCommandBufferStatus, MTLCompareFunction,
-    MTLCullMode, MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport,
-    MTLWinding, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
-    RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
+    IndirectCommandBufferDescriptor, MTLBlendFactor, MTLBlendOperation, MTLClearColor,
+    MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLIndexType, MTLIndirectCommandType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat,
+    MTLVertexStepFunction, MTLViewport, MTLWinding, NSInteger, NSRange, NSUInteger,
+    RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
+    RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
 use metal_api_core::provider::{
-    CompareFunction, CullMode as ContractCullMode, Winding as ContractWinding,
+    BlendFactor, BlendOperation, CompareFunction, CullMode as ContractCullMode,
+    Winding as ContractWinding,
 };
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
@@ -1209,6 +1211,9 @@ pub(crate) struct RenderPlan<'a> {
     /// The pass's culling state, or `None` for "keep every triangle"
     /// (`research/docs/23` §3.3, v39).
     pub(crate) cull: Option<RenderPassCull>,
+    /// The pass's blend state, or `None` for "write the fragment output"
+    /// (`research/docs/23` §3.3, v40).
+    pub(crate) blend: Option<RenderPassBlend>,
     /// The rail-owned depth attachment this pass opens, or `None` for a pass
     /// with no depth surface (`research/docs/23` §3.3, v36).
     pub(crate) depth: Option<PlannedDepth>,
@@ -1459,6 +1464,7 @@ pub(crate) fn plan<'a>(
         viewport: request.pass.viewport,
         scissor: request.pass.scissor,
         cull: request.pass.cull,
+        blend: request.pass.blend.clone(),
         depth: request.pass.depth.as_ref().map(|depth| PlannedDepth {
             width: u32::try_from(depth.width).unwrap_or(u32::MAX),
             height: u32::try_from(depth.height).unwrap_or(u32::MAX),
@@ -2340,6 +2346,25 @@ pub(crate) fn present_target_texture(
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
 
+/// One contract blend factor as the `MTLBlendFactor` it names.
+#[cfg(target_os = "macos")]
+const fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
+    match factor {
+        BlendFactor::Zero => MTLBlendFactor::Zero,
+        BlendFactor::One => MTLBlendFactor::One,
+        BlendFactor::SourceAlpha => MTLBlendFactor::SourceAlpha,
+        BlendFactor::OneMinusSourceAlpha => MTLBlendFactor::OneMinusSourceAlpha,
+    }
+}
+
+/// One contract blend operation as the `MTLBlendOperation` it names.
+#[cfg(target_os = "macos")]
+const fn metal_blend_operation(operation: BlendOperation) -> MTLBlendOperation {
+    match operation {
+        BlendOperation::Add => MTLBlendOperation::Add,
+    }
+}
+
 /// The rail-owned depth texture of a pass that declares one
 /// (`research/docs/23` §3.3, v36).
 ///
@@ -2489,13 +2514,28 @@ fn render_pipeline_state(
     // One pipeline attachment per colour location: entry `i` states the pixel
     // format the reviewed fragment's output `i` is compiled against, which the
     // plan already forced to agree with the pass's attachment list
-    // (`research/docs/23` §3.3).
+    // (`research/docs/23` §3.3). A pass that states blend state states it here,
+    // per location, exactly as Metal's colour attachment descriptor indexes it
+    // (`research/docs/23` §3.3, v40).
     for (index, attachment) in planned.attachments.iter().enumerate() {
         let color = descriptor
             .color_attachments()
             .object_at(index as u64)
             .ok_or_else(|| resource_refusal("metal_render_pipeline_attachment_unavailable"))?;
         color.set_pixel_format(metal_pixel_format(attachment.format));
+        if let Some(blend) = planned
+            .blend
+            .as_ref()
+            .and_then(|blend| blend.attachments.get(index))
+        {
+            color.set_blending_enabled(true);
+            color.set_rgb_blend_operation(metal_blend_operation(blend.operation));
+            color.set_alpha_blend_operation(metal_blend_operation(blend.operation));
+            color.set_source_rgb_blend_factor(metal_blend_factor(blend.source_rgb));
+            color.set_destination_rgb_blend_factor(metal_blend_factor(blend.destination_rgb));
+            color.set_source_alpha_blend_factor(metal_blend_factor(blend.source_alpha));
+            color.set_destination_alpha_blend_factor(metal_blend_factor(blend.destination_alpha));
+        }
     }
     device
         .new_render_pipeline_state(descriptor.as_ref())
@@ -2595,6 +2635,7 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,
@@ -3384,6 +3425,7 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            blend: None,
             cull: None,
             depth: None,
             depth_test: None,

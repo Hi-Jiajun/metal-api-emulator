@@ -831,6 +831,7 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
+            blend: None,
             cull: None,
             // The object API's depth surface states the shape directly: it has
             // no trace identity, so this is the same rail-owned description the
