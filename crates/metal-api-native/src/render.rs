@@ -65,7 +65,7 @@ use metal::{
     MTLCommandBufferStatus, MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin,
     MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
     MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction,
-    MTLViewport, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
+    MTLViewport, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
     RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
@@ -808,6 +808,11 @@ pub(crate) struct PlannedIndexStream<'a> {
     /// The highest index the draw reads plus one: the number of vertices the
     /// bound streams have to cover for this draw.
     pub(crate) vertex_span: u64,
+    /// Vertex offset every index is read through (`research/docs/23` §3.3,
+    /// v34), i.e. Metal's `baseVertex`. The stream has to cover
+    /// `base_vertex + vertex_span` records, and the draw call carries the
+    /// offset whenever it is non-zero.
+    pub(crate) base_vertex: u64,
 }
 
 /// Resolve a pass's vertex streams and index buffer from the pass itself.
@@ -895,13 +900,22 @@ fn plan_vertex_input<'a>(
     }
     let indices = match &pass.indices {
         None => None,
-        Some(binding) => Some(plan_index_stream(binding, pass.vertices)?),
+        Some(binding) => Some(plan_index_stream(
+            binding,
+            pass.vertices,
+            u64::from(pass.base_vertex),
+        )?),
     };
     match &indices {
         // An indexed draw reads the vertices its index values select, so each
         // stream has to cover that span. The refusal names the index that
         // reached past the stream, because that is what the trace has to change.
         Some(indices) => {
+            // The offset takes part in the proof: the vertex a draw reads is
+            // `base_vertex + index`, so a span that fits on its own can still
+            // reach past the stream once the offset is added
+            // (`research/docs/23` §3.3, v34).
+            let required_span = indices.vertex_span.saturating_add(indices.base_vertex);
             for (buffer_index, stream) in streams.iter().enumerate() {
                 // A per-instance stream is proved against the instance count
                 // above, so the vertex span does not apply to it
@@ -917,17 +931,14 @@ fn plan_vertex_input<'a>(
                     .unwrap_or(u64::MAX)
                     .checked_div(stream.stride)
                     .unwrap_or(0);
-                if indices.vertex_span > covered {
-                    return Err(
-                        index_value_refusal(highest_index(indices.vertex_span), covered)
-                            .with_field(
-                                "buffer_index",
-                                FieldValue::Unsigned(
-                                    u64::try_from(buffer_index).unwrap_or(u64::MAX),
-                                ),
-                            )
-                            .with_field("view", FieldValue::Unsigned(indices.view_id.get())),
-                    );
+                if required_span > covered {
+                    return Err(index_value_refusal(highest_index(required_span), covered)
+                        .with_field(
+                            "buffer_index",
+                            FieldValue::Unsigned(u64::try_from(buffer_index).unwrap_or(u64::MAX)),
+                        )
+                        .with_field("base_vertex", FieldValue::Unsigned(indices.base_vertex))
+                        .with_field("view", FieldValue::Unsigned(indices.view_id.get())));
                 }
             }
             // The `vertex_id` shape binds no stream to bound its index values:
@@ -935,12 +946,13 @@ fn plan_vertex_input<'a>(
             // `FULL_SCREEN_TRIANGLE_VERTICES` positions, so an index at or above
             // that count would read a position the module does not carry.
             if pass.vertex_buffers.is_empty()
-                && indices.vertex_span > u64::from(FULL_SCREEN_TRIANGLE_VERTICES)
+                && required_span > u64::from(FULL_SCREEN_TRIANGLE_VERTICES)
             {
                 return Err(index_value_refusal(
-                    highest_index(indices.vertex_span),
+                    highest_index(required_span),
                     u64::from(FULL_SCREEN_TRIANGLE_VERTICES),
                 )
+                .with_field("base_vertex", FieldValue::Unsigned(indices.base_vertex))
                 .with_field("view", FieldValue::Unsigned(indices.view_id.get())));
             }
         }
@@ -984,6 +996,7 @@ fn highest_index(vertex_span: u64) -> u32 {
 fn plan_index_stream<'a>(
     binding: &'a IndexBufferBinding,
     index_count: u32,
+    base_vertex: u64,
 ) -> Result<PlannedIndexStream<'a>, ProviderError> {
     let view = &binding.view;
     let bytes = stream_bytes(view, INDEX_SLUG)?;
@@ -1014,6 +1027,7 @@ fn plan_index_stream<'a>(
         Some(value) => u64::from(value) + 1,
     };
     Ok(PlannedIndexStream {
+        base_vertex,
         view_id: view.view_id,
         bytes,
         offset: view.offset,
@@ -2048,14 +2062,33 @@ fn encode_into_and_readback(
             Some(indices) => {
                 let offset = NSUInteger::try_from(indices.offset).unwrap_or(NSUInteger::MAX);
                 let buffer = stream_buffer(device, indices.offset, indices.bytes)?;
-                encoder.draw_indexed_primitives_instanced(
-                    MTLPrimitiveType::Triangle,
-                    u64::from(indices.index_count),
-                    metal_index_type(indices.format),
-                    buffer.as_ref(),
-                    offset,
-                    u64::from(planned.instance_count),
-                );
+                if indices.base_vertex == 0 {
+                    encoder.draw_indexed_primitives_instanced(
+                        MTLPrimitiveType::Triangle,
+                        u64::from(indices.index_count),
+                        metal_index_type(indices.format),
+                        buffer.as_ref(),
+                        offset,
+                        u64::from(planned.instance_count),
+                    );
+                } else {
+                    // The offset belongs to the draw call
+                    // (`research/docs/23` §3.3, v34): the base-vertex entry
+                    // states it beside the instance count, and a zero-offset
+                    // draw keeps the pre-v34 entry point exactly.
+                    let base_vertex =
+                        NSInteger::try_from(indices.base_vertex).unwrap_or(NSInteger::MAX);
+                    encoder.draw_indexed_primitives_instanced_base_instance(
+                        MTLPrimitiveType::Triangle,
+                        u64::from(indices.index_count),
+                        metal_index_type(indices.format),
+                        buffer.as_ref(),
+                        offset,
+                        u64::from(planned.instance_count),
+                        base_vertex,
+                        0,
+                    );
+                }
                 stream_buffers.push(buffer);
             }
             None => {
@@ -2400,6 +2433,7 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: PipelineId::new(3),
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(7),
@@ -3185,6 +3219,7 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            base_vertex: 0,
             pipeline: QUAD_PIPELINE,
             color_attachments: vec![RenderAttachment {
                 view_id: ViewId::new(7),

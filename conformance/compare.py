@@ -645,11 +645,15 @@ def _vertex_input_declaration(case, where):
     if layout is None:
         _require(not vertex_buffers and indices is None,
                  f"{where}: vertex buffers without a vertex layout describe no stream")
+        _require(case.get("base_vertex", 0) == 0,
+                 f"{where}: a base vertex needs an index buffer")
         return None
     _object(layout, ("buffers",), f"{where}.vertex_layout")
     streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
     if len(streams) == 2:
         return _instanced_declaration(case, streams, vertex_buffers, indices, where)
+    if case.get("base_vertex", 0) != 0:
+        return _base_vertex_declaration(case, streams, vertex_buffers, indices, where)
     _require(len(streams) == 1, f"{where}: the reviewed shape is one vertex stream")
     _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
     _require(streams[0]["stride"] == quad_stride,
@@ -799,6 +803,64 @@ def _instanced_declaration(case, streams, vertex_buffers, indices, where):
             "tints": tints}
 
 
+def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed base-vertex shape (`research/docs/23` §3.3, v34).
+
+    The layout and the index buffer are the reviewed quad's; the shape adds a
+    five-vertex stream whose first vertex is a degenerate centre and a
+    `base_vertex` of one, so the same indices draw the reviewed quad only when
+    the offset reaches the draw. A rail that ignored it would read the centre
+    and three corners and leave part of the attachment at the load's colour,
+    which the full-coverage expectation below refuses.
+    """
+    quad_vertices, quad_indices, quad_stride = 4, 6, 8
+    offset = 1
+    _require(case.get("base_vertex") == offset,
+             f"{where}: the reviewed base-vertex draw offsets its indices by {offset}")
+    _require(len(streams) == 1, f"{where}: the reviewed base-vertex shape is one stream")
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == quad_stride,
+             f"{where}: the reviewed base-vertex stream has stride {quad_stride}")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 1, f"{where}: the reviewed stream has one attribute")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x2"),
+             f"{where}: the reviewed attribute is location 0, offset 0, float32x2")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed base-vertex shape binds one stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require(binding["length"] == quad_stride * (quad_vertices + offset),
+             f"{where}: the reviewed base-vertex stream is the degenerate centre plus the quad")
+    _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
+             == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    _require(indices is not None, f"{where}: the reviewed base-vertex shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["allocation"] > 0 and indices["view"] > 0,
+             f"{where}: zero index buffer identity")
+    width = {"uint16": 2, "uint32": 4}.get(indices["format"])
+    _require(width is not None, f"{where}: unsupported index format")
+    _require(indices["length"] == quad_indices * width,
+             f"{where}: the index buffer is the reviewed six indices")
+    index_bytes = _hex(indices["initial_hex"], f"{where}.indices.initial_hex")
+    _require(len(index_bytes) == indices["length"],
+             f"{where}: the index bytes do not match their length")
+    for position in range(0, len(index_bytes), width):
+        chunk = index_bytes[position:position + width]
+        index = int.from_bytes(chunk, "little")
+        _require(index < quad_vertices,
+                 f"{where}: index {position // width} names vertex {index} outside the quad")
+    return {"vertices": quad_vertices, "indices": quad_indices}
+
+
 def _inside_scissor(index, width, scissor):
     """Whether the row-major texel `index` falls inside a `[x, y, w, h]` scissor.
 
@@ -851,7 +913,7 @@ def _render_plan(plan, suite):
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
-                               "instance_count", "wildcard_texels"})
+                               "instance_count", "wildcard_texels", "base_vertex"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case

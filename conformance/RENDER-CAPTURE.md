@@ -993,3 +993,36 @@ depth) will need, and it is the reason the channel landed before them.
 The evidence boundary is the same as §13's: the five-rail CI run plus the
 RTX 5060 capture of the suite, with the Apple half in the `native-oracle-build`
 job.
+
+## 15. The base-vertex offset (v34)
+
+An indexed draw reads the vertex its index names; both APIs let the caller add a
+constant to every index, which is how several meshes share one vertex buffer.
+`RenderPassDescriptor::base_vertex` is that offset (Metal's `baseVertex`,
+Vulkan's `vkCmdDrawIndexed(…, vertexOffset, …)`), and it is a *draw* parameter:
+`0` is the shape every earlier increment published, so a pass that does not
+offset anything keeps its pre-v34 bytes on the wire and in every rail.
+
+The field's rules are two:
+
+* it needs an index buffer — the two APIs add it to index *values*, and a
+  non-indexed draw has none to add it to — which is
+  `ContractError::BaseVertexRequiresIndices`;
+* the bound streams have to cover the offset vertices too: the fetched vertex is
+  `base_vertex + index`, so both rails' footprint proofs add the offset before
+  they compare against the stream (Vulkan's `vertex_capacity` check, the native
+  rail's index-span proof). A stream that fits the indices on their own but not
+  the offset is refused before a device object exists.
+
+The reviewed fixture `base_vertex_quad_4x4` is what makes the offset observable
+rather than merely accepted: the reviewed quad's layout, module and index buffer
+over a five-vertex stream whose first vertex is a degenerate centre, drawn with
+`base_vertex: 1`. With the offset the indices reach the four reviewed corners and
+every texel of the cleared 4x4 attachment is the fragment output; without it the
+degenerate centre replaces a corner and six texel centres keep the clear colour.
+The fixture's marker names the three trace rails, because the object API's
+indexed entries have no base-vertex form yet: a case that declares one is
+refused on those rails instead of being recorded with offset zero.
+
+The evidence boundary is §13's: the five-rail CI run (with the Apple half in
+`native-oracle-build`) plus the RTX 5060 capture of the same suite.

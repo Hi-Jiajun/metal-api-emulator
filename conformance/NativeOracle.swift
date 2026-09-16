@@ -229,6 +229,14 @@ private struct RenderCaseDefinition: Decodable {
     /// (`metal_api_core::provider::RenderPassDescriptor::instance_count`,
     /// `research/docs/23` §3.3, v31). The reviewed instanced case declares two.
     let instance_count: UInt64?
+    /// The vertex offset every index value of the draw is read through, or
+    /// `nil` for zero — the semantics every pre-v34 case has
+    /// (`metal_api_core::provider::RenderPassDescriptor::base_vertex`,
+    /// `research/docs/23` §3.3, v34). Metal's `baseVertex` and Vulkan's
+    /// `vertexOffset` only exist for an indexed draw, so a case that declares
+    /// one without an index buffer is refused. The reviewed base-vertex case
+    /// declares one over its five-vertex stream.
+    let base_vertex: UInt64?
     /// The vertex-input half, absent for the `vertex_id` shape
     /// (`research/docs/23` §3.3). A case that carries a layout draws the
     /// indexed reviewed module instead: the layout, its bindings and the index
@@ -323,6 +331,10 @@ private struct ValidatedIndexStream {
     /// Where the view starts inside its allocation, for the draw call's
     /// `indexBufferOffset`.
     let offset: UInt64
+    /// The draw's vertex offset (`research/docs/23` §3.3, v34): the footprint
+    /// proofs read the indices *after* it, and the draw call carries it as
+    /// Metal's `baseVertex`.
+    let baseVertex: UInt64
     let bytes: Data
 }
 
@@ -1513,6 +1525,11 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     case (nil, nil, nil):
         try require(definition.vertices == 3,
                     "\(definition.id): expected the full-screen triangle")
+        // The base vertex only exists for an indexed draw: both APIs add it to
+        // the index values, and a non-indexed draw has none to add it to
+        // (`research/docs/23` §3.3, v34).
+        try require((definition.base_vertex ?? 0) == 0,
+                    "\(definition.id): a base vertex needs an index buffer")
         vertexStreams = []
         indexStream = nil
     case (let layout?, let bindings?, let indices?):
@@ -1521,6 +1538,11 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         try require(layout.buffers == reviewedBuffers,
                     "\(definition.id): the vertex layout is not the reviewed one")
+        // The draw's vertex offset (`research/docs/23` §3.3, v34): absent means
+        // zero, the shape every pre-v34 case draws. It takes part in the
+        // footprint proof below, because the vertex a draw reads is
+        // `base_vertex + index`.
+        let baseVertex = definition.base_vertex ?? 0
         try require(bindings.count == reviewedBuffers.count,
                     "\(definition.id): one binding per reviewed stream")
         // The reviewed indexed fixture draws six `uint16` indices over the four
@@ -1585,6 +1607,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         "\(definition.id): the reviewed instanced draw runs exactly two "
                         + "instances")
         }
+        // The offset takes part in the proof: a span that fits on its own can
+        // still reach past the stream once the base vertex is added
+        // (`research/docs/23` §3.3, v34). The proof only has to decide whether
+        // a stream covers the span, so an unrepresentable sum saturates — it is
+        // by definition larger than any buffer this oracle admits, the same
+        // answer `render.rs::plan_vertex_input` computes with `saturating_add` —
+        // instead of trapping on the addition.
+        let (spanAndOffset, offsetOverflowed) = span.addingReportingOverflow(baseVertex)
+        let requiredSpan = offsetOverflowed ? UInt64.max : spanAndOffset
         // A per-instance stream advances once per instance instead of once per
         // index-selected vertex, so the draw reads `instanceCount` records of
         // it (`research/docs/23` §3.3, v31); every other stream has to cover
@@ -1596,14 +1627,16 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                             "\(definition.id): the draw reads \(instanceCount) records of "
                             + "binding \(stream.binding), which covers \(covered)")
             } else {
-                try require(span <= covered,
-                            "\(definition.id): index values reach vertex \(span - 1) of "
-                            + "binding \(stream.binding), which covers \(covered)")
+                try require(requiredSpan <= covered,
+                            "\(definition.id): index values reach vertex \(requiredSpan - 1) of "
+                            + "binding \(stream.binding) through base vertex \(baseVertex), "
+                            + "which covers \(covered)")
             }
         }
         vertexStreams = resolved
         indexStream = ValidatedIndexStream(format: format, indexCount: indexCount,
                                            offset: indices.offset,
+                                           baseVertex: baseVertex,
                                            bytes: indexBytes)
     default:
         throw OracleError("\(definition.id): a vertex layout, its bindings and the index "
@@ -2436,13 +2469,32 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
                                                offset: indexStream.offset,
                                                bytes: indexStream.bytes)
         streamBuffers.append(indexBuffer)
-        encoder.drawIndexedPrimitives(type: .triangle,
-                                      indexCount: Int(indexStream.indexCount),
-                                      indexType: indexStream.format.metal,
-                                      indexBuffer: indexBuffer,
-                                      indexBufferOffset: try hostOffset(indexStream.offset,
-                                                                        id: definition.id),
-                                      instanceCount: instanceCount)
+        let indexBufferOffset = try hostOffset(indexStream.offset, id: definition.id)
+        if indexStream.baseVertex == 0 {
+            encoder.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: Int(indexStream.indexCount),
+                                          indexType: indexStream.format.metal,
+                                          indexBuffer: indexBuffer,
+                                          indexBufferOffset: indexBufferOffset,
+                                          instanceCount: instanceCount)
+        } else {
+            // The offset belongs to the draw call (`research/docs/23` §3.3,
+            // v34): the base-vertex entry states it beside the instance count,
+            // and a zero-offset draw keeps the pre-v34 entry point exactly.
+            // The wire field is a `u64`, so the narrowing is fallible by
+            // construction; refusing it fails closed instead of trapping.
+            guard let baseVertex = Int(exactly: indexStream.baseVertex) else {
+                throw OracleError("\(definition.id): the base vertex does not fit this host")
+            }
+            encoder.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: Int(indexStream.indexCount),
+                                          indexType: indexStream.format.metal,
+                                          indexBuffer: indexBuffer,
+                                          indexBufferOffset: indexBufferOffset,
+                                          instanceCount: instanceCount,
+                                          baseVertex: baseVertex,
+                                          baseInstance: 0)
+        }
     } else {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0,
                                vertexCount: Int(definition.vertices),
@@ -2541,6 +2593,7 @@ private func renderSelfTest() throws -> CaseResult {
         viewport: [0, 0, 2, 2],
         scissor: nil,
         instance_count: nil,
+        base_vertex: nil,
         // The `vertex_id` shape: positions come from the vertex index, so the
         // case declares no layout, no stream and no index buffer.
         vertex_layout: nil,
@@ -2600,6 +2653,7 @@ private func presentSelfTest() throws -> CaseResult {
         viewport: [0, 0, 2, 2],
         scissor: nil,
         instance_count: nil,
+        base_vertex: nil,
         // The present equivalent replays the `vertex_id` shape, so it declares
         // no vertex input either.
         vertex_layout: nil,
@@ -2675,6 +2729,7 @@ private func vertexSelfTest() throws -> CaseResult {
         viewport: [0, 0, 2, 2],
         scissor: nil,
         instance_count: nil,
+        base_vertex: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         // The stream and index views, spelled exactly as a suite spells them:
         // each view carries its own bytes (`research/docs/23` §3.6), which is
@@ -2754,6 +2809,7 @@ private func mrtSelfTest() throws -> CaseResult {
         viewport: [0, 0, 2, 2],
         scissor: nil,
         instance_count: nil,
+        base_vertex: nil,
         vertex_layout: RenderVertexLayoutDefinition(buffers: reviewed.buffers ?? []),
         vertex_buffers: [RenderVertexBufferDefinition(allocation: 940, view: 950, offset: 0,
                                                       length: UInt64(vertices.count),

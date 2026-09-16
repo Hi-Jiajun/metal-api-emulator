@@ -29,6 +29,7 @@ DECLARING_ID = "render_declaring_quad_extent"
 RENDER_ID = "scissor_left_half_4x4"
 INSTANCED_ID = "instanced_pair_4x4"
 WILDCARD_ID = "dontcare_scissor_half_4x4"
+BASE_VERTEX_ID = "base_vertex_quad_4x4"
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -50,6 +51,10 @@ WILDCARD_TEXELS = [2, 3, 6, 7, 10, 11, 14, 15]
 WILDCARD_REPORTED = "".join(
     OUTPUT if index not in WILDCARD_TEXELS else "cdcdcdcd"
     for index in range(16))
+# The v34 fixture: the reviewed quad's indices offset by one over a five-vertex
+# stream, drawn into a cleared 4x4 attachment. A rail that ignored the offset
+# would leave the six texels the degenerate shape misses at the clear colour.
+BASE_VERTEX_EXPECTED = OUTPUT * 16
 # Every rail executes the scissor from v30 on: the object API's encoder carries
 # `set_scissor`, so the fixture names all five. The instanced pair is the same
 # story from v32 on: `draw_indexed_primitives_instanced_with_attachments` is
@@ -59,6 +64,9 @@ TRACE_RAILS = ("native-metal", "vulkan", "native-metal-provider")
 OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
 ALL_RAILS = TRACE_RAILS + OBJECT_RAILS
 INSTANCED_RAILS = ALL_RAILS
+# The base-vertex draw is the trace rails' shape until the object API gains its
+# own base-vertex entry point (`research/docs/23` §3.3, v34).
+BASE_VERTEX_RAILS = TRACE_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -102,6 +110,19 @@ def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
         "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
                         "offset": ATTACHMENT[2], "bytes_hex": WILDCARD_REPORTED}],
         "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": WILDCARD_REPORTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def base_vertex_result(provider_backend=True, copy_in=2, copy_out=2):
+    result = {
+        "id": BASE_VERTEX_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": BASE_VERTEX_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": BASE_VERTEX_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -172,6 +193,8 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
+            if rail in BASE_VERTEX_RAILS:
+                report["results"].append(base_vertex_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -187,6 +210,8 @@ class ScissorObservationTests(unittest.TestCase):
             report = counted_declaring(suite, digest, rail)
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
+            if rail in BASE_VERTEX_RAILS:
+                report["results"].append(base_vertex_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -204,6 +229,8 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
+            if rail in BASE_VERTEX_RAILS:
+                report["results"].append(base_vertex_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -236,7 +263,51 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(render_result())
         report["results"].append(instanced_result())
         report["results"].append(wildcard_result())
+        report["results"].append(base_vertex_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
+
+    def test_v28_pins_the_base_vertex_fixture(self):
+        case = self.suite["render_cases"][3]
+        self.assertEqual(case["id"], BASE_VERTEX_ID)
+        self.assertEqual(case["base_vertex"], 1)
+        self.assertEqual(case["vertex_buffers"][0]["length"], 40)
+        self.assertEqual(case["attachment"]["clear_hex"], CLEAR)
+        self.assertEqual(case["expected_hex"], BASE_VERTEX_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(BASE_VERTEX_RAILS))
+
+    def test_v28_plans_the_base_vertex_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[BASE_VERTEX_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(BASE_VERTEX_EXPECTED))])
+        self.assertEqual(expectation.rails, frozenset(BASE_VERTEX_RAILS))
+        self.assertEqual(expectation.wildcards, {})
+
+    def test_v28_refuses_a_base_vertex_the_stream_cannot_cover(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][3]["base_vertex"] = 2
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "offsets its indices by 1"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_wrong_base_vertex_stream(self):
+        broken = copy.deepcopy(self.suite)
+        # Drop the degenerate centre: the stream is then the plain reviewed
+        # quad and the offset would read past it.
+        broken["render_cases"][3]["vertex_buffers"][0]["length"] = 32
+        broken["render_cases"][3]["vertex_buffers"][0]["initial_hex"] = (
+            "000080bf000080bf0000803f000080bf000080bf0000803f0000803f0000803f")
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "degenerate centre plus the quad"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_base_vertex_on_the_plain_quad(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][0]["base_vertex"] = 1
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "degenerate centre plus the quad"):
+            compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_wildcard_beyond_the_attachment(self):
         broken = copy.deepcopy(self.suite)
@@ -273,6 +344,7 @@ class ScissorObservationTests(unittest.TestCase):
         report = counted_declaring(self.suite, digest, "vulkan")
         report["results"].append(render_result())
         report["results"].append(instanced_result())
+        report["results"].append(base_vertex_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -294,6 +366,8 @@ class ScissorObservationTests(unittest.TestCase):
             report = counted_declaring(suite, digest, rail)
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
+            if rail in BASE_VERTEX_RAILS:
+                report["results"].append(base_vertex_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
