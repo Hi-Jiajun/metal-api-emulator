@@ -2378,6 +2378,8 @@ fn a_stencil_draw_records_the_surface_and_state_and_needs_an_index_buffer() {
         width: 2,
         height: 2,
         load: RenderStencilLoad::Clear(0),
+        store: None,
+        identity: None,
     };
     let test = RenderStencilTest {
         compare: contract::StencilCompare::Equal,
@@ -2453,6 +2455,8 @@ fn a_stencil_draw_records_the_surface_and_state_and_needs_an_index_buffer() {
                 width: 2,
                 height: 4,
                 load: RenderStencilLoad::Clear(0),
+                store: None,
+                identity: None,
             },
             Some(test),
             None,

@@ -1102,6 +1102,16 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     open the surface without testing against it — but a test without the
     attachment it reads describes nothing, so that half-declared shape is
     refused rather than read as a pass whose fragments are all discarded.
+
+    The v49 increment upgrades that attachment the way v43 upgraded the depth
+    one: with a `store` action the fixture also names the allocation and the
+    view the texels land in and the bytes it expects there — one byte per texel,
+    the whole extent of a `stencil8` surface — and the comparison observes them
+    through the same writeback and allocation channel the colour side uses. A
+    stencil attachment without one is the v47 shape — opened, masked with and
+    dropped — so it carries neither identity nor expectation, and a fixture
+    that half-declares the stored shape is refused rather than read as either
+    one.
     """
     quad_indices, stride = 6, 32
     _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
@@ -1129,8 +1139,11 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
     _require(isinstance(stencil, dict),
              f"{where}: a stencil test needs the stencil attachment it reads")
     # The clear value rides on the `load: "clear"` arm, so the field set is the
-    # one the fixture uses rather than a fixed key list.
-    allowed = {"format", "width", "height", "load", "clear_value"}
+    # one the fixture uses rather than a fixed key list. The store increment
+    # adds the three fields of an observable stencil landing
+    # (`research/docs/23` §3.3, v49).
+    store_fields = {"store", "allocation", "view", "expected_hex"}
+    allowed = {"format", "width", "height", "load", "clear_value"} | store_fields
     _require(set(stencil) - allowed == set(),
              f"{where}.stencil: unexpected fields "
              + ", ".join(sorted(set(stencil) - allowed)))
@@ -1142,6 +1155,55 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
              f"{where}: the reviewed stencil attachment is cleared")
     clear_value = _integer(stencil["clear_value"], f"{where}.stencil.clear_value", 0, 255)
     _require(clear_value == 0, f"{where}: the reviewed stencil clear is zero")
+    # Either the surface disappears with the pass — the only shape before v49 —
+    # or the pass keeps it, and then the identity and the expected texels are
+    # what makes the landing observable. The two arms are mutually exclusive in
+    # both directions, exactly as the depth attachment states them
+    # (`research/docs/23` §3.3, v43/v49): an identity without an action would be
+    # an observation nobody claims, and an action without an identity an
+    # observation nobody can read.
+    store = stencil.get("store")
+    if store is None:
+        _require(not (store_fields & set(stencil)),
+                 f"{where}: a discarded stencil attachment carries no identity or expectation")
+        stencil_store = None
+    else:
+        _require(store == "store",
+                 f"{where}.stencil: unsupported stencil store op {store!r}")
+        missing = [field for field in ("allocation", "view", "expected_hex")
+                   if field not in stencil]
+        _require(not missing,
+                 f"{where}: a stored stencil attachment needs its store action, its "
+                 "identity and an expectation")
+        allocation = _integer(stencil["allocation"], f"{where}.stencil.allocation")
+        view = _integer(stencil["view"], f"{where}.stencil.view")
+        _require(allocation > 0 and view > 0,
+                 f"{where}: zero stencil attachment identity")
+        expected = _hex(stencil["expected_hex"], f"{where}.stencil.expected_hex")
+        _require(stencil["expected_hex"] == expected.hex(),
+                 f"{where}.stencil.expected_hex: the expectation has to be lowercase bytes")
+        width = _integer(stencil["width"], f"{where}.stencil.width", 1)
+        height = _integer(stencil["height"], f"{where}.stencil.height", 1)
+        _require(len(expected) == width * height,
+                 f"{where}.stencil: the expected stencil texels do not match the attachment")
+        # The falsifiability rule the colour and depth sides state: clean texels
+        # are exactly what a pass that never stored the surface leaves behind,
+        # so an expectation equal to them could not tell "stored" from
+        # "dropped".
+        _require(expected != bytes([clear_value]) * (width * height),
+                 f"{where}: the expected stencil texels equal the clear value")
+        # The stencil attachment is a second resource of the same pass, so it
+        # cannot be the colour attachment under another name
+        # (`research/docs/23` §3.3, v49).
+        colours = [case["attachment"]] if "attachment" in case \
+            else case.get("attachments", [])
+        _require(all(not isinstance(colour, dict)
+                     or (colour.get("allocation") != allocation
+                         and colour.get("view") != view)
+                     for colour in colours),
+                 f"{where}.stencil: the stencil resource has to differ from the "
+                 "colour attachment")
+        stencil_store = (allocation, view, expected)
     test = case.get("stencil_test")
     if test is not None:
         # The reviewed state is the one fixture's, whole: `equal` against the
@@ -1177,10 +1239,14 @@ def _stencil_declaration(case, streams, vertex_buffers, indices, where):
             f"{where}.indices")
     _require(indices["initial_hex"] == "000001000200030004000500",
              f"{where}: the reviewed stencil indices are the two reviewed triangles")
-    # The stencil attachment is rail-owned and observed by its effect on the
-    # colour side only, so the shape declares no landing and the assembly below
-    # owes it neither a writeback nor an allocation image.
-    return {"vertices": quad_indices, "indices": quad_indices}
+    # The stored stencil attachment, when the case declares one, is the
+    # `(allocation, view, expected_texels)` triple the assembly below lands
+    # beside the colour attachment; without one the surface is rail-owned and
+    # observed by its effect on the colour side only, so the shape declares no
+    # landing and the assembly owes it neither a writeback nor an allocation
+    # image (`research/docs/23` §3.3, v47/v49).
+    return {"vertices": quad_indices, "indices": quad_indices,
+            "stencil_store": stencil_store}
 
 
 def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
@@ -1832,6 +1898,49 @@ def _render_plan(plan, suite):
                                len(depth_expected)))
             written.add(depth_allocation)
             touched.add(depth_allocation)
+        # The stored stencil attachment (`research/docs/23` §3.3, v49) lands
+        # through the same channel one byte wide: one writeback under the
+        # stencil view and one allocation image, and the same questions the
+        # depth landing asks. Its view is declared by the declaring pass exactly
+        # as a colour attachment's is — the reviewed declaring kernel carries a
+        # third *read* binding for it — so the declaring case declares that one
+        # view, it only reads it (a compute write would race the store), the
+        # declaration's byte range is the stencil extent the attachment
+        # restates, and the bytes it pins are not the stored texels, or the
+        # fixture could not tell "stored" from "never written". The allocation
+        # image is the declaring case's own image with the landing overlaid,
+        # which is what makes the guard bytes around the one-byte-per-texel view
+        # part of the comparison rather than something the fixture could
+        # forget.
+        if vertex_input is not None and vertex_input.get("stencil_store") is not None:
+            stencil_allocation, stencil_view, stencil_expected = (
+                vertex_input["stencil_store"])
+            declared = [buffer for buffer in by_id[declaring]["buffers"]
+                        if buffer["allocation"] == stencil_allocation
+                        and buffer["view"] == stencil_view]
+            _require(len(declared) == 1,
+                     f"{where}: the declaring case has to declare exactly the stencil "
+                     "attachment view")
+            declared = declared[0]
+            _require(declared["access"] == "read",
+                     f"{where}: the declaring pass must only read the stencil attachment view")
+            _require(declared["length"] == len(stencil_expected),
+                     f"{where}: the stencil view's byte range disagrees with the attachment")
+            _require(_hex(declared.get("initial_hex"), f"{where} declared stencil bytes")
+                     != stencil_expected,
+                     f"{where}: the declared stencil view's bytes equal the expectation")
+            image = bytearray(plan[declaring][1][stencil_allocation])
+            _require(len(image) == declared["allocation_size"],
+                     f"{where}: inconsistent stencil allocation size")
+            image[declared["offset"]:declared["offset"] + len(stencil_expected)] = (
+                stencil_expected)
+            images[stencil_allocation] = bytes(image)
+            writes.append(((stencil_allocation, stencil_view, declared["offset"]),
+                           stencil_expected))
+            identities.append((stencil_allocation, stencil_view, declared["offset"],
+                               len(stencil_expected)))
+            written.add(stencil_allocation)
+            touched.add(stencil_allocation)
         # The wildcard mask is stated once per observed attachment, in the
         # absolute byte offsets of its allocation, so the writeback comparison
         # and the allocation-image comparison read the same set.

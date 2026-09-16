@@ -217,16 +217,20 @@ private struct BlendAttachmentDefinition: Decodable {
     let operation: String
 }
 
-/// The rail-owned stencil attachment a render case declares
-/// (`research/docs/23` §3.3, v47).
+/// The stencil attachment a render case declares (`research/docs/23` §3.3,
+/// v47; the store pair is v49).
 ///
 /// The fields mirror `metal_api_core::provider::RenderStencilAttachment`: the
 /// format spelling, the extent and the load operation with the value a clear
-/// starts from. The surface is rail-owned like the first depth increment's:
-/// the stored values decide which primitives survive and nothing reads them
-/// back, so no trace identity and no readback travel with it. A stencil
-/// readback channel is a later increment, and it is what would add the
-/// identity fields this shape deliberately leaves out.
+/// starts from. The surface is rail-owned — no trace identity and no readback
+/// — so the default shape names no view for it, and the four fields below stay
+/// absent with the store action (fail-closed).
+///
+/// A case that stores the stencil surface (`research/docs/23` §3.3, v49)
+/// states all four of them: the store action, the identity its texels land in
+/// and the bytes the readback has to show there. One `stencil8` texel is one
+/// byte, so the landing is `width * height` bytes, and it travels through the
+/// same writeback channel a colour or depth attachment uses.
 private struct StencilAttachmentDefinition: Decodable {
     let format: String
     let width: Int
@@ -234,6 +238,24 @@ private struct StencilAttachmentDefinition: Decodable {
     let load: String
     /// The value a `"clear"` load starts from; absent for any other load.
     let clear_value: UInt32?
+    /// The pass's stencil store action (`research/docs/23` §3.3, v49). The
+    /// only spelling this increment admits is `"store"`, which is what makes
+    /// the texels observable; a surface the pass discards is the *absent*
+    /// field rather than a second spelling, so no `"dontcare"` arm exists
+    /// here.
+    let store: String?
+    /// The allocation the stored stencil texels land in, present exactly when
+    /// `store` is.
+    let allocation: UInt64?
+    /// The view inside that allocation the landing covers, present exactly
+    /// when `store` is.
+    let view: UInt64?
+    /// The reviewed stencil texels, present exactly when `store` is: an image
+    /// in the surface's own one-byte `stencil8` texel layout, compared byte
+    /// for byte against the readback like a colour attachment's expectation.
+    /// It has to differ from the clear image, or "the pass stored the texels"
+    /// and "it never wrote stencil" would read the same.
+    let expected_hex: String?
 }
 
 /// The stencil state a render case declares (`research/docs/23` §3.3, v47).
@@ -418,7 +440,10 @@ private struct RenderCaseDefinition: Decodable {
     /// `research/docs/23` §3.3, v47). The reviewed stencil case clears one
     /// `stencil8` surface to zero, covering the same render area as the colour
     /// attachment, and the values the pass stores are what decide which half
-    /// of its draw survives; the observation stays the colour attachment.
+    /// of its draw survives. The surface is rail-owned where the case declares
+    /// no store action, and the observation stays the colour attachment there;
+    /// the v49 store pair (`§3.3`, v49) adds the identity its texels land in
+    /// and turns the surface itself into an observed half.
     let stencil: StencilAttachmentDefinition?
     /// The pass's stencil state, or `nil` for no stencil state — the shape
     /// every pre-v47 case declares. A state only exists for a pass that opens
@@ -452,8 +477,9 @@ private struct ValidatedRender {
     let depth: ValidatedDepth?
     /// The reviewed stencil surface and state, or `nil` for the stencil-less
     /// shape every pre-v47 case declares (`research/docs/23` §3.3, v47). The
-    /// runner states these on the pass descriptor and the encoder, and the
-    /// surface itself is rail-owned: it is never read back.
+    /// runner states these on the pass descriptor and the encoder. The surface
+    /// itself is rail-owned unless the case states the v49 store pair, which is
+    /// what adds the landing and the readback below.
     let stencil: ValidatedStencil?
 }
 
@@ -574,14 +600,29 @@ private struct ValidatedDepthStore {
 /// its clear starts from and the reference the test compares against. The
 /// review above already forced these to the reviewed values, so the runner
 /// only has to state the surface on the pass descriptor and the test on the
-/// encoder's depth-stencil state. The surface is rail-owned exactly like the
-/// pre-v43 depth shape: the pass discards it, so there is no readback, no
-/// writeback and no allocation observation.
+/// encoder's depth-stencil state. The optional store pair (`§3.3`, v49) says
+/// whether the texels outlive the pass and where they land.
 private struct ValidatedStencil {
     let width: Int
     let height: Int
     let clearValue: UInt32
     let reference: UInt32
+    /// The stored surface's landing and expectation, or `nil` for the
+    /// rail-owned shape every pre-v49 case declares: the pass discards the
+    /// texels exactly as `render.rs::stencil_texture` does, so there is no
+    /// readback, no writeback and no allocation observation.
+    let store: ValidatedStencilStore?
+}
+
+/// The landing a stored stencil surface names (`research/docs/23` §3.3, v49):
+/// the allocation and view the stencil texels land in at offset zero, and the
+/// bytes the readback has to show there — one byte per texel, where the depth
+/// sibling's landing carries four. The observation travels through the same
+/// writeback / allocation channel a colour attachment uses.
+private struct ValidatedStencilStore {
+    let allocation: UInt64
+    let view: UInt64
+    let expected: Data
 }
 
 private struct SuiteDefinition: Decodable {
@@ -1008,6 +1049,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 64 },
                     "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
                     + "and a 64-byte read buffer at 2")
+    case "render_declaring_stencil_store":
+        // v49's declaring case: the same reviewed copy_word_with_witness
+        // kernel over the same colour view and output view, but the third
+        // binding is the stencil landing's own view — one byte per `stencil8`
+        // texel, so the 4x4 surface's 16 bytes where the depth sibling's
+        // `depth32float` view carries 64 (`research/docs/23` §3.3, v49).
+        try require(definition.entry == "copy_word_with_witness"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 3, "\(definition.id): expected three buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 }
+                    && definition.buffers.contains { $0.binding == 2 && $0.access == "read" && $0.length == 16 },
+                    "\(definition.id): expected a 64-byte read buffer at 0, a write buffer at 1 "
+                    + "and a 16-byte read buffer at 2")
     case "copy_word", "copy_seed_a", "copy_seed_b", "copy_pingpong",
          "alias_disjoint_pair", "alias_disjoint_pair_reversed":
         try require(definition.entry == "copy_word"
@@ -1253,20 +1309,25 @@ private func validateBuffers(_ definition: CaseDefinition, guardByte: UInt8,
         // Each owned view must have a canary prefix and suffix to make an
         // offset/extent mismatch observable. Bounds above make addition safe.
         //
-        // v13's declaring case is the one exception: its read view *is* the
-        // whole attachment allocation (`offset == 0`,
-        // `allocation_size == length`), because the render case stores into
-        // exactly those bytes and the comparison is against that view. There is
-        // no neighbouring byte to guard with, and the render path's own
-        // sentinel-versus-fragment check is what keeps an extent mistake
-        // observable there (`conformance/RENDER-CAPTURE.md` §3). The exception
-        // is written down here rather than loosening the rule for every case.
-        let wholeAllocationDeclaringView =
+        // The declaring pass is the one exception: its read view starts at the
+        // attachment allocation's first byte (`offset == 0`) and covers
+        // exactly the bytes the render case's own pass stores into. For
+        // v13–v43 that view *is* the whole attachment allocation
+        // (`allocation_size == length`); v49's stencil landing is the 16-byte
+        // prefix of a 64-byte allocation instead — the 4x4 `stencil8` surface
+        // where the depth sibling's `depth32float` surface fills its own
+        // allocation (`research/docs/23` §3.3, v49). There is no neighbouring
+        // byte on the left to guard with in either shape, the trailing bytes of
+        // a prefix-shaped allocation stay at the guard byte, and the render
+        // path's own sentinel-versus-fragment check is what keeps an extent
+        // mistake observable there (`conformance/RENDER-CAPTURE.md` §3). The
+        // exception is written down here rather than loosening the rule for
+        // every case.
+        let declaringLandingView =
             declaringShapeIDs.contains(definition.id)
             && buffer.access == "read" && buffer.offset == 0
-            && buffer.allocation_size == buffer.length
         let end = buffer.offset + buffer.length
-        try require(wholeAllocationDeclaringView
+        try require(declaringLandingView
                     || (buffer.offset >= 4 && buffer.allocation_size - end >= 4),
                     "\(context): expected at least four guard bytes before and after the view")
         let initial = try decodeHex(buffer.initial_hex, context: context)
@@ -1378,7 +1439,8 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v27":
         expectedIDs = ["render_declaring_two_attachments"]
     case "compute-buffer-v28":
-        expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store"]
+        expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store",
+                       "render_declaring_stencil_store"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2631,8 +2693,61 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): the reviewed stencil state is an equal test against "
                     + "reference zero with both masks wide open that keeps both failure "
                     + "outcomes and increments-wraps on pass")
+        // The stencil store pair (`research/docs/23` §3.3, v49) is all-or-
+        // nothing, mirroring the contract's `StencilStoreIdentityMismatch` and
+        // the depth sibling's own rule: the rail-owned shape every pre-v49 case
+        // declares states none of the four fields, and a storing surface states
+        // the action, its identity and what the readback has to show. One
+        // `stencil8` texel is one byte, so the expected image is
+        // `width * height` bytes — a quarter of the depth sibling's. An
+        // expectation that equals the clear image is refused because it could
+        // not tell "the pass stored the stencil texels" from "it never wrote
+        // stencil" (`docs/23` §3.3, v49).
+        let stencilStore: ValidatedStencilStore?
+        if let spelling = stencil.store {
+            try require(spelling == "store",
+                        "\(definition.id): the only stored stencil spelling is \"store\"")
+            guard let allocation = stencil.allocation,
+                  let view = stencil.view,
+                  let expectedHex = stencil.expected_hex else {
+                throw OracleError("\(definition.id): a stored stencil attachment needs its "
+                                  + "store action, its identity and an expectation")
+            }
+            try require(allocation > 0 && view > 0,
+                        "\(definition.id): zero stencil attachment identity")
+            let expected = try decodeHex(expectedHex,
+                                         context: "\(definition.id) expected stencil texels")
+            try require(expected.count == stencil.width * stencil.height,
+                        "\(definition.id): expected stencil texel bytes do not match the "
+                        + "stencil attachment")
+            // The clear image the surface starts from — one byte per texel, the
+            // reviewed clear value — is exactly what a pass that never stored
+            // its stencil would read back.
+            let clearImage = Data(repeating: UInt8(truncatingIfNeeded: clearValue),
+                                  count: stencil.width * stencil.height)
+            try require(expected != clearImage,
+                        "\(definition.id): the expected stencil texels equal the clear stencil")
+            // The stencil landing is a resource of its own: a colour attachment
+            // already names these identities, and sharing one would make the
+            // colour readback and the stencil readback the same landing
+            // (`research/docs/23` §3.3, v49).
+            for attachment in attachments {
+                try require(allocation != attachment.allocation && view != attachment.view,
+                            "\(definition.id): the stencil attachment reuses the colour "
+                            + "attachment's identity")
+            }
+            stencilStore = ValidatedStencilStore(allocation: allocation, view: view,
+                                                 expected: expected)
+        } else {
+            try require(stencil.allocation == nil && stencil.view == nil
+                        && stencil.expected_hex == nil,
+                        "\(definition.id): a discarded stencil attachment carries no identity "
+                        + "or expectation")
+            stencilStore = nil
+        }
         validatedStencil = ValidatedStencil(width: stencil.width, height: stencil.height,
-                                            clearValue: clearValue, reference: test.reference)
+                                            clearValue: clearValue, reference: test.reference,
+                                            store: stencilStore)
     } else {
         validatedStencil = nil
     }
@@ -3029,11 +3144,16 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         texture.label = "native oracle: \(definition.id) depth"
         depthTarget = texture
     }
-    // The stencil surface is rail-owned too (`research/docs/23` §3.3, v47): the
-    // stored values decide which primitives survive and this increment reads
-    // nothing back, so private storage is enough and the pass discards it after
-    // the draw — the same shape the pre-v43 depth surface has. The local keeps
-    // the texture alive until the encoder's own reference takes over.
+    // The stencil surface is the rail's own texture for the shape every pre-v49
+    // case declares (`research/docs/23` §3.3, v47): the stored values decide
+    // which primitives survive and nothing reads them back, so private storage
+    // is enough and the pass discards it after the draw — the same shape the
+    // pre-v43 depth surface has. A case that stores the surface (`§3.3`, v49)
+    // reads its texels back on the CPU, and `getBytes` cannot read a private
+    // texture (Apple's `MTLTexture` documentation): that shape allocates shared
+    // storage, the same reason its colour attachments and the storing depth
+    // surface do. The local keeps the texture alive until the encoder's own
+    // reference takes over.
     var stencilTarget: MTLTexture?
     if let stencil = fixture.stencil {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
@@ -3042,7 +3162,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             height: stencil.height,
             mipmapped: false)
         descriptor.usage = .renderTarget
-        descriptor.storageMode = .private
+        descriptor.storageMode = stencil.store == nil ? .private : .shared
         guard let texture = device.makeTexture(descriptor: descriptor) else {
             throw OracleError("\(definition.id): cannot allocate the stencil attachment")
         }
@@ -3204,10 +3324,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.clearDepth = depth.clearDepth
         attachment.storeAction = depth.store == nil ? .dontCare : .store
     }
-    // The stencil surface opens with its own load operation and leaves with the
-    // pass (`research/docs/23` §3.3, v47): it is rail-owned, so this increment
-    // reads nothing back and `dontCare` is its store action — the shape every
-    // pre-v43 depth surface has.
+    // The stencil surface opens with its own load operation (`research/docs/23`
+    // §3.3, v47) and leaves with the pass unless the case says otherwise
+    // (`§3.3`, v49): a stored surface lands in the identity its case states,
+    // and the rail-owned shape every pre-v49 case declares discards its texels
+    // with the pass — `dontCare` is that store action, the same one the
+    // rail-owned depth surface states above.
     if let stencil = fixture.stencil {
         guard let texture = stencilTarget, let attachment = pass.stencilAttachment else {
             throw OracleError("\(definition.id): cannot reach the stencil attachment")
@@ -3215,7 +3337,7 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.texture = texture
         attachment.loadAction = .clear
         attachment.clearStencil = stencil.clearValue
-        attachment.storeAction = .dontCare
+        attachment.storeAction = stencil.store == nil ? .dontCare : .store
     }
     guard let commandBuffer = queue.makeCommandBuffer() else {
         throw OracleError("\(definition.id): cannot create a command buffer")
@@ -3442,6 +3564,49 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         }
         if let differing {
             throw OracleError("\(definition.id): depth texels \(hex(observed)) do not match "
+                              + "the reviewed expectation \(hex(store.expected)) "
+                              + "(first differing byte at offset \(differing))")
+        }
+        writebacks.append(Writeback(allocation: store.allocation, view: store.view,
+                                    offset: 0, bytes_hex: hex(observed)))
+        allocations.append(AllocationResult(allocation: store.allocation,
+                                             bytes_hex: hex(observed)))
+    }
+    // A stored stencil surface reports its texels through the same channel
+    // (`research/docs/23` §3.3, v49): one writeback for the stencil view at
+    // offset zero and one allocation observation, one byte per `stencil8`
+    // texel rather than the depth sibling's four — so the readback is
+    // `width * height` bytes with the surface's own `width` as the row pitch.
+    // It is appended after the colour attachments and after the depth surface,
+    // which is the report's `(allocation, view)` order for this shape: the
+    // case's colour landing (900/910) sorts before its stencil landing
+    // (940/951). The comparison reports the first differing byte and both
+    // sides, the same shape the colour and depth readbacks above use.
+    if let stencil = fixture.stencil, let store = stencil.store {
+        guard let texture = stencilTarget else {
+            throw OracleError("\(definition.id): the stored stencil attachment left the pass")
+        }
+        var observed = Data(count: stencil.width * stencil.height)
+        observed.withUnsafeMutableBytes { bytes in
+            if let destination = bytes.baseAddress {
+                texture.getBytes(destination,
+                                 bytesPerRow: stencil.width,
+                                 from: MTLRegionMake2D(0, 0, stencil.width, stencil.height),
+                                 mipmapLevel: 0)
+            }
+        }
+        try require(observed.count == store.expected.count,
+                    "\(definition.id): the stencil attachment read back \(observed.count) bytes "
+                    + "against the reviewed expectation's \(store.expected.count)")
+        var differing: Int?
+        for (offset, pair) in zip(store.expected, observed).enumerated() {
+            if pair.0 != pair.1 {
+                differing = offset
+                break
+            }
+        }
+        if let differing {
+            throw OracleError("\(definition.id): stencil texels \(hex(observed)) do not match "
                               + "the reviewed expectation \(hex(store.expected)) "
                               + "(first differing byte at offset \(differing))")
         }

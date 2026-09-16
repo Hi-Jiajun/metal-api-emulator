@@ -14,11 +14,11 @@ use metal_api_core::provider::{
     InitialState, LoadOp, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
     PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
     RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, ResourceTableSnapshot,
-    SemanticDigest, ShaderSource, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-    StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
+    RenderPassDescriptor, RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity,
+    ResourceTableSnapshot, SemanticDigest, ShaderSource, StencilCompare, StencilFormat,
+    StencilLoadOp, StencilOp, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1364,6 +1364,24 @@ struct StencilAttachmentDefinition {
     /// The value a `"clear"` load starts from; absent for any other load.
     #[serde(default)]
     clear_value: Option<u8>,
+    /// The store action the pass states (`research/docs/23` §3.3, v49), or
+    /// absent for the rail-owned shape: the surface disappears with the pass
+    /// and nothing observes its texels.
+    #[serde(default)]
+    store: Option<String>,
+    /// The allocation the stored stencil texels land in. Present exactly when
+    /// `store` is, together with `view` and `expected_hex`.
+    #[serde(default)]
+    allocation: Option<u64>,
+    /// The view inside that allocation the landing covers.
+    #[serde(default)]
+    view: Option<u64>,
+    /// The stencil texels the readback has to carry, as lowercase hex — one
+    /// byte per texel. The fixture states them because the comparison is
+    /// byte-exact: a rail that skipped the store, the readback or the draw's
+    /// stencil write lands other bytes and fails here.
+    #[serde(default)]
+    expected_hex: Option<String>,
 }
 
 /// The stencil state a render case's draw tests and writes with
@@ -2251,6 +2269,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v28") => &[
             "render_declaring_quad_extent",
             "render_declaring_depth_store",
+            "render_declaring_stencil_store",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -2292,6 +2311,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
                 .into_iter()
                 .map(|attachment| (attachment.allocation, attachment.view))
                 .chain(case.depth.as_ref().and_then(depth_attachment_identity))
+                .chain(case.stencil.as_ref().and_then(stencil_attachment_identity))
         })
         .collect::<BTreeSet<_>>();
     for case in &suite.cases {
@@ -2464,6 +2484,15 @@ fn render_case_attachments(case: &RenderCase) -> Vec<&RenderAttachmentDefinition
 /// would land.
 fn depth_attachment_identity(depth: &DepthAttachmentDefinition) -> Option<(u64, u64)> {
     match (depth.store.as_deref(), depth.allocation, depth.view) {
+        (Some("store"), Some(allocation), Some(view)) => Some((allocation, view)),
+        _ => None,
+    }
+}
+
+/// The identity a render case's stored stencil attachment lands in
+/// (`research/docs/23` §3.3, v49), or `None` for the rail-owned shape.
+fn stencil_attachment_identity(stencil: &StencilAttachmentDefinition) -> Option<(u64, u64)> {
+    match (stencil.store.as_deref(), stencil.allocation, stencil.view) {
         (Some("store"), Some(allocation), Some(view)) => Some((allocation, view)),
         _ => None,
     }
@@ -3009,6 +3038,72 @@ fn reviewed_depth_geometry(
                  the stored value on failure and increments it with wraparound on success"
             )
             .into());
+        }
+        // The stencil readback pair (`research/docs/23` §3.3, v49): a pass that
+        // keeps its stencil surface states its store action, where the texels
+        // land and what the readback has to contain, and states all three
+        // together. The expectation must be the surface's own one-byte-per-texel
+        // extent and must differ from the clear value, or "the store ran" and
+        // "the surface was never written" would read back the same bytes.
+        let stencil_extent = stencil
+            .width
+            .checked_mul(stencil.height)
+            .ok_or("stencil extent overflows")?;
+        match (&stencil.store, &stencil.expected_hex) {
+            (None, None) => {
+                if stencil.allocation.is_some() || stencil.view.is_some() {
+                    return Err(format!(
+                        "{where_}: a discarded stencil attachment carries no identity or expectation"
+                    )
+                    .into());
+                }
+            }
+            (Some(store), Some(expected_hex)) => {
+                if store != "store" {
+                    return Err(format!(
+                        "{where_}: the only stencil store action is \"store\", got {store:?}"
+                    )
+                    .into());
+                }
+                let (Some(allocation), Some(view)) = (stencil.allocation, stencil.view) else {
+                    return Err(format!(
+                        "{where_}: a stored stencil attachment needs its allocation and view"
+                    )
+                    .into());
+                };
+                if allocation == 0 || view == 0 {
+                    return Err(format!("{where_}: zero stencil identity").into());
+                }
+                let texels = unhex(expected_hex)?;
+                if texels.len() as u64 != stencil_extent {
+                    return Err(format!(
+                        "{where_}: the expected stencil texels do not match the stencil extent"
+                    )
+                    .into());
+                }
+                let clear = stencil.clear_value.unwrap_or(0);
+                if texels.iter().all(|texel| *texel == clear) {
+                    return Err(format!(
+                        "{where_}: the expected stencil texels equal the clear value"
+                    )
+                    .into());
+                }
+                if let Some(attachment) = &case.attachment {
+                    if attachment.allocation == allocation && attachment.view == view {
+                        return Err(format!(
+                            "{where_}: the stencil identity has to differ from the colour attachment"
+                        )
+                        .into());
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{where_}: the stencil store action, its identity and its expectation travel \
+                     together"
+                )
+                .into())
+            }
         }
     }
     let stream = &layout.buffers[0];
@@ -4651,6 +4746,16 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4), (2, "read", 64)][..],
         ),
+        // v49: the same read pair with the *stencil* surface's own one-byte
+        // extent (4x4 texels = 16 bytes) as the third read binding, so one
+        // submission declares the colour attachment's view and the stencil
+        // landing the render pass stores into.
+        "render_declaring_stencil_store" => (
+            "copy_word_with_witness",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 64), (1, "write", 4), (2, "read", 16)][..],
+        ),
         "render_declaring_four_attachments" => (
             "mrt_declare4",
             [1, 1, 1],
@@ -5562,6 +5667,38 @@ fn case_stencil(
                 width: stencil.width,
                 height: stencil.height,
                 load,
+                // The v49 pair travels together (`research/docs/23` §3.3): a
+                // pass that keeps its stencil surface names where the texels
+                // land, and the reviewed shape is validated before this point.
+                store: match stencil.store.as_deref() {
+                    None => None,
+                    Some("store") => Some(StoreOp::Store),
+                    Some("dontcare") => Some(StoreOp::DontCare),
+                    Some(other) => {
+                        return Err(
+                            format!("{where_}: unsupported stencil store action {other:?}").into(),
+                        )
+                    }
+                },
+                identity: match (stencil.store.is_some(), stencil.allocation, stencil.view) {
+                    (true, Some(allocation), Some(view)) => Some(RenderStencilIdentity {
+                        allocation_id: AllocationId::new(allocation),
+                        view_id: ViewId::new(view),
+                    }),
+                    (true, ..) => {
+                        return Err(format!(
+                            "{where_}: a stored stencil attachment needs its allocation and view"
+                        )
+                        .into())
+                    }
+                    (false, None, None) => None,
+                    (false, ..) => {
+                        return Err(format!(
+                            "{where_}: a discarded stencil attachment carries no identity"
+                        )
+                        .into())
+                    }
+                },
             })
         }
     };
@@ -5722,6 +5859,54 @@ fn run_render_case(
     // view — the reviewed kernel carries a third read binding for it — so the
     // view is in the trace's pool and its offset and length are the ones the
     // writeback has to cover.
+    // The stored stencil attachment's own landing view (`research/docs/23`
+    // §3.3, v49): its identity resolves against the declaring pass's table
+    // exactly as the depth landing's does, because the stencil texels leave
+    // through the same byte-keyed writeback channel.
+    let stencil_view = match case
+        .stencil
+        .as_ref()
+        .and_then(|stencil| stencil.store.as_deref())
+    {
+        None => None,
+        Some("store") => {
+            let definition = case
+                .stencil
+                .as_ref()
+                .ok_or("a stored stencil attachment needs its definition")?;
+            let allocation = definition
+                .allocation
+                .ok_or("a stored stencil attachment needs its allocation")?;
+            let view = definition
+                .view
+                .ok_or("a stored stencil attachment needs its view")?;
+            Some(
+                views
+                    .iter()
+                    .find(|candidate| {
+                        candidate.view_id == ViewId::new(view)
+                            && candidate.allocation_id == AllocationId::new(allocation)
+                    })
+                    .cloned()
+                    .ok_or_else(|| -> Box<dyn Error> {
+                        format!(
+                            "the declaring pass does not declare the stencil view {view} of \
+                             render case {}",
+                            case.id
+                        )
+                        .into()
+                    })?,
+            )
+        }
+        Some(other) => {
+            return Err(format!(
+                "render case {}: unsupported stencil store action {other:?}",
+                case.id
+            )
+            .into())
+        }
+    };
+
     let depth_view = match case.depth.as_ref().and_then(|depth| depth.store.as_deref()) {
         None => None,
         Some("store") => {
@@ -5926,6 +6111,7 @@ fn run_render_case(
         if declared_views
             .iter()
             .chain(depth_view.iter())
+            .chain(stencil_view.iter())
             .any(|view| view.view_id == write.view_id && view.allocation_id == write.allocation_id)
         {
             landed.insert((write.allocation_id, write.view_id), write);
@@ -6037,6 +6223,67 @@ fn run_render_case(
             .iter()
             .find(|(id, _)| *id == allocation)
             .ok_or("the depth allocation is missing")?
+            .1
+            .clone();
+        writebacks.push(Writeback {
+            allocation,
+            view,
+            offset: write.offset,
+            bytes_hex: hex(&write.bytes),
+        });
+        images.push(Allocation {
+            allocation,
+            bytes_hex: hex(&image),
+        });
+    }
+    // The stored stencil attachment's own landing, after the depth one
+    // (`research/docs/23` §3.3, v49): one writeback covering the exact view the
+    // declaring pass declared, and one allocation image holding that view's
+    // bytes.
+    if let Some(declared) = &stencil_view {
+        let definition = case
+            .stencil
+            .as_ref()
+            .ok_or("a stored stencil attachment needs its definition")?;
+        let allocation = definition
+            .allocation
+            .ok_or("a stored stencil attachment needs its allocation")?;
+        let view = definition
+            .view
+            .ok_or("a stored stencil attachment needs its view")?;
+        let write = landed
+            .get(&(AllocationId::new(allocation), ViewId::new(view)))
+            .ok_or("the render rail landed no stencil writeback")?;
+        if write.offset != declared.offset || write.bytes.len() as u64 != declared.length {
+            return Err(format!(
+                "render case {}: the stencil writeback covers {}..{} instead of {}..{}",
+                case.id,
+                write.offset,
+                write.offset + write.bytes.len() as u64,
+                declared.offset,
+                declared.offset + declared.length
+            )
+            .into());
+        }
+        let expected = unhex(
+            definition
+                .expected_hex
+                .as_deref()
+                .ok_or("a stored stencil attachment needs expected_hex")?,
+        )?;
+        if write.bytes != expected {
+            return Err(format!(
+                "render case {}: the stencil readback is {} against the reviewed {}",
+                case.id,
+                hex(&write.bytes),
+                hex(&expected)
+            )
+            .into());
+        }
+        let image = allocations
+            .iter()
+            .find(|(id, _)| *id == allocation)
+            .ok_or("the stencil allocation is missing")?
             .1
             .clone();
         writebacks.push(Writeback {
@@ -6574,6 +6821,22 @@ fn run_object_render_case(
         // declares.
         let object_stencil = {
             let (stencil, test) = case_stencil(case, &format!("render case {}", case.id))?;
+            // The identity the recording names is the *object* view the
+            // declaring pass bound, exactly as the depth landing does
+            // (`research/docs/23` §3.3, v44/v49). It is resolved before the
+            // conversion because the lookup can fail.
+            let object_identity = match stencil.as_ref().and_then(|stencil| stencil.identity) {
+                Some(identity) => {
+                    let (_, view) = resources
+                        .get(&identity.view_id.get())
+                        .ok_or("the declaring pass does not declare the stencil view")?;
+                    Some(RenderStencilIdentity {
+                        allocation_id: view.allocation_id(),
+                        view_id: view.view_id(),
+                    })
+                }
+                None => None,
+            };
             (
                 stencil.map(|stencil| objects::RenderStencilAttachment {
                     width: stencil.width,
@@ -6586,6 +6849,8 @@ fn run_object_render_case(
                             objects::RenderStencilLoad::Load
                         }
                     },
+                    store: stencil.store,
+                    identity: object_identity,
                 }),
                 test.map(|test| objects::RenderStencilTest {
                     compare: test.compare,
@@ -6880,6 +7145,71 @@ fn run_object_render_case(
             let image = allocation_buffers
                 .get(&allocation)
                 .ok_or("the depth allocation is missing")?
+                .read()?;
+            writebacks.push(Writeback {
+                allocation,
+                view,
+                offset: landed.offset,
+                bytes_hex: hex(&landed.bytes),
+            });
+            images_report.push(Allocation {
+                allocation,
+                bytes_hex: hex(&image),
+            });
+        }
+    }
+    // The stored stencil attachment's own landing (`research/docs/23` §3.3,
+    // v49), reported exactly as the trace rail reports it.
+    if let Some(definition) = &case.stencil {
+        if definition.store.as_deref() == Some("store") {
+            let allocation = definition
+                .allocation
+                .ok_or("a stored stencil attachment needs its allocation")?;
+            let view = definition
+                .view
+                .ok_or("a stored stencil attachment needs its view")?;
+            let landed = output
+                .writebacks
+                .iter()
+                .find(|write| {
+                    report_ids.get(&(write.allocation_id, write.view_id))
+                        == Some(&(allocation, view))
+                })
+                .ok_or("the object render rail landed no stencil writeback")?;
+            let declared = declaring
+                .buffers
+                .iter()
+                .find(|buffer| buffer.allocation == allocation && buffer.view == view)
+                .ok_or("the declaring pass does not declare the stencil attachment view")?;
+            if landed.offset != declared.offset || landed.bytes.len() as u64 != declared.length {
+                return Err(format!(
+                    "render case {}: the stencil writeback covers {}..{} instead of {}..{}",
+                    case.id,
+                    landed.offset,
+                    landed.offset + landed.bytes.len() as u64,
+                    declared.offset,
+                    declared.offset + declared.length
+                )
+                .into());
+            }
+            let expected = unhex(
+                definition
+                    .expected_hex
+                    .as_deref()
+                    .ok_or("a stored stencil attachment needs expected_hex")?,
+            )?;
+            if landed.bytes != expected {
+                return Err(format!(
+                    "render case {}: the stencil readback is {} against the reviewed {}",
+                    case.id,
+                    hex(&landed.bytes),
+                    hex(&expected)
+                )
+                .into());
+            }
+            let image = allocation_buffers
+                .get(&allocation)
+                .ok_or("the stencil allocation is missing")?
                 .read()?;
             writebacks.push(Writeback {
                 allocation,

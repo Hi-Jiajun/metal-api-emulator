@@ -2252,6 +2252,20 @@ pub struct RenderStencilAttachment {
     pub height: u64,
     /// How the pass establishes the attachment's contents.
     pub load: StencilLoadOp,
+    /// The store action the pass asks for, or `None` for the rail-owned shape
+    /// every pre-v49 trace means (`research/docs/23` §3.3, v49): the surface
+    /// disappears with the pass, exactly as [`StoreOp::DontCare`] states it.
+    ///
+    /// A storing surface needs an [`identity`](Self::identity) as well, and an
+    /// identity needs a storing surface: the pair is all-or-nothing, the same
+    /// rule the depth attachment states since v43.
+    pub store: Option<StoreOp>,
+    /// The stored surface's resource identity, present exactly when the trace
+    /// observes the texels (`research/docs/23` §3.3, v49). The bytes land
+    /// through the same writeback channel a colour or depth attachment uses:
+    /// one [`BufferWriteback`] for the view at its own offset inside the
+    /// allocation, one byte per stencil texel.
+    pub identity: Option<RenderStencilIdentity>,
 }
 
 impl RenderStencilAttachment {
@@ -2264,6 +2278,24 @@ impl RenderStencilAttachment {
                 "stencil attachment bytes",
             ))
     }
+
+    /// Whether the pass keeps this surface, which is what makes it observable.
+    pub fn is_stored(&self) -> bool {
+        self.store == Some(StoreOp::Store)
+    }
+}
+
+/// The resource identity of a stored stencil attachment
+/// (`research/docs/23` §3.3, v49).
+///
+/// The depth side's [`RenderDepthIdentity`] one byte wide: the allocation the
+/// stored texels land in, and the view inside it the landing covers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderStencilIdentity {
+    /// The allocation the stored stencil texels land in.
+    pub allocation_id: AllocationId,
+    /// The view inside that allocation the landing covers.
+    pub view_id: ViewId,
 }
 
 /// `VK_FORMAT_S8_UINT` and `MTLPixelFormatStencil8` both carry one byte per
@@ -2591,6 +2623,30 @@ impl RenderPassDescriptor {
                     viewport: [width, height],
                     stencil: [stencil.width, stencil.height],
                 });
+            }
+            // The store action and the identity are one decision in two fields,
+            // exactly as the depth attachment states them since v43
+            // (`research/docs/23` §3.3, v43/v49).
+            match (stencil.store, stencil.identity) {
+                (None, None) | (Some(StoreOp::DontCare), None) => {}
+                (None, Some(_))
+                | (Some(StoreOp::Store), None)
+                | (Some(StoreOp::DontCare), Some(_)) => {
+                    return Err(ContractError::StencilStoreIdentityMismatch {
+                        store: stencil.store,
+                        identity: stencil.identity.is_some(),
+                    });
+                }
+                (Some(StoreOp::Store), Some(identity)) => {
+                    if identity.allocation_id.is_zero() {
+                        return Err(ContractError::InvalidIdentity(
+                            "stencil attachment allocation id",
+                        ));
+                    }
+                    if identity.view_id.is_zero() {
+                        return Err(ContractError::InvalidIdentity("stencil attachment view id"));
+                    }
+                }
             }
         }
         // A stencil test without a stencil attachment has nothing to test
@@ -4764,6 +4820,42 @@ impl DeclaredView {
             }),
         }
     }
+
+    /// Whether this declaration describes the extent a stored stencil
+    /// attachment restates (`research/docs/23` §3.3, v49), or the refusal that
+    /// names the disagreement.
+    ///
+    /// Only a buffer declaration can cover a stencil landing, for the same
+    /// reason the depth landing needs one: the attachment's texels leave
+    /// through the byte-keyed writeback channel, one byte per texel.
+    fn admit_stencil_extent(
+        self,
+        pass_index: usize,
+        stencil: &RenderStencilAttachment,
+        view: ViewId,
+    ) -> Result<(), ContractError> {
+        let expected = stencil.expected_bytes()?;
+        match self {
+            Self::Buffer { length, .. } => {
+                if expected == length {
+                    Ok(())
+                } else {
+                    Err(ContractError::AttachmentExtentMismatch {
+                        pass_index,
+                        view,
+                        expected,
+                        declared: length,
+                    })
+                }
+            }
+            Self::Texture { .. } => Err(ContractError::AttachmentExtentMismatch {
+                pass_index,
+                view,
+                expected,
+                declared: self.extent_bytes(),
+            }),
+        }
+    }
 }
 
 impl ComputeTrace {
@@ -5164,6 +5256,30 @@ impl ComputeTrace {
                 &|declaration| declaration.admit_depth_extent(pass_index, depth, identity.view_id),
             )?;
         }
+        // A stored stencil attachment that names its landing is the same shape
+        // one byte wide (`research/docs/23` §3.3, v49): the same declaration
+        // rules, with the stencil surface's own byte extent.
+        for (pass_index, pass) in self.passes.iter().enumerate() {
+            let Some(render) = pass.as_render() else {
+                continue;
+            };
+            let Some(stencil) = render.stencil.as_ref() else {
+                continue;
+            };
+            let Some(identity) = stencil.identity else {
+                continue;
+            };
+            Self::admit_attachment_view(
+                &declared,
+                &mut pool,
+                pass_index,
+                identity.view_id,
+                identity.allocation_id,
+                &|declaration| {
+                    declaration.admit_stencil_extent(pass_index, stencil, identity.view_id)
+                },
+            )?;
+        }
         // Render vertex and index buffers declare their own bytes, so the only
         // questions left are the ones an ordering rule answers: no compute
         // binding may write bytes the draw reads, and no compute pass after the
@@ -5286,6 +5402,29 @@ impl ComputeTrace {
                 .as_ref()
                 .filter(|depth| depth.is_stored())
                 .and_then(|depth| depth.identity)
+            else {
+                continue;
+            };
+            let Some(&position) = positions.get(&identity.view_id) else {
+                continue;
+            };
+            let resource = &mut resources[position];
+            resource.access = match resource.access {
+                BufferAccess::Unused => BufferAccess::Write,
+                BufferAccess::Read => BufferAccess::ReadWrite,
+                BufferAccess::Write | BufferAccess::ReadWrite => resource.access,
+            };
+        }
+        // A stored stencil attachment is a landing too (`research/docs/23`
+        // §3.3, v49): its view leaves through the same byte-keyed writeback
+        // channel, so the view it was declared with has to be writable before
+        // the pool is uploaded.
+        for pass in self.render_passes() {
+            let Some(identity) = pass
+                .stencil
+                .as_ref()
+                .filter(|stencil| stencil.is_stored())
+                .and_then(|stencil| stencil.identity)
             else {
                 continue;
             };
@@ -6726,6 +6865,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::UnsupportedStencilFormat(_)
         | E::StencilExtentMismatch { .. }
         | E::StencilTestWithoutAttachment
+        | E::StencilStoreIdentityMismatch { .. }
         | E::BlendAttachmentCountMismatch { .. } => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
@@ -8177,6 +8317,13 @@ pub enum ContractError {
     /// The pass declares stencil state but carries no stencil attachment
     /// (`research/docs/23` §3.3, v47).
     StencilTestWithoutAttachment,
+    /// The pass's stencil store action and stencil identity disagree
+    /// (`research/docs/23` §3.3, v49). The depth sibling's rule one byte wide:
+    /// `Store` needs a landing, and a landing needs `Store`.
+    StencilStoreIdentityMismatch {
+        store: Option<StoreOp>,
+        identity: bool,
+    },
     /// The pass's depth store action and depth identity disagree
     /// (`research/docs/23` §3.3, v43).
     ///
@@ -8731,6 +8878,12 @@ impl fmt::Display for ContractError {
             Self::StencilTestWithoutAttachment => write!(
                 formatter,
                 "a stencil test needs a stencil attachment: there is nothing to test against"
+            ),
+            Self::StencilStoreIdentityMismatch { store, identity } => write!(
+                formatter,
+                "a stencil store action ({store:?}) and a stencil identity ({}) have to be stated \
+                 together: a stored surface needs a landing, and a landing needs a stored surface",
+                if *identity { "present" } else { "absent" }
             ),
             Self::BlendAttachmentCountMismatch {
                 blend,
