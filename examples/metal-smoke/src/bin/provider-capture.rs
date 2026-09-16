@@ -7082,7 +7082,7 @@ fn run_object_render_case(
                 }),
             )
         };
-        if case.depth.is_some() {
+        if case.depth.is_some() && case.multisample.is_none() {
             // The reviewed depth case opens the surface through the object
             // API's depth entry (`research/docs/23` §3.3, v36/v37): the pass
             // descriptor the trace rails carry and the object rail's own draw
@@ -7135,6 +7135,68 @@ fn run_object_render_case(
                 depth_test,
                 present,
             )?;
+        } else if let Some(multisample) = case_multisample(case)? {
+            // The reviewed multisample case runs on the object rails too
+            // (`research/docs/23` §3.3, v51/v52): the encoder records the same
+            // pass-wide raster the trace contract names, so the pass it
+            // becomes is the one the other rails execute. A case that also
+            // opens a depth surface takes the combined entry (`§3.3`, v53/v54)
+            // — the rail-owned surface the pass tests and writes, never keeps.
+            //
+            // A stencil surface beside the raster is refused by the contract
+            // (`MultisampleSurfaceUnsupported`), and the recording entries
+            // would silently drop it: refusing here keeps this rail from
+            // recording a pass the other rails would never execute.
+            if case.stencil.is_some() {
+                return Err(format!(
+                    "render case {}: a multisample raster does not execute a stencil surface",
+                    case.id
+                )
+                .into());
+            }
+            let (depth, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
+            match depth {
+                Some(depth) => {
+                    let object_depth = objects::RenderDepthAttachment {
+                        width: depth.width,
+                        height: depth.height,
+                        load: match depth.load {
+                            DepthLoadOp::Clear(bits) => {
+                                objects::RenderDepthLoad::Clear(f32::from_bits(bits))
+                            }
+                            DepthLoadOp::Load => objects::RenderDepthLoad::Load,
+                        },
+                        store: depth.store,
+                        identity: None,
+                    };
+                    let object_depth_test = depth_test.map(|test| objects::RenderDepthTest {
+                        compare: test.compare,
+                        write: test.write,
+                    });
+                    render.draw_indexed_primitives_with_multisample_depth(
+                        &recorded,
+                        width,
+                        height,
+                        index_count,
+                        u32::try_from(case.instance_count)?,
+                        object_depth,
+                        object_depth_test,
+                        multisample,
+                        present,
+                    )?;
+                }
+                None => {
+                    render.draw_indexed_primitives_with_multisample(
+                        &recorded,
+                        width,
+                        height,
+                        index_count,
+                        u32::try_from(case.instance_count)?,
+                        multisample,
+                        present,
+                    )?;
+                }
+            }
         } else if let (Some(stencil), stencil_test) = &object_stencil {
             // The reviewed stencil case runs on the object rails too
             // (`research/docs/23` §3.3, v47/v48): the encoder records the same
@@ -7189,20 +7251,6 @@ fn run_object_render_case(
                 index_count,
                 u32::try_from(case.base_vertex)?,
                 u32::try_from(case.instance_count)?,
-                present,
-            )?;
-        } else if let Some(multisample) = case_multisample(case)? {
-            // The reviewed multisample case runs on the object rails too
-            // (`research/docs/23` §3.3, v51/v52): the encoder records the same
-            // pass-wide raster the trace contract names, so the pass it becomes
-            // is the one the other rails execute.
-            render.draw_indexed_primitives_with_multisample(
-                &recorded,
-                width,
-                height,
-                index_count,
-                u32::try_from(case.instance_count)?,
-                multisample,
                 present,
             )?;
         } else if case.instance_count > 1 {

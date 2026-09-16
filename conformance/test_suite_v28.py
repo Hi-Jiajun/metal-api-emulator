@@ -280,9 +280,11 @@ CULL_RAILS = ALL_RAILS
 # state on both object rails, so the marker widens to every rail
 # (`research/docs/23` §3.3, v51/v52).
 MSAA_RAILS = ALL_RAILS
-# The depth-tested sibling is the trace rails' own first increment
-# (`research/docs/23` §3.3, v53).
-MSAA_DEPTH_RAILS = TRACE_RAILS
+# The depth-tested sibling named the three trace rails first; the v54 recording
+# entry (`draw_indexed_primitives_with_multisample_depth`) carries the same two
+# halves on both object rails, so the marker widens to every rail
+# (`research/docs/23` §3.3, v53/v54).
+MSAA_DEPTH_RAILS = ALL_RAILS
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
