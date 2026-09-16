@@ -6375,6 +6375,10 @@ fn run_render_case(
         ],
         scissor,
         multisample,
+        // No reviewed case states the depth resolve yet (`research/docs/23`
+        // §3.3, v57): the capture leaves the field absent, which the rails
+        // execute as the API default filter.
+        depth_resolve: None,
         vertices: u32::try_from(case.vertices)?,
         vertex_buffers,
         indices,

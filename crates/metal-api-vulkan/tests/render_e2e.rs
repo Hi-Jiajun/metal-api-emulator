@@ -158,6 +158,7 @@ fn render_pass(
     RenderPassDescriptor {
         blend: None,
         multisample: None,
+        depth_resolve: None,
         cull: None,
         depth: None,
         depth_test: None,
@@ -587,6 +588,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
             TracePass::Render(RenderPassDescriptor {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 depth_test: None,
@@ -775,6 +777,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
             TracePass::Render(RenderPassDescriptor {
                 blend: None,
                 multisample: None,
+                depth_resolve: None,
                 cull: None,
                 depth: None,
                 depth_test: None,

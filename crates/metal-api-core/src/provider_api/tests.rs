@@ -193,6 +193,11 @@ impl ComputeProvider for FakeProvider {
             // render ones (`research/docs/23` §3.3, v51/v52).
             supports_render_multisample: self.render,
             max_render_sample_count: if self.render { 4 } else { 0 },
+            // The fixture provider does not execute the depth resolve yet, so
+            // both bits keep the "cannot resolve" defaults and a resolving pass
+            // is refused during admission (`research/docs/23` §3.3, v57).
+            supports_render_depth_resolve: false,
+            depth_resolve_modes: 0,
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self
