@@ -44,6 +44,10 @@ ALLOCATION_OBSERVATIONS = {
 # the `"min"`/`"max"` depth resolve filter a capture has to carry in its
 # `depth_resolve_modes` mask for the case to appear, or `None` for a case every
 # rail its marker names reports unconditionally.
+# `wildcards` maps each observed attachment's `(allocation, view, offset)`
+# identity to a dict of its own byte offsets: `None` is a byte the case leaves
+# unclaimed (`research/docs/23` §3.3, v33), and a tuple is the closed candidate
+# set a constrained wildcard texel may carry (`research/docs/23` §3.3, v67).
 RenderExpectation = namedtuple(
     "RenderExpectation",
     "writes allocations touched written rails attachment present icb wildcards filter "
@@ -126,23 +130,38 @@ def _list(value, where):
     return value
 
 
-def _same_bytes(actual, expected, where, offset=0, wildcards=frozenset()):
-    """Compare two byte strings, skipping the offsets the case leaves wild.
+def _same_bytes(actual, expected, where, offset=0, wildcards=frozenset(), allowed=None):
+    """Compare two byte strings against the case's claim on each byte.
 
-    `offset` is where the compared range starts inside its allocation, and
+    `offset` is where the compared range starts inside its allocation.
     `wildcards` holds absolute allocation offsets whose bytes the case does not
-    claim (`research/docs/23` §3.3, v33). A byte at a wild offset is neither
-    compared nor used to build an error message: the case said in advance that
-    what landed there is undefined.
+    claim (`research/docs/23` §3.3, v33): a byte at a wild offset is neither
+    compared nor used to build an error message, because the case said in
+    advance that what landed there is undefined. `allowed` maps absolute
+    offsets to the closed set of byte values a *constrained* wildcard texel may
+    carry (`research/docs/23` §3.3, v67): the measured byte has to be one of
+    them, and a byte outside the set is refused with the same first-differing
+    shape the exact comparison uses.
     """
     _require(len(actual) == len(expected),
              f"{where}: length mismatch: expected {len(expected)} bytes, got {len(actual)}")
+    allowed = allowed or {}
     for index, (left, right) in enumerate(zip(actual, expected)):
-        if offset + index in wildcards:
+        position = offset + index
+        if position in wildcards:
             continue
+        candidates = allowed.get(position)
+        if candidates is not None:
+            if left in candidates:
+                continue
+            raise CaptureError(
+                f"{where}: first differing byte at offset {position}: "
+                f"got 0x{left:02x}, which is none of "
+                + ", ".join(f"0x{candidate:02x}" for candidate in candidates)
+            )
         if left != right:
             raise CaptureError(
-                f"{where}: first differing byte at offset {offset + index}: "
+                f"{where}: first differing byte at offset {position}: "
                 f"expected 0x{right:02x}, got 0x{left:02x}"
             )
 
@@ -173,8 +192,13 @@ def _compare_observation(result, expected_writes, expected_allocations, where,
     wildcards = wildcards or {}
     for (identity, actual), (_, expected) in zip(actual_writes, expected_writes):
         allocation, view, offset = identity
+        claims = wildcards.get(identity, {})
+        skips = frozenset(position for position, candidates in claims.items()
+                          if candidates is None)
+        allows = {position: candidates for position, candidates in claims.items()
+                  if candidates is not None}
         _same_bytes(actual, expected, f"{where} writeback allocation {allocation}/view {view}",
-                    offset, wildcards.get(identity, frozenset()))
+                    offset, skips, allows)
 
     seen_allocations = set()
     for value in _list(result["allocations"], f"{where}.allocations"):
@@ -184,14 +208,17 @@ def _compare_observation(result, expected_writes, expected_allocations, where,
         _require(allocation in expected_allocations, f"{where}: unknown allocation {allocation}")
         seen_allocations.add(allocation)
         actual = _hex(value["bytes_hex"], f"{where} allocation {allocation}.bytes_hex")
-        skipped = frozenset(
-            index
-            for identity, offsets in wildcards.items()
-            if identity[0] == allocation
-            for index in offsets
-        )
+        skipped, allowed = set(), {}
+        for identity, claims in wildcards.items():
+            if identity[0] != allocation:
+                continue
+            for position, candidates in claims.items():
+                if candidates is None:
+                    skipped.add(position)
+                else:
+                    allowed[position] = candidates
         _same_bytes(actual, expected_allocations[allocation],
-                    f"{where} allocation {allocation}", 0, skipped)
+                    f"{where} allocation {allocation}", 0, frozenset(skipped), allowed)
     missing = set(expected_allocations) - seen_allocations
     _require(not missing, f"{where}: missing allocations {sorted(missing)}")
 
@@ -1409,6 +1436,105 @@ def _resolve_texel(fragment, clear, covered, samples):
     return bytes(resolved)
 
 
+def _mix_candidates(fragment, clear, samples):
+    """Every exact k-of-`samples` mix of two colours (`research/docs/23` §3.3, v67).
+
+    A constrained wildcard texel of a multisample raster may carry the resolve
+    of a texel whose covered samples the draw wrote and whose other samples
+    stayed at the pass's reference colour, so its candidate set is the closed
+    set of mixtures those two colours produce. A mixture whose channels are not
+    exactly representable is not a value any resolve of the reviewed shape may
+    produce and is left out (`_resolve_texel` answers `None`), which keeps the
+    set independent of a driver's rounding rule. `samples=1` is the single
+    sample shape: the two colours themselves.
+    """
+    candidates = set()
+    for covered in range(samples + 1):
+        resolved = _resolve_texel(fragment, clear, covered, samples)
+        if resolved is not None:
+            candidates.add(resolved)
+    return candidates
+
+
+def _wildcard_allowed_texels(case, where):
+    """Parse the constrained wildcard channel (`research/docs/23` §3.3, v67).
+
+    The unconstrained list (`wildcard_texels`, v33) names bytes the case does
+    not claim at all: whatever the rail left is accepted. This channel names
+    the same positions but states, in advance, the *closed* set of byte values
+    each one may carry — a resolved texel is one of the exact mixes its
+    reference colours produce, never an arbitrary byte. The two forms are
+    mutually exclusive: a case that states an allowed set may not also declare
+    the same texels unclaimed, or the claim would be whichever the comparator
+    read first. Returns a dict of texel index to a tuple of allowed values in
+    declaration order, or `None` for a case that states none.
+    """
+    declared = case.get("wildcard_allowed_texels")
+    if declared is None:
+        return None
+    declared = _list(declared, f"{where}.wildcard_allowed_texels")
+    _require(declared,
+             f"{where}: an allowed set has to name at least one texel")
+    parsed = {}
+    for position, entry in enumerate(declared):
+        entry_where = f"{where}.wildcard_allowed_texels[{position}]"
+        _object(entry, ("index", "allowed"), entry_where)
+        texel = _integer(entry["index"], f"{entry_where}.index", 0)
+        _require(texel not in parsed, f"{where}: duplicate wildcard texel {texel}")
+        allowed = _list(entry["allowed"], f"{entry_where}.allowed")
+        _require(allowed, f"{entry_where}: an allowed set has to name a value")
+        values = []
+        for value_position, value in enumerate(allowed):
+            value_hex = _string(value, f"{entry_where}.allowed[{value_position}]")
+            value = _hex(value_hex, f"{entry_where}.allowed[{value_position}]")
+            _require(value_hex == value.hex(),
+                     f"{entry_where}.allowed[{value_position}]: an allowed value has to "
+                     "be lowercase bytes")
+            _require(len(value) == 4,
+                     f"{entry_where}.allowed[{value_position}]: a 8-bit texel is four bytes")
+            _require(value not in values,
+                     f"{entry_where}: duplicate allowed value {value_hex}")
+            values.append(value)
+        parsed[texel] = tuple(values)
+    return parsed
+
+
+def _check_allowed_texels(allowed, texel_count, fragment, samples, clear, where):
+    """Hold a constrained wildcard's declared sets to the shape's own mixes.
+
+    `allowed` names the texels whose bytes the case does not pin, and each of
+    them states the closed set its bytes may come from. The shape fixes that
+    set: a resolve of `samples` samples where the draw wrote `k` of them and the
+    rest stayed at the pass's reference colour can only produce the exact
+    k-of-`samples` mixes of the fragment output and that colour, so a declared
+    set has to be exactly those values — a value outside them would accept a
+    byte no reviewed rail may produce, and a missing one would refuse a resolve
+    that is correct (`research/docs/23` §3.3, v67). `samples` is 1 for the
+    single-sample shape, whose mixes are the two colours themselves, and every
+    named texel has to stay inside the attachment's `texel_count` texels.
+    """
+    for texel in allowed:
+        _require(texel < texel_count,
+                 f"{where}: wildcard texel {texel} is outside the attachment")
+    reference = _hex(clear, f"{where} reference colour")
+    _require(len(reference) == 4, f"{where}: a reference colour is four bytes")
+    _require(reference != fragment,
+             f"{where}: a constrained wildcard texel needs a reference colour other "
+             "than the fragment output")
+    candidates = _mix_candidates(fragment, reference, samples)
+    _require(len(candidates) > 1,
+             f"{where}: the fragment output and the reference colour have to differ")
+    for texel, values in allowed.items():
+        for value in values:
+            _require(value in candidates,
+                     f"{where}: texel {texel} states the allowed value 0x{value.hex()}, "
+                     "which is not an exact mix of the fragment output and the reference colour")
+        missing = candidates - set(values)
+        _require(not missing,
+                 f"{where}: texel {texel} leaves out the resolve "
+                 + ", ".join(f"0x{value.hex()}" for value in sorted(missing)))
+
+
 def _render_plan(plan, suite):
     """Plan the render cases of a suite (`research/docs/23` §1.2, §5.2).
 
@@ -1448,7 +1574,8 @@ def _render_plan(plan, suite):
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
-                               "instance_count", "wildcard_texels", "base_vertex",
+                               "instance_count", "wildcard_texels", "wildcard_allowed_texels",
+                               "base_vertex",
                                "depth", "depth_test", "coverage", "cull", "blend",
                                "stencil", "stencil_test", "multisample", "depth_resolve",
                                "requires_depth_resolve_filter", "stencil_resolve",
@@ -1678,6 +1805,23 @@ def _render_plan(plan, suite):
             wildcard_texels = sorted(seen_texels)
             _require(definitions[0].get("store", "store") == "store",
                      f"{where}: a wildcard list needs a stored attachment")
+        else:
+            wildcard_texels = None
+        # The constrained wildcard channel (`research/docs/23` §3.3, v67): the
+        # same shape as the unconstrained list, but every named texel states
+        # the closed set of byte values it may carry instead of leaving the
+        # bytes unclaimed. The shape belongs to a `dontcare` load's undefined
+        # pre-pass contents just as the v33 list does — nothing else makes an
+        # unobserved texel legitimate — and the two forms cannot be stated
+        # together. The per-texel candidate rules (soundness against the
+        # reference mix, completeness, and the multisample shape) are checked
+        # once the attachment loop has parsed the case's colours.
+        wildcard_allowed = _wildcard_allowed_texels(case, where) if single else None
+        if wildcard_allowed is not None:
+            _require(wildcard_texels is None,
+                     f"{where}: the two wildcard channels are mutually exclusive")
+            _require(definitions[0].get("store", "store") == "store",
+                     f"{where}: an allowed set needs a stored attachment")
         # The pass-wide multisample raster (`research/docs/23` §3.3, v51): the
         # first increment reviews one shape — a single colour attachment opened
         # from a clear, four samples, no depth or stencil surface, no present
@@ -1694,9 +1838,16 @@ def _render_plan(plan, suite):
                               f"{where}.multisample.sample_count", 1) in (2, 4, 8),
                      f"{where}: the reviewed multisample rasters are two, four or eight "
                      "samples")
-            _require(case["attachment"].get("load") == "clear",
+            # The attachment's load (`research/docs/23` §3.3, v51/v67): the
+            # reviewed pass opens it from a clear, whose colour is then the
+            # reference every expectation is a resolve of — or, from v67 on,
+            # from `dontcare` while every unclaimed texel states the closed set
+            # its resolve may land in. The free `wildcard_texels` list stays
+            # refused here: a nominal colour the expectation does not mix with
+            # is what the constrained form exists for.
+            _require(case["attachment"].get("load") in ("clear", "dontcare"),
                      f"{where}: the reviewed multisample pass opens its attachment from a "
-                     "clear")
+                     "clear or a dontcare load with constrained wildcard texels")
             # The depth surface beside the raster is admitted from v53 on and
             # the stencil surface from v55 (`research/docs/23` §3.3, v53/v55):
             # both are rail-owned — the pass tests and writes them, but keeping
@@ -1755,8 +1906,15 @@ def _render_plan(plan, suite):
             # reviews the two together (`research/docs/25` §5.2).
             _require("icb" not in case,
                      f"{where}: a multisample case carries no ICB")
+            # A multisample expectation claims every texel it resolves, and a
+            # texel it does *not* claim needs the closed candidate set the
+            # constrained channel states (`research/docs/23` §3.3, v67): a
+            # resolve of undefined pre-pass contents is not free to be any
+            # byte, so the unconstrained list of a single-sample `dontcare`
+            # load has no meaning beside a raster.
             _require(wildcard_texels is None,
-                     f"{where}: the multisample raster claims every texel it resolves")
+                     f"{where}: the multisample raster claims every texel it resolves, or "
+                     "states the closed allowed set of a constrained wildcard texel")
             # The trace rails' footprint proof is the only gate that would
             # notice an offset index span, and no reviewed fixture covers the
             # shape; the object rail has no entry that carries both. Refusing it
@@ -1902,6 +2060,8 @@ def _render_plan(plan, suite):
                 _require(len(clear) == 4, f"{attachment_where}: a clear colour is four bytes")
                 _require("initial_hex" not in attachment,
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
+                _require(wildcard_allowed is None,
+                         f"{attachment_where}: a cleared attachment has no unclaimed texel")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
                 # The combined depth-stencil shape's mixed column carries the
@@ -1939,6 +2099,14 @@ def _render_plan(plan, suite):
                     _require(0 in covered_seen and samples in covered_seen,
                              f"{attachment_where}: a multisample expectation needs both "
                              "a fully covered and an uncovered texel")
+                    # A cleared raster has no unclaimed texel: the colour it
+                    # starts from is the fixture's own, so the expectation can
+                    # pin every byte. The constrained channel exists for the
+                    # `dontcare` load the multisample gate admits beside it
+                    # (`research/docs/23` §3.3, v67).
+                    _require(wildcard_allowed is None,
+                             f"{attachment_where}: a cleared multisample raster has no "
+                             "unclaimed texel")
                 elif coverage == "partial":
                     # The draw covers part of the attachment: every texel is
                     # the fragment output or the colour the pass started from,
@@ -2039,11 +2207,29 @@ def _render_plan(plan, suite):
                 # v33). Without a list the milestone's stricter rule — and its
                 # exact message — stay: the fixture then has no way to say
                 # which bytes it does not claim, so it claims all of them.
-                if wildcard_texels is None:
-                    _require(all(chunk == texel for chunk in texels),
-                             f"{attachment_where}: every texel of a dontcare load has to be "
-                             "the fragment output")
-                else:
+                if wildcard_allowed is not None:
+                    # The constrained channel (`research/docs/23` §3.3, v67):
+                    # the named texels' bytes are the resolve of a raster's
+                    # samples, so beside a raster they are exactly the resolve
+                    # mixes of the case's own colours, and on the single-sample
+                    # shape they are the two colours themselves. Both are the
+                    # closed set the case has to state.
+                    _require("clear_hex" in attachment,
+                             f"{attachment_where}: a constrained wildcard texel needs the "
+                             "reference colour of its mixes")
+                    _check_allowed_texels(
+                        wildcard_allowed, len(texels), texel,
+                        multisample["sample_count"] if multisample is not None else 1,
+                        attachment["clear_hex"], attachment_where)
+                    for position in range(len(texels)):
+                        if position not in wildcard_allowed:
+                            _require(texels[position] == texel,
+                                     f"{attachment_where}: texel {position} of a dontcare load "
+                                     "has to be the fragment output")
+                elif wildcard_texels is not None:
+                    _require(multisample is None,
+                             f"{attachment_where}: a multisample case states the closed "
+                             "allowed set of its unclaimed texels")
                     claimed = [position for position in range(len(texels))
                                if position not in wildcard_texels]
                     _require(claimed,
@@ -2053,8 +2239,16 @@ def _render_plan(plan, suite):
                         _require(texels[position] == texel,
                                  f"{attachment_where}: texel {position} of a dontcare load "
                                  "has to be the fragment output")
-                _require("clear_hex" not in attachment,
-                         f"{attachment_where}: a dontcare load carries no clear colour")
+                else:
+                    # A case that claims every texel states the raster's own
+                    # uniform rule (`research/docs/23` §3.3, v61): every texel
+                    # is the fragment output.
+                    _require(all(chunk == texel for chunk in texels),
+                             f"{attachment_where}: every texel of a dontcare load has to be "
+                             "the fragment output")
+                if wildcard_allowed is None:
+                    _require("clear_hex" not in attachment,
+                             f"{attachment_where}: a dontcare load carries no clear colour")
                 _require("initial_hex" not in attachment,
                          f"{attachment_where}: a dontcare load carries no initial bytes")
                 # The declaring pass still pins the view's bytes, but a
@@ -2251,16 +2445,30 @@ def _render_plan(plan, suite):
                                len(stencil_expected)))
             written.add(stencil_allocation)
             touched.add(stencil_allocation)
-        # The wildcard mask is stated once per observed attachment, in the
+        # The wildcard claims are stated once per observed attachment, in the
         # absolute byte offsets of its allocation, so the writeback comparison
-        # and the allocation-image comparison read the same set.
+        # and the allocation-image comparison read the same map. A free byte
+        # (`wildcard_texels`) maps to `None` and is skipped; a constrained one
+        # maps to its closed candidate set, and the measured byte has to be one
+        # of those values (`research/docs/23` §3.3, v33/v67).
         wildcards = {}
-        if wildcard_texels is not None and writes:
+        claims = None
+        if writes:
             (allocation, view, offset), _ = writes[0]
-            wildcards[(allocation, view, offset)] = frozenset(
-                offset + texel * 4 + byte
-                for texel in wildcard_texels
-                for byte in range(4))
+            if wildcard_texels is not None:
+                claims = {
+                    offset + texel * 4 + byte: None
+                    for texel in wildcard_texels
+                    for byte in range(4)
+                }
+            elif wildcard_allowed is not None:
+                claims = {
+                    offset + texel * 4 + byte: tuple(value[byte] for value in values)
+                    for texel, values in wildcard_allowed.items()
+                    for byte in range(4)
+                }
+        if claims:
+            wildcards[(allocation, view, offset)] = claims
         render_plan[case_id] = RenderExpectation(
             writes=writes,
             allocations=images,

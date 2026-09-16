@@ -382,6 +382,14 @@ private struct RenderIndexBufferDefinition: Decodable {
     let format: String
 }
 
+/// The allowed values of one constrained wildcard texel
+/// (`research/docs/23` §3.3, v67): the row-major texel index and the four-byte
+/// values its bytes may take, each spelled as lowercase hex.
+private struct WildcardAllowedTexel: Decodable {
+    let index: Int
+    let allowed: [String]
+}
+
 /// One offscreen render case (`research/docs/23` §1.2, §5.1).
 private struct RenderCaseDefinition: Decodable {
     let id: String
@@ -480,6 +488,14 @@ private struct RenderCaseDefinition: Decodable {
     /// makes an unclaimed byte legitimate. An absent list means the case
     /// claims every texel, the semantics every case before v33 has.
     let wildcard_texels: [Int]?
+    /// The constrained wildcard channel (`research/docs/23` §3.3, v67): the
+    /// row-major texels whose bytes the case does not pin, each with the
+    /// *closed* set of values its four bytes may carry. Beside a multisample
+    /// raster such a texel is a resolve whose covered samples the draw wrote
+    /// and whose other samples kept the pass's reference colour, so the set is
+    /// exactly the mixtures those two colours produce. Only a `dontcare` load
+    /// may name one, and an absent list means the case pins every texel.
+    let wildcard_allowed_texels: [WildcardAllowedTexel]?
     /// The rail-owned depth attachment the pass opens, or `nil` for no depth
     /// surface — the shape every case before v36 declares
     /// (`metal_api_core::provider::RenderPassDescriptor::depth`,
@@ -631,6 +647,13 @@ private struct ValidatedRenderAttachment {
     /// and the reported bytes stay the measured ones; the empty set is every
     /// attachment that declares no wildcard list.
     let wildcardBytes: Set<Int>
+    /// The candidate values of the constrained wildcard texels
+    /// (`research/docs/23` §3.3, v67): each of their four bytes maps to the
+    /// closed set of values it may carry. The readback comparison accepts a
+    /// measured byte in that set and refuses one outside it, which is what
+    /// keeps the channel a claim rather than a licence. The empty map is every
+    /// attachment that declares no allowed set.
+    let allowedBytes: [Int: Set<UInt8>]
     /// The ``MTLPixelFormat`` the case's declared attachment format names
     /// (`research/docs/23` §3.3, v21): the texture and the pipeline attachment
     /// both take it, so the case's expected texels pin which channel order the
@@ -1093,6 +1116,25 @@ private func hex(_ bytes: Data) -> String {
         result.append(alphabet[Int(byte & 15)])
     }
     return String(decoding: result, as: UTF8.self)
+}
+
+/// The exact k-of-`samples` mix of two four-byte colours
+/// (`research/docs/23` §3.3, v67), or `nil` when a channel's mean is not
+/// representable in a byte. `covered` of the samples carry `fragment` and the
+/// rest carry `reference`; this is the resolve a constrained wildcard texel of
+/// a multisample raster may land in, and the two colours themselves for the
+/// single-sample shape.
+private func mixTexel(_ fragment: Data, _ reference: Data, _ covered: Int, _ samples: Int) -> Data? {
+    guard fragment.count == 4, reference.count == 4, samples > 0 else { return nil }
+    var resolved = [UInt8]()
+    resolved.reserveCapacity(4)
+    for channel in 0..<4 {
+        let total = Int(fragment[fragment.startIndex + channel]) * covered
+            + Int(reference[reference.startIndex + channel]) * (samples - covered)
+        guard total % samples == 0 else { return nil }
+        resolved.append(UInt8(total / samples))
+    }
+    return Data(resolved)
 }
 
 private func decodeHex(_ value: String, context: String) throws -> Data {
@@ -2525,7 +2567,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     + "surface: a combined surface is admitted only through a stencil "
                     + "resolve")
         try require(definition.wildcard_texels == nil,
-                    "\(definition.id): the multisample raster claims every texel it resolves")
+                    "\(definition.id): the multisample raster claims every texel it resolves, "
+                    + "or states the closed allowed set of a constrained wildcard texel")
         // The reviewed multisample shapes carry no vertex offset, and the
         // oracle's own footprint proof is the only gate that would notice one
         // (`research/docs/23` §3.3, v54 review H1); the fixture gate states the
@@ -2533,11 +2576,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(definition.base_vertex == nil || definition.base_vertex == 0,
                     "\(definition.id): the reviewed multisample shapes carry no base vertex")
         // The trace contract's own rule one line up: a multisampled pass opens
-        // its attachment from a clear, which `conformance/compare.py` states
-        // explicitly (`research/docs/23` §3.3, v54 review L1).
-        try require(definition.attachment?.load == "clear",
+        // its attachment from a clear — or, from v67 on, from `dontcare` while
+        // every unclaimed texel states the closed set its resolve may land in,
+        // which `conformance/compare.py` states explicitly
+        // (`research/docs/23` §3.3, v54 review L1/v67).
+        try require(definition.attachment?.load == "clear"
+                    || (definition.attachment?.load == "dontcare"
+                        && definition.wildcard_allowed_texels != nil),
                     "\(definition.id): the reviewed multisample pass opens its attachment "
-                    + "from a clear")
+                    + "from a clear or a dontcare load with constrained wildcard texels")
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents
@@ -2572,6 +2619,48 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         for texel in wildcards {
             try require(texel < texelCount,
                         "\(definition.id): wildcard texel \(texel) is outside the attachment")
+        }
+    }
+    // The constrained wildcard channel (`research/docs/23` §3.3, v67): the
+    // same single-attachment `dontcare` shape as the free list, but every
+    // named texel states the closed set of values its bytes may carry instead
+    // of leaving them unclaimed. The two channels cannot be stated together —
+    // a byte either has a claim or it has none — and every entry is held to
+    // the four-byte lowercase spelling here; what the values *are* is the
+    // case's own arithmetic and is held to the fragment output and the
+    // reference colour below, where both are decoded.
+    if let allowed = definition.wildcard_allowed_texels {
+        try require(definition.wildcard_texels == nil,
+                    "\(definition.id): the two wildcard channels are mutually exclusive")
+        try require(definition.attachment != nil,
+                    "\(definition.id): the constrained wildcard channel is the "
+                    + "single-attachment shape")
+        try require(!allowed.isEmpty,
+                    "\(definition.id): an allowed set has to name at least one texel")
+        let attachment = attachments[0]
+        try require(attachment.load == "dontcare",
+                    "\(definition.id): only a dontcare load may leave texels unclaimed by "
+                    + "an allowed set")
+        let texelCount = attachment.width * attachment.height
+        var seen = Set<Int>()
+        for entry in allowed {
+            try require(entry.index >= 0 && entry.index < texelCount,
+                        "\(definition.id): wildcard texel \(entry.index) is outside the "
+                        + "attachment")
+            try require(!seen.contains(entry.index),
+                        "\(definition.id): duplicate wildcard texel \(entry.index)")
+            seen.insert(entry.index)
+            try require(!entry.allowed.isEmpty,
+                        "\(definition.id): an allowed set has to name a value")
+            var values = Set<Data>()
+            for value in entry.allowed {
+                let bytes = try decodeHex(value, context: "\(definition.id) allowed value")
+                try require(bytes.count == 4 && value == hex(bytes),
+                            "\(definition.id): an allowed value has to be four lowercase bytes")
+                try require(!values.contains(bytes),
+                            "\(definition.id): duplicate allowed value \(value)")
+                values.insert(bytes)
+            }
         }
     }
     // The v19 pass-level rule core admission states as
@@ -2871,7 +2960,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // without any pre-seed. The byte-level "the declared view's bytes
             // differ from the expectation" rule is the suite comparator's; the
             // oracle only has to refuse the two carried-value spellings.
-            try require(attachment.clear_hex == nil,
+            // A constrained wildcard texel's *reference* colour
+            // (`research/docs/23` §3.3, v67) is the one exception: it is the
+            // second colour the resolve's mixes are built from, not a colour
+            // this pass clears the attachment to.
+            try require(attachment.clear_hex == nil
+                        || definition.wildcard_allowed_texels != nil,
                         "\(definition.id): a dontcare load carries no clear colour")
             try require(attachment.initial_hex == nil,
                         "\(definition.id): a dontcare load carries no initial bytes")
@@ -2888,6 +2982,47 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                         try require(Data(expected[(texel * 4)..<(texel * 4 + 4)]) == fragment,
                                     "\(definition.id): texel \(texel) of a dontcare load has to "
                                     + "be the fragment output")
+                    }
+                } else if let allowed = definition.wildcard_allowed_texels {
+                    // The constrained shape: every texel the case does not
+                    // name carries the fragment output, and every value a
+                    // named texel states has to be an exact mix of that output
+                    // and the reference colour (`research/docs/23` §3.3, v67).
+                    try require(attachment.clear_hex != nil,
+                                "\(definition.id): a constrained wildcard texel needs the "
+                                + "reference colour of its mixes")
+                    let reference = try decodeHex(attachment.clear_hex!,
+                                                  context: "\(definition.id) reference colour")
+                    try require(reference.count == 4,
+                                "\(definition.id): a reference colour is four bytes")
+                    try require(reference != fragment,
+                                "\(definition.id): a constrained wildcard texel needs a "
+                                + "reference colour other than the fragment output")
+                    let samples = Int(definition.multisample?.sample_count ?? 1)
+                    var candidates = Set<Data>()
+                    for covered in 0...samples {
+                        if let mix = mixTexel(fragment, reference, covered, samples) {
+                            candidates.insert(mix)
+                        }
+                    }
+                    try require(candidates.count > 1,
+                                "\(definition.id): the fragment output and the reference colour "
+                                + "have to differ")
+                    let named = Set(allowed.map { $0.index })
+                    for texel in 0..<(expected.count / 4) where !named.contains(texel) {
+                        try require(Data(expected[(texel * 4)..<(texel * 4 + 4)]) == fragment,
+                                    "\(definition.id): texel \(texel) of a dontcare load has to "
+                                    + "be the fragment output")
+                    }
+                    for entry in allowed {
+                        var declared = Set<Data>()
+                        for value in entry.allowed {
+                            declared.insert(try decodeHex(value,
+                                                          context: "\(definition.id) allowed value"))
+                        }
+                        try require(declared == candidates,
+                                    "\(definition.id): texel \(entry.index) does not state the "
+                                    + "exact mix set of the case's colours")
                     }
                 } else {
                     for offset in stride(from: 0, to: expected.count, by: 4) {
@@ -2912,6 +3047,19 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         for texel in definition.wildcard_texels ?? [] {
             wildcardBytes.formUnion((texel * 4)..<(texel * 4 + 4))
         }
+        // The constrained channel's candidates travel as one set per byte
+        // offset, so the same map serves the readback comparison below
+        // (`research/docs/23` §3.3, v67).
+        var allowedBytes = [Int: Set<UInt8>]()
+        for entry in definition.wildcard_allowed_texels ?? [] {
+            var values = [Data]()
+            for value in entry.allowed {
+                values.append(try decodeHex(value, context: "\(definition.id) allowed value"))
+            }
+            for byte in 0..<4 {
+                allowedBytes[entry.index * 4 + byte] = Set(values.map { $0[byte] })
+            }
+        }
         let pixelFormat: MTLPixelFormat
         switch attachment.format {
         case "bgra8_unorm": pixelFormat = .bgra8Unorm
@@ -2923,7 +3071,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             width: attachment.width, height: attachment.height,
             load: attachment.load, store: attachment.store,
             clearComponents: clearComponents, initial: initial, expected: expected,
-            wildcardBytes: wildcardBytes, pixelFormat: pixelFormat))
+            wildcardBytes: wildcardBytes, allowedBytes: allowedBytes,
+            pixelFormat: pixelFormat))
     }
     // The two reviewed MRT locations write two different byte strings, so a
     // cleared dual case whose locations read back the same texel could not
@@ -4117,9 +4266,13 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         // texels the case does not claim (`research/docs/23` §3.3, v33): a
         // wildcard texel's four bytes are neither compared nor named, because
         // the fixture said in advance that whatever lands there is undefined.
-        // Every other byte still has to equal the reviewed expectation, the
-        // first claimed byte that differs is reported with its offset, and the
-        // writeback and allocation below still carry the measured bytes.
+        // A *constrained* wildcard texel (`research/docs/23` §3.3, v67) is the
+        // other half: its bytes are compared against the closed set the case
+        // declared, so a value outside the set is refused even though the
+        // exact byte is the driver's. Every other byte still has to equal the
+        // reviewed expectation, the first claimed byte that differs is
+        // reported with its offset, and the writeback and allocation below
+        // still carry the measured bytes.
         try require(observed.count == expected.count,
                     "\(definition.id): attachment \(index) read back \(observed.count) bytes "
                     + "against the reviewed expectation's \(expected.count)")
@@ -4128,12 +4281,26 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             if attachment.wildcardBytes.contains(offset) {
                 continue
             }
+            if let candidates = attachment.allowedBytes[offset] {
+                if candidates.contains(pair.1) {
+                    continue
+                }
+                differing = offset
+                break
+            }
             if pair.0 != pair.1 {
                 differing = offset
                 break
             }
         }
         if let differing {
+            let observedByte = observed[observed.startIndex.advanced(by: differing)]
+            if let candidates = attachment.allowedBytes[differing] {
+                throw OracleError("\(definition.id): attachment \(index) byte \(differing) is "
+                                  + "0x\(String(format: "%02x", observedByte)), which is none of "
+                                  + candidates.sorted().map { String(format: "0x%02x", $0) }
+                                    .joined(separator: ", "))
+            }
             throw OracleError("\(definition.id): attachment \(index) bytes \(hex(observed)) "
                               + "do not match the reviewed expectation \(hex(expected)) "
                               + "(first differing byte at offset \(differing))")

@@ -908,12 +908,14 @@ fn prepare_render_request<'a>(
                 &metal_api_core::provider::ContractError::SingleSampleMultisampleState.to_string(),
             ));
         }
-        for (index, attachment) in pass.color_attachments.iter().enumerate() {
-            if !matches!(attachment.load, LoadOp::Clear(_)) {
-                return Err(capability_refusal("render_multisample_load_unsupported")
-                    .with_field("attachment", FieldValue::Unsigned(index as u64)));
-            }
-        }
+        // The attachment's load (`research/docs/23` §3.3, v51/v67): a clear or
+        // a `dontcare` load is admitted from v67 on — `dontcare` opens the
+        // multisampled image from undefined contents exactly as its
+        // single-sample sibling does, and the resolve then lands whatever the
+        // samples hold, which is the shape the constrained wildcard
+        // expectation states. A `load` still needs previous bytes on a
+        // multisampled image, which is the load increment this rail does not
+        // execute, and the per-attachment loop below refuses it by name.
         // The present action beside the raster (`research/docs/24` §3.5, v62)
         // is executed by `execute_present_render`: the pass renders into a
         // rail-owned n-sample surface and resolves into the provider-owned
@@ -1967,12 +1969,17 @@ pub(crate) fn execute_offscreen_render(
                          this format",
                     ));
             }
-            if !matches!(attachment.load, LoadOp::Clear(_)) {
+            // A multisampled attachment's load (`research/docs/23` §3.3,
+            // v51/v67): `clear` and `dontcare` both execute — the second opens
+            // the multisampled image from undefined contents and resolves
+            // whatever the samples hold. A `load` would have to upload
+            // single-sample previous bytes into a multisampled image, which is
+            // the load increment this rail does not execute.
+            if matches!(attachment.load, LoadOp::Load) {
                 return Err(
                     capability_refusal("render_multisample_load_unsupported").with_detail(
-                        "the first multisample increment opens every attachment from a clear: \
-                         a multisampled surface's previous contents are the load increment it \
-                         does not execute",
+                        "a multisampled surface's previous contents are the load increment \
+                         this rail does not execute",
                     ),
                 );
             }
