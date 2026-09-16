@@ -1601,9 +1601,11 @@
       },
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
-        "vulkan",
         "native-metal",
-        "native-metal-provider"
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4
@@ -1691,9 +1693,11 @@
       },
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
-        "vulkan",
         "native-metal",
-        "native-metal-provider"
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4
@@ -1782,9 +1786,11 @@
       },
       "expected_hex": "ff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ff",
       "capture_rails": [
-        "vulkan",
         "native-metal",
-        "native-metal-provider"
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4

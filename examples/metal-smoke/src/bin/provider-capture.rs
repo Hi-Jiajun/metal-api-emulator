@@ -1315,10 +1315,11 @@ fn default_instance_count() -> u64 {
 /// (`research/docs/23` §3.3, v54 review H1/M1).
 ///
 /// One family is one thing an object-API recording entry can carry: a
-/// pass-wide raster, a depth surface, a stencil surface, a blend state, a
-/// culling state or a vertex offset. The counts (`instance_count`, the index
-/// count) are deliberately not families — every indexed entry carries them —
-/// and neither is the indirect payload, which has an entry of its own.
+/// pass-wide raster, a depth surface, a depth resolve, a stencil surface, a
+/// blend state, a culling state or a vertex offset. The counts
+/// (`instance_count`, the index count) are deliberately not families — every
+/// indexed entry carries them — and neither is the indirect payload, which has
+/// an entry of its own.
 fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
     let mut families = Vec::new();
     if case.multisample.is_some() {
@@ -1326,6 +1327,9 @@ fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
     }
     if case.depth.is_some() {
         families.push("depth");
+    }
+    if case.depth_resolve.is_some() {
+        families.push("depth_resolve");
     }
     if case.stencil.is_some() {
         families.push("stencil");
@@ -1345,11 +1349,13 @@ fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
 /// The family sets the reviewed object-API entries carry, spelled once so the
 /// admission table and its test cannot drift (the v54 review's N3).
 ///
-/// Each reviewed entry carries one family, and the two combined entries carry a
-/// raster plus one surface (`multisample+depth` since v54, `multisample+stencil`
-/// since v56). Every other combination would be recorded through an entry that
-/// silently drops the rest — the failure mode the v54 review found — so the
-/// object rail refuses it by name instead.
+/// Each reviewed entry carries one family, and the combined entries carry a
+/// raster plus one surface (`multisample+depth` since v54,
+/// `multisample+stencil` since v56), plus the stored surface's resolve
+/// (`multisample+depth+depth_resolve` since v58). Every other combination
+/// would be recorded through an entry that silently drops the rest — the
+/// failure mode the v54 review found — so the object rail refuses it by name
+/// instead.
 const REVIEWED_FAMILY_SETS: &[&[&str]] = &[
     &[],
     &["multisample"],
@@ -1359,6 +1365,7 @@ const REVIEWED_FAMILY_SETS: &[&[&str]] = &[
     &["cull"],
     &["base_vertex"],
     &["multisample", "depth"],
+    &["multisample", "depth", "depth_resolve"],
     &["multisample", "stencil"],
 ];
 
@@ -7471,7 +7478,10 @@ fn run_object_render_case(
             // pass-wide raster the trace contract names, so the pass it
             // becomes is the one the other rails execute. A case that also
             // opens a depth surface takes the combined entry (`§3.3`, v53/v54)
-            // — the rail-owned surface the pass tests and writes, never keeps.
+            // — the rail-owned surface the pass tests and writes, never keeps
+            // — unless the case states its depth resolve (`§3.3`, v57/v58):
+            // then the stored surface takes the resolving entry, which names
+            // the same landing identity the trace contract carries.
             //
             // A stencil surface beside the raster takes the combined entry
             // from v56 on (`research/docs/23` §3.3, v55/v56); the contract's
@@ -7481,6 +7491,7 @@ fn run_object_render_case(
             let (stencil, stencil_test) = case_stencil(case, &format!("render case {}", case.id))?;
             match (depth, stencil) {
                 (Some(depth), _) => {
+                    let resolve = case_depth_resolve(case)?;
                     let object_depth = objects::RenderDepthAttachment {
                         width: depth.width,
                         height: depth.height,
@@ -7491,23 +7502,58 @@ fn run_object_render_case(
                             DepthLoadOp::Load => objects::RenderDepthLoad::Load,
                         },
                         store: depth.store,
-                        identity: None,
+                        // The stored surface beside the raster reaches this
+                        // arm only with its resolve (`validate_render_case`),
+                        // and then names the object view the declaring pass
+                        // bound — the same landing the trace contract carries;
+                        // the rail-owned shape keeps the identity absent.
+                        identity: match (&resolve, depth.identity) {
+                            (Some(_), Some(identity)) => {
+                                let (_, view) = resources
+                                    .get(&identity.view_id.get())
+                                    .ok_or("the declaring pass does not declare the depth view")?;
+                                Some(RenderDepthIdentity {
+                                    allocation_id: view.allocation_id(),
+                                    view_id: view.view_id(),
+                                })
+                            }
+                            _ => None,
+                        },
                     };
                     let object_depth_test = depth_test.map(|test| objects::RenderDepthTest {
                         compare: test.compare,
                         write: test.write,
                     });
-                    render.draw_indexed_primitives_with_multisample_depth(
-                        &recorded,
-                        width,
-                        height,
-                        index_count,
-                        u32::try_from(case.instance_count)?,
-                        object_depth,
-                        object_depth_test,
-                        multisample,
-                        present,
-                    )?;
+                    if let Some(resolve) = resolve {
+                        // The stored surface's own tail (`research/docs/23`
+                        // §3.3, v57/v58): the entry carries the filter the
+                        // case states, so the pass the object rail records is
+                        // the resolving pass the trace rails execute.
+                        render.draw_indexed_primitives_with_multisample_depth_resolve(
+                            &recorded,
+                            width,
+                            height,
+                            index_count,
+                            u32::try_from(case.instance_count)?,
+                            object_depth,
+                            object_depth_test,
+                            multisample,
+                            resolve.filter,
+                            present,
+                        )?;
+                    } else {
+                        render.draw_indexed_primitives_with_multisample_depth(
+                            &recorded,
+                            width,
+                            height,
+                            index_count,
+                            u32::try_from(case.instance_count)?,
+                            object_depth,
+                            object_depth_test,
+                            multisample,
+                            present,
+                        )?;
+                    }
                 }
                 (None, Some(stencil)) => {
                     let object_stencil = objects::RenderStencilAttachment {
