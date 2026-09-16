@@ -107,7 +107,10 @@ pub enum Error {
         index_buffer: bool,
     },
     /// A multi-attachment draw recorded no colour attachments, so the pass it
-    /// would become has no target for any fragment output to land in.
+    /// would become has no target for any fragment output to land in — and no
+    /// stored depth attachment to land its texels in either
+    /// (`research/docs/23` §3.3, v46: the depth-only recording is the shape
+    /// this refusal admits).
     EmptyRenderAttachmentList,
     /// A multi-attachment draw recorded more than
     /// [`MAX_COLOR_ATTACHMENTS`], the cap the pass's own descriptor carries.
@@ -813,27 +816,31 @@ impl RenderTarget {
             .collect();
         // The present tail hands on the location-0 attachment, which is the
         // single-attachment shape v16/v17 published: the target restates the
-        // first attachment's view, allocation, format and extent. A recorded
-        // target always carries at least one attachment (`record_render_pass`
-        // refuses an empty list), so location 0 is always present here.
-        let first = &self.attachments[0];
-        let present = self.present.map(|initial| PresentDescriptor {
-            target: PresentTarget {
-                allocation_id: first.view.allocation_id(),
-                view_id: first.view.view_id,
-                format: first.format,
-                width: self.width,
-                height: self.height,
-                image_count: MAX_PRESENT_IMAGE_COUNT,
-                initial: match initial {
-                    PresentInitial::Undefined => InitialState::Undefined,
-                    PresentInitial::Sentinel(bytes) => InitialState::Sentinel(bytes.to_vec()),
+        // first attachment's view, allocation, format and extent. A recording
+        // with no colour attachment is the depth-only shape (`v46`), which
+        // carries no present action — the recording entry refuses that pairing
+        // — so location 0 exists whenever this arm is taken.
+        let present = match (self.present, self.attachments.first()) {
+            (Some(initial), Some(first)) => Some(PresentDescriptor {
+                target: PresentTarget {
+                    allocation_id: first.view.allocation_id(),
+                    view_id: first.view.view_id,
+                    format: first.format,
+                    width: self.width,
+                    height: self.height,
+                    image_count: MAX_PRESENT_IMAGE_COUNT,
+                    initial: match initial {
+                        PresentInitial::Undefined => InitialState::Undefined,
+                        PresentInitial::Sentinel(bytes) => InitialState::Sentinel(bytes.to_vec()),
+                    },
                 },
-            },
-            source: first.view.view_id,
-            mode: PresentMode::Fifo,
-            acquire: AcquirePolicy::Blocking,
-        });
+                source: first.view.view_id,
+                mode: PresentMode::Fifo,
+                acquire: AcquirePolicy::Blocking,
+            }),
+            (Some(_), None) => return Err(Error::EmptyRenderAttachmentList),
+            (None, _) => None,
+        };
         let vertex_buffers = self
             .draw
             .vertex_buffers
@@ -3155,7 +3162,16 @@ impl RenderCommandEncoder {
         indirect: Option<&IndirectCommandBuffer>,
     ) -> Result<(), Error> {
         let pipeline = self.pipeline.clone().ok_or(ApiError::MissingPipeline)?;
-        if attachments.is_empty() {
+        // A zero-colour-attachment recording is the depth-only pass
+        // (`research/docs/23` §3.3, v46): the rasterizer still tests and writes
+        // the depth surface the draw names, and that surface is the whole
+        // landing. Without a *stored* depth attachment there is no target at
+        // all, which stays the refusal it always was.
+        let stored_depth = draw
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.store == Some(contract::DepthStoreOp::Store));
+        if attachments.is_empty() && !stored_depth {
             return Err(Error::EmptyRenderAttachmentList);
         }
         if attachments.len() > MAX_COLOR_ATTACHMENTS {

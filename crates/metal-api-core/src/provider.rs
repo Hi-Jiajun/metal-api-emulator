@@ -2207,7 +2207,12 @@ impl RenderPassDescriptor {
         if self.pipeline.is_zero() {
             return Err(ContractError::InvalidIdentity("render pipeline id"));
         }
-        if self.color_attachments.is_empty() {
+        // A pass with no colour attachment at all is the zero-colour-attachment
+        // depth pass (`research/docs/23` §3.3, v46): the rasterizer still tests
+        // and writes depth, and the depth attachment is the whole observation.
+        // Without a depth attachment the pass has no surface to render into at
+        // all, which stays the structural refusal it always was.
+        if self.color_attachments.is_empty() && self.depth.is_none() {
             return Err(ContractError::EmptyAttachmentList);
         }
         if self.color_attachments.len() > MAX_COLOR_ATTACHMENTS {
@@ -2518,9 +2523,11 @@ impl RenderPipelineContract {
                 RenderPipelineStage::Fragment,
             ));
         }
-        if self.color_formats.is_empty() {
-            return Err(ContractError::EmptyRenderPipelineColorFormats);
-        }
+        // An empty list names a **depth-only pipeline** (`research/docs/23`
+        // §3.3, v46): the fragment stage generates no output, so there is no
+        // colour format to state. `validate_against` pairs it with the pass it
+        // renders for — an empty list may only render into a pass with no
+        // colour attachment, and the count rule below is what states that.
         for format in &self.color_formats {
             if !format.is_admitted_for_color_attachment() {
                 // The pipeline's format reuses the attachment's variant: an
@@ -2546,9 +2553,9 @@ impl RenderPipelineContract {
     /// agreement about formats that are not there.
     pub fn validate_against(&self, pass: &RenderPassDescriptor) -> Result<(), ContractError> {
         self.validate()?;
-        if pass.color_attachments.is_empty() {
-            return Err(ContractError::EmptyAttachmentList);
-        }
+        // A pass with no colour attachment is the depth-only shape (`v46`), and
+        // its pipeline states no colour format: the count rule right below is
+        // what pairs the two, so neither side needs its own emptiness refusal.
         if self.color_formats.len() != pass.color_attachments.len() {
             return Err(ContractError::RenderPipelineFormatCountMismatch {
                 pipeline: self.color_formats.len(),
@@ -8056,6 +8063,12 @@ pub enum ContractError {
     DuplicateRenderPipelineEntry(RenderPipelineStage),
     /// A render pipeline compiles no colour-attachment format at all, so there
     /// is no location the fragment stage could write into.
+    /// Retained for the shape the first pipeline increments refused. Admission
+    /// no longer uses it: an empty colour-format list names a **depth-only
+    /// pipeline** (`research/docs/23` §3.3, v46), and `validate_against` pairs
+    /// it with the pass it renders for — so the variant currently has **no
+    /// construction point** and only the error-class/slug mapping and its
+    /// `Display` arm remain.
     EmptyRenderPipelineColorFormats,
     /// The pipeline's format list and the pass's attachment list have different
     /// lengths, so `location` `i` has no counterpart on one side of the pair.
@@ -14619,16 +14632,47 @@ mod tests {
     }
 
     #[test]
-    fn render_pipeline_contract_refuses_an_empty_color_format_list() {
+    fn render_pipeline_contract_admits_an_empty_color_format_list() {
+        // v46: an empty list names the depth-only pipeline, whose fragment stage
+        // generates no output. It is not a shape of its own — agreement with a
+        // pass is what decides whether it may render, and the count rule below
+        // refuses it for any pass that does carry colour attachments.
         let mut contract = render_pipeline_contract();
         contract.color_formats.clear();
+        contract
+            .validate()
+            .expect("a depth-only pipeline states no colour format");
+        let mut colour_pass = render_pass();
+        colour_pass.depth = Some(depth_attachment());
         assert_eq!(
-            contract.validate(),
-            Err(ContractError::EmptyRenderPipelineColorFormats)
+            contract.validate_against(&colour_pass),
+            Err(ContractError::RenderPipelineFormatCountMismatch {
+                pipeline: 0,
+                attachments: 1,
+            })
         );
-        let refusal = contract_error_refusal(ContractError::EmptyRenderPipelineColorFormats);
-        assert_eq!(refusal.class, ProviderErrorClass::Args);
-        assert_eq!(refusal.slug, "trace_contract_invalid");
+
+        // The depth-only pipeline is the one a zero-colour-attachment pass
+        // agrees with, and that pass keeps its depth surface.
+        let mut depth_only = render_pass();
+        depth_only.color_attachments.clear();
+        let mut stored = depth_attachment();
+        stored.store = Some(DepthStoreOp::Store);
+        stored.identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(950),
+        });
+        depth_only.depth = Some(stored);
+        depth_only.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        depth_only
+            .validate()
+            .expect("a pass with no colour attachment is well formed");
+        contract
+            .validate_against(&depth_only)
+            .expect("a depth-only pipeline renders into a depth-only pass");
     }
 
     #[test]
@@ -15035,14 +15079,34 @@ mod tests {
     }
 
     #[test]
-    fn render_pipeline_contract_refuses_to_agree_with_an_empty_attachment_list() {
+    fn render_pipeline_contract_admits_a_zero_attachment_pass_only_for_the_depth_shape() {
+        // A pass with no colour attachment at all is the v46 depth-only shape,
+        // and its pipeline states no colour format; without a depth attachment
+        // there is nothing to render into, and the pass keeps its own refusal.
         let contract = render_pipeline_contract();
         let mut pass = render_pass();
         pass.color_attachments.clear();
         assert_eq!(
             contract.validate_against(&pass),
-            Err(ContractError::EmptyAttachmentList)
+            Err(ContractError::RenderPipelineFormatCountMismatch {
+                pipeline: 1,
+                attachments: 0,
+            })
         );
+        assert_eq!(pass.validate(), Err(ContractError::EmptyAttachmentList));
+
+        let mut depth_only = render_pass();
+        depth_only.color_attachments.clear();
+        let mut stored = depth_attachment();
+        stored.store = Some(DepthStoreOp::Store);
+        stored.identity = Some(RenderDepthIdentity {
+            allocation_id: AllocationId::new(940),
+            view_id: ViewId::new(950),
+        });
+        depth_only.depth = Some(stored);
+        depth_only
+            .validate()
+            .expect("the depth-only pass is well formed with its depth attachment");
     }
 
     #[test]

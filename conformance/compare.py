@@ -34,8 +34,10 @@ ALLOCATION_OBSERVATIONS = {
 # capture backends a suite declares this case executable on; `attachment` is
 # the `(allocation, view, offset, length)` tuple the render result has to report
 # and nothing else for a single-attachment case, or the tuple list in location
-# order for an MRT case, which is what keeps an attachment from passing as a
-# buffer writeback; and `present` is the case's optional present section, the
+# order for an MRT case — and for the v46 pass that binds no colour attachment
+# at all, the tuple list is the stored depth landing, the case's whole
+# observation — which is what keeps an attachment from passing as a buffer
+# writeback; and `present` is the case's optional present section, the
 # acquire/present counts every rail its marker names has to report
 # (`research/docs/24` §5.3), or `None` when the suite declares none.
 RenderExpectation = namedtuple(
@@ -1188,16 +1190,30 @@ def _render_plan(plan, suite):
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
-        _require(single != multiple,
+        # The v46 pass binds *no* colour attachment at all (`research/docs/23`
+        # §3.3): neither `attachment` nor `attachments` appears, and the depth
+        # section is the whole landing surface. The third shape is admitted
+        # only when a `depth` section is declared — the depth parser below
+        # still has to find a stored landing — so "no attachments" can never
+        # pass as "nothing to compare".
+        no_colour = not single and not multiple and "depth" in case
+        _require(single != multiple or no_colour,
                  f"{where}: exactly one of attachment and attachments is required")
         if single:
             _require("expected_hex" in case or "depth" in case,
                      f"{where}: missing fields expected_hex")
-        else:
+        elif multiple:
             _require("expected_hex" not in case,
                      f"{where}: an attachment list carries its own expected_hex")
-        definitions = [case["attachment"]] if single else \
-            _list(case["attachments"], f"{where}.attachments")
+        else:
+            # The colour side discards nothing because it does not exist, so a
+            # case-level expectation would claim bytes no attachment could
+            # produce (`research/docs/23` §3.3, v46).
+            _require("expected_hex" not in case,
+                     f"{where}: a case with no colour attachment carries no expectation")
+        definitions = [] if no_colour else (
+            [case["attachment"]] if single
+            else _list(case["attachments"], f"{where}.attachments"))
         if multiple:
             _require(2 <= len(definitions) <= 4,
                      f"{where}: the reviewed MRT shapes are two to four attachments")

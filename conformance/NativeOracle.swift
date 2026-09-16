@@ -1540,6 +1540,37 @@ private func reviewedDepthModule() -> ReviewedRenderModule {
                                                           format: "float32x4")])])
 }
 
+/// The reviewed zero-colour-attachment depth fixture (`research/docs/23` §3.3,
+/// v46): the depth pair's own stride-32 two-attribute stream, drawn by a stage
+/// pair whose fragment entry is **void**. A pass with no colour attachment at
+/// all is well formed exactly this way — the Metal Shading Language
+/// Specification states it as "If the fragment function does not generate
+/// output, it returns void", and `MTLRenderPipelineDescriptor.fragmentFunction`
+/// documents the effect: no writes to the colour render target occur, while
+/// depth (and stencil) writes still proceed. So the rasterizer tests and writes
+/// depth for every covered fragment, and the stored depth surface is the whole
+/// observation.
+///
+/// The depth pair's module cannot stand in for it: `render_depth_pair_tint`
+/// generates a colour output that no attachment of this shape declares, so the
+/// reviewed module has to be the one whose fragment stage generates nothing.
+/// The stream shape is the pair's own, which is what lets the case keep the
+/// same vertex bytes its neighbours read.
+private func reviewedDepthOnlyModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_depth_only_vertex",
+        fragment_entry: "render_depth_only_fragment",
+        metal: RenderSourcePin(path: "shaders/depth_only_4x4.metal",
+                               sha256: "9e66c6059a5ff04db5e1bfe221ec1b5b6fc3664c0d555196ca8c903310571dcb"),
+        buffers: [RenderVertexBufferLayoutDefinition(
+            stride: 32,
+            step: "per_vertex",
+            attributes: [RenderVertexAttributeDefinition(location: 0, offset: 0,
+                                                          format: "float32x3"),
+                         RenderVertexAttributeDefinition(location: 1, offset: 16,
+                                                          format: "float32x4")])])
+}
+
 /// The reviewed module a render case's vertex-input and colour-format shapes
 /// select, mirroring `crates/metal-api-native/src/render.rs::reviewed_module`:
 /// a `vertex_id` single-attachment case draws the triangle module, a
@@ -1547,8 +1578,11 @@ private func reviewedDepthModule() -> ReviewedRenderModule {
 /// pair module the depth and cull fixtures share, a single-attachment case
 /// whose two-stream layout steps per instance draws the instanced module, a
 /// single-attachment case with any other layout the indexed one, and an
-/// indexed case with two `rgba8_unorm` attachments the dual one. A shape no
-/// module was reviewed for is refused instead of matched approximately.
+/// indexed case with two `rgba8_unorm` attachments the dual one. The
+/// zero-colour shape (`§3.3`, v46) carries no attachment at all, and its
+/// two-attribute stream selects the void-fragment module the depth pair's own
+/// layout names. A shape no module was reviewed for is refused instead of
+/// matched approximately.
 private func reviewedModule(for definition: RenderCaseDefinition) throws -> ReviewedRenderModule {
     let attachments = try colorAttachments(definition)
     // The 8-bit UNORM modules are layout-agnostic: the same store lands in
@@ -1569,6 +1603,14 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
     switch (definition.vertex_layout, attachments.count) {
     case (nil, 1):
         return reviewedRenderModule()
+    // The reviewed zero-colour shape (`research/docs/23` §3.3, v46) is the
+    // depth pair's own single stream drawn with no colour attachment at all.
+    // The attachment count tells it apart from the v36 pair, whose layout is
+    // otherwise the same; the fragment entry it selects is the void one, which
+    // is what makes a pass without a colour target well formed.
+    case (let layout?, 0) where layout.buffers.count == 1
+        && layout.buffers[0].attributes.count == 2:
+        return reviewedDepthOnlyModule()
     // The reviewed depth shape (`research/docs/23` §3.3, v36) is the one
     // single-stream layout carrying two attributes: a `float32x3` position and
     // a `float32x4` tint sharing one stride-32 vertex. The reviewed equality
@@ -1597,7 +1639,15 @@ private func reviewedModule(for definition: RenderCaseDefinition) throws -> Revi
 }
 
 /// The colour attachments a render case declares: the single `attachment`
-/// field or the MRT `attachments` list, never both and never neither.
+/// field or the MRT `attachments` list, never both.
+///
+/// *Neither* field is the zero-colour shape (`research/docs/23` §3.3, v46), and
+/// it is a well-formed case only when the pass's landing is its stored depth
+/// surface: with no colour attachment to observe, that stored surface is the
+/// whole observation, and the case has to state its identity and expectation to
+/// be comparable. That test is the same one the depth review below makes at
+/// length; here it is the admission test that keeps the two absences from being
+/// read as an omitted section, so every other case keeps the refusal it had.
 private func colorAttachments(_ definition: RenderCaseDefinition) throws -> [RenderAttachmentDefinition] {
     switch (definition.attachment, definition.attachments) {
     case (let single?, nil):
@@ -1606,6 +1656,13 @@ private func colorAttachments(_ definition: RenderCaseDefinition) throws -> [Ren
         try require(!many.isEmpty, "\(definition.id): the attachment list is empty")
         return many
     case (nil, nil):
+        // The zero-colour depth shape: a case with no colour attachment is
+        // admitted only when its depth attachment is a stored surface with the
+        // identity and the expectation that make the landing observable.
+        if let depth = definition.depth, depth.store == "store",
+           depth.allocation != nil, depth.view != nil, depth.expected_hex != nil {
+            return []
+        }
         throw OracleError("\(definition.id): exactly one of attachment and attachments is required")
     case (_?, _?):
         throw OracleError("\(definition.id): attachment and attachments are mutually exclusive")
@@ -1928,8 +1985,21 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     // landing, and a depth-only shape that still spells a case-level
     // expectation, are both refused — the wording the MRT discard arm uses
     // (`conformance/compare.py` reports the same two refusals the same way).
+    // The v46 zero-colour shape carries no expectation either: the pass has no
+    // colour attachment at all, so a case-level expectation would claim bytes
+    // no surface holds, and the arm below is where that reading is stated.
     let expectedHexes: [String?]
-    if definition.attachment != nil {
+    if attachments.isEmpty {
+        // The zero-colour shape (`research/docs/23` §3.3, v46): the pass carries
+        // no colour attachment, so there is no colour landing an expectation
+        // could describe. A case-level `expected_hex` would claim bytes no
+        // surface holds, so it is refused with the same reading the v45 discard
+        // gets — the stored depth surface its own section names is the whole
+        // observation, and the depth review below is what pins its texels.
+        try require(definition.expected_hex == nil,
+                    "\(definition.id): a pass without a colour attachment carries no expectation")
+        expectedHexes = []
+    } else if definition.attachment != nil {
         let discards = attachments[0].store == "dontcare"
         if let top = definition.expected_hex {
             try require(!discards,
@@ -2332,10 +2402,28 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         }
         // The depth attachment is a second raster with the pass's own extent
         // (`research/docs/23` §3.3, v36): the two have to agree, the same rule
-        // the viewport states for the colour side.
-        try require(depth.width == attachments[0].width
-                    && depth.height == attachments[0].height,
-                    "\(definition.id): the depth attachment has to match the colour extent")
+        // the viewport states for the colour side. The zero-colour shape
+        // (`§3.3`, v46) has no colour attachment to state that extent, so the
+        // depth surface *is* the pass's render area there: the case's viewport
+        // has to cover it, and the scissor, when the case declares one, has to
+        // stay inside it — the rectangle rule the colour side states once per
+        // attachment.
+        if let colour = attachments.first {
+            try require(depth.width == colour.width && depth.height == colour.height,
+                        "\(definition.id): the depth attachment has to match the colour extent")
+        } else {
+            try require(definition.viewport == [0, 0, UInt64(depth.width), UInt64(depth.height)],
+                        "\(definition.id): the viewport must cover the depth attachment")
+            if let scissor = definition.scissor {
+                try require(scissor.count == 4,
+                            "\(definition.id): a scissor is four numbers")
+                try require(scissor[2] > 0 && scissor[3] > 0
+                            && scissor[0] + scissor[2] <= UInt64(depth.width)
+                            && scissor[1] + scissor[3] <= UInt64(depth.height),
+                            "\(definition.id): a scissor has to be a non-empty rectangle "
+                            + "inside the depth attachment")
+            }
+        }
         guard let test = definition.depth_test else {
             throw OracleError("\(definition.id): the reviewed depth shape carries a depth test")
         }
@@ -2854,6 +2942,9 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // One pipeline attachment per colour location: entry `i` states the pixel
     // format the reviewed fragment's output `i` is compiled against, which the
     // validation above already forced to agree with the case's attachment list.
+    // The zero-colour shape (`research/docs/23` §3.3, v46) states no location at
+    // all: its fragment entry generates no output, so there is no colour format
+    // to compile against and this loop runs zero times.
     for index in 0..<fixture.attachments.count {
         pipelineDescriptor.colorAttachments[index].pixelFormat =
             fixture.attachments[index].pixelFormat
@@ -2972,10 +3063,18 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         encoder.setFrontFacing(.counterClockwise)
     }
     // The viewport is explicit because the contract carries it, even though the
-    // first increment only accepts the attachment-covering default.
+    // first increment only accepts the attachment-covering default. The render
+    // area is the colour attachment's extent when the pass has one, and the
+    // depth surface's own for the zero-colour shape (`research/docs/23` §3.3,
+    // v46) — the validation above pinned the case's viewport to whichever of
+    // the two the pass carries.
+    guard let renderWidth = fixture.attachments.first?.width ?? fixture.depth?.width,
+          let renderHeight = fixture.attachments.first?.height ?? fixture.depth?.height else {
+        throw OracleError("\(definition.id): the pass states no render area")
+    }
     encoder.setViewport(MTLViewport(originX: 0, originY: 0,
-                                    width: Double(fixture.attachments[0].width),
-                                    height: Double(fixture.attachments[0].height),
+                                    width: Double(renderWidth),
+                                    height: Double(renderHeight),
                                     znear: 0, zfar: 1))
     // The scissor is the pass's own rectangle when it declares one; both rails
     // state it in framebuffer coordinates with the origin at the render area's
