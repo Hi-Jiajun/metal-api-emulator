@@ -267,10 +267,11 @@ BLEND_RAILS = ALL_RAILS
 # `draw_indexed_primitives_with_cull` is the object API's own culling entry, so
 # its marker names all five rails.
 CULL_RAILS = ALL_RAILS
-# The v51 multisample raster is the trace rail's first increment: the object API
-# records no pass-wide raster state yet, so its marker names the three rails
-# that execute the trace (`research/docs/23` §3.3, v51).
-MSAA_RAILS = TRACE_RAILS
+# The v51 multisample raster named the three trace rails first; the v52
+# recording entry (`draw_indexed_primitives_with_multisample`) carries the same
+# state on both object rails, so the marker widens to every rail
+# (`research/docs/23` §3.3, v51/v52).
+MSAA_RAILS = ALL_RAILS
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
 # `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
@@ -2137,10 +2138,10 @@ class ScissorObservationTests(unittest.TestCase):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_reports_the_msaa_case_on_every_rail_its_marker_names(self):
-        # The marker is the rule: the three trace rails owe the resolve
-        # target's landing, and the two object rails have to leave the case out
-        # rather than report a run they do not own (`research/docs/23` §3.3,
-        # v51).
+        # The marker is the rule: every rail the marker names owes the resolve
+        # target's landing, and a capture on any other rail has to leave the
+        # case out rather than report a run it does not own
+        # (`research/docs/23` §3.3, v51/v52).
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             owes = msaa_marker(suite, rail)
@@ -2160,13 +2161,22 @@ class ScissorObservationTests(unittest.TestCase):
                             "is not a rail this render case runs on"):
                         compare.validate_capture(suite, digest, report, rail)
 
-    def test_v28_refuses_a_msaa_case_that_names_an_object_rail(self):
+    def test_v28_refuses_a_rail_the_msaa_marker_does_not_name(self):
+        # The v51/v52 shape: a capture whose msaa marker names every rail
+        # *except* the one it runs on is refused rather than compared, exactly
+        # as the scissor and instanced markers state it.
         broken = copy.deepcopy(self.suite)
-        broken["render_cases"][MSAA_INDEX]["capture_rails"] = list(ALL_RAILS)
-        with self.assertRaisesRegex(
-                compare.CaptureError,
-                "the object API entry is the increment after it"):
-            compare._render_plan(compare._suite_plan(broken), broken)
+        broken["render_cases"][MSAA_INDEX]["capture_rails"] = ["native-metal"]
+        digest = hashlib.sha256(
+            json.dumps(broken, sort_keys=True).encode("utf-8")).hexdigest()
+        for position, case in enumerate(broken["render_cases"]):
+            if position != MSAA_INDEX:
+                case["capture_rails"] = ["native-metal"]
+        report = counted_declaring(broken, digest, "vulkan")
+        report["results"].append(msaa_result())
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "is not a rail this render case runs on"):
+            compare.validate_capture(broken, digest, report, "vulkan")
 
 
 if __name__ == "__main__":

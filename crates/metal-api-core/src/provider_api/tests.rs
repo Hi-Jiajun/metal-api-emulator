@@ -188,8 +188,11 @@ impl ComputeProvider for FakeProvider {
             // (`research/docs/23` §3.3, v31).
             supports_render_instancing: self.vertex_input,
             max_render_instances: if self.vertex_input { 4 } else { 0 },
-            supports_render_multisample: false,
-            max_render_sample_count: 0,
+            // The object rails record and execute the pass-wide raster, so the
+            // fixture provider declares the two multisample bits beside its
+            // render ones (`research/docs/23` §3.3, v51/v52).
+            supports_render_multisample: self.render,
+            max_render_sample_count: if self.render { 4 } else { 0 },
             supports_presentation: self.render,
             max_present_targets: u32::from(self.render),
             supported_present_modes: self
@@ -2329,6 +2332,104 @@ fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
         }
         .into()
     );
+}
+
+#[test]
+fn a_multisample_draw_records_the_raster_and_needs_an_index_buffer() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_multi(&provider, vec![AttachmentFormat::Rgba8Unorm]);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let target = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let view = target.view(0, 16).unwrap();
+    let scratch = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let scratch_view = scratch.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+    let index = device
+        .new_buffer_with_bytes(vec![0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let index_view = index.view(0, 16).unwrap();
+    let attachment = RenderColorAttachment {
+        view: &view,
+        format: AttachmentFormat::Rgba8Unorm,
+        load: RenderAttachmentLoad::Clear([0x22, 0x44, 0x66, 0x89]),
+        store: StoreOp::Store,
+    };
+    let state = contract::MultisampleState {
+        sample_count: contract::SampleCount::Four,
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &view).unwrap();
+        encoder.set_buffer(1, &scratch_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+
+    // The multisample entry is an indexed one like the other state-carrying
+    // entries, so an encoder without an index buffer is refused before a pass
+    // is recorded (`research/docs/23` §3.3, v51/v52).
+    assert_eq!(
+        encoder.draw_indexed_primitives_with_multisample(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            None,
+        ),
+        Err(Error::MissingIndexBuffer)
+    );
+
+    // Stating the single-sample raster is refused at recording time: the
+    // absent field is what that shape means, so the entry cannot record a
+    // second encoding of it (`research/docs/23` §3.3, v51).
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    assert_eq!(
+        encoder.draw_indexed_primitives_with_multisample(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            contract::MultisampleState {
+                sample_count: contract::SampleCount::One,
+            },
+            None,
+        ),
+        Err(ContractError::SingleSampleMultisampleState.into())
+    );
+
+    encoder
+        .draw_indexed_primitives_with_multisample(&[attachment], 2, 2, 6, 1, state, None)
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let pass = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the recorded draw is a render pass");
+    assert_eq!(pass.multisample, Some(state));
+    assert!(pass.depth.is_none() && pass.stencil.is_none());
 }
 
 #[test]

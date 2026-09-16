@@ -772,6 +772,10 @@ struct RenderDraw {
     stencil: Option<RenderStencilAttachment>,
     /// The stencil state the pass tests and writes with, or `None` for no test.
     stencil_test: Option<RenderStencilTest>,
+    /// The pass-wide multisample raster this pass renders with, or `None` for
+    /// the single-sample raster every draw the object API could record before
+    /// v52 had (`research/docs/23` §3.3, v51/v52).
+    multisample: Option<contract::MultisampleState>,
 }
 
 /// The pass-shaped view one bound draw input becomes.
@@ -824,6 +828,7 @@ impl RenderDraw {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         }
     }
 }
@@ -905,11 +910,11 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
-            // The object API records no multisample state yet
-            // (`research/docs/23` §3.3, v51): the pass-wide raster state is the
-            // trace rail's first increment, and the recording entry that
-            // carries it is the increment after it.
-            multisample: None,
+            // The pass-wide multisample raster travels with the recording
+            // (`research/docs/23` §3.3, v51/v52): the entry that names it is
+            // the only one that sets this field, so every earlier recording
+            // keeps the single-sample shape and its exact bytes.
+            multisample: self.draw.multisample,
             // The blend state is the pass's own, exactly as the culling and
             // depth entries state theirs (`research/docs/23` §3.3, v40/v42).
             blend: self.draw.blend.clone(),
@@ -2651,6 +2656,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2702,6 +2708,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: Some(stencil),
             stencil_test,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2748,6 +2755,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2793,6 +2801,7 @@ impl RenderCommandEncoder {
             depth_test,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2912,6 +2921,66 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// with the pass-wide multisample raster (`research/docs/23` §3.3,
+    /// v51/v52).
+    ///
+    /// The recording carries the same one-field state the trace contract does:
+    /// the colour attachments are rendered with a four-sample raster and the
+    /// covered samples are resolved into the attachments themselves, which is
+    /// what the caller's views observe. Every other rule is
+    /// [`Self::draw_indexed_primitives_with_attachments`]'s, and the contract's
+    /// own admission refuses the shapes this increment does not review — a
+    /// depth or stencil surface beside the raster, and a present action behind
+    /// it — exactly as it does for a trace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_multisample(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        multisample: contract::MultisampleState,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        // A stated single-sample raster is what the absent field already means,
+        // so the recording refuses it with the contract's own error instead of
+        // recording a second encoding of the shape every earlier entry states
+        // (`research/docs/23` §3.3, v51).
+        if multisample.sample_count == contract::SampleCount::One {
+            return Err(ContractError::SingleSampleMultisampleState.into());
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            blend: None,
+            cull: None,
+            depth: None,
+            depth_test: None,
+            stencil: None,
+            stencil_test: None,
+            multisample: Some(multisample),
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -2959,6 +3028,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3011,6 +3081,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3056,6 +3127,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3101,6 +3173,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3143,6 +3216,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3186,6 +3260,7 @@ impl RenderCommandEncoder {
             depth_test: None,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3234,6 +3309,7 @@ impl RenderCommandEncoder {
             depth_test,
             stencil: None,
             stencil_test: None,
+            multisample: None,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
@@ -3511,6 +3587,7 @@ impl RenderCommandEncoder {
                 depth_test: None,
                 stencil: None,
                 stencil_test: None,
+                multisample: None,
             },
             other => {
                 return Err(Error::IndirectKindMismatch {

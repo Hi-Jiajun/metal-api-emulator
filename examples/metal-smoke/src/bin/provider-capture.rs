@@ -1296,6 +1296,31 @@ fn default_instance_count() -> u64 {
     1
 }
 
+/// The pass-wide multisample state a case states, in the contract's own shape
+/// (`research/docs/23` §3.3, v51/v52).
+///
+/// `validate_render_case` already refused every count but the reviewed four
+/// before this runs, so the mapping is total over the shapes that can reach
+/// either rail; the refusal below keeps the helper total for a directly
+/// constructed case.
+fn case_multisample(case: &RenderCase) -> Result<Option<MultisampleState>> {
+    match &case.multisample {
+        Some(definition) => Ok(Some(MultisampleState {
+            sample_count: match definition.sample_count {
+                4 => SampleCount::Four,
+                other => {
+                    return Err(format!(
+                        "render case {}: unsupported multisample count {other}",
+                        case.id
+                    )
+                    .into())
+                }
+            },
+        })),
+        None => Ok(None),
+    }
+}
+
 /// The resolve of one texel's samples (`research/docs/23` §3.3, v51).
 ///
 /// `covered` of `samples` samples carry the fragment output and the rest the
@@ -3900,17 +3925,6 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 format!("{where_}: the multisample raster has to claim partial coverage").into(),
             );
         }
-        if case
-            .capture_rails
-            .iter()
-            .any(|rail| rail.ends_with("-objects"))
-        {
-            return Err(format!(
-                "{where_}: the multisample raster is the trace rail's first increment: the \
-                 object API entry is the increment after it"
-            )
-            .into());
-        }
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels it does not claim, and only a `dontcare` load has bytes that may
@@ -6204,21 +6218,7 @@ fn run_render_case(
     // reviewed fixture's four-sample raster. `validate_render_case` refused
     // every other count before this point, so the mapping is total over the
     // shapes that can reach it.
-    let multisample = match &case.multisample {
-        Some(definition) => Some(MultisampleState {
-            sample_count: match definition.sample_count {
-                4 => SampleCount::Four,
-                other => {
-                    return Err(format!(
-                        "render case {}: unsupported multisample count {other}",
-                        case.id
-                    )
-                    .into())
-                }
-            },
-        }),
-        None => None,
-    };
+    let multisample = case_multisample(case)?;
     trace.passes.push(TracePass::Render(RenderPassDescriptor {
         pipeline: render_pipeline.pipeline_id,
         color_attachments,
@@ -7146,6 +7146,20 @@ fn run_object_render_case(
                 index_count,
                 u32::try_from(case.base_vertex)?,
                 u32::try_from(case.instance_count)?,
+                present,
+            )?;
+        } else if let Some(multisample) = case_multisample(case)? {
+            // The reviewed multisample case runs on the object rails too
+            // (`research/docs/23` §3.3, v51/v52): the encoder records the same
+            // pass-wide raster the trace contract names, so the pass it becomes
+            // is the one the other rails execute.
+            render.draw_indexed_primitives_with_multisample(
+                &recorded,
+                width,
+                height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                multisample,
                 present,
             )?;
         } else if case.instance_count > 1 {
