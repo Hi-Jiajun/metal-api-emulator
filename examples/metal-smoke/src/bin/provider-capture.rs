@@ -5028,13 +5028,40 @@ fn run_object_render_case(
             render.set_vertex_buffer(u32::try_from(binding)?, stream)?;
         }
         render.set_index_buffer(index, *format)?;
-        render.draw_indexed_primitives_with_attachments(
-            &recorded,
-            attachments[0].0.width,
-            attachments[0].0.height,
-            u32::try_from(case.vertices)?,
-            present,
-        )?;
+        // The instance count belongs to the draw call, exactly as Metal's
+        // `drawIndexedPrimitives(...:instanceCount:)` spells it
+        // (`research/docs/23` §3.3, v32): a single-instance case keeps the
+        // pre-v32 entry point and its bytes, while the reviewed instanced case
+        // takes the second one.
+        let index_count = u32::try_from(case.vertices)?;
+        if case.instance_count > 1 {
+            render.draw_indexed_primitives_instanced_with_attachments(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                present,
+            )?;
+        } else {
+            render.draw_indexed_primitives_with_attachments(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                present,
+            )?;
+        }
+    } else if case.instance_count > 1 {
+        // The milestone's `vertex_id` triangle has no instanced entry point on
+        // the object API yet: recording it with one instance would draw a
+        // different pass than the trace rails, so it is refused here instead of
+        // silently narrowed (`research/docs/23` §3.3, v32).
+        return Err(format!(
+            "render case {}: the object rails have no instanced vertex_id shape",
+            case.id
+        )
+        .into());
     } else {
         // The milestone's `vertex_id` triangle binds no stream and no index
         // buffer, so it is the one shape that records through the

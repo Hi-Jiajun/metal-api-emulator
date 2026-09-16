@@ -42,12 +42,14 @@ INSTANCED_EXPECTED = "".join(
     INSTANCE_TINTS[0] if (index % 4) < 2 else INSTANCE_TINTS[1]
     for index in range(16))
 # Every rail executes the scissor from v30 on: the object API's encoder carries
-# `set_scissor`, so the fixture names all five. The instanced pair is the trace
-# rails' shape until the object API gains its own instanced draw call.
+# `set_scissor`, so the fixture names all five. The instanced pair is the same
+# story from v32 on: `draw_indexed_primitives_instanced_with_attachments` is
+# the object API's `drawIndexedPrimitives(...:instanceCount:)`, so its marker
+# names all five rails too.
 TRACE_RAILS = ("native-metal", "vulkan", "native-metal-provider")
 OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
 ALL_RAILS = TRACE_RAILS + OBJECT_RAILS
-INSTANCED_RAILS = TRACE_RAILS
+INSTANCED_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -150,7 +152,7 @@ class ScissorObservationTests(unittest.TestCase):
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
-    def test_v28_instances_on_every_trace_rail(self):
+    def test_v28_instances_on_every_rail(self):
         for rail in INSTANCED_RAILS:
             suite = copy.deepcopy(self.suite)
             # The scissor case names one other rail: this capture owes the

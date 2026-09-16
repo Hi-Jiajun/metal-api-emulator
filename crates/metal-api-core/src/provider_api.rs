@@ -2375,6 +2375,26 @@ impl RenderCommandEncoder {
     /// [`StoreOp::Store`], exactly as [`Self::draw_render_pass`] does; the
     /// multi-attachment shape that spells one store per location is
     /// [`Self::draw_primitives_with_attachments`].
+    /// The count checks every direct draw shares, in one place so a new draw
+    /// entry (the instanced pair below) cannot widen them by accident: the draw
+    /// covers at least the reviewed triangle, and it runs at least one
+    /// instance — zero instances is the "nothing landed" shape the contract
+    /// refuses as [`ContractError::ZeroLength`], so the encoder refuses it
+    /// before a pass exists.
+    fn admit_draw_counts(count: u32, instance_count: u32) -> Result<(), Error> {
+        if count < FULL_SCREEN_TRIANGLE_VERTICES {
+            return Err(ContractError::DrawVertexCountBelowMinimum {
+                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
+                actual: count,
+            }
+            .into());
+        }
+        if instance_count == 0 {
+            return Err(ContractError::ZeroLength("render instance count").into());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw_primitives(
         &mut self,
@@ -2430,13 +2450,7 @@ impl RenderCommandEncoder {
         if self.vertex_buffers.is_empty() {
             return Err(Error::MissingVertexBuffer);
         }
-        if vertex_count < FULL_SCREEN_TRIANGLE_VERTICES {
-            return Err(ContractError::DrawVertexCountBelowMinimum {
-                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
-                actual: vertex_count,
-            }
-            .into());
-        }
+        Self::admit_draw_counts(vertex_count, 1)?;
         let draw = RenderDraw {
             vertices: vertex_count,
             vertex_buffers: self.bound_vertex_buffers(),
@@ -2444,6 +2458,75 @@ impl RenderCommandEncoder {
             instance_count: 1,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams,
+    /// run once per instance (`research/docs/23` §3.3, v31/v32).
+    ///
+    /// Metal's own entry point is
+    /// `drawPrimitives(type:vertexStart:vertexCount:instanceCount:)`: the
+    /// instance count belongs to the draw call rather than to encoder state,
+    /// which is why this is a second recording entry and not a `set_` method
+    /// like [`Self::set_scissor`]. Every other rule is
+    /// [`Self::draw_primitives_with_attachments`]'s: the attachment list is
+    /// positional, the pipeline's compiled formats have to agree entry by
+    /// entry, and a list with no store is refused. `instance_count` of zero is
+    /// [`ContractError::ZeroLength`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_instanced_with_attachments(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        Self::admit_draw_counts(vertex_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+            instance_count,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record the single-attachment shape of
+    /// [`Self::draw_primitives_instanced_with_attachments`], fixing
+    /// [`StoreOp::Store`] exactly as [`Self::draw_primitives`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_instanced(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        load: RenderAttachmentLoad,
+        vertex_count: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.draw_primitives_instanced_with_attachments(
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+                store: StoreOp::Store,
+            }],
+            width,
+            height,
+            vertex_count,
+            instance_count,
+            present,
+        )
     }
 
     /// Record the milestone's render pass through the bound index buffer.
@@ -2515,13 +2598,7 @@ impl RenderCommandEncoder {
             .index_buffer
             .as_ref()
             .ok_or(Error::MissingIndexBuffer)?;
-        if index_count < FULL_SCREEN_TRIANGLE_VERTICES {
-            return Err(ContractError::DrawVertexCountBelowMinimum {
-                minimum: FULL_SCREEN_TRIANGLE_VERTICES,
-                actual: index_count,
-            }
-            .into());
-        }
+        Self::admit_draw_counts(index_count, 1)?;
         let draw = RenderDraw {
             vertices: index_count,
             vertex_buffers: self.bound_vertex_buffers(),
@@ -2532,6 +2609,75 @@ impl RenderCommandEncoder {
             instance_count: 1,
         };
         self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer,
+    /// run once per instance (`research/docs/23` §3.3, v31/v32).
+    ///
+    /// The indexed sibling of
+    /// [`Self::draw_primitives_instanced_with_attachments`], matching Metal's
+    /// `drawIndexedPrimitives(...:instanceCount:)`. The bound index buffer is
+    /// still required ([`Error::MissingIndexBuffer`]), the pipeline's layout
+    /// still decides how each stream advances, and every other rule is
+    /// [`Self::draw_indexed_primitives_with_attachments`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_instanced_with_attachments(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record the single-attachment shape of
+    /// [`Self::draw_indexed_primitives_instanced_with_attachments`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_instanced(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        load: RenderAttachmentLoad,
+        index_count: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.draw_indexed_primitives_instanced_with_attachments(
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+                store: StoreOp::Store,
+            }],
+            width,
+            height,
+            index_count,
+            instance_count,
+            present,
+        )
     }
 
     /// Land one render pass in the command's pass list.

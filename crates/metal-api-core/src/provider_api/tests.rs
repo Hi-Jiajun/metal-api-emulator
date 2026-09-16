@@ -1,10 +1,10 @@
 use super::*;
 use crate::provider::{
     allocate_device_epoch, AliasMode, AttachmentFormat, BufferAccess, BufferBindingContract,
-    BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, FootprintProof,
-    FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
+    BufferWriteback, CompletionReadback, ComputeProvider, ComputeTrace, ContractError,
+    FootprintProof, FunctionIdentity, FunctionSource, PipelineContract, PipelineId, PresentMode,
     ProviderErrorClass, ProviderHealth, ProviderPhase, RenderPipelineContract, Retryability,
-    SemanticDigest, ShaderSource, StorageMode, SubmissionId, ValidatedComputeTrace,
+    SemanticDigest, ShaderSource, StorageMode, SubmissionId, TracePass, ValidatedComputeTrace,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
 };
 use std::sync::atomic::AtomicUsize;
@@ -1906,6 +1906,109 @@ fn multi_attachment_draws_refuse_empty_duplicate_and_excess_lists() {
         .draw_primitives_with_attachments(&[shapes[0]], 2, 2, FULL_SCREEN_TRIANGLE_VERTICES, None)
         .unwrap();
     encoder.end_encoding().unwrap();
+}
+
+#[test]
+fn an_instanced_draw_records_the_instance_count_and_refuses_zero() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_vertex_input());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    // The bound stream means the pipeline has to carry the reviewed layout, or
+    // the recorded pass would disagree with the pipeline about its bindings.
+    let render_metadata = render_metadata_multi(&provider, vec![AttachmentFormat::Rgba8Unorm]);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let target = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let view = target.view(0, 16).unwrap();
+    let scratch = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let scratch_view = scratch.view(0, 16).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+    let index = device
+        .new_buffer_with_bytes(vec![0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let index_view = index.view(0, 16).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    // The declaring pass is what puts the attachment view in the trace's
+    // resource table, exactly as every other render fixture declares it.
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &view).unwrap();
+        encoder.set_buffer(1, &scratch_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+
+    // Zero instances is not a draw: the encoder refuses it with the same
+    // contract error a zero-count pass would produce
+    // (`research/docs/23` §3.3, v31/v32), before any pass is recorded.
+    assert_eq!(
+        encoder.draw_primitives_instanced(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            FULL_SCREEN_TRIANGLE_VERTICES,
+            0,
+            None,
+        ),
+        Err(ContractError::ZeroLength("render instance count").into())
+    );
+    assert_eq!(
+        encoder.draw_indexed_primitives_instanced(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            6,
+            0,
+            None,
+        ),
+        Err(ContractError::ZeroLength("render instance count").into())
+    );
+
+    // The two-instance shapes record; the commit is what turns them into the
+    // pass the rails read, and the pass carries the count the API named.
+    encoder
+        .draw_indexed_primitives_instanced(
+            &view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            6,
+            2,
+            None,
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let pass = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the recorded draw is a render pass");
+    assert_eq!(pass.instance_count, 2);
+    assert_eq!(pass.vertices, 6);
+    assert!(pass.indices.is_some());
+    // The declaring compute pass is still the trace's first pass, so the
+    // attachment resolves exactly as it does for every other render case.
+    assert_eq!(trace.passes.len(), 2);
 }
 
 #[test]

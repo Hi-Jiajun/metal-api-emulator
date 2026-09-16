@@ -936,12 +936,20 @@ the stepped vertex-layout tag and the count through the pass's
 `RENDER_FEATURE_INSTANCING` bit, so a frame that instances nothing keeps its
 pre-v31 bytes exactly.
 
+Both trace rails and (from v32) both object rails execute the fixture: the
+object API's `RenderCommandEncoder::draw_primitives_instanced` and
+`draw_indexed_primitives_instanced` are the `instanceCount:` half of Metal's own
+draw calls — the count belongs to the draw, not to encoder state — and every
+other rule (the bound streams, the positional attachments, the pipeline's own
+step functions) is the shape the trace entries already state. The fixture's
+marker therefore names all five rails; an object capture that omitted the case
+would be a marker refusal.
+
 The evidence boundary of this milestone:
 
 * the comparator's per-half expectation and the Swift oracle's matching rule are
   what refuse a fixture that carries one tint twice or swaps the halves;
-* the object API has no instanced draw call yet, so the fixture's marker names
-  the three trace rails and the object captures must omit it;
 * the Apple evidence is the macOS job's `native-metal` capture of this suite,
   and the Windows evidence is the RTX 5060 capture of the same suite on both
-  trace rails; a green job without either is compile evidence only.
+  trace rails and both object rails; a green job without either is compile
+  evidence only.
