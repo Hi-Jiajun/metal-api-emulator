@@ -651,7 +651,9 @@ pub(crate) const DEPTH_RESOLVE_SAMPLE0_BIT: u32 = 1u32 << DepthResolveFilter::Sa
 /// already requires — a real device query rather than a compile-time constant,
 /// combined with the platform fact the crate models. The filter mask stays
 /// fail-closed at Sample0 because Min/Max execution on Apple Paravirtual is
-/// not yet measured (`research/docs/23` §3.3, v57c).
+/// not yet measured (`research/docs/23` §3.3, v57c). Min/Max are decided by
+/// the `--depth-resolve-selftest` CI output; until that evidence lands, only
+/// Sample0 is declared.
 #[cfg(target_os = "macos")]
 pub(crate) fn device_depth_resolve_capability_bits(device: &Device) -> DepthResolveCapabilityBits {
     let supports = device.supports_family(metal::MTLGPUFamily::Apple4);
