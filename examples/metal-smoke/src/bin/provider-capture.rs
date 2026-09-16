@@ -1439,6 +1439,25 @@ struct RenderCase {
     /// unobservable — and the list has to leave at least one texel observed.
     #[serde(default)]
     wildcard_texels: Option<Vec<u64>>,
+    /// Texels the case does not pin, each with the *closed* set of byte values
+    /// its bytes may carry (`research/docs/23` §3.3, v67). Beside a
+    /// multisample raster, such a texel's bytes are a resolve whose covered
+    /// samples the draw wrote and whose other samples kept the pass's
+    /// reference colour, so the set is exactly the mixtures those two colours
+    /// produce. The channel is the single-attachment shape's, the load has to
+    /// be `dontcare`, and it cannot be stated beside the free list: a byte
+    /// either has a claim or it has none.
+    #[serde(default)]
+    wildcard_allowed_texels: Option<Vec<WildcardAllowedTexel>>,
+}
+
+/// The allowed values of one constrained wildcard texel
+/// (`research/docs/23` §3.3, v67): the row-major texel index and the four-byte
+/// values its bytes may take, each spelled as lowercase hex.
+#[derive(Clone, Deserialize)]
+struct WildcardAllowedTexel {
+    index: u64,
+    allowed: Vec<String>,
 }
 
 /// The instance count a case draws when it says nothing: the single instance
@@ -2228,7 +2247,11 @@ fn main() -> Result<()> {
         return Err("refusing to overwrite an existing capture".into());
     }
     // Validate every source and case before creating either provider device.
-    let raw = read_bounded(&suite_path, 65536)?;
+    // The reviewed suite has outgrown the 64 KiB bound the first suites fit in
+    // (v67's constrained wildcard fixture pushed `suite-v28.json` past it), so
+    // the ceiling is a quarter of the 1 MiB every other reviewed document gets;
+    // the cap still refuses a file that is not a suite at all.
+    let raw = read_bounded(&suite_path, 256 * 1024)?;
     let suite: Suite = serde_json::from_slice(&raw)?;
     validate_suite(&suite)?;
     let directory = suite_path.parent().unwrap_or(Path::new("."));
@@ -4460,9 +4483,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         let (attachment, _) = shapes.first().ok_or(format!(
             "{where_}: a multisample raster needs an attachment"
         ))?;
-        if attachment.load != "clear" {
+        // The attachment's load (`research/docs/23` §3.3, v51/v67): the
+        // reviewed pass opens it from a clear, or from v67 on from `dontcare`
+        // while every unclaimed texel states the closed set its resolve may
+        // land in. The free list stays refused here.
+        if !matches!(attachment.load.as_str(), "clear" | "dontcare") {
             return Err(format!(
-                "{where_}: the reviewed multisample pass opens its attachment from a clear"
+                "{where_}: the reviewed multisample pass opens its attachment from a clear or a \
+                 dontcare load with constrained wildcard texels"
             )
             .into());
         }
@@ -4646,6 +4674,149 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 "{where_}: a wildcard list has to leave at least one texel observed"
             )
             .into());
+        }
+    }
+    // The constrained wildcard channel (`research/docs/23` §3.3, v67): the
+    // same single-attachment `dontcare` shape as the free list, but every
+    // named texel states the closed set of values its bytes may carry instead
+    // of leaving them unclaimed. The two channels cannot be stated together —
+    // a byte either has a claim or it has none — and every entry is held to
+    // the four-byte lowercase spelling here; what the values *are* is the
+    // case's own shape and is checked with the attachment's colours below.
+    if case.wildcard_allowed_texels.is_some() && case.wildcard_texels.is_some() {
+        return Err(format!("{where_}: the two wildcard channels are mutually exclusive").into());
+    }
+    if let Some(allowed) = &case.wildcard_allowed_texels {
+        let (attachment, _) = shapes
+            .first()
+            .ok_or(format!("{where_}: an allowed set needs an attachment"))?;
+        if !single {
+            return Err(format!(
+                "{where_}: the constrained wildcard channel is the single-attachment shape"
+            )
+            .into());
+        }
+        if attachment.load != "dontcare" {
+            return Err(format!(
+                "{where_}: only a dontcare load may leave texels unclaimed by an allowed set"
+            )
+            .into());
+        }
+        if allowed.is_empty() {
+            return Err(format!("{where_}: an allowed set has to name at least one texel").into());
+        }
+        let texel_count = attachment.width * attachment.height;
+        let mut seen = BTreeSet::new();
+        for (position, entry) in allowed.iter().enumerate() {
+            if entry.index >= texel_count {
+                return Err(format!(
+                    "{where_}: wildcard texel {} is outside the attachment",
+                    entry.index
+                )
+                .into());
+            }
+            if !seen.insert(entry.index) {
+                return Err(format!("{where_}: duplicate wildcard texel {}", entry.index).into());
+            }
+            if entry.allowed.is_empty() {
+                return Err(format!("{where_}: allowed set {position} has to name a value").into());
+            }
+            let mut distinct = BTreeSet::new();
+            for (value_position, value) in entry.allowed.iter().enumerate() {
+                let bytes = unhex(value)?;
+                if value.len() != 8 || value != &hex(&bytes) {
+                    return Err(format!(
+                        "{where_}: allowed set {position} value {value_position} has to be \
+                         four lowercase bytes"
+                    )
+                    .into());
+                }
+                if !distinct.insert(bytes) {
+                    return Err(format!(
+                        "{where_}: allowed set {position} names the value {value} twice"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    // The values a constrained wildcard texel may take (`research/docs/23`
+    // §3.3, v67) are the case's own arithmetic, not the fixture's choice: a
+    // resolve of `samples` samples where the draw wrote `k` of them and the
+    // rest kept the pass's reference colour can only produce the exact
+    // k-of-`samples` mixes of the fragment output and that colour, so every
+    // declared set has to be exactly those values — a value outside them would
+    // accept a byte no reviewed rail may produce, and a missing one would
+    // refuse a resolve that is correct. The single-sample shape's mixes are
+    // the two colours themselves.
+    if let Some(allowed) = &case.wildcard_allowed_texels {
+        let fragment = unhex(shapes[0].1.as_deref().ok_or(format!(
+            "{where_}: a constrained wildcard texel needs the fragment output"
+        ))?)?;
+        let reference = unhex(shapes[0].0.clear_hex.as_deref().ok_or(format!(
+            "{where_}: a constrained wildcard texel needs the reference colour of its mixes"
+        ))?)?;
+        if reference.len() != 4 {
+            return Err(format!("{where_}: a reference colour is four bytes").into());
+        }
+        if reference == fragment {
+            return Err(format!(
+                "{where_}: a constrained wildcard texel needs a reference colour other than the \
+                 fragment output"
+            )
+            .into());
+        }
+        let samples = case
+            .multisample
+            .as_ref()
+            .map_or(1_u64, |multisample| multisample.sample_count);
+        let mut candidates = BTreeSet::new();
+        for covered in 0..=samples {
+            let mut mix = Vec::with_capacity(4);
+            let mut exact = true;
+            for channel in 0..4 {
+                let total = u64::from(fragment[channel]) * covered
+                    + u64::from(reference[channel]) * (samples - covered);
+                if !total.is_multiple_of(samples) {
+                    exact = false;
+                    break;
+                }
+                mix.push(u8::try_from(total / samples)?);
+            }
+            if exact {
+                candidates.insert(mix);
+            }
+        }
+        if candidates.len() <= 1 {
+            return Err(format!(
+                "{where_}: the fragment output and the reference colour have to differ"
+            )
+            .into());
+        }
+        for entry in allowed {
+            let declared = entry
+                .allowed
+                .iter()
+                .map(|value| unhex(value))
+                .collect::<Result<BTreeSet<_>>>()?;
+            for value in &declared {
+                if !candidates.contains(value) {
+                    return Err(format!(
+                        "{where_}: texel {} states the allowed value 0x{}, which is not an exact \
+                         mix of the fragment output and the reference colour",
+                        entry.index,
+                        hex(value)
+                    )
+                    .into());
+                }
+            }
+            if declared != candidates {
+                return Err(format!(
+                    "{where_}: texel {} does not state the exact mix set of the case's colours",
+                    entry.index
+                )
+                .into());
+            }
         }
     }
     let mut parsed = Vec::new();
@@ -5036,12 +5207,47 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         // attachment. The unclaimed texels are the wildcard
                         // list's (`research/docs/23` §3.3, v33), and without
                         // one the stricter v20 rule and its exact message stay.
+                        // The constrained channel (`research/docs/23` §3.3, v67)
+                        // is the other way to leave a texel unclaimed: the texel's
+                        // bytes then have to be one of the values it states, and
+                        // that set is held to the case's own colours below.
+                        if let Some(allowed) = &case.wildcard_allowed_texels {
+                            let mut claimed = BTreeMap::new();
+                            for entry in allowed {
+                                let values = entry
+                                    .allowed
+                                    .iter()
+                                    .map(|value| unhex(value))
+                                    .collect::<Result<Vec<_>>>()?;
+                                claimed.insert(entry.index, values);
+                            }
+                            for (position, chunk) in texels.chunks_exact(4).enumerate() {
+                                let position = u64::try_from(position)?;
+                                let Some(values) = claimed.get(&position) else {
+                                    if chunk != &texels[..4] {
+                                        return Err(format!(
+                                    "{where_}: texel {position} of a dontcare load has to be \
+                                     the fragment output"
+                                )
+                                        .into());
+                                    }
+                                    continue;
+                                };
+                                if !values.iter().any(|value| value.as_slice() == chunk) {
+                                    return Err(format!(
+                                "{where_}: texel {position} of a dontcare load is not one of \
+                                 its declared values"
+                            )
+                                    .into());
+                                }
+                            }
+                        }
                         match &case.wildcard_texels {
                             None => {
-                                if !uniform_texel {
+                                if case.wildcard_allowed_texels.is_none() && !uniform_texel {
                                     return Err(format!(
-                                        "{where_}: every texel of a dontcare load has to be the fragment output"
-                                    )
+                                "{where_}: every texel of a dontcare load has to be the fragment output"
+                            )
                                     .into());
                                 }
                             }
@@ -5070,7 +5276,13 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                                 }
                             }
                         }
-                        if attachment.clear_hex.is_some() {
+                        // The reference colour of a constrained wildcard texel
+                        // (`research/docs/23` §3.3, v67) is stated beside a
+                        // `dontcare` load as well: it is the second colour the
+                        // resolve's mixes are built from, not a colour the pass
+                        // clears the attachment to.
+                        if attachment.clear_hex.is_some() && case.wildcard_allowed_texels.is_none()
+                        {
                             return Err(format!(
                                 "{where_}: a dontcare load carries no clear colour"
                             )
@@ -5159,7 +5371,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         }
                     }
                     "dontcare" => {
-                        if attachment.clear_hex.is_some() {
+                        // A `dontcare` attachment carries no clear colour — the
+                        // pass neither reads nor writes its texels. The
+                        // constrained wildcard channel's reference colour is
+                        // the exception (`research/docs/23` §3.3, v67): it is
+                        // the second colour the resolve's mixes are built
+                        // from, not a colour this pass clears the attachment to.
+                        if attachment.clear_hex.is_some() && case.wildcard_allowed_texels.is_none()
+                        {
                             return Err(format!(
                                 "{where_}: a dontcare load carries no clear colour"
                             )
