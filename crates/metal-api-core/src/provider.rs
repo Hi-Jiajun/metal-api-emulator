@@ -2452,9 +2452,11 @@ pub struct RenderPassDescriptor {
     /// mix of the fragment output and the load's own colour.
     ///
     /// The first multisample increment executes colour-only offscreen passes:
-    /// a depth or stencil attachment beside it, and a present action behind
-    /// it, are both refused by [`Self::validate`] until the increments that
-    /// review those shapes.
+    /// a depth surface beside it is admitted from v53 on — the surface is
+    /// implicitly four-sample, rail-owned and must not be stored, because the
+    /// resolve of a multisampled depth surface is the increment that reviews
+    /// the two APIs' filters. A stencil surface beside the raster and a present
+    /// action behind it stay refused until the increments that review them.
     pub multisample: Option<MultisampleState>,
     /// The depth attachment this pass opens, or `None` for a pass with no
     /// depth surface at all (`research/docs/23` §3.3, v36). When present,
@@ -2556,10 +2558,15 @@ impl RenderPassDescriptor {
             if self.color_attachments.is_empty() {
                 return Err(ContractError::MultisampleWithoutColorAttachment);
             }
-            if self.depth.is_some() {
-                return Err(ContractError::MultisampleSurfaceUnsupported {
-                    surface: "depth attachment",
-                });
+            // The depth surface beside the raster (`research/docs/23` §3.3,
+            // v53) is admitted as the rail-owned shape: the pass may test and
+            // write it, but keeping its texels would need the depth resolve
+            // filters the two APIs spell differently, which is the increment
+            // after this one.
+            if let Some(depth) = &self.depth {
+                if depth.store == Some(DepthStoreOp::Store) {
+                    return Err(ContractError::MultisampleDepthStoreUnsupported);
+                }
             }
             if self.stencil.is_some() {
                 return Err(ContractError::MultisampleSurfaceUnsupported {
@@ -7007,6 +7014,7 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::MultisampleWithoutColorAttachment
         | E::MultisampleSurfaceUnsupported { .. }
         | E::MultisamplePresentUnsupported
+        | E::MultisampleDepthStoreUnsupported
         | E::UnsupportedDepthFormat(_)
         | E::DepthExtentMismatch { .. }
         | E::DepthTestWithoutAttachment
@@ -8453,6 +8461,13 @@ pub enum ContractError {
     /// surfaces of a resolved pass that is has to be a deliberate increment
     /// rather than an implication.
     MultisamplePresentUnsupported,
+    /// The pass states a multisample raster and keeps its depth surface
+    /// (`research/docs/23` §3.3, v53). A multisampled depth surface's texels
+    /// are only observable through a resolve, and the two APIs spell that
+    /// resolve differently (Metal's `MTLMultisampleDepthResolveFilter` against
+    /// Vulkan's depth-stencil-resolve step): the increment that reviews those
+    /// filters is the one that can admit a stored surface here.
+    MultisampleDepthStoreUnsupported,
     ViewportOriginUnsupported {
         origin: [u32; 2],
     },
@@ -9021,6 +9036,10 @@ impl fmt::Display for ContractError {
             Self::MultisamplePresentUnsupported => formatter.write_str(
                 "a multisample raster with a present action is outside the first multisample \
                  increment: the resolved surface's presentation is a later increment",
+            ),
+            Self::MultisampleDepthStoreUnsupported => formatter.write_str(
+                "a multisample raster cannot keep its depth surface yet: the depth resolve \
+                 filters the two APIs spell differently are a later increment",
             ),
             Self::ViewportOriginUnsupported { origin } => write!(
                 formatter,
@@ -13686,20 +13705,47 @@ mod tests {
         pass.validate()
             .expect("the four-sample raster is well formed");
 
-        // The first multisample increment reviews neither a depth nor a
-        // stencil surface beside the raster, and no present action behind it.
+        // The depth surface beside the raster is admitted from v53 on, as the
+        // rail-owned shape (`research/docs/23` §3.3, v53): the pass may test and
+        // write it, but keeping its texels would need the depth resolve filters
+        // the two APIs spell differently.
         let mut with_depth = pass.clone();
         with_depth.depth = Some(depth_attachment());
         with_depth.depth_test = Some(DepthTest {
             compare: CompareFunction::Less,
             write: true,
         });
+        with_depth
+            .validate()
+            .expect("a rail-owned depth surface beside the raster is well formed");
+        let mut stored_depth = with_depth.clone();
+        {
+            let depth = stored_depth
+                .depth
+                .as_mut()
+                .expect("the fixture opens a depth attachment");
+            depth.store = Some(DepthStoreOp::Store);
+            depth.identity = Some(RenderDepthIdentity {
+                allocation_id: AllocationId::new(940),
+                view_id: ViewId::new(950),
+            });
+        }
         assert_eq!(
-            with_depth.validate(),
-            Err(ContractError::MultisampleSurfaceUnsupported {
-                surface: "depth attachment",
-            })
+            stored_depth.validate(),
+            Err(ContractError::MultisampleDepthStoreUnsupported)
         );
+        // A depth test beside the raster still needs its surface, exactly as
+        // the single-sample shape states it.
+        let mut test_only = pass.clone();
+        test_only.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        assert_eq!(
+            test_only.validate(),
+            Err(ContractError::DepthTestWithoutAttachment)
+        );
+        // The stencil surface and the present action stay refused.
         let mut with_stencil = pass.clone();
         with_stencil.stencil = Some(RenderStencilAttachment {
             format: StencilFormat::Stencil8,

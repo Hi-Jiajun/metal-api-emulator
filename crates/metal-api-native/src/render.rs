@@ -1694,6 +1694,25 @@ pub(crate) fn plan<'a>(
         // not execute.
         multisample: match request.pass.multisample {
             Some(multisample) if multisample.sample_count == SampleCount::Four => {
+                // A multisampled depth surface is rail-owned in this increment
+                // (`research/docs/23` §3.3, v53): keeping it would need the
+                // depth resolve filter, so a directly-constructed request that
+                // asks for one is refused here exactly as the contract refuses
+                // it.
+                if request
+                    .pass
+                    .depth
+                    .as_ref()
+                    .is_some_and(|depth| depth.store == Some(DepthStoreOp::Store))
+                {
+                    return Err(
+                        capability_refusal("render_multisample_depth_store_unsupported")
+                            .with_detail(
+                            "a multisampled depth surface cannot be kept yet: the depth resolve \
+                             filters are a later increment",
+                        ),
+                    );
+                }
                 Some(SampleCount::Four)
             }
             Some(_) => {
@@ -2531,7 +2550,7 @@ fn encode_into_and_readback(
     let depth_target = planned
         .depth
         .as_ref()
-        .map(|depth| depth_texture(device, depth))
+        .map(|depth| depth_texture(device, depth, planned.multisample))
         .transpose()?;
     if let (Some(depth), Some(texture)) = (&planned.depth, &depth_target) {
         let attachment = pass
@@ -2975,9 +2994,24 @@ const fn metal_stencil_operation(operation: StencilOp) -> MTLStencilOperation {
 /// (`research/docs/16` §4.8). The pre-v43 shapes keep `Private`: nothing reads
 /// those texels back, and the rail-owned surface disappears with the pass.
 #[cfg(target_os = "macos")]
-fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, ProviderError> {
+fn depth_texture(
+    device: &Device,
+    depth: &PlannedDepth,
+    multisample: Option<SampleCount>,
+) -> Result<Texture, ProviderError> {
     let descriptor = TextureDescriptor::new();
-    descriptor.set_texture_type(MTLTextureType::D2);
+    // A multisampled pass creates its depth surface with the raster's own
+    // sample count (`research/docs/23` §3.3, v53): Metal refuses an encoder
+    // whose depth texture's sample count disagrees with `rasterSampleCount`, so
+    // the two come from one decision. The surface stays `Private` because a
+    // multisampled depth surface is rail-owned in this increment — keeping it
+    // would need the depth resolve filter the increment after this one reviews.
+    if multisample.is_some() {
+        descriptor.set_texture_type(MTLTextureType::D2Multisample);
+        descriptor.set_sample_count(4);
+    } else {
+        descriptor.set_texture_type(MTLTextureType::D2);
+    }
     descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
     descriptor.set_width(u64::from(depth.width));
     descriptor.set_height(u64::from(depth.height));
