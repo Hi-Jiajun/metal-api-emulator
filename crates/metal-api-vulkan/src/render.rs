@@ -819,12 +819,26 @@ fn prepare_render_request<'a>(
                  surface's presentation is a later increment",
             ));
         }
-        if pass.depth.is_some() || pass.stencil.is_some() {
-            return Err(
-                capability_refusal("render_multisample_surface_unsupported").with_detail(
-                    "the first multisample increment executes colour-only offscreen passes",
-                ),
-            );
+        // The depth surface beside the raster is admitted from v53 on
+        // (`research/docs/23` §3.3, v53): it is created with the pass's own
+        // sample count and stays rail-owned, because keeping its texels would
+        // need the depth resolve the increment after this one reviews. A
+        // stencil surface beside the raster stays refused, and so does a stored
+        // depth surface — the contract refuses the latter too, and this rail
+        // re-asserts it for a directly-constructed request.
+        if pass.stencil.is_some() {
+            return Err(capability_refusal("render_multisample_surface_unsupported")
+                .with_detail("the multisample raster does not execute a stencil surface yet"));
+        }
+        if let Some(depth) = &pass.depth {
+            if depth.store == Some(DepthStoreOp::Store) {
+                return Err(
+                    capability_refusal("render_multisample_depth_store_unsupported").with_detail(
+                        "a multisampled depth surface cannot be kept yet: the depth resolve \
+                         filters are a later increment",
+                    ),
+                );
+            }
         }
     }
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
@@ -1448,6 +1462,38 @@ pub(crate) fn format_supports_multisample_color_attachment(
     }
 }
 
+/// Whether the selected device can use `format` as a four-sample depth-stencil
+/// attachment with `tiling` (`research/docs/23` §3.3, v53).
+///
+/// The colour sibling's rule one usage over: a multisampled pass's depth
+/// surface has to carry the same sample count as the colour attachments, so the
+/// device answers the four-sample combination through the same
+/// `vkGetPhysicalDeviceImageFormatProperties` query.
+pub(crate) fn format_supports_multisample_depth_attachment(
+    context: &VulkanContext,
+    format: vk::Format,
+    tiling: vk::ImageTiling,
+) -> bool {
+    let properties = unsafe {
+        context
+            .instance
+            .get_physical_device_image_format_properties(
+                context.physical,
+                format,
+                vk::ImageType::TYPE_2D,
+                tiling,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageCreateFlags::empty(),
+            )
+    };
+    match properties {
+        Ok(properties) => properties
+            .sample_counts
+            .contains(vk::SampleCountFlags::TYPE_4),
+        Err(_) => false,
+    }
+}
+
 /// Whether the selected device's whole framebuffer admits four samples
 /// (`research/docs/23` §3.3, v51).
 ///
@@ -1570,6 +1616,16 @@ pub(crate) fn execute_offscreen_render(
         None => vk::SampleCountFlags::TYPE_1,
     };
     if samples != vk::SampleCountFlags::TYPE_1 {
+        if request
+            .depth
+            .as_ref()
+            .is_some_and(OffscreenDepthAttachment::storing)
+        {
+            return Err(capability_refusal("render_multisample_depth_store_unsupported").with_detail(
+                "a multisampled depth surface cannot be kept yet: the depth resolve filters are \
+                 a later increment",
+            ));
+        }
         for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
             if !format_supports_multisample_color_attachment(context, *vk_format, tiling) {
                 return Err(attachment_format_refusal()
@@ -1593,6 +1649,31 @@ pub(crate) fn execute_offscreen_render(
                     ),
                 );
             }
+        }
+        // The depth surface beside the raster is created with the same sample
+        // count (`research/docs/23` §3.3, v53), so the device has to admit the
+        // four-sample depth combination before the first depth image exists.
+        if request.depth.is_some()
+            && !format_supports_multisample_depth_attachment(
+                context,
+                vk::Format::D32_SFLOAT,
+                tiling,
+            )
+        {
+            return Err(attachment_format_refusal()
+                .with_field(
+                    "vk_format",
+                    FieldValue::Unsigned(vk::Format::D32_SFLOAT.as_raw() as u64),
+                )
+                .with_field("tiling", FieldValue::Text(tiling_name(tiling).to_owned()))
+                .with_field(
+                    "missing_feature",
+                    FieldValue::Text("depth_attachment_samples_4".to_owned()),
+                )
+                .with_detail(
+                    "vkGetPhysicalDeviceImageFormatProperties reports no four-sample \
+                     DEPTH_STENCIL_ATTACHMENT combination for D32_SFLOAT",
+                ));
         }
     }
     for (vk_format, attachment) in vk_formats.iter().zip(&request.attachments) {
@@ -1685,6 +1766,7 @@ pub(crate) fn execute_offscreen_render(
             depth.height,
             depth.clear.is_none(),
             depth.storing(),
+            samples,
         )?;
         if depth.storing() {
             objects.create_depth_readback(byte_length)?;
@@ -2415,6 +2497,11 @@ struct DepthObjects {
     /// Whether the pass opens the image from the attachment layout a previous
     /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
     loading: bool,
+    /// The sample count the image was created with (`research/docs/23` §3.3,
+    /// v53): `TYPE_1` for every pre-v53 depth surface, `TYPE_4` when the pass
+    /// states a multisample raster, which the render pass's own depth
+    /// description restates so the two cannot disagree.
+    samples: vk::SampleCountFlags,
     /// The host-visible buffer this pass's depth texels land in, present
     /// exactly when the pass stores the surface (`research/docs/23` §3.3, v43).
     /// A discarded surface is never copied out, so it needs no destination.
@@ -2598,6 +2685,7 @@ impl<'a> OffscreenObjects<'a> {
         height: u32,
         loading: bool,
         storing: bool,
+        samples: vk::SampleCountFlags,
     ) -> Result<(), ProviderError> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -2609,7 +2697,7 @@ impl<'a> OffscreenObjects<'a> {
             })
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
@@ -2636,6 +2724,7 @@ impl<'a> OffscreenObjects<'a> {
             memory,
             view,
             loading,
+            samples,
             readback: None,
             mapping: None,
         });
@@ -2932,14 +3021,21 @@ impl<'a> OffscreenObjects<'a> {
                 // action discards the surface and leaves it in its attachment
                 // layout; a storing pass ends in `TRANSFER_SRC_OPTIMAL`, so the
                 // copy-out below runs without a further barrier (v43).
+                // A multisampled pass creates the surface with the raster's own
+                // sample count (v53), so the description restates what the
+                // image was built with.
                 let loading = self.depth.as_ref().is_some_and(|objects| objects.loading);
                 let storing = self
                     .depth
                     .as_ref()
                     .is_some_and(|objects| objects.readback.is_some());
+                let samples = self
+                    .depth
+                    .as_ref()
+                    .map_or(vk::SampleCountFlags::TYPE_1, |objects| objects.samples);
                 vk::AttachmentDescription::default()
                     .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(samples)
                     .load_op(if loading {
                         vk::AttachmentLoadOp::LOAD
                     } else {
@@ -3922,7 +4018,15 @@ impl<'a> OffscreenObjects<'a> {
         }
         .map_err(|error| execution_refusal("begin command buffer", &error.to_string()))?;
 
-        let clear_values = attachments
+        // `pClearValues` is indexed by *attachment*, not by colour location, so
+        // the list has to mirror the render pass's own attachment order: the
+        // colour entries first, then one entry per resolve target, then the
+        // depth-stencil surface. A resolve target ignores its entry (its load
+        // op is `DONT_CARE`), but the array still has to reach the depth index
+        // — a shorter list silently shifts the depth clear, and Lavapipe then
+        // clears the depth surface to zero instead of the trace's own value
+        // (`research/docs/23` §3.3, v51/v53).
+        let mut clear_values = attachments
             .iter()
             .map(|attachment| vk::ClearValue {
                 color: clear_value_for(
@@ -3936,7 +4040,18 @@ impl<'a> OffscreenObjects<'a> {
                     },
                 ),
             })
-            .chain(depth.map(|depth| vk::ClearValue {
+            .collect::<Vec<_>>();
+        for (objects, attachment) in self.attachments.iter().zip(attachments) {
+            if objects.resolve.is_some() {
+                // The placeholder the resolve attachment's own index needs:
+                // its load op is `DONT_CARE`, so the value is never read.
+                clear_values.push(vk::ClearValue {
+                    color: clear_value_for(attachment.format, ClearColor::new([0; 4])),
+                });
+            }
+        }
+        if let Some(depth) = depth {
+            clear_values.push(vk::ClearValue {
                 // The depth entry follows the colour entries, exactly as the
                 // render pass's attachment list does
                 // (`research/docs/23` §3.3, v36). Vulkan ignores it when the
@@ -3945,21 +4060,21 @@ impl<'a> OffscreenObjects<'a> {
                     depth: depth.clear.unwrap_or(1.0),
                     stencil: 0,
                 },
-            }))
-            .chain(stencil.filter(|_| depth.is_none()).map(|stencil| {
+            });
+        }
+        if let Some(stencil) = stencil.filter(|_| depth.is_none()) {
+            clear_values.push(vk::ClearValue {
                 // The stencil entry follows the colour entries when the pass
                 // opens no depth surface — the two share one reference slot,
                 // so a pass never carries both entries (`research/docs/23`
                 // §3.3, v47). Vulkan ignores it when the stencil load op is
                 // not `CLEAR`.
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 0.0,
-                        stencil: u32::from(stencil.clear.unwrap_or(0)),
-                    },
-                }
-            }))
-            .collect::<Vec<_>>();
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 0.0,
+                    stencil: u32::from(stencil.clear.unwrap_or(0)),
+                },
+            });
+        }
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },

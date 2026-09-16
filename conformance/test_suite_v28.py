@@ -105,6 +105,12 @@ BLEND_ID = "blend_alpha_quad_4x4"
 # mean of the fragment output and the clear colour — a byte pattern a
 # single-sample raster cannot produce.
 MSAA_ID = "msaa_edge_4x4"
+# The v53 fixture: the depth pair's own two triangles over the same four-sample
+# raster the edge fixture states, with the rail-owned `depth32float` surface
+# cleared to one and a `less` test with writes on. Both primitives cover every
+# sample, so the near tint wins on every texel and a rail that ignored the depth
+# test would land the far tint instead.
+MSAA_DEPTH_ID = "msaa_depth_pair_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
 # the v45 depth-only case and v46 no-colour case follow it, so every case after
 # the stored depth pair moved by three positions.
@@ -123,10 +129,12 @@ BLEND_INDEX = 12
 # The v51 multisample fixture is the newest case, so every earlier position is
 # unchanged and the new one is last.
 MSAA_INDEX = 13
+# The v53 depth-tested multisample fixture follows it.
+MSAA_DEPTH_INDEX = 14
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
-                  MSAA_ID)
+                  MSAA_ID, MSAA_DEPTH_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -272,6 +280,10 @@ CULL_RAILS = ALL_RAILS
 # state on both object rails, so the marker widens to every rail
 # (`research/docs/23` §3.3, v51/v52).
 MSAA_RAILS = ALL_RAILS
+# The depth-tested sibling is the trace rails' own first increment
+# (`research/docs/23` §3.3, v53).
+MSAA_DEPTH_RAILS = TRACE_RAILS
+MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The reviewed multisample expectation: the fragment output where the quad
 # covers every sample, the clear colour where it covers none, and the
 # `2`-of-`4` resolve of the two in the column the quad's right edge crosses.
@@ -407,6 +419,20 @@ def msaa_marker(suite, rail):
     return rail in MSAA_RAILS
 
 
+def msaa_depth_marker(suite, rail):
+    """Point the v53 case at `rail` when that rail owes it, and elsewhere when not.
+
+    The depth-tested multisample case is the trace rails' first increment, so its
+    committed marker names the three trace rails: a capture on a rail the marker
+    names is owed the resolved attachment's landing, and one on any other rail
+    has to leave the case out entirely (`research/docs/23` §3.3, v53). Returns
+    whether `rail` owes the case.
+    """
+    suite["render_cases"][MSAA_DEPTH_INDEX]["capture_rails"] = (
+        [rail] if rail in MSAA_DEPTH_RAILS else [other_rail(rail)])
+    return rail in MSAA_DEPTH_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -446,6 +472,26 @@ def msaa_result(provider_backend=True, copy_in=2, copy_out=2):
         "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
                         "offset": ATTACHMENT[2], "bytes_hex": MSAA_EXPECTED}],
         "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_depth_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v53 landing: the depth-tested raster's own resolve target.
+
+    The rail-owned depth surface contributes no writeback and no allocation
+    image — it disappears with the pass — so the observation is the colour
+    attachment's resolved texels, exactly as the v52 fixture's is
+    (`research/docs/23` §3.3, v53).
+    """
+    result = {
+        "id": MSAA_DEPTH_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_DEPTH_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_DEPTH_EXPECTED}],
     }
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
@@ -734,6 +780,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(blend_result(rail != "native-metal"))
             if rail in MSAA_RAILS:
                 report["results"].append(msaa_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RAILS:
+                report["results"].append(msaa_depth_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -788,6 +836,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(blend_result(rail != "native-metal"))
             if rail in MSAA_RAILS:
                 report["results"].append(msaa_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RAILS:
+                report["results"].append(msaa_depth_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -832,6 +882,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(blend_result(rail != "native-metal"))
             if rail in MSAA_RAILS:
                 report["results"].append(msaa_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RAILS:
+                report["results"].append(msaa_depth_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -875,6 +927,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(cull_result())
         report["results"].append(blend_result())
         report["results"].append(msaa_result())
+        report["results"].append(msaa_depth_result())
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -1970,6 +2023,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(cull_result())
         report["results"].append(blend_result())
         report["results"].append(msaa_result())
+        report["results"].append(msaa_depth_result())
         broken = wildcard_result()
         # The left half is claimed, so a wrong byte there is a refusal even
         # though the right half stays wild.
@@ -2018,6 +2072,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(blend_result(rail != "native-metal"))
             if rail in MSAA_RAILS:
                 report["results"].append(msaa_result(rail != "native-metal"))
+            if rail in MSAA_DEPTH_RAILS:
+                report["results"].append(msaa_depth_result(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -2161,6 +2217,79 @@ class ScissorObservationTests(unittest.TestCase):
                             "is not a rail this render case runs on"):
                         compare.validate_capture(suite, digest, report, rail)
 
+    def test_v28_pins_the_msaa_depth_fixture(self):
+        case = self.suite["render_cases"][MSAA_DEPTH_INDEX]
+        self.assertEqual(case["id"], MSAA_DEPTH_ID)
+        self.assertEqual(case["multisample"], {"sample_count": 4})
+        self.assertNotIn("coverage", case)
+        self.assertEqual(case["depth"]["format"], "depth32float")
+        self.assertNotIn("store", case["depth"])
+        self.assertEqual(case["depth_test"], {"compare": "less", "write": True})
+        self.assertEqual(case["expected_hex"], MSAA_DEPTH_EXPECTED)
+        self.assertEqual(sorted(case["capture_rails"]), sorted(MSAA_DEPTH_RAILS))
+
+    def test_v28_plans_the_msaa_depth_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[MSAA_DEPTH_ID]
+        self.assertEqual(expectation.writes,
+                         [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                           bytes.fromhex(MSAA_DEPTH_EXPECTED))])
+
+    def test_v28_refuses_a_msaa_depth_surface_that_is_stored(self):
+        # A multisampled depth surface's texels are only observable through a
+        # depth resolve, and the two APIs spell that resolve differently, so the
+        # reviewed shape is the rail-owned one: a case that keeps the surface is
+        # refused rather than compared (`research/docs/23` §3.3, v53).
+        broken = copy.deepcopy(self.suite)
+        depth = broken["render_cases"][MSAA_DEPTH_INDEX]["depth"]
+        depth["store"] = "store"
+        depth["allocation"] = 940
+        depth["view"] = 951
+        depth["expected_hex"] = "00" * 64
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a multisampled depth surface is rail-owned"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_msaa_depth_case_that_claims_partial_coverage(self):
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_DEPTH_INDEX]["coverage"] = "partial"
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a multisample pass with a depth surface claims no partial coverage"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_msaa_depth_expectation_that_is_not_one_output(self):
+        # The depth pair's two primitives both cover every sample, so the
+        # expectation is one fragment output repeated — a mixed texel would
+        # claim a raster the fixture does not describe.
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][MSAA_DEPTH_INDEX]["expected_hex"] = (
+            "ff0000ff" * 15 + "00ff00ff")
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "has to be the fragment output"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_reports_the_msaa_depth_case_on_every_rail_its_marker_names(self):
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = msaa_depth_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != MSAA_DEPTH_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(msaa_depth_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
     def test_v28_refuses_a_rail_the_msaa_marker_does_not_name(self):
         # The v51/v52 shape: a capture whose msaa marker names every rail
         # *except* the one it runs on is refused rather than compared, exactly
@@ -2174,6 +2303,7 @@ class ScissorObservationTests(unittest.TestCase):
                 case["capture_rails"] = ["native-metal"]
         report = counted_declaring(broken, digest, "vulkan")
         report["results"].append(msaa_result())
+        report["results"].append(msaa_depth_result())
         with self.assertRaisesRegex(compare.CaptureError,
                                     "is not a rail this render case runs on"):
             compare.validate_capture(broken, digest, report, "vulkan")

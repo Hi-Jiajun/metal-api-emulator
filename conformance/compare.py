@@ -1548,14 +1548,27 @@ def _render_plan(plan, suite):
             _require(_integer(multisample["sample_count"],
                               f"{where}.multisample.sample_count", 1) == 4,
                      f"{where}: the reviewed multisample raster is four samples")
-            _require(coverage == "partial",
-                     f"{where}: the multisample raster has to claim partial coverage")
             _require(case["attachment"].get("load") == "clear",
                      f"{where}: the reviewed multisample pass opens its attachment from a "
                      "clear")
-            _require("depth" not in case and "stencil" not in case,
-                     f"{where}: the reviewed multisample pass opens no depth or stencil "
-                     "surface")
+            # The depth surface beside the raster is admitted from v53 on
+            # (`research/docs/23` §3.3, v53): it is rail-owned — the pass tests
+            # and writes it, but keeping its texels would need the depth resolve
+            # filters the two APIs spell differently — and the expectation then
+            # follows the depth pair's own uniform rule instead of the resolve
+            # rule. A stencil surface beside the raster stays refused.
+            _require("stencil" not in case,
+                     f"{where}: the reviewed multisample pass opens no stencil surface")
+            if "depth" in case:
+                _require(case["depth"].get("store") is None,
+                         f"{where}: a multisampled depth surface is rail-owned: the depth "
+                         "resolve filters are a later increment")
+                _require(coverage is None,
+                         f"{where}: a multisample pass with a depth surface claims no partial "
+                         "coverage")
+            else:
+                _require(coverage == "partial",
+                         f"{where}: the multisample raster has to claim partial coverage")
             _require("present" not in case and "icb" not in case,
                      f"{where}: a multisample case carries neither a present action nor "
                      "an ICB")
@@ -1701,7 +1714,7 @@ def _render_plan(plan, suite):
                          f"{attachment_where}: a cleared attachment carries no initial bytes")
                 _require(clear != texel,
                          f"{attachment_where}: the clear colour equals the expected texel")
-                if multisample is not None:
+                if multisample is not None and case.get("depth") is None:
                     # The multisample resolve (`research/docs/23` §3.3, v51):
                     # every texel is the mean of the samples a primitive
                     # covered, so the expectation has to be a k-of-`sample_count`

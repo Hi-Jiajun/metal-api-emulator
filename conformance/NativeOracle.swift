@@ -2219,11 +2219,26 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): the multisample raster is the single-attachment shape")
         try require(multisample.sample_count == 4,
                     "\(definition.id): the reviewed multisample raster is four samples")
-        try require(definition.coverage == "partial",
-                    "\(definition.id): the multisample raster has to claim partial coverage")
-        try require(definition.depth == nil && definition.stencil == nil,
-                    "\(definition.id): the reviewed multisample pass opens no depth or "
-                    + "stencil surface")
+        // The raster's own expectation shape depends on what it opens
+        // (`research/docs/23` §3.3, v51/v53): a colour-only raster resolves
+        // fragment output and clear into partial texels and therefore has to
+        // claim partial coverage, while a raster that opens a rail-owned depth
+        // surface is the depth fixture's own shape — both of its primitives
+        // cover every sample, the near one wins and every texel is one fragment
+        // output.
+        if let depth = definition.depth {
+            try require(depth.store == nil,
+                        "\(definition.id): a multisampled depth surface is rail-owned: the "
+                        + "depth resolve filters are a later increment")
+            try require(definition.coverage == nil,
+                        "\(definition.id): a multisample pass with a depth surface claims no "
+                        + "partial coverage")
+        } else {
+            try require(definition.coverage == "partial",
+                        "\(definition.id): the multisample raster has to claim partial coverage")
+        }
+        try require(definition.stencil == nil,
+                    "\(definition.id): the reviewed multisample pass opens no stencil surface")
         try require(definition.wildcard_texels == nil,
                     "\(definition.id): the multisample raster claims every texel it resolves")
     }
@@ -2320,7 +2335,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // the previous bytes are decoded, below.
             let texel = Data(texels.prefix(4))
             var texelCount = 0
-            if attachment.load == "clear", let multisample = definition.multisample {
+            if attachment.load == "clear", let multisample = definition.multisample,
+               definition.depth == nil {
                 // The multisample resolve (`research/docs/23` §3.3, v51): every
                 // texel is the arithmetic mean of the samples a primitive
                 // covered, so the expectation has to be a k-of-`sample_count`
@@ -3262,6 +3278,15 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             width: depth.width,
             height: depth.height,
             mipmapped: false)
+        // A multisampled pass creates its depth surface with the raster's own
+        // sample count (`research/docs/23` §3.3, v53): Metal refuses an encoder
+        // whose depth texture disagrees with `rasterSampleCount`, and the
+        // surface is rail-owned — keeping it would need the depth resolve
+        // filter the increment after this one reviews.
+        if let multisample = definition.multisample {
+            descriptor.textureType = .type2DMultisample
+            descriptor.sampleCount = Int(multisample.sample_count)
+        }
         descriptor.usage = .renderTarget
         descriptor.storageMode = depth.store == nil ? .private : .shared
         guard let texture = device.makeTexture(descriptor: descriptor) else {

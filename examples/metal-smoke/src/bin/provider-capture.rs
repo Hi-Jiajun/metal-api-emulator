@@ -3903,9 +3903,9 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
             )
             .into());
         }
-        if case.depth.is_some() || case.stencil.is_some() {
+        if case.stencil.is_some() {
             return Err(format!(
-                "{where_}: the reviewed multisample pass opens no depth or stencil surface"
+                "{where_}: the reviewed multisample pass opens no stencil surface"
             )
             .into());
         }
@@ -3920,7 +3920,34 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 format!("{where_}: the multisample raster claims every texel it resolves").into(),
             );
         }
-        if case.coverage.as_deref() != Some("partial") {
+        // The raster's expectation shape depends on what it opens
+        // (`research/docs/23` §3.3, v51/v53): a colour-only raster resolves
+        // fragment output and clear into the partially covered texels and has
+        // to claim that shape, while a raster that opens a rail-owned depth
+        // surface is the depth pair's own shape — both primitives cover every
+        // sample, the near one wins and every texel is one fragment output.
+        if case.depth.is_some() {
+            let (depth, test) = case_depth(case, &where_)?;
+            let depth = depth.ok_or(format!("{where_}: a depth surface needs its attachment"))?;
+            if depth.store.is_some() {
+                return Err(format!(
+                    "{where_}: a multisampled depth surface is rail-owned: the depth resolve \
+                     filters are a later increment"
+                )
+                .into());
+            }
+            if test.is_none() {
+                return Err(
+                    format!("{where_}: a multisampled depth surface needs its test").into(),
+                );
+            }
+            if case.coverage.is_some() {
+                return Err(format!(
+                    "{where_}: a multisample pass with a depth surface claims no partial coverage"
+                )
+                .into());
+            }
+        } else if case.coverage.as_deref() != Some("partial") {
             return Err(
                 format!("{where_}: the multisample raster has to claim partial coverage").into(),
             );
@@ -4041,56 +4068,72 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                         // rule stays: every texel is the output
                         // (`research/docs/23` §3.3, v29).
                         if let Some(multisample) = &case.multisample {
-                            // The multisample resolve (`research/docs/23` §3.3,
-                            // v51): every texel is the arithmetic mean of the
-                            // samples a primitive covered, so the expectation
-                            // has to be a k-of-`sample_count` mix of the
-                            // fragment output and the clear colour — and at
-                            // least one texel has to be a *partial* mix, which
-                            // is the one byte pattern a single-sample raster
-                            // cannot produce.
-                            let clear_colour =
-                                unhex(attachment.clear_hex.as_deref().ok_or(format!(
-                                    "{where_}: a clear attachment needs clear_hex"
-                                ))?)?;
-                            if clear_colour.len() != 4 {
-                                return Err(
-                                    format!("{where_}: a clear colour is four bytes").into()
-                                );
-                            }
-                            let samples = u32::try_from(multisample.sample_count)?;
-                            let fragment = [texel[0], texel[1], texel[2], texel[3]];
-                            let mut partial = 0_usize;
-                            for (index, chunk) in texels.chunks_exact(4).enumerate() {
-                                let mut covered = None;
-                                for count in 0..=samples {
-                                    let Some(mixed) =
-                                        resolve_texel(&fragment, &clear_colour, count, samples)
-                                    else {
-                                        continue;
-                                    };
-                                    if chunk == mixed {
-                                        covered = Some(count);
-                                        break;
-                                    }
-                                }
-                                let Some(count) = covered else {
+                            // A raster that opens a rail-owned depth surface
+                            // keeps the depth pair's own expectation shape
+                            // (`research/docs/23` §3.3, v53): both primitives
+                            // cover every sample, the near one wins and every
+                            // texel is one fragment output, so the resolve rule
+                            // below — which exists for a *partially covered*
+                            // raster — is not the one that applies.
+                            if case.depth.is_some() {
+                                if !uniform_texel {
                                     return Err(format!(
-                                        "{where_}: texel {index} is not the resolve of any \
-                                         coverage of the {samples}-sample raster"
+                                        "{where_}: a depth-tested multisample expectation has to \
+                                         be one fragment output"
                                     )
                                     .into());
-                                };
-                                if count > 0 && count < samples {
-                                    partial += 1;
                                 }
-                            }
-                            if partial == 0 {
-                                return Err(format!(
-                                    "{where_}: a multisample expectation needs at least one \
+                            } else {
+                                // The multisample resolve (`research/docs/23` §3.3,
+                                // v51): every texel is the arithmetic mean of the
+                                // samples a primitive covered, so the expectation
+                                // has to be a k-of-`sample_count` mix of the
+                                // fragment output and the clear colour — and at
+                                // least one texel has to be a *partial* mix, which
+                                // is the one byte pattern a single-sample raster
+                                // cannot produce.
+                                let clear_colour = unhex(attachment.clear_hex.as_deref().ok_or(
+                                    format!("{where_}: a clear attachment needs clear_hex"),
+                                )?)?;
+                                if clear_colour.len() != 4 {
+                                    return Err(
+                                        format!("{where_}: a clear colour is four bytes").into()
+                                    );
+                                }
+                                let samples = u32::try_from(multisample.sample_count)?;
+                                let fragment = [texel[0], texel[1], texel[2], texel[3]];
+                                let mut partial = 0_usize;
+                                for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                    let mut covered = None;
+                                    for count in 0..=samples {
+                                        let Some(mixed) =
+                                            resolve_texel(&fragment, &clear_colour, count, samples)
+                                        else {
+                                            continue;
+                                        };
+                                        if chunk == mixed {
+                                            covered = Some(count);
+                                            break;
+                                        }
+                                    }
+                                    let Some(count) = covered else {
+                                        return Err(format!(
+                                            "{where_}: texel {index} is not the resolve of any \
+                                         coverage of the {samples}-sample raster"
+                                        )
+                                        .into());
+                                    };
+                                    if count > 0 && count < samples {
+                                        partial += 1;
+                                    }
+                                }
+                                if partial == 0 {
+                                    return Err(format!(
+                                        "{where_}: a multisample expectation needs at least one \
                                      partially covered texel"
-                                )
-                                .into());
+                                    )
+                                    .into());
+                                }
                             }
                         } else if case.coverage.as_deref() == Some("partial") {
                             let clear_colour =
