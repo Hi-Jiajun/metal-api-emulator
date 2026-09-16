@@ -1674,6 +1674,142 @@ impl RenderAttachment {
     }
 }
 
+/// Depth attachment formats this increment admits.
+///
+/// One value, because it is the one format both rails create without a second
+/// review surface: Vulkan's `VK_FORMAT_D32_SFLOAT` and Metal's
+/// `MTLPixelFormatDepth32Float`. The code is this contract's own, for the
+/// reason [`VertexFormat`] records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepthFormat {
+    Depth32Float,
+}
+
+impl DepthFormat {
+    pub const ADMITTED: [Self; 1] = [Self::Depth32Float];
+
+    /// Stable wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Depth32Float => 0,
+        }
+    }
+
+    /// Inverse of [`DepthFormat::code`]. An unknown code is a decoder error.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Depth32Float),
+            _ => None,
+        }
+    }
+}
+
+/// How a depth attachment's contents are established before the pass.
+///
+/// The depth sibling of [`LoadOp`], without the `DontCare` arm this increment
+/// does not schedule: a depth test against undefined contents would make the
+/// pass's outcome depend on state no trace declared, which is exactly what the
+/// wildcard channel (`docs/23` §3.3, v33) has to state in advance rather than
+/// leave implicit. The clear carries the depth value as an `f32` — the value
+/// the rails hand their own clear APIs — and its bits travel on the wire so a
+/// frame is byte-stable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepthLoadOp {
+    /// Clear every depth texel to the `f32` whose IEEE-754 bits these are.
+    ///
+    /// The bits travel rather than the float itself so the pass keeps its `Eq`
+    /// (a `NaN` clear would make two otherwise identical passes compare
+    /// unequal) and so a frame is byte-stable: a decoder reads exactly the
+    /// value the encoder wrote.
+    Clear(u32),
+    /// Keep the attachment's previous contents. The first depth increment has
+    /// no way to *observe* them (no depth readback channel yet), so a trace
+    /// that wants them observed is a later increment's shape.
+    Load,
+}
+
+impl DepthLoadOp {
+    /// The clear value a `Clear` arm carries, decoded.
+    pub const fn clear_depth(self) -> Option<f32> {
+        match self {
+            Self::Clear(bits) => Some(f32::from_bits(bits)),
+            Self::Load => None,
+        }
+    }
+
+    /// The `Clear` arm for one depth value.
+    pub const fn clear(depth: f32) -> Self {
+        Self::Clear(depth.to_bits())
+    }
+}
+
+/// How one depth comparison treats a fragment (`research/docs/23` §3.3, v36).
+///
+/// Two values, because the reviewed fixture needs exactly these: `Less` is the
+/// ordinary "nearer wins" test the fixture proves, and `Always` is the "the
+/// attachment exists but the test passes" control a fixture can use to show
+/// which half of the state it is observing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareFunction {
+    Less,
+    Always,
+}
+
+impl CompareFunction {
+    pub const ADMITTED: [Self; 2] = [Self::Less, Self::Always];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Less => 0,
+            Self::Always => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Less),
+            1 => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
+/// The depth state one pass tests and writes with (`research/docs/23` §3.3,
+/// v36).
+///
+/// Both fields are the pass's own, mirroring Metal, where the depth compare
+/// function and the write enable live in the `MTLDepthStencilState` the encoder
+/// sets — not in the pipeline. The Vulkan rail bakes them into the per-pass
+/// pipeline it builds from this same value, so one description serves both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DepthTest {
+    /// The comparison a fragment has to pass to be kept.
+    pub compare: CompareFunction,
+    /// Whether a passing fragment writes its depth.
+    pub write: bool,
+}
+
+/// The depth attachment one render pass carries (`research/docs/23` §3.3,
+/// v36).
+///
+/// The first depth increment's attachment is **rail-owned**: it has no view or
+/// allocation identity in the trace's resource table and no observation
+/// channel, because nothing reads it back yet. What a trace states is the shape
+/// the rails have to create and open: the format, the extent and the load
+/// operation. A depth readback channel is a later increment, and it is what
+/// would add the identity fields this one deliberately leaves out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderDepthAttachment {
+    /// The only format this increment admits ([`DepthFormat::ADMITTED`]).
+    pub format: DepthFormat,
+    /// Extent in texels; it has to match every colour attachment's extent, the
+    /// same rule the viewport states for the colour side.
+    pub width: u64,
+    pub height: u64,
+    /// How the pass establishes the attachment's contents.
+    pub load: DepthLoadOp,
+}
+
 /// The render-track pass: up to [`MAX_COLOR_ATTACHMENTS`] colour attachments,
 /// one non-indexed draw, no dynamic state (`research/docs/23` §3.1).
 ///
@@ -1751,6 +1887,15 @@ pub struct RenderPassDescriptor {
     /// too short for `base_vertex + highest_index + 1` is refused before any
     /// device object exists.
     pub base_vertex: u32,
+    /// The depth attachment this pass opens, or `None` for a pass with no
+    /// depth surface at all (`research/docs/23` §3.3, v36). When present,
+    /// [`Self::depth_test`] says what the fragments do with it.
+    pub depth: Option<RenderDepthAttachment>,
+    /// The depth state the pass's draw tests and writes with, or `None` for
+    /// "no test" — which a pass with a depth attachment may still declare, and
+    /// which is the shape every earlier increment published (they had no depth
+    /// attachment at all).
+    pub depth_test: Option<DepthTest>,
     /// Instances of the one draw (`research/docs/23` §3.3, v31), i.e. Metal's
     /// `drawPrimitives(vertexCount:instanceCount:)` and Vulkan's
     /// `vkCmdDraw(vertexCount, instanceCount, …)`. `1` is the single-instance
@@ -1872,6 +2017,33 @@ impl RenderPassDescriptor {
                     attachment: [attachment.width, attachment.height],
                 });
             }
+        }
+        // The depth attachment is a second raster with the pass's own extent
+        // (`research/docs/23` §3.3, v36): a depth surface a different size than
+        // the colour attachments would make the two rasters disagree, so the
+        // extents have to match exactly.
+        if let Some(depth) = &self.depth {
+            if depth.width == 0 || depth.height == 0 {
+                return Err(ContractError::ZeroDimension {
+                    field: "depth attachment",
+                    axis: if depth.width == 0 { 0 } else { 1 },
+                });
+            }
+            if !DepthFormat::ADMITTED.contains(&depth.format) {
+                return Err(ContractError::UnsupportedDepthFormat(depth.format));
+            }
+            if u64::from(width) != depth.width || u64::from(height) != depth.height {
+                return Err(ContractError::DepthExtentMismatch {
+                    viewport: [width, height],
+                    depth: [depth.width, depth.height],
+                });
+            }
+        }
+        // A depth test without a depth attachment has nothing to test against,
+        // and one against undefined contents would be the shape the wildcard
+        // channel has to state rather than a default this contract implies.
+        if self.depth_test.is_some() && self.depth.is_none() {
+            return Err(ContractError::DepthTestWithoutAttachment);
         }
         // The scissor, when present, has to stay inside the viewport and be
         // non-empty: a zero-area scissor would make "nothing landed" look like
@@ -2552,7 +2724,15 @@ pub enum CompletionPolicy {
 /// list, never by a combination of absent optionals. The `Compute` arm keeps
 /// the exact value of the pre-render pass type, so every existing provider
 /// path only has to unwrap a variant it already understands.
+///
+/// The render descriptor is deliberately carried inline rather than boxed: the
+/// depth increment (v36) pushed it past clippy's variant-size threshold, and
+/// boxing one arm would turn every match on `TracePass` into a dereference for
+/// a few hundred bytes that a submission holds one of at a time. The IPC
+/// request and response enums, which are cloned far more often, carry the same
+/// allowance for the same reason.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum TracePass {
     /// One dispatch over the compute pipeline named by `ComputePass::pipeline`.
     Compute(ComputePass),
@@ -5866,7 +6046,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         ),
         E::ViewportExtentMismatch { .. }
         | E::ScissorOutOfBounds { .. }
-        | E::BaseVertexRequiresIndices { .. } => {
+        | E::BaseVertexRequiresIndices { .. }
+        | E::UnsupportedDepthFormat(_)
+        | E::DepthExtentMismatch { .. }
+        | E::DepthTestWithoutAttachment => {
             (ProviderErrorClass::Args, "trace_contract_invalid")
         }
         // Presentation contract, Step 1. The three first-increment narrowings
@@ -7295,6 +7478,17 @@ pub enum ContractError {
     BaseVertexRequiresIndices {
         base_vertex: u32,
     },
+    /// The pass's depth attachment is not a format this increment admits
+    /// (`research/docs/23` §3.3, v36).
+    UnsupportedDepthFormat(DepthFormat),
+    /// The pass's depth attachment extent does not match the colour raster.
+    DepthExtentMismatch {
+        viewport: [u32; 2],
+        depth: [u64; 2],
+    },
+    /// The pass declares depth state but carries no depth attachment
+    /// (`research/docs/23` §3.3, v36).
+    DepthTestWithoutAttachment,
     ViewportExtentMismatch {
         viewport: [u32; 2],
         attachment: [u64; 2],
@@ -7794,6 +7988,18 @@ impl fmt::Display for ContractError {
                 formatter,
                 "base vertex {base_vertex} needs an index buffer: the two APIs add it to \
                  the index values, and a non-indexed draw has none"
+            ),
+            Self::UnsupportedDepthFormat(format) => write!(
+                formatter,
+                "depth format {format:?} is not one this increment admits"
+            ),
+            Self::DepthExtentMismatch { viewport, depth } => write!(
+                formatter,
+                "depth attachment extent {depth:?} does not match the colour raster {viewport:?}"
+            ),
+            Self::DepthTestWithoutAttachment => write!(
+                formatter,
+                "a depth test needs a depth attachment: there is nothing to test against"
             ),
             Self::ViewportExtentMismatch {
                 viewport,
@@ -9063,6 +9269,8 @@ mod tests {
 
     fn render_trace_pass(pipeline: u64, width: u64, height: u64) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(pipeline),
             color_attachments: vec![RenderAttachment {
@@ -12305,6 +12513,8 @@ mod tests {
 
     fn render_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(5),
             color_attachments: vec![render_attachment(AttachmentFormat::Rgba8Unorm)],
@@ -13034,6 +13244,8 @@ mod tests {
 
     fn render_pass_into(attachment: RenderAttachment) -> TracePass {
         TracePass::Render(RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(4),
             viewport: [0, 0, attachment.width as u32, attachment.height as u32],

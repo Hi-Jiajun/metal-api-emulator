@@ -30,10 +30,10 @@
 
 use ash::vk;
 use metal_api_core::provider::{
-    AttachmentFormat, BufferSource, BufferView, ClearColor, FieldValue, IndexFormat,
-    IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp, VertexBufferLayout,
-    VertexFormat, VertexStep,
+    AttachmentFormat, BufferSource, BufferView, ClearColor, CompareFunction, DepthTest, FieldValue,
+    IndexFormat, IndirectCommandDescriptor, LoadOp, ProviderError, ProviderErrorClass,
+    ProviderPhase, RenderPassDescriptor, RenderPipelineContract, Retryability, StoreOp,
+    VertexBufferLayout, VertexFormat, VertexStep,
 };
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -133,6 +133,51 @@ const INSTANCED_VERTEX_ENTRY: &str = "instanced_quad_main";
 const INSTANCED_TINT_FRAG_SPV: &[u8] = include_bytes!("render_spv/instanced_tint.frag.spv");
 /// Entry point [`INSTANCED_TINT_FRAG_SPV`] declares.
 const INSTANCED_TINT_FRAGMENT_ENTRY: &str = "instanced_tint_main";
+
+/// The reviewed depth fixture's vertex stage (`research/docs/23` §3.3, v36).
+///
+/// The module reads the caller-held `float32x3` positions (so the caller
+/// chooses each triangle's depth) and their `float32x4` tints, and forwards the
+/// tint. The rail pairs it with [`DEPTH_TINT_FRAG_SPV`] and nothing else.
+const DEPTH_VERTEX_SPV: &[u8] = include_bytes!("render_spv/depth_pair.vert.spv");
+/// Entry point [`DEPTH_VERTEX_SPV`] declares.
+const DEPTH_VERTEX_ENTRY: &str = "depth_pair_main";
+/// The reviewed fragment stage of the depth fixture: the vertex stage's
+/// forwarded tint, stored to `Location 0` of the single 8-bit attachment.
+const DEPTH_TINT_FRAG_SPV: &[u8] = include_bytes!("render_spv/depth_pair_tint.frag.spv");
+/// Entry point [`DEPTH_TINT_FRAG_SPV`] declares.
+const DEPTH_TINT_FRAGMENT_ENTRY: &str = "depth_pair_tint_main";
+
+/// The depth fixture's reviewed fragment stage, when the request's vertex stage
+/// is the reviewed depth module.
+///
+/// `None` means the vertex stage is not that module. The pair is reviewed for
+/// the single 8-bit UNORM attachment the fixture draws into; any other format
+/// list is refused rather than rendered with a store the review never covered —
+/// the same rule [`instanced_fragment_stage`] states.
+fn depth_fragment_stage(
+    vertex_entry: &str,
+    vertex_spirv: &[u8],
+    formats: &[AttachmentFormat],
+) -> Result<Option<(&'static [u8], &'static str)>, ProviderError> {
+    if vertex_entry != DEPTH_VERTEX_ENTRY || vertex_spirv != DEPTH_VERTEX_SPV {
+        return Ok(None);
+    }
+    match formats {
+        [AttachmentFormat::Rgba8Unorm] | [AttachmentFormat::Bgra8Unorm] => {
+            Ok(Some((DEPTH_TINT_FRAG_SPV, DEPTH_TINT_FRAGMENT_ENTRY)))
+        }
+        _ => Err(capability_refusal("render_depth_format_unsupported")
+            .with_field("attachments", FieldValue::Unsigned(formats.len() as u64))
+            .with_detail("the reviewed depth module draws into one 8-bit UNORM attachment")),
+    }
+}
+
+/// Whether a request's vertex stage is the reviewed depth module, and so
+/// requires the pass to carry a depth attachment with a test.
+fn vertex_stage_is_depth(vertex_entry: &str, vertex_spirv: &[u8]) -> bool {
+    vertex_entry == DEPTH_VERTEX_ENTRY && vertex_spirv == DEPTH_VERTEX_SPV
+}
 
 /// The fragment stage this rail owns for one request's vertex stage.
 ///
@@ -244,6 +289,11 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// attachments disagree). The milestone fixes 2×2 (`docs/23` §1.3) so full
     /// coverage is distinguishable from a single stored texel.
     pub extent: [u32; 2],
+    /// The depth attachment this pass opens, or `None` for a pass with no
+    /// depth surface (`research/docs/23` §3.3, v36). The attachment is
+    /// rail-owned: it has no trace identity and is never read back, so what it
+    /// carries is the shape the rail creates and opens.
+    pub depth: Option<OffscreenDepthAttachment>,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
     /// The caller-held vertex streams the pass binds, in binding order
@@ -260,6 +310,20 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `DrawIndexed` carries its index and instance counts and replays through
     /// the rail's own `[0, 1, 2]` index buffer.
     pub indirect: Option<IndirectReplay>,
+}
+
+/// The depth attachment one offscreen pass opens (`research/docs/23` §3.3,
+/// v36).
+pub(crate) struct OffscreenDepthAttachment {
+    /// Extent in texels; core admission already held it to the colour
+    /// attachments' own extent.
+    pub width: u32,
+    pub height: u32,
+    /// `Some(depth)` for a clear load, `None` for `Load`.
+    pub clear: Option<f32>,
+    /// The pass's depth state, or `None` for "the attachment exists and
+    /// nothing tests it".
+    pub test: Option<DepthTest>,
 }
 
 /// One colour attachment of an offscreen render request.
@@ -442,14 +506,22 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
     // (`research/docs/23` §3.3, v31): the vertex module that forwards a
     // per-instance tint selects the tint-storing fragment module, and every
     // other vertex stage keeps the format list's solid module.
-    let stage = match instanced_fragment_stage(
+    let stage = match depth_fragment_stage(
         &stages.contract.vertex_entry,
         &stages.vertex_spirv,
         &stages.contract.color_formats,
     ) {
         Ok(Some(pair)) => pair,
-        Ok(None) => match solid_fragment_spirv(&stages.contract.color_formats) {
-            Ok(module) => (module, SOLID_FRAGMENT_ENTRY),
+        Ok(None) => match instanced_fragment_stage(
+            &stages.contract.vertex_entry,
+            &stages.vertex_spirv,
+            &stages.contract.color_formats,
+        ) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => match solid_fragment_spirv(&stages.contract.color_formats) {
+                Ok(module) => (module, SOLID_FRAGMENT_ENTRY),
+                Err(_) => return false,
+            },
             Err(_) => return false,
         },
         Err(_) => return false,
@@ -553,6 +625,18 @@ fn prepare_render_request<'a>(
         return Err(fragment_stage_mismatch_refusal(
             &stages.contract.color_formats,
             &stages.contract.fragment_entry,
+        ));
+    }
+    // The reviewed depth module is the one module whose fragments depend on the
+    // pass's depth state: without an attachment and a test its two triangles
+    // would race in submission order, which is a shape the review never
+    // covered (`research/docs/23` §3.3, v36).
+    if vertex_stage_is_depth(&stages.contract.vertex_entry, &stages.vertex_spirv)
+        && (pass.depth.is_none() || pass.depth_test.is_none())
+    {
+        return Err(capability_refusal("render_depth_state_unsupported").with_detail(
+            "the reviewed depth module draws one triangle nearer than the other; a pass without \
+             a depth attachment and test would decide it by submission order",
         ));
     }
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
@@ -748,8 +832,15 @@ fn prepare_render_request<'a>(
             }
         }
     };
+    let depth = pass.depth.as_ref().map(|depth| OffscreenDepthAttachment {
+        width: u32::try_from(depth.width).unwrap_or(u32::MAX),
+        height: u32::try_from(depth.height).unwrap_or(u32::MAX),
+        clear: depth.load.clear_depth(),
+        test: pass.depth_test,
+    });
     let request = OffscreenRenderRequest {
         attachments,
+        depth,
         scissor: pass.scissor,
         instance_count: pass.instance_count,
         base_vertex: pass.base_vertex,
@@ -1123,10 +1214,21 @@ pub(crate) fn execute_offscreen_render(
     // v31): its reviewed vertex module selects the tint-storing fragment
     // module, and every other vertex stage keeps the format list's solid
     // module.
+    // The instanced and depth fixtures own reviewed module pairs of their own
+    // (`research/docs/23` §3.3, v31/v36): their vertex stages select the
+    // fragment module that stores the varying they forward, and every other
+    // vertex stage keeps the format list's solid module.
     let (fragment_spirv, fragment_entry_name) =
-        match instanced_fragment_stage(request.vertex.entry, request.vertex.spirv, &formats)? {
+        match depth_fragment_stage(request.vertex.entry, request.vertex.spirv, &formats)? {
             Some(pair) => pair,
-            None => (solid_fragment_spirv(&formats)?, SOLID_FRAGMENT_ENTRY),
+            None => match instanced_fragment_stage(
+                request.vertex.entry,
+                request.vertex.spirv,
+                &formats,
+            )? {
+                Some(pair) => pair,
+                None => (solid_fragment_spirv(&formats)?, SOLID_FRAGMENT_ENTRY),
+            },
         };
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
@@ -1204,7 +1306,13 @@ pub(crate) fn execute_offscreen_render(
             attachment.store == StoreOp::Store,
         )?;
     }
-    objects.create_render_pass(&vk_formats)?;
+    if let Some(depth) = &request.depth {
+        // The depth image is created before the render pass that names it, and
+        // its `Load`/clear choice is settled by the image's own load operation
+        // (`research/docs/23` §3.3, v36).
+        objects.create_depth(depth.width, depth.height, depth.clear.is_none())?;
+    }
+    objects.create_render_pass(&vk_formats, request.depth.as_ref())?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -1212,6 +1320,7 @@ pub(crate) fn execute_offscreen_render(
         &vertex_entry,
         &fragment_entry,
         &request.vertex_streams,
+        request.depth.as_ref(),
     )?;
     // One readback destination per stored attachment; a discarded attachment
     // creates none, because its bytes leave no observable surface to land in
@@ -1247,7 +1356,13 @@ pub(crate) fn execute_offscreen_render(
         None => {}
     }
     objects.create_command_pool(queue_index)?;
-    objects.record(&request.attachments, request.scissor, width, height)?;
+    objects.record(
+        &request.attachments,
+        request.depth.as_ref(),
+        request.scissor,
+        width,
+        height,
+    )?;
     objects.submit_and_wait(queue_index)?;
 
     // One readback record per stored attachment: `copy_out` equals the stored
@@ -1684,7 +1799,7 @@ pub(crate) fn execute_present_render(
     context.record_present_acquire();
     let mut objects = OffscreenObjects::new(context);
     objects.attach_present_target(target, *layout);
-    objects.create_render_pass(&[vk_format])?;
+    objects.create_render_pass(&[vk_format], None)?;
     objects.create_framebuffer(width, height)?;
     objects.create_pipeline(
         &vertex_words,
@@ -1692,6 +1807,7 @@ pub(crate) fn execute_present_render(
         &vertex_entry,
         &fragment_entry,
         &request.vertex_streams,
+        None,
     )?;
     let readback_mapping = objects.create_readback(byte_length)?;
     objects.create_vertex_inputs(&request.vertex_streams, request.index_stream.as_ref())?;
@@ -1699,7 +1815,7 @@ pub(crate) fn execute_present_render(
     objects.instance_count = request.instance_count;
     objects.base_vertex = request.base_vertex;
     objects.create_command_pool(queue_index)?;
-    objects.record(std::slice::from_ref(attachment), None, width, height)?;
+    objects.record(std::slice::from_ref(attachment), None, None, width, height)?;
     objects.submit_and_wait(queue_index)?;
 
     let texels = unsafe {
@@ -1750,6 +1866,10 @@ struct OffscreenObjects<'a> {
     context: &'a VulkanContext,
     /// One entry per colour attachment, in location order.
     attachments: Vec<AttachmentObjects>,
+    /// The rail-owned depth image of a pass that declares one
+    /// (`research/docs/23` §3.3, v36). `None` for every pre-v36 pass, which is
+    /// why the render pass, framebuffer and pipeline below all branch on it.
+    depth: Option<DepthObjects>,
     /// Whether this scope created every `attachments` image/memory/view and
     /// must destroy them on Drop. A present pass borrows the provider-owned
     /// [`PresentTargetImage`] instead, so its per-pass scope must not destroy
@@ -1800,6 +1920,17 @@ struct OffscreenObjects<'a> {
     fence: vk::Fence,
 }
 
+/// The Vulkan objects the rail-owned depth attachment owns
+/// (`research/docs/23` §3.3, v36).
+struct DepthObjects {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// Whether the pass opens the image from the attachment layout a previous
+    /// pass left it in (`Load`) or from `UNDEFINED` (a clear).
+    loading: bool,
+}
+
 /// The Vulkan objects one colour attachment owns inside [`OffscreenObjects`].
 ///
 /// `load_op` and `initial_layout` travel with the attachment because both feed
@@ -1836,6 +1967,7 @@ impl<'a> OffscreenObjects<'a> {
         Self {
             context,
             attachments: Vec::new(),
+            depth: None,
             owns_attachments: true,
             present: false,
             render_pass: vk::RenderPass::null(),
@@ -1903,6 +2035,55 @@ impl<'a> OffscreenObjects<'a> {
     /// reads its pre-pass contents (`docs/23` §3.1, v20);
     /// `DEVICE_LOCAL` is the memory class the probe used for every
     /// optimal-tiling candidate.
+    /// Create the rail-owned depth image of a pass that declares one.
+    ///
+    /// The image is a `D32_SFLOAT` depth attachment with no transfer usage and
+    /// no readback: nothing observes it in this increment, so the render pass
+    /// is free to leave it in its attachment layout after the pass
+    /// (`research/docs/23` §3.3, v36). `Load` opens it from the attachment
+    /// layout a previous pass left it in — which only a trace that wrote it in
+    /// the same submission can rely on — and a clear opens it from
+    /// `UNDEFINED`.
+    fn create_depth(
+        &mut self,
+        width: u32,
+        height: u32,
+        loading: bool,
+    ) -> Result<(), ProviderError> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, _) = crate::allocate_image_backing(
+            self.context,
+            &info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "depth",
+        )
+        .map_err(|error| execution_refusal("create depth image", &error.detail))?;
+        let view =
+            crate::create_depth_image_view(self.context, image, vk::Format::D32_SFLOAT, "depth")
+                .map_err(|error| execution_refusal("create depth view", &error.detail))?;
+        self.depth = Some(DepthObjects {
+            image,
+            memory,
+            view,
+            loading,
+        });
+        Ok(())
+    }
+
     fn create_attachment(
         &mut self,
         format: vk::Format,
@@ -1995,7 +2176,11 @@ impl<'a> OffscreenObjects<'a> {
     /// Each entry of `formats` is the `VkFormat` of the attachment at the same
     /// location; the per-attachment load operation and initial layout come
     /// from the scope's own attachment records.
-    fn create_render_pass(&mut self, formats: &[vk::Format]) -> Result<(), ProviderError> {
+    fn create_render_pass(
+        &mut self,
+        formats: &[vk::Format],
+        depth: Option<&OffscreenDepthAttachment>,
+    ) -> Result<(), ProviderError> {
         let attachments = self
             .attachments
             .iter()
@@ -2018,6 +2203,30 @@ impl<'a> OffscreenObjects<'a> {
                     .initial_layout(attachment.initial_layout)
                     .final_layout(final_layout)
             })
+            .chain(depth.map(|_| {
+                // The depth attachment: never stored (nothing reads it back),
+                // opened from `UNDEFINED` for a clear and from the attachment
+                // layout for a load, and left in the attachment layout after
+                // the pass (`research/docs/23` §3.3, v36).
+                let loading = self.depth.as_ref().is_some_and(|objects| objects.loading);
+                vk::AttachmentDescription::default()
+                    .format(vk::Format::D32_SFLOAT)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(if loading {
+                        vk::AttachmentLoadOp::LOAD
+                    } else {
+                        vk::AttachmentLoadOp::CLEAR
+                    })
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(if loading {
+                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            }))
             .collect::<Vec<_>>();
         let color_refs = (0..self.attachments.len())
             .map(|index| {
@@ -2026,9 +2235,20 @@ impl<'a> OffscreenObjects<'a> {
                     .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             })
             .collect::<Vec<_>>();
-        let subpasses = [vk::SubpassDescription::default()
+        // The depth reference follows the colour references, so its attachment
+        // index is the colour count (`research/docs/23` §3.3, v36).
+        let depth_ref = depth.map(|_| {
+            vk::AttachmentReference::default()
+                .attachment(self.attachments.len() as u32)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        });
+        let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_refs)];
+            .color_attachments(&color_refs);
+        if let Some(depth_ref) = &depth_ref {
+            subpass = subpass.depth_stencil_attachment(depth_ref);
+        }
+        let subpasses = [subpass];
         let mut dependencies = vec![vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
@@ -2056,6 +2276,38 @@ impl<'a> OffscreenObjects<'a> {
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::HOST_READ)
         });
+        if depth.is_some() {
+            // The depth clear and the test's depth writes are their own access
+            // class: the same pair the colour side states, named for the
+            // early/late fragment tests (`research/docs/23` §3.3, v36).
+            dependencies.push(
+                vk::SubpassDependency::default()
+                    .src_subpass(vk::SUBPASS_EXTERNAL)
+                    .dst_subpass(0)
+                    .src_stage_mask(
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    )
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            );
+            dependencies.push(
+                vk::SubpassDependency::default()
+                    .src_subpass(0)
+                    .dst_subpass(vk::SUBPASS_EXTERNAL)
+                    .src_stage_mask(
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_stage_mask(vk::PipelineStageFlags::HOST)
+                    .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty()),
+            );
+        }
         let info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpasses)
@@ -2066,11 +2318,17 @@ impl<'a> OffscreenObjects<'a> {
     }
 
     fn create_framebuffer(&mut self, width: u32, height: u32) -> Result<(), ProviderError> {
-        let views = self
+        let mut views = self
             .attachments
             .iter()
             .map(|attachment| attachment.view)
             .collect::<Vec<_>>();
+        if let Some(depth) = &self.depth {
+            // The framebuffer's attachment list is the render pass's, in the
+            // same order: the colour views first, the depth view last
+            // (`research/docs/23` §3.3, v36).
+            views.push(depth.view);
+        }
         let info = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(&views)
@@ -2093,6 +2351,7 @@ impl<'a> OffscreenObjects<'a> {
         vertex_entry: &CStr,
         fragment_entry: &CStr,
         vertex_streams: &[VertexStream<'_>],
+        depth: Option<&OffscreenDepthAttachment>,
     ) -> Result<(), ProviderError> {
         self.vertex_module = unsafe {
             self.context.device.create_shader_module(
@@ -2197,7 +2456,24 @@ impl<'a> OffscreenObjects<'a> {
         }
         .map_err(|error| execution_refusal("create pipeline layout", &error.to_string()))?;
 
-        let info = vk::GraphicsPipelineCreateInfo::default()
+        // The depth state is built only when the pass carries a depth
+        // attachment: Vulkan refuses a depth-stencil state on a subpass with no
+        // depth reference, and a pre-v36 pass has none
+        // (`research/docs/23` §3.3, v36).
+        let depth_state = depth.map(|attachment| {
+            vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(attachment.test.is_some())
+                .depth_write_enable(attachment.test.is_some_and(|test| test.write))
+                .depth_compare_op(match attachment.test.map(|test| test.compare) {
+                    Some(CompareFunction::Less) => vk::CompareOp::LESS,
+                    // `Always` is also what an attachment with no test states:
+                    // the pass still clears it, and every fragment passes.
+                    Some(CompareFunction::Always) | None => vk::CompareOp::ALWAYS,
+                })
+                .depth_bounds_test_enable(false)
+                .stencil_test_enable(false)
+        });
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_assembly)
@@ -2209,6 +2485,9 @@ impl<'a> OffscreenObjects<'a> {
             .layout(self.pipeline_layout)
             .render_pass(self.render_pass)
             .subpass(0);
+        if let Some(depth_state) = &depth_state {
+            info = info.depth_stencil_state(depth_state);
+        }
         let pipelines = unsafe {
             self.context
                 .device
@@ -2626,6 +2905,7 @@ impl<'a> OffscreenObjects<'a> {
     fn record(
         &mut self,
         attachments: &[OffscreenColorAttachment<'_>],
+        depth: Option<&OffscreenDepthAttachment>,
         scissor: Option<[u32; 4]>,
         width: u32,
         height: u32,
@@ -2653,6 +2933,16 @@ impl<'a> OffscreenObjects<'a> {
                     },
                 ),
             })
+            .chain(depth.map(|depth| vk::ClearValue {
+                // The depth entry follows the colour entries, exactly as the
+                // render pass's attachment list does
+                // (`research/docs/23` §3.3, v36). Vulkan ignores it when the
+                // depth load op is not `CLEAR`.
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: depth.clear.unwrap_or(1.0),
+                    stencil: 0,
+                },
+            }))
             .collect::<Vec<_>>();
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -3013,6 +3303,17 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 self.context
                     .device
                     .destroy_render_pass(self.render_pass, None);
+            }
+            if let Some(depth) = &self.depth {
+                if depth.view != vk::ImageView::null() {
+                    self.context.device.destroy_image_view(depth.view, None);
+                }
+                if depth.image != vk::Image::null() {
+                    self.context.device.destroy_image(depth.image, None);
+                }
+                if depth.memory != vk::DeviceMemory::null() {
+                    self.context.device.free_memory(depth.memory, None);
+                }
             }
             if self.owns_attachments {
                 for attachment in &self.attachments {
@@ -3403,6 +3704,8 @@ mod tests {
     /// sentinel the coverage assertions look for.
     fn milestone_pass(format: AttachmentFormat) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(11),
             color_attachments: vec![RenderAttachment {
@@ -3537,6 +3840,7 @@ mod tests {
         let mut blobs = execute_offscreen_render(
             context,
             &OffscreenRenderRequest {
+                depth: None,
                 base_vertex: 0,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {
@@ -3821,6 +4125,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            depth: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::R32Uint,
@@ -3883,6 +4188,7 @@ mod tests {
             let mut blobs = execute_offscreen_render(
                 &context,
                 &OffscreenRenderRequest {
+                    depth: None,
                     base_vertex: 0,
                     scissor: None,
                     attachments: vec![OffscreenColorAttachment {
@@ -4022,6 +4328,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            depth: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
@@ -4143,6 +4450,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                depth: None,
                 base_vertex: 0,
                 scissor: None,
                 attachments: vec![
@@ -4206,6 +4514,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                depth: None,
                 base_vertex: 0,
                 scissor: None,
                 attachments: vec![
@@ -4266,6 +4575,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                depth: None,
                 base_vertex: 0,
                 scissor: None,
                 attachments: vec![
@@ -4312,6 +4622,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            depth: None,
             scissor: None,
             attachments: vec![OffscreenColorAttachment {
                 format: AttachmentFormat::Rgba8Unorm,
@@ -4345,6 +4656,7 @@ mod tests {
             return;
         };
         let request = OffscreenRenderRequest {
+            depth: None,
             scissor: None,
             attachments: vec![
                 OffscreenColorAttachment {
@@ -4487,6 +4799,7 @@ mod tests {
         let blobs = execute_offscreen_render(
             &context,
             &OffscreenRenderRequest {
+                depth: None,
                 base_vertex: 0,
                 scissor: None,
                 attachments: vec![OffscreenColorAttachment {

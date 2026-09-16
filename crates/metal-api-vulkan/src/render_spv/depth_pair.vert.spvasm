@@ -1,0 +1,55 @@
+; 本文件是 depth_pair.vert.spv 的可读源（research/docs/23 §3.3，v36 深度测试）。
+; 复现命令：
+;   spirv-as --target-env vulkan1.0 depth_pair.vert.spvasm -o depth_pair.vert.spv
+;   spirv-val --target-env vulkan1.0 depth_pair.vert.spv
+; 入口名 depth_pair_main：core 的 RenderPipelineContract 要求 vertex/fragment 入口名不同。
+; 形状与被审查的 MSL 模块 conformance/shaders/depth_pair_4x4.metal 逐条对应：
+;   - location 0（vec3 float32，stride 32、offset 0）是顶点位置，z 由调用方给出；
+;   - location 1（vec4 float32，offset 16）是该顶点的颜色，原样转发给片元阶段；
+;   - 顶点阶段不做任何重排，所以 fixtures 的两个 oversize 三角形谁活下来只由深度状态决定。
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "depth_pair_main" %pos_in %tint_in %glpos %tint_out
+               OpSource GLSL 450
+               OpName %main "depth_pair_main"
+               OpName %gl_PerVertex "gl_PerVertex"
+               OpMemberName %gl_PerVertex 0 "gl_Position"
+               OpName %pos_in "position"
+               OpName %tint_in "tint"
+               OpName %tint_out "tint_out"
+               OpName %glpos "gl_PerVertex"
+               OpDecorate %pos_in Location 0
+               OpDecorate %tint_in Location 1
+               OpDecorate %tint_out Location 0
+               OpDecorate %gl_PerVertex Block
+               OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %int = OpTypeInt 32 1
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+%gl_PerVertex = OpTypeStruct %v4float
+%_ptr_Input_v3float = OpTypePointer Input %v3float
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_ptr_Output_PerVertex = OpTypePointer Output %gl_PerVertex
+     %pos_in = OpVariable %_ptr_Input_v3float Input
+    %tint_in = OpVariable %_ptr_Input_v4float Input
+   %tint_out = OpVariable %_ptr_Output_v4float Output
+      %glpos = OpVariable %_ptr_Output_PerVertex Output
+     %float_1 = OpConstant %float 1
+      %int_0 = OpConstant %int 0
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+        %pos = OpLoad %v3float %pos_in
+       %tint = OpLoad %v4float %tint_in
+          %x = OpCompositeExtract %float %pos 0
+          %y = OpCompositeExtract %float %pos 1
+          %z = OpCompositeExtract %float %pos 2
+       %pos4 = OpCompositeConstruct %v4float %x %y %z %float_1
+  %glpos_ptr = OpAccessChain %_ptr_Output_v4float %glpos %int_0
+               OpStore %glpos_ptr %pos4
+               OpStore %tint_out %tint
+               OpReturn
+               OpFunctionEnd

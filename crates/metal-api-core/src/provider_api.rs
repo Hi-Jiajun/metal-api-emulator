@@ -792,6 +792,8 @@ impl RenderTarget {
                 format: indices.format,
             });
         let descriptor = RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             scissor: self.scissor,
             pipeline: pipeline_id,
             color_attachments,

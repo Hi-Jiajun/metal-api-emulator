@@ -652,6 +652,8 @@ def _vertex_input_declaration(case, where):
     streams = _list(layout["buffers"], f"{where}.vertex_layout.buffers")
     if len(streams) == 2:
         return _instanced_declaration(case, streams, vertex_buffers, indices, where)
+    if case.get("depth") is not None:
+        return _depth_declaration(case, streams, vertex_buffers, indices, where)
     if case.get("base_vertex", 0) != 0:
         return _base_vertex_declaration(case, streams, vertex_buffers, indices, where)
     _require(len(streams) == 1, f"{where}: the reviewed shape is one vertex stream")
@@ -803,6 +805,75 @@ def _instanced_declaration(case, streams, vertex_buffers, indices, where):
             "tints": tints}
 
 
+def _depth_declaration(case, streams, vertex_buffers, indices, where):
+    """Pin the reviewed depth pair (`research/docs/23` §3.3, v36).
+
+    One stream whose vertices carry a `float32x3` position at offset 0 and a
+    `float32x4` tint at offset 16 (stride thirty-two), two oversize triangles at
+    `z = 0.5` and `z = 0.9`, a cleared `depth32float` attachment and a `less`
+    test with writes on. With that state the near triangle wins everywhere the
+    two overlap — which is the whole attachment — so the expectation is the
+    near tint sixteen times; a rail that dropped the attachment, the clear or
+    the test would show the far one.
+    """
+    quad_indices, stride = 6, 32
+    _object(streams[0], ("stride", "attributes"), f"{where}.vertex_layout.buffers[0]")
+    _require(streams[0]["stride"] == stride,
+             f"{where}: the reviewed depth stream has stride {stride}")
+    attributes = _list(streams[0]["attributes"],
+                       f"{where}.vertex_layout.buffers[0].attributes")
+    _require(len(attributes) == 2, f"{where}: the reviewed depth stream has two attributes")
+    _object(attributes[0], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[0]")
+    _require((attributes[0]["location"], attributes[0]["offset"], attributes[0]["format"])
+             == (0, 0, "float32x3"),
+             f"{where}: the reviewed depth position is location 0, offset 0, float32x3")
+    _object(attributes[1], ("location", "offset", "format"),
+            f"{where}.vertex_layout.buffers[0].attributes[1]")
+    _require((attributes[1]["location"], attributes[1]["offset"], attributes[1]["format"])
+             == (1, 16, "float32x4"),
+             f"{where}: the reviewed depth tint is location 1, offset 16, float32x4")
+    depth = case.get("depth")
+    _require(isinstance(depth, dict), f"{where}: a depth attachment is an object")
+    # The clear value rides on the `load: "clear"` arm, so the field set is the
+    # one the fixture uses rather than a fixed key list.
+    _require(set(depth) - {"format", "width", "height", "load", "clear_depth"} == set(),
+             f"{where}.depth: unexpected fields "
+             + ", ".join(sorted(set(depth) - {"format", "width", "height", "load",
+                                              "clear_depth"})))
+    for field in ("format", "width", "height", "load"):
+        _require(field in depth, f"{where}.depth: missing field {field}")
+    _require(depth["format"] == "depth32float",
+             f"{where}: the reviewed depth attachment is depth32float")
+    _require(depth["load"] == "clear",
+             f"{where}: the reviewed depth attachment is cleared")
+    _require(depth.get("clear_depth") == 1.0,
+             f"{where}: the reviewed depth clear is one")
+    test = case.get("depth_test")
+    _require(isinstance(test, dict), f"{where}: a depth test is an object")
+    _object(test, ("compare", "write"), f"{where}.depth_test")
+    _require(test["compare"] == "less" and test["write"] is True,
+             f"{where}: the reviewed depth state is a less test with writes on")
+    bindings = _list(vertex_buffers, f"{where}.vertex_buffers")
+    _require(len(bindings) == 1, f"{where}: the reviewed depth shape binds one stream")
+    binding = bindings[0]
+    _object(binding, ("allocation", "view", "offset", "length", "initial_hex"),
+            f"{where}.vertex_buffers[0]")
+    _require(binding["allocation"] > 0 and binding["view"] > 0,
+             f"{where}: zero vertex stream identity")
+    _require(binding["length"] == stride * quad_indices,
+             f"{where}: the reviewed depth stream is six stride-{stride} vertices")
+    _require(len(_hex(binding["initial_hex"], f"{where}.vertex_buffers[0].initial_hex"))
+             == binding["length"],
+             f"{where}: the vertex stream bytes do not match its length")
+    _require(indices is not None, f"{where}: the reviewed depth shape is indexed")
+    _object(indices, ("allocation", "view", "offset", "length", "initial_hex", "format"),
+            f"{where}.indices")
+    _require(indices["initial_hex"] == "000001000200030004000500",
+             f"{where}: the reviewed depth indices are the two reviewed triangles")
+    return {"vertices": quad_indices, "indices": quad_indices}
+
+
 def _base_vertex_declaration(case, streams, vertex_buffers, indices, where):
     """Pin the reviewed base-vertex shape (`research/docs/23` §3.3, v34).
 
@@ -913,7 +984,8 @@ def _render_plan(plan, suite):
         unexpected = sorted(set(case) - set(required)
                             - {"attachment", "expected_hex", "attachments", "present", "icb",
                                "vertex_layout", "vertex_buffers", "indices", "scissor",
-                               "instance_count", "wildcard_texels", "base_vertex"})
+                               "instance_count", "wildcard_texels", "base_vertex",
+                               "depth", "depth_test"})
         _require(not unexpected, f"{where}: unexpected fields {', '.join(unexpected)}")
         single = "attachment" in case
         multiple = "attachments" in case
@@ -1040,6 +1112,14 @@ def _render_plan(plan, suite):
             viewport = _list(case["viewport"], f"{attachment_where}.viewport")
             _require(viewport == [0, 0, width, height],
                      f"{attachment_where}: the viewport must cover the attachment")
+            # The depth attachment is a second raster with the pass's own
+            # extent (`research/docs/23` §3.3, v36): the two have to agree, the
+            # same rule the viewport states for the colour side.
+            if case.get("depth") is not None:
+                _require(case["depth"].get("width") == width
+                         and case["depth"].get("height") == height,
+                         f"{attachment_where}: the depth attachment has to match the "
+                         "colour extent")
             if scissor is not None:
                 x, y, scissor_width, scissor_height = scissor
                 _require(scissor_width > 0 and scissor_height > 0

@@ -50,24 +50,29 @@ use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
     AttachmentFormat, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
-    ContractError, FieldValue, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor, LoadOp,
-    PipelineId, PresentDescriptor, PresentMode, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassDescriptor, RenderPipelineContract, StoreOp, TracePass, VertexFormat, VertexLayout,
-    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    ContractError, DepthTest, FieldValue, IndexBufferBinding, IndexFormat,
+    IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassDescriptor, RenderPipelineContract, StoreOp,
+    TracePass, VertexFormat, VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 
+// The depth compare function is only named by the encoder body, which exists
+// on macOS alone; the plan's own `DepthTest` travels unchanged everywhere.
 #[cfg(target_os = "macos")]
 use foreign_types::ForeignType;
 #[cfg(target_os = "macos")]
 use metal::{
-    Buffer, CommandQueue, CompileOptions, Device, IndirectCommandBufferDescriptor, MTLClearColor,
-    MTLCommandBufferStatus, MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction,
-    MTLViewport, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
+    Buffer, CommandQueue, CompileOptions, DepthStencilDescriptor, Device,
+    IndirectCommandBufferDescriptor, MTLClearColor, MTLCommandBufferStatus, MTLCompareFunction,
+    MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport,
+    NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
     RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor, VertexDescriptor,
 };
+#[cfg(target_os = "macos")]
+use metal_api_core::provider::CompareFunction;
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
 
@@ -1165,6 +1170,9 @@ pub(crate) struct RenderPlan<'a> {
     /// The pass's scissor rectangle, or `None` for the whole viewport
     /// (`research/docs/23` §3.3, v29).
     pub(crate) scissor: Option<[u32; 4]>,
+    /// The rail-owned depth attachment this pass opens, or `None` for a pass
+    /// with no depth surface (`research/docs/23` §3.3, v36).
+    pub(crate) depth: Option<PlannedDepth>,
     pub(crate) vertices: u32,
     /// Instances the draw runs (`research/docs/23` §3.3, v31): Metal's
     /// `drawPrimitives(vertexCount:instanceCount:)` second count. `1` for every
@@ -1183,6 +1191,21 @@ pub(crate) struct RenderPlan<'a> {
     /// Bytes per attachment row of the same shared shape (`research/docs/23`
     /// §3.5).
     pub(crate) row_pitch: usize,
+}
+
+/// The depth attachment a plan opens (`research/docs/23` §3.3, v36).
+///
+/// Rail-owned like the Vulkan rail's: no trace identity and no readback, so the
+/// plan carries the shape the encoder creates and opens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedDepth {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// `Some(bits)` for a clear (the `f32`'s own bits), `None` for `Load`.
+    pub(crate) clear_bits: Option<u32>,
+    /// The pass's depth state, or `None` for "the attachment exists and
+    /// nothing tests it".
+    pub(crate) test: Option<DepthTest>,
 }
 
 /// One colour attachment of a planned pass, resolved before any Metal object
@@ -1396,6 +1419,12 @@ pub(crate) fn plan<'a>(
         extent,
         viewport: request.pass.viewport,
         scissor: request.pass.scissor,
+        depth: request.pass.depth.as_ref().map(|depth| PlannedDepth {
+            width: u32::try_from(depth.width).unwrap_or(u32::MAX),
+            height: u32::try_from(depth.height).unwrap_or(u32::MAX),
+            clear_bits: depth.load.clear_depth().map(f32::to_bits),
+            test: request.pass.depth_test,
+        }),
         vertices: request.pass.vertices,
         instance_count: request.pass.instance_count,
         vertex_streams,
@@ -2009,12 +2038,61 @@ fn encode_into_and_readback(
             RenderStoreAction::DontCare => color.set_store_action(MTLStoreAction::DontCare),
         }
     }
+    // The depth attachment is the rail's own texture, created when the plan
+    // declares one and never read back (`research/docs/23` §3.3, v36): the pass
+    // descriptor opens it with the plan's load operation and discards it after
+    // the draw.
+    // The texture and the depth-stencil state stay in these locals until the
+    // readback below: the pass descriptor and the encoder reference them, and
+    // the rail's objects are autoreleased at the end of the pool.
+    let depth_target = planned
+        .depth
+        .as_ref()
+        .map(|depth| depth_texture(device, depth))
+        .transpose()?;
+    if let (Some(depth), Some(texture)) = (&planned.depth, &depth_target) {
+        let attachment = pass
+            .depth_attachment()
+            .ok_or_else(|| resource_refusal("metal_render_depth_descriptor_unavailable"))?;
+        attachment.set_texture(Some(texture));
+        match depth.clear_bits {
+            Some(bits) => {
+                attachment.set_load_action(MTLLoadAction::Clear);
+                attachment.set_clear_depth(f64::from(f32::from_bits(bits)));
+            }
+            None => attachment.set_load_action(MTLLoadAction::Load),
+        }
+        attachment.set_store_action(MTLStoreAction::DontCare);
+    }
+    let depth_stencil_state = planned.depth.as_ref().map(|depth| {
+        let descriptor = DepthStencilDescriptor::new();
+        let (compare, write) = match depth.test {
+            Some(test) => (
+                match test.compare {
+                    CompareFunction::Less => MTLCompareFunction::Less,
+                    CompareFunction::Always => MTLCompareFunction::Always,
+                },
+                test.write,
+            ),
+            // An attachment with no test still clears; every fragment passes.
+            None => (MTLCompareFunction::Always, false),
+        };
+        descriptor.set_depth_compare_function(compare);
+        descriptor.set_depth_write_enabled(write);
+        device.new_depth_stencil_state(&descriptor)
+    });
     // The command buffer and the encoder are autoreleased and the rail is
     // synchronous, so neither has to be retained: nothing here outlives this
     // pool.
     let command = queue.new_command_buffer();
     let encoder = command.new_render_command_encoder(pass);
     encoder.set_render_pipeline_state(&pipeline);
+    // Metal's depth state is encoder state (`research/docs/23` §3.3, v36): the
+    // compare function and the write enable are the pass's own, exactly as the
+    // contract states them.
+    if let Some(state) = &depth_stencil_state {
+        encoder.set_depth_stencil_state(state);
+    }
     // The vertex streams the plan resolved, bound at the same indices the
     // pipeline's `MTLVertexDescriptor` names. The MTLBuffers are kept for the
     // whole call: they have to outlive the encoder that reads them, and the
@@ -2208,6 +2286,30 @@ pub(crate) fn present_target_texture(
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
 
+/// The rail-owned depth texture of a pass that declares one
+/// (`research/docs/23` §3.3, v36).
+///
+/// Private storage, because nothing reads the depth texels back: the colour
+/// attachments' shared storage exists for their readback, and the depth
+/// attachment has none in this increment.
+#[cfg(target_os = "macos")]
+fn depth_texture(device: &Device, depth: &PlannedDepth) -> Result<Texture, ProviderError> {
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
+    descriptor.set_width(u64::from(depth.width));
+    descriptor.set_height(u64::from(depth.height));
+    descriptor.set_mipmap_level_count(1);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(MTLStorageMode::Private);
+    let pointer: *mut metal::MTLTexture =
+        unsafe { msg_send![device.as_ref(), newTextureWithDescriptor: descriptor.as_ref()] };
+    if pointer.is_null() {
+        return Err(resource_refusal("metal_render_depth_allocation_failed"));
+    }
+    Ok(unsafe { Texture::from_ptr(pointer) })
+}
+
 /// One MTLBuffer holding a stream view's bytes, for a vertex or index binding.
 ///
 /// The image is the view's bytes placed at the view's own offset inside its
@@ -2324,6 +2426,12 @@ fn render_pipeline_state(
         }
         descriptor.set_vertex_descriptor(Some(vertex_descriptor));
     }
+    // A pass that opens a depth attachment compiles its pipeline against that
+    // attachment's format; a pre-v36 pass declares none
+    // (`research/docs/23` §3.3, v36).
+    if planned.depth.is_some() {
+        descriptor.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
+    }
     // One pipeline attachment per colour location: entry `i` states the pixel
     // format the reviewed fragment's output `i` is compiled against, which the
     // plan already forced to agree with the pass's attachment list
@@ -2433,6 +2541,8 @@ mod tests {
     /// as the full-screen triangle.
     fn milestone_pass(load: LoadOp) -> RenderPassDescriptor {
         RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: PipelineId::new(3),
             color_attachments: vec![RenderAttachment {
@@ -3219,6 +3329,8 @@ mod tests {
     /// bound stream.
     fn quad_pass() -> RenderPassDescriptor {
         RenderPassDescriptor {
+            depth: None,
+            depth_test: None,
             base_vertex: 0,
             pipeline: QUAD_PIPELINE,
             color_attachments: vec![RenderAttachment {

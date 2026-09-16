@@ -2261,6 +2261,27 @@ fn allocate_image_backing(
 /// Shared by the sampled-texture rail and the render-attachment rail; the
 /// aspect mask is `COLOR` for both because neither admits a depth/stencil or
 /// plane-disjoint format (`research/docs/23` §3.3).
+fn create_depth_image_view(
+    context: &VulkanContext,
+    image: vk::Image,
+    format: vk::Format,
+    what: &str,
+) -> Result<vk::ImageView, ExecutionFailure> {
+    let info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    unsafe { context.device.create_image_view(&info, None) }
+        .map_err(|error| ExecutionFailure::vulkan(error, format!("create {what} view: {error}")))
+}
+
 fn create_color_image_view(
     context: &VulkanContext,
     image: vk::Image,
