@@ -1452,7 +1452,9 @@
       "capture_rails": [
         "native-metal",
         "vulkan",
-        "native-metal-provider"
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
       ],
       "multisample": {
         "sample_count": 4

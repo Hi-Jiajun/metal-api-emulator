@@ -1344,6 +1344,7 @@ fn object_entry_admits(families: &[&str]) -> bool {
             | ["cull"]
             | ["base_vertex"]
             | ["multisample", "depth"]
+            | ["multisample", "stencil"]
     )
 }
 
@@ -7248,20 +7249,14 @@ fn run_object_render_case(
             // opens a depth surface takes the combined entry (`§3.3`, v53/v54)
             // — the rail-owned surface the pass tests and writes, never keeps.
             //
-            // A stencil surface beside the raster is refused by the contract
-            // (`MultisampleSurfaceUnsupported`), and the recording entries
-            // would silently drop it: refusing here keeps this rail from
-            // recording a pass the other rails would never execute.
-            if case.stencil.is_some() {
-                return Err(format!(
-                    "render case {}: a multisample raster does not execute a stencil surface",
-                    case.id
-                )
-                .into());
-            }
+            // A stencil surface beside the raster takes the combined entry
+            // from v56 on (`research/docs/23` §3.3, v55/v56); the contract's
+            // own admission already refused a stored surface and a combined
+            // depth-stencil surface.
             let (depth, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
-            match depth {
-                Some(depth) => {
+            let (stencil, stencil_test) = case_stencil(case, &format!("render case {}", case.id))?;
+            match (depth, stencil) {
+                (Some(depth), _) => {
                     let object_depth = objects::RenderDepthAttachment {
                         width: depth.width,
                         height: depth.height,
@@ -7290,7 +7285,43 @@ fn run_object_render_case(
                         present,
                     )?;
                 }
-                None => {
+                (None, Some(stencil)) => {
+                    let object_stencil = objects::RenderStencilAttachment {
+                        width: stencil.width,
+                        height: stencil.height,
+                        load: match stencil.load {
+                            metal_api_core::provider::StencilLoadOp::Clear(value) => {
+                                objects::RenderStencilLoad::Clear(value)
+                            }
+                            metal_api_core::provider::StencilLoadOp::Load => {
+                                objects::RenderStencilLoad::Load
+                            }
+                        },
+                        store: stencil.store,
+                        identity: None,
+                    };
+                    let object_stencil_test = stencil_test.map(|test| objects::RenderStencilTest {
+                        compare: test.compare,
+                        fail_op: test.fail_op,
+                        depth_fail_op: test.depth_fail_op,
+                        pass_op: test.pass_op,
+                        read_mask: test.read_mask,
+                        write_mask: test.write_mask,
+                        reference: test.reference,
+                    });
+                    render.draw_indexed_primitives_with_multisample_stencil(
+                        &recorded,
+                        width,
+                        height,
+                        index_count,
+                        u32::try_from(case.instance_count)?,
+                        object_stencil,
+                        object_stencil_test,
+                        multisample,
+                        present,
+                    )?;
+                }
+                (None, None) => {
                     render.draw_indexed_primitives_with_multisample(
                         &recorded,
                         width,

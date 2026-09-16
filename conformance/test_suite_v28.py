@@ -292,9 +292,11 @@ MSAA_RAILS = ALL_RAILS
 # halves on both object rails, so the marker widens to every rail
 # (`research/docs/23` §3.3, v53/v54).
 MSAA_DEPTH_RAILS = ALL_RAILS
-# The stencil sibling is the trace rails' own first increment, exactly as the
-# depth sibling was (`research/docs/23` §3.3, v55).
-MSAA_STENCIL_RAILS = TRACE_RAILS
+# The stencil sibling named the three trace rails first; the v56 recording entry
+# (`draw_indexed_primitives_with_multisample_stencil`) carries the same two
+# halves on both object rails, so the marker widens to every rail
+# (`research/docs/23` §3.3, v55/v56).
+MSAA_STENCIL_RAILS = ALL_RAILS
 MSAA_STENCIL_EXPECTED = "ff0000ff" * 16
 MSAA_DEPTH_EXPECTED = "ff0000ff" * 16
 # The reviewed multisample expectation: the fragment output where the quad
