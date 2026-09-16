@@ -224,6 +224,13 @@ impl NativeMetalProvider {
             // §3.3, v51): the plan holds the raster to the one count the encoder
             // builds, and this snapshot publishes exactly that count.
             let multisample_bits = render::multisample_capability_bits();
+            // The depth-resolve bits come from the device probe
+            // (`render::device_depth_resolve_capability_bits`,
+            // `research/docs/23` §3.3, v57c): the snapshot publishes the
+            // Sample0 bit when the device answers the Apple-family question,
+            // and Min/Max stay undeclared until an Apple Paravirtual run
+            // measures them.
+            let depth_resolve_bits = render::device_depth_resolve_capability_bits(&device);
             // The heap bits stay closed until `--heap-selftest` passes on an
             // Apple GPU; they come from one spelling (`crate::heap`) so the
             // snapshot and the flip condition cannot drift.
@@ -306,13 +313,16 @@ impl NativeMetalProvider {
                 // rail, recorded on `render::multisample_capability_bits`.
                 supports_render_multisample: multisample_bits.supports_render_multisample,
                 max_render_sample_count: multisample_bits.max_render_sample_count,
-                // The depth resolve is not executed yet: the `RenderPass2`
-                // migration and the per-device filter probe are the next
-                // increment's work, so both bits stay at the "cannot resolve"
-                // defaults and a resolving pass is refused during admission
-                // (`research/docs/23` §3.3, v57).
-                supports_render_depth_resolve: false,
-                depth_resolve_modes: 0,
+                // The depth resolve is executed by this rail as of v57c: the
+                // encoder opens the four-sample depth surface with
+                // `storeAction = .multisampleResolve` and lands the Sample0
+                // reduction in the v43 shared-storage readback texture. The
+                // bits come from the device probe
+                // (`render::device_depth_resolve_capability_bits`); Min/Max
+                // stay undeclared until an Apple Paravirtual run measures them
+                // (`research/docs/23` §3.3, v57c).
+                supports_render_depth_resolve: depth_resolve_bits.supports_render_depth_resolve,
+                depth_resolve_modes: depth_resolve_bits.depth_resolve_modes,
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).
@@ -1409,7 +1419,12 @@ impl NativeMetalProvider {
         // from values, so a trace this provider cannot execute end to end is
         // refused with nothing on the queue.
         let render_contracts = self.render_contracts(trace)?;
-        let render_plan = render::plan_trace(trace, &pool, &render_contracts)?;
+        let render_plan = render::plan_trace(
+            trace,
+            &pool,
+            &render_contracts,
+            self.capabilities.depth_resolve_modes,
+        )?;
         pending.submitted = true;
         let resources = pending.resources.as_ref().expect("encoded resources");
         resources.command.commit();
@@ -1940,7 +1955,12 @@ impl NativeMetalProvider {
             // can still abandon the observation before `wait` lands it — the
             // same shape the Vulkan object rail reports.
             let render_contracts = self.render_contracts(trace)?;
-            let render_plan = render::plan_trace(trace, &pool, &render_contracts)?;
+            let render_plan = render::plan_trace(
+                trace,
+                &pool,
+                &render_contracts,
+                self.capabilities.depth_resolve_modes,
+            )?;
             pending.submitted = true;
             let resources = pending.resources.as_ref().expect("encoded resources");
             resources.command.commit();

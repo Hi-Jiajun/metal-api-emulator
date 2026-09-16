@@ -234,9 +234,9 @@ private struct MultisampleDefinition: Decodable {
 /// The pass-level filter the two APIs spell differently: the case's own
 /// spelling is the closed family's wire name (`"sample0"`/`"min"`/`"max"`),
 /// and the rails map it onto their own constants. The reviewed fixture states
-/// `"sample0"`, the one filter the Lavapipe device reports; the native rail
-/// keeps its fail-closed "cannot resolve" snapshot in this increment, so the
-/// fixture's marker does not name it.
+/// `"sample0"`, the filter the native rail declares; the Min probe states
+/// `"min"` with an expectation the macOS CI still has to confirm
+/// (`research/docs/23` §3.3, v57c).
 private struct DepthResolveDefinition: Decodable {
     let filter: String
 }
@@ -431,11 +431,11 @@ private struct RenderCaseDefinition: Decodable {
     /// k-of-four mix of the two, which a single-sample raster cannot produce.
     let multisample: MultisampleDefinition?
     /// The depth resolve a stored multisampled depth surface states
-    /// (`research/docs/23` §3.3, v57), or `nil` for a pass that resolves
+    /// (`research/docs/23` §3.3, v57c), or `nil` for a pass that resolves
     /// nothing. Only legal beside a multisample raster whose depth attachment
     /// is stored; the reviewed fixture states the `sample0` filter and its
-    /// marker names the Vulkan rail alone, so this oracle validates the shape
-    /// but never runs it.
+    /// marker names this oracle's rail, so this rail maps the filter onto the
+    /// native `MTLMultisampleDepthResolveFilter` and reads the landing back.
     let depth_resolve: DepthResolveDefinition?
     /// The wildcard channel (`research/docs/23` §3.3, v33): the row-major
     /// texel indices of the single attachment whose bytes the case does *not*
@@ -3336,22 +3336,42 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
             mipmapped: false)
         // A multisampled pass creates its depth surface with the raster's own
         // sample count (`research/docs/23` §3.3, v53): Metal refuses an encoder
-        // whose depth texture disagrees with `rasterSampleCount`. The stored
-        // shape would need the depth resolve the v57 increment reviews, and
-        // this oracle's rail keeps its fail-closed "cannot resolve" snapshot,
-        // so no fixture marker names it for a stored multisampled depth
-        // surface (`research/docs/23` §3.3, v57).
+        // whose depth texture disagrees with `rasterSampleCount`. A resolving
+        // pass (v57c) keeps that surface private — the resolve target below is
+        // what the CPU reads back — while a stored non-resolving surface keeps
+        // its own shared texels.
         if let multisample = definition.multisample {
             descriptor.textureType = .type2DMultisample
             descriptor.sampleCount = Int(multisample.sample_count)
         }
         descriptor.usage = .renderTarget
-        descriptor.storageMode = depth.store == nil ? .private : .shared
+        descriptor.storageMode = (depth.store == nil || definition.depth_resolve != nil)
+            ? .private : .shared
         guard let texture = device.makeTexture(descriptor: descriptor) else {
             throw OracleError("\(definition.id): cannot allocate the depth attachment")
         }
         texture.label = "native oracle: \(definition.id) depth"
         depthTarget = texture
+    }
+    // The single-sample landing a depth resolve writes into
+    // (`research/docs/23` §3.3, v57c): the v43 shared-storage readback texture,
+    // one `depth32Float` texel per texel, observed by the readback below
+    // exactly as a stored non-resolving surface observes its own texture. The
+    // four-sample surface above never reaches the CPU, so it stays private.
+    var depthResolveTarget: MTLTexture?
+    if let depth = fixture.depth, definition.depth_resolve != nil {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float,
+            width: depth.width,
+            height: depth.height,
+            mipmapped: false)
+        descriptor.usage = .renderTarget
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw OracleError("\(definition.id): cannot allocate the depth resolve target")
+        }
+        texture.label = "native oracle: \(definition.id) depth resolve"
+        depthResolveTarget = texture
     }
     // The stencil surface is the rail's own texture for the shape every pre-v49
     // case declares (`research/docs/23` §3.3, v47): the stored values decide
@@ -3561,7 +3581,28 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         attachment.texture = texture
         attachment.loadAction = .clear
         attachment.clearDepth = depth.clearDepth
-        attachment.storeAction = depth.store == nil ? .dontCare : .store
+        // A resolving stored surface lands through `.multisampleResolve` in the
+        // single-sample target above, with the filter the case named
+        // (`research/docs/23` §3.3, v57c); every other stored shape keeps its
+        // own texels, and a discarded surface disappears with the pass
+        // (`§3.3`, v43).
+        if let resolve = definition.depth_resolve, let landing = depthResolveTarget {
+            attachment.storeAction = .multisampleResolve
+            attachment.resolveTexture = landing
+            switch resolve.filter {
+            case "sample0":
+                attachment.depthResolveFilter = .sample0
+            case "min":
+                attachment.depthResolveFilter = .min
+            case "max":
+                attachment.depthResolveFilter = .max
+            default:
+                throw OracleError(
+                    "\(definition.id): unsupported depth resolve filter \(resolve.filter)")
+            }
+        } else {
+            attachment.storeAction = depth.store == nil ? .dontCare : .store
+        }
     }
     // The stencil surface opens with its own load operation (`research/docs/23`
     // §3.3, v47) and leaves with the pass unless the case says otherwise
@@ -3779,7 +3820,12 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
     // (940/950). The comparison reports the first differing byte and both
     // sides, the same shape the colour readback above uses.
     if let depth = fixture.depth, let store = depth.store {
-        guard let texture = depthTarget else {
+        // A resolving pass observes the single-sample landing its resolve
+        // wrote; every non-resolving stored surface is read back from its own
+        // texture (`research/docs/23` §3.3, v43/v57c).
+        let readbackTexture = definition.depth_resolve != nil
+            ? depthResolveTarget : depthTarget
+        guard let texture = readbackTexture else {
             throw OracleError("\(definition.id): the stored depth attachment left the pass")
         }
         var observed = Data(count: depth.width * depth.height * 4)

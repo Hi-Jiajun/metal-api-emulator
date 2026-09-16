@@ -2655,6 +2655,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_depth_resolve_bit_without_a_depth_attachment_is_refused() {
+        let request = CommandRequest::Submit {
+            trace: multisample_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let wide = frame
+            .windows(3)
+            .enumerate()
+            .skip(10)
+            .find(|(_, window)| *window == [0x11, 0x20, 0x01])
+            .map(|(index, _)| index)
+            .expect("the multisample pass takes the wide tag");
+
+        // Set the depth-resolve bit (`0x4000`) beside the multisample bit,
+        // with the low byte keeping the vertex-input bit alone: no depth
+        // section exists, so the decoder refuses the orphaned resolve before
+        // reading its filter, exactly as the depth store and identity bits are
+        // refused (`research/docs/23` §3.3, v57).
+        let mut orphaned = frame;
+        orphaned[wide + 1] = 0x60;
+        assert!(
+            matches!(
+                CommandCodec::decode_request(&orphaned),
+                Err(CodecError::DepthFeatureWithoutAttachment(0x4000))
+            ),
+            "a depth resolve bit without a depth block has to be refused"
+        );
+    }
+
     /// A render trace whose pass opens a rail-owned stencil attachment and
     /// tests it (`research/docs/23` §3.3, v47): the state the reviewed
     /// increment's fixture uses, so the wire's byte shape is pinned by the same
@@ -2825,6 +2856,46 @@ mod tests {
         assert!(!plain_frame
             .windows(3)
             .any(|window| window == [0x11, 0x63, 0x21]));
+    }
+
+    #[test]
+    fn depth_resolve_frames_round_trip_every_admitted_filter() {
+        // The v57 wire carries one filter code per pass, so each of the three
+        // admitted filters has to survive its own round trip — the first
+        // fixture only pinned `Min` (`research/docs/23` §3.3, v57).
+        for (filter, code) in [
+            (DepthResolveFilter::Sample0, 0x00),
+            (DepthResolveFilter::Min, 0x01),
+            (DepthResolveFilter::Max, 0x02),
+        ] {
+            let mut trace = depth_resolve_trace();
+            let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+                panic!("the fixture is a render pass");
+            };
+            pass.depth_resolve = Some(MultisampleDepthResolve { filter });
+            let request = CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            };
+            let frame = CommandCodec::encode_request(&request).unwrap();
+            assert_eq!(
+                CommandCodec::decode_request(&frame).unwrap(),
+                request,
+                "the {filter:?} filter survives the round trip"
+            );
+            // The filter byte follows the depth identity's view tail and the
+            // four-sample count, so each admitted code travels in its own byte.
+            let position = frame
+                .windows(10)
+                .enumerate()
+                .skip(10)
+                .find(|(_, window)| {
+                    *window == [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xB6, 0x01, code]
+                })
+                .map(|(index, _)| index + 9)
+                .unwrap_or_else(|| panic!("the frame carries the {filter:?} filter byte"));
+            assert_eq!(frame[position], code);
+        }
     }
 
     #[test]
