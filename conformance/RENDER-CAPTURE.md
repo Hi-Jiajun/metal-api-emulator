@@ -1020,9 +1020,11 @@ over a five-vertex stream whose first vertex is a degenerate centre, drawn with
 `base_vertex: 1`. With the offset the indices reach the four reviewed corners and
 every texel of the cleared 4x4 attachment is the fragment output; without it the
 degenerate centre replaces a corner and six texel centres keep the clear colour.
-The fixture's marker names the three trace rails, because the object API's
-indexed entries have no base-vertex form yet: a case that declares one is
-refused on those rails instead of being recorded with offset zero.
+Both trace rails and (from v35) both object rails execute the fixture: the
+object API's `draw_indexed_primitives_base_vertex` is the `baseVertex:` half of
+Metal's indexed draw, and an encoder without an index buffer is refused before
+a pass is recorded, exactly as the contract refuses the combination. The
+fixture's marker therefore names all five rails.
 
 The evidence boundary is §13's: the five-rail CI run (with the Apple half in
 `native-oracle-build`) plus the RTX 5060 capture of the same suite.

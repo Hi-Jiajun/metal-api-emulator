@@ -2661,6 +2661,83 @@ impl RenderCommandEncoder {
         self.record_render_pass(attachments, width, height, present, draw, None)
     }
 
+    /// Record a multi-attachment render pass through the bound index buffer,
+    /// reading every index through `base_vertex` (`research/docs/23` §3.3,
+    /// v35).
+    ///
+    /// Metal's own entry point is
+    /// `drawIndexedPrimitives(…:baseVertex:baseInstance:)`; the offset belongs
+    /// to the draw call rather than to encoder state, which is why this is a
+    /// third recording entry rather than a `set_` method. Only an indexed draw
+    /// may carry it — the contract refuses a base vertex without an index
+    /// buffer, and an encoder that reaches here without one is refused with
+    /// [`Error::MissingIndexBuffer`] exactly as the other indexed entries are.
+    /// Every other rule is
+    /// [`Self::draw_indexed_primitives_with_attachments`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_base_vertex_with_attachments(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        base_vertex: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record the single-attachment shape of
+    /// [`Self::draw_indexed_primitives_base_vertex_with_attachments`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_base_vertex(
+        &mut self,
+        attachment: &BufferView,
+        format: AttachmentFormat,
+        width: u64,
+        height: u64,
+        load: RenderAttachmentLoad,
+        index_count: u32,
+        base_vertex: u32,
+        instance_count: u32,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.draw_indexed_primitives_base_vertex_with_attachments(
+            &[RenderColorAttachment {
+                view: attachment,
+                format,
+                load,
+                store: StoreOp::Store,
+            }],
+            width,
+            height,
+            index_count,
+            base_vertex,
+            instance_count,
+            present,
+        )
+    }
+
     /// Record the single-attachment shape of
     /// [`Self::draw_indexed_primitives_instanced_with_attachments`].
     #[allow(clippy::too_many_arguments)]

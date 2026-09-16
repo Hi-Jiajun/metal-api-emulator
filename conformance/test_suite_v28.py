@@ -64,9 +64,11 @@ TRACE_RAILS = ("native-metal", "vulkan", "native-metal-provider")
 OBJECT_RAILS = ("vulkan-objects", "native-metal-provider-objects")
 ALL_RAILS = TRACE_RAILS + OBJECT_RAILS
 INSTANCED_RAILS = ALL_RAILS
-# The base-vertex draw is the trace rails' shape until the object API gains its
-# own base-vertex entry point (`research/docs/23` §3.3, v34).
-BASE_VERTEX_RAILS = TRACE_RAILS
+# The base-vertex draw is the same story from v35 on:
+# `draw_indexed_primitives_base_vertex_with_attachments` is the object API's
+# `drawIndexedPrimitives(…:baseVertex:baseInstance:)`, so its marker names all
+# five rails too.
+BASE_VERTEX_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):
