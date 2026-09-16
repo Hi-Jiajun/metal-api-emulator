@@ -700,6 +700,10 @@ struct RenderDraw {
     /// v34). `0` is the shape every object-API draw records today; the field
     /// exists here because the pass it lands in carries it.
     base_vertex: u32,
+    /// The culling state this pass draws with, or `None` for "keep every
+    /// triangle" — the shape every draw the object API could record before v41
+    /// had (`research/docs/23` §3.3, v39/v41).
+    cull: Option<contract::RenderPassCull>,
     /// The depth surface this pass opens, or `None` for a pass with no depth
     /// surface — the shape every draw the object API could record before v37
     /// had (`research/docs/23` §3.3, v36/v37).
@@ -752,6 +756,7 @@ impl RenderDraw {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            cull: None,
             depth: None,
             depth_test: None,
         }
@@ -832,7 +837,9 @@ impl RenderTarget {
             });
         let descriptor = RenderPassDescriptor {
             blend: None,
-            cull: None,
+            // The culling state is the pass's own, exactly as the depth entry
+            // states its surface (`research/docs/23` §3.3, v39/v41).
+            cull: self.draw.cull,
             // The object API's depth surface states the shape directly: it has
             // no trace identity, so this is the same rail-owned description the
             // trace contract carries (`research/docs/23` §3.3, v36/v37).
@@ -2523,6 +2530,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count: 1,
             base_vertex: 0,
+            cull: None,
             depth: None,
             depth_test: None,
         };
@@ -2565,6 +2573,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count,
             base_vertex: 0,
+            cull: None,
             depth: None,
             depth_test: None,
         };
@@ -2606,6 +2615,7 @@ impl RenderCommandEncoder {
             indices: None,
             instance_count,
             base_vertex: 0,
+            cull: None,
             depth: Some(depth),
             depth_test,
         };
@@ -2721,6 +2731,7 @@ impl RenderCommandEncoder {
             }),
             instance_count: 1,
             base_vertex: 0,
+            cull: None,
             depth: None,
             depth_test: None,
         };
@@ -2764,6 +2775,7 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex: 0,
+            cull: None,
             depth: None,
             depth_test: None,
         };
@@ -2812,6 +2824,86 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex,
+            cull: None,
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass over the bound vertex streams that
+    /// culls triangles (`research/docs/23` §3.3, v39/v41).
+    ///
+    /// The culling counterpart of
+    /// [`Self::draw_primitives_with_attachments`]: the pass runs with the mode
+    /// and the front-facing winding `cull` states, and every other rule is that
+    /// entry's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_primitives_with_cull(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        vertex_count: u32,
+        instance_count: u32,
+        cull: contract::RenderPassCull,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if self.vertex_buffers.is_empty() {
+            return Err(Error::MissingVertexBuffer);
+        }
+        Self::admit_draw_counts(vertex_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: vertex_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: None,
+            instance_count,
+            base_vertex: 0,
+            cull: Some(cull),
+            depth: None,
+            depth_test: None,
+        };
+        self.record_render_pass(attachments, width, height, present, draw, None)
+    }
+
+    /// Record a multi-attachment render pass through the bound index buffer
+    /// that culls triangles (`research/docs/23` §3.3, v39/v41).
+    ///
+    /// The indexed sibling of [`Self::draw_primitives_with_cull`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_primitives_with_cull(
+        &mut self,
+        attachments: &[RenderColorAttachment<'_>],
+        width: u64,
+        height: u64,
+        index_count: u32,
+        instance_count: u32,
+        cull: contract::RenderPassCull,
+        present: Option<PresentInitial>,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        let (index_view, index_format) = self
+            .index_buffer
+            .as_ref()
+            .ok_or(Error::MissingIndexBuffer)?;
+        Self::admit_draw_counts(index_count, instance_count)?;
+        let draw = RenderDraw {
+            vertices: index_count,
+            vertex_buffers: self.bound_vertex_buffers(),
+            indices: Some(RenderIndex {
+                view: index_view.clone(),
+                format: *index_format,
+            }),
+            instance_count,
+            base_vertex: 0,
+            cull: Some(cull),
             depth: None,
             depth_test: None,
         };
@@ -2856,6 +2948,7 @@ impl RenderCommandEncoder {
             }),
             instance_count,
             base_vertex: 0,
+            cull: None,
             depth: Some(depth),
             depth_test,
         };
@@ -3117,9 +3210,10 @@ impl RenderCommandEncoder {
                 // increment: the replay reads the index values the rail's own
                 // buffer holds (`research/docs/25` §4.3).
                 base_vertex: 0,
-                // An ICB replay opens no depth surface either: the payload has
-                // no depth section, so the replay stays the v20 shape
-                // (`research/docs/25` §4.3, v37).
+                // An ICB replay states neither culling nor a depth surface: the
+                // payload has neither, so the replay stays the v20 shape
+                // (`research/docs/25` §4.3, v37/v41).
+                cull: None,
                 depth: None,
                 depth_test: None,
             },

@@ -107,7 +107,10 @@ CULL_EXPECTED = INSTANCE_TINTS[1] * 16
 # (`4080c080`).
 BLEND_EXPECTED = "20406040" * 16
 BLEND_RAILS = TRACE_RAILS
-CULL_RAILS = TRACE_RAILS
+# The culling state is the same story from v41 on:
+# `draw_indexed_primitives_with_cull` is the object API's own culling entry, so
+# its marker names all five rails.
+CULL_RAILS = ALL_RAILS
 
 
 def render_result(provider_backend=True, copy_in=2, copy_out=2):

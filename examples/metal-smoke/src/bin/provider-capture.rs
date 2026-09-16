@@ -5995,6 +5995,7 @@ fn run_object_render_case(
         // pre-v32 entry point and its bytes, while the reviewed instanced case
         // takes the second one.
         let index_count = u32::try_from(case.vertices)?;
+        let cull = case_cull(case)?;
         if case.depth.is_some() {
             // The reviewed depth case opens the surface through the object
             // API's depth entry (`research/docs/23` §3.3, v36/v37): the pass
@@ -6024,6 +6025,20 @@ fn run_object_render_case(
                 u32::try_from(case.instance_count)?,
                 depth,
                 depth_test,
+                present,
+            )?;
+        } else if let Some(cull) = cull {
+            // The reviewed culling case runs on the object rails too
+            // (`research/docs/23` §3.3, v39/v41): the encoder records the same
+            // mode and winding the trace contract names, through the object
+            // API's own culling entry.
+            render.draw_indexed_primitives_with_cull(
+                &recorded,
+                attachments[0].0.width,
+                attachments[0].0.height,
+                index_count,
+                u32::try_from(case.instance_count)?,
+                cull,
                 present,
             )?;
         } else if case.base_vertex != 0 {
