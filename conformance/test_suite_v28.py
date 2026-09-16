@@ -467,12 +467,15 @@ MSAA_EXPECTED = "".join(
 # face would land the third triangle's tint on the covered columns, so the
 # expectation is the first triangle's tint, its `2`-of-`4` resolve against the
 # clear in the split column, and the clear where nothing drew. The three trace
-# rails execute it; the object rails carry no entry for the pair, so the marker
-# names the trace three. The tints carry only zero and one channels, so every
-# expected byte is an exact tint, clear or two-of-four mean: no channel sits on
-# a rounding tie, which is what the RTX 5060 direct track measured when a
-# half-intensity tint read back one step below its Lavapipe byte.
-MSAA_DS_RAILS = TRACE_RAILS
+# rails named it first, and the v68 recording entry
+# (`draw_indexed_primitives_with_multisample_depth_stencil`) carries the same
+# pair on both object rails, so the marker names all five
+# (`research/docs/23` §3.3, v66/v68). The tints carry only zero and one
+# channels, so every expected byte is an exact tint, clear or two-of-four mean:
+# no channel sits on a rounding tie, which is what the RTX 5060 direct track
+# measured when a half-intensity tint read back one step below its Lavapipe
+# byte.
+MSAA_DS_RAILS = ALL_RAILS
 MSAA_DS_STENCIL_TEST = {"compare": "equal", "reference": 0, "read_mask": 255,
                         "write_mask": 255, "fail_op": "keep",
                         "depth_fail_op": "increment_wrap", "pass_op": "keep"}
@@ -729,9 +732,11 @@ def msaa_ds_marker(suite, rail):
     """Point the v66 combined pair at `rail` when that rail owes it.
 
     The rail-owned combined depth-stencil pair is the trace rails' own
-    increment: the object rails have no single entry that carries both faces
-    without a resolve, so the committed marker names the trace three
-    (`research/docs/23` §3.3, v66). Returns whether `rail` owes the case.
+    increment, and from v68 both object rails carry it too: the v68 recording
+    entry (`draw_indexed_primitives_with_multisample_depth_stencil`) states
+    both faces of the one surface at once, so the committed marker names all
+    five rails (`research/docs/23` §3.3, v66/v68). Returns whether `rail` owes
+    the case.
     """
     suite["render_cases"][MSAA_DS_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_DS_RAILS else [other_rail(rail)])

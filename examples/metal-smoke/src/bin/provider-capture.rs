@@ -1507,10 +1507,11 @@ fn object_state_families(case: &RenderCase) -> Vec<&'static str> {
 /// Each reviewed entry carries one family, and the combined entries carry a
 /// raster plus one surface (`multisample+depth` since v54,
 /// `multisample+stencil` since v56), plus the stored surface's resolve
-/// (`multisample+depth+depth_resolve` since v58). Every other combination
-/// would be recorded through an entry that silently drops the rest — the
-/// failure mode the v54 review found — so the object rail refuses it by name
-/// instead.
+/// (`multisample+depth+depth_resolve` since v58) — or the two faces of the
+/// combined depth-stencil surface one entry carries together
+/// (`multisample+depth+stencil` since v68). Every other combination would be
+/// recorded through an entry that silently drops the rest — the failure mode
+/// the v54 review found — so the object rail refuses it by name instead.
 const REVIEWED_FAMILY_SETS: &[&[&str]] = &[
     &[],
     &["multisample"],
@@ -1522,6 +1523,7 @@ const REVIEWED_FAMILY_SETS: &[&[&str]] = &[
     &["multisample", "depth"],
     &["multisample", "depth", "depth_resolve"],
     &["multisample", "stencil"],
+    &["multisample", "depth", "stencil"],
 ];
 
 /// Whether one object-API recording entry carries every family a case declares.
@@ -8322,7 +8324,74 @@ fn run_object_render_case(
             let (depth, depth_test) = case_depth(case, &format!("render case {}", case.id))?;
             let (stencil, stencil_test) = case_stencil(case, &format!("render case {}", case.id))?;
             match (depth, stencil) {
-                (Some(depth), _) => {
+                (Some(depth), Some(stencil)) => {
+                    // Both faces of the combined depth-stencil surface at once
+                    // (`research/docs/23` §3.3, v66/v68): the v68 recording
+                    // entry carries the same rail-owned pair the trace rails
+                    // execute — one surface the pass tests and writes through
+                    // both faces, kept by neither — so the pass the object
+                    // rail records is the one the other rails run. The pair
+                    // keeps both faces or neither and the stored pair needs
+                    // the two resolves this ladder's entry does not carry, so
+                    // `object_entry_admits` refuses the stored shape before
+                    // this arm is reached.
+                    let object_depth = objects::RenderDepthAttachment {
+                        width: depth.width,
+                        height: depth.height,
+                        load: match depth.load {
+                            DepthLoadOp::Clear(bits) => {
+                                objects::RenderDepthLoad::Clear(f32::from_bits(bits))
+                            }
+                            DepthLoadOp::Load => objects::RenderDepthLoad::Load,
+                        },
+                        store: depth.store,
+                        // The rail-owned pair keeps no landing: both faces
+                        // disappear with the pass, exactly as the trace
+                        // contract states the v66 shape.
+                        identity: None,
+                    };
+                    let object_depth_test = depth_test.map(|test| objects::RenderDepthTest {
+                        compare: test.compare,
+                        write: test.write,
+                    });
+                    let object_stencil = objects::RenderStencilAttachment {
+                        width: stencil.width,
+                        height: stencil.height,
+                        load: match stencil.load {
+                            metal_api_core::provider::StencilLoadOp::Clear(value) => {
+                                objects::RenderStencilLoad::Clear(value)
+                            }
+                            metal_api_core::provider::StencilLoadOp::Load => {
+                                objects::RenderStencilLoad::Load
+                            }
+                        },
+                        store: stencil.store,
+                        identity: None,
+                    };
+                    let object_stencil_test = stencil_test.map(|test| objects::RenderStencilTest {
+                        compare: test.compare,
+                        fail_op: test.fail_op,
+                        depth_fail_op: test.depth_fail_op,
+                        pass_op: test.pass_op,
+                        read_mask: test.read_mask,
+                        write_mask: test.write_mask,
+                        reference: test.reference,
+                    });
+                    render.draw_indexed_primitives_with_multisample_depth_stencil(
+                        &recorded,
+                        width,
+                        height,
+                        index_count,
+                        u32::try_from(case.instance_count)?,
+                        multisample,
+                        object_depth,
+                        object_stencil,
+                        object_depth_test,
+                        object_stencil_test,
+                        present,
+                    )?;
+                }
+                (Some(depth), None) => {
                     let resolve = case_depth_resolve(case)?;
                     let object_depth = objects::RenderDepthAttachment {
                         width: depth.width,
@@ -9144,13 +9213,25 @@ mod tests {
         assert_eq!(colour_only, vec!["multisample"]);
         assert!(object_entry_admits(&colour_only));
 
-        // The v66 combined pair declares three families at once, and no object
-        // entry carries both faces beside the raster: the object rails refuse
-        // it by name, which is why its marker names the three trace rails
-        // (`research/docs/23` §3.3, v66).
+        // The v66 combined pair declares three families at once, and the v68
+        // recording entry carries both faces beside the raster, so the object
+        // rails admit it by name and its marker names all five rails
+        // (`research/docs/23` §3.3, v66/v68).
         let combined_pair = object_state_families(&render_case("msaa_ds_pair_4x4"));
         assert_eq!(combined_pair, vec!["multisample", "depth", "stencil"]);
-        assert!(!object_entry_admits(&combined_pair));
+        assert!(object_entry_admits(&combined_pair));
+
+        // The v60 stored combined shape keeps both faces through their own
+        // resolves, which is one family more than any single object entry
+        // carries: the object rails refuse it by name and its marker stays at
+        // the three trace rails (`research/docs/23` §3.3, v60/v68).
+        let stored_combined =
+            object_state_families(&render_case("msaa_stencil_resolve_sample0_4x4"));
+        assert_eq!(
+            stored_combined,
+            vec!["multisample", "depth", "depth_resolve", "stencil"]
+        );
+        assert!(!object_entry_admits(&stored_combined));
 
         // The v54 review's worst case: a raster plus a vertex offset. No entry
         // carries both, so the object rail refuses it by name instead of
@@ -9193,6 +9274,7 @@ mod tests {
             vec!["base_vertex"],
             vec!["multisample", "depth"],
             vec!["multisample", "stencil"],
+            vec!["multisample", "depth", "stencil"],
         ];
         let all = [
             "multisample",
