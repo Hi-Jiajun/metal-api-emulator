@@ -640,17 +640,25 @@ struct RenderIndex {
 }
 
 /// The depth surface one recorded pass opens (`research/docs/23` §3.3,
-/// v36/v37).
+/// v36/v37/v44).
 ///
-/// The object API's depth surface is rail-owned, exactly like the trace
-/// contract's: it has no view identity because nothing reads it back, so what a
-/// caller states is the extent and how the pass establishes the surface's
-/// contents.
+/// The recorded surface mirrors the trace contract's: what a caller states is
+/// the extent and how the pass establishes the surface's contents, and — from
+/// v44 on — whether the pass keeps it and where its texels land. The two
+/// optional fields are the contract's own decision in the same shape: `store`
+/// alone is the pre-v44 rail-owned surface dropped with the pass, and a storing
+/// surface names its [`contract::RenderDepthIdentity`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderDepthAttachment {
     pub width: u64,
     pub height: u64,
     pub load: RenderDepthLoad,
+    /// The store action the pass asks for, or `None` for the rail-owned shape
+    /// every pre-v44 recording means (`research/docs/23` §3.3, v43).
+    pub store: Option<contract::DepthStoreOp>,
+    /// The stored surface's resource identity, present exactly when the
+    /// recording observes the texels (`research/docs/23` §3.3, v43).
+    pub identity: Option<contract::RenderDepthIdentity>,
 }
 
 /// How a recorded pass establishes its depth surface.
@@ -861,13 +869,13 @@ impl RenderTarget {
                         RenderDepthLoad::Clear(value) => contract::DepthLoadOp::clear(value),
                         RenderDepthLoad::Load => contract::DepthLoadOp::Load,
                     },
-                    // The object API's depth surface keeps the rail-owned shape
-                    // (`research/docs/23` §3.3, v36/v37): the store action and
-                    // the identity fields are the depth readback increment's,
-                    // and this entry states neither, exactly as it did before
-                    // they existed.
-                    store: None,
-                    identity: None,
+                    // The recording's own store action and landing identity
+                    // travel straight into the contract's depth attachment
+                    // (`research/docs/23` §3.3, v43/v44): one description, so
+                    // the recorded pass and the trace it becomes cannot
+                    // disagree about whether the surface is kept.
+                    store: depth.store,
+                    identity: depth.identity,
                 }),
             depth_test: self.draw.depth_test.map(|test| contract::DepthTest {
                 compare: test.compare,

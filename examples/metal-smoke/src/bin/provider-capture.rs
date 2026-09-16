@@ -6284,6 +6284,28 @@ fn run_object_render_case(
                     }
                     DepthLoadOp::Load => objects::RenderDepthLoad::Load,
                 },
+                // The v44 recording carries the same store action and landing
+                // identity the trace contract does (`research/docs/23` §3.3,
+                // v43/v44), so a stored depth surface is observable on both
+                // object rails exactly as it is on the trace rails. The
+                // identity the recording names is the *object* view the
+                // declaring pass bound — the fixture's own view id maps to it
+                // through the resources table, exactly as the colour
+                // attachment's does — while the report maps it back for the
+                // comparison.
+                store: depth.store,
+                identity: match depth.identity {
+                    Some(identity) => {
+                        let (_, view) = resources
+                            .get(&identity.view_id.get())
+                            .ok_or("the declaring pass does not declare the depth view")?;
+                        Some(RenderDepthIdentity {
+                            allocation_id: view.allocation_id(),
+                            view_id: view.view_id(),
+                        })
+                    }
+                    None => None,
+                },
             };
             let depth_test = depth_test.map(|test| objects::RenderDepthTest {
                 compare: test.compare,
@@ -6458,6 +6480,73 @@ fn run_object_render_case(
             allocation: attachment.allocation,
             bytes_hex: hex(&image),
         });
+    }
+    // The stored depth attachment's own landing (`research/docs/23` §3.3,
+    // v43/v44), reported exactly as the trace rail reports it: the object API's
+    // recording names the same view, so the same writeback and the same
+    // allocation image are owed here.
+    if let Some(definition) = &case.depth {
+        if definition.store.as_deref() == Some("store") {
+            let allocation = definition
+                .allocation
+                .ok_or("a stored depth attachment needs its allocation")?;
+            let view = definition
+                .view
+                .ok_or("a stored depth attachment needs its view")?;
+            let landed = output
+                .writebacks
+                .iter()
+                .find(|write| {
+                    report_ids.get(&(write.allocation_id, write.view_id))
+                        == Some(&(allocation, view))
+                })
+                .ok_or("the object render rail landed no depth writeback")?;
+            let declared = declaring
+                .buffers
+                .iter()
+                .find(|buffer| buffer.allocation == allocation && buffer.view == view)
+                .ok_or("the declaring pass does not declare the depth attachment view")?;
+            if landed.offset != declared.offset || landed.bytes.len() as u64 != declared.length {
+                return Err(format!(
+                    "render case {}: the depth writeback covers {}..{} instead of {}..{}",
+                    case.id,
+                    landed.offset,
+                    landed.offset + landed.bytes.len() as u64,
+                    declared.offset,
+                    declared.offset + declared.length
+                )
+                .into());
+            }
+            let expected = unhex(
+                definition
+                    .expected_hex
+                    .as_deref()
+                    .ok_or("a stored depth attachment needs expected_hex")?,
+            )?;
+            if landed.bytes != expected {
+                return Err(format!(
+                    "render case {}: the depth readback is {} against the reviewed {}",
+                    case.id,
+                    hex(&landed.bytes),
+                    hex(&expected)
+                )
+                .into());
+            }
+            let image = allocation_buffers
+                .get(&allocation)
+                .ok_or("the depth allocation is missing")?
+                .read()?;
+            writebacks.push(Writeback {
+                allocation,
+                view,
+                offset: landed.offset,
+                bytes_hex: hex(&landed.bytes),
+            });
+            images_report.push(Allocation {
+                allocation,
+                bytes_hex: hex(&image),
+            });
+        }
     }
     eprintln!(
         "objects render case completed: {} attachments={} bytes={}",

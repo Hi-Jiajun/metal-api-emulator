@@ -122,7 +122,11 @@ DEPTH_RAILS = ALL_RAILS
 # The stored depth attachment names the three trace rails: the object API has no
 # render command encoder, so the object rails cannot hand the texels back yet
 # (`research/docs/23` §3.3, v43).
-DEPTH_STORE_RAILS = TRACE_RAILS
+# The v44 object entries record the same store action and landing identity the
+# trace contract carries — `draw_indexed_primitives_with_depth` takes one
+# `RenderDepthAttachment` whose `store`/`identity` are the contract's own — so
+# the stored-depth fixture's marker names all five rails.
+DEPTH_STORE_RAILS = ALL_RAILS
 # The alignment fixture names every rail: both trace and object rails execute
 # the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
 # framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
@@ -619,11 +623,12 @@ class ScissorObservationTests(unittest.TestCase):
                 self.assertEqual(counts,
                                  (3, 3) if case["id"] == DEPTH_STORE_ID else (2, 2))
 
-    def test_v28_reports_the_depth_store_only_on_the_trace_rails(self):
-        # The v43 fixture names the three trace rails. A capture on one of them
-        # is owed the stored depth observation; the object rails carry no render
-        # command encoder, so a capture there must leave the case out, and one
-        # that reports it anyway is refused.
+    def test_v28_reports_the_depth_store_on_every_rail_its_marker_names(self):
+        # The marker is the rule, whichever rails it names: a capture on a rail
+        # the fixture's marker names is owed the stored depth observation, and a
+        # capture on any other rail has to leave the case out. v44 widened the
+        # marker to all five rails, because the object API's depth entry now
+        # records the same store action and landing identity.
         for rail in ALL_RAILS:
             suite = copy.deepcopy(self.suite)
             owes = depth_store_marker(suite, rail)
