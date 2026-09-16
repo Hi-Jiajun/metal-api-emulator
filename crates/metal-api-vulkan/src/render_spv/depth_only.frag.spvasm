@@ -1,0 +1,20 @@
+; 本文件是 depth_only.frag.spv 的可读源（research/docs/23 §3.3，v46）。
+; 复现命令：
+;   spirv-as --target-env vulkan1.0 depth_only.frag.spvasm -o depth_only.frag.spv
+;   spirv-val --target-env vulkan1.0 depth_only.frag.spv
+; 入口名 depth_only_fragment_main（与顶点入口 depth_pair_main 不同名）。
+; 本模块**不声明任何 Output**：零颜色附件的 pass 里没有颜色附件可写，而片元阶段
+; 仍然执行、深度测试与深度写入照旧发生——这正是"只写深度"的 Vulkan 形状
+; （Metal 侧对应 MSL 的 `fragment void`，见 conformance/shaders/depth_only_4x4.metal）。
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "depth_only_fragment_main"
+               OpExecutionMode %main OriginUpperLeft
+               OpSource GLSL 450
+               OpName %main "depth_only_fragment_main"
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+               OpReturn
+               OpFunctionEnd

@@ -180,6 +180,18 @@ pub(crate) const DEPTH_VERTEX_ENTRY: &str = "render_depth_pair_vertex";
 /// Fragment entry of the reviewed depth module.
 pub(crate) const DEPTH_FRAGMENT_ENTRY: &str = "render_depth_pair_tint";
 
+/// The reviewed zero-colour-attachment depth module (`research/docs/23` §3.3,
+/// v46): the depth pair's vertex stage beside a **void** fragment stage, so a
+/// pass with no colour attachment still tests and writes depth.
+pub(crate) const REVIEWED_DEPTH_ONLY_SOURCE: &str =
+    include_str!("../../../conformance/shaders/depth_only_4x4.metal");
+
+/// Vertex entry of the reviewed zero-colour-attachment depth module.
+pub(crate) const DEPTH_ONLY_VERTEX_ENTRY: &str = "render_depth_only_vertex";
+
+/// Fragment entry of the reviewed zero-colour-attachment depth module.
+pub(crate) const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "render_depth_only_fragment";
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -209,7 +221,7 @@ pub(crate) struct ReviewedModule {
 
 /// The reviewed modules, one per (vertex-input shape, colour-format shape)
 /// pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 8] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 9] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -272,6 +284,16 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 8] = [
         fragment_entry: DEPTH_FRAGMENT_ENTRY,
         binds_buffers: true,
     },
+    // The reviewed zero-colour-attachment depth fixture (`research/docs/23`
+    // §3.3, v46): the same vertex stage with a fragment stage that generates no
+    // output, which is the shape a pass with no colour attachment compiles.
+    ReviewedModule {
+        source: REVIEWED_DEPTH_ONLY_SOURCE,
+        path: "conformance/shaders/depth_only_4x4.metal",
+        vertex_entry: DEPTH_ONLY_VERTEX_ENTRY,
+        fragment_entry: DEPTH_ONLY_FRAGMENT_ENTRY,
+        binds_buffers: true,
+    },
 ];
 
 /// The reviewed module a pipeline's vertex-input shape and colour-format list
@@ -310,6 +332,15 @@ pub(crate) fn reviewed_module(
         // is the shape its vertex stage reads, so it is matched before the
         // instanced and plain single-output arms
         // (`research/docs/23` §3.3, v36).
+        //
+        // An *empty* format list is that shape with no colour target at all:
+        // the zero-colour-attachment depth pass, whose fragment stage generates
+        // no output (`research/docs/23` §3.3, v46).
+        (VertexLayout::Buffers(buffers), [])
+            if buffers.len() == 1 && buffers[0].attributes.len() == 2 =>
+        {
+            Some(&REVIEWED_MODULES[8])
+        }
         (VertexLayout::Buffers(buffers), [single])
             if unorm8(single) && buffers.len() == 1 && buffers[0].attributes.len() == 2 =>
         {
@@ -1372,8 +1403,31 @@ pub(crate) fn plan<'a>(
                 ));
         }
     }
-    let Some(attachment) = attachments.first() else {
-        return Err(contract_refusal(ContractError::EmptyAttachmentList));
+    // The pass's raster is its colour attachment's — or, for the
+    // zero-colour-attachment depth pass (`research/docs/23` §3.3, v46), its
+    // depth attachment's: the depth surface is the whole raster, and the
+    // pipeline's empty colour-format list is what states that no colour
+    // target exists beside it.
+    let raster = match attachments.first() {
+        Some(attachment) => [attachment.width, attachment.height],
+        None => {
+            let depth = request
+                .pass
+                .depth
+                .as_ref()
+                .ok_or_else(|| contract_refusal(ContractError::EmptyAttachmentList))?;
+            let identity = depth.identity.ok_or_else(|| {
+                args_refusal("render_depth_state_unsupported").with_detail(
+                    "a pass with no colour attachment renders into its stored depth surface",
+                )
+            })?;
+            if depth.store != Some(DepthStoreOp::Store) || identity.view_id.is_zero() {
+                return Err(args_refusal("render_depth_state_unsupported").with_detail(
+                    "a pass with no colour attachment renders into its stored depth surface",
+                ));
+            }
+            [depth.width, depth.height]
+        }
     };
     // The pipeline's (vertex-input shape, colour-format list) pair selects the
     // one reviewed module this call may compile; the (module, entry pair) pair
@@ -1415,14 +1469,12 @@ pub(crate) fn plan<'a>(
             );
         }
     }
-    if attachment.width > MAX_ATTACHMENT_DIMENSION[0]
-        || attachment.height > MAX_ATTACHMENT_DIMENSION[1]
-    {
+    if raster[0] > MAX_ATTACHMENT_DIMENSION[0] || raster[1] > MAX_ATTACHMENT_DIMENSION[1] {
         // The slug and fields capability admission uses for this fact
         // (`metal_api_core::provider::ProviderCapabilities::admit_render_passes`).
         return Err(capability_refusal("attachment_dimension_limit")
-            .with_field("width", FieldValue::Unsigned(attachment.width))
-            .with_field("height", FieldValue::Unsigned(attachment.height))
+            .with_field("width", FieldValue::Unsigned(raster[0]))
+            .with_field("height", FieldValue::Unsigned(raster[1]))
             .with_field(
                 "maximum_width",
                 FieldValue::Unsigned(MAX_ATTACHMENT_DIMENSION[0]),
@@ -1433,12 +1485,19 @@ pub(crate) fn plan<'a>(
             ));
     }
     // Bounded by the check above, so these conversions cannot lose a bit.
-    let extent = [attachment.width as u32, attachment.height as u32];
-    let texel_bytes = usize::try_from(attachment.expected_bytes().map_err(contract_refusal)?)
+    let extent = [raster[0] as u32, raster[1] as u32];
+    // Every admitted colour format and `depth32float` alike store four bytes per
+    // texel, so one texel-byte count serves the colour attachments and the
+    // depth-only pass's readback (`crates/metal-api-core`:
+    // `AttachmentFormat::bytes_per_texel` and `DEPTH_BYTES_PER_TEXEL`).
+    let texel_bytes = usize::try_from(
+        u64::from(extent[0])
+            .saturating_mul(u64::from(extent[1]))
+            .saturating_mul(4),
+    )
+    .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
+    let row_pitch = usize::try_from(u64::from(extent[0]).saturating_mul(4))
         .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
-    let row_pitch =
-        usize::try_from(u64::from(extent[0]).saturating_mul(attachment.format.bytes_per_texel()))
-            .map_err(|_| capability_refusal("attachment_dimension_limit"))?;
     // The vertex-input half: the streams with their bytes and their footprints.
     // Planned after the attachment because a stream is the draw's own input,
     // exactly as the attachment is its output.
@@ -3116,6 +3175,98 @@ mod tests {
         assert_eq!(second.store, RenderStoreAction::DontCare);
         assert!(matches!(first.load, RenderLoadAction::Clear(_)));
         assert!(matches!(second.load, RenderLoadAction::Clear(_)));
+    }
+
+    /// The zero-colour-attachment depth pass (`research/docs/23` §3.3, v46): a
+    /// pass with no colour attachment at all plans its raster from the stored
+    /// depth attachment, compiles the reviewed module whose fragment stage
+    /// generates no output, and carries no colour attachment to read back.
+    ///
+    /// Runs without a device, so the shape rules are the whole check here; the
+    /// macOS CI executes the compiled pipeline.
+    #[test]
+    fn plan_admits_a_zero_colour_attachment_depth_pass() {
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.color_attachments.clear();
+        // The reviewed depth-only module reads the depth pair's stream, so the
+        // pass binds one: the same two-attribute layout its vertex stage was
+        // written for.
+        pass.vertex_buffers = vec![BufferView {
+            view_id: ViewId::new(31),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(33),
+            offset: 0,
+            length: 192,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 192]),
+        }];
+        pass.indices = Some(IndexBufferBinding {
+            view: quad_index_view(),
+            format: IndexFormat::Uint16,
+        });
+        pass.vertices = 6;
+        pass.depth = Some(RenderDepthAttachment {
+            format: DepthFormat::Depth32Float,
+            width: 2,
+            height: 2,
+            load: DepthLoadOp::clear(1.0),
+            store: Some(DepthStoreOp::Store),
+            identity: Some(RenderDepthIdentity {
+                allocation_id: DEPTH_STORE_ALLOCATION,
+                view_id: DEPTH_STORE_VIEW,
+            }),
+        });
+        pass.depth_test = Some(DepthTest {
+            compare: CompareFunction::Less,
+            write: true,
+        });
+        let pipeline = RenderPipelineContract {
+            vertex_entry: DEPTH_ONLY_VERTEX_ENTRY.to_owned(),
+            fragment_entry: DEPTH_ONLY_FRAGMENT_ENTRY.to_owned(),
+            color_formats: Vec::new(),
+            vertex_layout: VertexLayout::Buffers(vec![VertexBufferLayout {
+                stride: 32,
+                step: VertexStep::PerVertex,
+                attributes: vec![
+                    VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x3,
+                    },
+                    VertexAttribute {
+                        location: 1,
+                        offset: 16,
+                        format: VertexFormat::Float32x4,
+                    },
+                ],
+            }]),
+        };
+        let request = OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &pipeline,
+            source: REVIEWED_DEPTH_ONLY_SOURCE,
+            initial: Vec::new(),
+        };
+        let planned = plan(&request).expect("the zero-colour depth pass plans");
+        assert!(
+            planned.attachments.is_empty(),
+            "a pass with no colour attachment plans no colour readback"
+        );
+        assert_eq!(planned.extent, [2, 2]);
+        assert_eq!(
+            planned.depth.as_ref().map(|depth| depth.store),
+            Some(Some(DepthStoreOp::Store))
+        );
+
+        // The module pairing is the whole allowlist: the depth pair's source is
+        // refused for this shape, exactly as any other unreviewed module is.
+        let mismatched = OffscreenRenderRequest {
+            source: REVIEWED_DEPTH_SOURCE,
+            ..request
+        };
+        let error = plan(&mismatched).expect_err("the pair module is not this shape's module");
+        assert_eq!(error.slug, "native_render_source_not_reviewed");
     }
 
     /// The v20 load increment (`research/docs/23` §3.1): a `LoadOp::DontCare`

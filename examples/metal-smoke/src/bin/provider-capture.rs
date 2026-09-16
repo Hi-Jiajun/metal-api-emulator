@@ -193,6 +193,17 @@ const DEPTH_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
     "../../../../crates/metal-api-vulkan/src/render_spv/",
     "depth_pair_tint.frag.spv"
 ));
+/// The reviewed zero-colour-attachment depth module (`research/docs/23` §3.3,
+/// v46): the depth pair's vertex stage beside a *no-output* fragment stage, so
+/// a pass with no colour attachment still tests and writes depth. The MSL
+/// counterpart spells the same shape as `fragment void`.
+const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "depth_only_fragment_main";
+const DEPTH_ONLY_MSL_VERTEX_ENTRY: &str = "render_depth_only_vertex";
+const DEPTH_ONLY_MSL_FRAGMENT_ENTRY: &str = "render_depth_only_fragment";
+const DEPTH_ONLY_FRAGMENT_SPV: &[u8] = include_bytes!(concat!(
+    "../../../../crates/metal-api-vulkan/src/render_spv/",
+    "depth_only.frag.spv"
+));
 /// Bytes per depth-pair vertex: `float32x3` at offset 0 and `float32x4` at
 /// offset 16, so the stride is thirty-two.
 const DEPTH_STRIDE: u64 = 32;
@@ -986,6 +997,16 @@ fn register_render_pipeline(
         // triangle survives, and the tint varying is what makes the surviving
         // one visible, so neither the solid nor the instanced module can stand
         // in for it.
+        // The zero-colour-attachment depth pass (`research/docs/23` §3.3, v46)
+        // is the depth pair's shape with no colour target at all: the same
+        // vertex stage, paired with the reviewed fragment stage that declares
+        // no output.
+        RenderGeometry::DepthPair if formats.is_empty() => (
+            (DEPTH_VERTEX_ENTRY, DEPTH_ONLY_FRAGMENT_ENTRY),
+            (DEPTH_ONLY_MSL_VERTEX_ENTRY, DEPTH_ONLY_MSL_FRAGMENT_ENTRY),
+            (DEPTH_VERTEX_SPV, DEPTH_ONLY_FRAGMENT_SPV),
+            reviewed_depth_layout(),
+        ),
         RenderGeometry::DepthPair => (
             (DEPTH_VERTEX_ENTRY, DEPTH_FRAGMENT_ENTRY),
             (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
@@ -2436,6 +2457,15 @@ fn render_attachment_shapes(
             .iter()
             .map(|attachment| Ok((attachment, attachment.expected_hex.clone())))
             .collect()
+    } else if case
+        .depth
+        .as_ref()
+        .is_some_and(|depth| depth.store.as_deref() == Some("store"))
+    {
+        // The zero-colour-attachment depth pass (`research/docs/23` §3.3,
+        // v46): the case declares no colour attachment at all, and its stored
+        // depth attachment is the whole landing.
+        Ok(Vec::new())
     } else {
         Err(format!("render case {}: no attachment declared", case.id).into())
     }
@@ -3341,7 +3371,18 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
     // whose entries each carry their own expectation.
     let single = case.attachment.is_some() || case.expected_hex.is_some();
     let multiple = case.attachments.is_some();
-    if single == multiple {
+    // A case may declare no colour attachment at all when its stored depth
+    // attachment is the whole landing (`research/docs/23` §3.3, v46): the
+    // depth-only shape proper, where the rasterizer writes depth into a surface
+    // no colour target exists beside.
+    let no_colour = case.attachment.is_none()
+        && case.attachments.is_none()
+        && case.expected_hex.is_none()
+        && case
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.store.as_deref() == Some("store"));
+    if single == multiple && !no_colour {
         return Err(
             format!("{where_}: exactly one of attachment and attachments is required").into(),
         );
@@ -3480,6 +3521,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // offset is draw state, so the entries and the layout do not change
         // (`research/docs/23` §3.3, v34).
         RenderGeometry::BaseVertexQuad => (QUAD_MSL_VERTEX_ENTRY, QUAD_MSL_FRAGMENT_ENTRY),
+        // The zero-colour-attachment depth pass is the depth pair's shape with
+        // no colour target beside it (`research/docs/23` §3.3, v46), so it
+        // compiles the module whose fragment stage generates no output.
+        RenderGeometry::DepthPair if no_colour => {
+            (DEPTH_ONLY_MSL_VERTEX_ENTRY, DEPTH_ONLY_MSL_FRAGMENT_ENTRY)
+        }
         RenderGeometry::DepthPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::CullPair => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
         RenderGeometry::BlendTriangle => (DEPTH_MSL_VERTEX_ENTRY, DEPTH_MSL_FRAGMENT_ENTRY),
@@ -6220,6 +6267,20 @@ fn run_object_render_case(
         None => None,
     };
     render.set_scissor(scissor)?;
+    // The extent the recorded pass states is its colour attachment's — or, for
+    // the zero-colour-attachment depth pass (`research/docs/23` §3.3, v46), its
+    // depth attachment's: the depth surface is the whole raster, and the object
+    // API's draw entries take that extent as their own argument.
+    let (width, height) = match attachments.first() {
+        Some((attachment, _)) => (attachment.width, attachment.height),
+        None => {
+            let depth = case
+                .depth
+                .as_ref()
+                .ok_or("a render case without a colour attachment needs a depth attachment")?;
+            (depth.width, depth.height)
+        }
+    };
     // The pass's own streams (`research/docs/23` §3.3): the object API binds
     // the views the case declares, and the encoder carries their bytes into the
     // trace at commit. A vertex-input case is a direct indexed draw by
@@ -6257,8 +6318,8 @@ fn run_object_render_case(
             icb,
             recorded[0].view,
             recorded[0].format,
-            attachments[0].0.width,
-            attachments[0].0.height,
+            width,
+            height,
             recorded[0].load,
             present,
         )?;
@@ -6320,8 +6381,8 @@ fn run_object_render_case(
             });
             render.draw_indexed_primitives_with_depth(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 u32::try_from(case.instance_count)?,
                 depth,
@@ -6334,8 +6395,8 @@ fn run_object_render_case(
             // per-attachment blend the trace contract names.
             render.draw_indexed_primitives_with_blend(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 u32::try_from(case.instance_count)?,
                 &blend.attachments,
@@ -6348,8 +6409,8 @@ fn run_object_render_case(
             // API's own culling entry.
             render.draw_indexed_primitives_with_cull(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 u32::try_from(case.instance_count)?,
                 cull,
@@ -6362,8 +6423,8 @@ fn run_object_render_case(
             // pre-v35 entry points and their bytes.
             render.draw_indexed_primitives_base_vertex_with_attachments(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 u32::try_from(case.base_vertex)?,
                 u32::try_from(case.instance_count)?,
@@ -6372,8 +6433,8 @@ fn run_object_render_case(
         } else if case.instance_count > 1 {
             render.draw_indexed_primitives_instanced_with_attachments(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 u32::try_from(case.instance_count)?,
                 present,
@@ -6381,8 +6442,8 @@ fn run_object_render_case(
         } else {
             render.draw_indexed_primitives_with_attachments(
                 &recorded,
-                attachments[0].0.width,
-                attachments[0].0.height,
+                width,
+                height,
                 index_count,
                 present,
             )?;
@@ -6404,8 +6465,8 @@ fn run_object_render_case(
         render.draw_render_pass(
             recorded[0].view,
             recorded[0].format,
-            attachments[0].0.width,
-            attachments[0].0.height,
+            width,
+            height,
             recorded[0].load,
             present,
         )?;

@@ -18,6 +18,9 @@ writeback and allocation channel the colour side already uses, and one more
 touched and written allocation behind the provider counts. The v45 increment
 makes that landing the pass's whole observation: the colour attachment renders
 and then discards, so the stored depth texels are everything a capture owes.
+The v46 increment removes the colour attachment altogether: a pass whose
+fragment stage produces no output still writes depth, so the same stored depth
+texels stay the case's whole observation with no colour surface at all.
 """
 
 import copy
@@ -47,6 +50,10 @@ DEPTH_STORE_ID = "depth_store_pair_4x4"
 # colour attachment that discards — the stored depth texels are the only thing
 # the pass observes.
 DEPTH_ONLY_ID = "depth_only_store_4x4"
+# The v46 fixture: the same stored depth landing again, but the pass binds no
+# colour attachment at all — the fragment stage produces no output, and the
+# stored depth texels stay the whole observation.
+DEPTH_NO_COLOUR_ID = "depth_only_no_colour_4x4"
 # The reviewed depth resource of the v43 fixture: the allocation and the view
 # the stored texels land in, and the view's whole extent.
 DEPTH_STORE_ALLOCATION = 940
@@ -56,15 +63,17 @@ ALIGNMENT_ID = "top_half_quad_4x4"
 CULL_ID = "cull_back_half_quad_4x4"
 BLEND_ID = "blend_alpha_quad_4x4"
 # The v43 case sits between the v36 depth pair and the v38 alignment fixture, and
-# the v45 depth-only case follows it, so every case after the stored depth pair
-# moved by two positions.
+# the v45 depth-only case and v46 no-colour case follow it, so every case after
+# the stored depth pair moved by three positions.
 DEPTH_STORE_INDEX = 5
 DEPTH_ONLY_INDEX = 6
-ALIGNMENT_INDEX = 7
-CULL_INDEX = 8
-BLEND_INDEX = 9
+DEPTH_NO_COLOUR_INDEX = 7
+ALIGNMENT_INDEX = 8
+CULL_INDEX = 9
+BLEND_INDEX = 10
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
-                  DEPTH_STORE_ID, DEPTH_ONLY_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID)
+                  DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
+                  ALIGNMENT_ID, CULL_ID, BLEND_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -139,6 +148,10 @@ DEPTH_STORE_RAILS = ALL_RAILS
 # same store action and landing identity, and the pass has nothing else to hand
 # back — every colour attachment discards (`research/docs/23` §3.3, v45).
 DEPTH_ONLY_RAILS = ALL_RAILS
+# The no-colour case names the same five rails for the same reason: the object
+# entries carry the same store action and landing identity, and the pass binds
+# no colour attachment at all (`research/docs/23` §3.3, v46).
+DEPTH_NO_COLOUR_RAILS = ALL_RAILS
 # The alignment fixture names every rail: both trace and object rails execute
 # the reviewed quad, and the Vulkan rail's reviewed vertex modules flip y so the
 # framebuffer rows agree with Metal's convention (`research/docs/23` §3.3, v38).
@@ -230,6 +243,20 @@ def depth_only_marker(suite, rail):
     return rail in DEPTH_ONLY_RAILS
 
 
+def depth_no_colour_marker(suite, rail):
+    """Point the v46 case at `rail` when that rail owes it, and elsewhere when not.
+
+    The no-colour case is the stored depth landing with no colour attachment at
+    all, so its marker names the same five rails and the same rule applies: a
+    capture on a rail the marker names is owed the stored depth observation,
+    and one on any other rail has to leave the case out entirely. Returns
+    whether `rail` owes the case.
+    """
+    suite["render_cases"][DEPTH_NO_COLOUR_INDEX]["capture_rails"] = (
+        [rail] if rail in DEPTH_NO_COLOUR_RAILS else [other_rail(rail)])
+    return rail in DEPTH_NO_COLOUR_RAILS
+
+
 def wildcard_result(provider_backend=True, copy_in=2, copy_out=2):
     result = {
         "id": WILDCARD_ID,
@@ -308,6 +335,31 @@ def depth_only_result(provider_backend=True, copy_in=3, copy_out=2):
     """
     result = {
         "id": DEPTH_ONLY_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [
+            {"allocation": DEPTH_STORE_ALLOCATION, "view": DEPTH_STORE_VIEW,
+             "offset": 0, "bytes_hex": DEPTH_STORE_EXPECTED},
+        ],
+        "allocations": [
+            {"allocation": DEPTH_STORE_ALLOCATION, "bytes_hex": DEPTH_STORE_EXPECTED},
+        ],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def depth_no_colour_result(provider_backend=True, copy_in=3, copy_out=2):
+    """The v46 landing: the stored depth observation and nothing else.
+
+    The pass binds no colour attachment at all, so the stored depth surface is
+    the case's whole observation and uses the channel the colour side already
+    uses. The declaring pass still reads the colour view, the probe and the
+    depth view, and it still writes the probe, so a provider capture owes the
+    plan's three touched and two written allocations.
+    """
+    result = {
+        "id": DEPTH_NO_COLOUR_ID,
         "completion": "CompletedVisible",
         "writebacks": [
             {"allocation": DEPTH_STORE_ALLOCATION, "view": DEPTH_STORE_VIEW,
@@ -425,6 +477,7 @@ class ScissorObservationTests(unittest.TestCase):
             suite["render_cases"][0]["capture_rails"] = [rail]
             owes_depth_store = depth_store_marker(suite, rail)
             owes_depth_only = depth_only_marker(suite, rail)
+            owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -440,6 +493,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_store_result(rail != "native-metal"))
             if owes_depth_only:
                 report["results"].append(depth_only_result(rail != "native-metal"))
+            if owes_depth_no_colour:
+                report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -453,6 +508,9 @@ class ScissorObservationTests(unittest.TestCase):
                 if not owes_depth_only:
                     self.assertNotIn(DEPTH_ONLY_ID,
                                      [result["id"] for result in report["results"]])
+                if not owes_depth_no_colour:
+                    self.assertNotIn(DEPTH_NO_COLOUR_ID,
+                                     [result["id"] for result in report["results"]])
                 compare.validate_capture(suite, digest, report, rail)
 
     def test_v28_instances_on_every_rail(self):
@@ -464,6 +522,7 @@ class ScissorObservationTests(unittest.TestCase):
             suite["render_cases"][1]["capture_rails"] = [rail]
             owes_depth_store = depth_store_marker(suite, rail)
             owes_depth_only = depth_only_marker(suite, rail)
+            owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -477,6 +536,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_store_result(rail != "native-metal"))
             if owes_depth_only:
                 report["results"].append(depth_only_result(rail != "native-metal"))
+            if owes_depth_no_colour:
+                report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -495,6 +556,7 @@ class ScissorObservationTests(unittest.TestCase):
                 other for other in ALL_RAILS if other != rail]
             owes_depth_store = depth_store_marker(suite, rail)
             owes_depth_only = depth_only_marker(suite, rail)
+            owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -510,6 +572,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_store_result(rail != "native-metal"))
             if owes_depth_only:
                 report["results"].append(depth_only_result(rail != "native-metal"))
+            if owes_depth_no_colour:
+                report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:
@@ -552,6 +616,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_result())
         report["results"].append(depth_store_result())
         report["results"].append(depth_only_result())
+        report["results"].append(depth_no_colour_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
@@ -680,17 +745,18 @@ class ScissorObservationTests(unittest.TestCase):
 
     def test_v28_counts_the_depth_store_and_its_neighbours(self):
         # The stored depth resource is one more touched and one more written
-        # allocation behind the provider counts (three and three); the v45 case
-        # touches the same three but writes only the probe and the depth
-        # surface, because its colour attachment discards; every other render
-        # case keeps the declaring pass's two and two.
+        # allocation behind the provider counts (three and three); the v45 and
+        # v46 cases touch the same three but write only the probe and the depth
+        # surface — the v45 colour attachment discards, and the v46 pass binds
+        # none at all; every other render case keeps the declaring pass's two
+        # and two.
         plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
         for case in self.suite["render_cases"]:
             expectation = plan[case["id"]]
             counts = (len(expectation.touched), len(expectation.written))
             if case["id"] == DEPTH_STORE_ID:
                 expected = (3, 3)
-            elif case["id"] == DEPTH_ONLY_ID:
+            elif case["id"] in (DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID):
                 expected = (3, 2)
             else:
                 expected = (2, 2)
@@ -913,6 +979,129 @@ class ScissorObservationTests(unittest.TestCase):
                 "a vertex-input case carries neither a present action nor an ICB"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
+    def test_v28_pins_the_depth_no_colour_fixture(self):
+        case = self.suite["render_cases"][DEPTH_NO_COLOUR_INDEX]
+        self.assertEqual(case["id"], DEPTH_NO_COLOUR_ID)
+        # The v46 shape binds no colour attachment at all: neither the single
+        # attachment object nor the MRT list appears, and there is no colour
+        # expectation for either shape to carry.
+        self.assertNotIn("attachment", case)
+        self.assertNotIn("attachments", case)
+        self.assertNotIn("expected_hex", case)
+        # The reviewed module is the no-output pair — a vertex stage plus a
+        # `fragment void` stage — so the pass produces depth and nothing else.
+        self.assertEqual(case["metal"]["path"], "shaders/depth_only_4x4.metal")
+        self.assertEqual(case["vertex_entry"], "render_depth_only_vertex")
+        self.assertEqual(case["fragment_entry"], "render_depth_only_fragment")
+        # The depth section is the v45 case's, down to the texels the store
+        # hands back, so both cases observe the same landing.
+        store = self.suite["render_cases"][DEPTH_ONLY_INDEX]
+        self.assertEqual(case["depth"], store["depth"])
+        self.assertEqual(case["depth"]["store"], "store")
+        self.assertEqual(case["depth"]["allocation"], DEPTH_STORE_ALLOCATION)
+        self.assertEqual(case["depth"]["view"], DEPTH_STORE_VIEW)
+        self.assertEqual(case["depth"]["expected_hex"], DEPTH_STORE_EXPECTED)
+        # Everything else — the layout, the streams, the indices, the viewport
+        # and the depth state — is the stored pair's own shape.
+        for field in ("declaring_case", "vertex_layout", "vertex_buffers", "indices",
+                      "vertices", "viewport", "depth_test"):
+            self.assertEqual(case[field], store[field])
+        self.assertEqual(sorted(case["capture_rails"]), sorted(DEPTH_NO_COLOUR_RAILS))
+
+    def test_v28_plans_the_depth_no_colour_fixture(self):
+        plan = compare._render_plan(compare._suite_plan(self.suite), self.suite)
+        expectation = plan[DEPTH_NO_COLOUR_ID]
+        # The stored depth surface is the case's whole observation: one
+        # writeback and one allocation image under the depth view, and nothing
+        # on the colour side, because there is no colour attachment.
+        self.assertEqual(expectation.writes,
+                         [((DEPTH_STORE_ALLOCATION, DEPTH_STORE_VIEW, 0),
+                           bytes.fromhex(DEPTH_STORE_EXPECTED))])
+        self.assertEqual(expectation.allocations,
+                         {DEPTH_STORE_ALLOCATION: bytes.fromhex(DEPTH_STORE_EXPECTED)})
+        # The declaring pass still reads the colour view, the probe and the
+        # depth view and still writes the probe and the depth surface, so the
+        # counts are the v45 case's own (three touched, two written).
+        self.assertEqual(expectation.touched, {900, 920, 940})
+        self.assertEqual(expectation.written, {920, 940})
+        # One landing means the identity list is that one attachment.
+        self.assertEqual(list(expectation.attachment), [DEPTH_STORE_ATTACHMENT])
+        self.assertEqual(expectation.rails, frozenset(DEPTH_NO_COLOUR_RAILS))
+
+    def test_v28_reports_the_depth_no_colour_store_on_every_rail_its_marker_names(self):
+        # The v46 case follows the same marker rule: a capture on a rail the
+        # fixture's marker names is owed its stored depth observation, and a
+        # capture on any other rail has to leave the case out.
+        for rail in ALL_RAILS:
+            suite = copy.deepcopy(self.suite)
+            owes = depth_no_colour_marker(suite, rail)
+            for position, case in enumerate(suite["render_cases"]):
+                if position != DEPTH_NO_COLOUR_INDEX:
+                    case["capture_rails"] = [other_rail(rail)]
+            digest = hashlib.sha256(
+                json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
+            report = counted_declaring(suite, digest, rail)
+            report["results"].append(depth_no_colour_result(rail != "native-metal"))
+            with self.subTest(rail=rail):
+                if owes:
+                    compare.validate_capture(suite, digest, report, rail)
+                else:
+                    with self.assertRaisesRegex(
+                            compare.CaptureError,
+                            "is not a rail this render case runs on"):
+                        compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_refuses_a_depth_no_colour_case_that_drops_its_landing(self):
+        # The stored depth surface is the case's one landing. Without it the
+        # pass observes nothing at all, and the plan refuses the shape exactly
+        # as the all-discarded colour arm does.
+        broken = copy.deepcopy(self.suite)
+        depth = broken["render_cases"][DEPTH_NO_COLOUR_INDEX]["depth"]
+        for field in ("store", "allocation", "view", "expected_hex"):
+            del depth[field]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "every colour attachment discards, leaving no observable landing point"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_half_declared_depth_landing_on_the_depth_no_colour_case(self):
+        # Dropping only the action leaves the identity and the expectation
+        # behind: the depth parser's own half-declaration rule refuses it.
+        broken = copy.deepcopy(self.suite)
+        del broken["render_cases"][DEPTH_NO_COLOUR_INDEX]["depth"]["store"]
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a discarded depth attachment carries no identity or expectation"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_refuses_a_colour_expectation_on_the_depth_no_colour_case(self):
+        # The case-level expectation is the single-attachment shape's claim
+        # about stored colour bytes, and the v46 pass binds no colour
+        # attachment to store them, so the shape cannot carry one
+        # (`research/docs/23` §3.3, v46).
+        broken = copy.deepcopy(self.suite)
+        broken["render_cases"][DEPTH_NO_COLOUR_INDEX]["expected_hex"] = OUTPUT * 16
+        with self.assertRaisesRegex(
+                compare.CaptureError,
+                "a case with no colour attachment carries no expectation"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+    def test_v28_allows_the_discarding_colour_shape_on_the_depth_no_colour_case(self):
+        # Re-adding the v45 shape — one cleared colour attachment that discards
+        # — turns the case back into `depth_only_store_4x4`'s own form, which
+        # the suite already reviews: the plan accepts it and the observation is
+        # unchanged.
+        suite = copy.deepcopy(self.suite)
+        suite["render_cases"][DEPTH_NO_COLOUR_INDEX]["attachment"] = copy.deepcopy(
+            self.suite["render_cases"][DEPTH_ONLY_INDEX]["attachment"])
+        plan = compare._render_plan(compare._suite_plan(suite), suite)
+        expectation = plan[DEPTH_NO_COLOUR_ID]
+        self.assertEqual(expectation.writes,
+                         [((DEPTH_STORE_ALLOCATION, DEPTH_STORE_VIEW, 0),
+                           bytes.fromhex(DEPTH_STORE_EXPECTED))])
+        self.assertEqual(expectation.touched, {900, 920, 940})
+        self.assertEqual(expectation.written, {920, 940})
+
     def test_v28_pins_the_alignment_fixture(self):
         case = self.suite["render_cases"][ALIGNMENT_INDEX]
         self.assertEqual(case["id"], ALIGNMENT_ID)
@@ -1051,6 +1240,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(depth_result())
         report["results"].append(depth_store_result())
         report["results"].append(depth_only_result())
+        report["results"].append(depth_no_colour_result())
         report["results"].append(alignment_result())
         report["results"].append(cull_result())
         report["results"].append(blend_result())
@@ -1072,6 +1262,7 @@ class ScissorObservationTests(unittest.TestCase):
                 other for other in INSTANCED_RAILS if other != rail]
             owes_depth_store = depth_store_marker(suite, rail)
             owes_depth_only = depth_only_marker(suite, rail)
+            owes_depth_no_colour = depth_no_colour_marker(suite, rail)
             digest = hashlib.sha256(
                 json.dumps(suite, sort_keys=True).encode("utf-8")).hexdigest()
             report = counted_declaring(suite, digest, rail)
@@ -1085,6 +1276,8 @@ class ScissorObservationTests(unittest.TestCase):
                 report["results"].append(depth_store_result(rail != "native-metal"))
             if owes_depth_only:
                 report["results"].append(depth_only_result(rail != "native-metal"))
+            if owes_depth_no_colour:
+                report["results"].append(depth_no_colour_result(rail != "native-metal"))
             if rail in ALIGNMENT_RAILS:
                 report["results"].append(alignment_result(rail != "native-metal"))
             if rail in CULL_RAILS:

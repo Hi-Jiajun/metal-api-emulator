@@ -149,13 +149,25 @@ const DEPTH_TINT_FRAG_SPV: &[u8] = include_bytes!("render_spv/depth_pair_tint.fr
 /// Entry point [`DEPTH_TINT_FRAG_SPV`] declares.
 const DEPTH_TINT_FRAGMENT_ENTRY: &str = "depth_pair_tint_main";
 
+/// The reviewed no-output fragment stage (`research/docs/23` §3.3, v46).
+///
+/// The module declares no `Output` at all, which is what makes a pass with no
+/// colour attachment well formed: nothing writes colour, and the per-fragment
+/// operations still test and write the depth attachment. The Metal counterpart
+/// is MSL's `fragment void` (`conformance/shaders/depth_only_4x4.metal`).
+const DEPTH_ONLY_FRAG_SPV: &[u8] = include_bytes!("render_spv/depth_only.frag.spv");
+/// Entry point [`DEPTH_ONLY_FRAG_SPV`] declares.
+const DEPTH_ONLY_FRAGMENT_ENTRY: &str = "depth_only_fragment_main";
+
 /// The depth fixture's reviewed fragment stage, when the request's vertex stage
 /// is the reviewed depth module.
 ///
 /// `None` means the vertex stage is not that module. The pair is reviewed for
 /// the single 8-bit UNORM attachment the fixture draws into; any other format
 /// list is refused rather than rendered with a store the review never covered —
-/// the same rule [`instanced_fragment_stage`] states.
+/// the same rule [`instanced_fragment_stage`] states. An *empty* list is the
+/// zero-colour-attachment depth pass (`research/docs/23` §3.3, v46): the same
+/// vertex stage beside the reviewed stage that declares no output at all.
 fn depth_fragment_stage(
     vertex_entry: &str,
     vertex_spirv: &[u8],
@@ -165,6 +177,7 @@ fn depth_fragment_stage(
         return Ok(None);
     }
     match formats {
+        [] => Ok(Some((DEPTH_ONLY_FRAG_SPV, DEPTH_ONLY_FRAGMENT_ENTRY))),
         [AttachmentFormat::Rgba8Unorm] | [AttachmentFormat::Bgra8Unorm] => {
             Ok(Some((DEPTH_TINT_FRAG_SPV, DEPTH_TINT_FRAGMENT_ENTRY)))
         }
@@ -217,8 +230,9 @@ fn instanced_fragment_stage(
 /// `render_mrt_format_combination_unsupported` before any Vulkan object exists.
 /// `R32Uint` is refused with the slug the contract and the format rail already
 /// use for it, so an integer attachment cannot reach a colour store. An empty
-/// or over-two list is refused as an attachment-count capability fact, so the
-/// map is total over every list shape the frozen core contract can carry.
+/// list is the depth-only pipeline's no-output stage (`v46`); an over-long list
+/// is refused as an attachment-count capability fact, so the map is total over
+/// every list shape the frozen core contract can carry.
 pub(crate) fn solid_fragment_spirv(
     formats: &[AttachmentFormat],
 ) -> Result<&'static [u8], ProviderError> {
@@ -235,6 +249,11 @@ pub(crate) fn solid_fragment_spirv(
         )
     };
     Ok(match formats {
+        // An empty list is the depth-only pipeline (`research/docs/23` §3.3,
+        // v46): the reviewed fragment stage declares no output at all, so the
+        // subpass has nothing to write colour into and the per-fragment
+        // operations still test and write depth.
+        [] => DEPTH_ONLY_FRAG_SPV,
         [AttachmentFormat::R32Float] => SOLID_R32F_FRAG_SPV,
         [format] if unorm8(*format) => SOLID_UNORM8_FRAG_SPV,
         [format] => {
@@ -258,8 +277,27 @@ pub(crate) fn solid_fragment_spirv(
         [first, second, ..] => {
             return Err(mrt_format_combination_refusal(*first, *second));
         }
-        _ => return Err(mrt_attachment_count_refusal(formats.len())),
     })
+}
+
+/// The reviewed fragment stage a colour-format list selects, paired with the
+/// entry point that module declares.
+///
+/// Two reviewed stages serve this map: the solid modules (one entry between
+/// them, [`SOLID_FRAGMENT_ENTRY`]) and the depth-only module an empty list
+/// selects ([`DEPTH_ONLY_FRAGMENT_ENTRY`], `research/docs/23` §3.3, v46). The
+/// pairing is stated once here so a pipeline cannot name one module's entry
+/// while compiling another's bytes.
+fn solid_fragment_stage(
+    formats: &[AttachmentFormat],
+) -> Result<(&'static [u8], &'static str), ProviderError> {
+    let module = solid_fragment_spirv(formats)?;
+    let entry = if formats.is_empty() {
+        DEPTH_ONLY_FRAGMENT_ENTRY
+    } else {
+        SOLID_FRAGMENT_ENTRY
+    };
+    Ok((module, entry))
 }
 
 /// One offscreen render pass to execute.
@@ -539,8 +577,8 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
             &stages.contract.color_formats,
         ) {
             Ok(Some(pair)) => pair,
-            Ok(None) => match solid_fragment_spirv(&stages.contract.color_formats) {
-                Ok(module) => (module, SOLID_FRAGMENT_ENTRY),
+            Ok(None) => match solid_fragment_stage(&stages.contract.color_formats) {
+                Ok(stage) => stage,
                 Err(_) => return false,
             },
             Err(_) => return false,
@@ -563,7 +601,14 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
         .with_field("fragment_entry", FieldValue::Text(entry.to_owned()))
         .with_field(
             "reviewed_entry",
-            FieldValue::Text(SOLID_FRAGMENT_ENTRY.to_owned()),
+            FieldValue::Text(
+                if formats.is_empty() {
+                    DEPTH_ONLY_FRAGMENT_ENTRY
+                } else {
+                    SOLID_FRAGMENT_ENTRY
+                }
+                .to_owned(),
+            ),
         )
         .with_detail(
             "the fragment stage is not the module this rail builds for the colour format list, \
@@ -734,7 +779,26 @@ fn prepare_render_request<'a>(
             previous: *previous,
         });
     }
-    let extent = extent.expect("core admission refuses an empty attachment list");
+    // A pass with no colour attachment takes its extent from the depth
+    // attachment it renders into: the depth surface is the whole raster
+    // (`research/docs/23` §3.3, v46), and its extent is what the pipeline's
+    // viewport and the readback use.
+    let extent = match (extent, pass.depth.as_ref()) {
+        (Some(extent), _) => extent,
+        (None, Some(depth)) => {
+            let width = narrow_dimension(depth.width)?;
+            let height = narrow_dimension(depth.height)?;
+            if width == 0 || height == 0 {
+                return Err(contract_refusal("depth attachment has a zero dimension"));
+            }
+            [width, height]
+        }
+        (None, None) => {
+            return Err(contract_refusal(
+                "a render pass opens a colour attachment or a depth attachment",
+            ))
+        }
+    };
     // Vertex input (`research/docs/23` §3.3): every bound stream declares its
     // own bytes, so the rail proves the footprint the draw reads and refuses
     // anything the reviewed shape does not cover.
@@ -1250,11 +1314,6 @@ pub(crate) fn execute_offscreen_render(
     if request.attachments.len() > metal_api_core::provider::MAX_COLOR_ATTACHMENTS {
         return Err(mrt_attachment_count_refusal(request.attachments.len()));
     }
-    if request.attachments.is_empty() {
-        return Err(contract_refusal(
-            "render pass declares no colour attachment",
-        ));
-    }
     // `docs/23` §3.6, v19: core admission refuses an all-discarded pass as
     // `AllRenderAttachmentsDiscarded`, and the rail re-asserts the same
     // at-least-one-store rule for a directly-constructed request. Discarding
@@ -1300,7 +1359,7 @@ pub(crate) fn execute_offscreen_render(
                 &formats,
             )? {
                 Some(pair) => pair,
-                None => (solid_fragment_spirv(&formats)?, SOLID_FRAGMENT_ENTRY),
+                None => solid_fragment_stage(&formats)?,
             },
         };
     let tiling = vk::ImageTiling::OPTIMAL;
@@ -4982,6 +5041,26 @@ mod tests {
         assert_eq!(depth.len(), 16);
         assert_eq!(depth, 0.0_f32.to_le_bytes().repeat(4));
         assert_ne!(depth, 1.0_f32.to_le_bytes().repeat(4));
+
+        // v46: with *no* colour attachment at all the pass is the depth-only
+        // shape proper — the reviewed no-output fragment stage runs, the
+        // per-fragment operations still test and write depth, and the depth
+        // texels are the entire readback (`research/docs/23` §3.3, v46).
+        let no_colour = OffscreenRenderRequest {
+            attachments: Vec::new(),
+            ..depth_only
+        };
+        let readback = execute_offscreen_render(&context, &no_colour)
+            .expect("a pass with no colour attachment renders into its depth surface");
+        assert!(
+            readback.attachments.is_empty(),
+            "a pass with no colour attachment owes no colour readback"
+        );
+        let depth = readback
+            .depth
+            .expect("the stored depth surface reads back its texels");
+        eprintln!("zero-colour depth readback: {}", hex(&depth));
+        assert_eq!(depth, 0.0_f32.to_le_bytes().repeat(4));
     }
 
     /// A dual-format list outside the reviewed `[Rgba8Unorm, Rgba8Unorm]` shape

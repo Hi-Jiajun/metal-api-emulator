@@ -679,6 +679,81 @@
       ]
     },
     {
+      "id": "depth_only_no_colour_4x4",
+      "declaring_case": "render_declaring_depth_store",
+      "vertex_entry": "render_depth_only_vertex",
+      "fragment_entry": "render_depth_only_fragment",
+      "metal": {
+        "path": "shaders/depth_only_4x4.metal",
+        "sha256": "9e66c6059a5ff04db5e1bfe221ec1b5b6fc3664c0d555196ca8c903310571dcb"
+      },
+      "vertex_layout": {
+        "buffers": [
+          {
+            "stride": 32,
+            "attributes": [
+              {
+                "location": 0,
+                "offset": 0,
+                "format": "float32x3"
+              },
+              {
+                "location": 1,
+                "offset": 16,
+                "format": "float32x4"
+              }
+            ]
+          }
+        ]
+      },
+      "vertex_buffers": [
+        {
+          "allocation": 1300,
+          "view": 1310,
+          "offset": 0,
+          "length": 192,
+          "initial_hex": "000080bf000080bf0000003f000000000000803f00000000000000000000803f00004040000080bf0000003f000000000000803f00000000000000000000803f000080bf000040400000003f000000000000803f00000000000000000000803f000080bf000080bf6666663f00000000000000000000803f000000000000803f00004040000080bf6666663f00000000000000000000803f000000000000803f000080bf000040406666663f00000000000000000000803f000000000000803f"
+        }
+      ],
+      "indices": {
+        "allocation": 1320,
+        "view": 1330,
+        "offset": 0,
+        "length": 12,
+        "initial_hex": "000001000200030004000500",
+        "format": "uint16"
+      },
+      "vertices": 6,
+      "viewport": [
+        0,
+        0,
+        4,
+        4
+      ],
+      "depth": {
+        "format": "depth32float",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_depth": 1.0,
+        "store": "store",
+        "allocation": 940,
+        "view": 950,
+        "expected_hex": "0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f0000003f"
+      },
+      "depth_test": {
+        "compare": "less",
+        "write": true
+      },
+      "capture_rails": [
+        "native-metal",
+        "vulkan",
+        "native-metal-provider",
+        "vulkan-objects",
+        "native-metal-provider-objects"
+      ]
+    },
+    {
       "id": "top_half_quad_4x4",
       "declaring_case": "render_declaring_quad_extent",
       "vertex_entry": "render_quad_vertex",
