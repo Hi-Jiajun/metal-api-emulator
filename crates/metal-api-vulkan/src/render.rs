@@ -41,8 +41,8 @@ use metal_api_core::provider::{
     ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot,
     Retryability, SampleCount, SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp,
-    StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
-    TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
+    StencilResolveFilter, StencilTest, StoreOp, TextureAccess, TextureFormat, TextureSource,
+    TextureType, TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
     MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
@@ -320,13 +320,17 @@ const REVIEWED_TEXTURE_COUNT: usize = 1;
 /// declaration to it ([`translated_texture_slots`]).
 const REVIEWED_SAMPLER_POLICY: SamplerPolicy = SamplerPolicy::reviewed_render_sampler();
 
-/// One sampled texture's execution slot (`research/docs/23` §3.3, v100).
+/// One read-only texture's execution slot (`research/docs/23` §3.3,
+/// v100/v105).
 ///
-/// Two rails states the pair. The reviewed sampling pair reads
+/// Three rails state the pair. The reviewed sampling pair reads
 /// `DescriptorSet 0 / Binding i` for the pass's entry `i`, and the one state
 /// the review names; a translated fragment stage reads the slot its own
-/// reflection names, with the state its AIR was lowered against. Both end up
-/// here, so `create_render_textures` builds one layout and one sampler from the
+/// reflection names, with the state its AIR was lowered against or with the
+/// state the pass declares for the runtime `[[sampler(n)]]` argument it reads
+/// through. A translated stage that only texel-fetches a texture reads the
+/// image descriptor and no sampler at all. All three end up here, so
+/// `create_render_textures` builds one layout and one optional sampler from the
 /// pair and holds no branch of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RenderTextureSlot {
@@ -352,15 +356,51 @@ pub(crate) enum RenderTextureSlot {
         sampler_binding: u32,
         sampler: SamplerPolicy,
     },
+    /// A translated fragment stage's sampler-free texture: the translator
+    /// emits the sampled image alone (`OpTypeImage`) and the module reads it
+    /// with `OpImageFetch`, so the rail binds one `SAMPLED_IMAGE` at the image's
+    /// slot and declares no `SAMPLER` for it.
+    Fetch { set: u32, image: u32 },
 }
 
 impl RenderTextureSlot {
-    /// The sampler state this slot's samples are executed with.
-    pub(crate) const fn sampler(&self) -> SamplerPolicy {
+    /// The sampler state this slot's samples are executed with, or `None` for
+    /// a slot no sampler is created for.
+    pub(crate) const fn sampler(&self) -> Option<SamplerPolicy> {
         match self {
-            Self::Combined { sampler, .. } | Self::Split { sampler, .. } => *sampler,
+            Self::Combined { sampler, .. } | Self::Split { sampler, .. } => Some(*sampler),
+            Self::Fetch { .. } => None,
         }
     }
+}
+
+/// The refusal a texture declaration gets when the *access* it states is not
+/// the one the module's own instructions read the texture through
+/// (`research/docs/23` §3.3, v105).
+///
+/// The declaration states how the pass reads a texture and the module states
+/// how it is actually read, so the two have to be one statement: a declaration
+/// that says `Fetched` under a module whose instructions sample the image — or
+/// a declaration that says `Sampled` under a module that only texel-fetches —
+/// would have the rail build a descriptor set (and, for the sampled arm, a
+/// `VkSampler`) the module's instructions never read through. A module that
+/// reads the image directly, writes it, or never touches it has no read-only
+/// arm at all, so it answers here too. Both halves travel in the fields, so a
+/// caller can fix the declaration without a second lookup.
+fn texture_access_refusal(
+    binding: u32,
+    declared: TextureAccess,
+    module: DescriptorImageUse,
+) -> ProviderError {
+    capability_refusal("render_texture_access_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field("declared_access", FieldValue::Text(format!("{declared:?}")))
+        .with_field("module_access", FieldValue::Text(module.name().to_owned()))
+        .with_detail(
+            "the declaration states one read-only access and the module's own instructions \
+             state another, so the descriptor set the rail would build is not the one the \
+             module reads through",
+        )
 }
 
 /// The refusal a declaration gets when the sampler state it names is not the
@@ -2052,22 +2092,27 @@ fn validate_translated_stage_textures(
     translated_texture_pairs(stages, stage, entry, reflection).map(|_| ())
 }
 
-/// One translated fragment stage's sampled texture and the sampler half it is
-/// read through (`research/docs/23` §3.3, v100/v102).
+/// One translated fragment stage's read-only texture and the sampler half it is
+/// read through, when it has one (`research/docs/23` §3.3, v100/v102/v105).
 ///
 /// The pairing is the *module's*: a static half is the AIR constexpr sampler
 /// the module carries, and a runtime half is the `[[sampler(n)]]` argument
 /// whose state the module does not carry. Both halves keep the descriptor slot
 /// the reflection names, because the module's own `OpSampledImage` is what
 /// combines them; the state a runtime half executes with is resolved later,
-/// where the pass's own declaration is in hand.
+/// where the pass's own declaration is in hand. A texel-fetch texture carries
+/// `None` here instead: the module's own `OpImageFetch` reads the image
+/// descriptor alone, so the pairing names no sampler at all and the rail binds
+/// no `SAMPLER` slot for it.
 struct TranslatedTexturePair {
     /// The Metal `[[texture(n)]]` index this pair came from, so a refusal can
     /// name the texture half of the pairing as well as the sampler half.
     texture_binding: u32,
     /// The `SAMPLED_IMAGE` slot the module reads the texture from.
     image: u32,
-    sampler: TranslatedSampler,
+    /// The sampler half this texture's samples read through, or `None` for a
+    /// texture the module only texel-fetches.
+    sampler: Option<TranslatedSampler>,
 }
 
 /// The sampler half of one translated texture pair, as the *module* states it
@@ -2119,6 +2164,11 @@ fn translated_texture_pairs(
     if stage != RenderStage::Fragment {
         return Ok(Vec::new());
     }
+    // The module's own statement of how it reads each descriptor image
+    // (`research/docs/23` §3.3, v105): the reflection says a texture argument
+    // exists, this says whether the module's instructions sample it or
+    // texel-fetch it, which is the half the declaration has to repeat.
+    let descriptor_uses = descriptor_image_uses(&stages.fragment_spirv);
     // The AIR-embedded constexpr samplers first: one sampled texture is read
     // through one of them, exactly as the compute face's narrow class states
     // it, so the two lists pair by position below.
@@ -2302,6 +2352,37 @@ fn translated_texture_pairs(
                 .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
                 .with_detail("the render sampler uploads and reads one rgba8_unorm surface"));
         }
+        // Whether the module samples this texture or texel-fetches it is the
+        // module's *own* statement (`research/docs/23` §3.3, v105): the
+        // sampler-free arm binds the image alone and the sampled arm binds the
+        // sampler the module reads through, and the two are one `OpTypeImage`
+        // shape. The declaration has to repeat the module's arm, so a
+        // declaration that states the other one — or that reads a descriptor
+        // the module reads directly, writes, or never touches — is refused by
+        // name with both halves in hand rather than executed with a descriptor
+        // nothing reads through.
+        let module_use = descriptor_uses
+            .get(&(descriptor.set, descriptor.binding))
+            .copied()
+            .unwrap_or(DescriptorImageUse::Unused);
+        match (declared.access, module_use) {
+            (TextureAccess::Fetched, DescriptorImageUse::Fetched) => {
+                pairs.push(TranslatedTexturePair {
+                    texture_binding: binding.metal_index,
+                    image: descriptor.binding,
+                    sampler: None,
+                });
+                continue;
+            }
+            (TextureAccess::Sampled, DescriptorImageUse::Sampled) => {}
+            _ => {
+                return Err(texture_access_refusal(
+                    binding.metal_index,
+                    declared.access,
+                    module_use,
+                ))
+            }
+        }
         // Which sampler half this texture reads through is the declaration's
         // statement (`research/docs/23` §3.3, v100/v102), and the module has to
         // back it: a declaration naming a static state pairs with the module's
@@ -2358,7 +2439,7 @@ fn translated_texture_pairs(
         pairs.push(TranslatedTexturePair {
             texture_binding: binding.metal_index,
             image: descriptor.binding,
-            sampler,
+            sampler: Some(sampler),
         });
     }
     for declared in &stages.contract.textures {
@@ -2446,7 +2527,18 @@ fn translated_texture_slots(
 ) -> Result<Vec<RenderTextureSlot>, ProviderError> {
     let mut slots = Vec::new();
     for pair in translated_texture_pairs(stages, stage, entry, reflection)? {
-        let (sampler, policy) = match pair.sampler {
+        // A texture the module only texel-fetches takes an image-only slot
+        // (`research/docs/23` §3.3, v105): the module's own `OpImageFetch` reads
+        // the image descriptor and no sampler is created for the binding, so
+        // the layout below never declares a `SAMPLER` slot for it.
+        let Some(pair_sampler) = pair.sampler else {
+            slots.push(RenderTextureSlot::Fetch {
+                set: 0,
+                image: pair.image,
+            });
+            continue;
+        };
+        let (sampler, policy) = match pair_sampler {
             TranslatedSampler::Module { descriptor, policy } => (descriptor, policy),
             TranslatedSampler::Runtime {
                 metal_binding,
@@ -3024,6 +3116,227 @@ fn module_entry_point(module: &[u8], model: spirv::ExecutionModel) -> Option<Str
         cursor = end;
     }
     found
+}
+
+/// How one reflected `[[texture(n)]]` binding's descriptor image is consumed by
+/// the module itself (`research/docs/23` §3.3, v105).
+///
+/// The reflection states *what* a texture argument is; the module states *how*
+/// it is read, and the two read-only arms the render contract admits are only
+/// distinguishable there. Metal's `access::sample` lowers to an
+/// `OpSampledImage` that combines the descriptor's image with a sampler, while
+/// Metal's `access::read` lowers to an `OpImageFetch` that reads the very same
+/// descriptor without one. SPIR-V spells both images with `Sampled = 1` — its
+/// validator demands exactly that operand for `OpImageFetch` — so the type
+/// cannot answer the question. The *use* can, and a rail that guessed would
+/// bind (or omit) a sampler the module does or does not read through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DescriptorImageUse {
+    /// Some `OpSampledImage` combines this descriptor's image with a sampler.
+    Sampled,
+    /// `OpImageFetch` reads this descriptor's image and no `OpSampledImage`
+    /// ever names it: a texel fetch with an explicit level of detail.
+    Fetched,
+    /// The module reaches the image through an instruction that needs a
+    /// descriptor neither read-only arm builds — a direct read
+    /// (`OpImageRead`), a write, or an image texel pointer.
+    Direct,
+    /// The module decorates the descriptor but no instruction this walk
+    /// classifies reads it.
+    Unused,
+}
+
+impl DescriptorImageUse {
+    /// The name a refusal quotes for this use.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Sampled => "sampled",
+            Self::Fetched => "fetched",
+            Self::Direct => "directly read or written",
+            Self::Unused => "unused",
+        }
+    }
+
+    /// Fold two uses of one slot into the one a refusal states.
+    ///
+    /// The order is the descriptor the rail has to build: an image some
+    /// instruction samples needs the sampler even when another instruction
+    /// fetches it, and an image the module touches directly needs the storage
+    /// descriptor neither read-only arm builds.
+    const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Sampled, _) | (_, Self::Sampled) => Self::Sampled,
+            (Self::Direct, _) | (_, Self::Direct) => Self::Direct,
+            (Self::Fetched, _) | (_, Self::Fetched) => Self::Fetched,
+            (Self::Unused, Self::Unused) => Self::Unused,
+        }
+    }
+}
+
+/// The fixpoint step of [`descriptor_image_uses`]: every descriptor variable
+/// `from` descends from becomes one `target` descends from too. Answers whether
+/// `target`'s set grew, which is what makes the surrounding loop terminate.
+fn union_sources(
+    sources: &mut BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    target: u32,
+    from: u32,
+) -> bool {
+    let Some(source) = sources.get(&from).cloned() else {
+        return false;
+    };
+    let entry = sources.entry(target).or_default();
+    let before = entry.len();
+    entry.extend(source);
+    entry.len() != before
+}
+
+/// The use each decorated descriptor slot's image gets in one module
+/// (`research/docs/23` §3.3, v105).
+///
+/// The walk resolves every classified instruction's image operand back to the
+/// `UniformConstant` variable its own `DescriptorSet`/`Binding` decorations
+/// name, through the copies the translator emits — `OpLoad`, `OpCopyObject`,
+/// `OpSelect`, `OpPhi`, access chains, and the function parameters a call feeds
+/// — and answers one classification per decorated slot. Nothing else is read:
+/// a slot the module never decorates has no answer here, and the pairing above
+/// reads that absence as [`DescriptorImageUse::Unused`], which is a refusal by
+/// name rather than a silently bound descriptor.
+///
+/// A module that does not parse into a whole number of instructions answers
+/// with an empty map. That is not a hole: [`RenderStages::validate`] refuses
+/// such a module by name at registration, before a trace can select it, and
+/// this walk runs only on modules registration has already accepted.
+fn descriptor_image_uses(module: &[u8]) -> BTreeMap<(u32, u32), DescriptorImageUse> {
+    let Some(words) = spirv_words(module) else {
+        return BTreeMap::new();
+    };
+    if words.len() < 5 {
+        return BTreeMap::new();
+    }
+    // Instructions as (opcode, operands) in module order, where `operands` are
+    // the instruction's words after its own header word.
+    let mut instructions: Vec<(u32, &[u32])> = Vec::new();
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        let Some(end) = cursor
+            .checked_add(word_count)
+            .filter(|end| word_count != 0 && *end <= words.len())
+        else {
+            return BTreeMap::new();
+        };
+        instructions.push((opcode, &words[cursor + 1..end]));
+        cursor = end;
+    }
+    // One pass for the two decorations, the descriptor variables, and each
+    // function's parameter ids in declaration order.
+    let mut decorations = BTreeMap::<u32, (Option<u32>, Option<u32>)>::new();
+    let mut variables = std::collections::BTreeSet::new();
+    let mut functions = BTreeMap::<u32, Vec<u32>>::new();
+    let mut current_function = None;
+    for (opcode, operands) in &instructions {
+        if *opcode == spirv::Op::Decorate as u32 && operands.len() >= 3 {
+            let entry = decorations.entry(operands[0]).or_default();
+            if operands[1] == spirv::Decoration::DescriptorSet as u32 {
+                entry.0 = Some(operands[2]);
+            } else if operands[1] == spirv::Decoration::Binding as u32 {
+                entry.1 = Some(operands[2]);
+            }
+        } else if *opcode == spirv::Op::Variable as u32 && operands.len() >= 3 {
+            variables.insert(operands[1]);
+        } else if *opcode == spirv::Op::Function as u32 && operands.len() >= 2 {
+            functions.entry(operands[1]).or_default();
+            current_function = Some(operands[1]);
+        } else if *opcode == spirv::Op::FunctionParameter as u32 && operands.len() >= 2 {
+            if let Some(function) = current_function {
+                functions.entry(function).or_default().push(operands[1]);
+            }
+        }
+    }
+    let mut slots = BTreeMap::<(u32, u32), u32>::new();
+    let mut uses = BTreeMap::<(u32, u32), DescriptorImageUse>::new();
+    for variable in &variables {
+        if let Some((Some(set), Some(binding))) = decorations.get(variable).copied() {
+            slots.insert((set, binding), *variable);
+            uses.insert((set, binding), DescriptorImageUse::Unused);
+        }
+    }
+    // Which descriptor variables each image-bearing id descends from. The
+    // fixpoint is bounded: the translator's copy chains are short, and a cycle
+    // that never settles leaves the slot unused, which the pairing refuses by
+    // name instead of executing a descriptor nobody classified.
+    let mut sources = BTreeMap::<u32, std::collections::BTreeSet<u32>>::new();
+    for _ in 0..8 {
+        let mut changed = false;
+        for (opcode, operands) in &instructions {
+            if *opcode == spirv::Op::Load as u32 && operands.len() >= 3 {
+                if variables.contains(&operands[2]) {
+                    let entry = sources.entry(operands[1]).or_default();
+                    changed |= entry.insert(operands[2]);
+                }
+            } else if *opcode == spirv::Op::CopyObject as u32 && operands.len() >= 3 {
+                changed |= union_sources(&mut sources, operands[1], operands[2]);
+            } else if *opcode == spirv::Op::Select as u32 && operands.len() >= 5 {
+                changed |= union_sources(&mut sources, operands[1], operands[3]);
+                changed |= union_sources(&mut sources, operands[1], operands[4]);
+            } else if *opcode == spirv::Op::Phi as u32 && operands.len() >= 3 {
+                for value in operands[2..].iter().step_by(2) {
+                    changed |= union_sources(&mut sources, operands[1], *value);
+                }
+            } else if (*opcode == spirv::Op::AccessChain as u32
+                || *opcode == spirv::Op::InBoundsAccessChain as u32)
+                && operands.len() >= 3
+            {
+                changed |= union_sources(&mut sources, operands[1], operands[2]);
+            } else if *opcode == spirv::Op::FunctionCall as u32 && operands.len() >= 3 {
+                if let Some(parameters) = functions.get(&operands[2]) {
+                    for (parameter, argument) in parameters.iter().zip(operands[3..].iter()) {
+                        changed |= union_sources(&mut sources, *parameter, *argument);
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // The classified instructions, each with the image operand it reads in
+    // operand order, and the read each one is.
+    let mut variable_slots = BTreeMap::<u32, Vec<(u32, u32)>>::new();
+    for (slot, variable) in &slots {
+        variable_slots.entry(*variable).or_default().push(*slot);
+    }
+    for (opcode, operands) in &instructions {
+        let (image, use_) = if *opcode == spirv::Op::SampledImage as u32 && operands.len() >= 3 {
+            (operands[2], DescriptorImageUse::Sampled)
+        } else if *opcode == spirv::Op::ImageFetch as u32 && operands.len() >= 3 {
+            (operands[2], DescriptorImageUse::Fetched)
+        } else if (*opcode == spirv::Op::ImageRead as u32
+            || *opcode == spirv::Op::ImageTexelPointer as u32)
+            && operands.len() >= 3
+        {
+            (operands[2], DescriptorImageUse::Direct)
+        } else if *opcode == spirv::Op::ImageWrite as u32 && !operands.is_empty() {
+            (operands[0], DescriptorImageUse::Direct)
+        } else {
+            continue;
+        };
+        let Some(readers) = sources.get(&image) else {
+            continue;
+        };
+        for variable in readers {
+            let Some(slot_of_variable) = variable_slots.get(variable) else {
+                continue;
+            };
+            for slot in slot_of_variable {
+                let entry = uses.entry(*slot).or_insert(DescriptorImageUse::Unused);
+                *entry = entry.merge(use_);
+            }
+        }
+    }
+    uses
 }
 
 /// The stage name a reflection reports, spelled as this module spells stages.
@@ -7364,14 +7677,15 @@ struct OffscreenObjects<'a> {
     fence: vk::Fence,
 }
 
-/// The Vulkan objects one sampled render texture owns
-/// (`research/docs/23` §3.3, v70).
+/// The Vulkan objects one read-only render texture owns
+/// (`research/docs/23` §3.3, v70/v105).
 ///
 /// The compute rail's sampled texture, scoped to the pass instead of to a
-/// dispatch: a host-visible `LINEAR` `R8G8B8A8_UNORM` image, its view and the
-/// provider-synthesised nearest/clamp sampler the descriptor binds. The bytes
-/// are written once, when the pass's objects are created, and the `record`
-/// step's barrier is what makes them visible to the fragment stage.
+/// dispatch: a host-visible `LINEAR` `R8G8B8A8_UNORM` image, its view and —
+/// for a binding the module samples — the sampler the declaration names. A
+/// texel-fetch binding carries no sampler (`v105`). The bytes are written once,
+/// when the pass's objects are created, and the `record` step's barrier is what
+/// makes them visible to the fragment stage.
 ///
 /// A no-copy texture's image is device-local instead (`research/docs/23` §75,
 /// R5c), and `copy_source` carries the owner's imported window the `record`
@@ -7381,7 +7695,11 @@ struct SampledTextureObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
-    sampler: vk::Sampler,
+    /// The sampler this texture's samples read through, or `None` for a slot
+    /// the module only texel-fetches (`research/docs/23` §3.3, v105): a
+    /// sampler-free slot is one `SAMPLED_IMAGE` descriptor and creates no
+    /// `VkSampler` at all.
+    sampler: Option<vk::Sampler>,
     /// The extent the image was created with, which is also the region the
     /// no-copy arm's `vkCmdCopyBufferToImage` covers (`research/docs/23` §75,
     /// R5c).
@@ -9386,21 +9704,31 @@ impl<'a> OffscreenObjects<'a> {
             // module's samples take their filtering and addressing from the
             // descriptor the rail binds, so the contract is the statement the
             // bytes are read under — and the registration gate has already held
-            // it to the module or to the reviewed pair.
-            let sampler_info = crate::sampler_create_info(texture.slot.sampler());
-            let sampler = unsafe { self.context.device.create_sampler(&sampler_info, None) }
-                .map_err(|error| {
-                    unsafe {
-                        if let Some((buffer, buffer_memory)) = copy_source {
-                            self.context.device.destroy_buffer(buffer, None);
-                            self.context.device.free_memory(buffer_memory, None);
-                        }
-                        self.context.device.destroy_image_view(view, None);
-                        self.context.device.destroy_image(image, None);
-                        self.context.device.free_memory(memory, None);
-                    }
-                    execution_refusal("create render texture sampler", &error.to_string())
-                })?;
+            // it to the module or to the reviewed pair. A texel-fetch slot
+            // states no state at all (`v105`): the module's own `OpImageFetch`
+            // reads the image descriptor, so no `VkSampler` is created and the
+            // layout declares no `SAMPLER` slot for it.
+            let sampler = texture
+                .slot
+                .sampler()
+                .map(|policy| {
+                    let sampler_info = crate::sampler_create_info(policy);
+                    unsafe { self.context.device.create_sampler(&sampler_info, None) }.map_err(
+                        |error| {
+                            unsafe {
+                                if let Some((buffer, buffer_memory)) = copy_source {
+                                    self.context.device.destroy_buffer(buffer, None);
+                                    self.context.device.free_memory(buffer_memory, None);
+                                }
+                                self.context.device.destroy_image_view(view, None);
+                                self.context.device.destroy_image(image, None);
+                                self.context.device.free_memory(memory, None);
+                            }
+                            execution_refusal("create render texture sampler", &error.to_string())
+                        },
+                    )
+                })
+                .transpose()?;
             if copy_source.is_none() {
                 self.context.record_buffer_upload();
                 self.context
@@ -9445,6 +9773,13 @@ impl<'a> OffscreenObjects<'a> {
                 } => {
                     planned_bindings.insert(image, vk::DescriptorType::SAMPLED_IMAGE);
                     planned_bindings.insert(sampler_binding, vk::DescriptorType::SAMPLER);
+                }
+                // The sampler-free arm declares the image alone
+                // (`research/docs/23` §3.3, v105): the module's own
+                // `OpImageFetch` reads it, and a `SAMPLER` entry here would be
+                // a descriptor nothing in the module reads.
+                RenderTextureSlot::Fetch { image, .. } => {
+                    planned_bindings.insert(image, vk::DescriptorType::SAMPLED_IMAGE);
                 }
             }
         }
@@ -9535,9 +9870,12 @@ impl<'a> OffscreenObjects<'a> {
             // The upload lands the image in `GENERAL` before the draw
             // (`Self::record`), the same layout the compute rail binds its
             // sampled textures in.
+            // The reviewed pair's combined descriptor is the one arm that
+            // needs a sampler; its slot always carries one, and the sampler-free
+            // arm never reaches this closure.
             let info = |texture: &SampledTextureObjects| {
                 vk::DescriptorImageInfo::default()
-                    .sampler(texture.sampler)
+                    .sampler(texture.sampler.unwrap_or(vk::Sampler::null()))
                     .image_view(texture.view)
                     .image_layout(vk::ImageLayout::GENERAL)
             };
@@ -9579,10 +9917,32 @@ impl<'a> OffscreenObjects<'a> {
                         continue;
                     }
                     let sampler_index = sampler_infos.len();
-                    sampler_infos.push(vk::DescriptorImageInfo::default().sampler(texture.sampler));
+                    sampler_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .sampler(texture.sampler.unwrap_or(vk::Sampler::null())),
+                    );
                     planned.push((
                         write(sampler_binding, vk::DescriptorType::SAMPLER),
                         Written::Sampler(sampler_index),
+                    ));
+                }
+                // The sampler-free arm writes the image alone
+                // (`research/docs/23` §3.3, v105): the module's own
+                // `OpImageFetch` reads this descriptor, and the layout above
+                // declares no `SAMPLER` beside it.
+                RenderTextureSlot::Fetch { image, .. } => {
+                    if !written_bindings.insert(image) {
+                        continue;
+                    }
+                    let image_index = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(texture.view)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    );
+                    planned.push((
+                        write(image, vk::DescriptorType::SAMPLED_IMAGE),
+                        Written::Image(image_index),
                     ));
                 }
             }
@@ -11641,8 +12001,13 @@ impl<'a> Drop for OffscreenObjects<'a> {
             // the pool owns the set, so destroying the pool releases both and
             // the layout goes with it.
             for texture in &self.textures {
-                if texture.sampler != vk::Sampler::null() {
-                    self.context.device.destroy_sampler(texture.sampler, None);
+                // A texel-fetch binding created no sampler
+                // (`research/docs/23` §3.3, v105), so only a slot that owns one
+                // destroys it.
+                if let Some(sampler) = texture.sampler {
+                    if sampler != vk::Sampler::null() {
+                        self.context.device.destroy_sampler(sampler, None);
+                    }
                 }
                 if texture.view != vk::ImageView::null() {
                     self.context.device.destroy_image_view(texture.view, None);

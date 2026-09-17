@@ -495,6 +495,32 @@ impl Device {
         )
     }
 
+    /// Declare one texel-fetch texture — the object a fragment stage's
+    /// `texture2d<T, access::read>` argument binds — with its initial contents
+    /// (`research/docs/23` §3.3, v105).
+    ///
+    /// The handle is read-only exactly as the sampled one is, so what changes
+    /// is the access every view carries: `Fetched` is the arm the pass's
+    /// declaration pairs with, and the Vulkan rail binds the image alone for it
+    /// — the module's own `OpImageFetch` reads the texels and no `SAMPLER` slot
+    /// is declared. A sampler-free binding is never a landing, so this
+    /// constructor's bytes stay its declared initial contents.
+    pub fn new_fetched_texture_with_bytes(
+        &self,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
+        self.new_texture(
+            contract::TextureAccess::Fetched,
+            format,
+            width,
+            height,
+            bytes,
+        )
+    }
+
     fn new_texture(
         &self,
         access: contract::TextureAccess,
@@ -1326,9 +1352,9 @@ struct TextureInner {
     available: Condvar,
 }
 
-/// A texture handle: a sampled texture is a read-only source, and a storage
-/// texture a compute write target whose completion updates this handle's own
-/// bytes. Clone is cheap and shares the same allocation.
+/// A texture handle: a sampled or texel-fetched texture is a read-only source,
+/// and a storage texture a compute write target whose completion updates this
+/// handle's own bytes. Clone is cheap and shares the same allocation.
 #[derive(Clone)]
 pub struct Texture {
     inner: Arc<TextureInner>,
@@ -1352,8 +1378,10 @@ impl Texture {
     }
 
     /// The access every view this handle declares carries: `Sampled` for a
-    /// texture declared through [`Device::new_texture_with_bytes`], `Storage`
-    /// for one declared through [`Device::new_storage_texture_with_bytes`].
+    /// texture declared through [`Device::new_texture_with_bytes`], `Fetched`
+    /// for one declared through [`Device::new_fetched_texture_with_bytes`], and
+    /// `Storage` for one declared through
+    /// [`Device::new_storage_texture_with_bytes`].
     pub fn access(&self) -> contract::TextureAccess {
         self.inner.access
     }
