@@ -237,8 +237,13 @@ class StageBufferCaptureTests(unittest.TestCase):
         self.validate()
 
     def test_the_objects_rail_is_not_a_rail_these_cases_run_on(self):
-        # The object API binds no stage buffers, so a capture of that rail owes
-        # the two declaring passes and nothing else.
+        # This suite's marker was pinned while the object API bound no stage
+        # buffers, so a capture of that rail owes the two declaring passes and
+        # nothing else. The increment that gave the object rails their own
+        # entry point carries the same two cases in `suite-v32.json` with the
+        # object rails named (`research/docs/23` §3.3, v87); this suite keeps
+        # its own statement, and a capture of it that reports a case the marker
+        # does not name is still refused.
         report = capture_for(self.suite, backend="vulkan-objects")
         report["results"] = [result for result in report["results"]
                              if result["id"] in (DECLARING_SINK_ID, DECLARING_LEASE_ID)]

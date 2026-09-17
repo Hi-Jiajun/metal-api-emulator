@@ -67,6 +67,8 @@ struct FakeProvider {
     render: bool,
     vertex_input: bool,
     fragment_texture: bool,
+    stage_buffers: bool,
+    staged_lease: bool,
     depth_resolve: bool,
     stencil_resolve: bool,
     heap: bool,
@@ -92,6 +94,8 @@ impl FakeProvider {
             render: false,
             vertex_input: false,
             fragment_texture: false,
+            stage_buffers: false,
+            staged_lease: false,
             depth_resolve: false,
             stencil_resolve: false,
             heap: false,
@@ -112,6 +116,14 @@ impl FakeProvider {
     }
     fn with_fragment_texture(mut self) -> Self {
         self.fragment_texture = true;
+        self
+    }
+    fn with_stage_buffers(mut self) -> Self {
+        self.stage_buffers = true;
+        self
+    }
+    fn with_staged_lease(mut self) -> Self {
+        self.staged_lease = true;
         self
     }
     fn with_depth_resolve(mut self) -> Self {
@@ -159,6 +171,23 @@ impl FakeProvider {
             .unwrap_or_default()
     }
 
+    /// The stage buffers the most recent render pass carried, in canonical
+    /// order, for the encoder-side stage-buffer tests
+    /// (`research/docs/23` §3.3, v87).
+    fn last_render_stage_buffers(&self) -> Vec<contract::StageBufferView> {
+        self.traces
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|trace| {
+                trace
+                    .render_passes()
+                    .next()
+                    .map(|pass| pass.stage_buffers.clone())
+            })
+            .unwrap_or_default()
+    }
+
     fn error(&self, token: CompletionToken) -> ProviderError {
         ProviderError::new(
             ProviderPhase::Submit,
@@ -173,8 +202,16 @@ impl FakeProvider {
 impl ComputeProvider for FakeProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            supports_render_stage_buffers: false,
-            max_render_stage_buffers: 0,
+            // The object API's stage-buffer entry point
+            // (`research/docs/23` §3.3, v87): the fixture provider declares the
+            // face when a test asks for it, and the staged arm's source mode
+            // when a test binds a staged lease.
+            supports_render_stage_buffers: self.stage_buffers,
+            max_render_stage_buffers: if self.stage_buffers {
+                MAX_RENDER_STAGE_BUFFERS as u32
+            } else {
+                0
+            },
             supports_compute_texture_sampling: false,
             max_compute_textures: 0,
             supported_compute_texture_formats: Vec::new(),
@@ -190,7 +227,11 @@ impl ComputeProvider for FakeProvider {
             max_buffer_range: 65536,
             max_push_constant_bytes: 0,
             alias_mode: self.alias_mode,
-            storage_modes: vec![StorageMode::OwnedBytes],
+            storage_modes: if self.staged_lease {
+                vec![StorageMode::OwnedBytes, StorageMode::StagedLease]
+            } else {
+                vec![StorageMode::OwnedBytes]
+            },
             host_readback: true,
             submit_only: false,
             supports_render_passes: self.render,
@@ -1689,6 +1730,459 @@ fn a_recording_binds_one_fragment_texture_in_binding_order() {
                 .collect()
         )
     );
+}
+
+/// The render metadata one stage-buffer case's pipeline carries
+/// (`research/docs/23` §3.3, v83-v87): the reviewed contract's fields with the
+/// slots the case declares.
+fn render_metadata_with_stage_buffers(
+    provider: &FakeProvider,
+    stage_buffers: Vec<contract::StageBufferBinding>,
+) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    metadata
+        .render
+        .as_mut()
+        .expect("render metadata carries a render half")
+        .stage_buffers = stage_buffers;
+    metadata
+}
+
+#[test]
+fn a_render_pass_binds_its_stage_buffers_in_canonical_order() {
+    // The object-API half of the stage-buffer face (`research/docs/23` §3.3,
+    // v83-v87): the encoder states the slot and the bytes, the recorded
+    // pipeline's declaration states the access, and the pass the provider
+    // receives carries both — in the contract's canonical order whatever order
+    // the bindings were recorded in.
+    let provider = Arc::new(FakeProvider::new().with_render().with_stage_buffers());
+    let device = Device::new(provider.clone());
+    // The declaring pass reads the attachment the render pass stores into and
+    // the view that becomes the writable slot's pool entry, exactly as a
+    // render case's declaring pass declares both.
+    let declaring = pipeline(&device, "declare");
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        vec![
+            contract::StageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 8 },
+            },
+            contract::StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 4 },
+            },
+        ],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let positions = device.new_buffer_with_bytes((0..8u8).collect()).unwrap();
+    let positions_view = positions.view(0, 8).unwrap();
+    let tint = device.new_buffer_with_bytes(vec![0x11; 4]).unwrap();
+    let tint_view = tint.view(0, 4).unwrap();
+    let foreign = {
+        let other = Device::new(Arc::new(
+            FakeProvider::new().with_render().with_stage_buffers(),
+        ));
+        other
+            .new_buffer_with_bytes(vec![0x22; 4])
+            .unwrap()
+            .view(0, 4)
+            .unwrap()
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        assert!(matches!(
+            encoder.set_stage_buffer(RenderPipelineStage::Vertex, 0, &foreign),
+            Err(Error::ForeignBuffer)
+        ));
+        // Bound fragment-first on purpose: the pass still carries the canonical
+        // order, so a binding's position cannot depend on the call order.
+        encoder
+            .set_stage_buffer(RenderPipelineStage::Fragment, 0, &tint_view)
+            .unwrap();
+        encoder
+            .set_stage_buffer(RenderPipelineStage::Vertex, 0, &positions_view)
+            .unwrap();
+        assert!(matches!(
+            encoder.set_stage_buffer(RenderPipelineStage::Vertex, 0, &positions_view),
+            Err(Error::StageBufferAlreadyBound {
+                stage: RenderPipelineStage::Vertex,
+                index: 0,
+            })
+        ));
+        assert!(matches!(
+            encoder.set_stage_buffer(
+                RenderPipelineStage::Vertex,
+                MAX_RENDER_STAGE_BUFFER_INDEX,
+                &positions_view,
+            ),
+            Err(Error::Contract(
+                ContractError::RenderStageBufferIndexExceeded { index, .. }
+            )) if index == MAX_RENDER_STAGE_BUFFER_INDEX
+        ));
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .expect("a stage-buffer pass records like the pre-v83 one");
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    let slots = provider.last_render_stage_buffers();
+    assert_eq!(slots.len(), 2, "both bound slots reach the trace");
+    assert_eq!(slots[0].stage, RenderPipelineStage::Vertex);
+    assert_eq!(slots[0].view.metal_binding, 0);
+    assert_eq!(slots[0].view.access, BufferAccess::Read);
+    assert_eq!(slots[0].view.view_id, positions_view.view_id());
+    assert_eq!(
+        slots[0].view.source,
+        BufferSource::OwnedBytes((0..8u8).collect())
+    );
+    assert_eq!(slots[1].stage, RenderPipelineStage::Fragment);
+    assert_eq!(slots[1].view.access, BufferAccess::Read);
+    assert_eq!(slots[1].view.view_id, tint_view.view_id());
+    assert_eq!(
+        slots[1].view.source,
+        BufferSource::OwnedBytes(vec![0x11; 4])
+    );
+}
+
+#[test]
+fn a_writable_stage_buffer_slot_carries_the_declarations_own_access() {
+    // A writable slot is the landing the writeback channel publishes
+    // (`research/docs/23` §3.3, v86). The encoder states no access of its own,
+    // so the pass carries the recorded pipeline's declaration, and the view is
+    // the one the declaring compute pass already bound — the trace's own pool
+    // entry the landing is keyed by.
+    let provider = Arc::new(FakeProvider::new().with_render().with_stage_buffers());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "read:0,1");
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        vec![contract::StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 1,
+            access: BufferAccess::Write,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let sink = device.new_buffer_with_bytes(vec![0xcd; 4]).unwrap();
+    let sink_view = sink.view(0, 4).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        encoder.set_buffer(1, &sink_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder
+            .set_stage_buffer(RenderPipelineStage::Fragment, 1, &sink_view)
+            .unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    let slots = provider.last_render_stage_buffers();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].view.access, BufferAccess::Write);
+    assert_eq!(slots[0].view.view_id, sink_view.view_id());
+    assert_eq!(slots[0].view.allocation_id, sink_view.allocation_id());
+    assert_eq!(
+        slots[0].view.source,
+        BufferSource::OwnedBytes(vec![0xcd; 4])
+    );
+}
+
+#[test]
+fn a_stage_buffer_slot_the_pipeline_does_not_declare_is_refused() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_stage_buffers());
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "declare");
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        vec![contract::StageBufferBinding {
+            stage: RenderPipelineStage::Vertex,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let other = device.new_buffer_with_bytes(vec![0x11; 4]).unwrap();
+    let other_view = other.view(0, 4).unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    // The pipeline's declaration is the vertex slot alone: binding the
+    // fragment slot would fill a descriptor no use covers, so the pass refuses
+    // the pairing by name instead of dropping the binding.
+    encoder
+        .set_stage_buffer(RenderPipelineStage::Fragment, 0, &other_view)
+        .unwrap();
+    assert!(matches!(
+        encoder.draw_render_pass(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            None,
+        ),
+        Err(Error::Contract(
+            ContractError::UndeclaredStageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: 0,
+            }
+        ))
+    ));
+    drop(encoder);
+}
+
+#[test]
+fn a_lease_bound_stage_buffer_names_the_imported_reservation() {
+    // The staged arm the trace rail already executes
+    // (`research/docs/23` §90, R9i): the caller imports the lease through its
+    // own provider channel and binds the reservation here, so the object rail's
+    // pass carries the same `BufferSource` the trace rail's does. A commit that
+    // completes proves the snapshot carried the owner's registration: admission
+    // refuses a lease the resource table does not hold (`lease_not_admitted`
+    // one layer down, `UnknownAllocation` here).
+    let provider = Arc::new(
+        FakeProvider::new()
+            .with_render()
+            .with_stage_buffers()
+            .with_staged_lease(),
+    );
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "declare");
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        vec![contract::StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Read,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let lease_id = contract::LeaseId::new(4242);
+    let allocation = AllocationId::new(4241);
+    let lease = StageBufferLease {
+        reservation: LeaseReservation {
+            lease: contract::BufferLease {
+                lease_id,
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+            },
+            offset: 0,
+            length: 4,
+        },
+        allocation_size: 4096,
+        arm: StageBufferLeaseArm::StagedLease,
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        // A reservation that reaches past the owner's registration is refused
+        // by name, exactly as the trace's own resource table refuses it.
+        assert!(matches!(
+            encoder.set_stage_buffer_lease(
+                RenderPipelineStage::Fragment,
+                0,
+                StageBufferLease {
+                    allocation_size: 2,
+                    ..lease
+                },
+            ),
+            Err(Error::Contract(ContractError::LeaseRangeOutOfBounds { .. }))
+        ));
+        encoder
+            .set_stage_buffer_lease(RenderPipelineStage::Fragment, 0, lease)
+            .unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                2,
+                2,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    let slots = provider.last_render_stage_buffers();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].view.allocation_id, allocation);
+    assert_eq!(slots[0].view.offset, 0);
+    assert_eq!(slots[0].view.length, 4);
+    assert_eq!(slots[0].view.source, BufferSource::StagedLease(lease_id));
+}
+
+#[test]
+fn a_writable_stage_buffer_slot_refuses_a_lease_binding() {
+    // An imported lease has no host image the writeback channel could land in,
+    // so the pairing is refused by name instead of executed as a pass whose
+    // landing no rail could publish (`research/docs/23` §3.3, v86/v87).
+    let provider = Arc::new(
+        FakeProvider::new()
+            .with_render()
+            .with_stage_buffers()
+            .with_staged_lease(),
+    );
+    let device = Device::new(provider.clone());
+    let declaring = pipeline(&device, "declare");
+    let render_metadata = render_metadata_with_stage_buffers(
+        &provider,
+        vec![contract::StageBufferBinding {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            access: BufferAccess::Write,
+            footprint: FootprintProof::Static { max_bytes: 4 },
+        }],
+    );
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let attachment_view = attachment.view(0, 16).unwrap();
+    let lease = StageBufferLease {
+        reservation: LeaseReservation {
+            lease: contract::BufferLease {
+                lease_id: contract::LeaseId::new(4242),
+                allocation_id: AllocationId::new(4241),
+                owner_epoch: provider.device_epoch(),
+            },
+            offset: 0,
+            length: 4,
+        },
+        allocation_size: 4096,
+        arm: StageBufferLeaseArm::StagedLease,
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder
+        .set_stage_buffer_lease(RenderPipelineStage::Fragment, 0, lease)
+        .unwrap();
+    assert!(matches!(
+        encoder.draw_render_pass(
+            &attachment_view,
+            AttachmentFormat::Rgba8Unorm,
+            2,
+            2,
+            RenderAttachmentLoad::Clear([0xfe; 4]),
+            None,
+        ),
+        Err(Error::WritableStageBufferLeaseUnsupported {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+        })
+    ));
+    drop(encoder);
 }
 
 #[test]

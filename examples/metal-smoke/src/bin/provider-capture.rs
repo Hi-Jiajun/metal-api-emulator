@@ -3539,28 +3539,31 @@ fn main() -> Result<()> {
             .any(|rail| rail == backend.report_name(api))
         {
             // A rail the marker does not name omits the case. A stage-buffer
-            // case says why out loud, because the omission is a boundary of
-            // the shape rather than a device's answer: the object API has no
-            // stage-buffer entry point yet (`research/docs/23` §3.3, v83), and
-            // the native rails carry no translator for it.
+            // case says why out loud, because the omission is a boundary of the
+            // shape rather than a device's answer: the rails that bind its slots
+            // are exactly the ones its marker names — the Vulkan trace rail and
+            // the object rails now bind them (`research/docs/23` §3.3, v83-v87),
+            // and the native rails carry no translator for the translated arm.
             if !case.stage_buffers.is_empty() {
                 println!(
-                    "render case skipped: {} ({} binds no stage buffers; the case is marked for \
-                     {})",
+                    "render case skipped: {} (not a rail this case's marker names: {})",
                     case.id,
-                    backend.report_name(api),
                     case.capture_rails.join(", ")
                 );
             }
             continue;
         }
-        // A rail the marker *does* name has to execute the shape: executing a
-        // stage-buffer case through the object API would drop the bindings,
-        // which is why the refusal is by name rather than a silent run.
-        if !case.stage_buffers.is_empty() && object_device.is_some() {
+        // A rail the marker *does* name has to execute the shape. The object
+        // rails bind a stage-buffer case's slots through their own encoder
+        // entries, so they run the case like any other; a native rail has no
+        // stage-buffer face to run it with (it translates no AIR and publishes
+        // no render stage-buffer capability), so a case whose marker named one
+        // is refused by name rather than executed through a narrowed shape
+        // (`research/docs/23` §3.3, v83).
+        if !case.stage_buffers.is_empty() && backend == Backend::NativeMetalProvider {
             return Err(format!(
-                "render case {}: the object API binds no stage buffers yet, so this case runs \
-                 on the trace rail alone",
+                "render case {}: the native rails carry no stage-buffer face, so this case runs \
+                 on the rails that bind its slots",
                 case.id
             )
             .into());
@@ -3643,7 +3646,9 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>();
             let object_pipeline = match &object_render_pipeline {
                 Some((formats, cached_geometry, pipeline))
-                    if *formats == attachment_formats && *cached_geometry == geometry =>
+                    if *formats == attachment_formats
+                        && *cached_geometry == geometry
+                        && case.translated_stages.is_none() =>
                 {
                     pipeline.clone()
                 }
@@ -3658,9 +3663,16 @@ fn main() -> Result<()> {
                         &attachment_formats,
                     )?;
                     let wrapped = device.render_pipeline(&registered)?;
-                    render_pipeline = Some((attachment_formats.clone(), geometry, registered));
-                    object_render_pipeline =
-                        Some((attachment_formats.clone(), geometry, wrapped.clone()));
+                    // A translated case registers its own two stages, so two of
+                    // them never share one cached registration and neither ever
+                    // takes the reviewed arm's: only a reviewed registration is
+                    // reused across cases, exactly as the trace rail's cache
+                    // rule states (`research/docs/23` §3.3, v84).
+                    if case.translated_stages.is_none() {
+                        render_pipeline = Some((attachment_formats.clone(), geometry, registered));
+                        object_render_pipeline =
+                            Some((attachment_formats.clone(), geometry, wrapped.clone()));
+                    }
                     wrapped
                 }
             };
@@ -3670,6 +3682,8 @@ fn main() -> Result<()> {
                 declaring,
                 case,
                 &object_pipeline,
+                provider.as_ref(),
+                &leases,
                 suite.guard_byte,
                 async_execution,
             )?
@@ -3862,6 +3876,13 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         // against — the writable sink's own pool view, and the borrowed tint's
         // owner registration.
         (1, "compute-buffer-v31") => &[
+            "render_declaring_stage_buffer_sink",
+            "render_declaring_stage_buffer_lease",
+        ],
+        // The object rail's half of the stage-buffer face
+        // (`research/docs/23` §3.3, v87): the same two declaring passes, whose
+        // render cases now name the object rails beside the trace rail.
+        (1, "compute-buffer-v32") => &[
             "render_declaring_stage_buffer_sink",
             "render_declaring_stage_buffer_lease",
         ],
@@ -5558,17 +5579,24 @@ fn reviewed_stage_buffer_geometry(case: &RenderCase, where_: &str) -> Result<Ren
         )
         .into());
     }
-    // One rail executes the shape today, and the marker has to say so. The
-    // native rails compile no AIR and their render stage-buffer capability is
-    // off at this commit (`crates/metal-api-native/src/render.rs` publishes
-    // `supports_render_stage_buffers = false`), while the object API has no
-    // stage-buffer entry point at all (`crates/metal-api-core/src/provider_api.rs`):
-    // a case that named either would claim a capture that rail cannot report,
-    // so the marker is the Vulkan trace rail alone.
-    if case.capture_rails.as_slice() != ["vulkan"] {
+    // The rails that execute the shape have to be the ones the marker names.
+    // The Vulkan trace rail always owns it; the object rails own it from the
+    // increment that gave them a stage-buffer entry point
+    // (`crates/metal-api-core/src/provider_api.rs`, `research/docs/23` §3.3,
+    // v87), and one capture reports both the sync and the async run under the
+    // same backend name. The native rails compile no AIR and their render
+    // stage-buffer capability is off (`crates/metal-api-native/src/render.rs`
+    // publishes `supports_render_stage_buffers = false`), and the Swift oracle
+    // is not a provider at all: a case that named any of them would claim a
+    // capture that rail cannot report.
+    if case
+        .capture_rails
+        .iter()
+        .any(|rail| !matches!(rail.as_str(), "vulkan" | "vulkan-objects"))
+    {
         return Err(format!(
-            "{where_}: a stage-buffer case runs on the Vulkan trace rail alone, so its \
-             capture_rails has to be [\"vulkan\"]"
+            "{where_}: a stage-buffer case runs on the Vulkan trace rail and its object rails, \
+             so its capture_rails can only name \"vulkan\" and \"vulkan-objects\""
         )
         .into());
     }
@@ -5884,29 +5912,74 @@ fn stage_buffer_declarations(case: &RenderCase) -> Result<Vec<StageBufferBinding
         .collect()
 }
 
-/// The pass-level views one render case's stage-buffer slots bind
-/// (`research/docs/23` §3.3, v83): the same entries the declarations are built
-/// from, resolved to the bytes their own source arm names.
+/// One stage-buffer slot a render case declares, resolved to the bytes its own
+/// source arm names (`research/docs/23` §3.3, v83-v87; §90, R9i).
 ///
-/// An owned view reads the case's own bytes every time a trace is built, while
-/// a lease-armed view names the import the provider already holds — exactly the
-/// rule a compute case's `case_sources` follows (`research/docs/23` §90, R9i).
-fn stage_buffer_views(
+/// Both rails resolve their slots through this one walk, so the trace rail's
+/// pass-level views and the object rail's encoder bindings cannot disagree
+/// about which bytes a slot reads or which import carries them. The identity
+/// fields stay the fixture's own — the object rail maps its own identities
+/// back for the report, exactly as it does for every other binding — while an
+/// owned slot reads the case's own bytes every time a trace is built and a
+/// lease-armed one names the import the provider already holds, exactly the
+/// rule a compute case's `case_sources` follows.
+struct ResolvedStageBuffer {
+    stage: RenderPipelineStage,
+    index: u32,
+    access: BufferAccess,
+    allocation: u64,
+    view: u64,
+    offset: u64,
+    length: u64,
+    /// The bytes a writable slot's writeback has to carry, exactly as the
+    /// suite declares them, or `None` for a read-only slot.
+    expected: Option<Vec<u8>>,
+    source: ResolvedStageSource,
+}
+
+/// Where one resolved slot's bytes come from (`research/docs/23` §90, R9i).
+enum ResolvedStageSource {
+    /// The case's own bytes. The trace carries them, and a rail that binds a
+    /// caller-held view holds them in its own host image.
+    Bytes(Vec<u8>),
+    /// An import the provider already holds, and the arm it was imported
+    /// through. The owner window a borrowed import maps is the caller's to keep
+    /// alive until the case's submission has been waited for.
+    Lease {
+        reservation: LeaseReservation,
+        allocation_size: u64,
+        arm: objects::StageBufferLeaseArm,
+    },
+}
+
+/// Resolve every stage-buffer slot a render case declares, importing the
+/// leases its lease arms name (`research/docs/23` §3.3, v83-v87; §90, R9i).
+fn resolved_stage_buffers(
     case: &RenderCase,
     leases: &LeaseHandles,
     provider: &dyn PipelineProvider,
     guard: u8,
     imported: &mut CaseLeases,
     windows: &mut Vec<OwnerWindow>,
-) -> Result<Vec<StageBufferView>> {
+) -> Result<Vec<ResolvedStageBuffer>> {
     let where_ = format!("render case {}", case.id);
-    let mut views = Vec::with_capacity(case.stage_buffers.len());
+    let mut slots = Vec::with_capacity(case.stage_buffers.len());
     for definition in &case.stage_buffers {
         let stage = stage_buffer_stage(&definition.stage, &where_)?;
         let access = stage_buffer_access(&definition.access, &where_)?;
         let bytes = unhex(&definition.initial_hex)?;
+        if bytes.len() as u64 != definition.length {
+            return Err(format!(
+                "{where_}: stage buffer {}/{} declares {} bytes over a {}-byte view",
+                definition.stage,
+                definition.index,
+                bytes.len(),
+                definition.length
+            )
+            .into());
+        }
         let source = match stage_buffer_storage_mode(definition, &where_)? {
-            BufferSourceKind::OwnedBytes => BufferSource::OwnedBytes(bytes),
+            BufferSourceKind::OwnedBytes => ResolvedStageSource::Bytes(bytes),
             BufferSourceKind::StagedLease => {
                 let reservation = LeaseReservation {
                     lease: BufferLease {
@@ -5924,7 +5997,13 @@ fn stage_buffer_views(
                     .map_err(|error| format!("{where_}: import staged lease: {error:?}"))?;
                 imported.reservations.push(reservation);
                 imported.staged.push(reservation.lease.lease_id);
-                BufferSource::StagedLease(reservation.lease.lease_id)
+                ResolvedStageSource::Lease {
+                    reservation,
+                    allocation_size: definition
+                        .allocation_size
+                        .ok_or("a staged stage buffer states its allocation size")?,
+                    arm: objects::StageBufferLeaseArm::StagedLease,
+                }
             }
             BufferSourceKind::BorrowedNoCopy => {
                 // The window is the owner's own mapping, so the same alignment
@@ -5992,24 +6071,58 @@ fn stage_buffer_views(
                 windows.push(window);
                 imported.reservations.push(borrowed.reservation);
                 imported.borrowed.push(borrowed.reservation.lease.lease_id);
-                BufferSource::BorrowedNoCopy(borrowed.reservation.lease.lease_id)
+                ResolvedStageSource::Lease {
+                    reservation: borrowed.reservation,
+                    allocation_size,
+                    arm: objects::StageBufferLeaseArm::BorrowedNoCopy,
+                }
             }
         };
-        views.push(StageBufferView {
+        slots.push(ResolvedStageBuffer {
             stage,
-            view: BufferView {
-                view_id: ViewId::new(definition.view),
-                metal_binding: definition.index,
-                allocation_id: AllocationId::new(definition.allocation),
-                offset: definition.offset,
-                length: definition.length,
-                access,
-                attribute_stride: None,
-                source,
+            index: definition.index,
+            access,
+            allocation: definition.allocation,
+            view: definition.view,
+            offset: definition.offset,
+            length: definition.length,
+            expected: match definition.expected_hex.as_deref() {
+                Some(value) => Some(unhex(value)?),
+                None => None,
             },
+            source,
         });
     }
-    Ok(views)
+    Ok(slots)
+}
+
+/// One resolved slot as the trace contract's own pass-level view.
+fn stage_buffer_view(slot: &ResolvedStageBuffer) -> StageBufferView {
+    StageBufferView {
+        stage: slot.stage,
+        view: BufferView {
+            view_id: ViewId::new(slot.view),
+            metal_binding: slot.index,
+            allocation_id: AllocationId::new(slot.allocation),
+            offset: slot.offset,
+            length: slot.length,
+            access: slot.access,
+            attribute_stride: None,
+            source: match &slot.source {
+                ResolvedStageSource::Bytes(bytes) => BufferSource::OwnedBytes(bytes.clone()),
+                ResolvedStageSource::Lease {
+                    reservation, arm, ..
+                } => match arm {
+                    objects::StageBufferLeaseArm::StagedLease => {
+                        BufferSource::StagedLease(reservation.lease.lease_id)
+                    }
+                    objects::StageBufferLeaseArm::BorrowedNoCopy => {
+                        BufferSource::BorrowedNoCopy(reservation.lease.lease_id)
+                    }
+                },
+            },
+        },
+    }
 }
 
 /// Classify a render case's geometry and pin the reviewed shape.
@@ -9498,7 +9611,7 @@ fn run_render_case(
             })?;
         }
     }
-    let stage_buffers = stage_buffer_views(
+    let slots = resolved_stage_buffers(
         case,
         leases,
         provider,
@@ -9506,6 +9619,7 @@ fn run_render_case(
         &mut case_leases,
         &mut owner_windows,
     )?;
+    let stage_buffers = slots.iter().map(stage_buffer_view).collect::<Vec<_>>();
     for reservation in &case_leases.reservations {
         resources.insert_lease(*reservation)?;
     }
@@ -10395,12 +10509,18 @@ fn run_object_case(
 /// attachment view the compute pass declares is the one the render pass stores
 /// into (`research/docs/23` §3.6). The observation is the attachment's own
 /// allocation and writeback, exactly as the trace rail reports it.
+// The object runner's signature is the trace runner's own input set plus the
+// two lease channels a stage buffer may source its bytes from: splitting it
+// into a context struct would put the same fields behind one more name.
+#[allow(clippy::too_many_arguments)]
 fn run_object_render_case(
     device: &objects::Device,
     programs: &[objects::Pipeline],
     declaring: &Case,
     case: &RenderCase,
     render_pipeline: &objects::RenderPipeline,
+    provider: &dyn PipelineProvider,
+    leases: &LeaseHandles,
     guard: u8,
     async_execution: bool,
 ) -> Result<CaseResult> {
@@ -10591,6 +10711,76 @@ fn run_object_render_case(
         None => None,
     };
     render.set_scissor(scissor)?;
+    // The pass's own stage buffers (`research/docs/23` §3.3, v83-v87): the same
+    // three-arm source channel the trace rail resolves, bound through the
+    // object API's own encoder entries. A caller-held slot's bytes land in an
+    // object buffer the rail creates — or in the view the declaring pass
+    // already bound, which is where a writable slot's writeback has to land —
+    // while a lease-armed slot names the import the provider already holds.
+    // The owner window a borrowed slot maps stays alive in `owner_windows`
+    // until this case's submission has been waited for, exactly as the trace
+    // rail keeps it (`research/docs/23` §90, R9i).
+    let mut case_leases = CaseLeases::default();
+    let mut owner_windows = Vec::new();
+    let stage_slots = resolved_stage_buffers(
+        case,
+        leases,
+        provider,
+        guard,
+        &mut case_leases,
+        &mut owner_windows,
+    )?;
+    for slot in &stage_slots {
+        match &slot.source {
+            ResolvedStageSource::Bytes(bytes) => {
+                // The declaring pass's own view is the identity the trace's
+                // pool carries, so a writable slot has to bind exactly it
+                // (`ComputeTrace::validate_serial_buffer_reuse` refuses a
+                // landing whose view the trace does not declare); a slot the
+                // declaring pass does not declare carries its own bytes under
+                // its own identity.
+                let view = match resources.get(&slot.view) {
+                    Some((_, view)) => view.clone(),
+                    None => {
+                        let allocation = match allocation_buffers.get(&slot.allocation) {
+                            Some(existing) => existing.clone(),
+                            None => {
+                                let start = usize::try_from(slot.offset)?;
+                                let mut image =
+                                    vec![guard; usize::try_from(slot.offset + slot.length)?];
+                                image[start..start + bytes.len()].copy_from_slice(bytes);
+                                let created = device.new_buffer_with_bytes(image)?;
+                                allocation_buffers.insert(slot.allocation, created.clone());
+                                created
+                            }
+                        };
+                        allocation
+                            .view(usize::try_from(slot.offset)?, usize::try_from(slot.length)?)?
+                    }
+                };
+                report_ids.insert(
+                    (view.allocation_id(), view.view_id()),
+                    (slot.allocation, slot.view),
+                );
+                render.set_stage_buffer(slot.stage, slot.index, &view)?;
+            }
+            ResolvedStageSource::Lease {
+                reservation,
+                allocation_size,
+                arm,
+            } => {
+                render.set_stage_buffer_lease(
+                    slot.stage,
+                    slot.index,
+                    objects::StageBufferLease {
+                        reservation: *reservation,
+                        allocation_size: *allocation_size,
+                        arm: *arm,
+                    },
+                )?;
+            }
+        }
+    }
     // The extent the recorded pass states is its colour attachment's — or, for
     // the zero-colour-attachment depth pass (`research/docs/23` §3.3, v46), its
     // depth attachment's: the depth surface is the whole raster, and the object
@@ -11206,6 +11396,29 @@ fn run_object_render_case(
     ) {
         return Err("object render capture requires completed visible results".into());
     }
+    // The lease imports belong to this case alone: a later case may reuse a
+    // view id, and both registries refuse a duplicate import until the
+    // previous one is released. This case's single submission has been waited
+    // for, so the provider's own observation is dropped first — the command
+    // releases its completion token when it is dropped, and the no-copy
+    // registry's retirement rule waits on exactly that
+    // (`research/docs/23` §90, R9i). The owner window a borrowed slot maps
+    // stays alive in `owner_windows` past both calls.
+    drop(command);
+    for lease_id in &case_leases.staged {
+        leases
+            .staged
+            .release_staged_lease(*lease_id)
+            .map_err(|error| format!("render case {}: release staged lease: {error:?}", case.id))?;
+    }
+    for lease_id in &case_leases.borrowed {
+        leases
+            .borrowed
+            .release_borrowed_lease(*lease_id)
+            .map_err(|error| {
+                format!("render case {}: release borrowed lease: {error:?}", case.id)
+            })?;
+    }
     // One writeback and one allocation image per attachment, in location
     // order. Each writeback has to cover the exact range its declaring view
     // states, so a rail that landed a different range cannot be reported as
@@ -11389,6 +11602,77 @@ fn run_object_render_case(
             images_report.push(Allocation::observed(allocation, &image));
         }
     }
+    // The writable stage buffers' own landings (`research/docs/23` §3.3, v86),
+    // after the colour, depth and stencil ones as on the other rails: one
+    // writeback covering the exact view the declaring pass declared, and one
+    // allocation image holding the bytes it left there. A lease-bound slot is
+    // never writable on this rail — the object API refuses that pairing by
+    // name, because an imported lease has no host image the writeback could
+    // land in.
+    for slot in &stage_slots {
+        if !slot.access.is_writable() {
+            continue;
+        }
+        let landed = output
+            .writebacks
+            .iter()
+            .find(|write| {
+                report_ids.get(&(write.allocation_id, write.view_id))
+                    == Some(&(slot.allocation, slot.view))
+            })
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "render case {}: the object rail landed no writeback for the writable stage \
+                     buffer {}/{}",
+                    case.id,
+                    slot.stage.name(),
+                    slot.index
+                )
+                .into()
+            })?;
+        if landed.offset != slot.offset || landed.bytes.len() as u64 != slot.length {
+            return Err(format!(
+                "render case {}: the writable stage buffer {}/{} landed {}..{} instead of \
+                 {}..{}",
+                case.id,
+                slot.stage.name(),
+                slot.index,
+                landed.offset,
+                landed.offset + landed.bytes.len() as u64,
+                slot.offset,
+                slot.offset + slot.length
+            )
+            .into());
+        }
+        let expected = slot
+            .expected
+            .as_deref()
+            .ok_or("a writable stage buffer states the bytes it lands")?;
+        if landed.bytes != expected {
+            return Err(format!(
+                "render case {}: the writable stage buffer {}/{} landed {} against the reviewed \
+                 {}",
+                case.id,
+                slot.stage.name(),
+                slot.index,
+                hex(&landed.bytes),
+                hex(expected)
+            )
+            .into());
+        }
+        let image = allocation_buffers
+            .get(&slot.allocation)
+            .ok_or("the writable stage buffer's allocation is missing")?
+            .read()?;
+        writebacks.push(Writeback::encoded(
+            slot.allocation,
+            slot.view,
+            landed.offset,
+            &landed.bytes,
+        ));
+        images_report.push(Allocation::observed(slot.allocation, &image));
+    }
+    let storage_modes = stage_buffer_storage_modes(case)?;
     eprintln!(
         "objects render case completed: {} attachments={} bytes={}",
         case.id,
@@ -11409,7 +11693,7 @@ fn run_object_render_case(
         present: None,
         heap: None,
         icb: None,
-        storage_modes: None,
+        storage_modes,
     })
 }
 

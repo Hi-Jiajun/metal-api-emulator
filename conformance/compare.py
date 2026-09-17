@@ -67,9 +67,12 @@ MAX_RENDER_STAGE_BUFFER_INDEX = 16
 # (`metal_api_core::provider::RENDER_AFFINE_AXES`): `0` is the vertex index,
 # `1` the instance index.
 RENDER_AFFINE_AXES = 2
-# The Vulkan trace rail: the one rail that translates a stage-buffer case's AIR
-# stages and binds their slots today (`research/docs/23` §3.3, v83-v86).
+# The Vulkan trace rail: the reference rail every stage-buffer case names
+# (`research/docs/23` §3.3, v83-v87).
 VULKAN_TRACE_RAIL = "vulkan"
+# The Vulkan object rails (`research/docs/23` §3.3, v87): one marker covers the
+# synchronous and the deferred run, because both captures report this backend.
+VULKAN_OBJECTS_RAIL = "vulkan-objects"
 
 # One stage-buffer slot a render case declares (`research/docs/23` §3.3,
 # v83-v86): the pipeline's declaration (`stage`, `index`, `access`, `footprint`)
@@ -3257,17 +3260,27 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
-        # A stage-buffer case runs on the Vulkan trace rail alone in this
-        # increment (`research/docs/23` §3.3, v83-v86): the object API binds no
-        # stage buffers, the native rails translate no AIR and publish no
-        # render stage-buffer capability, and the Swift oracle compiles no AIR.
-        # Naming another rail would claim an observation that rail cannot
-        # report, so the marker is pinned here as well as in the two captures'
-        # own validators.
+        # The rails a stage-buffer case runs on (`research/docs/23` §3.3,
+        # v83-v87). The v31 increment pinned the marker to the Vulkan trace rail
+        # alone: the object API bound no stage buffers, the native rails
+        # translate no AIR and publish no render stage-buffer capability, and the
+        # Swift oracle compiles no AIR, so naming another rail would claim an
+        # observation that rail cannot report. The object rails gained their own
+        # entry point in the increment that follows, so a case of that suite may
+        # name them beside the trace rail — one marker covers the synchronous and
+        # the deferred run, because both captures report the object backend —
+        # while the native rails and the oracle stay out of every such marker.
         if case.get("stage_buffers"):
-            _require(rails == [VULKAN_TRACE_RAIL],
-                     f"{where}: a stage-buffer case runs on the Vulkan trace rail alone, so its "
-                     "capture_rails has to be [\"vulkan\"]")
+            if suite["suite"] == "compute-buffer-v31":
+                pinned = [VULKAN_TRACE_RAIL]
+                refusal = ("a stage-buffer case runs on the Vulkan trace rail alone, so its "
+                           "capture_rails has to be [\"vulkan\"]")
+            else:
+                pinned = [VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL]
+                refusal = ("a stage-buffer case runs on the Vulkan trace rail and its object "
+                           "rails, so its capture_rails has to be [\"vulkan\", "
+                           "\"vulkan-objects\"]")
+            _require(rails == pinned, f"{where}: {refusal}")
 
         # Every attachment resolves against the declaring case's own table:
         # one of its declared views has to be the attachment, it has to be

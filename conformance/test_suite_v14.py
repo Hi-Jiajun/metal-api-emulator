@@ -512,7 +512,11 @@ class ShippedSuitePlanTests(unittest.TestCase):
         # the stage-buffer face (`research/docs/23` §3.3, v83-v86) and are
         # pinned by `test_suite_v31.py`, which owns that section, so it joins
         # the list as well, and the count below tracks the committed suites.
-        self.assertEqual(len(paths), len(PINNED_PLANS) + 30)
+        # v32 carries the same two stage-buffer render cases with the object
+        # rails named beside the trace rail, plus the staged arm's own fixture
+        # (`research/docs/23` §3.3, v87): its plan is pinned by
+        # `test_suite_v32.py`, so it joins the same list.
+        self.assertEqual(len(paths), len(PINNED_PLANS) + 31)
         observed = {}
         for path in paths:
             suite = json.loads(path.read_text(encoding="utf-8"))
@@ -526,7 +530,8 @@ class ShippedSuitePlanTests(unittest.TestCase):
                                       "compute-buffer-v24", "compute-buffer-v25",
                                       "compute-buffer-v26", "compute-buffer-v27",
                                       "compute-buffer-v28", "compute-buffer-v29",
-                                      "compute-buffer-v30", "compute-buffer-v31"):
+                                      "compute-buffer-v30", "compute-buffer-v31",
+                                      "compute-buffer-v32"):
                     continue
                 expected = {"compute-buffer-v14": PINNED_V14_PLAN,
                             "compute-buffer-v15": PINNED_V15_PLAN}.get(suite["suite"], {})
