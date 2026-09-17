@@ -6,6 +6,7 @@
 //! is submitted.
 
 use ash::ext::{device_fault, external_memory_host};
+use ash::khr::shader_float_controls2;
 use ash::{vk, Device as AshDevice, Entry, Instance};
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
@@ -45,10 +46,89 @@ const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
+/// The SPIR-V extension the translator emits beside `FloatControls2`.
+///
+/// `metal2vulkan` `43c46ac` decorates a floating-point result that withholds a
+/// fast-math permission with `FPFastMathMode`, and the decoration demands
+/// `OpCapability FloatControls2` together with this `OpExtension` name.
+const SPV_KHR_FLOAT_CONTROLS2: &str = "SPV_KHR_float_controls2";
+
 type EnqueueProbe = Arc<dyn Fn(usize) + Send + Sync>;
 
 fn failure(message: impl Into<String>) -> ExecutorError {
     ExecutorError::new(message)
+}
+
+/// The device features the SPIR-V capability gate admits.
+///
+/// The gate used to be device-independent: the reviewed subset named
+/// capabilities every admitted device has to enable (`Shader`, `ImageQuery`,
+/// the `shaderInt8`/`shaderInt64` pair and the two sampled-image shapes), so one
+/// whitelist could answer for all of them. `FloatControls2` is the first
+/// capability a translation can demand that a device may or may not have, so it
+/// is answered by the device that will execute the module: the provider derives
+/// this policy from the selected device and hands it to both translation entry
+/// points and to the render registration gate. A device without the feature
+/// keeps the fail-closed phase-1 answer, byte for byte.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpirvFeaturePolicy {
+    float_controls2: bool,
+}
+
+impl SpirvFeaturePolicy {
+    /// The phase-1 subset: the capabilities every admitted device enables.
+    pub const PHASE1: Self = Self {
+        float_controls2: false,
+    };
+
+    /// Admit (or keep refusing) `FloatControls2` with `SPV_KHR_float_controls2`.
+    pub const fn with_float_controls2(mut self, admitted: bool) -> Self {
+        self.float_controls2 = admitted;
+        self
+    }
+
+    /// Whether the gate admits `FloatControls2` + `SPV_KHR_float_controls2`.
+    pub const fn float_controls2(self) -> bool {
+        self.float_controls2
+    }
+}
+
+/// What the selected device reported about `VK_KHR_shader_float_controls2`.
+///
+/// Two facts, kept apart because they are asked separately and can disagree:
+/// the extension name is enumerated from the device's extension list, and
+/// `shaderFloatControls2` is the feature query that answers whether the
+/// capability is actually available. Only the conjunction — the pair the device
+/// create info enables — admits the SPIR-V capability, so a device that
+/// advertises the name with the bit off stays refused. The two readings are also
+/// the evidence a host rail records for a device it cannot create here (R8).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FloatControls2Support {
+    extension: bool,
+    feature: bool,
+}
+
+impl FloatControls2Support {
+    /// Whether the device enumerated `VK_KHR_shader_float_controls2` by name.
+    pub const fn extension_present(self) -> bool {
+        self.extension
+    }
+
+    /// Whether `VkPhysicalDeviceShaderFloatControls2FeaturesKHR` reports the
+    /// `shaderFloatControls2` feature on.
+    pub const fn feature_reported(self) -> bool {
+        self.feature
+    }
+
+    /// Whether the device was created with the extension and feature enabled.
+    pub const fn enabled(self) -> bool {
+        self.extension && self.feature
+    }
+
+    /// The gate policy this support answers with.
+    pub const fn policy(self) -> SpirvFeaturePolicy {
+        SpirvFeaturePolicy::PHASE1.with_float_controls2(self.enabled())
+    }
 }
 
 /// Admit one submission against a provider lifecycle and return the refusal
@@ -284,6 +364,26 @@ impl VulkanExecutor {
         &self.context.device_name
     }
 
+    /// What this device reported about `VK_KHR_shader_float_controls2` (R8).
+    ///
+    /// The two readings — extension name and `shaderFloatControls2` — are the
+    /// capability snapshot a host rail records, and
+    /// [`Self::spirv_feature_policy`] is the gate answer derived from them. A
+    /// device that reports neither keeps the phase-1 subset.
+    pub fn float_controls2_support(&self) -> FloatControls2Support {
+        self.context.float_controls2_support()
+    }
+
+    /// The SPIR-V capability policy this device answers with (R8).
+    ///
+    /// [`TranslatedComputePipeline::translate_with_policy`] and
+    /// [`TranslatedRenderStage::translate_with_policy`] take it, and the
+    /// provider's own translation paths pass it, so a module a caller translated
+    /// against this device is the module its gate validates.
+    pub fn spirv_feature_policy(&self) -> SpirvFeaturePolicy {
+        self.context.spirv_feature_policy()
+    }
+
     /// Report the selected Vulkan device as neutral provider capabilities.
     ///
     /// The snapshot executor exposes owned host bytes and synchronous
@@ -483,7 +583,24 @@ pub struct TranslatedComputePipeline {
 }
 
 impl TranslatedComputePipeline {
+    /// Translate under the phase-1 capability subset.
+    ///
+    /// The subset every admitted device enables is the fail-closed default: a
+    /// caller holding the device hands its own answer to
+    /// [`Self::translate_with_policy`] instead.
     pub fn translate(function: &Function) -> Result<Self, ExecutorError> {
+        Self::translate_with_policy(function, SpirvFeaturePolicy::PHASE1)
+    }
+
+    /// Translate under one device's capability policy.
+    ///
+    /// The policy is the device's own answer (`SpirvFeaturePolicy`), and it
+    /// only ever opens the capabilities that device enabled: every other shape
+    /// of the module is checked exactly as [`Self::translate`] checks it.
+    pub fn translate_with_policy(
+        function: &Function,
+        policy: SpirvFeaturePolicy,
+    ) -> Result<Self, ExecutorError> {
         let options = TransformOptions {
             kernel_local_size: [1, 1, 1],
             kernel_dispatch: Some(KernelDispatch::safe_default()),
@@ -518,7 +635,7 @@ impl TranslatedComputePipeline {
         };
         let (spv, reflection) = translated
             .map_err(|error| failure(format!("translate {}: {error}", function.name())))?;
-        validate_spirv_capabilities(&spv)?;
+        validate_spirv_capabilities(&spv, policy)?;
         validate_pipeline_reflection(function.name(), &reflection)?;
         Ok(Self { spv, reflection })
     }
@@ -609,7 +726,29 @@ impl TranslatedRenderStage {
     /// validated for the SPIR-V capabilities this rail enables, exactly as the
     /// compute path is, so a module this provider could not create is refused
     /// before it reaches a registration.
+    ///
+    /// Translate one render stage under the phase-1 capability subset.
+    ///
+    /// The subset every admitted device enables is the fail-closed default: a
+    /// caller holding the device hands its own answer to
+    /// [`Self::translate_with_policy`] instead.
     pub fn translate(stage: RenderStage, function: &Function) -> Result<Self, ExecutorError> {
+        Self::translate_with_policy(stage, function, SpirvFeaturePolicy::PHASE1)
+    }
+
+    /// Translate one render stage under one device's capability policy.
+    ///
+    /// The policy is the device's own answer
+    /// ([`VulkanExecutor::spirv_feature_policy`] /
+    /// [`VulkanComputeProvider::spirv_feature_policy`]), and the provider
+    /// re-asks it at registration, so a module translated against another
+    /// device's policy is refused where the pipeline would be minted rather
+    /// than where the module is decoded.
+    pub fn translate_with_policy(
+        stage: RenderStage,
+        function: &Function,
+        policy: SpirvFeaturePolicy,
+    ) -> Result<Self, ExecutorError> {
         // The kernel options do not apply to a graphics stage: `TransformOptions`
         // defaults carry the API's own defaults (amplification 1, no sampled
         // raster count, no specialized sampler), and the render rail supplies
@@ -649,7 +788,7 @@ impl TranslatedRenderStage {
                 function.name()
             ))
         })?;
-        validate_spirv_capabilities(&spirv)?;
+        validate_spirv_capabilities(&spirv, policy)?;
         if reflection.stage != stage.reflected_stage() {
             return Err(failure(format!(
                 "translate {} {}: the reflection reports stage {:?}",
@@ -684,7 +823,10 @@ impl TranslatedRenderStage {
 impl ComputeExecutor for VulkanExecutor {
     fn new_compute_pipeline(&self, function: &Function) -> Result<PipelineArtifact, ExecutorError> {
         self.context.ensure_usable()?;
-        let translated = TranslatedComputePipeline::translate(function)?;
+        let translated = TranslatedComputePipeline::translate_with_policy(
+            function,
+            self.context.spirv_feature_policy(),
+        )?;
         self.context.ensure_usable()?;
         Ok(Arc::new(VulkanPipelineArtifact {
             context: Arc::clone(&self.context),
@@ -826,6 +968,11 @@ pub(crate) struct VulkanContext {
     independent_resolve_none: bool,
     memory: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
+    /// What the device reported about `VK_KHR_shader_float_controls2`, and
+    /// whether the feature was enabled at device creation (R8). The SPIR-V
+    /// capability gate reads it as [`FloatControls2Support::policy`], so the
+    /// snapshot and the gate are the same pair of readings.
+    float_controls2: FloatControls2Support,
     queue_locks: Vec<Mutex<()>>,
     enqueue_probe: Mutex<Option<EnqueueProbe>>,
     /// The single admission and terminal-state authority for this device.
@@ -952,20 +1099,50 @@ impl VulkanContext {
                 .extension_name_as_c_str()
                 .is_ok_and(|name| name == device_fault::NAME)
         });
-        let enabled_extensions = if has_external_memory_host {
-            vec![external_memory_host::NAME.as_ptr()]
-        } else {
-            Vec::new()
+        // `VK_KHR_shader_float_controls2` (R8): the extension name answers
+        // "can the device be asked for the feature at all", and the feature
+        // query answers "does it have it". The query is a valid
+        // `VkPhysicalDeviceFeatures2` chain whether or not the extension is
+        // supported — an unsupported device reports the bit off — so both
+        // readings can be recorded before the device exists.
+        let float_controls2_extension = extensions.iter().any(|extension| {
+            extension
+                .extension_name_as_c_str()
+                .is_ok_and(|name| name == shader_float_controls2::NAME)
+        });
+        let mut float_controls2_features =
+            vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default();
+        let mut float_controls2_query =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut float_controls2_features);
+        unsafe { instance.get_physical_device_features2(physical, &mut float_controls2_query) };
+        let float_controls2 = FloatControls2Support {
+            extension: float_controls2_extension,
+            feature: float_controls2_features.shader_float_controls2 == vk::TRUE,
         };
+        let mut enabled_extensions = Vec::new();
+        if has_external_memory_host {
+            enabled_extensions.push(external_memory_host::NAME.as_ptr());
+        }
+        // The name is only requested when the device advertised it *and*
+        // reported the feature: enabling an absent extension is a device
+        // creation error, and enabling one whose bit is off would put the
+        // module gate and the device out of step.
+        if float_controls2.enabled() {
+            enabled_extensions.push(shader_float_controls2::NAME.as_ptr());
+        }
         let mut vulkan13 = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
         let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::default().shader_int8(shader_int8);
         let physical_features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+        let mut float_controls2_enable =
+            vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
+                .shader_float_controls2(float_controls2.enabled());
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enabled_extensions)
             .enabled_features(&physical_features)
             .push_next(&mut vulkan13)
-            .push_next(&mut vulkan12);
+            .push_next(&mut vulkan12)
+            .push_next(&mut float_controls2_enable);
         let device = match unsafe { instance.create_device(physical, &device_info, None) } {
             Ok(device) => device,
             Err(error) => {
@@ -1044,6 +1221,7 @@ impl VulkanContext {
             independent_resolve_none,
             memory,
             device_name,
+            float_controls2,
             queue_locks: (0..queue_count).map(|_| Mutex::new(())).collect(),
             enqueue_probe: Mutex::new(None),
             lifecycle: Mutex::new(ProviderLifecycle::new(
@@ -1093,6 +1271,20 @@ impl VulkanContext {
     /// answered.
     pub(crate) fn admitted_stencil_resolve_modes(&self) -> u32 {
         provider::stencil_resolve_mode_mask(self.stencil_resolve_modes)
+    }
+
+    /// What this device reported about `VK_KHR_shader_float_controls2` (R8).
+    pub(crate) const fn float_controls2_support(&self) -> FloatControls2Support {
+        self.float_controls2
+    }
+
+    /// The SPIR-V capability policy this device answers with (R8).
+    ///
+    /// Both translation entry points and the render registration gate read this
+    /// one value, so the module a rail admits and the device that will execute
+    /// it cannot drift apart.
+    pub(crate) const fn spirv_feature_policy(&self) -> SpirvFeaturePolicy {
+        self.float_controls2.policy()
     }
 
     /// Admit one new submission against the lifecycle.
@@ -2412,7 +2604,31 @@ fn validate_storage_buffer_size(
     Ok(())
 }
 
-fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
+/// Read one SPIR-V literal string operand (`OpExtension`, `OpSource`).
+///
+/// The operand is a null-terminated UTF-8 string packed into words, so the
+/// decode is the little-endian byte run up to the first NUL. `None` is a
+/// malformed operand, which the callers treat as a refusal rather than as an
+/// extension the module may carry.
+fn spirv_literal_string(words: &[u32]) -> Option<String> {
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
+}
+
+/// The device-independent shape checks plus `policy`'s capability subset.
+///
+/// `policy` is the device's own answer ([`SpirvFeaturePolicy`]); the phase-1
+/// capabilities stay unconditional, `FloatControls2` is admitted exactly when
+/// the policy carries it, and every other capability or `OpExtension` name
+/// keeps the refusal it had before the gate grew a device-derived arm.
+fn validate_spirv_capabilities(
+    spv: &[u8],
+    policy: SpirvFeaturePolicy,
+) -> Result<(), ExecutorError> {
     if !spv.len().is_multiple_of(4) {
         return Err(failure("translated SPIR-V is not word aligned"));
     }
@@ -2444,8 +2660,12 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
             // Vulkan 1.0 core capabilities: Shader is required by every
             // module, ImageQuery by texture size/level queries, and
             // Sampled1D/SampledBuffer cover the linear and buffer texture
-            // shapes the reviewed fixtures use. Everything else stays
-            // refused until a capability gate admits a provider feature.
+            // shapes the reviewed fixtures use. `FloatControls2` rides the
+            // device's own policy: the translator demands it for a float
+            // result that withholds a fast-math permission, and only a device
+            // that enabled `VK_KHR_shader_float_controls2` admits it.
+            // Everything else stays refused until a capability gate admits a
+            // provider feature.
             if !matches!(
                 capability,
                 value if value == Capability::Shader as u32
@@ -2458,15 +2678,25 @@ fn validate_spirv_capabilities(spv: &[u8]) -> Result<(), ExecutorError> {
                     || value == Capability::Int64 as u32
                     || value == Capability::Sampled1D as u32
                     || value == Capability::SampledBuffer as u32
+                    || (policy.float_controls2()
+                        && value == Capability::FloatControls2 as u32)
             ) {
                 return Err(failure(format!(
                     "SPIR-V capability {capability} requires a Vulkan feature outside the Phase 1 subset"
                 )));
             }
         } else if opcode == Op::Extension as u32 {
-            return Err(failure(
-                "SPIR-V extensions are outside the Phase 1 feature subset",
-            ));
+            // The one extension the gate can admit is the name that belongs to
+            // the capability above; it is admitted on the same policy bit, and
+            // a module naming any other extension stays refused whatever the
+            // policy says.
+            let extension = spirv_literal_string(&words[cursor + 1..end]);
+            if !(policy.float_controls2() && extension.as_deref() == Some(SPV_KHR_FLOAT_CONTROLS2))
+            {
+                return Err(failure(
+                    "SPIR-V extensions are outside the Phase 1 feature subset",
+                ));
+            }
         }
         cursor = end;
     }
@@ -6717,7 +6947,10 @@ mod tests {
             (2_u32 << 16) | Op::Capability as u32,
             Capability::Shader as u32,
         ];
-        assert!(validate_spirv_capabilities(&spirv_bytes(&[&shader])).is_ok());
+        assert!(
+            validate_spirv_capabilities(&spirv_bytes(&[&shader]), SpirvFeaturePolicy::PHASE1)
+                .is_ok()
+        );
 
         // The reviewed texture fixtures need these core capabilities, and the
         // device enables the matching shaderInt8/shaderInt64 features.
@@ -6730,7 +6963,11 @@ mod tests {
         ] {
             let instruction = [(2_u32 << 16) | Op::Capability as u32, capability as u32];
             assert!(
-                validate_spirv_capabilities(&spirv_bytes(&[&shader, &instruction])).is_ok(),
+                validate_spirv_capabilities(
+                    &spirv_bytes(&[&shader, &instruction]),
+                    SpirvFeaturePolicy::PHASE1
+                )
+                .is_ok(),
                 "{capability:?} is inside the reviewed subset"
             );
         }
@@ -6741,12 +6978,148 @@ mod tests {
             (2_u32 << 16) | Op::Capability as u32,
             Capability::Float64 as u32,
         ];
-        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64])).unwrap_err();
+        let error = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &float64]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
         assert!(error.message().contains("outside the Phase 1 subset"));
 
         let extension = [(2_u32 << 16) | Op::Extension as u32, 0];
-        let error = validate_spirv_capabilities(&spirv_bytes(&[&shader, &extension])).unwrap_err();
+        let error = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &extension]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
         assert!(error.message().contains("extensions"));
+    }
+
+    /// The extension instruction's operand is a NUL-terminated literal string
+    /// packed into words, so the decoder is what a policy-based admission has to
+    /// read; the helper is exercised through the gate itself above.
+    fn extension_instruction(name: &str) -> Vec<u32> {
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.push(0);
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let words = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+        let mut instruction = vec![((1 + words.len()) as u32) << 16 | Op::Extension as u32];
+        instruction.extend_from_slice(&words);
+        instruction
+    }
+
+    /// R8: `FloatControls2` is the first capability a *device* answers.
+    ///
+    /// Under the phase-1 policy the capability and the extension name it rides
+    /// in on keep the refusals they had before the gate grew a device arm — the
+    /// same sentences, so a device without the feature answers exactly as it did
+    /// before. Under a policy that admits the feature both are let through, and
+    /// a module naming *another* extension is still refused: the device arm opens
+    /// one capability and one extension name, never "extensions".
+    #[test]
+    fn float_controls2_rides_the_device_policy_and_nothing_else_does() {
+        let shader = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Shader as u32,
+        ];
+        let float_controls2 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::FloatControls2 as u32,
+        ];
+        let extension = extension_instruction(SPV_KHR_FLOAT_CONTROLS2);
+        let other_extension = extension_instruction("SPV_EXT_descriptor_indexing");
+
+        // The capability number the decline text carries, pinned here because it
+        // is what the render rail's decline recorded on the real device.
+        assert_eq!(Capability::FloatControls2 as u32, 6029);
+
+        let phase1 = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &float_controls2]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
+        assert!(
+            phase1.message().contains("capability 6029"),
+            "the refusal keeps the capability number: {}",
+            phase1.message()
+        );
+        let phase1_extension = validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &extension]),
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            phase1_extension.message(),
+            "SPIR-V extensions are outside the Phase 1 feature subset"
+        );
+
+        let admitted = SpirvFeaturePolicy::PHASE1.with_float_controls2(true);
+        assert!(
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float_controls2]), admitted)
+                .is_ok()
+        );
+        assert!(
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &extension]), admitted).is_ok()
+        );
+        // Both together, in the order the translator emits them.
+        assert!(validate_spirv_capabilities(
+            &spirv_bytes(&[&shader, &float_controls2, &extension]),
+            admitted
+        )
+        .is_ok());
+        let other =
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &other_extension]), admitted)
+                .unwrap_err();
+        assert_eq!(
+            other.message(),
+            "SPIR-V extensions are outside the Phase 1 feature subset"
+        );
+        // A capability the device did not answer for stays refused whatever the
+        // float-controls bit says.
+        let float64 = [
+            (2_u32 << 16) | Op::Capability as u32,
+            Capability::Float64 as u32,
+        ];
+        let still_refused =
+            validate_spirv_capabilities(&spirv_bytes(&[&shader, &float64]), admitted).unwrap_err();
+        assert!(still_refused.message().contains("capability 10"));
+    }
+
+    /// The support struct is the pair of readings, and the policy is the
+    /// conjunction: a device that advertises the name with the bit off, or
+    /// carries the bit without the name, keeps the phase-1 answer.
+    #[test]
+    fn float_controls2_support_admits_only_the_conjunction() {
+        assert_eq!(
+            FloatControls2Support::default().policy(),
+            SpirvFeaturePolicy::PHASE1
+        );
+        for support in [
+            FloatControls2Support {
+                extension: true,
+                feature: false,
+            },
+            FloatControls2Support {
+                extension: false,
+                feature: true,
+            },
+            FloatControls2Support::default(),
+        ] {
+            assert!(!support.enabled());
+            assert!(!support.policy().float_controls2());
+        }
+        let both = FloatControls2Support {
+            extension: true,
+            feature: true,
+        };
+        assert!(both.extension_present());
+        assert!(both.feature_reported());
+        assert!(both.enabled());
+        assert!(both.policy().float_controls2());
     }
 
     #[test]

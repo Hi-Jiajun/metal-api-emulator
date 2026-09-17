@@ -83,6 +83,29 @@ const COPY_WORD_AIR: &str =
 /// not cover that pixel.
 const CLEAR_SENTINEL: [u8; 4] = [0xfe; 4];
 
+/// The R6 boundary pair, copied from reims-vgpu `d4ebd12`
+/// (`crates/reims-vgpu/tests/fixtures/air/`): the same two-stream vertex module
+/// with the `fadd`'s `fast` flag run present and removed. The pinned translator
+/// decorates the removed-flag module with `FPFastMathMode` and demands
+/// `FloatControls2` + `SPV_KHR_float_controls2` for it (`docs/23` §77, R8).
+const TWO_STREAM_VERTEX_AIR: &str = include_str!("fixtures/reims_indexed_tri_two_stream.ll");
+const TWO_STREAM_PRECISE_VERTEX_AIR: &str =
+    include_str!("fixtures/reims_indexed_tri_two_stream_precise.ll");
+
+/// The entry both halves of the pair declare.
+const TWO_STREAM_VERTEX_ENTRY: &str = "reims_two_stream_vertex";
+
+/// The vertices the pair draws: the two-stream positions of R6's fixture
+/// `(-1,-1) (3,-1) (-1,3)` — the covering triangle — with one `float2` offset
+/// added to every vertex.
+const TWO_STREAM_POSITIONS: [(f32, f32); 3] = [(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)];
+
+/// The offset both rails have to read out of the *second* stream. Shifting the
+/// triangle's left edge to `-0.25` leaves the 2x2 attachment's left column
+/// uncovered, so a rail that dropped the stream (or bound the first stream
+/// twice) cannot land the expected bytes.
+const TWO_STREAM_OFFSET: (f32, f32) = (0.75, 0.0);
+
 /// The `InitialState::Sentinel` bytes the present tail pre-fills its target
 /// with: distinct from both the clear sentinel and the fragment output, so a
 /// target the pass never rendered into stays falsifiable (`docs/24` §3.1).
@@ -101,6 +124,10 @@ const ATTACHMENT_VIEW: ViewId = ViewId::new(901);
 const ATTACHMENT_ALLOCATION: AllocationId = AllocationId::new(902);
 const SCRATCH_VIEW: ViewId = ViewId::new(903);
 const SCRATCH_ALLOCATION: AllocationId = AllocationId::new(904);
+const POSITION_VIEW: ViewId = ViewId::new(905);
+const POSITION_ALLOCATION: AllocationId = AllocationId::new(906);
+const OFFSET_VIEW: ViewId = ViewId::new(907);
+const OFFSET_ALLOCATION: AllocationId = AllocationId::new(908);
 
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -696,5 +723,360 @@ fn a_translation_consuming_an_unproduced_varying_is_refused() {
     assert_eq!(
         refused.fields.get("consumed_varyings"),
         Some(&FieldValue::Text("0".to_owned()))
+    );
+}
+
+/// Translate one stage under the device's own capability policy.
+///
+/// The policy is the provider's answer, so the module a caller registers is the
+/// module the device that will execute it validated (`docs/23` §77, R8).
+fn translate_stage_with_policy(
+    executor: &Arc<VulkanExecutor>,
+    stage: RenderStage,
+    source: &str,
+    entry: &str,
+    policy: metal_api_vulkan::SpirvFeaturePolicy,
+) -> Result<TranslatedRenderStage, metal_api_core::ExecutorError> {
+    let device = Device::new(Arc::clone(executor) as Arc<dyn ComputeExecutor>);
+    let library = device
+        .new_library_with_air(source)
+        .expect("the fixture library loads");
+    let function = library.function(entry).expect("the fixture entry exists");
+    TranslatedRenderStage::translate_with_policy(stage, &function, policy)
+}
+
+/// Whether one module declares `OpCapability FloatControls2` *and* the
+/// extension name the translator emits beside it — the pair R6 measured on the
+/// decline. Both halves are read out of the instruction stream, word by word,
+/// so the assertion is about the module's own bytes rather than about the
+/// translator's promise.
+fn declares_float_controls2(module: &[u8]) -> bool {
+    let words = module
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect::<Vec<_>>();
+    let mut capability = false;
+    let mut extension = false;
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        if word_count == 0 || cursor + word_count > words.len() {
+            break;
+        }
+        if opcode == spirv::Op::Capability as u32
+            && word_count == 2
+            && words[cursor + 1] == spirv::Capability::FloatControls2 as u32
+        {
+            capability = true;
+        }
+        if opcode == spirv::Op::Extension as u32 {
+            let mut bytes = Vec::new();
+            for word in &words[cursor + 1..cursor + word_count] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            if let Some(end) = bytes.iter().position(|byte| *byte == 0) {
+                extension = bytes[..end] == *b"SPV_KHR_float_controls2";
+            }
+        }
+        cursor += word_count;
+    }
+    capability && extension
+}
+
+/// The two-stream layout the pair's interface states: one `float32x2` attribute
+/// per stream, at locations 0 and 1.
+fn two_stream_layout() -> VertexLayout {
+    VertexLayout::Buffers(vec![
+        VertexBufferLayout {
+            stride: 8,
+            step: VertexStep::PerVertex,
+            attributes: vec![VertexAttribute {
+                location: 0,
+                offset: 0,
+                format: VertexFormat::Float32x2,
+            }],
+        },
+        VertexBufferLayout {
+            stride: 8,
+            step: VertexStep::PerVertex,
+            attributes: vec![VertexAttribute {
+                location: 1,
+                offset: 0,
+                format: VertexFormat::Float32x2,
+            }],
+        },
+    ])
+}
+
+/// The contract the pair registers under: the AIR entry both halves declare,
+/// the format list the shared fragment fixture stores, and the two-stream
+/// layout.
+fn two_stream_contract() -> RenderPipelineContract {
+    RenderPipelineContract {
+        vertex_entry: TWO_STREAM_VERTEX_ENTRY.to_owned(),
+        fragment_entry: FRAGMENT_ENTRY.to_owned(),
+        color_formats: vec![AttachmentFormat::Rgba8Unorm],
+        vertex_layout: two_stream_layout(),
+    }
+}
+
+/// `float2` records in stream order: little-endian pairs.
+fn f32x2(records: &[(f32, f32)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(records.len() * 8);
+    for (x, y) in records {
+        bytes.extend_from_slice(&x.to_ne_bytes());
+        bytes.extend_from_slice(&y.to_ne_bytes());
+    }
+    bytes
+}
+
+fn two_stream_view(
+    view_id: ViewId,
+    allocation_id: AllocationId,
+    binding: u32,
+    bytes: Vec<u8>,
+) -> BufferView {
+    BufferView {
+        view_id,
+        metal_binding: binding,
+        allocation_id,
+        offset: 0,
+        length: u64::try_from(bytes.len()).expect("stream length"),
+        access: BufferAccess::Read,
+        attribute_stride: None,
+        source: BufferSource::OwnedBytes(bytes),
+    }
+}
+
+/// One trace carrying the declaring compute pass and one render pass that binds
+/// both vertex streams and draws the pair's three vertices.
+fn two_stream_trace(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+) -> (ComputeTrace, ResourceTableSnapshot) {
+    let positions = f32x2(&TWO_STREAM_POSITIONS);
+    let offsets = f32x2(&[TWO_STREAM_OFFSET; 3]);
+    let mut pass = render_pass(render.pipeline_id, None);
+    pass.vertex_buffers = vec![
+        two_stream_view(POSITION_VIEW, POSITION_ALLOCATION, 0, positions.clone()),
+        two_stream_view(OFFSET_VIEW, OFFSET_ALLOCATION, 1, offsets.clone()),
+    ];
+    let trace = ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(22),
+        pipelines: vec![compute.clone(), render.clone()],
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: vec![
+            TracePass::Compute(ComputePass {
+                pipeline: compute.pipeline_id,
+                buffers: vec![
+                    BufferView {
+                        view_id: ATTACHMENT_VIEW,
+                        metal_binding: 0,
+                        allocation_id: ATTACHMENT_ALLOCATION,
+                        offset: 0,
+                        length: 16,
+                        access: BufferAccess::Read,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(ATTACHMENT_WORD.repeat(4)),
+                    },
+                    BufferView {
+                        view_id: SCRATCH_VIEW,
+                        metal_binding: 1,
+                        allocation_id: SCRATCH_ALLOCATION,
+                        offset: 0,
+                        length: 4,
+                        access: BufferAccess::Write,
+                        attribute_stride: None,
+                        source: BufferSource::OwnedBytes(vec![0xab; 4]),
+                    },
+                ],
+                textures: Vec::new(),
+                dispatch: Dispatch {
+                    kind: DispatchKind::ThreadsExact,
+                    grid: [1, 1, 1],
+                    threads_per_threadgroup: [1, 1, 1],
+                },
+            }),
+            TracePass::Render(pass),
+        ],
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    };
+    let mut resources = ResourceTableSnapshot::new();
+    for (allocation, size) in [
+        (ATTACHMENT_ALLOCATION, 16_u64),
+        (SCRATCH_ALLOCATION, 8),
+        (
+            POSITION_ALLOCATION,
+            u64::try_from(positions.len()).expect("stream length"),
+        ),
+        (
+            OFFSET_ALLOCATION,
+            u64::try_from(offsets.len()).expect("stream length"),
+        ),
+    ] {
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })
+            .expect("fixture allocation");
+    }
+    (trace, resources)
+}
+
+/// Submit one two-stream trace and return the attachment's readback bytes.
+fn submit_two_stream(
+    provider: &VulkanComputeProvider,
+    compute: &CompiledComputePipeline,
+    render: &CompiledComputePipeline,
+    what: &str,
+) -> Vec<u8> {
+    let (trace, resources) = two_stream_trace(provider, compute, render);
+    let admitted = provider
+        .capabilities()
+        .validate_trace(trace.clone(), resources)
+        .expect("the two-stream trace is admitted");
+    let submitted = provider.submit(admitted).expect("the submission completes");
+    submitted
+        .validate_for_trace(&trace)
+        .expect("the writebacks cover the trace");
+    let bytes = submitted
+        .writebacks
+        .into_iter()
+        .find(|writeback| writeback.view_id == ATTACHMENT_VIEW)
+        .map(|writeback| writeback.bytes)
+        .expect("the attachment has a writeback");
+    eprintln!("{what} two-stream attachment readback: {}", hex(&bytes));
+    bytes
+}
+
+/// R8: the R6 boundary pair, translated, registered and executed.
+///
+/// R6 pinned a boundary rather than a feature: the two-stream vertex module
+/// beside this test carries the `fast` flag run a Metal module compiled with the
+/// default math mode carries, while the same module with that run removed makes
+/// the pinned translator decorate its float result with `FPFastMathMode` and
+/// demand `FloatControls2` + `SPV_KHR_float_controls2` — which the Phase-1
+/// capability subset did not admit. The canonical provider answered a *typed
+/// decline* (`pipeline_compile`, `SPIR-V capability 6029 …`) and the draw ended.
+///
+/// The device now answers for the capability, so the withheld-permission module
+/// translates, registers and executes, and it lands byte for byte what its
+/// `fast` sibling lands: the left column keeps the clear sentinel (the second
+/// stream's offset was read) and the right column carries the fragment's own
+/// texel. The test also asserts the fixture is the module it is named for — the
+/// `fast` sibling must *not* declare the capability, the precise one must — and
+/// keeps the fail-closed arm for a device that reports no `shaderFloatControls2`
+/// (the same sentence R6 recorded).
+#[test]
+fn a_withheld_float_permission_lands_the_pairs_own_bytes() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let policy = provider.spirv_feature_policy();
+    let support = provider.float_controls2_support();
+    eprintln!(
+        "device float-controls2: extension={} feature={} enabled={}",
+        support.extension_present(),
+        support.feature_reported(),
+        support.enabled()
+    );
+    let fast = translate_stage_with_policy(
+        &executor,
+        RenderStage::Vertex,
+        TWO_STREAM_VERTEX_AIR,
+        TWO_STREAM_VERTEX_ENTRY,
+        policy,
+    )
+    .expect("the fast sibling translates");
+    assert!(
+        !declares_float_controls2(fast.spirv()),
+        "the fast sibling grants every relaxation, so the translator emits no FPFastMathMode \
+         for it"
+    );
+    let precise = match translate_stage_with_policy(
+        &executor,
+        RenderStage::Vertex,
+        TWO_STREAM_PRECISE_VERTEX_AIR,
+        TWO_STREAM_VERTEX_ENTRY,
+        policy,
+    ) {
+        Ok(precise) => precise,
+        Err(error) => {
+            // Fail-closed arm: a device that does not answer for the capability
+            // refuses the module with the sentence R6 recorded, and the `fast`
+            // sibling is still the shape that executes.
+            assert!(
+                !policy.float_controls2(),
+                "the device answered for FloatControls2 and the module still failed: {error}"
+            );
+            assert!(
+                error.message().contains("capability 6029"),
+                "the refusal keeps the capability number: {error}"
+            );
+            eprintln!("this device does not answer for FloatControls2: {error}");
+            return;
+        }
+    };
+    assert!(
+        policy.float_controls2() && declares_float_controls2(precise.spirv()),
+        "the device answered for FloatControls2, so the precise fixture has to be the module \
+         that demands it"
+    );
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let register = |vertex: TranslatedRenderStage, what: &[u8]| {
+        let fragment = translate_stage_with_policy(
+            &executor,
+            RenderStage::Fragment,
+            FRAGMENT_AIR,
+            FRAGMENT_ENTRY,
+            policy,
+        )
+        .expect("the shared fragment fixture translates");
+        provider
+            .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+                contract: two_stream_contract(),
+                vertex,
+                fragment,
+                logical_digest: digest(what),
+            })
+            .expect("the two-stream pair registers")
+    };
+    let fast_pipeline = register(fast, b"two-stream-fast");
+    let precise_pipeline = register(precise, b"two-stream-precise");
+
+    let fast_bytes = submit_two_stream(&provider, &compute, &fast_pipeline, "fast");
+    let precise_bytes = submit_two_stream(&provider, &compute, &precise_pipeline, "precise");
+    assert_eq!(
+        precise_bytes, fast_bytes,
+        "the withheld-permission module has to land byte for byte what its fast sibling lands"
+    );
+    // The offset the second stream carries is read: the triangle's left edge
+    // sits at -0.25, so the 2x2 attachment's left column keeps the clear
+    // sentinel while the right column carries the fragment's own texel.
+    let texel = EXPECTED_RGBA8_TEXELS[..4].to_vec();
+    let mut expected = Vec::new();
+    for _row in 0..2 {
+        expected.extend_from_slice(&CLEAR_SENTINEL);
+        expected.extend_from_slice(&texel);
+    }
+    assert_eq!(
+        precise_bytes,
+        expected,
+        "left column keeps the clear sentinel, right column the fragment's texel: {}",
+        hex(&precise_bytes)
+    );
+    eprintln!(
+        "withheld-permission module landed [{}] on {}",
+        hex(&precise_bytes),
+        executor.device_name()
     );
 }

@@ -2,9 +2,9 @@
 //! lease copies and host-memory no-copy imports.
 
 use crate::{
-    execute_pool_sequence_with_status, render, Binding, BoundDispatch, PendingExecution,
-    PoolBinding, PoolKey, PoolKind, SequenceTail, TranslatedComputePipeline, VulkanContext,
-    VulkanExecutor, VulkanPipelineArtifact,
+    execute_pool_sequence_with_status, render, Binding, BoundDispatch, FloatControls2Support,
+    PendingExecution, PoolBinding, PoolKey, PoolKind, SequenceTail, SpirvFeaturePolicy,
+    TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -584,6 +584,31 @@ impl VulkanComputeProvider {
             .to_owned()
     }
 
+    /// What this provider's device reported about
+    /// `VK_KHR_shader_float_controls2` (R8).
+    ///
+    /// The two readings — extension name and `shaderFloatControls2` — are the
+    /// capability snapshot a caller records, and [`Self::spirv_feature_policy`]
+    /// is the gate answer derived from them.
+    pub fn float_controls2_support(&self) -> FloatControls2Support {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .float_controls2_support()
+    }
+
+    /// The SPIR-V capability policy this provider's device answers with (R8).
+    ///
+    /// A caller that translates outside the provider — the render rail's
+    /// translated-stage arm translates each stage itself — asks for this and
+    /// hands it to `TranslatedRenderStage::translate_with_policy`, so the
+    /// module it registers is the module this device validated. The provider
+    /// re-asks the same policy at registration regardless.
+    pub fn spirv_feature_policy(&self) -> SpirvFeaturePolicy {
+        self.lock_executor()
+            .expect("executor lock poisoned")
+            .spirv_feature_policy()
+    }
+
     /// Report whether this provider can still admit new work.
     ///
     /// Health and admission are the same query on the same lifecycle, so a
@@ -612,14 +637,19 @@ impl VulkanComputeProvider {
         logical_digest: SemanticDigest,
     ) -> Result<CompiledComputePipeline, ProviderError> {
         self.ensure_usable()?;
-        let translated = TranslatedComputePipeline::translate(function).map_err(|error| {
-            refusal(
-                ProviderPhase::Compile,
-                ProviderErrorClass::Compile,
-                "pipeline_translation_failed",
-            )
-            .with_detail(error.to_string())
-        })?;
+        // The device answers for its own capability subset: the gate runs under
+        // the policy this device derived, and the lock is taken for the read
+        // only — translation itself must not hold it.
+        let policy = self.spirv_feature_policy();
+        let translated = TranslatedComputePipeline::translate_with_policy(function, policy)
+            .map_err(|error| {
+                refusal(
+                    ProviderPhase::Compile,
+                    ProviderErrorClass::Compile,
+                    "pipeline_translation_failed",
+                )
+                .with_detail(error.to_string())
+            })?;
         let revision = SemanticDigest::new("git-commit", TRANSLATOR_REVISION.to_vec())
             .expect("non-empty pinned translator identity");
         let contract = translated
@@ -749,6 +779,13 @@ impl VulkanComputeProvider {
         logical_digest: SemanticDigest,
     ) -> Result<CompiledComputePipeline, ProviderError> {
         self.ensure_usable()?;
+        // The device answers for the modules as well (R8): the registration
+        // gate re-asks the capability subset the translation gate asked, with
+        // this provider's own policy, so a caller cannot register a module its
+        // device could not create — whether it translated elsewhere or handed
+        // the rail a module of its own. It is asked before the module's own
+        // accounting, in the same order the translation entry point asks it.
+        render::validate_module_capabilities(&stages, self.spirv_feature_policy())?;
         stages.validate()?;
         let function = FunctionIdentity {
             logical_digest,
