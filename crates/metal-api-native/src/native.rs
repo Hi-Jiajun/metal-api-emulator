@@ -270,7 +270,17 @@ impl NativeMetalProvider {
                 max_invocations: local.into_iter().fold(1_u64, u64::saturating_mul).min(1024),
                 max_group_count: [1024; 3],
                 max_storage_buffer_descriptors: 31,
-                max_buffer_range: device.max_buffer_length().min(1024 * 1024),
+                // The reviewed window's own bytes: R5a widened the attachment
+                // ceiling to 2048x2048, whose declaring view is four bytes per
+                // texel, so the range cap follows that single spelling
+                // (`render::REVIEWED_ATTACHMENT_CEILING`) instead of keeping a
+                // second, smaller number that would reject the wide fixture at
+                // admission (`storage_buffer_range_limit`).
+                max_buffer_range: device.max_buffer_length().min(
+                    render::REVIEWED_ATTACHMENT_CEILING[0]
+                        .saturating_mul(render::REVIEWED_ATTACHMENT_CEILING[1])
+                        .saturating_mul(4),
+                ),
                 max_push_constant_bytes: 0,
                 // Same ranged-aliasing argument as the Vulkan provider: each
                 // admitted view is copied into its own MTLBuffer that starts
