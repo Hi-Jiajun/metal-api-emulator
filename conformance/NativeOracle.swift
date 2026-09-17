@@ -19,12 +19,25 @@ import Dispatch
 import Darwin
 
 private let maximumFileBytes = 1_048_576
+/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70; R5a,
+/// §73): the window the oracle validates every render fixture against. The
+/// rails declare the smaller of this ceiling and their device's own framebuffer
+/// limit, so a fixture at the ceiling is inside every conformant device's
+/// window (Metal's 2D texture ceiling is 16384, and the Apple Paravirtual
+/// device this oracle runs on answers that). Widening it is a deliberate change
+/// that owes a boundary fixture at the new value, in all three review surfaces.
+///
+/// Declared before its users: a file-scope `let` that reads a later one is
+/// still lazily initialised in Swift, but the constant-folded read here has
+/// gone wrong once on the macOS job (the limit answered zero and every suite
+/// failed validation), so the order is the safe one.
+private let reviewedAttachmentCeiling = 2048
 /// The largest byte extent one declared view may carry: the reviewed window's
 /// own attachment, four bytes per texel (R5a, `research/docs/23` §73). The guard
 /// keeps an unchecked suite from asking the oracle for more bytes than the
 /// review measured, while the wide case's 2048x2048 declaring view is inside it.
 private let maximumAllocationBytes: UInt64 =
-    UInt64(reviewedAttachmentCeiling * reviewedAttachmentCeiling * 4)
+    UInt64(reviewedAttachmentCeiling) * UInt64(reviewedAttachmentCeiling) * 4
 /// The largest allocation image a capture spells out as hex (R5a,
 /// `research/docs/23` §73). A wider image is reported as its digest: the wide
 /// attachment's declaring view is 16 MiB, so its image would be 32 MiB of hex in
@@ -33,14 +46,6 @@ private let maximumAllocationBytes: UInt64 =
 /// every pre-R5a case is unchanged.
 private let maximumVerbatimAllocationBytes = 1_048_576
 private let maximumPassCount = 8
-/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70; R5a,
-/// §73): the window the oracle validates every render fixture against. The
-/// rails declare the smaller of this ceiling and their device's own framebuffer
-/// limit, so a fixture at the ceiling is inside every conformant device's
-/// window (Metal's 2D texture ceiling is 16384, and the Apple Paravirtual
-/// device this oracle runs on answers that). Widening it is a deliberate change
-/// that owes a boundary fixture at the new value, in all three review surfaces.
-private let reviewedAttachmentCeiling = 2048
 
 private struct OracleError: Error, CustomStringConvertible {
     let description: String
