@@ -181,12 +181,14 @@ pub enum CodecError {
         count: usize,
         maximum: usize,
     },
-    /// A render pass bound stage buffers, a face this frame layout has no
-    /// section for yet (`research/docs/23` §3.3, v83). The narrow feature byte
-    /// and the wide feature word are both full, so the encoder refuses the
-    /// frame rather than writing bytes no decoder would read as the block.
-    StageBufferUnsupported {
-        bindings: usize,
+    /// A stage buffer list carried more entries than the contract's own cap
+    /// (`research/docs/23` §3.3, v83). The block's count is one byte, so this
+    /// is the protocol's bound; the contract refuses anything above
+    /// [`metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS`] before a frame
+    /// is written.
+    RenderStageBufferCount {
+        count: usize,
+        maximum: usize,
     },
     /// A wide feature that describes the depth attachment arrived without one.
     /// The store action and the identity are properties *of* the depth
@@ -336,9 +338,9 @@ impl fmt::Display for CodecError {
                 formatter,
                 "capability snapshot names {count} render texture formats, maximum {maximum}"
             ),
-            Self::StageBufferUnsupported { bindings } => write!(
+            Self::RenderStageBufferCount { count, maximum } => write!(
                 formatter,
-                "render pass binds {bindings} stage buffers, a face this frame layout cannot carry yet"
+                "stage buffer list carries {count} bindings, maximum {maximum}"
             ),
             Self::DepthFeatureWithoutAttachment(features) => write!(
                 formatter,

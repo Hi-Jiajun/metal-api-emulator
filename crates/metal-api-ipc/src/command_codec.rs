@@ -25,12 +25,14 @@ use metal_api_core::provider::{
     PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderHealth,
     ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot,
-    Retryability, SampleCount, SemanticDigest, ShaderSource, StagedLease, StencilCompare,
-    StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
-    StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
-    Winding, MAX_COLOR_ATTACHMENTS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
+    RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
+    ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
+    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_COLOR_ATTACHMENTS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
+    MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -264,6 +266,35 @@ const RENDER_WIDE_FEATURE_STENCIL_RESOLVE: u16 = 0x8000;
 /// tag answers [`CodecError::UnknownPassTag`] for it.
 const PASS_KIND_RENDER_SAMPLED: u8 = 0x12;
 
+/// A render pass that binds caller-held stage buffers
+/// (`research/docs/23` §3.3, v83).
+///
+/// The wide feature word is full to its last bit (`0x8000`) and the sampled
+/// texture block already took a tag of its own (v70), so the stage buffer
+/// block needed a tag of its own as well — the choice
+/// [`PASS_KIND_RENDER_SAMPLED`]'s comment already named. The payload repeats
+/// the wide tag's first half: the same `u16` feature word (same meanings, so
+/// every tag keeps sharing the section walker), followed by the stage buffer
+/// block — a `u8` count and that many `(stage, BufferView)` pairs. Each entry
+/// names its stage explicitly, unlike the pass's vertex streams whose position
+/// is their binding: two stages' `[[buffer(N)]]` index spaces overlap, so a
+/// position cannot say which namespace it fills (`research/docs/23` §83.2).
+/// A pass that binds no stage buffer keeps writing the tags above and every
+/// pre-v83 frame keeps its exact bytes; a decoder that predates this tag
+/// answers [`CodecError::UnknownPassTag`] for it.
+const PASS_KIND_RENDER_STAGE_BUFFERS: u8 = 0x13;
+
+/// A render pass that binds both sampled textures and stage buffers
+/// (`research/docs/23` §3.3, v83).
+///
+/// The payload is [`PASS_KIND_RENDER_SAMPLED`]'s — the same `u16` feature word
+/// and the texture block — with the stage buffer block appended after it, so a
+/// pass that both samples a texture and reads a stage buffer travels in one
+/// frame instead of forcing the caller to drop one half. A decoder that
+/// predates this tag refuses it exactly as it refuses
+/// [`PASS_KIND_RENDER_STAGE_BUFFERS`].
+const PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS: u8 = 0x14;
+
 /// Every bit of the wide feature word this version knows. The low byte is the
 /// narrow byte verbatim; an unknown *high* bit is a decoder refusal, exactly as
 /// an unknown pass tag is, so a future section cannot be skipped silently.
@@ -315,6 +346,23 @@ const PIPELINE_KIND_RENDER: u8 = 0x01;
 /// [`CodecError::UnknownPipelineTag`] instead of misreading the list as a
 /// vertex layout.
 const PIPELINE_KIND_RENDER_MRT: u8 = 0x02;
+
+/// Render entry whose contract declares pipeline-level stage buffer bindings
+/// (`research/docs/23` §3.3, v83).
+///
+/// The contract's stage buffer half is a list that no pre-v83 entry could
+/// carry, so it needed a tag of its own rather than a fourth field inside
+/// `PIPELINE_KIND_RENDER`: an older decoder would read the block's bytes as
+/// the entry that follows. This tag always writes its colour formats the way
+/// [`PIPELINE_KIND_RENDER_MRT`] does — a length-prefixed list, because the tag
+/// already is the new shape — and appends the declaration block after the
+/// vertex layout: a `u8` count and that many
+/// `(stage, index, access, footprint)` tuples. A contract whose declaration
+/// list is empty keeps writing `PIPELINE_KIND_RENDER` /
+/// `PIPELINE_KIND_RENDER_MRT` and every pre-v83 registration keeps its exact
+/// bytes; a decoder that predates this tag answers
+/// [`CodecError::UnknownPipelineTag`] for it.
+const PIPELINE_KIND_RENDER_STAGE_BUFFERS: u8 = 0x03;
 
 /// Maximum number of passes one tagged trace frame may carry.
 ///
@@ -408,6 +456,21 @@ const CAPABILITY_STENCIL_RESOLVE_TAIL: u8 = 0x10;
 /// texture sampling but none of the earlier blocks still keeps the decoder's
 /// position rules unambiguous.
 const CAPABILITY_RENDER_TEXTURE_TAIL: u8 = 0x20;
+
+/// Presence tag of the capability tail's stage-buffer block
+/// (`research/docs/23` §3.3, v83).
+///
+/// The block is the tail's seventh and newest optional section: one presence
+/// tag, one bool and one `u32` binding cap, the same shape the render-sampler
+/// block uses one section earlier. It follows the render-sampler block when
+/// the snapshot declares either stage buffer bit, so a snapshot that declares
+/// the capability without any earlier block still keeps the decoder's
+/// position rules unambiguous — the rule every block before it states. A
+/// snapshot whose two bits stay at their defaults keeps the shorter frame and
+/// the decoder reads the missing block as `false`/`0`: the "cannot bind a
+/// stage buffer" defaults provider admission refuses a stage-buffer pass
+/// with.
+const CAPABILITY_STAGE_BUFFER_TAIL: u8 = 0x40;
 
 /// Maximum texture formats one capability snapshot may declare as render-pass
 /// sampling sources.
@@ -573,7 +636,17 @@ impl CommandCodec {
                 epoch,
                 capabilities,
             } => {
-                if capabilities.declares_render_support() {
+                // The stage buffer bits are part of the same question
+                // `declares_render_support` answers for every other render
+                // bit (`research/docs/23` §3.3, v83): a snapshot that declared
+                // one of them without declaring anything else would otherwise
+                // keep sending the legacy payload and its declaration would be
+                // lost on the wire — the exact "declared a bit that travels as
+                // the old bytes" failure the render track's own predicates
+                // document.
+                if capabilities.declares_render_support()
+                    || declares_render_stage_buffer_support(capabilities)
+                {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
                     put_capabilities(&mut encoder, capabilities)?;
@@ -1443,9 +1516,10 @@ fn put_pipeline_tagged(
 ) -> Result<(), CodecError> {
     match &pipeline.render {
         Some(contract) => {
-            encoder.u8(render_pipeline_kind(contract)?);
+            let kind = render_pipeline_kind(contract)?;
+            encoder.u8(kind);
             put_pipeline(encoder, pipeline);
-            put_render_pipeline_contract(encoder, contract)?;
+            put_render_pipeline_contract(encoder, contract, kind)?;
         }
         None => {
             encoder.u8(PIPELINE_KIND_COMPUTE);
@@ -1457,14 +1531,28 @@ fn put_pipeline_tagged(
 
 /// The pipeline-table tag one render contract wears.
 ///
-/// The tag is a function of the format count because that count is what the
-/// pre-MRT body cannot express: one format keeps `PIPELINE_KIND_RENDER` and the
-/// exact bytes it always had, two to [`MAX_COLOR_ATTACHMENTS`] take
-/// `PIPELINE_KIND_RENDER_MRT`. A contract with no format at all, or with more
-/// than the render track admits, is refused here — before the tag is written —
-/// so a refused registration never emits a partial entry.
+/// The tag is a function of two facts the earlier bodies cannot express: the
+/// format count and whether the contract declares stage buffer bindings. One
+/// format and no declaration keeps `PIPELINE_KIND_RENDER` and the exact bytes
+/// it always had; two to [`MAX_COLOR_ATTACHMENTS`] formats and no declaration
+/// take `PIPELINE_KIND_RENDER_MRT`; a contract that declares at least one
+/// stage buffer takes `PIPELINE_KIND_RENDER_STAGE_BUFFERS`, whose body writes
+/// the formats the MRT way and appends the declaration block. A contract with
+/// no format at all, with more than the render track admits, or with more
+/// declarations than [`MAX_RENDER_STAGE_BUFFERS`] is refused here — before the
+/// tag is written — so a refused registration never emits a partial entry.
 fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecError> {
-    match bounded_color_format_count(contract.color_formats.len() as u64)? {
+    let format_count = bounded_color_format_count(contract.color_formats.len() as u64)?;
+    if contract.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+        return Err(CodecError::RenderStageBufferCount {
+            count: contract.stage_buffers.len(),
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    if !contract.stage_buffers.is_empty() {
+        return Ok(PIPELINE_KIND_RENDER_STAGE_BUFFERS);
+    }
+    match format_count {
         1 => Ok(PIPELINE_KIND_RENDER),
         _ => Ok(PIPELINE_KIND_RENDER_MRT),
     }
@@ -1473,24 +1561,109 @@ fn render_pipeline_kind(contract: &RenderPipelineContract) -> Result<u8, CodecEr
 fn put_render_pipeline_contract(
     encoder: &mut Encoder,
     contract: &RenderPipelineContract,
+    kind: u8,
 ) -> Result<(), CodecError> {
     // The entry keeps the field order the single-format shape established
     // (both entry names, then the format, then the vertex layout); only the
     // format field changes shape, from one byte to a length-prefixed list, and
-    // only when the tag says so.
+    // only when the tag says so. The v83 tag appends the stage buffer
+    // declarations after the layout and always writes the length-prefixed
+    // form, because the tag itself is the new shape.
     bounded_color_format_count(contract.color_formats.len() as u64)?;
     encoder.text(&contract.vertex_entry);
     encoder.text(&contract.fragment_entry);
-    match contract.color_formats.as_slice() {
-        [format] => put_attachment_format(encoder, *format),
-        formats => {
-            encoder.u64(formats.len() as u64);
-            for format in formats {
-                put_attachment_format(encoder, *format);
-            }
+    if kind == PIPELINE_KIND_RENDER {
+        let [format] = contract.color_formats.as_slice() else {
+            // `render_pipeline_kind` only picks this tag for a one-format
+            // contract, so this arm is unreachable for every caller that
+            // writes the tag and the body together.
+            return Err(CodecError::RenderPipelineFormatCount {
+                count: contract.color_formats.len(),
+                maximum: MAX_COLOR_ATTACHMENTS,
+            });
+        };
+        put_attachment_format(encoder, *format);
+    } else {
+        encoder.u64(contract.color_formats.len() as u64);
+        for format in &contract.color_formats {
+            put_attachment_format(encoder, *format);
         }
     }
-    put_vertex_layout(encoder, &contract.vertex_layout)
+    put_vertex_layout(encoder, &contract.vertex_layout)?;
+    if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS {
+        put_stage_buffer_declarations(encoder, &contract.stage_buffers)?;
+    }
+    Ok(())
+}
+
+/// Encode one contract's stage buffer declarations (`research/docs/23` §3.3,
+/// v83): a `u8` count and that many `(stage, index, access, footprint)`
+/// tuples, in the canonical order the contract's own rules state.
+///
+/// The list is bound the way every other length prefix is: a count above
+/// [`MAX_RENDER_STAGE_BUFFERS`] is refused before a single tuple is written,
+/// so a refused registration never emits a partial block.
+fn put_stage_buffer_declarations(
+    encoder: &mut Encoder,
+    bindings: &[StageBufferBinding],
+) -> Result<(), CodecError> {
+    if bindings.len() > MAX_RENDER_STAGE_BUFFERS {
+        return Err(CodecError::RenderStageBufferCount {
+            count: bindings.len(),
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    encoder.u8(bindings.len() as u8);
+    for binding in bindings {
+        encoder.u8(binding.stage.code());
+        encoder.u32(binding.index);
+        put_access(encoder, binding.access);
+        put_footprint(encoder, &binding.footprint);
+    }
+    Ok(())
+}
+
+/// Decode the stage buffer declarations of a v83 pipeline entry.
+///
+/// The count is read as one byte and refused above the contract's own cap
+/// before a single tuple — or a `Vec` of that length — is produced, so a
+/// corrupt count cannot drive the decoder.
+fn get_stage_buffer_declarations(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<StageBufferBinding>, CodecError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_RENDER_STAGE_BUFFERS {
+        return Err(CodecError::RenderStageBufferCount {
+            count,
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    let mut bindings = Vec::with_capacity(count);
+    for _ in 0..count {
+        bindings.push(StageBufferBinding {
+            stage: get_render_pipeline_stage(decoder)?,
+            index: decoder.u32()?,
+            access: get_access(decoder)?,
+            footprint: get_footprint(decoder)?,
+        });
+    }
+    Ok(bindings)
+}
+
+/// Decode one render pipeline stage code (`research/docs/23` §3.3, v83).
+///
+/// The wire codes are [`RenderPipelineStage::code`]'s ordinals — vertex `0`,
+/// fragment `1` — and any other byte is refused by name rather than read as
+/// one of the two stages.
+fn get_render_pipeline_stage(decoder: &mut Decoder<'_>) -> Result<RenderPipelineStage, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(RenderPipelineStage::Vertex),
+        1 => Ok(RenderPipelineStage::Fragment),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "render pipeline stage",
+            value,
+        }),
+    }
 }
 
 /// Bound one contract's colour-format list.
@@ -1585,7 +1758,7 @@ fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipel
     let mut pipeline = get_pipeline(decoder)?;
     pipeline.render = match kind {
         PIPELINE_KIND_COMPUTE => None,
-        PIPELINE_KIND_RENDER | PIPELINE_KIND_RENDER_MRT => {
+        PIPELINE_KIND_RENDER | PIPELINE_KIND_RENDER_MRT | PIPELINE_KIND_RENDER_STAGE_BUFFERS => {
             Some(get_render_pipeline_contract(decoder, kind)?)
         }
         tag => return Err(CodecError::UnknownPipelineTag(tag)),
@@ -1595,11 +1768,14 @@ fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipel
 
 /// Decode the render half of one pipeline-table entry.
 ///
-/// `kind` selects the shape of the format field: `PIPELINE_KIND_RENDER` is a
-/// single byte, `PIPELINE_KIND_RENDER_MRT` a length-prefixed list. A list
-/// length outside `1..=MAX_COLOR_ATTACHMENTS` is refused rather than read as a
-/// shorter or longer entry, so a corrupt prefix cannot shift the vertex layout
-/// that follows it.
+/// `kind` selects the shape of the format field and whether the declaration
+/// block follows it: `PIPELINE_KIND_RENDER` is a single format byte,
+/// `PIPELINE_KIND_RENDER_MRT` a length-prefixed list, and
+/// `PIPELINE_KIND_RENDER_STAGE_BUFFERS` the same list plus the stage buffer
+/// declarations after the vertex layout (`research/docs/23` §3.3, v83). A
+/// list length outside `1..=MAX_COLOR_ATTACHMENTS` is refused rather than read
+/// as a shorter or longer entry, so a corrupt prefix cannot shift the vertex
+/// layout that follows it.
 fn get_render_pipeline_contract(
     decoder: &mut Decoder<'_>,
     kind: u8,
@@ -1607,7 +1783,8 @@ fn get_render_pipeline_contract(
     let vertex_entry = decoder.text()?;
     let fragment_entry = decoder.text()?;
     let color_formats = match kind {
-        PIPELINE_KIND_RENDER_MRT => {
+        PIPELINE_KIND_RENDER => vec![get_attachment_format(decoder)?],
+        _ => {
             let count = bounded_color_format_count(decoder.u64()?)?;
             let mut formats = Vec::with_capacity(count);
             for _ in 0..count {
@@ -1615,14 +1792,19 @@ fn get_render_pipeline_contract(
             }
             formats
         }
-        _ => vec![get_attachment_format(decoder)?],
+    };
+    let vertex_layout = get_vertex_layout(decoder)?;
+    let stage_buffers = if kind == PIPELINE_KIND_RENDER_STAGE_BUFFERS {
+        get_stage_buffer_declarations(decoder)?
+    } else {
+        Vec::new()
     };
     Ok(RenderPipelineContract {
-        stage_buffers: Vec::new(),
+        stage_buffers,
         vertex_entry,
         fragment_entry,
         color_formats,
-        vertex_layout: get_vertex_layout(decoder)?,
+        vertex_layout,
     })
 }
 
@@ -2073,20 +2255,6 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         maximum: MAX_COLOR_ATTACHMENTS,
                     });
                 }
-                // Stage buffer bindings (`research/docs/23` §3.3, v83) have
-                // no section in this frame's layout yet: the narrow feature
-                // byte and the wide feature word are both full, so carrying
-                // them needs a tag of its own — the increment after this one.
-                // Until then the encoder refuses a pass that binds one
-                // instead of shipping a frame whose decoder would read the
-                // block as the next pass, and the decoder's own
-                // `RenderPassDescriptor` keeps the empty list every pre-v83
-                // frame states.
-                if !pass.stage_buffers.is_empty() {
-                    return Err(CodecError::StageBufferUnsupported {
-                        bindings: pass.stage_buffers.len(),
-                    });
-                }
                 // `tagged` is true whenever a render entry exists, so the tag
                 // below always belongs to the extended layout.
                 // The pass kind carries the present half: an offscreen pass
@@ -2170,6 +2338,18 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         maximum: MAX_RENDER_TEXTURES,
                     });
                 }
+                // The stage buffer block follows the sampled-texture block's
+                // own rule (`research/docs/23` §3.3, v83): the wide word has
+                // no bit left for it either, so a pass that binds one takes
+                // the tag of its own and every pre-v83 frame keeps its exact
+                // bytes.
+                let has_stage_buffers = !pass.stage_buffers.is_empty();
+                if has_stage_buffers && pass.stage_buffers.len() > MAX_RENDER_STAGE_BUFFERS {
+                    return Err(CodecError::RenderStageBufferCount {
+                        count: pass.stage_buffers.len(),
+                        maximum: MAX_RENDER_STAGE_BUFFERS,
+                    });
+                }
                 let wide = has_depth_store
                     || has_depth_resource
                     || has_stencil
@@ -2187,6 +2367,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     || has_blend
                     || wide
                     || has_render_textures
+                    || has_stage_buffers
                 {
                     let mut features = if has_vertex_input {
                         RENDER_FEATURE_VERTEX_INPUT
@@ -2214,7 +2395,7 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     if has_blend {
                         features |= RENDER_FEATURE_BLEND;
                     }
-                    if wide || has_render_textures {
+                    if wide || has_render_textures || has_stage_buffers {
                         // The wide word's low byte is the narrow byte, so a
                         // decoder reads both tags through one section walker
                         // and only the extra bits differ.
@@ -2243,26 +2424,25 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                         if has_stencil_resolve {
                             wide_features |= RENDER_WIDE_FEATURE_STENCIL_RESOLVE;
                         }
+                        // The wide word is full, so each block the word has no
+                        // bit for rides a tag of its own, and a pass that
+                        // carries both blocks takes the tag that appends
+                        // them in the one order the decoder reads
+                        // (`research/docs/23` §3.3, v70/v83). A pass with
+                        // neither block keeps the plain wide tag.
+                        let tag = match (has_render_textures, has_stage_buffers) {
+                            (false, false) => PASS_KIND_RENDER_EXT_WIDE,
+                            (true, false) => PASS_KIND_RENDER_SAMPLED,
+                            (false, true) => PASS_KIND_RENDER_STAGE_BUFFERS,
+                            (true, true) => PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS,
+                        };
+                        encoder.u8(tag);
+                        encoder.u16(wide_features);
                         if has_render_textures {
-                            // The wide word is full, so the texture block
-                            // rides the tag of its own: the same `u16` word
-                            // (same meanings, so the section walker is
-                            // shared) followed by the block
-                            // (`research/docs/23` §3.3, v70).
-                            encoder.u8(PASS_KIND_RENDER_SAMPLED);
-                            encoder.u16(wide_features);
-                            encoder.u8(u8::try_from(pass.textures.len()).map_err(|_| {
-                                CodecError::RenderTextureCount {
-                                    count: pass.textures.len(),
-                                    maximum: MAX_RENDER_TEXTURES,
-                                }
-                            })?);
-                            for texture in &pass.textures {
-                                put_texture(encoder, texture);
-                            }
-                        } else {
-                            encoder.u8(PASS_KIND_RENDER_EXT_WIDE);
-                            encoder.u16(wide_features);
+                            put_render_texture_block(encoder, &pass.textures)?;
+                        }
+                        if has_stage_buffers {
+                            put_stage_buffer_block(encoder, &pass.stage_buffers)?;
                         }
                     } else {
                         encoder.u8(PASS_KIND_RENDER_EXT);
@@ -2404,6 +2584,63 @@ fn put_render_pass(
         if let Some(present) = &pass.present {
             put_present_descriptor(encoder, present)?;
         }
+    }
+    Ok(())
+}
+
+/// Encode the sampled-texture block of a [`PASS_KIND_RENDER_SAMPLED`] pass
+/// (`research/docs/23` §3.3, v70): a `u8` count and that many full
+/// [`TextureView`]s, source bytes and all.
+///
+/// The count is bound here the way the decoder bounds it: a pass that binds
+/// more textures than [`MAX_RENDER_TEXTURES`] is refused before a single view
+/// is written, so a refused frame never carries a partial block.
+fn put_render_texture_block(
+    encoder: &mut Encoder,
+    textures: &[TextureView],
+) -> Result<(), CodecError> {
+    if textures.len() > MAX_RENDER_TEXTURES {
+        return Err(CodecError::RenderTextureCount {
+            count: textures.len(),
+            maximum: MAX_RENDER_TEXTURES,
+        });
+    }
+    encoder.u8(
+        u8::try_from(textures.len()).map_err(|_| CodecError::RenderTextureCount {
+            count: textures.len(),
+            maximum: MAX_RENDER_TEXTURES,
+        })?,
+    );
+    for texture in textures {
+        put_texture(encoder, texture);
+    }
+    Ok(())
+}
+
+/// Encode the stage buffer block of a [`PASS_KIND_RENDER_STAGE_BUFFERS`] or
+/// [`PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS`] pass (`research/docs/23` §3.3,
+/// v83): a `u8` count and that many `(stage, BufferView)` pairs.
+///
+/// Each entry travels as a full [`BufferView`] — identity, range and source
+/// bytes — for the same reason the vertex streams do: the bytes a stage's
+/// `[[buffer(N)]]` argument reads have to travel with the trace that binds
+/// them, and the view's own `metal_binding` is the index inside its stage.
+/// The count is bound before a single entry is written, exactly as the
+/// decoder bounds it.
+fn put_stage_buffer_block(
+    encoder: &mut Encoder,
+    views: &[StageBufferView],
+) -> Result<(), CodecError> {
+    if views.len() > MAX_RENDER_STAGE_BUFFERS {
+        return Err(CodecError::RenderStageBufferCount {
+            count: views.len(),
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    encoder.u8(views.len() as u8);
+    for view in views {
+        encoder.u8(view.stage.code());
+        put_view(encoder, &view.view);
     }
     Ok(())
 }
@@ -2780,6 +3017,30 @@ fn get_trace_tagged(
                 }
                 TracePass::Render(get_render_sampled_pass(decoder, features)?)
             }
+            // The stage-buffer kind carries the same wide feature word and,
+            // right after it, the stage buffer block (`research/docs/23`
+            // §3.3, v83). An unknown bit is refused exactly as it is above: a
+            // section this decoder does not know cannot be skipped to reach
+            // the ones after it.
+            PASS_KIND_RENDER_STAGE_BUFFERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_stage_buffer_pass(decoder, features)?)
+            }
+            // The combined kind writes the sampled tag's payload — the wide
+            // word and the texture block — and then the stage buffer block
+            // after it, so a pass that carries both blocks is one frame.
+            PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS => {
+                let features = decoder.u16()?;
+                let unknown = features & !RENDER_WIDE_FEATURE_KNOWN;
+                if unknown != 0 {
+                    return Err(CodecError::UnknownRenderFeature(unknown));
+                }
+                TracePass::Render(get_render_sampled_stage_buffer_pass(decoder, features)?)
+            }
             tag => return Err(CodecError::UnknownPassTag(tag)),
         });
     }
@@ -2857,14 +3118,63 @@ fn get_render_ext_pass(
 ///
 /// The layout repeats the wide tag's — the same `u16` feature word, then the
 /// section walker below — with the texture block read immediately after the
-/// word, where the encoder writes it: a `u8` count and that many full
-/// [`TextureView`]s. A count above the contract's own cap is refused with
-/// [`CodecError::RenderTextureCount`] before a single texture is read, so a
-/// corrupt count cannot drive the decoder.
+/// word, where the encoder writes it. The block itself is read by
+/// [`get_render_texture_block`], whose count rule every tag that carries the
+/// block shares.
 fn get_render_sampled_pass(
     decoder: &mut Decoder<'_>,
     features: u16,
 ) -> Result<RenderPassDescriptor, CodecError> {
+    let textures = get_render_texture_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.textures = textures;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the stage-buffer render pass of [`PASS_KIND_RENDER_STAGE_BUFFERS`]
+/// (`research/docs/23` §3.3, v83).
+///
+/// The layout repeats the wide tag's — the same `u16` feature word, then the
+/// section walker below — with the stage buffer block read immediately after
+/// the word, where the encoder writes it.
+fn get_render_stage_buffer_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let stage_buffers = get_stage_buffer_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.stage_buffers = stage_buffers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode the combined sampled-texture and stage-buffer render pass of
+/// [`PASS_KIND_RENDER_SAMPLED_STAGE_BUFFERS`] (`research/docs/23` §3.3, v83).
+///
+/// The blocks are read in the one order the encoder writes them — the texture
+/// block first — so a pass that carries both keeps one frame and the two
+/// blocks cannot be read in either order.
+fn get_render_sampled_stage_buffer_pass(
+    decoder: &mut Decoder<'_>,
+    features: u16,
+) -> Result<RenderPassDescriptor, CodecError> {
+    let textures = get_render_texture_block(decoder)?;
+    let stage_buffers = get_stage_buffer_block(decoder)?;
+    let mut pass = get_render_pass(decoder, false)?;
+    pass.textures = textures;
+    pass.stage_buffers = stage_buffers;
+    get_render_ext_sections(decoder, features, &mut pass)?;
+    Ok(pass)
+}
+
+/// Decode one sampled-texture block (`research/docs/23` §3.3, v70): a `u8`
+/// count and that many full [`TextureView`]s.
+///
+/// A count above the contract's own cap is refused with
+/// [`CodecError::RenderTextureCount`] before a single texture is read, so a
+/// corrupt count cannot drive the decoder.
+fn get_render_texture_block(decoder: &mut Decoder<'_>) -> Result<Vec<TextureView>, CodecError> {
     let texture_count = usize::from(decoder.u8()?);
     if texture_count > MAX_RENDER_TEXTURES {
         return Err(CodecError::RenderTextureCount {
@@ -2876,10 +3186,32 @@ fn get_render_sampled_pass(
     for _ in 0..texture_count {
         textures.push(get_texture(decoder)?);
     }
-    let mut pass = get_render_pass(decoder, false)?;
-    pass.textures = textures;
-    get_render_ext_sections(decoder, features, &mut pass)?;
-    Ok(pass)
+    Ok(textures)
+}
+
+/// Decode one stage buffer block (`research/docs/23` §3.3, v83): a `u8` count
+/// and that many `(stage, BufferView)` pairs.
+///
+/// The count is refused above the contract's own cap before a single entry is
+/// read, and each entry's stage byte goes through the named-stage decoder, so
+/// a corrupt block is refused by name rather than read as the pass's own
+/// fields.
+fn get_stage_buffer_block(decoder: &mut Decoder<'_>) -> Result<Vec<StageBufferView>, CodecError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_RENDER_STAGE_BUFFERS {
+        return Err(CodecError::RenderStageBufferCount {
+            count,
+            maximum: MAX_RENDER_STAGE_BUFFERS,
+        });
+    }
+    let mut views = Vec::with_capacity(count);
+    for _ in 0..count {
+        views.push(StageBufferView {
+            stage: get_render_pipeline_stage(decoder)?,
+            view: get_view(decoder)?,
+        });
+    }
+    Ok(views)
 }
 
 /// Decode the optional sections an extended render pass's feature word names,
@@ -4127,6 +4459,18 @@ fn get_storage_mode(decoder: &mut Decoder<'_>) -> Result<StorageMode, CodecError
     }
 }
 
+/// Whether any stage buffer capability bit differs from its default
+/// (`research/docs/23` §3.3, v83).
+///
+/// [`ProviderCapabilities::declares_render_support`] answers this question for
+/// every render bit that predates the stage buffer face; the two bits added by
+/// v83 live in this codec's own predicate because the capability payload is
+/// this crate's to keep, so the declaration cannot be dropped on the wire —
+/// the exact failure every other `declares_*` predicate exists to prevent.
+fn declares_render_stage_buffer_support(capabilities: &ProviderCapabilities) -> bool {
+    capabilities.supports_render_stage_buffers || capabilities.max_render_stage_buffers != 0
+}
+
 /// Encode a capability snapshot, including its render bits.
 ///
 /// Only [`RENDER_CAPABILITIES_RESPONSE`] frames use this layout. A snapshot
@@ -4214,6 +4558,12 @@ fn put_capabilities(
         // tag, and this guard is what keeps the declaration from being
         // silently dropped (`research/docs/23` §3.3, v70).
         || capabilities.declares_render_texture_support()
+        // The stage-buffer block follows the same rule once more
+        // (`research/docs/23` §3.3, v83): a snapshot that declares only the
+        // two stage buffer bits still writes the heap/ICB half the decoder
+        // reads by position before the tag, so the declaration cannot be
+        // dropped on the wire.
+        || declares_render_stage_buffer_support(capabilities)
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -4315,6 +4665,14 @@ fn put_capabilities(
             for format in &capabilities.supported_render_texture_formats {
                 put_texture_format(encoder, *format);
             }
+        }
+        // The stage-buffer block is the tail's newest section and follows the
+        // render-sampler half when the snapshot declares either of its two
+        // bits (`research/docs/23` §3.3, v83).
+        if declares_render_stage_buffer_support(capabilities) {
+            encoder.u8(CAPABILITY_STAGE_BUFFER_TAIL);
+            encoder.bool(capabilities.supports_render_stage_buffers);
+            encoder.u32(capabilities.max_render_stage_buffers);
         }
     }
     Ok(())
@@ -4594,6 +4952,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
         && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
         && tag != CAPABILITY_RENDER_TEXTURE_TAIL
+        && tag != CAPABILITY_STAGE_BUFFER_TAIL
     {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
@@ -4608,6 +4967,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             && tag != CAPABILITY_DEPTH_RESOLVE_TAIL
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
+            && tag != CAPABILITY_STAGE_BUFFER_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -4622,6 +4982,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         if tag != CAPABILITY_DEPTH_RESOLVE_TAIL
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
+            && tag != CAPABILITY_STAGE_BUFFER_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -4637,7 +4998,10 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             return Ok(capabilities);
         }
         tag = decoder.u8()?;
-        if tag != CAPABILITY_STENCIL_RESOLVE_TAIL && tag != CAPABILITY_RENDER_TEXTURE_TAIL {
+        if tag != CAPABILITY_STENCIL_RESOLVE_TAIL
+            && tag != CAPABILITY_RENDER_TEXTURE_TAIL
+            && tag != CAPABILITY_STAGE_BUFFER_TAIL
+        {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
     }
@@ -4653,30 +5017,44 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         }
         tag = decoder.u8()?;
     }
-    // The render-sampler block is the tail's sixth and newest optional section
+    // The render-sampler block is the tail's sixth optional section
     // (`research/docs/23` §3.3, v70): it follows the stencil-resolve block when
     // present, and reads the bool, the binding cap and the admitted texture
-    // formats.
-    if tag != CAPABILITY_RENDER_TEXTURE_TAIL {
+    // formats. The stage-buffer block may follow it, so the walk continues
+    // while bytes remain.
+    if tag == CAPABILITY_RENDER_TEXTURE_TAIL {
+        capabilities.supports_render_texture_sampling = decoder.bool()?;
+        capabilities.max_render_textures = decoder.u32()?;
+        let render_texture_format_count =
+            usize::try_from(decoder.u64()?).map_err(|_| CodecError::RenderTextureFormatCount {
+                count: usize::MAX,
+                maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+            })?;
+        if render_texture_format_count > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS {
+            return Err(CodecError::RenderTextureFormatCount {
+                count: render_texture_format_count,
+                maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
+            });
+        }
+        let mut supported_render_texture_formats = Vec::with_capacity(render_texture_format_count);
+        for _ in 0..render_texture_format_count {
+            supported_render_texture_formats.push(get_texture_format(decoder)?);
+        }
+        capabilities.supported_render_texture_formats = supported_render_texture_formats;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        tag = decoder.u8()?;
+    }
+    // The stage-buffer block is the tail's seventh and newest optional section
+    // (`research/docs/23` §3.3, v83): it follows the render-sampler block when
+    // present, and reads the bool plus the binding cap. A snapshot that
+    // declares only this block writes its own tag directly, exactly as the
+    // sections before it do.
+    if tag != CAPABILITY_STAGE_BUFFER_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.supports_render_texture_sampling = decoder.bool()?;
-    capabilities.max_render_textures = decoder.u32()?;
-    let render_texture_format_count =
-        usize::try_from(decoder.u64()?).map_err(|_| CodecError::RenderTextureFormatCount {
-            count: usize::MAX,
-            maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
-        })?;
-    if render_texture_format_count > MAX_SUPPORTED_RENDER_TEXTURE_FORMATS {
-        return Err(CodecError::RenderTextureFormatCount {
-            count: render_texture_format_count,
-            maximum: MAX_SUPPORTED_RENDER_TEXTURE_FORMATS,
-        });
-    }
-    let mut supported_render_texture_formats = Vec::with_capacity(render_texture_format_count);
-    for _ in 0..render_texture_format_count {
-        supported_render_texture_formats.push(get_texture_format(decoder)?);
-    }
-    capabilities.supported_render_texture_formats = supported_render_texture_formats;
+    capabilities.supports_render_stage_buffers = decoder.bool()?;
+    capabilities.max_render_stage_buffers = decoder.u32()?;
     Ok(capabilities)
 }
