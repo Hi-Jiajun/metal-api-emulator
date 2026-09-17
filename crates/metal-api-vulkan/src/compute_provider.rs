@@ -3,8 +3,9 @@
 
 use crate::{
     execute_pool_sequence_with_status, render, Binding, BoundDispatch, FloatControls2Support,
-    PendingExecution, PoolBinding, PoolKey, PoolKind, SequenceTail, SpirvFeaturePolicy,
-    TranslatedComputePipeline, VulkanContext, VulkanExecutor, VulkanPipelineArtifact,
+    LandingTarget, LandingUpdate, PendingExecution, PoolBinding, PoolKey, PoolKind, SequenceTail,
+    SpirvFeaturePolicy, TranslatedComputePipeline, VulkanContext, VulkanExecutor,
+    VulkanPipelineArtifact,
 };
 use metal_api_core::completion::wire::CompletionOutbox;
 use metal_api_core::completion::{AbandonmentOutcome, CompletionRecord, ObservationDeadline};
@@ -24,7 +25,7 @@ use metal_api_core::provider::{
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
 };
-use metal_api_core::{AirSource, BufferBinding, BufferUpdate, Device, Function, Size};
+use metal_api_core::{AirSource, BufferBinding, Device, Function, Size};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -171,6 +172,11 @@ struct CompletionSlot {
     record: Arc<CompletionRecord>,
     pending: Option<PendingExecution>,
     pool: Vec<BufferView>,
+    /// The texture pool the deferred readback maps its storage image landings
+    /// through (`research/docs/26` §21.4, C2). A storage image's landing is
+    /// keyed by a texture view identity rather than a buffer pool key, so the
+    /// slot carries the pool the same way it carries the buffer one.
+    textures: Vec<metal_api_core::provider::TextureView>,
     /// Render writebacks produced synchronously during an async submission.
     /// The render rail completes inside `submit` even when the compute half is
     /// deferred, so its bytes ride alongside the deferred pool readback and are
@@ -2107,7 +2113,7 @@ impl VulkanComputeProvider {
         timeout: Duration,
     ) -> Result<CompletionDisposition, ProviderError> {
         self.validate_token(token)?;
-        let (record, pending, pool, render_writebacks, heap_observations, deadline) = {
+        let (record, pending, pool, textures, render_writebacks, heap_observations, deadline) = {
             let mut completions = self.completions.lock().map_err(|_| registry_poisoned())?;
             let slot = completions
                 .get_mut(&token.submission_id)
@@ -2119,6 +2125,7 @@ impl VulkanComputeProvider {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                     slot.deadline,
                 )
             } else if let Some(pending) = slot.pending.take() {
@@ -2126,6 +2133,7 @@ impl VulkanComputeProvider {
                     Arc::clone(&slot.record),
                     Some(pending),
                     slot.pool.clone(),
+                    slot.textures.clone(),
                     slot.render_writebacks.clone(),
                     slot.heap_observations.clone(),
                     slot.deadline,
@@ -2134,6 +2142,7 @@ impl VulkanComputeProvider {
                 (
                     Arc::clone(&slot.record),
                     None,
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -2151,7 +2160,7 @@ impl VulkanComputeProvider {
         match pending.wait(duration_to_nanos(deadline.clamp(timeout))) {
             Ok(true) => match pending
                 .read_updates()
-                .and_then(|updates| map_writebacks(&pool, updates, token))
+                .and_then(|updates| map_writebacks(&pool, &textures, updates, token))
             {
                 Ok(writebacks) => {
                     drop(pending);
@@ -2922,6 +2931,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         record,
                         pending: Some(pending),
                         pool,
+                        textures: textures.clone(),
                         render_writebacks,
                         heap_observations: heap_plan
                             .as_ref()
@@ -2964,9 +2974,15 @@ impl ComputeProvider for VulkanComputeProvider {
             // (`AttachmentComputeConflict`), and the render rail runs last, so
             // the map keeps the bytes a repeated attachment write ends with.
             let mut merged = BTreeMap::new();
-            for writeback in map_writebacks(&pool, updates, token)?.into_iter().chain(
-                self.execute_render_passes(trace, &pool, &render_plan, admitted.resources())?,
-            ) {
+            for writeback in map_writebacks(&pool, &textures, updates, token)?
+                .into_iter()
+                .chain(self.execute_render_passes(
+                    trace,
+                    &pool,
+                    &render_plan,
+                    admitted.resources(),
+                )?)
+            {
                 merged.insert((writeback.allocation_id, writeback.view_id), writeback);
             }
             let writebacks: Vec<BufferWriteback> = merged.into_values().collect();
@@ -3002,6 +3018,7 @@ impl ComputeProvider for VulkanComputeProvider {
                         record: observation,
                         pending: None,
                         pool: Vec::new(),
+                        textures: Vec::new(),
                         render_writebacks: Vec::new(),
                         heap_observations: Vec::new(),
                         deadline: ObservationDeadline::new(self.observation_deadline),
@@ -3206,25 +3223,50 @@ fn narrow_dimensions(wide: [u64; 3]) -> Result<Size, ProviderError> {
 
 fn map_writebacks(
     pool: &[BufferView],
-    updates: Vec<BufferUpdate>,
+    textures: &[metal_api_core::provider::TextureView],
+    updates: Vec<LandingUpdate>,
     token: CompletionToken,
 ) -> Result<Vec<BufferWriteback>, ProviderError> {
     let mut writebacks = Vec::with_capacity(updates.len());
     for update in updates {
-        let view = usize::try_from(update.index)
-            .ok()
-            .and_then(|position| pool.get(position))
-            .ok_or_else(|| output_error(token, "writeback_unknown_binding"))?;
-        let offset = view
-            .offset
-            .checked_add(update.offset as u64)
-            .ok_or_else(|| output_error(token, "writeback_range_overflow"))?;
-        writebacks.push(BufferWriteback {
-            view_id: view.view_id,
-            allocation_id: view.allocation_id,
-            offset,
-            bytes: update.bytes,
-        });
+        match update.target {
+            LandingTarget::Buffer(index) => {
+                let view = usize::try_from(index)
+                    .ok()
+                    .and_then(|position| pool.get(position))
+                    .ok_or_else(|| output_error(token, "writeback_unknown_binding"))?;
+                let offset = view
+                    .offset
+                    .checked_add(update.offset as u64)
+                    .ok_or_else(|| output_error(token, "writeback_range_overflow"))?;
+                writebacks.push(BufferWriteback {
+                    view_id: view.view_id,
+                    allocation_id: view.allocation_id,
+                    offset,
+                    bytes: update.bytes,
+                });
+            }
+            // A storage image landing is keyed by the texture pool's Metal
+            // index, exactly as the descriptor writer resolves the image
+            // (`research/docs/26` §21.4, C2). The bytes are the view's whole
+            // tightly packed extent, so the landing starts at the allocation's
+            // own zero and carries the view identity the writeback channel
+            // validates against. A landing whose texture is not in the pool is
+            // a rail bug, and it is reported instead of being dropped.
+            LandingTarget::Texture(index) => {
+                let texture = textures
+                    .iter()
+                    .find(|texture| texture.metal_binding == index)
+                    .ok_or_else(|| output_error(token, "writeback_unknown_binding"))?;
+                writebacks.push(BufferWriteback {
+                    view_id: texture.view_id,
+                    allocation_id: texture.allocation_id,
+                    offset: u64::try_from(update.offset)
+                        .map_err(|_| output_error(token, "writeback_range_overflow"))?,
+                    bytes: update.bytes,
+                });
+            }
+        }
     }
     writebacks.sort_by_key(|w| (w.allocation_id, w.view_id));
     Ok(writebacks)
@@ -3241,7 +3283,7 @@ fn execute_on_context(
     retains: &mut BorrowedRetains,
     textures: &[metal_api_core::provider::TextureView],
     indirect_dispatch: Option<[u32; 3]>,
-) -> Result<Vec<BufferUpdate>, ProviderError> {
+) -> Result<Vec<LandingUpdate>, ProviderError> {
     // The synchronous path goes through the same queue policy as the deferred
     // object path (`research/docs/21` §4): the tier table decides which idle
     // queue receives the work, and a one-queue device keeps answering zero.
@@ -3373,16 +3415,23 @@ fn render_pipeline_table_contract() -> PipelineContract {
     }
 }
 
-/// Refuse a compute texture declaration whose sampler state is not the state
-/// the registered module carries (`research/docs/26` §21.3, C1b).
+/// Refuse a compute texture declaration the registered module does not carry
+/// (`research/docs/26` §21.3–§21.4, C1b/C2).
 ///
-/// From C1b on the rail creates one `VkSampler` per AIR-embedded constexpr
-/// sampler, with the state the module's own AIR was lowered against. The
-/// declaration's job is therefore to *restate* that state: a request naming
-/// another filtering or address mode would change which texels the module
-/// reads without changing the module, so it is a capability refusal carrying
-/// the binding, the declared state and the module's state rather than a
-/// silently substituted sampler.
+/// The halves of one declaration are checked in the order the execution path
+/// resolves them. The access decides which descriptor the binding is executed
+/// as — sampled textures are combined image samplers, storage images are
+/// `STORAGE_IMAGE` descriptors — so a request that names the other one is
+/// refused by name (`compute_texture_access_unsupported`) with both accesses.
+/// The shape follows (`compute_texture_type_unsupported`,
+/// `compute_texture_format_unsupported`), because the module's `OpTypeImage`
+/// was decorated with one dimensionality and one format. When those agree the
+/// sampler state is restated: from C1b on the rail creates one `VkSampler` per
+/// AIR-embedded constexpr sampler, with the state the module's own AIR was
+/// lowered against, so a request naming another filtering or address mode would
+/// change which texels the module reads without changing the module and is
+/// refused with the binding, the declared state and the module's state rather
+/// than a silently substituted sampler.
 fn refuse_foreign_texture_samplers(
     requested: &CompiledComputePipeline,
     registered: &CompiledComputePipeline,
@@ -3398,7 +3447,108 @@ fn refuse_foreign_texture_samplers(
             // refusal, not this gate's.
             continue;
         };
-        if declared.sampler != module.sampler {
+        // The access is the first half of the same restatement
+        // (`research/docs/26` §21.4, C2): a declaration that names a sampled
+        // binding where the module writes is refused by name before the sampler
+        // comparison, because the two accesses are executed by different
+        // descriptors and a substituted one would change what the module can
+        // observe. Core's pair rules already refuse a *view* that disagrees
+        // with a request's own contract; this gate is the request's contract
+        // against the module that will run.
+        if declared.access != module.access {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "compute_texture_access_unsupported",
+            )
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field(
+                "declared_access",
+                FieldValue::Text(format!("{:?}", declared.access)),
+            )
+            .with_field(
+                "module_access",
+                FieldValue::Text(format!("{:?}", module.access)),
+            ));
+        }
+        // The shape is the second half of the restatement. The module's
+        // `OpTypeImage` was decorated with one dimensionality and one format,
+        // and a descriptor of another shape would either be refused by Vulkan
+        // or read as bytes the module never declared. Each half names itself so
+        // a fix needs no second lookup.
+        if declared.texture_type != module.texture_type {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "compute_texture_type_unsupported",
+            )
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field(
+                "declared_type",
+                FieldValue::Text(format!("{:?}", declared.texture_type)),
+            )
+            .with_field(
+                "module_type",
+                FieldValue::Text(format!("{:?}", module.texture_type)),
+            ));
+        }
+        if declared.format != module.format {
+            return Err(refusal(
+                ProviderPhase::Resolve,
+                ProviderErrorClass::Capability,
+                "compute_texture_format_unsupported",
+            )
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field(
+                "declared_format",
+                FieldValue::Text(format!("{:?}", declared.format)),
+            )
+            .with_field(
+                "module_format",
+                FieldValue::Text(format!("{:?}", module.format)),
+            ));
+        }
+        // A storage declaration carries no sampler on either side (core
+        // enforces that invariant), so the sampler comparison below runs for
+        // sampled bindings only — where both halves are present.
+        if declared.sampler == module.sampler {
+            continue;
+        }
+        let (declared_sampler, module_sampler) = match (declared.sampler, module.sampler) {
+            (Some(declared_sampler), Some(module_sampler)) => (declared_sampler, module_sampler),
+            // Unreachable through core validation: an access either carries a
+            // sampler on both sides or on neither. Kept as a named refusal so a
+            // hand-built contract cannot slip past with a half-stated pair.
+            (declared_sampler, module_sampler) => {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "compute_texture_sampler_unsupported",
+                )
+                .with_field(
+                    "binding",
+                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
+                )
+                .with_field(
+                    "declared_sampler",
+                    FieldValue::Text(format!("{declared_sampler:?}")),
+                )
+                .with_field(
+                    "module_sampler",
+                    FieldValue::Text(format!("{module_sampler:?}")),
+                ));
+            }
+        };
+        if declared_sampler != module_sampler {
             return Err(refusal(
                 ProviderPhase::Resolve,
                 ProviderErrorClass::Capability,
@@ -3410,19 +3560,19 @@ fn refuse_foreign_texture_samplers(
             )
             .with_field(
                 "filter",
-                FieldValue::Text(format!("{:?}", declared.sampler.filter)),
+                FieldValue::Text(format!("{:?}", declared_sampler.filter)),
             )
             .with_field(
                 "address",
-                FieldValue::Text(format!("{:?}", declared.sampler.address)),
+                FieldValue::Text(format!("{:?}", declared_sampler.address)),
             )
             .with_field(
                 "module_filter",
-                FieldValue::Text(format!("{:?}", module.sampler.filter)),
+                FieldValue::Text(format!("{:?}", module_sampler.filter)),
             )
             .with_field(
                 "module_address",
-                FieldValue::Text(format!("{:?}", module.sampler.address)),
+                FieldValue::Text(format!("{:?}", module_sampler.address)),
             ));
         }
     }
@@ -3699,7 +3849,7 @@ mod tests {
                     access: TextureAccess::Sampled,
                     texture_type: TextureType::D2,
                     format: TextureFormat::R32Uint,
-                    sampler,
+                    sampler: Some(sampler),
                     footprint: TextureFootprintProof::WholeView,
                 }],
                 shader_capabilities: Vec::new(),
@@ -3730,18 +3880,18 @@ mod tests {
             })
             .collect();
         let updates = vec![
-            BufferUpdate {
-                index: 1,
+            LandingUpdate {
+                target: LandingTarget::Buffer(1),
                 offset: 0,
                 bytes: vec![2; 4],
             },
-            BufferUpdate {
-                index: 0,
+            LandingUpdate {
+                target: LandingTarget::Buffer(0),
                 offset: 0,
                 bytes: vec![1; 4],
             },
         ];
-        let writes = map_writebacks(&pool, updates, token).unwrap();
+        let writes = map_writebacks(&pool, &[], updates, token).unwrap();
         assert_eq!(writes[0].view_id, ViewId::new(430));
         assert_eq!(writes[0].allocation_id, AllocationId::new(330));
         assert_eq!(writes[0].offset, 20);
@@ -3753,8 +3903,9 @@ mod tests {
         assert_eq!(
             map_writebacks(
                 &pool,
-                vec![BufferUpdate {
-                    index: 9,
+                &[],
+                vec![LandingUpdate {
+                    target: LandingTarget::Buffer(9),
                     offset: 0,
                     bytes: vec![3; 4]
                 }],

@@ -252,7 +252,10 @@ fn a_declaration_that_moves_away_from_the_modules_sampler_is_refused_by_name() {
     assert_eq!(registered.contract.texture_bindings.len(), 1);
     assert_eq!(
         registered.contract.texture_bindings[0].sampler,
-        policy(SamplerFilter::Linear, SamplerAddressMode::ClampToEdge),
+        Some(policy(
+            SamplerFilter::Linear,
+            SamplerAddressMode::ClampToEdge
+        )),
         "the registered declaration is the module's own AIR state"
     );
     assert_eq!(
@@ -263,8 +266,10 @@ fn a_declaration_that_moves_away_from_the_modules_sampler_is_refused_by_name() {
     // A request that declares nearest+clamp against that module is refused
     // before any device object exists.
     let mut tampered = registered.clone();
-    tampered.contract.texture_bindings[0].sampler =
-        policy(SamplerFilter::Nearest, SamplerAddressMode::ClampToEdge);
+    tampered.contract.texture_bindings[0].sampler = Some(policy(
+        SamplerFilter::Nearest,
+        SamplerAddressMode::ClampToEdge,
+    ));
     let tampered_trace = trace(&provider, &tampered);
     let admitted = provider
         .capabilities()

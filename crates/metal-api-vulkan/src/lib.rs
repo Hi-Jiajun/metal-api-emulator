@@ -2048,11 +2048,12 @@ pub(crate) fn execute_pipeline_sequence_with_status(
     textures: &[metal_api_core::provider::TextureView],
     queue_index: usize,
 ) -> Result<Vec<BufferUpdate>, ProviderError> {
+    refuse_executor_storage_landings(textures)?;
     let buffers = buffers
         .into_iter()
         .map(PoolBinding::Owned)
         .collect::<Vec<_>>();
-    execute_pool_sequence_with_status(
+    buffer_updates(execute_pool_sequence_with_status(
         context,
         artifacts,
         &buffers,
@@ -2063,7 +2064,65 @@ pub(crate) fn execute_pipeline_sequence_with_status(
             indirect_dispatch: None,
         },
         queue_index,
+    )?)
+}
+
+/// The standalone executor's `execute` contract returns buffer-keyed updates,
+/// so a storage image landing has no channel there (`research/docs/26` §21.4,
+/// C2). The provider path owns the writeback channel and executes the shape, so
+/// this refusal is about the boundary and not about the device: a caller that
+/// hands a writable texture to the executor is refused by name instead of
+/// being handed a trace whose texels silently never leave.
+pub(crate) fn refuse_executor_storage_landings(
+    textures: &[metal_api_core::provider::TextureView],
+) -> Result<(), ProviderError> {
+    let Some(texture) = textures.iter().find(|texture| texture.access.is_writable()) else {
+        return Ok(());
+    };
+    Err(ProviderError::new(
+        ProviderPhase::Resolve,
+        ProviderErrorClass::Capability,
+        "compute_storage_image_executor_unsupported",
     )
+    .expect("non-empty provider error slug")
+    .with_field(
+        "binding",
+        FieldValue::Unsigned(u64::from(texture.metal_binding)),
+    )
+    .with_field("access", FieldValue::Text(format!("{:?}", texture.access)))
+    .with_detail(
+        "the executor API returns buffer updates only; submit the trace through a provider, \
+         which publishes storage image landings on the writeback channel",
+    ))
+}
+
+/// Narrow a pool sequence's landings onto the executor's buffer-keyed update
+/// channel. Callers run [`refuse_executor_storage_landings`] first, so a
+/// texture landing here is a programming error rather than a request shape.
+fn buffer_updates(updates: Vec<LandingUpdate>) -> Result<Vec<BufferUpdate>, ProviderError> {
+    let mut buffer_updates = Vec::with_capacity(updates.len());
+    for update in updates {
+        match update.target {
+            LandingTarget::Buffer(index) => buffer_updates.push(BufferUpdate {
+                index,
+                offset: update.offset,
+                bytes: update.bytes,
+            }),
+            LandingTarget::Texture(index) => {
+                return Err(ProviderError::new(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Internal,
+                    "compute_storage_image_executor_unsupported",
+                )
+                .expect("non-empty provider error slug")
+                .with_field("texture", FieldValue::Unsigned(u64::from(index)))
+                .with_detail(
+                    "a storage image landing reached the executor's buffer-keyed update channel",
+                ));
+            }
+        }
+    }
+    Ok(buffer_updates)
 }
 
 /// The trailing inputs a pool-sequence submission carries beyond the core
@@ -2090,7 +2149,7 @@ pub(crate) fn execute_pool_sequence_with_status(
     dispatches: &[BoundDispatch],
     tail: SequenceTail<'_>,
     queue_index: usize,
-) -> Result<Vec<BufferUpdate>, ProviderError> {
+) -> Result<Vec<LandingUpdate>, ProviderError> {
     for artifact in artifacts {
         if !Arc::ptr_eq(context, &artifact.context) {
             return Err(dispatch_args_error(failure(
@@ -2120,7 +2179,7 @@ fn execute_submission_stages(
     dispatches: &[BoundDispatch],
     tail: SequenceTail<'_>,
     queue_index: usize,
-) -> Result<Vec<BufferUpdate>, ProviderError> {
+) -> Result<Vec<LandingUpdate>, ProviderError> {
     let mut pending =
         PendingExecution::submit(context, queue_index, artifacts, buffers, dispatches, tail)?;
     if !pending.wait(FENCE_TIMEOUT_NS)? {
@@ -2137,6 +2196,30 @@ fn execute_submission_stages(
         ));
     }
     pending.read_updates()
+}
+
+/// The resource one landing update belongs to (`research/docs/26` §21.4, C2).
+///
+/// A buffer landing is keyed by its pool key — the shape the standalone
+/// executor's `BufferUpdate` channel already carries. A storage image's bytes
+/// belong to a texture view rather than to any Metal buffer index, so the
+/// update keeps the texture's own key and the provider maps it onto the
+/// writeback channel it owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LandingTarget {
+    /// A buffer pool key (the position of the pooled view).
+    Buffer(u32),
+    /// The Metal texture index of a storage image.
+    Texture(u32),
+}
+
+/// One complete resource landing a pool sequence produced: the whole tightly
+/// packed extent of a writable buffer view or storage image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LandingUpdate {
+    pub target: LandingTarget,
+    pub offset: usize,
+    pub bytes: Vec<u8>,
 }
 
 /// A recorded and queue-submitted sequence whose completion fence is pending.
@@ -2273,7 +2356,7 @@ impl PendingExecution {
         }
     }
 
-    pub(crate) fn read_updates(&self) -> Result<Vec<BufferUpdate>, ProviderError> {
+    pub(crate) fn read_updates(&self) -> Result<Vec<LandingUpdate>, ProviderError> {
         self.resources
             .read_updates(&self.writable_pool_keys)
             .map_err(ExecutionFailure::into_readback_provider)
@@ -2612,6 +2695,17 @@ fn validate_descriptor_limits(
             .count(),
     )
     .map_err(|_| failure("reflected texture count overflows u32"))?;
+    // Writable storage images bind as `STORAGE_IMAGE` descriptors
+    // (`research/docs/26` §21.4, C2), a third descriptor class with its own
+    // per-stage and per-set limits.
+    let storage_image_count = u32::try_from(
+        reflection
+            .bindings
+            .iter()
+            .filter(|binding| matches!(binding.kind, ResourceKind::StorageImage))
+            .count(),
+    )
+    .map_err(|_| failure("reflected storage image count overflows u32"))?;
     // AIR static samplers and runtime `[[sampler(n)]]` bindings each consume
     // one sampler descriptor (`research/docs/26` §21.3, C1b).
     let sampler_count = u32::try_from(
@@ -2632,12 +2726,17 @@ fn validate_descriptor_limits(
         || buffer_count > limits.max_descriptor_set_storage_buffers
         || sampled_count > limits.max_per_stage_descriptor_sampled_images
         || sampled_count > limits.max_descriptor_set_sampled_images
+        || storage_image_count > limits.max_per_stage_descriptor_storage_images
+        || storage_image_count > limits.max_descriptor_set_storage_images
         || sampled_count.saturating_add(sampler_count) > limits.max_per_stage_descriptor_samplers
         || sampled_count.saturating_add(sampler_count) > limits.max_descriptor_set_samplers
-        || buffer_count.saturating_add(sampled_count) > limits.max_per_stage_resources
+        || buffer_count
+            .saturating_add(sampled_count)
+            .saturating_add(storage_image_count)
+            > limits.max_per_stage_resources
     {
         return Err(failure(format!(
-            "{buffer_count} storage buffers, {sampled_count} sampled textures and {sampler_count} samplers exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
+            "{buffer_count} storage buffers, {sampled_count} sampled textures, {storage_image_count} storage images and {sampler_count} samplers exceed Vulkan descriptor limits per-stage-buffers={} per-set-buffers={} per-stage-images={} per-stage-samplers={} all-resources={} bound-sets={}",
             limits.max_per_stage_descriptor_storage_buffers,
             limits.max_descriptor_set_storage_buffers,
             limits.max_per_stage_descriptor_sampled_images,
@@ -2655,12 +2754,15 @@ fn validate_descriptor_limits(
 /// An AIR-embedded constexpr sampler (`ResourceKind::StaticSampler`) and a
 /// runtime `[[sampler(n)]]` (`ResourceKind::Sampler`) each own a `VkSampler`
 /// the provider creates from the reflected state and binds at the binding the
-/// reflection names (`research/docs/26` §21.3, C1b).
+/// reflection names (`research/docs/26` §21.3, C1b). A writable storage image
+/// (`ResourceKind::StorageImage`) binds as a plain `STORAGE_IMAGE` with no
+/// sampler at all (§21.4, C2).
 fn descriptor_type_for_binding(
     binding: &metal2vulkan::reflect::ResourceBinding,
 ) -> vk::DescriptorType {
     match binding.kind {
         ResourceKind::Texture => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        ResourceKind::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
         ResourceKind::StaticSampler | ResourceKind::Sampler => vk::DescriptorType::SAMPLER,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
@@ -3239,17 +3341,20 @@ fn validate_pipeline_reflection(
     }
     let mut descriptor_bindings = BTreeSet::new();
     for binding in &reflection.bindings {
-        // The reviewed compute face: Metal buffers, sampled textures, and the
-        // AIR-embedded constexpr samplers this increment executes
-        // (`research/docs/26` §21.3, C1b). Everything else — runtime
-        // `[[sampler(n)]]`, storage images, color inputs, imageblocks — stays
-        // outside the subset and is refused by name.
+        // The reviewed compute face: Metal buffers, sampled textures, writable
+        // storage images, and the AIR-embedded constexpr samplers this rail
+        // executes (`research/docs/26` §21.3–§21.4, C1b/C2). Everything else —
+        // runtime `[[sampler(n)]]`, color inputs, imageblocks, texture arrays —
+        // stays outside the subset and is refused by name.
         if !matches!(
             binding.kind,
-            ResourceKind::Buffer | ResourceKind::Texture | ResourceKind::StaticSampler
+            ResourceKind::Buffer
+                | ResourceKind::Texture
+                | ResourceKind::StorageImage
+                | ResourceKind::StaticSampler
         ) {
             return Err(failure(format!(
-                "the compute texture subset supports Metal buffers, sampled textures and AIR static samplers, not {:?}",
+                "the compute texture subset supports Metal buffers, sampled textures, writable storage images and AIR static samplers, not {:?}",
                 binding.kind
             )));
         }
@@ -3258,6 +3363,7 @@ fn validate_pipeline_reflection(
         let what = match binding.kind {
             ResourceKind::Buffer => "buffer",
             ResourceKind::Texture => "texture",
+            ResourceKind::StorageImage => "storage image",
             _ => "static sampler",
         };
         let descriptor = binding.descriptor.ok_or_else(|| {
@@ -3288,6 +3394,26 @@ fn validate_pipeline_reflection(
             if binding.texture_shape.is_none() {
                 return Err(failure(format!(
                     "Metal texture {} has no reflected shape",
+                    binding.metal_index
+                )));
+            }
+            continue;
+        }
+        if binding.kind == ResourceKind::StorageImage {
+            // A storage image is the writable sibling of the sampled face
+            // (`research/docs/26` §21.4, C2). The shape is checked where the
+            // contract is derived (`map_storage_image_binding`), so this gate
+            // only states what the execution path needs: one writable
+            // classification and a reflected shape to address it with.
+            if binding.access != Some(ResourceAccess::Storage) {
+                return Err(failure(format!(
+                    "Metal storage image {} is not a writable storage classification ({:?})",
+                    binding.metal_index, binding.access
+                )));
+            }
+            if binding.texture_shape.is_none() {
+                return Err(failure(format!(
+                    "Metal storage image {} has no reflected shape",
                     binding.metal_index
                 )));
             }
@@ -3356,9 +3482,14 @@ fn validate_bound_buffers(
     buffers: &[(u32, usize)],
     grid: [u32; 3],
 ) -> Result<(), ExecutorError> {
+    // Buffer indices only. Textures and storage images share the Metal argument
+    // index space with buffers (`research/docs/26` §21.3–§21.4): a storage
+    // image alone at index 0 is not a buffer slot the caller failed to bind, and
+    // the checks below answer buffer questions only.
     let metal_indices = reflection
         .bindings
         .iter()
+        .filter(|binding| binding.kind == ResourceKind::Buffer)
         .map(|binding| binding.metal_index)
         .collect::<BTreeSet<_>>();
     let mut supplied = BTreeSet::new();
@@ -3576,9 +3707,12 @@ struct GpuBuffer {
     uploaded_ranges: BTreeMap<usize, usize>,
 }
 
-/// One sampled texture owned by an execution: a host-visible `VkImage` and the
-/// sampler the provider supplies for it, because the translator synthesizes
-/// the sampler (`research/docs/16` §4.3). Only R32Uint/D2 is admitted.
+/// One texture owned by an execution. A sampled texture is a host-visible
+/// linear `VkImage` and the sampler the provider supplies for it, because the
+/// translator synthesizes the sampler (`research/docs/16` §4.3); a writable
+/// storage image carries no sampler and travels through a
+/// [`GpuStorageImage`] transfer buffer instead (`research/docs/26` §21.4, C2).
+/// Only D2 single-sample R32 textures are admitted on either face.
 struct GpuTexture {
     index: u64,
     /// The descriptor writer resolves the texture through the pass binding
@@ -3587,7 +3721,24 @@ struct GpuTexture {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// `vk::Sampler::null()` for a storage image, which binds as a plain
+    /// `STORAGE_IMAGE` descriptor.
     sampler: vk::Sampler,
+    /// The transfer backing of a storage image; `None` for a sampled texture.
+    storage: Option<GpuStorageImage>,
+}
+
+/// The host-visible transfer buffer one storage image's bytes travel through
+/// (`research/docs/26` §21.4, C2). It holds the view's initial contents before
+/// the first dispatch and the landed texels after the last one, both tightly
+/// packed, and stays mapped for the execution's lifetime.
+struct GpuStorageImage {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapping: usize,
+    len: usize,
+    /// The extent the copy regions cover: the view's own texel extent.
+    extent: vk::Extent3D,
 }
 
 /// One `VkSampler` created for an AIR-embedded constexpr sampler binding
@@ -4478,11 +4629,14 @@ impl ExecutionResources {
         Ok(())
     }
 
-    /// Upload the submission's sampled textures. Only the first increment's
-    /// shape is admitted: a D2, single-sample R32Uint texture with an owned
-    /// byte source. The provider creates the image, its view and the sampler
-    /// the translator expects at the texture binding; the descriptor write
-    /// happens in `create_descriptors`.
+    /// Upload the submission's textures. Two shapes are admitted: a D2,
+    /// single-sample R32Uint/R32Float sampled texture with an owned byte source
+    /// (host-visible linear image plus the sampler its binding executes with),
+    /// and the writable storage image of `research/docs/26` §21.4 (C2), whose
+    /// bytes travel through a transfer buffer because a `STORAGE_IMAGE` needs
+    /// the optimal tiling. The provider creates the image, its view and, for a
+    /// sampled binding, the sampler the translator expects; the descriptor
+    /// write happens in `create_descriptors`.
     fn create_textures(
         &mut self,
         textures: &[metal_api_core::provider::TextureView],
@@ -4496,6 +4650,10 @@ impl ExecutionResources {
             let byte_length = texture
                 .expected_bytes()
                 .map_err(|error| failure(format!("texture {}: {error}", texture.metal_binding)))?;
+            if texture.access == TextureAccess::Storage {
+                self.create_storage_texture(texture, byte_length, dispatches)?;
+                continue;
+            }
             let vk_format = match texture.format {
                 TextureFormat::R32Uint => vk::Format::R32_UINT,
                 TextureFormat::R32Float => vk::Format::R32_SFLOAT,
@@ -4702,8 +4860,270 @@ impl ExecutionResources {
                 memory,
                 view,
                 sampler,
+                storage: None,
             });
         }
+        Ok(())
+    }
+
+    /// Create one writable storage image and the transfer buffer its bytes
+    /// travel through (`research/docs/26` §21.4, C2).
+    ///
+    /// A `STORAGE_IMAGE` is only guaranteed on optimal tiling, so the image
+    /// cannot be the host-visible linear one a sampled texture is. The bytes
+    /// therefore enter through `vkCmdCopyBufferToImage` before the first
+    /// dispatch and leave through `vkCmdCopyImageToBuffer` after the last one,
+    /// both recorded by [`Self::record`]; the transfer buffer stays mapped for
+    /// the execution's lifetime, exactly as an owned buffer backing does.
+    /// `byte_length` is the view's tightly packed extent, which is also the
+    /// extent the writeback channel requires.
+    fn create_storage_texture(
+        &mut self,
+        texture: &metal_api_core::provider::TextureView,
+        byte_length: u64,
+        dispatches: &[BoundDispatch],
+    ) -> Result<(), ExecutionFailure> {
+        use metal_api_core::provider::{TextureAccess, TextureFormat, TextureSource, TextureType};
+
+        // One format: the R32f storage image `texture2d<float, write>` and
+        // `texture2d<float, read_write>` lower to, and the one the contract
+        // derivation admits (`map_storage_image_binding`). A second format
+        // enters through a fixture that proves its landing, exactly as the
+        // sampled face's list does.
+        let vk_format = match texture.format {
+            TextureFormat::R32Float => vk::Format::R32_SFLOAT,
+            other => {
+                return Err(failure(format!(
+                    "storage image {} needs the reviewed D2 single-sample R32Float shape, not {other:?}",
+                    texture.metal_binding
+                ))
+                .into())
+            }
+        };
+        if texture.texture_type != TextureType::D2
+            || texture.sample_count != 1
+            || texture.depth != 1
+            || texture.array_length != 1
+            || texture.access != TextureAccess::Storage
+        {
+            return Err(failure(format!(
+                "storage image {} needs the reviewed D2 single-sample R32Float shape",
+                texture.metal_binding
+            ))
+            .into());
+        }
+        let TextureSource::OwnedBytes(bytes) = &texture.source else {
+            return Err(failure(format!(
+                "storage image {} needs an owned byte source in this increment",
+                texture.metal_binding
+            ))
+            .into());
+        };
+        let index = u64::from(texture.metal_binding);
+        if self.textures.iter().any(|existing| existing.index == index) {
+            return Err(failure(format!(
+                "texture {} occurs more than once",
+                texture.metal_binding
+            ))
+            .into());
+        }
+        // The first device fact the storage face asks: this format has to be
+        // usable as a storage image on the tiling the rail creates. A device
+        // that answers otherwise is refused by name instead of being handed a
+        // descriptor it cannot execute.
+        let features = unsafe {
+            self.context
+                .instance
+                .get_physical_device_format_properties(self.context.physical, vk_format)
+        };
+        if !features
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+        {
+            return Err(failure(format!(
+                "device reports no optimal-tiling storage image support for {:?}; refusing instead of binding a descriptor it cannot execute",
+                texture.format
+            ))
+            .into());
+        }
+        let extent = vk::Extent3D {
+            width: u32::try_from(texture.width)
+                .map_err(|_| failure("storage image width overflows u32"))?,
+            height: u32::try_from(texture.height)
+                .map_err(|_| failure("storage image height overflows u32"))?,
+            depth: 1,
+        };
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let (image, memory, _requirements) = allocate_image_backing(
+            &self.context,
+            &image_info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            "storage image",
+        )?;
+        let view = match create_color_image_view(&self.context, image, vk_format, "storage image") {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(error);
+            }
+        };
+        // The transfer buffer: host-visible, tightly packed, and large enough
+        // for the view's whole extent. It is created with the bytes already in
+        // it, so the record path only has to copy device-to-device.
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(byte_length)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = match unsafe { self.context.device.create_buffer(&buffer_info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_image_view(view, None);
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("create storage image transfer buffer: {error}"),
+                ));
+            }
+        };
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.destroy_image_view(view, None);
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let buffer_memory = match unsafe { self.context.device.allocate_memory(&allocation, None) }
+        {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_buffer(buffer, None);
+                    self.context.device.destroy_image_view(view, None);
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("allocate storage image transfer memory: {error}"),
+                ));
+            }
+        };
+        let cleanup = |context: &VulkanContext| unsafe {
+            context.device.destroy_buffer(buffer, None);
+            context.device.free_memory(buffer_memory, None);
+            context.device.destroy_image_view(view, None);
+            context.device.destroy_image(image, None);
+            context.device.free_memory(memory, None);
+        };
+        if let Err(error) = unsafe {
+            self.context
+                .device
+                .bind_buffer_memory(buffer, buffer_memory, 0)
+        } {
+            cleanup(&self.context);
+            return Err(ExecutionFailure::vulkan(
+                error,
+                format!("bind storage image transfer memory: {error}"),
+            ));
+        }
+        let mapped = match unsafe {
+            self.context.device.map_memory(
+                buffer_memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                cleanup(&self.context);
+                return Err(ExecutionFailure::vulkan(
+                    error,
+                    format!("map storage image transfer memory: {error}"),
+                ));
+            }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        }
+        self.context.record_buffer_upload();
+        self.context.record_buffer_upload_bytes(bytes.len());
+        let pool_key = match dispatches
+            .iter()
+            .flat_map(|dispatch| dispatch.bindings.iter())
+            .find(|binding| {
+                binding.metal_index == texture.metal_binding
+                    && binding.key.kind == PoolKind::Texture
+            })
+            .map(|binding| binding.key)
+        {
+            Some(pool_key) => pool_key,
+            None => {
+                cleanup(&self.context);
+                return Err(failure(format!(
+                    "Metal storage image {} is not bound in any dispatch",
+                    texture.metal_binding
+                ))
+                .into());
+            }
+        };
+        let length = usize::try_from(byte_length).map_err(|_| {
+            failure(format!(
+                "storage image {} length overflows usize",
+                texture.metal_binding
+            ))
+        })?;
+        if let Err(error) = self.register_view(pool_key, index, 0, length) {
+            cleanup(&self.context);
+            return Err(error);
+        }
+        self.textures.push(GpuTexture {
+            index,
+            pool_key,
+            image,
+            memory,
+            view,
+            sampler: vk::Sampler::null(),
+            storage: Some(GpuStorageImage {
+                buffer,
+                memory: buffer_memory,
+                mapping: mapped as usize,
+                len: length,
+                extent,
+            }),
+        });
         Ok(())
     }
 
@@ -5038,11 +5458,13 @@ impl ExecutionResources {
             .map_err(|_| failure("descriptor set count overflows u32"))?;
         let mut storage_buffer_count = 0_u32;
         let mut sampled_image_count = 0_u32;
+        let mut storage_image_count = 0_u32;
         let mut sampler_count = 0_u32;
         for pipeline in translated {
             for binding in &pipeline.reflection().bindings {
                 let counter = match descriptor_type_for_binding(binding) {
                     vk::DescriptorType::COMBINED_IMAGE_SAMPLER => &mut sampled_image_count,
+                    vk::DescriptorType::STORAGE_IMAGE => &mut storage_image_count,
                     vk::DescriptorType::SAMPLER => &mut sampler_count,
                     _ => &mut storage_buffer_count,
                 };
@@ -5051,7 +5473,7 @@ impl ExecutionResources {
                     .ok_or_else(|| failure("descriptor pool count overflows u32"))?;
             }
         }
-        let mut sizes = Vec::with_capacity(3);
+        let mut sizes = Vec::with_capacity(4);
         if storage_buffer_count > 0 {
             sizes.push(vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -5062,6 +5484,12 @@ impl ExecutionResources {
             sizes.push(vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: sampled_image_count,
+            });
+        }
+        if storage_image_count > 0 {
+            sizes.push(vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: storage_image_count,
             });
         }
         if sampler_count > 0 {
@@ -5099,6 +5527,7 @@ impl ExecutionResources {
             let mut writes = Vec::with_capacity(reflection.bindings.len());
             let mut buffer_infos = Vec::with_capacity(reflection.bindings.len());
             let mut image_infos = Vec::with_capacity(reflection.bindings.len());
+            let mut storage_infos = Vec::with_capacity(reflection.bindings.len());
             let mut sampler_infos = Vec::with_capacity(reflection.bindings.len());
             for binding in &reflection.bindings {
                 if matches!(
@@ -5153,6 +5582,43 @@ impl ExecutionResources {
                     writes.push(vk::WriteDescriptorSet::default());
                     continue;
                 }
+                if binding.kind == ResourceKind::StorageImage {
+                    // A storage image is written by the module itself, so the
+                    // descriptor carries the image view in `GENERAL` and no
+                    // sampler (`research/docs/26` §21.4, C2). The layout is the
+                    // one the record path transitions to before the first
+                    // dispatch binds it.
+                    let pool_key = dispatch
+                        .bindings
+                        .iter()
+                        .find(|candidate| {
+                            candidate.metal_index == binding.metal_index
+                                && candidate.key.kind == PoolKind::Texture
+                        })
+                        .map(|candidate| candidate.key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "pass binds no storage image at Metal index {}; bindings={:?}",
+                                binding.metal_index, dispatch.bindings
+                            ))
+                        })?;
+                    let texture = self
+                        .textures
+                        .iter()
+                        .find(|texture| texture.pool_key == pool_key)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "Metal storage image {} was not uploaded for this submission",
+                                binding.metal_index
+                            ))
+                        })?;
+                    let info = vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_view(texture.view);
+                    storage_infos.push(info);
+                    writes.push(vk::WriteDescriptorSet::default());
+                    continue;
+                }
                 let pool_key = dispatch
                     .bindings
                     .iter()
@@ -5175,6 +5641,7 @@ impl ExecutionResources {
             // descriptor writes borrow the vectors, so the slices stay valid
             // until `update_descriptor_sets` returns.
             let mut image_cursor = 0;
+            let mut storage_cursor = 0;
             let mut buffer_cursor = 0;
             let mut sampler_cursor = 0;
             let writes = writes
@@ -5197,6 +5664,12 @@ impl ExecutionResources {
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .image_info(std::slice::from_ref(&image_infos[image_cursor]));
                         image_cursor += 1;
+                        write
+                    } else if binding.kind == ResourceKind::StorageImage {
+                        let write = write
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(std::slice::from_ref(&storage_infos[storage_cursor]));
+                        storage_cursor += 1;
                         write
                     } else {
                         let write = write
@@ -5331,8 +5804,14 @@ impl ExecutionResources {
                 })?;
             // Host-visible linear images are uploaded in PREINITIALIZED and the
             // sampled descriptor binds them in GENERAL, so the first transition
-            // needs only the new layout, not an access scope.
+            // needs only the new layout, not an access scope. A storage image
+            // is not in that state: it is created UNDEFINED and its own upload
+            // chain below transitions it to GENERAL (`research/docs/26` §21.4,
+            // C2), so it is skipped here.
             for texture in &self.textures {
+                if texture.storage.is_some() {
+                    continue;
+                }
                 let barrier = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::PREINITIALIZED)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -5354,6 +5833,80 @@ impl ExecutionResources {
                     &[],
                     &[],
                     &[barrier],
+                );
+            }
+            // Each storage image lands its initial contents before the first
+            // dispatch: UNDEFINED -> TRANSFER_DST_OPTIMAL, copy the whole
+            // tightly packed view from its transfer buffer, then
+            // TRANSFER_DST_OPTIMAL -> GENERAL, which is the layout the storage
+            // descriptor states and the only one a shader may read or write
+            // through (`research/docs/26` §21.4, C2). The copy covers whole
+            // texels of a single-mip, single-layer 2D image, so the buffer's
+            // rows are the image's rows with no padding to state.
+            for texture in &self.textures {
+                let Some(storage) = &texture.storage else {
+                    continue;
+                };
+                let subresource = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let acquire = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(range);
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[acquire],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(subresource)
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(storage.extent);
+                self.context.device.cmd_copy_buffer_to_image(
+                    self.command,
+                    storage.buffer,
+                    texture.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                let release = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(range);
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[release],
                 );
             }
             for (pass_index, plan) in plans.iter().enumerate() {
@@ -5436,6 +5989,80 @@ impl ExecutionResources {
                         );
                     }
                 }
+            }
+            // Every storage image copies its landed texels back after the last
+            // dispatch: GENERAL -> TRANSFER_SRC_OPTIMAL, one
+            // `vkCmdCopyImageToBuffer` of the whole tightly packed view, then a
+            // TRANSFER -> HOST barrier so the mapped transfer buffer's bytes
+            // are the ones the copy wrote (`research/docs/26` §21.4, C2). The
+            // transfer buffer is the same one the initial contents rode in on,
+            // so a landing is one buffer per image and no second allocation.
+            for texture in &self.textures {
+                let Some(storage) = &texture.storage else {
+                    continue;
+                };
+                let subresource = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let release = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(range);
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[release],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(subresource)
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(storage.extent);
+                self.context.device.cmd_copy_image_to_buffer(
+                    self.command,
+                    texture.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    storage.buffer,
+                    &[region],
+                );
+                let available = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(storage.buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                self.context.device.cmd_pipeline_barrier(
+                    self.command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[available],
+                    &[],
+                );
             }
             // Fence retirement establishes execution completion; this barrier
             // makes compute writes available to coherent host readback.
@@ -5547,7 +6174,7 @@ impl ExecutionResources {
     fn read_updates(
         &self,
         writable_pool_keys: &BTreeSet<u32>,
-    ) -> Result<Vec<BufferUpdate>, ExecutionFailure> {
+    ) -> Result<Vec<LandingUpdate>, ExecutionFailure> {
         let mut updates = Vec::new();
         // One readback operation per distinct device buffer, then one slice per
         // writable view: a shared backing is read once even when several of its
@@ -5585,13 +6212,42 @@ impl ExecutionResources {
             if !bytes.is_empty() {
                 self.context.record_buffer_readback_bytes(bytes.len());
             }
-            updates.push(BufferUpdate {
-                index: pool_key,
+            updates.push(LandingUpdate {
+                target: LandingTarget::Buffer(pool_key),
                 offset: 0,
                 bytes,
             });
         }
-        updates.sort_by_key(|update| update.index);
+        // One readback per storage image, taken from the transfer buffer the
+        // record path copied the landed texels into (`research/docs/26` §21.4,
+        // C2). The bytes are the view's whole tightly packed extent, which is
+        // exactly the landing the writeback channel requires, and the mapping
+        // was made at creation and stays valid until this execution's
+        // resources are destroyed.
+        for texture in &self.textures {
+            let Some(storage) = &texture.storage else {
+                continue;
+            };
+            self.context.record_buffer_readback();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(storage.mapping as *const u8, storage.len).to_vec()
+            };
+            if !bytes.is_empty() {
+                self.context.record_buffer_readback_bytes(bytes.len());
+            }
+            updates.push(LandingUpdate {
+                target: LandingTarget::Texture(
+                    u32::try_from(texture.index)
+                        .map_err(|_| failure("storage image index overflows u32"))?,
+                ),
+                offset: 0,
+                bytes,
+            });
+        }
+        updates.sort_by_key(|update| match update.target {
+            LandingTarget::Buffer(key) => (0_u8, key),
+            LandingTarget::Texture(index) => (1_u8, index),
+        });
         Ok(updates)
     }
 }
@@ -5652,10 +6308,17 @@ impl Drop for ExecutionResources {
                 self.context.device.free_memory(memory, None);
             }
             for texture in &self.textures {
-                self.context.device.destroy_sampler(texture.sampler, None);
+                if texture.sampler != vk::Sampler::null() {
+                    self.context.device.destroy_sampler(texture.sampler, None);
+                }
                 self.context.device.destroy_image_view(texture.view, None);
                 self.context.device.destroy_image(texture.image, None);
                 self.context.device.free_memory(texture.memory, None);
+                if let Some(storage) = &texture.storage {
+                    self.context.device.unmap_memory(storage.memory);
+                    self.context.device.destroy_buffer(storage.buffer, None);
+                    self.context.device.free_memory(storage.memory, None);
+                }
             }
             for sampler in &self.static_samplers {
                 self.context.device.destroy_sampler(sampler.sampler, None);

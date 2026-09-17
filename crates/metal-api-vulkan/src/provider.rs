@@ -365,6 +365,7 @@ pub(crate) fn pipeline_contract(
     }
     let mut buffer_bindings = Vec::with_capacity(reflection.bindings.len());
     let mut texture_bindings = Vec::new();
+    let mut sampled_texture_count = 0_usize;
     for binding in &reflection.bindings {
         // Sampled textures get their own list (`research/docs/26` §21.3, step
         // 1). Before this list existed the class judge had to trust the
@@ -374,10 +375,20 @@ pub(crate) fn pipeline_contract(
         // provider's reflection validation has admitted the binding's kind and
         // access (`research/docs/16` §4.7).
         if binding.kind == ResourceKind::Texture {
+            sampled_texture_count += 1;
             texture_bindings.push(map_texture_binding(
                 binding,
                 static_samplers.first().copied(),
             )?);
+            continue;
+        }
+        // A write-capable storage image joins the same texture list with the
+        // `Storage` access (`research/docs/26` §21.4, C2): the pair rules
+        // compare access, type, format and reach exactly as they do for a
+        // sampled binding, and the execution rail binds it as a Vulkan
+        // `STORAGE_IMAGE` instead of a combined image sampler.
+        if binding.kind == ResourceKind::StorageImage {
+            texture_bindings.push(map_storage_image_binding(binding)?);
             continue;
         }
         // The sampler itself has no separate contract entry: its state is the
@@ -387,7 +398,7 @@ pub(crate) fn pipeline_contract(
         }
         if binding.kind != ResourceKind::Buffer {
             return Err(failure(format!(
-                "provider contract only maps Metal buffers, found {:?} at {}",
+                "provider contract only maps Metal buffers, sampled textures, storage images and AIR static samplers, found {:?} at {}",
                 binding.kind, binding.metal_index
             )));
         }
@@ -402,10 +413,10 @@ pub(crate) fn pipeline_contract(
             footprint: map_footprint(footprint, binding.metal_index)?,
         });
     }
-    if !static_samplers.is_empty() && texture_bindings.len() != 1 {
+    if !static_samplers.is_empty() && sampled_texture_count != 1 {
         return Err(failure(format!(
             "a module with one AIR static sampler must declare exactly one sampled texture; reflected {}",
-            texture_bindings.len()
+            sampled_texture_count
         )));
     }
 
@@ -493,6 +504,64 @@ fn map_texture_binding(
         format,
         static_sampler.unwrap_or_else(metal_api_core::provider::SamplerPolicy::synthesized_read),
     ))
+}
+
+/// Map one reflected storage image onto the contract's texture face
+/// (`research/docs/26` §21.4, C2).
+///
+/// The reviewed storage class is the sibling of the sampled one: a D2,
+/// single-sample, non-arrayed texture the module declares write-capable, whose
+/// AIR storage format is `R32f` — the format `texture2d<float, write>` and
+/// `texture2d<float, read_write>` lower to, and the only one this increment
+/// uploads and lands. Metal's `access::write` and `access::read_write` both
+/// arrive here as `ResourceAccess::Storage`; the contract states the one
+/// storage access the execution path has instead of inventing a second. The
+/// declaration carries no sampler, because a storage descriptor has none, and
+/// states the whole view as its landing (`TextureFootprintProof::WholeView`).
+///
+/// The format list is deliberately narrower than the sampled face's: the
+/// translator spells a `texture2d<uint, write>` as `Rgba8ui`, a four-lane
+/// 8-bit storage image whose landing this increment has no fixture for, so that
+/// shape is refused here with the reflected format named rather than
+/// registered as a size nobody proved.
+fn map_storage_image_binding(
+    binding: &ResourceBinding,
+) -> Result<TextureBindingContract, ExecutorError> {
+    use metal2vulkan::meta::{TextureDimension, TextureFormat as AirTextureFormat};
+
+    let shape = binding.texture_shape.as_ref().ok_or_else(|| {
+        failure(format!(
+            "texture {} has no reflected shape",
+            binding.metal_index
+        ))
+    })?;
+    if shape.dimension != TextureDimension::D2
+        || shape.arrayed
+        || shape.multisampled
+        || shape.array_ref
+        || !shape.writable
+    {
+        return Err(failure(format!(
+            "texture {} is not the D2 single-sample storage image this rail executes",
+            binding.metal_index
+        )));
+    }
+    if binding.access != Some(ResourceAccess::Storage) {
+        return Err(failure(format!(
+            "texture {} is declared writable but the module classifies it as {:?}",
+            binding.metal_index, binding.access
+        )));
+    }
+    let format = match shape.storage_format {
+        Some(AirTextureFormat::R32f) => metal_api_core::provider::TextureFormat::R32Float,
+        other => {
+            return Err(failure(format!(
+                "texture {} has storage format {other:?}; the reviewed compute storage image is R32f (texture2d<float, write> / texture2d<float, read_write>), which is the only landed shape this increment proves",
+                binding.metal_index
+            )))
+        }
+    };
+    Ok(TextureBindingContract::storage(binding.metal_index, format))
 }
 
 fn map_access(access: Option<ResourceAccess>, index: u32) -> Result<BufferAccess, ExecutorError> {
