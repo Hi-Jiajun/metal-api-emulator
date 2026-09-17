@@ -33,12 +33,13 @@ use metal_api_core::provider::{
     DispatchKind, DispatchType, FieldValue, IndexBufferBinding, IndexFormat,
     IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-    LeaseReservation, LoadOp, NoCopyLeaseImporter, OperationId, PipelineId, PresentDescriptor,
-    PresentMode, PresentTarget, ProviderCapabilities, ProviderError, ProviderErrorClass,
-    ProviderPhase, RenderAttachment, RenderPassDescriptor, RenderPipelineContract,
-    ResourceTableSnapshot, SemanticDigest, StagedLease, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    LeaseReservation, LoadOp, MultisampleState, NoCopyLeaseImporter, OperationId, PipelineId,
+    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, SampleCount, SemanticDigest, StagedLease,
+    StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -1903,6 +1904,28 @@ fn vertex_input_fixture_with_load(
     index_bytes: Vec<u8>,
     load: bool,
 ) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
+    vertex_input_fixture_with_raster(vertex_bytes, index_bytes, load, None)
+}
+
+/// The same fixture drawn into a four-sample raster the attachment is seeded
+/// into (`research/docs/23` §82, v82): the shape the multisampled `Load` route
+/// exists for.
+fn vertex_input_fixture_with_multisample(
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+    load: bool,
+) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
+    vertex_input_fixture_with_raster(vertex_bytes, index_bytes, load, Some(SampleCount::Four))
+}
+
+/// The body of the vertex-input fixtures: one pass over a 2×2 attachment whose
+/// load op and raster sample count the caller selects.
+fn vertex_input_fixture_with_raster(
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+    load: bool,
+    samples: Option<SampleCount>,
+) -> Option<(VulkanComputeProvider, ComputeTrace, ResourceTableSnapshot)> {
     let executor = executor()?;
     let device = Device::new(Arc::clone(&executor) as Arc<dyn ComputeExecutor>);
     let provider =
@@ -1936,6 +1959,9 @@ fn vertex_input_fixture_with_load(
         // The declaring compute case's attachment view carries the previous
         // bytes; the rail uploads them before the draw.
         pass.color_attachments[0].load = LoadOp::Load;
+    }
+    if let Some(sample_count) = samples {
+        pass.multisample = Some(MultisampleState { sample_count });
     }
     // The draw's count is the index count: six for the reviewed quad, three for
     // the load fixture's single triangle.
@@ -2142,6 +2168,69 @@ fn a_loading_pass_keeps_the_bytes_the_draw_does_not_cover() {
     assert!(
         cleared.chunks_exact(4).any(|texel| texel == CLEAR_SENTINEL),
         "a clearing pass leaves its own colour where the draw missed: {}",
+        hex(&cleared)
+    );
+    assert_ne!(cleared, attachment);
+}
+
+/// The v82 tail channel: a multisampled attachment a pass opens with
+/// `LoadOp::Load`.
+///
+/// A multisampled image cannot receive its previous bytes through
+/// `vkCmdCopyBufferToImage` — the command's own valid usage holds its
+/// destination to one sample (`VUID-vkCmdCopyBufferToImage-dstImage-07973`) —
+/// so the rail seeds every sample of the image with the declaring view's own
+/// texel through a `CLEAR`-opened render pass it records before the measured
+/// one, which then opens the image with `LOAD` (`research/docs/23` §82). The
+/// left-column triangle covers the left texel of the 2×2 attachment completely
+/// and the right one not at all, so the resolve is deterministic on any device:
+/// the covered texel carries the fragment output and the uncovered one the
+/// seed. What this measures that the clearing fixture cannot: a rail that
+/// dropped the declared bytes would land the driver's own undefined contents
+/// in the uncovered texel, and a rail that refused the shape would land
+/// nothing.
+#[test]
+fn a_multisampled_load_pass_resolves_the_seeded_samples() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture_with_multisample(left_column_vertex_bytes(), quad_index_bytes(), true)
+    else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("seeded multisample readback: {}", hex(&attachment));
+    assert_eq!(attachment.len(), 16);
+    let covered = attachment
+        .chunks_exact(4)
+        .filter(|texel| *texel == QUAD_TEXEL)
+        .count();
+    let seeded = attachment
+        .chunks_exact(4)
+        .filter(|texel| *texel == ATTACHMENT_WORD)
+        .count();
+    assert_eq!(
+        (covered, seeded),
+        (2, 2),
+        "the covered texels resolve the fragment output and the uncovered ones the seed: {}",
+        hex(&attachment)
+    );
+
+    // The counter-shape: the identical raster opened from a clear leaves the
+    // clear sentinel where the draw missed, which is exactly the byte the seed
+    // replaces. The two runs therefore differ in the texels the load is about.
+    let Some((provider, trace, resources)) = vertex_input_fixture_with_multisample(
+        left_column_vertex_bytes(),
+        quad_index_bytes(),
+        false,
+    ) else {
+        return;
+    };
+    let writebacks = submit_vertex_input(&provider, &trace, &resources);
+    let cleared = readback(&writebacks, ATTACHMENT_VIEW);
+    eprintln!("cleared multisample readback: {}", hex(&cleared));
+    assert!(
+        cleared.chunks_exact(4).any(|texel| texel == CLEAR_SENTINEL),
+        "a clearing multisampled pass leaves its own colour where the draw missed: {}",
         hex(&cleared)
     );
     assert_ne!(cleared, attachment);

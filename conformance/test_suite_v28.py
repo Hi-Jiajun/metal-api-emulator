@@ -170,6 +170,24 @@ MSAA_UNIFORM_8X_ID = "msaa_uniform_8x_4x4"
 # (`research/docs/23` §3.3, v69).
 MSAA_EDGE_2X_ID = "msaa_edge_2x_4x4"
 MSAA_EDGE_8X_ID = "msaa_edge_8x_4x4"
+# The v82 trio (`research/docs/23` §82): the same edge geometry on the 4x, 2x
+# and 8x rasters, but the attachment is opened with `load` instead of a clear.
+# A multisampled image cannot be uploaded into — the transfer commands are
+# single-sample at both ends — so the reviewed route is a seed pass whose clear
+# value is the declared window itself: one repeated texel, the colour the v69
+# pair clears with. The observation is therefore the v69 pair's, and the
+# fixture's own claim is that the *declared* pre-pass bytes are what the samples
+# hold: a rail that dropped them would land the driver's undefined contents.
+MSAA_LOAD_4X_ID = "msaa_load_4x4"
+MSAA_LOAD_2X_ID = "msaa_load_2x_4x4"
+MSAA_LOAD_8X_ID = "msaa_load_8x_4x4"
+# The v82 declaring case (`research/docs/23` §82): the same v27 `copy_word`
+# shape over the same whole-allocation attachment view, holding the one repeated
+# texel the seeded-load trio's windows are made of. The v27 declaring case's own
+# bytes stay what they always were; naming a second case is what lets the load
+# trio state a seed without moving every earlier fixture's expectations.
+DECLARING_MULTISAMPLE_SEED_ID = "render_declaring_multisample_seed"
+DECLARING_QUAD_BYTES = "cd" * 64
 # The v66 case: the rail-owned combined depth-stencil pair, whose three
 # triangles share the v51 edge coverage and whose two faces are both discarded
 # with the pass (`research/docs/23` §3.3, v66).
@@ -212,6 +230,10 @@ MSAA_DS_INDEX = 23
 # The v69 edge pair follows it, the 2x case first.
 MSAA_EDGE_2X_INDEX = 24
 MSAA_EDGE_8X_INDEX = 25
+# The v82 seeded-load trio follows the v69 pair, in raster order.
+MSAA_LOAD_4X_INDEX = 26
+MSAA_LOAD_2X_INDEX = 27
+MSAA_LOAD_8X_INDEX = 28
 # The v70 render sampler (`research/docs/23` §3.3, v70): one `rgba8_unorm`
 # texture of the attachment's own extent whose own texels are the expectation.
 SAMPLED_ID = "sampled_texel_4x4"
@@ -234,7 +256,8 @@ REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID
                   MSAA_DEPTH_RESOLVE_MIN_EDGE_ID, MSAA_DEPTH_RESOLVE_MAX_EDGE_ID,
                   MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID,
                   MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID, MSAA_DS_ID,
-                  MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID, SAMPLED_ID,
+                  MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID,
+                  MSAA_LOAD_4X_ID, MSAA_LOAD_2X_ID, MSAA_LOAD_8X_ID, SAMPLED_ID,
                   FULL_COVER_16X16_ID, SAMPLED_64_ID, SAMPLED_RULE_2048_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
@@ -899,6 +922,58 @@ def msaa_edge_2x_result(provider_backend=True, copy_in=2, copy_out=2):
     if provider_backend:
         result["copy_in"], result["copy_out"] = copy_in, copy_out
     return result
+
+
+def msaa_load_result(case_id, provider_backend=True, copy_in=2, copy_out=2):
+    """One v82 seeded-load landing (`research/docs/23` §82).
+
+    The shape is the v51 case's — one colour attachment resolved into its own
+    view — and the expectation is the v69 pair's own bytes: a seeded multisample
+    raster whose declared window is the colour the v69 pair clears with resolves
+    to the same bytes, and pinning that equality is the point of the trio. Only
+    the case id changes, so one builder serves all three rasters.
+    """
+    result = {
+        "id": case_id,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": ATTACHMENT[0], "view": ATTACHMENT[1],
+                        "offset": ATTACHMENT[2], "bytes_hex": MSAA_EXPECTED}],
+        "allocations": [{"allocation": ATTACHMENT[0], "bytes_hex": MSAA_EXPECTED}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def msaa_load_4x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v82 4x landing: the raster every multisampling device admits."""
+    return msaa_load_result(MSAA_LOAD_4X_ID, provider_backend, copy_in, copy_out)
+
+
+def msaa_load_2x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v82 2x sibling, owed exactly when the device's mask carries 2x."""
+    return msaa_load_result(MSAA_LOAD_2X_ID, provider_backend, copy_in, copy_out)
+
+
+def msaa_load_8x_result(provider_backend=True, copy_in=2, copy_out=2):
+    """The v82 8x sibling, owed exactly when the device's mask carries 8x."""
+    return msaa_load_result(MSAA_LOAD_8X_ID, provider_backend, copy_in, copy_out)
+
+
+def msaa_load_results(provider_backend, render_sample_counts=0):
+    """The v82 trio's results for a capture whose sample mask is known.
+
+    The 4x raster is the v51 baseline every multisampling device admits, so its
+    case is owed by every capture that reads the suite; the 2x and 8x cases
+    carry the v61 device gate, so only a mask that carries their bit owes them
+    (`research/docs/23` §3.3, v61/v82).
+    """
+    results = [msaa_load_4x_result(provider_backend)]
+    if render_sample_counts & (1 << 1):
+        results.append(msaa_load_2x_result(provider_backend))
+    if render_sample_counts & (1 << 3):
+        results.append(msaa_load_8x_result(provider_backend))
+    return results
 
 
 def sampled_result(provider_backend=True, copy_in=3, copy_out=2):
@@ -1575,6 +1650,7 @@ class ScissorObservationTests(unittest.TestCase):
                     msaa_stencil_resolve_drs_result(rail != "native-metal"))
             if owes_msaa_ds:
                 report["results"].append(msaa_ds_result(rail != "native-metal"))
+            report["results"].extend(msaa_load_results(rail != "native-metal"))
             with self.subTest(rail=rail):
                 if not owes_depth_store:
                     self.assertNotIn(DEPTH_STORE_ID,
@@ -1661,6 +1737,7 @@ class ScissorObservationTests(unittest.TestCase):
                     msaa_stencil_resolve_drs_result(rail != "native-metal"))
             if owes_msaa_ds:
                 report["results"].append(msaa_ds_result(rail != "native-metal"))
+            report["results"].extend(msaa_load_results(rail != "native-metal"))
             with self.subTest(rail=rail):
                 compare.validate_capture(suite, digest, report, rail)
 
@@ -1738,6 +1815,7 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
                 report["results"].append(
                     msaa_depth_resolve_max_edge_result(rail != "native-metal"))
+            report["results"].extend(msaa_load_results(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -1794,6 +1872,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(msaa_edge_2x_result())
         report["results"].append(msaa_edge_8x_result())
         report["results"].append(msaa_ds_result())
+        report["results"].extend(msaa_load_results(True, 1 << 1 | 1 << 3))
         compare.validate_capture(self.suite, digest, report, "vulkan")
 
     def test_v28_pins_the_base_vertex_fixture(self):
@@ -2988,6 +3067,7 @@ class ScissorObservationTests(unittest.TestCase):
             if rail in MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS:
                 report["results"].append(
                     msaa_depth_resolve_max_edge_result(rail != "native-metal"))
+            report["results"].extend(msaa_load_results(rail != "native-metal"))
             with self.subTest(rail=rail):
                 with self.assertRaisesRegex(compare.CaptureError,
                                             "is not a rail this render case runs on"):
@@ -3075,14 +3155,55 @@ class ScissorObservationTests(unittest.TestCase):
                                     "fragment output"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
-    def test_v28_refuses_a_multisample_case_with_a_loading_attachment(self):
-        broken = copy.deepcopy(self.suite)
+    def test_v28_admits_a_seeded_multisample_load_and_refuses_a_per_texel_seed(self):
+        # The v82 shape (`research/docs/23` §82): a multisampled raster whose
+        # attachment is opened with `load` and whose declared window is one
+        # repeated texel is the reviewed seed route. The 4x case's own bytes are
+        # the v69 pair's, because a seeded raster whose window is the colour the
+        # cleared pair opens with resolves to the same picture.
+        case = copy.deepcopy(self.suite["render_cases"][MSAA_INDEX])
+        seed = case["attachment"]["clear_hex"]
+        del case["attachment"]["clear_hex"]
+        case["attachment"]["load"] = "load"
+        case["attachment"]["initial_hex"] = seed * 16
+        # The seed is what the declaring case declares for the attachment view,
+        # so the mutated case names the v82 declaring case (`research/docs/23`
+        # §82) rather than the v27 one whose view holds `cd` bytes.
+        case["declaring_case"] = DECLARING_MULTISAMPLE_SEED_ID
+        suite = copy.deepcopy(self.suite)
+        suite["render_cases"][MSAA_INDEX] = case
+        plan = compare._render_plan(compare._suite_plan(suite), suite)
+        self.assertIn(MSAA_ID, plan)
+
+        # A window that is not one repeated texel is a seed no reviewed rail
+        # executes: the clear value is one colour for the whole attachment.
+        broken = copy.deepcopy(suite)
         attachment = broken["render_cases"][MSAA_INDEX]["attachment"]
-        attachment["load"] = "load"
-        attachment["initial_hex"] = MSAA_CLEAR * 16
-        del attachment["clear_hex"]
+        mixed = attachment["initial_hex"]
+        attachment["initial_hex"] = mixed[:8] + "ff" + mixed[10:]
+        # The declaring case moves with the window, or the earlier
+        # declared-bytes rule would fire first and the uniformity refusal below
+        # would never be reached.
+        declaring = next(case for case in broken["cases"]
+                         if case["id"] == DECLARING_MULTISAMPLE_SEED_ID)
+        declared = next(buffer for buffer in declaring["buffers"]
+                        if buffer["allocation"] == ATTACHMENT[0])
+        declared["initial_hex"] = attachment["initial_hex"]
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "the reviewed multisample pass opens its attachment"):
+                                    "loads one repeated texel"):
+            compare._render_plan(compare._suite_plan(broken), broken)
+
+        # A single-sample `load` still has nothing unclaimed, so the constrained
+        # channel stays refused there.
+        broken = copy.deepcopy(self.suite)
+        attachment = broken["render_cases"][0]["attachment"]
+        attachment["load"] = "load"
+        attachment["initial_hex"] = DECLARING_QUAD_BYTES
+        del attachment["clear_hex"]
+        broken["render_cases"][0]["wildcard_allowed_texels"] = [
+            {"index": 2, "allowed": [CLEAR, OUTPUT]}]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "a loaded attachment has no unclaimed texel"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v28_refuses_a_multisample_case_that_widens_to_an_attachment_list(self):

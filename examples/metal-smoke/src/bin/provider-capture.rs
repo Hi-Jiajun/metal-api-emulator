@@ -3161,6 +3161,7 @@ fn validate_suite(suite: &Suite) -> Result<()> {
         (1, "compute-buffer-v27") => &["render_declaring_two_attachments"],
         (1, "compute-buffer-v28") => &[
             "render_declaring_quad_extent",
+            "render_declaring_multisample_seed",
             "render_declaring_depth_store",
             "render_declaring_depth_resolve",
             "render_declaring_stencil_store",
@@ -5370,14 +5371,16 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         let (attachment, _) = shapes.first().ok_or(format!(
             "{where_}: a multisample raster needs an attachment"
         ))?;
-        // The attachment's load (`research/docs/23` §3.3, v51/v67): the
-        // reviewed pass opens it from a clear, or from v67 on from `dontcare`
+        // The attachment's load (`research/docs/23` §3.3, v51/v67/v82): the
+        // reviewed pass opens it from a clear, from v67 on from `dontcare`
         // while every unclaimed texel states the closed set its resolve may
-        // land in. The free list stays refused here.
-        if !matches!(attachment.load.as_str(), "clear" | "dontcare") {
+        // land in, or from v82 on from `load` whose declared window is the one
+        // repeated texel the seam seeds every sample with. The free list stays
+        // refused here.
+        if !matches!(attachment.load.as_str(), "clear" | "dontcare" | "load") {
             return Err(format!(
-                "{where_}: the reviewed multisample pass opens its attachment from a clear or a \
-                 dontcare load with constrained wildcard texels"
+                "{where_}: the reviewed multisample pass opens its attachment from a clear, a \
+                 seeded load or a dontcare load with constrained wildcard texels"
             )
             .into());
         }
@@ -5612,8 +5615,12 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         // constrained claim bounds; a cleared raster has no undefined content,
         // so the channel is only admitted there beside a multisample raster
         // that claims the partial coverage its allowed set resolves
-        // (`research/docs/23` §3.3, v67/v69), and a loaded attachment hands the
-        // pass its own bytes, so nothing is unclaimed beside it.
+        // (`research/docs/23` §3.3, v67/v69). A loaded multisample raster is the
+        // same shape one route along: its declared window is the one repeated
+        // texel the rail seeds every sample of the raster with, so the resolve
+        // is a mix of two colours the fixture owns
+        // (`research/docs/23` §82, v82). Beside a single-sample load nothing is
+        // unclaimed, so the channel keeps its refusal there.
         match attachment.load.as_str() {
             "dontcare" => {}
             "clear" => {
@@ -5633,7 +5640,18 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                 }
             }
             "load" => {
-                return Err(format!("{where_}: a loaded attachment has no unclaimed texel").into())
+                if case.multisample.is_none() {
+                    return Err(
+                        format!("{where_}: a loaded attachment has no unclaimed texel").into(),
+                    );
+                }
+                if case.coverage.as_deref() != Some("partial") {
+                    return Err(format!(
+                        "{where_}: a loaded multisample raster states the partial coverage its \
+                         seed resolves"
+                    )
+                    .into());
+                }
             }
             other => return Err(format!("{where_}: unknown attachment load op {other:?}").into()),
         }
@@ -5688,9 +5706,7 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         let fragment = unhex(shapes[0].1.as_deref().ok_or(format!(
             "{where_}: a constrained wildcard texel needs the fragment output"
         ))?)?;
-        let reference = unhex(shapes[0].0.clear_hex.as_deref().ok_or(format!(
-            "{where_}: a constrained wildcard texel needs the reference colour of its mixes"
-        ))?)?;
+        let reference = wildcard_reference(case, shapes[0].0)?;
         if reference.len() != 4 {
             return Err(format!("{where_}: a reference colour is four bytes").into());
         }
@@ -6171,37 +6187,109 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
                             )
                             .into());
                         }
-                        // Partial coverage, in both directions: every texel is
-                        // either the byte the load handed it or the pass's
-                        // fragment output, every drawn texel carries the *same*
-                        // output, and both halves appear.
-                        let mut drawn: Option<&[u8]> = None;
-                        let mut drawn_count = 0_usize;
-                        let mut kept_count = 0_usize;
-                        for (position, texel) in texels.chunks_exact(4).enumerate() {
-                            let previous = &initial[position * 4..position * 4 + 4];
-                            if texel == previous {
-                                kept_count += 1;
-                                continue;
+                        // The loaded multisampled raster
+                        // (`research/docs/23` §82, v82): the transfer commands
+                        // are single-sample at both ends, so the rail states
+                        // the declared window as one clear its own seed pass
+                        // writes into every sample and the measured pass opens
+                        // the image with `LOAD`. A clear value is one colour for
+                        // the whole attachment, so the window has to be one
+                        // repeated texel, and every pinned texel is the exact
+                        // k-of-`sample_count` resolve of that seed and the
+                        // fragment output.
+                        if let Some(multisample) = &case.multisample {
+                            let seed = initial[..4].to_vec();
+                            if initial
+                                .chunks_exact(4)
+                                .any(|texel| texel != seed.as_slice())
+                            {
+                                return Err(format!(
+                                    "{where_}: a seeded multisample raster loads one repeated \
+                                     texel; a per-texel seed is not a shape the reviewed rails \
+                                     execute"
+                                )
+                                .into());
                             }
-                            match drawn {
-                                None => drawn = Some(texel),
-                                Some(value) if value == texel => {}
-                                Some(_) => {
+                            let samples = u32::try_from(multisample.sample_count)?;
+                            let fragment = [texels[0], texels[1], texels[2], texels[3]];
+                            let claimed = case
+                                .wildcard_allowed_texels
+                                .as_ref()
+                                .map(|entries| {
+                                    entries
+                                        .iter()
+                                        .map(|entry| entry.index)
+                                        .collect::<BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            let mut partial = 0_usize;
+                            for (index, chunk) in texels.chunks_exact(4).enumerate() {
+                                if claimed.contains(&u64::try_from(index)?) {
+                                    continue;
+                                }
+                                let mut covered = None;
+                                for count in 0..=samples {
+                                    let Some(mixed) =
+                                        resolve_texel(&fragment, &seed, count, samples)
+                                    else {
+                                        continue;
+                                    };
+                                    if chunk == mixed {
+                                        covered = Some(count);
+                                        break;
+                                    }
+                                }
+                                let Some(count) = covered else {
                                     return Err(format!(
-                                        "{where_}: drawn texels disagree about the fragment output"
+                                        "{where_}: texel {index} is not the resolve of any \
+                                         coverage of the {samples}-sample raster"
                                     )
-                                    .into())
+                                    .into());
+                                };
+                                if count > 0 && count < samples {
+                                    partial += 1;
                                 }
                             }
-                            drawn_count += 1;
-                        }
-                        if drawn_count == 0 || kept_count == 0 {
-                            return Err(format!(
+                            if claimed.is_empty() && partial == 0 {
+                                return Err(format!(
+                                    "{where_}: a multisample expectation needs at least one \
+                                     partially covered texel"
+                                )
+                                .into());
+                            }
+                        } else {
+                            // Partial coverage, in both directions: every texel is
+                            // either the byte the load handed it or the pass's
+                            // fragment output, every drawn texel carries the *same*
+                            // output, and both halves appear.
+                            let mut drawn: Option<&[u8]> = None;
+                            let mut drawn_count = 0_usize;
+                            let mut kept_count = 0_usize;
+                            for (position, texel) in texels.chunks_exact(4).enumerate() {
+                                let previous = &initial[position * 4..position * 4 + 4];
+                                if texel == previous {
+                                    kept_count += 1;
+                                    continue;
+                                }
+                                match drawn {
+                                    None => drawn = Some(texel),
+                                    Some(value) if value == texel => {}
+                                    Some(_) => {
+                                        return Err(format!(
+                                        "{where_}: drawn texels disagree about the fragment output"
+                                    )
+                                        .into())
+                                    }
+                                }
+                                drawn_count += 1;
+                            }
+                            if drawn_count == 0 || kept_count == 0 {
+                                return Err(format!(
                                 "{where_}: a loaded attachment needs at least one drawn and one kept texel, \
                                  got {drawn_count} drawn and {kept_count} kept"
                             )
                             .into());
+                            }
                         }
                     }
                     "dontcare" => {
@@ -6862,7 +6950,10 @@ fn case_shape(id: &str) -> Result<CaseShape> {
         // each one word of a 16-byte view) and writes their xor into its own
         // output view.
         // v27: the v13 copy_word shape with a 4x4 attachment view (64 bytes).
-        "render_declaring_quad_extent" => (
+        // v82: the same shape over the same view, declaring the one repeated
+        // texel the multisampled load's seed pass clears every sample with
+        // (`research/docs/23` §82).
+        "render_declaring_quad_extent" | "render_declaring_multisample_seed" => (
             "copy_word",
             [1, 1, 1],
             [1, 1, 1],
@@ -10086,6 +10177,50 @@ fn verified_source(directory: &Path, source: &Source) -> Result<Vec<u8>> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The second colour of a constrained wildcard texel's mix set
+/// (`research/docs/23` §3.3, v67/v82).
+///
+/// A case states it one of two ways. A `clear` or `dontcare` multisample raster
+/// carries the case-declared `clear_hex`, which is the colour the pass opens
+/// the raster from (or the reference the fixture names beside `dontcare`). A
+/// *loaded* multisample raster carries its declared window instead: the
+/// multisampled load is executed by a seed pass whose clear value is one colour
+/// for the whole attachment, so the window has to be one repeated texel and
+/// that texel is the colour every sample starts from. Both spellings are the
+/// fixture's own colours, and the byte string this returns is what the mix set
+/// is built from.
+fn wildcard_reference(
+    case: &RenderCase,
+    attachment: &RenderAttachmentDefinition,
+) -> Result<Vec<u8>> {
+    if case.multisample.is_some() && attachment.load == "load" {
+        let previous = unhex(
+            attachment
+                .initial_hex
+                .as_deref()
+                .ok_or("a loaded multisample raster needs the seed its window is made of")?,
+        )?;
+        if previous.len() < 4
+            || previous
+                .chunks_exact(4)
+                .any(|texel| texel != &previous[..4])
+        {
+            return Err(
+                "a seeded multisample raster loads one repeated texel; a per-texel seed is not \
+                 a shape the reviewed rails execute"
+                    .into(),
+            );
+        }
+        return Ok(previous[..4].to_vec());
+    }
+    unhex(
+        attachment
+            .clear_hex
+            .as_deref()
+            .ok_or("a constrained wildcard texel needs the reference colour of its mixes")?,
+    )
 }
 
 fn unhex(value: &str) -> Result<Vec<u8>> {

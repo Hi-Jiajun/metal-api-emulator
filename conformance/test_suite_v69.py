@@ -74,6 +74,8 @@ def full_capture(suite, overrides=None):
                 v28.msaa_stencil_resolve_sample0_result,
                 v28.msaa_uniform_2x_result, v28.msaa_uniform_8x_result,
                 v28.msaa_edge_2x_result, v28.msaa_edge_8x_result,
+                v28.msaa_load_4x_result, v28.msaa_load_2x_result,
+                v28.msaa_load_8x_result,
                 v28.sampled_result,
                 v28.full_cover_16x16_result, v28.sampled_64_result,
                 v28.sampled_rule_2048_result,
@@ -235,18 +237,56 @@ class ClearedEdgeClaimTests(unittest.TestCase):
                 "resolves"):
             self.plan(broken)
 
-    def test_a_loaded_attachment_may_not_claim_a_set(self):
-        # A loaded attachment hands the pass its own bytes, so nothing is
-        # unclaimed beside it (`research/docs/23` §3.3, v69).
+    def test_a_loaded_single_sample_attachment_may_not_claim_a_set(self):
+        # A single-sample loaded attachment hands the pass its own bytes, so
+        # nothing is unclaimed beside it (`research/docs/23` §3.3, v69). A
+        # loaded *multisampled* raster is the v82 seed shape and admits the
+        # channel instead (`research/docs/23` §82): its declared window is one
+        # repeated texel the seam writes into every sample, so the crossed
+        # column is a mix of two colours the fixture owns, exactly as it is
+        # beside a clear.
         broken = copy.deepcopy(self.suite)
         case = broken["render_cases"][v28.MSAA_EDGE_2X_INDEX]
         del case["multisample"]
         del case["requires_sample_count"]
         case["attachment"]["load"] = "load"
         case["attachment"]["initial_hex"] = "cd" * 64
+        del case["attachment"]["clear_hex"]
         with self.assertRaisesRegex(compare.CaptureError,
                                     "a loaded attachment has no unclaimed texel"):
             self.plan(broken)
+
+    def test_the_seeded_multisample_raster_admits_the_same_set(self):
+        # The v82 trio states the v69 pair's own bytes: a seeded raster whose
+        # declared window is the colour the cleared pair opens with resolves to
+        # the same picture, and the named column keeps the same closed set.
+        plan = self.plan()
+        for case_id, samples in ((v28.MSAA_LOAD_4X_ID, 4),
+                                 (v28.MSAA_LOAD_2X_ID, 2), (v28.MSAA_LOAD_8X_ID, 8)):
+            with self.subTest(case=case_id):
+                expectation = plan[case_id]
+                self.assertEqual(expectation.writes,
+                                 [((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                                   bytes.fromhex(expected_bytes({})))])
+                candidates = compare._mix_candidates(bytes.fromhex(OUTPUT),
+                                                     bytes.fromhex(CLEAR), samples)
+                self.assertEqual(sorted(candidates), sorted(bytes.fromhex(value)
+                                                            for value in CANDIDATES))
+                if case_id == v28.MSAA_LOAD_4X_ID:
+                    # The 4x raster pins the crossed column's own resolve, the
+                    # v51 fixture's claim, because both measured devices state
+                    # that count (v69).
+                    self.assertNotIn((ATTACHMENT[0], ATTACHMENT[1], ATTACHMENT[2]),
+                                     expectation.wildcards)
+                else:
+                    claims = expectation.wildcards[(ATTACHMENT[0], ATTACHMENT[1],
+                                                    ATTACHMENT[2])]
+                    for texel in CLAIMED_TEXELS:
+                        for byte in range(4):
+                            self.assertEqual(
+                                sorted(claims[texel * 4 + byte]),
+                                sorted(bytes.fromhex(value)[byte]
+                                       for value in CANDIDATES))
 
     def test_the_dontcare_shape_still_admits_the_channel(self):
         # The v67 shape is untouched by v69: beside a `dontcare` load every
