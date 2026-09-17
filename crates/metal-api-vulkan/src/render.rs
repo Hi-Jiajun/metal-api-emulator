@@ -31,14 +31,15 @@
 use ash::vk;
 use metal2vulkan::reflect::{ShaderReflection, ShaderStage};
 use metal_api_core::provider::{
-    AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
-    CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest,
-    FieldValue, IndexFormat, IndirectCommandDescriptor, LoadOp, MultisampleDepthResolve,
+    AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry, BorrowedView,
+    BufferSource, BufferView, ClearColor, CompareFunction, CullMode, DepthLoadOp,
+    DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue, IndexFormat,
+    IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, MultisampleDepthResolve,
     MultisampleState, MultisampleStencilResolve, ProviderError, ProviderErrorClass, ProviderPhase,
-    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract, Retryability,
-    SampleCount, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-    StoreOp, TextureFormat, TextureSource, TextureType, VertexBufferLayout, VertexFormat,
-    VertexStep, Winding, MAX_RENDER_TEXTURES,
+    RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
+    ResourceTableSnapshot, Retryability, SampleCount, StencilCompare, StencilLoadOp, StencilOp,
+    StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
+    VertexBufferLayout, VertexFormat, VertexStep, Winding, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -687,12 +688,17 @@ pub(crate) struct OffscreenColorAttachment<'a> {
 pub(crate) struct VertexStream<'a> {
     pub layout: &'a VertexBufferLayout,
     pub view: &'a BufferView,
+    /// The window this stream's bytes come from, resolved before any device
+    /// object exists (`research/docs/23` §71, R3c).
+    pub source: RenderInputSource<'a>,
 }
 
 /// One caller-held index buffer: its width and the pool view holding it.
 pub(crate) struct IndexStream<'a> {
     pub format: IndexFormat,
-    pub view: &'a BufferView,
+    /// The window this index stream's bytes come from, resolved beside the
+    /// vertex streams (`research/docs/23` §71, R3c).
+    pub source: RenderInputSource<'a>,
 }
 
 /// How an offscreen pass issues its direct draw.
@@ -1603,16 +1609,19 @@ pub(crate) fn execute_render_pass(
     stages: &RenderStages,
     pass: &RenderPassDescriptor,
     previous: &[Option<&[u8]>],
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     refuse_attachment_extent(context, pass)?;
     let request = prepare_render_request(
         stages,
         pass,
         previous,
+        leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
     )?;
-    execute_offscreen_render(context, &request)
+    let retains = RenderInputRetains::retain(leases, &request)?;
+    execute_offscreen_render_with_retains(context, &request, retains)
 }
 
 /// Validate one render pass against the pipeline it names and build the
@@ -1627,6 +1636,7 @@ fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
     previous: &'a [Option<&'a [u8]>],
+    leases: Option<&RenderLeaseContext<'_>>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
 ) -> Result<OffscreenRenderRequest<'a>, ProviderError> {
@@ -1989,7 +1999,7 @@ fn prepare_render_request<'a>(
     // fragment standing on a texel centre reads that texel's own bytes rather
     // than a filtered or boundary-rule-dependent neighbour.
     let textures = resolve_render_textures(pass, extent)?;
-    let streams = resolve_vertex_streams(stages, pass)?;
+    let streams = resolve_vertex_streams(stages, pass, leases)?;
     // A per-instance stream's record count is the draw's instance count, so its
     // footprint is proved against that count instead of the vertex span
     // (`research/docs/23` §3.3, v31).
@@ -2035,7 +2045,8 @@ fn prepare_render_request<'a>(
                         ),
                 );
             }
-            let index_values = decode_indices(view, indices.format, pass.vertices)?;
+            let index_source = resolve_render_input(view, leases, RenderInputRole::Index, 0)?;
+            let index_values = decode_indices(&index_source, indices.format, pass.vertices)?;
             for stream in &streams {
                 // A per-instance stream is proved against the instance count,
                 // not the index span (`research/docs/23` §3.3, v31).
@@ -2072,7 +2083,7 @@ fn prepare_render_request<'a>(
                 },
                 Some(IndexStream {
                     format: indices.format,
-                    view,
+                    source: index_source,
                 }),
             )
         }
@@ -2268,17 +2279,229 @@ fn resolve_render_textures<'a>(
     Ok(textures)
 }
 
+/// The owner-issued lease material one render submission resolves its render
+/// inputs from (`research/docs/23` §71, R3c).
+///
+/// The compute rail already owns both registries; the render rail shares them
+/// instead of keeping a second copy, so one import per device epoch serves both
+/// rails and both agree on when the owner's backing may be released.
+/// `resources` is the admitted snapshot and is authoritative for every
+/// reservation, exactly as it is on the compute side. `host_import_alignment`
+/// is the device's own `VK_EXT_external_memory_host` alignment, and zero when
+/// the device cannot import host memory at all.
+pub(crate) struct RenderLeaseContext<'a> {
+    pub(crate) staging: &'a LeaseRegistry,
+    pub(crate) borrowed: &'a Arc<BorrowedLeaseRegistry>,
+    pub(crate) resources: &'a ResourceTableSnapshot,
+    pub(crate) device_epoch: DeviceEpoch,
+    pub(crate) host_import_alignment: u64,
+}
+
+/// Which of a pass's two render inputs a refusal is about.
+#[derive(Clone, Copy)]
+enum RenderInputRole {
+    Vertex,
+    Index,
+}
+
+impl RenderInputRole {
+    /// The capability slug this role's unreadable source is refused with. The
+    /// two names are the ones this rail published before the lease channel
+    /// existed, so a capture that could not read a stream keeps its slug.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Vertex => "render_vertex_buffer_unsupported",
+            Self::Index => "render_index_buffer_unsupported",
+        }
+    }
+}
+
+/// Where one render input's bytes come from (`research/docs/23` §71, R3c).
+#[derive(Debug)]
+pub(crate) enum RenderInputSource<'a> {
+    /// The trace's own bytes (`BufferSource::OwnedBytes`), unchanged from the
+    /// pre-lease increments.
+    TraceBytes(&'a [u8]),
+    /// The provider's staged copy of an owner lease
+    /// (`BufferSource::StagedLease`); the rail uploads it like trace bytes.
+    StagedBytes(Vec<u8>),
+    /// The owner's own mapping (`BufferSource::BorrowedNoCopy`): the rail
+    /// imports this window instead of copying it, and holds a retain on the
+    /// lease until the pass's fence has signalled.
+    Borrowed {
+        lease: LeaseId,
+        window: BorrowedView,
+    },
+}
+
+impl RenderInputSource<'_> {
+    /// The bytes the rail's footprint proof reads.
+    ///
+    /// A borrowed window is read through the owner's mapping, because that is
+    /// where the proof's bytes are: the import contract keeps the mapping valid
+    /// at this address until the provider releases the import, so this reads
+    /// the same bytes the device will read rather than copying them into
+    /// provider-owned storage. Trace-owned and staged bytes are read from the
+    /// window the rail is about to upload.
+    fn proof_bytes(&self) -> &[u8] {
+        match self {
+            Self::TraceBytes(bytes) => bytes,
+            Self::StagedBytes(bytes) => bytes,
+            // SAFETY: the window was resolved by the no-copy registry for an
+            // imported lease, whose contract keeps the mapping readable over
+            // exactly this window until the import is released.
+            Self::Borrowed { window, .. } => unsafe {
+                std::slice::from_raw_parts(window.pointer as *const u8, window.len)
+            },
+        }
+    }
+
+    /// The no-copy lease this source reads, when it is one.
+    const fn borrowed_lease(&self) -> Option<LeaseId> {
+        match self {
+            Self::TraceBytes(_) | Self::StagedBytes(_) => None,
+            Self::Borrowed { lease, .. } => Some(*lease),
+        }
+    }
+}
+
+/// Resolve one render input's source into the window the rail binds
+/// (`research/docs/23` §71, R3c).
+///
+/// `OwnedBytes` resolves to the trace's own bytes exactly as before. A
+/// `StagedLease` resolves through the provider's staged registry, which holds
+/// the owner's staged copy; the rail uploads those bytes into a buffer of its
+/// own. A `BorrowedNoCopy` resolves through the no-copy registry, which hands
+/// back the owner's address and never copies. Every unresolvable arm is refused
+/// by name before any device object exists: a lease that was never imported or
+/// admitted, a reservation that does not cover the view, a device that cannot
+/// import host memory, and a pointer that misses the import alignment.
+fn resolve_render_input<'a>(
+    view: &'a BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    role: RenderInputRole,
+    binding: usize,
+) -> Result<RenderInputSource<'a>, ProviderError> {
+    match &view.source {
+        BufferSource::OwnedBytes(bytes) => Ok(RenderInputSource::TraceBytes(bytes)),
+        BufferSource::StagedLease(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    role,
+                    binding,
+                    "staged_lease",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     input cannot be read",
+                )
+            })?;
+            let bytes = leases.staging.view_bytes(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            Ok(RenderInputSource::StagedBytes(bytes))
+        }
+        BufferSource::BorrowedNoCopy(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    role,
+                    binding,
+                    "borrowed_no_copy",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     input cannot be read",
+                )
+            })?;
+            if leases.host_import_alignment == 0 {
+                return Err(host_import_refusal(role, binding, view));
+            }
+            let window = leases.borrowed.view_pointer(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            let alignment = usize::try_from(leases.host_import_alignment).unwrap_or(usize::MAX);
+            if !window.pointer.is_multiple_of(alignment) {
+                return Err(lease_alignment_refusal(
+                    *lease_id,
+                    window.pointer,
+                    leases.host_import_alignment,
+                    binding,
+                ));
+            }
+            Ok(RenderInputSource::Borrowed {
+                lease: *lease_id,
+                window,
+            })
+        }
+    }
+}
+
+/// One render input whose source this rail cannot read (`docs/23` §71).
+fn render_input_refusal(
+    role: RenderInputRole,
+    binding: usize,
+    storage_mode: &'static str,
+    detail: &'static str,
+) -> ProviderError {
+    capability_refusal(role.slug())
+        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field("storage_mode", FieldValue::Text(storage_mode.to_owned()))
+        .with_detail(detail)
+}
+
+/// The borrowed arm a device without host-memory import cannot execute.
+///
+/// The slug is the same one core admission and the compute rail publish for an
+/// unsupported storage mode, so a capture reads one name for one fact: this
+/// device cannot bind owner memory without copying it.
+fn host_import_refusal(role: RenderInputRole, binding: usize, view: &BufferView) -> ProviderError {
+    capability_refusal("storage_mode_unsupported")
+        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field(
+            "storage_mode",
+            FieldValue::Text("borrowed_no_copy".to_owned()),
+        )
+        .with_field("role", FieldValue::Text(role.slug().to_owned()))
+        .with_detail(
+            "the device does not import host memory, so a no-copy render input cannot be bound",
+        )
+}
+
+/// An owner pointer that misses the device's import alignment (`docs/23` §71).
+///
+/// The name and fields are the ones the compute rail's import publishes, so the
+/// two rails refuse the same fact the same way.
+fn lease_alignment_refusal(
+    lease_id: LeaseId,
+    pointer: usize,
+    alignment: u64,
+    binding: usize,
+) -> ProviderError {
+    capability_refusal("lease_alignment_unsupported")
+        .with_field("lease", FieldValue::Unsigned(lease_id.get()))
+        .with_field("pointer", FieldValue::Unsigned(pointer as u64))
+        .with_field("alignment", FieldValue::Unsigned(alignment))
+        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_detail("a no-copy render input has to meet the device's host import alignment")
+}
+
 /// Pair the pipeline's layout with the pass's bound streams.
 ///
 /// Core admission already refused a pass whose binding count disagrees with the
 /// layout, and this rail re-runs `validate_against` before reaching here, so the
 /// zip is length-checked by construction. What is added is the rail's own
-/// minimum: a stream has to hold at least one vertex, and the source has to be
-/// trace-owned bytes, because the first vertex-input increment uploads the
-/// trace's own bytes rather than a lease.
+/// minimum: a stream has to hold at least one vertex, and its bytes have to be
+/// resolvable — trace-owned bytes, a staged lease's copy, or a no-copy owner
+/// window (`research/docs/23` §71, R3c). The resolution runs before any device
+/// object exists, so an unresolvable stream is refused with nothing partially
+/// built.
 fn resolve_vertex_streams<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<VertexStream<'a>>, ProviderError> {
     let mut streams = Vec::with_capacity(pass.vertex_buffers.len());
     for (index, (view, layout)) in pass
@@ -2290,11 +2513,7 @@ fn resolve_vertex_streams<'a>(
         if layout.stride == 0 {
             return Err(contract_refusal("vertex buffer declares a zero stride"));
         }
-        if !matches!(view.source, BufferSource::OwnedBytes(_)) {
-            return Err(capability_refusal("render_vertex_buffer_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
-                .with_detail("the first vertex-input increment executes trace-owned bytes only"));
-        }
+        let source = resolve_render_input(view, leases, RenderInputRole::Vertex, index)?;
         if view.length < layout.stride {
             return Err(
                 capability_refusal("render_vertex_buffer_footprint_unsupported")
@@ -2304,7 +2523,11 @@ fn resolve_vertex_streams<'a>(
                     .with_detail("one vertex does not fit in the view the trace declares"),
             );
         }
-        streams.push(VertexStream { layout, view });
+        streams.push(VertexStream {
+            layout,
+            view,
+            source,
+        });
     }
     Ok(streams)
 }
@@ -2350,21 +2573,19 @@ fn vertex_vk_format(format: VertexFormat) -> Result<vk::Format, ProviderError> {
     })
 }
 
-/// Read the `count` indices the draw consumes out of one pool view.
+/// Read the `count` indices the draw consumes out of one resolved window.
 ///
-/// The bytes are the trace's own (`BufferSource::OwnedBytes`, whose length
-/// `BufferView::validate_shape` already pinned to the view's length), so this
-/// is a pure translation. The values feed the footprint proof: every index has
-/// to name a vertex the bound stream covers.
+/// Every source arm arrives with its length already pinned to the view's own
+/// (`OwnedBytes` by `BufferView::validate_shape`, a staged lease by the
+/// registry's reservation check, a borrowed window by the no-copy registry), so
+/// this is a pure translation. The values feed the footprint proof: every index
+/// has to name a vertex the bound stream covers.
 fn decode_indices(
-    view: &BufferView,
+    source: &RenderInputSource<'_>,
     format: IndexFormat,
     count: u32,
 ) -> Result<Vec<u32>, ProviderError> {
-    let BufferSource::OwnedBytes(bytes) = &view.source else {
-        return Err(capability_refusal("render_index_buffer_unsupported")
-            .with_detail("the first vertex-input increment executes trace-owned bytes only"));
-    };
+    let bytes = source.proof_bytes();
     let width = usize::try_from(format.bytes()).expect("index widths are two or four");
     let count = usize::try_from(count).map_err(|_| contract_refusal("index count overflows"))?;
     let mut indices = Vec::with_capacity(count);
@@ -2409,6 +2630,7 @@ pub(crate) fn execute_indirect_render_pass(
     pass: &RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
     previous: &[Option<&[u8]>],
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     let replay = match command {
         IndirectCommandDescriptor::Draw {
@@ -2458,11 +2680,13 @@ pub(crate) fn execute_indirect_render_pass(
         stages,
         pass,
         previous,
+        leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
     )?;
     request.indirect = Some(replay);
-    execute_offscreen_render(context, &request)
+    let retains = RenderInputRetains::retain(leases, &request)?;
+    execute_offscreen_render_with_retains(context, &request, retains)
 }
 
 /// Narrow one attachment dimension to the `u32` the Vulkan image extent uses.
@@ -2821,6 +3045,117 @@ pub(crate) fn limits_render_sample_count_mask(limits: &vk::PhysicalDeviceLimits)
     mask
 }
 
+/// The no-copy leases one render pass's inputs read, retained across its GPU
+/// span (`research/docs/23` §71, R3c).
+///
+/// The disposition mirrors the compute rail's own rule: a retain is dropped
+/// once the GPU can no longer read the owner's mapping — the pass's fence has
+/// signalled, or the device was lost, which is a teardown guarantee. A
+/// submission that failed without a lost device leaves every retain
+/// outstanding on purpose, so the owner is blocked rather than the mapping
+/// being freed under a GPU that may still be reading it; the rail is
+/// synchronous, so the alternative would be a silent use-after-free whose only
+/// remedy is a later device teardown.
+struct RenderInputRetains {
+    registry: Arc<BorrowedLeaseRegistry>,
+    lease_ids: Vec<LeaseId>,
+    /// Whether the holds are still outstanding. Cleared by [`Self::retire`]
+    /// and by [`Self::after_submission_failure`]'s fail-closed arm.
+    armed: bool,
+}
+
+impl RenderInputRetains {
+    /// Retain every no-copy lease the prepared pass reads, before a single
+    /// buffer is imported. `Ok(None)` for a pass whose inputs are uploaded
+    /// bytes, which is every pre-R3c submission.
+    fn retain(
+        leases: Option<&RenderLeaseContext<'_>>,
+        request: &OffscreenRenderRequest<'_>,
+    ) -> Result<Option<Self>, ProviderError> {
+        let mut lease_ids = Vec::new();
+        for stream in &request.vertex_streams {
+            if let Some(lease) = stream.source.borrowed_lease() {
+                lease_ids.push(lease);
+            }
+        }
+        if let Some(index) = &request.index_stream {
+            if let Some(lease) = index.source.borrowed_lease() {
+                lease_ids.push(lease);
+            }
+        }
+        if lease_ids.is_empty() {
+            return Ok(None);
+        }
+        let Some(leases) = leases else {
+            // Resolution already refused a borrowed window without a lease
+            // channel, so this arm is the belt-and-braces restatement: a
+            // borrowed input is never executed without its registry.
+            return Err(capability_refusal("storage_mode_unsupported")
+                .with_field(
+                    "storage_mode",
+                    FieldValue::Text("borrowed_no_copy".to_owned()),
+                )
+                .with_detail(
+                    "a no-copy render input was resolved without a lease channel to retain it in",
+                ));
+        };
+        let registry = Arc::clone(leases.borrowed);
+        registry.retain_all(&lease_ids)?;
+        Ok(Some(Self {
+            registry,
+            lease_ids,
+            armed: true,
+        }))
+    }
+
+    /// The pass's fence has signalled, or the device is gone: drop every hold.
+    fn retire(&mut self) {
+        if self.armed {
+            self.registry.retire_all(&self.lease_ids);
+            self.armed = false;
+        }
+    }
+
+    /// Dispose the retains after the pass's one submission returned an error.
+    ///
+    /// A lost device is a teardown guarantee, so the holds go, and so does a
+    /// failure that never reached `vkQueueSubmit` (the compute rail's own
+    /// `submitted` boundary). Every other error leaves them outstanding: the
+    /// queue may still be reading the owner mapping, and only a later teardown
+    /// can prove otherwise.
+    fn after_submission_failure(&mut self, error: &ProviderError, submitted: bool) {
+        if error.class == ProviderErrorClass::DeviceLost || !submitted {
+            self.retire();
+        } else {
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for RenderInputRetains {
+    fn drop(&mut self) {
+        // An early return is always before the pass's submission: the import
+        // may exist, but nothing has been queued to read it, so the holds go.
+        // A failed submission clears `armed` first.
+        self.retire();
+    }
+}
+
+/// Execute one prepared offscreen request whose inputs are all uploaded bytes.
+///
+/// The rail's own unit fixtures go through this entry point: a request they
+/// build always carries trace-owned bytes, so there is no no-copy lease to
+/// retain. A submission whose inputs resolved to owner windows goes through
+/// [`execute_offscreen_render_with_retains`] instead, which is the same
+/// execution with the lease lifecycle around it (`research/docs/23` §71).
+#[cfg(test)]
+pub(crate) fn execute_offscreen_render(
+    context: &VulkanContext,
+    request: &OffscreenRenderRequest<'_>,
+) -> Result<OffscreenReadback, ProviderError> {
+    execute_offscreen_render_with_retains(context, request, None)
+}
+
 /// Execute one offscreen render pass and return, in location order, `Some` of
 /// each stored attachment's tightly packed texel bytes (`width * height * 4`)
 /// and `None` for each discarded attachment.
@@ -2850,9 +3185,10 @@ pub(crate) struct OffscreenReadback {
     pub stencil: Option<Vec<u8>>,
 }
 
-pub(crate) fn execute_offscreen_render(
+fn execute_offscreen_render_with_retains(
     context: &VulkanContext,
     request: &OffscreenRenderRequest<'_>,
+    mut retains: Option<RenderInputRetains>,
 ) -> Result<OffscreenReadback, ProviderError> {
     // The attachment count is the rail's own gate, re-run on the request so a
     // hand-built request cannot skip `prepare_render_request`'s admission.
@@ -3460,7 +3796,22 @@ pub(crate) fn execute_offscreen_render(
         width,
         height,
     )?;
-    objects.submit_and_wait(queue_index)?;
+    // The retained no-copy leases outlive the submission: the fence below is
+    // what proves the GPU can no longer read the owner's mapping
+    // (`research/docs/23` §71, R3c).
+    match objects.submit_and_wait(queue_index) {
+        Ok(()) => {
+            if let Some(retains) = retains.as_mut() {
+                retains.retire();
+            }
+        }
+        Err(error) => {
+            if let Some(retains) = retains.as_mut() {
+                retains.after_submission_failure(&error, objects.submitted);
+            }
+            return Err(error);
+        }
+    }
 
     // One readback record per stored attachment: `copy_out` equals the stored
     // attachment count, so a caller can observe that a stored location really
@@ -3856,6 +4207,7 @@ pub(crate) fn execute_present_render(
     pass: &RenderPassDescriptor,
     target: &PresentTargetImage,
     previous: Option<&[u8]>,
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<u8>, ProviderError> {
     // The present path stays single-attachment: it renders into one
     // provider-owned target and hands that target on, so a pass whose
@@ -3867,6 +4219,7 @@ pub(crate) fn execute_present_render(
         stages,
         pass,
         &previous,
+        leases,
         context.admitted_depth_resolve_modes(),
         context.admitted_stencil_resolve_modes(),
     )?;
@@ -4005,6 +4358,10 @@ pub(crate) fn execute_present_render(
     let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
     let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
+    // The no-copy leases this pass reads are retained before the first import
+    // and dropped once the fence below proves the GPU is done with them
+    // (`research/docs/23` §71, R3c).
+    let mut retains = RenderInputRetains::retain(leases, &request)?;
     // One acquire per present action, before the pass runs (`docs/24` §3.6).
     //
     // The guard serializes the whole round trip on this target's layout: the
@@ -4045,7 +4402,19 @@ pub(crate) fn execute_present_render(
         width,
         height,
     )?;
-    objects.submit_and_wait(queue_index)?;
+    match objects.submit_and_wait(queue_index) {
+        Ok(()) => {
+            if let Some(retains) = retains.as_mut() {
+                retains.retire();
+            }
+        }
+        Err(error) => {
+            if let Some(retains) = retains.as_mut() {
+                retains.after_submission_failure(&error, objects.submitted);
+            }
+            return Err(error);
+        }
+    }
 
     let texels = unsafe {
         std::slice::from_raw_parts(readback_mapping as *const u8, byte_length as usize).to_vec()
@@ -4120,6 +4489,14 @@ struct OffscreenObjects<'a> {
     /// (`research/docs/23` §3.3, v70). Empty for every pre-v70 pass, which is
     /// the shape the pipeline layout and the descriptor bind branch on.
     textures: Vec<SampledTextureObjects>,
+    /// Whether this pass's command buffer reached `vkQueueSubmit`
+    /// (`research/docs/23` §71, R3c).
+    ///
+    /// A failure after this point may still leave the GPU reading the owner
+    /// mappings the pass imported, so it is the boundary the no-copy retain
+    /// disposition keys on; a failure before it leaves nothing that could read
+    /// them.
+    submitted: bool,
     /// The descriptor set layout the sampled pipeline is built from, or null
     /// for a pass that samples nothing.
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -4372,6 +4749,7 @@ impl<'a> OffscreenObjects<'a> {
             pipeline: vk::Pipeline::null(),
             readbacks: Vec::new(),
             textures: Vec::new(),
+            submitted: false,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set: vk::DescriptorSet::null(),
@@ -6100,8 +6478,8 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
-    /// Upload every caller-held stream the pass binds into its own host-visible
-    /// device buffer (`research/docs/23` §3.3).
+    /// Bind every caller-held stream the pass reads (`research/docs/23` §3.3,
+    /// §71).
     ///
     /// One buffer per pool view, holding that view's bytes: the provider's
     /// compute path binds a lone owned view at its own offset, and this rail
@@ -6109,39 +6487,30 @@ impl<'a> OffscreenObjects<'a> {
     /// the footprint proof assumed. The pool upload for the same view may have
     /// happened on the compute path, but these buffers are the rail's own and
     /// are destroyed with the pass.
+    ///
+    /// Trace-owned and staged bytes are uploaded into a host-visible buffer of
+    /// the rail's own; a borrowed window is imported at the owner's address
+    /// instead, which is the no-copy arm of the lease channel (R3c). Every
+    /// source was resolved before this call, so the bytes here come from the
+    /// window the footprint proof read and nothing is copied that the proof
+    /// did not see.
     fn create_vertex_inputs(
         &mut self,
         streams: &[VertexStream<'_>],
         index: Option<&IndexStream<'_>>,
     ) -> Result<(), ProviderError> {
         for stream in streams {
-            let BufferSource::OwnedBytes(bytes) = &stream.view.source else {
-                return Err(
-                    capability_refusal("render_vertex_buffer_unsupported").with_detail(
-                        "the first vertex-input increment executes trace-owned bytes only",
-                    ),
-                );
-            };
-            let (buffer, memory) = self.create_host_visible_buffer(
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            let (buffer, memory) = self.bind_render_input(
+                &stream.source,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
-                bytes,
                 "vertex input",
             )?;
             self.vertex_inputs.push((buffer, memory));
         }
         if let Some(index) = index {
-            let BufferSource::OwnedBytes(bytes) = &index.view.source else {
-                return Err(
-                    capability_refusal("render_index_buffer_unsupported").with_detail(
-                        "the first vertex-input increment executes trace-owned bytes only",
-                    ),
-                );
-            };
-            let (buffer, memory) = self.create_host_visible_buffer(
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            let (buffer, memory) = self.bind_render_input(
+                &index.source,
                 vk::BufferUsageFlags::INDEX_BUFFER,
-                bytes,
                 "index input",
             )?;
             self.input_index_buffer = buffer;
@@ -6149,6 +6518,143 @@ impl<'a> OffscreenObjects<'a> {
             self.input_index_type = indices_format(index.format);
         }
         Ok(())
+    }
+
+    /// Bind one resolved render input with `usage`.
+    ///
+    /// The two uploaded arms land in a host-visible buffer of the rail's own;
+    /// the borrowed arm imports the owner's mapping instead, which is the only
+    /// shape that reads the owner's pages directly (`research/docs/23` §71).
+    fn bind_render_input(
+        &self,
+        source: &RenderInputSource<'_>,
+        usage: vk::BufferUsageFlags,
+        name: &'static str,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
+        match source {
+            RenderInputSource::TraceBytes(bytes) => self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                usage,
+                bytes,
+                name,
+            ),
+            RenderInputSource::StagedBytes(bytes) => self.create_host_visible_buffer(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                usage,
+                bytes,
+                name,
+            ),
+            RenderInputSource::Borrowed { window, .. } => {
+                self.import_host_pointer_buffer(window, usage, name)
+            }
+        }
+    }
+
+    /// Import the owner's own mapping for one resolved no-copy window
+    /// (`research/docs/23` §71, R3c).
+    ///
+    /// The shape mirrors the compute rail's import: one buffer of the window's
+    /// own length, and one memory allocation taken from
+    /// `VK_EXT_external_memory_host` at the owner's address. Nothing is copied;
+    /// the buffer reads and writes the owner's pages. A driver that refuses the
+    /// import is a typed execution refusal, not a fallback to a copy.
+    fn import_host_pointer_buffer(
+        &self,
+        window: &BorrowedView,
+        usage: vk::BufferUsageFlags,
+        name: &'static str,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), ProviderError> {
+        let Some(host) = self.context.external_memory_host.as_ref() else {
+            // Resolution asked the same question before this point; the second
+            // line of defence keeps a directly-constructed request fail-closed
+            // instead of importing through a device that never advertised the
+            // extension.
+            return Err(capability_refusal("storage_mode_unsupported")
+                .with_field(
+                    "storage_mode",
+                    FieldValue::Text("borrowed_no_copy".to_owned()),
+                )
+                .with_detail(
+                    "the device does not import host memory, so a no-copy render input cannot be \
+                     bound",
+                ));
+        };
+        let info = vk::BufferCreateInfo::default()
+            .size(u64::try_from(window.len).unwrap_or(u64::MAX))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { self.context.device.create_buffer(&info, None) }.map_err(|error| {
+                execution_refusal(&format!("create {name} buffer"), &error.to_string())
+            })?;
+        let requirements = unsafe { self.context.device.get_buffer_memory_requirements(buffer) };
+        if requirements.size > u64::try_from(window.capacity).unwrap_or(u64::MAX) {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(execution_refusal(
+                &format!("import {name} host memory"),
+                &format!(
+                    "one buffer needs {} imported bytes but the lease reserves {}",
+                    requirements.size, window.capacity
+                ),
+            ));
+        }
+        let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (host.device.fp().get_memory_host_pointer_properties_ext)(
+                host.device.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                window.pointer as *const std::ffi::c_void,
+                &mut properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            unsafe { self.context.device.destroy_buffer(buffer, None) };
+            return Err(execution_refusal(
+                &format!("query {name} host pointer"),
+                &result.to_string(),
+            ));
+        }
+        let memory_type = match self.context.memory_type(
+            requirements.memory_type_bits & properties.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    &format!("find {name} memory type"),
+                    &error.to_string(),
+                ));
+            }
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+            .host_pointer(window.pointer as *mut std::ffi::c_void);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut import);
+        let memory = match unsafe { self.context.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.context.device.destroy_buffer(buffer, None) };
+                return Err(execution_refusal(
+                    &format!("import {name} host memory"),
+                    &error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = unsafe { self.context.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.context.device.destroy_buffer(buffer, None);
+                self.context.device.free_memory(memory, None);
+            }
+            return Err(execution_refusal(
+                &format!("bind {name} imported memory"),
+                &error.to_string(),
+            ));
+        }
+        Ok((buffer, memory))
     }
 
     /// Upload an attachment's previous bytes into a host-visible staging buffer
@@ -7148,6 +7654,7 @@ impl<'a> OffscreenObjects<'a> {
                 result,
             ));
         }
+        self.submitted = true;
         self.context.record_queue_submission(queue_index);
         if let Err(result) = self
             .context
@@ -7574,11 +8081,12 @@ fn driver_refusal(
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AcquirePolicy, AllocationId, DepthFormat, DepthLoadOp, InitialState, PipelineId,
-        PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
-        RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StencilFormat,
-        StencilLoadOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
-        VertexLayout, ViewId,
+        AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
+        DepthFormat, DepthLoadOp, InitialState, LeaseReservation, PipelineId, PresentDescriptor,
+        PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
+        RenderStencilAttachment, RenderStencilIdentity, StencilFormat, StencilLoadOp,
+        TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexLayout,
+        ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -7759,7 +8267,7 @@ mod tests {
             .expect("the reviewed sampling pair is executable");
         let pass = sampled_pass(4);
         let previous = vec![None];
-        let request = prepare_render_request(&stages, &pass, &previous, 0, 0)
+        let request = prepare_render_request(&stages, &pass, &previous, None, 0, 0)
             .expect("the reviewed sampling shape is admitted");
         assert_eq!(request.textures.len(), 1);
         assert_eq!(request.textures[0].extent, [4, 4]);
@@ -7770,7 +8278,7 @@ mod tests {
         // covered.
         let mut other_extent = sampled_pass(4);
         other_extent.textures = vec![sampled_texture_view(2, 2)];
-        let refused = match prepare_render_request(&stages, &other_extent, &previous, 0, 0) {
+        let refused = match prepare_render_request(&stages, &other_extent, &previous, None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a texture of another extent"),
         };
@@ -7783,7 +8291,7 @@ mod tests {
         let mut view = sampled_texture_view(4, 4);
         view.format = TextureFormat::Bgra8Unorm;
         other_format.textures = vec![view];
-        let refused = match prepare_render_request(&stages, &other_format, &previous, 0, 0) {
+        let refused = match prepare_render_request(&stages, &other_format, &previous, None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a texture of another format"),
         };
@@ -7808,7 +8316,7 @@ mod tests {
         // descriptor.
         let mut unbound = sampled_pass(4);
         unbound.textures = Vec::new();
-        let request = prepare_render_request(&stages, &unbound, &previous, 0, 0)
+        let request = prepare_render_request(&stages, &unbound, &previous, None, 0, 0)
             .expect("the shape is admitted; the binding question is the execution's");
         assert!(request.textures.is_empty());
     }
@@ -8582,7 +9090,7 @@ mod tests {
             .expect("the fixture describes one format per location");
         let previous = vec![None; maximum + 1];
 
-        let refused = match prepare_render_request(&stages, &pass, &previous, 0, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &previous, None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pass beyond the ceiling"),
         };
@@ -8635,7 +9143,7 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], 0b1, 0)
+        let request = prepare_render_request(&stages, &pass, &[None], None, 0b1, 0)
             .expect("a stored multisampled depth resolve the device admits is well formed");
         assert_eq!(
             request.depth_resolve.map(|resolve| resolve.filter),
@@ -8647,7 +9155,7 @@ mod tests {
     fn prepare_render_request_refuses_a_depth_resolve_filter_the_device_does_not_report() {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = depth_resolving_pass();
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0b10, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b10, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
         };
@@ -8664,7 +9172,7 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let mut pass = depth_resolving_pass();
         pass.depth_resolve = None;
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b1, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
@@ -8700,7 +9208,7 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], 0, 0)
+        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0)
             .expect("a present action beside the raster is well formed");
         assert_eq!(
             request.multisample.map(|state| state.sample_count),
@@ -8749,7 +9257,7 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], 0, 0b1)
+        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0b1)
             .expect("a stored multisampled stencil resolve the device admits is well formed");
         assert_eq!(
             request.stencil_resolve.map(|resolve| resolve.filter),
@@ -8761,7 +9269,7 @@ mod tests {
     fn prepare_render_request_refuses_a_stencil_resolve_filter_the_device_does_not_report() {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let pass = stencil_resolving_pass();
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b10) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b10) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a filter outside the device mask"),
         };
@@ -8778,7 +9286,7 @@ mod tests {
         let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
         let mut pass = stencil_resolving_pass();
         pass.stencil_resolve = None;
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b1) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b1) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a stored surface without a resolve"),
         };
@@ -8792,7 +9300,7 @@ mod tests {
         pass.stencil_resolve = Some(MultisampleStencilResolve {
             filter: StencilResolveFilter::DepthResolvedSample,
         });
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0, 0b1) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0b1) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse the filter without the depth resolve it names"),
         };
@@ -8847,7 +9355,7 @@ mod tests {
             .contract
             .validate_against(&pass)
             .expect("the fixture describes the reviewed single-attachment shape");
-        let request = prepare_render_request(&stages, &pass, &[None], 0, 0)
+        let request = prepare_render_request(&stages, &pass, &[None], None, 0, 0)
             .expect("the rail-owned combined pair is well formed");
         assert!(request.depth.is_some() && request.stencil.is_some());
         assert!(request.depth_resolve.is_none() && request.stencil_resolve.is_none());
@@ -8875,7 +9383,7 @@ mod tests {
         pass.depth_resolve = Some(MultisampleDepthResolve {
             filter: DepthResolveFilter::Sample0,
         });
-        let refused = match prepare_render_request(&stages, &pass, &[None], 0b1, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0b1, 0) {
             Err(error) => error,
             Ok(_) => panic!("the rail must refuse a pair that keeps one face"),
         };
@@ -9360,7 +9868,7 @@ mod tests {
             .validate_against(&pass)
             .expect("the pipeline compiles one format per location");
 
-        let refused = match prepare_render_request(&stages, &pass, &[None, None], 0, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[None, None], None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("attachments of one pass share one extent"),
         };
@@ -9390,7 +9898,7 @@ mod tests {
         stages.fragment_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
         let pass = milestone_pass(AttachmentFormat::R32Float);
         pass.validate().expect("the fixture pass is a legal shape");
-        let refused = execute_render_pass(&context, &stages, &pass, &[None])
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], None)
             .expect_err("the mismatched pairing is refused before any Vulkan object exists");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "render_fragment_stage_mismatch");
@@ -9411,7 +9919,7 @@ mod tests {
         let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         pass.color_attachments[0].load = LoadOp::Load;
-        let refused = execute_render_pass(&context, &stages, &pass, &[None])
+        let refused = execute_render_pass(&context, &stages, &pass, &[None], None)
             .expect_err("`Load` needs an upload rail this increment does not have");
         eprintln!("refused: {refused:?}");
         assert_eq!(refused.slug, "attachment_load_op_unsupported");
@@ -9490,10 +9998,10 @@ mod tests {
             .expect("the DontCare pass is a legal core shape now");
 
         // Without bytes the shape plans; with bytes it is refused by name.
-        prepare_render_request(&stages, &pass, &[None], 0, 0)
+        prepare_render_request(&stages, &pass, &[None], None, 0, 0)
             .expect("a DontCare attachment with no previous bytes plans");
         let previous: [u8; 16] = [0x11; 16];
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], 0, 0) {
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
         };
@@ -9703,7 +10211,7 @@ mod tests {
         let pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
         pass.validate().expect("the fixture pass is a legal shape");
         context.arm_driver_loss_injection(crate::DeviceLossPoint::Submit);
-        let error = execute_render_pass(&context, &stages, &pass, &[None])
+        let error = execute_render_pass(&context, &stages, &pass, &[None], None)
             .expect_err("the substituted driver answer refuses the render submission");
         eprintln!("render device loss: {error:?}");
         assert_eq!(error.class, ProviderErrorClass::DeviceLost);
@@ -9889,5 +10397,150 @@ mod tests {
             refused.fields.get("entry"),
             Some(&FieldValue::Text("vertex_main".to_owned()))
         );
+    }
+
+    /// One pool view over `allocation`, carrying `source` (`docs/23` §71).
+    fn leased_stream_view(source: BufferSource, allocation: AllocationId) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(41),
+            metal_binding: 0,
+            allocation_id: allocation,
+            offset: 0,
+            length: 32,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source,
+        }
+    }
+
+    /// One lease registration over `allocation`'s first `length` bytes.
+    fn lease_registration(
+        lease_id: LeaseId,
+        allocation: AllocationId,
+        length: u64,
+        epoch: DeviceEpoch,
+    ) -> LeaseReservation {
+        LeaseReservation {
+            lease: BufferLease {
+                lease_id,
+                allocation_id: allocation,
+                owner_epoch: epoch,
+            },
+            offset: 0,
+            length,
+        }
+    }
+
+    /// A lease-backed render input handed to a rail with no lease channel is
+    /// refused under the name this rail published before the channel existed,
+    /// with the storage mode it arrived under (`docs/23` §71, R3c).
+    #[test]
+    fn a_lease_backed_render_input_is_refused_without_a_lease_channel() {
+        let allocation = AllocationId::new(43);
+        let view = leased_stream_view(BufferSource::StagedLease(LeaseId::new(7)), allocation);
+        let refused = resolve_render_input(&view, None, RenderInputRole::Vertex, 1)
+            .expect_err("a lease cannot be read without the registry that imported it");
+        eprintln!("no channel: {refused:?}");
+        assert_eq!(refused.slug, "render_vertex_buffer_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(1))
+        );
+
+        // The index half keeps its own slug, so a capture can still tell which
+        // of the two inputs the rail could not read.
+        let view = leased_stream_view(BufferSource::BorrowedNoCopy(LeaseId::new(8)), allocation);
+        let refused = resolve_render_input(&view, None, RenderInputRole::Index, 0)
+            .expect_err("a no-copy window cannot be resolved without its registry");
+        eprintln!("no channel: {refused:?}");
+        assert_eq!(refused.slug, "render_index_buffer_unsupported");
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+    }
+
+    /// A borrowed render input on a device that does not import host memory is
+    /// refused under the name core admission and the compute rail publish for
+    /// the same fact (`docs/23` §71, R3c).
+    #[test]
+    fn a_borrowed_render_input_is_refused_without_host_import() {
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = ResourceTableSnapshot::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: DeviceEpoch::new(3),
+            host_import_alignment: 0,
+        };
+        let view = leased_stream_view(
+            BufferSource::BorrowedNoCopy(LeaseId::new(9)),
+            AllocationId::new(43),
+        );
+        let refused = resolve_render_input(&view, Some(&leases), RenderInputRole::Vertex, 0)
+            .expect_err("a device without host import cannot bind the owner's window");
+        eprintln!("no host import: {refused:?}");
+        assert_eq!(refused.slug, "storage_mode_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(refused.fields.get("view"), Some(&FieldValue::Unsigned(41)));
+    }
+
+    /// An owner window whose address misses the import alignment is refused by
+    /// name before any Vulkan import exists (`docs/23` §71, R3c).
+    #[test]
+    fn a_borrowed_render_input_is_refused_when_its_pointer_misses_the_alignment() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(11);
+        let allocation = AllocationId::new(43);
+        let reservation = lease_registration(lease_id, allocation, 32, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 64,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers its allocation");
+        let borrowed = BorrowedLeaseRegistry::new();
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000 + 1)
+                    .expect("a non-null owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &Arc::new(borrowed),
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: 4096,
+        };
+        let view = leased_stream_view(BufferSource::BorrowedNoCopy(lease_id), allocation);
+        let refused = resolve_render_input(&view, Some(&leases), RenderInputRole::Vertex, 0)
+            .expect_err("a pointer one byte past the alignment cannot be imported");
+        eprintln!("misaligned window: {refused:?}");
+        assert_eq!(refused.slug, "lease_alignment_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("alignment"),
+            Some(&FieldValue::Unsigned(4096))
+        );
+        assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(11)));
     }
 }
