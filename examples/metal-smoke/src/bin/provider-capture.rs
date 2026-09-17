@@ -3556,15 +3556,19 @@ fn main() -> Result<()> {
         }
         // A rail the marker *does* name has to execute the shape. The object
         // rails bind a stage-buffer case's slots through their own encoder
-        // entries, so they run the case like any other; a native rail has no
-        // stage-buffer face to run it with (it translates no AIR and publishes
-        // no render stage-buffer capability), so a case whose marker named one
-        // is refused by name rather than executed through a narrowed shape
-        // (`research/docs/23` §3.3, v83).
-        if !case.stage_buffers.is_empty() && backend == Backend::NativeMetalProvider {
+        // entries, so they run the case like any other; the native provider
+        // binds them through the same reviewed module once its capability
+        // snapshot declares the face (`research/docs/23` §83/§92, the Apple
+        // device readings that flipped `supports_render_stage_buffers`), so a
+        // case whose marker named a native rail without that bit is refused by
+        // name rather than executed through a narrowed shape.
+        if !case.stage_buffers.is_empty()
+            && backend == Backend::NativeMetalProvider
+            && !provider.capabilities().supports_render_stage_buffers
+        {
             return Err(format!(
-                "render case {}: the native rails carry no stage-buffer face, so this case runs \
-                 on the rails that bind its slots",
+                "render case {}: the native provider's capability snapshot carries no \
+                 stage-buffer face, so this case runs on the rails that declare it",
                 case.id
             )
             .into());
