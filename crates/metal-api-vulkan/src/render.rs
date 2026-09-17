@@ -894,9 +894,10 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `DrawIndexed` carries its index and instance counts and replays through
     /// the rail's own `[0, 1, 2]` index buffer.
     pub indirect: Option<IndirectReplay>,
-    /// The sampled textures the fragment stage reads, in binding order
-    /// (`research/docs/23` §3.3, v70). Empty for every pre-v70 pass, which is
-    /// the shape the pipeline layout and the descriptor bind below branch on.
+    /// The sampled textures the fragment stage reads, in canonical order
+    /// (`research/docs/23` §3.3, v70/v104): each entry carries the descriptor
+    /// slot its own binding states. Empty for every pre-v70 pass, which is the
+    /// shape the pipeline layout and the descriptor bind below branch on.
     pub textures: Vec<OffscreenRenderTexture<'a>>,
     /// Buffers the pass's stages read directly, in canonical order
     /// (`research/docs/23` §3.3, v83): vertex bindings first by index, then
@@ -974,12 +975,14 @@ impl StageBufferSlot {
 /// One sampled texture a render pass binds: the source of its texel bytes plus
 /// the shape the rail executes them with (`research/docs/23` §3.3, v70).
 ///
-/// The entry's position in [`OffscreenRenderRequest::textures`] is the binding
-/// index — the contract already held the view's own label to it — and the rail
-/// uploads these bytes into an image of its own, exactly as the compute rail
-/// uploads a pass's texture bindings; the no-copy arm imports the owner's own
-/// pages as the copy's transfer source instead (`research/docs/23` §75, R5c).
-/// The first increment executes one `rgba8_unorm` 2D surface whose extent
+/// The entry's own view states the binding: its `metal_binding` is the fragment
+/// stage's `[[texture(n)]]` argument, which the request shape carries as the
+/// descriptor slot to bind (`v104`), while the position in
+/// [`OffscreenRenderRequest::textures`] stays the list's canonical order. The
+/// rail uploads these bytes into an image of its own, exactly as the compute
+/// rail uploads a pass's texture bindings; the no-copy arm imports the owner's
+/// own pages as the copy's transfer source instead (`research/docs/23` §75,
+/// R5c). The first increment executes one `rgba8_unorm` 2D surface whose extent
 /// matches the render area, so every fragment stands on a texel centre and the
 /// nearest sample is an identity copy rather than a filtered or
 /// boundary-dependent read.
@@ -2491,13 +2494,16 @@ fn translated_texture_slots(
 }
 
 /// The slots the pass's sampled textures are executed with
-/// (`research/docs/23` §3.3, v100/v102).
+/// (`research/docs/23` §3.3, v100/v102/v104).
 ///
 /// The reviewed sampling pair reads `DescriptorSet 0 / Binding 0` for the one
 /// texture its own module samples, and is executed with the one state the
 /// review covers — so it executes exactly [`REVIEWED_TEXTURE_COUNT`] texture
-/// and refuses anything wider by name; the runtime `[[sampler(n)]]` state a
-/// translated module takes is a shape no reviewed module carries
+/// and refuses anything wider by name, and it reads that texture at its Metal
+/// index `0`: a pass whose one binding sits at another index is refused by name
+/// because the reviewed MSL sibling spells `[[texture(0)]]` and the other index
+/// has no module behind it. The runtime `[[sampler(n)]]` state a
+/// translated module takes is likewise a shape no reviewed module carries
 /// ([`RenderStages::validate_reviewed_texture_sampler`]). A translated fragment
 /// stage answers with the slots its own reflection names, which
 /// [`validate_translated_stage_textures`] has already held the contract's
@@ -2549,6 +2555,34 @@ fn render_texture_slots(
             .with_detail(
                 "the fragment stage names another number of sampled textures than the pass binds",
             ));
+    }
+    // The reviewed pair's own window is the one *slot* it reads
+    // (`research/docs/23` §3.3, v104): the census's sparse shape — one
+    // `[[texture(3)]]` and nothing below it — is a binding the pair's MSL
+    // sibling (`conformance/shaders/render_sampled_4x4.metal`) does not spell,
+    // so it is refused by name rather than executed with the pass's texture
+    // bound into another index the module actually reads. The translated arm
+    // answers the same question itself, by pairing each declaration with the
+    // descriptor slot the module's own reflection names.
+    if stages.fragment_translation.is_none() {
+        for view in &pass.textures {
+            if view.metal_binding != SAMPLED_TEXTURE_BINDING {
+                return Err(capability_refusal("render_texture_stage_unsupported")
+                    .with_field(
+                        "binding",
+                        FieldValue::Unsigned(u64::from(view.metal_binding)),
+                    )
+                    .with_field(
+                        "module_binding",
+                        FieldValue::Unsigned(u64::from(SAMPLED_TEXTURE_BINDING)),
+                    )
+                    .with_detail(
+                        "the reviewed sampling pair's module reads the texture at its own low \
+                         index, so a binding at another Metal index has no reviewed module \
+                         behind it",
+                    ));
+            }
+        }
     }
     Ok(slots)
 }
@@ -3944,17 +3978,21 @@ fn prepare_render_request_with_resident<'a>(
 }
 
 /// Resolve one pass's sampled textures into the rail's own request shape
-/// (`research/docs/23` §3.3, v70).
+/// (`research/docs/23` §3.3, v70/v104).
 ///
 /// The contract already holds the binding label, the read-only access and the
-/// single-sample requirement (`RenderPassDescriptor::validate`); this is the
-/// rail's own window, restated for a directly-constructed pass and narrowed to
-/// what the reviewed sampling module covers: one `rgba8_unorm` 2D surface,
-/// whose extent equals the render area. The extent rule is what keeps the
-/// fixture's expectation driver-independent — a texture of another size puts
-/// some fragment's `(column + 0.5) / width` sample either on a texel boundary
-/// or inside a neighbour, which is a filtered read the review never covered, so
-/// the pass is refused by name instead of sampled.
+/// single-sample requirement, and the pass's list the canonical order and the
+/// index bound (`RenderPassDescriptor::validate`); this is the rail's own
+/// window, restated for a directly-constructed pass and narrowed to what the
+/// reviewed sampling module covers: one `rgba8_unorm` 2D surface, whose extent
+/// equals the render area. The extent rule is what keeps the fixture's
+/// expectation driver-independent — a texture of another size puts some
+/// fragment's `(column + 0.5) / width` sample either on a texel boundary or
+/// inside a neighbour, which is a filtered read the review never covered, so
+/// the pass is refused by name instead of sampled. Every refusal below names
+/// the view's own `metal_binding` rather than the entry's position, because the
+/// list may skip an index (`v104`) and the number the module reads is the
+/// binding.
 ///
 /// The texture's bytes are resolved through the same three-arm channel the
 /// streams and the loading attachments use (`research/docs/23` §75, R5c): the
@@ -3978,10 +4016,15 @@ fn resolve_render_textures<'a>(
             .with_field("maximum", FieldValue::Unsigned(MAX_RENDER_TEXTURES as u64)));
     }
     let mut textures = Vec::with_capacity(pass.textures.len());
-    for (index, view) in pass.textures.iter().enumerate() {
+    for (position, view) in pass.textures.iter().enumerate() {
+        // Every refusal names the binding the *view* states rather than the
+        // entry's position (`v104`): the two are the same number only while the
+        // list happens to be dense from zero, which is exactly the assumption
+        // the sparse `[[texture(3)]]` shape retires.
+        let binding = view.metal_binding;
         if view.format != TextureFormat::Rgba8Unorm {
             return Err(capability_refusal("render_texture_format_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
                 .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
         }
@@ -3991,7 +4034,7 @@ fn resolve_render_textures<'a>(
             || view.array_length != 1
         {
             return Err(capability_refusal("render_texture_shape_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field(
                     "texture_type",
                     FieldValue::Text(format!("{:?}", view.texture_type)),
@@ -4001,7 +4044,11 @@ fn resolve_render_textures<'a>(
                 .with_field("array_length", FieldValue::Unsigned(view.array_length))
                 .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
         }
-        let source = resolve_render_texture_source(view, leases, index)?;
+        let source = resolve_render_texture_source(
+            view,
+            leases,
+            usize::try_from(binding).unwrap_or(usize::MAX),
+        )?;
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
         if width == 0 || height == 0 {
@@ -4009,7 +4056,7 @@ fn resolve_render_textures<'a>(
         }
         if [width, height] != extent {
             return Err(capability_refusal("render_texture_extent_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("width", FieldValue::Unsigned(u64::from(width)))
                 .with_field("height", FieldValue::Unsigned(u64::from(height)))
                 .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
@@ -4025,14 +4072,14 @@ fn resolve_render_textures<'a>(
             .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
         if u64::try_from(source.len()).unwrap_or(u64::MAX) != expected {
             return Err(contract_refusal(&format!(
-                "render texture {index} resolves {} bytes for a {width}x{height} surface",
+                "render texture binding {binding} resolves {} bytes for a {width}x{height} surface",
                 source.len()
             )));
         }
         textures.push(OffscreenRenderTexture {
             source,
             extent: [width, height],
-            slot: slots[index],
+            slot: slots[position],
         });
     }
     Ok(textures)
@@ -7237,9 +7284,10 @@ struct OffscreenObjects<'a> {
     pipeline: vk::Pipeline,
     /// One readback per attachment, in location order.
     readbacks: Vec<ReadbackObjects>,
-    /// The sampled textures the pass reads, in binding order
-    /// (`research/docs/23` §3.3, v70). Empty for every pre-v70 pass, which is
-    /// the shape the pipeline layout and the descriptor bind branch on.
+    /// The sampled textures the pass reads, in canonical order
+    /// (`research/docs/23` §3.3, v70/v104), each bound into the descriptor slot
+    /// its own entry states. Empty for every pre-v70 pass, which is the shape
+    /// the pipeline layout and the descriptor bind branch on.
     textures: Vec<SampledTextureObjects>,
     /// Whether this pass's command buffer reached `vkQueueSubmit`
     /// (`research/docs/23` §71, R3c).
@@ -12561,12 +12609,13 @@ mod tests {
             .is_some_and(|detail| detail.contains("declares texture binding 0")));
     }
 
-    /// The reviewed pair's window in the runtime-sampler increment
-    /// (`research/docs/23` §3.3, v102): the pair's module spells one
-    /// `constexpr sampler` and samples one texture, so a registration that
-    /// pairs a texture with a runtime `[[sampler(n)]]` argument, or that
-    /// declares a second sampled texture, is refused by name before any
-    /// device object exists.
+    /// The reviewed pair's window in the runtime-sampler increment and the
+    /// indexed-texture increment (`research/docs/23` §3.3, v102/v104): the
+    /// pair's module spells one `constexpr sampler` and samples one texture at
+    /// its own low index, so a registration that pairs a texture with a runtime
+    /// `[[sampler(n)]]` argument, that declares a second sampled texture, or
+    /// that binds the one texture at another Metal index, is refused by name
+    /// before any device object exists.
     #[test]
     fn the_reviewed_pair_refuses_a_runtime_sampler_and_a_second_texture() {
         // A declaration that pairs its texture with a runtime sampler argument
@@ -12640,6 +12689,40 @@ mod tests {
         assert_eq!(
             refused.fields.get("bindings"),
             Some(&FieldValue::Unsigned(1))
+        );
+
+        // The index is the same window's other half (`v104`): the pair's MSL
+        // sibling spells `[[texture(0)]]`, so the one binding the pair executes
+        // cannot sit at another Metal index — the contract's list is indexed
+        // rather than positional since this increment, which is what makes the
+        // reviewed module's own index a statement this rail has to hold it to.
+        let mut sparse = reviewed_sampled_stages();
+        sparse.contract.textures[0].metal_binding = 3;
+        let mut pass = sampled_pass(4);
+        let mut view = sampled_texture_view(4, 4);
+        view.metal_binding = 3;
+        pass.textures = vec![view];
+        let refused = match prepare_render_request(
+            &sparse,
+            &pass,
+            &[None],
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the reviewed pair reads [[texture(0)]]"),
+        };
+        eprintln!("sparse binding on the reviewed pair: refused: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_stage_unsupported");
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(3))
+        );
+        assert_eq!(
+            refused.fields.get("module_binding"),
+            Some(&FieldValue::Unsigned(0))
         );
     }
 

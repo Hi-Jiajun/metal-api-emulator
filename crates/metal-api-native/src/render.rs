@@ -233,6 +233,15 @@ pub(crate) const REVIEWED_SAMPLED_SOURCE: &str =
 /// nothing reads.
 pub(crate) const REVIEWED_SAMPLED_TEXTURE_COUNT: usize = 1;
 
+/// The Metal texture index the reviewed render-sampler module reads
+/// (`research/docs/23` §3.3, v104).
+///
+/// The module's `texture2d<float>` argument is `[[texture(0)]]`, so a pass
+/// whose own binding sits at another index has no reviewed module behind it:
+/// the contract's list is indexed rather than positional since `v104`, which is
+/// what makes this rail's window a statement rather than an assumption.
+pub(crate) const REVIEWED_SAMPLED_TEXTURE_BINDING: u32 = 0;
+
 /// Vertex entry of the reviewed render-sampler module.
 pub(crate) const SAMPLED_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
 
@@ -2854,14 +2863,18 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 }
 
 /// One sampled texture a render pass binds (`research/docs/23` §3.3, v70): the
-/// source of its tightly packed texel bytes plus the extent the pass's render
-/// area shares with it. The source's three arms are the three
+/// source of its tightly packed texel bytes, the extent the pass's render area
+/// shares with it, and the Metal index the fragment stage's own
+/// `[[texture(n)]]` argument names (`v104`) — the index the encoder binds it
+/// at, rather than the entry's position in the list. The source's three arms
+/// are the three
 /// [`TextureSource`] arms, resolved before any Metal object exists
 /// (`research/docs/23` §75, R5c).
 #[derive(Debug)]
 pub(crate) struct PlannedTexture<'a> {
     pub(crate) source: PlannedInputSource<'a>,
     pub(crate) extent: [u32; 2],
+    pub(crate) binding: u32,
 }
 
 /// Everything the encoder needs, decided before the first Metal object exists.
@@ -2879,10 +2892,11 @@ pub(crate) struct RenderPlan<'a> {
     /// the load/store actions and the previous bytes the encoder writes into
     /// each attachment before the pass opens.
     pub(crate) attachments: Vec<PlannedAttachment<'a>>,
-    /// The pass's sampled textures, in binding order (`research/docs/23` §3.3,
-    /// v70): the reviewed sampling pair's one `rgba8_unorm` surface whose
-    /// extent is the render area's own, carried as the bytes the encoder
-    /// uploads into its own `MTLTexture`. Empty for every pre-v70 plan.
+    /// The pass's sampled textures, in canonical binding order
+    /// (`research/docs/23` §3.3, v70/v104): the reviewed sampling pair's one
+    /// `rgba8_unorm` surface whose extent is the render area's own, carried as
+    /// the bytes the encoder uploads into its own `MTLTexture` and bound at the
+    /// Metal index the entry states. Empty for every pre-v70 plan.
     pub(crate) textures: Vec<PlannedTexture<'a>>,
     /// Attachment extent in texels, as `[width, height]`.
     pub(crate) extent: [u32; 2],
@@ -3691,8 +3705,8 @@ pub(crate) fn plan_with_leases<'a>(
             .with_field("module_filter", module_filter)
             .with_field("module_address", module_address));
     }
-    // The render sampler (`research/docs/23` §3.3, v70) is one decision in two
-    // halves, so both are answered together: the reviewed sampling module
+    // The render sampler (`research/docs/23` §3.3, v70/v104) is one decision in
+    // two halves, so both are answered together: the reviewed sampling module
     // samples the pass's own texture binding, and a pass that binds a texture
     // runs only through that module. A pass that binds none keeps the empty
     // list every pre-v70 plan carried.
@@ -3734,6 +3748,26 @@ pub(crate) fn plan_with_leases<'a>(
                          that binds another number has no reviewed module behind it; the wider \
                          shapes are the translated arm's, where the module's own reflection \
                          names the textures it reads",
+                    ));
+            }
+            // The index is the other half of the same window (`v104`): the
+            // reviewed MSL module reads `[[texture(0)]]`, so a binding the
+            // contract's indexed list places at another Metal index would be
+            // encoded into an argument the module does not read, and the
+            // descriptor it does read would stay unbound. Refused by name, with
+            // both indexes, rather than encoded as the low one.
+            let binding = request.pass.textures[0].metal_binding;
+            if binding != REVIEWED_SAMPLED_TEXTURE_BINDING {
+                return Err(capability_refusal("render_texture_stage_unsupported")
+                    .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+                    .with_field(
+                        "module_binding",
+                        FieldValue::Unsigned(u64::from(REVIEWED_SAMPLED_TEXTURE_BINDING)),
+                    )
+                    .with_detail(
+                        "the reviewed MSL sampling module reads the texture at its own low \
+                         index, so a binding at another Metal index has no reviewed module \
+                         behind it",
                     ));
             }
             resolve_render_textures(request.pass, extent, leases)?
@@ -4431,7 +4465,7 @@ fn validate_reviewed_stage_buffers(
 }
 
 /// Resolve one pass's sampled textures into the rail's own plan shape
-/// (`research/docs/23` §3.3, v70).
+/// (`research/docs/23` §3.3, v70/v104).
 ///
 /// The Vulkan rail's window, restated for a directly-constructed pass: exactly
 /// one `rgba8_unorm` 2D single-sample surface whose extent equals the render
@@ -4463,10 +4497,14 @@ fn resolve_render_textures<'a>(
             ));
     }
     let mut textures = Vec::with_capacity(pass.textures.len());
-    for (index, view) in pass.textures.iter().enumerate() {
+    for view in &pass.textures {
+        // Every refusal names the binding the view itself states (`v104`): the
+        // pass's list may skip an index, so the entry's position is the list's
+        // own order rather than the argument the module reads.
+        let binding = view.metal_binding;
         if view.format != TextureFormat::Rgba8Unorm {
             return Err(capability_refusal("render_texture_format_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
                 .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
         }
@@ -4476,7 +4514,7 @@ fn resolve_render_textures<'a>(
             || view.array_length != 1
         {
             return Err(capability_refusal("render_texture_shape_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field(
                     "texture_type",
                     FieldValue::Text(format!("{:?}", view.texture_type)),
@@ -4484,7 +4522,11 @@ fn resolve_render_textures<'a>(
                 .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
                 .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
         }
-        let source = resolve_render_texture_source(view, leases, index)?;
+        let source = resolve_render_texture_source(
+            view,
+            leases,
+            usize::try_from(binding).unwrap_or(usize::MAX),
+        )?;
         let width = u32::try_from(view.width).unwrap_or(u32::MAX);
         let height = u32::try_from(view.height).unwrap_or(u32::MAX);
         if width == 0 || height == 0 {
@@ -4495,7 +4537,7 @@ fn resolve_render_textures<'a>(
         }
         if [width, height] != extent {
             return Err(capability_refusal("render_texture_extent_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
+                .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("width", FieldValue::Unsigned(u64::from(width)))
                 .with_field("height", FieldValue::Unsigned(u64::from(height)))
                 .with_field("render_width", FieldValue::Unsigned(u64::from(extent[0])))
@@ -4520,6 +4562,7 @@ fn resolve_render_textures<'a>(
         textures.push(PlannedTexture {
             source,
             extent: [width, height],
+            binding,
         });
     }
     Ok(textures)
@@ -5918,14 +5961,12 @@ fn encode_into_and_readback(
         width: metal::NSUInteger::from(scissor_width),
         height: metal::NSUInteger::from(scissor_height),
     });
-    // The sampled textures are bound before the draw, in binding order: the
-    // entry's position in the plan is the binding the reviewed fragment stage
-    // reads (`research/docs/23` §3.3, v70).
-    for (index, texture) in sampled_textures.iter().enumerate() {
-        encoder.set_fragment_texture(
-            u64::try_from(index).unwrap_or(u64::MAX),
-            Some(texture.as_ref()),
-        );
+    // The sampled textures are bound before the draw at the index each entry's
+    // own view states (`research/docs/23` §3.3, v70/v104): the plan carries the
+    // Metal `[[texture(n)]]` argument the fragment stage reads, which is the
+    // contract's indexed binding rather than the entry's position.
+    for (sampled, texture) in planned.textures.iter().zip(&sampled_textures) {
+        encoder.set_fragment_texture(u64::from(sampled.binding), Some(texture.as_ref()));
     }
     match indirect {
         None => match &planned.indices {
