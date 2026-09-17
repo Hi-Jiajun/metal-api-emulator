@@ -34,6 +34,19 @@ use std::time::Duration;
 const TRANSLATOR_REVISION: &[u8] = b"43c46ac8a24adf1a6e872b8a52c706ec9614fad0";
 const GPU_DEADLINE: Duration = Duration::from_secs(20);
 
+/// How many present target identities the provider keeps resident across
+/// submissions at once.
+///
+/// The contract's own ceiling (`MAX_PRESENT_TARGETS`) bounds the targets *one
+/// trace* names; this is the provider-internal budget for the registry those
+/// traces fill over a process lifetime. A target's identity is the
+/// `(allocation, view)` pair the present names (`research/docs/24` §5.2), so a
+/// guest presenting many surfaces would otherwise grow one image per identity
+/// with no release surface at all. The registry evicts the least recently used
+/// entry beyond this budget, and a target is also retired as soon as the lease
+/// its allocation was imported under is released.
+pub const PRESENT_TARGET_BUDGET: usize = 8;
+
 /// One heap placement a provider executed: which heap a resource landed in,
 /// which allocation it belongs to, and the byte range it occupies there.
 ///
@@ -229,7 +242,17 @@ pub struct VulkanComputeProvider {
     next_submission: AtomicU64,
     pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredPipeline>>>,
     render_pipelines: Mutex<BTreeMap<PipelineId, Arc<RegisteredRenderPipeline>>>,
-    present_targets: Mutex<BTreeMap<(AllocationId, ViewId), Arc<render::PresentTargetImage>>>,
+    present_targets: Mutex<BTreeMap<(AllocationId, ViewId), PresentTargetEntry>>,
+    /// Monotonic use stamp behind the registry's least-recently-used order:
+    /// every lookup and every insert stamps its identity with the next value.
+    present_target_stamp: AtomicU64,
+    /// Cumulative present targets retired before the device epoch ended: the
+    /// budget's evictions plus the retirements a lease release drives.
+    present_target_evictions: AtomicU64,
+    /// The allocation each imported lease reserves. A release retires the
+    /// present targets created for that allocation, exactly as the native
+    /// rail's `drop_present_targets_for` does (`research/docs/24` §5.2).
+    lease_allocations: Mutex<BTreeMap<LeaseId, AllocationId>>,
     completions: Mutex<BTreeMap<SubmissionId, CompletionSlot>>,
     heap_observations: Mutex<Vec<HeapPlacementObservation>>,
     icb_observations: Mutex<Vec<IcbReplayObservation>>,
@@ -239,6 +262,13 @@ pub struct VulkanComputeProvider {
     completion_outbox: Option<Arc<CompletionOutbox>>,
     staging: LeaseRegistry,
     borrowed: Arc<BorrowedLeaseRegistry>,
+}
+
+/// One resident present target: the provider-owned image and the stamp that
+/// orders it in the registry's least-recently-used eviction.
+struct PresentTargetEntry {
+    image: Arc<render::PresentTargetImage>,
+    last_used: u64,
 }
 
 /// The provider-side capability snapshot for one device owner.
@@ -299,6 +329,9 @@ impl VulkanComputeProvider {
             pipelines: Mutex::new(BTreeMap::new()),
             render_pipelines: Mutex::new(BTreeMap::new()),
             present_targets: Mutex::new(BTreeMap::new()),
+            present_target_stamp: AtomicU64::new(0),
+            present_target_evictions: AtomicU64::new(0),
+            lease_allocations: Mutex::new(BTreeMap::new()),
             completions: Mutex::new(BTreeMap::new()),
             heap_observations: Mutex::new(Vec::new()),
             icb_observations: Mutex::new(Vec::new()),
@@ -1308,20 +1341,33 @@ impl VulkanComputeProvider {
     /// first use. The image is keyed by the target's allocation/view identity
     /// and reused across submissions, so it survives the pass's own drop scope
     /// (`docs/24` §5.2).
+    ///
+    /// The registry is bounded: an insert that takes it past
+    /// [`PRESENT_TARGET_BUDGET`] evicts the least recently used entries, and
+    /// every use re-stamps its identity, so the victim is the identity a
+    /// process least recently presented rather than the lowest key. The image
+    /// is an `Arc`, so a submission that already holds one keeps it alive
+    /// until its own pass returns — the same lifetime the layout lock
+    /// serializes on.
     fn present_target(
         &self,
         present: &PresentDescriptor,
         attachment: &RenderAttachment,
     ) -> Result<Arc<render::PresentTargetImage>, ProviderError> {
         let key = (present.target.allocation_id, present.target.view_id);
-        if let Some(existing) = self
-            .present_targets
-            .lock()
-            .map_err(|_| registry_poisoned())?
-            .get(&key)
         {
-            return Ok(Arc::clone(existing));
+            let mut registry = self
+                .present_targets
+                .lock()
+                .map_err(|_| registry_poisoned())?;
+            if let Some(entry) = registry.get_mut(&key) {
+                entry.last_used = self.next_present_target_stamp();
+                return Ok(Arc::clone(&entry.image));
+            }
         }
+        // The image is created outside the registry lock: it runs device calls
+        // and a sentinel pre-fill, and the registry is only the admission
+        // point that decides which identities stay resident.
         let mut image = render::PresentTargetImage::create(
             Arc::clone(&self.lock_executor()?.context),
             attachment.format,
@@ -1331,12 +1377,89 @@ impl VulkanComputeProvider {
         if let Some(sentinel) = present.target.initial.sentinel() {
             image.preset_sentinel(attachment.format, sentinel)?;
         }
+        let image = Arc::new(image);
         let mut registry = self
             .present_targets
             .lock()
             .map_err(|_| registry_poisoned())?;
-        let existing = registry.entry(key).or_insert_with(|| Arc::new(image));
-        Ok(Arc::clone(existing))
+        let stamp = self.next_present_target_stamp();
+        if let Some(entry) = registry.get_mut(&key) {
+            // Two submissions raced to create the same identity: the first
+            // insert stays authoritative and this one's image is dropped at
+            // the end of the call, once no submission can still hold it.
+            entry.last_used = stamp;
+            return Ok(Arc::clone(&entry.image));
+        }
+        registry.insert(
+            key,
+            PresentTargetEntry {
+                image: Arc::clone(&image),
+                last_used: stamp,
+            },
+        );
+        // The budget is a provider-internal policy, so the eviction happens
+        // here rather than in the contract: the targets themselves are dropped
+        // after the registry lock is released, so their images' device teardown
+        // cannot run under it.
+        let mut retired = Vec::new();
+        while registry.len() > PRESENT_TARGET_BUDGET {
+            let victim = registry
+                .iter()
+                .filter(|(identity, _)| **identity != key)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(identity, _)| *identity);
+            match victim.and_then(|victim| registry.remove(&victim)) {
+                Some(entry) => retired.push(entry),
+                None => break,
+            }
+        }
+        drop(registry);
+        if !retired.is_empty() {
+            self.present_target_evictions
+                .fetch_add(retired.len() as u64, Ordering::Relaxed);
+        }
+        drop(retired);
+        Ok(image)
+    }
+
+    /// The next least-recently-used stamp; only the registry lock's holders
+    /// call it, so the order is the lock's serial order.
+    fn next_present_target_stamp(&self) -> u64 {
+        self.present_target_stamp.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Drop any present target reserved for the allocation of a released
+    /// lease.
+    ///
+    /// A present target lives across submissions until its allocation's lease
+    /// is released (`docs/24` §5.2), so releasing the lease has to retire the
+    /// target too — the same rule the native rail states in its own
+    /// `drop_present_targets_for`. The lease→allocation mapping is removed in
+    /// the same call, so a double release cannot retire a sibling
+    /// allocation's targets.
+    fn drop_present_targets_for(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
+        let allocation_id = self
+            .lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&lease_id);
+        let Some(allocation_id) = allocation_id else {
+            return Ok(());
+        };
+        let retired = {
+            let mut registry = self
+                .present_targets
+                .lock()
+                .map_err(|_| registry_poisoned())?;
+            let before = registry.len();
+            registry.retain(|(allocation, _), _| *allocation != allocation_id);
+            before - registry.len()
+        };
+        if retired > 0 {
+            self.present_target_evictions
+                .fetch_add(retired as u64, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Number of provider-owned present targets still alive. Exposed for the
@@ -1348,6 +1471,16 @@ impl VulkanComputeProvider {
             .lock()
             .map(|registry| registry.len())
             .unwrap_or(0)
+    }
+
+    /// Cumulative number of present targets retired before the device epoch
+    /// ended, by either normal-path surface: the budget's eviction or the
+    /// release of the lease an allocation was reserved under. The device-loss
+    /// teardown that clears the registry is not counted here; it is observable
+    /// through the epoch advance instead.
+    #[doc(hidden)]
+    pub fn present_target_evictions(&self) -> u64 {
+        self.present_target_evictions.load(Ordering::Relaxed)
     }
 
     /// Cumulative present acquire / present completions of the presentation
@@ -1743,11 +1876,19 @@ impl LeaseImporter for VulkanComputeProvider {
                 FieldValue::Unsigned(staged.reservation.lease.owner_epoch.get()),
             ));
         }
-        self.staging.import(staged)
+        let lease_id = staged.lease_id();
+        let allocation_id = staged.reservation.lease.allocation_id;
+        self.staging.import(staged)?;
+        self.lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease_id, allocation_id);
+        Ok(())
     }
 
     fn release_staged_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
-        self.staging.release(lease_id)
+        self.staging.release(lease_id)?;
+        self.drop_present_targets_for(lease_id)
     }
 }
 
@@ -1788,11 +1929,19 @@ impl NoCopyLeaseImporter for VulkanComputeProvider {
                 alignment as u64,
             ));
         }
-        self.borrowed.import(borrowed)
+        let lease_id = borrowed.lease_id();
+        let allocation_id = borrowed.reservation.lease.allocation_id;
+        self.borrowed.import(borrowed)?;
+        self.lease_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(lease_id, allocation_id);
+        Ok(())
     }
 
     fn release_borrowed_lease(&self, lease_id: LeaseId) -> Result<(), ProviderError> {
-        self.borrowed.release(lease_id)
+        self.borrowed.release(lease_id)?;
+        self.drop_present_targets_for(lease_id)
     }
 }
 

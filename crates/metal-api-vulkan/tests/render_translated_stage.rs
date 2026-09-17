@@ -25,12 +25,13 @@
 //!   measurable from the outside.
 
 use metal_api_core::provider::{
-    AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource, BufferView,
-    ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
-    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue, LoadOp,
-    OperationId, PipelineId, ProviderError, ProviderErrorClass, RenderAttachment,
-    RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BufferAccess, BufferSource,
+    BufferView, ClearColor, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
+    ComputePass, ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
+    InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderError, ProviderErrorClass, RenderAttachment, RenderPassDescriptor,
+    RenderPipelineContract, ResourceTableSnapshot, SemanticDigest, StoreOp, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
     PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
@@ -81,6 +82,11 @@ const COPY_WORD_AIR: &str =
 /// The `LoadOp::Clear` sentinel: a texel still holding it proves the draw did
 /// not cover that pixel.
 const CLEAR_SENTINEL: [u8; 4] = [0xfe; 4];
+
+/// The `InitialState::Sentinel` bytes the present tail pre-fills its target
+/// with: distinct from both the clear sentinel and the fragment output, so a
+/// target the pass never rendered into stays falsifiable (`docs/24` §3.1).
+const PRESENT_SENTINEL: [u8; 4] = [0xfd; 4];
 
 /// The word `copy_word` reads out of the attachment view's first four bytes.
 const ATTACHMENT_WORD: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
@@ -226,7 +232,7 @@ fn compile_declaring_kernel(
         .expect("the compute pipeline registers")
 }
 
-fn render_pass(pipeline: PipelineId) -> RenderPassDescriptor {
+fn render_pass(pipeline: PipelineId, present: Option<PresentDescriptor>) -> RenderPassDescriptor {
     RenderPassDescriptor {
         blend: None,
         multisample: None,
@@ -255,7 +261,27 @@ fn render_pass(pipeline: PipelineId) -> RenderPassDescriptor {
         indices: None,
         instance_count: 1,
         textures: Vec::new(),
-        present: None,
+        present,
+    }
+}
+
+/// The present tail the R4a case attaches to the fixture's render pass: the
+/// pass's own attachment view is the target, handed on once in `Fifo` mode
+/// with a blocking acquire (`research/docs/24` §3.6).
+fn present_tail() -> PresentDescriptor {
+    PresentDescriptor {
+        target: PresentTarget {
+            allocation_id: ATTACHMENT_ALLOCATION,
+            view_id: ATTACHMENT_VIEW,
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 2,
+            height: 2,
+            image_count: 1,
+            initial: InitialState::Sentinel(PRESENT_SENTINEL.to_vec()),
+        },
+        source: ATTACHMENT_VIEW,
+        mode: PresentMode::Fifo,
+        acquire: AcquirePolicy::Blocking,
     }
 }
 
@@ -265,6 +291,7 @@ fn trace_for(
     provider: &VulkanComputeProvider,
     compute: &CompiledComputePipeline,
     render: &CompiledComputePipeline,
+    present: Option<PresentDescriptor>,
 ) -> (ComputeTrace, ResourceTableSnapshot) {
     let trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
@@ -304,7 +331,7 @@ fn trace_for(
                     threads_per_threadgroup: [1, 1, 1],
                 },
             }),
-            TracePass::Render(render_pass(render.pipeline_id)),
+            TracePass::Render(render_pass(render.pipeline_id, present)),
         ],
         completion_policy: CompletionPolicy::HostReadback,
         heap: None,
@@ -333,9 +360,10 @@ fn submit_for_readback(
     provider: &VulkanComputeProvider,
     compute: &CompiledComputePipeline,
     render: &CompiledComputePipeline,
+    present: Option<PresentDescriptor>,
     what: &str,
 ) -> Vec<u8> {
-    let (trace, resources) = trace_for(provider, compute, render);
+    let (trace, resources) = trace_for(provider, compute, render, present);
     let admitted = provider
         .capabilities()
         .validate_trace(trace.clone(), resources)
@@ -377,14 +405,87 @@ fn translated_stages_land_the_same_bytes_as_the_reviewed_pair() {
         })
         .expect("the translated pair registers");
 
-    let reviewed_bytes = submit_for_readback(&provider, &compute, &reviewed, "reviewed");
-    let translated_bytes = submit_for_readback(&provider, &compute, &translated, "translated");
+    let reviewed_bytes = submit_for_readback(&provider, &compute, &reviewed, None, "reviewed");
+    let translated_bytes =
+        submit_for_readback(&provider, &compute, &translated, None, "translated");
     eprintln!("expected: [{}] x4", hex(&EXPECTED_RGBA8_TEXELS[..4]));
     assert_eq!(reviewed_bytes, EXPECTED_RGBA8_TEXELS);
     assert_eq!(translated_bytes, EXPECTED_RGBA8_TEXELS);
     assert_eq!(
         translated_bytes, reviewed_bytes,
         "the translated pair has to land byte for byte what the reviewed pair lands"
+    );
+}
+
+/// R4a (E side): a **translated** registration executes a present tail
+/// (`research/docs/24` §3.6). Before this increment the present rail refused
+/// any translated stage by name
+/// (`render_present_translated_stage_unsupported`); the rail now binds the
+/// fragment module the registration named, exactly as the offscreen rail
+/// does, and the bytes, the acquire/present counters and the reused target
+/// identity are the ones the reviewed rail lands.
+#[test]
+fn translated_stages_land_the_same_bytes_through_a_present_tail() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let reviewed = register_reviewed(&provider).expect("the reviewed pair registers");
+    let (vertex, fragment) = translated_pair(&executor);
+    let translated = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: translated_contract(vec![AttachmentFormat::Rgba8Unorm]),
+            vertex,
+            fragment,
+            logical_digest: digest(b"translated-present-2x2"),
+        })
+        .expect("the translated pair registers");
+    let (acquires_before, presents_before) = provider.present_counts();
+
+    let reviewed_bytes = submit_for_readback(
+        &provider,
+        &compute,
+        &reviewed,
+        Some(present_tail()),
+        "reviewed present",
+    );
+    let translated_bytes = submit_for_readback(
+        &provider,
+        &compute,
+        &translated,
+        Some(present_tail()),
+        "translated present",
+    );
+
+    assert_eq!(reviewed_bytes, EXPECTED_RGBA8_TEXELS);
+    assert_eq!(
+        translated_bytes, reviewed_bytes,
+        "the translated pair has to land byte for byte what the reviewed pair lands, \
+         present tail included"
+    );
+    assert!(
+        !translated_bytes
+            .chunks_exact(4)
+            .any(|texel| texel == PRESENT_SENTINEL),
+        "the present target lands the fragment output, not its preset sentinel: {}",
+        hex(&translated_bytes)
+    );
+    // One acquire and one present per present action (`docs/24` §5.3), and
+    // both presents name the same (allocation, view) identity, so the target
+    // is reused rather than recreated.
+    assert_eq!(
+        provider.present_counts(),
+        (acquires_before + 2, presents_before + 2)
+    );
+    assert_eq!(
+        provider.present_target_count(),
+        1,
+        "both present tails name one target identity"
+    );
+    eprintln!(
+        "present counters after the two present tails: {:?}, target count={}",
+        provider.present_counts(),
+        provider.present_target_count()
     );
 }
 
