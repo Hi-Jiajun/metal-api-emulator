@@ -14,6 +14,12 @@ metal-api-core = { path = "../../crates/metal-api-core" }
 metal-api-ipc = { path = "../../crates/metal-api-ipc" }
 metal-api-native = { path = "../../crates/metal-api-native" }
 metal-api-vulkan = { path = "../../crates/metal-api-vulkan" }
+# The capture tool names the Vulkan descriptor layout of a translated render
+# stage directly (`metal2vulkan::reflect::DescriptorLayout`): the two stages of
+# a stage-buffer case translate into their own sets (the vertex stage's slots in
+# set 1, the fragment stage's in set 2), the arrangement the rail's reviewed
+# stage-buffer pair already binds (`research/docs/23` §3.3, v83/v84).
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan.git", rev = "43c46ac8a24adf1a6e872b8a52c706ec9614fad0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

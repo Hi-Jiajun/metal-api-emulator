@@ -231,6 +231,7 @@ dependencies = [
  "metal-api-ipc",
  "metal-api-native",
  "metal-api-vulkan",
+ "metal2vulkan",
  "serde",
  "serde_json",
  "sha2",
