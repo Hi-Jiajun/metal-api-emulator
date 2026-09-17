@@ -32,8 +32,8 @@ use metal_api_core::provider::{
     FootprintProof, InitialState, LoadOp, OperationId, PipelineId, PresentDescriptor, PresentMode,
     PresentTarget, ProviderError, ProviderErrorClass, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SemanticDigest,
-    StageBufferBinding, StoreOp, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexLayout, VertexStep, ViewId, PROVIDER_SCHEMA_VERSION,
+    StageBufferBinding, StageBufferView, StoreOp, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, VertexStep, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -189,6 +189,11 @@ const POSITION_VIEW: ViewId = ViewId::new(905);
 const POSITION_ALLOCATION: AllocationId = AllocationId::new(906);
 const OFFSET_VIEW: ViewId = ViewId::new(907);
 const OFFSET_ALLOCATION: AllocationId = AllocationId::new(908);
+/// The slot a pass tries to bind under the pipeline that declares none: the
+/// view is what the relaxed registration must answer with a refusal, not with
+/// a silently dropped binding.
+const UNUSED_SLOT_VIEW: ViewId = ViewId::new(909);
+const UNUSED_SLOT_ALLOCATION: AllocationId = AllocationId::new(910);
 
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -1027,11 +1032,15 @@ fn a_translation_above_the_rails_set_ceiling_is_refused() {
     );
 }
 
-/// The access arm of the pairing (`research/docs/23` §3.3, v84): a stage that
-/// declares the argument and never dereferences it reports `Unused`, and the
-/// contract admits `Read` alone — so the registration is refused by name
-/// instead of binding bytes the module's own interface does not classify as
-/// read.
+/// The fail-closed half of the unused arm (`research/docs/23` §3.3, v95): a
+/// stage that declares the argument and never dereferences it reports `Unused`,
+/// and a contract that *does* state the slot keeps the refusals this arm always
+/// had — a `Read` declaration disagrees with the reflection's own `Unused`
+/// classification (`render_stage_reflection_mismatch`), and an `Unused`
+/// declaration is not a shape the render contract admits at all
+/// (`render_pipeline_contract_invalid`, refused by the core contract rules
+/// before any pairing runs). Neither shape is executed, so a declaration can
+/// never be stated and silently ignored.
 #[test]
 fn a_stage_buffer_the_translation_never_reads_is_refused() {
     let Some((executor, provider)) = provider_with_device() else {
@@ -1077,6 +1086,154 @@ fn a_stage_buffer_the_translation_never_reads_is_refused() {
     assert_eq!(
         refused.fields.get("reflected_access"),
         Some(&FieldValue::Text("unused".to_owned()))
+    );
+
+    // The declared-`Unused` arm: the core contract rules refuse the
+    // declaration itself, before this rail's pairing ever sees it — the
+    // refusal R9m read on the reims side stays exactly where it was.
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_fragment(
+        &executor,
+        UNUSED_STAGE_BUFFER_FRAGMENT_AIR,
+        UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY,
+    );
+    let refused = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(
+                UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY,
+                vec![StageBufferBinding {
+                    stage: RenderPipelineStage::Fragment,
+                    index: 0,
+                    access: BufferAccess::Unused,
+                    footprint: FootprintProof::Static { max_bytes: 16 },
+                }],
+            ),
+            vertex,
+            fragment,
+            logical_digest: digest(b"declared-unused-translated-buffer-binding"),
+        })
+        .expect_err("an Unused declaration is not a shape the render contract admits");
+    eprintln!("refused a declared Unused slot: {refused:?}");
+    assert_eq!(refused.slug, "render_pipeline_contract_invalid");
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("is declared Unused")),
+        "the refusal names the declaration: {refused:?}"
+    );
+}
+
+/// The v95 arm, registration half (`research/docs/23` §3.3, v95): an argument
+/// the translated entry never dereferences is not part of the interface the
+/// rail executes, so it needs no declaration — the same fixture the refusal
+/// above measures registers once the contract states nothing for the slot, and
+/// the draw lands byte for byte what the reviewed pair lands.
+///
+/// The pass side of the arm is measured in the same test: the pipeline declares
+/// no stage buffer, so a pass view for the slot has nothing to pair with and is
+/// refused by name (`trace_contract_invalid`) — the slot cannot be bound, and
+/// with no landing there is nothing that could be written back through it.
+#[test]
+fn an_unused_stage_buffer_slot_needs_no_declaration() {
+    let Some((executor, provider)) = provider_with_device() else {
+        return;
+    };
+    let compute = compile_declaring_kernel(&provider, &executor);
+    let (vertex, _) = translated_pair(&executor);
+    let fragment = translate_fragment(
+        &executor,
+        UNUSED_STAGE_BUFFER_FRAGMENT_AIR,
+        UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY,
+    );
+    let binding = fragment
+        .reflection()
+        .bindings
+        .iter()
+        .find(|binding| binding.kind == ResourceKind::Buffer)
+        .expect("the fixture declares one Metal buffer");
+    let footprint = binding
+        .footprint
+        .as_ref()
+        .expect("the fixture's buffer carries a footprint");
+    eprintln!(
+        "unused fragment reflection binding: index {} access {:?} descriptor {:?} unbounded {} \
+         strided {} static ranges {:?}",
+        binding.metal_index,
+        binding.access,
+        binding.descriptor,
+        footprint.has_unbounded_access,
+        footprint.strided_accesses.len(),
+        footprint.static_ranges,
+    );
+    assert_eq!(binding.access, Some(ResourceAccess::Unused));
+    assert!(footprint.static_ranges.is_empty());
+
+    let reviewed = register_reviewed(&provider).expect("the reviewed pair registers");
+    let registered = provider
+        .register_translated_render_pipeline(TranslatedRenderPipelineRequest {
+            contract: stage_buffer_contract(UNUSED_STAGE_BUFFER_FRAGMENT_ENTRY, Vec::new()),
+            vertex,
+            fragment,
+            logical_digest: digest(b"unused-slot-translated-buffer-binding"),
+        })
+        .expect("an unused slot the contract does not declare registers");
+    eprintln!(
+        "registered the unused-slot pipeline as {:?} with no stage-buffer declaration",
+        registered.pipeline_id
+    );
+
+    let reviewed_bytes = submit_for_readback(&provider, &compute, &reviewed, None, "reviewed");
+    let unused_bytes = submit_for_readback(&provider, &compute, &registered, None, "unused-slot");
+    eprintln!("expected: [{}] x4", hex(&EXPECTED_RGBA8_TEXELS[..4]));
+    assert_eq!(unused_bytes, EXPECTED_RGBA8_TEXELS);
+    assert_eq!(
+        unused_bytes, reviewed_bytes,
+        "the unused-slot pipeline has to land byte for byte what the reviewed pair lands"
+    );
+
+    // The pass side of the arm: a view for the slot the pipeline never
+    // declared is refused by name rather than executed with the binding
+    // silently dropped.
+    let (mut trace, _) = trace_for_sized(&provider, &compute, &registered, None, 2, 2);
+    let TracePass::Render(pass) = &mut trace.passes[1] else {
+        panic!("the second pass is the render pass");
+    };
+    pass.stage_buffers = vec![StageBufferView {
+        stage: RenderPipelineStage::Fragment,
+        view: BufferView {
+            view_id: UNUSED_SLOT_VIEW,
+            metal_binding: 0,
+            allocation_id: UNUSED_SLOT_ALLOCATION,
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0x11; 16]),
+        },
+    }];
+    let (_, mut resources) = trace_for_sized(&provider, &compute, &registered, None, 2, 2);
+    resources
+        .insert_allocation(AllocationRecord {
+            allocation_id: UNUSED_SLOT_ALLOCATION,
+            owner_epoch: provider.device_epoch(),
+            size: 16,
+        })
+        .expect("the bound slot's allocation");
+    let refused = provider
+        .capabilities()
+        .validate_trace(trace, resources)
+        .expect_err("the pipeline states no slot for this pass view");
+    eprintln!("refused the pass binding the slot: {refused:?}");
+    assert_eq!(refused.slug, "trace_contract_invalid");
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(
+                "render pass binds a fragment stage buffer at 0 the pipeline never declared"
+            )),
+        "the refusal names the undeclared slot: {refused:?}"
     );
 }
 

@@ -1769,7 +1769,15 @@ fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static
 /// * a reflected slot the contract does not declare is interface this rail has
 ///   no bytes for — refused by name under the `bindings` field
 ///   (`render_stage_unsupported_interface`), which is also the refusal every
-///   non-buffer Metal binding keeps;
+///   non-buffer Metal binding keeps. A `[[buffer(N)]]` argument the entry never
+///   dereferences is the one reflection shape this arm does not see at all
+///   (*v95*): the translation classifies it `Unused`, nothing reads the slot,
+///   so it needs no declaration and takes no part in the pairing;
+/// * a contract that declares a slot the reflection classifies `Unused` is
+///   still refused by name — the declared access cannot match `Unused`, so the
+///   access arm below answers `render_stage_reflection_mismatch` rather than
+///   executing a declaration with nothing behind it (and the core contract
+///   rules refuse an `Unused` declaration outright, before any pairing runs);
 /// * a reflected access other than read-only — the one access the render
 ///   contract admits — is a disagreement between the declaration and the
 ///   module (`render_stage_reflection_mismatch`);
@@ -1818,6 +1826,16 @@ fn validate_translated_stage_buffers(
                  dropped",
             )
             .with_field("kind", FieldValue::Text(format!("{:?}", binding.kind))));
+        }
+        // An argument the translated entry never dereferences is not part of
+        // the interface the rail executes (`research/docs/23` §3.3, v95): the
+        // reflection classifies it `Unused`, the module reads nothing there, so
+        // the slot needs no declaration and the rail binds nothing into it. A
+        // contract that does state the slot skips this arm and falls through to
+        // the access check below, which refuses the pair by name instead of
+        // executing a declaration with nothing behind it.
+        if binding.access == Some(ResourceAccess::Unused) && declaration(index).is_none() {
+            continue;
         }
         let Some(declared) = declaration(index) else {
             return Err(unsupported(
