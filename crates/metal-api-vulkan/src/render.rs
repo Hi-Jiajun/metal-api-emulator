@@ -1604,6 +1604,7 @@ pub(crate) fn execute_render_pass(
     pass: &RenderPassDescriptor,
     previous: &[Option<&[u8]>],
 ) -> Result<OffscreenReadback, ProviderError> {
+    refuse_attachment_extent(context, pass)?;
     let request = prepare_render_request(
         stages,
         pass,
@@ -2452,6 +2453,7 @@ pub(crate) fn execute_indirect_render_pass(
                 .with_detail("the first indirect increment replays draws only"));
         }
     };
+    refuse_attachment_extent(context, pass)?;
     let mut request = prepare_render_request(
         stages,
         pass,
@@ -2474,6 +2476,68 @@ fn narrow_dimension(dimension: u64) -> Result<u32, ProviderError> {
             .with_field("requested", FieldValue::Unsigned(dimension))
             .with_field("maximum", FieldValue::Unsigned(u64::from(u32::MAX)))
     })
+}
+
+/// Refuse an attachment extent outside the rail's declared window.
+///
+/// R1b (`research/docs/23` §70) makes the window a declared, device-gated fact:
+/// the capability snapshot publishes the reviewed ceiling clamped by this
+/// device's `maxFramebuffer{Width,Height}`, and core admission refuses a wider
+/// attachment as `attachment_dimension_limit`. This is the rail's own second
+/// line, re-asked of the value it was handed so a directly-constructed request
+/// cannot skip either half. The two halves are asked in the order the caller
+/// can act on: the device's own answer first — an extent the device cannot open
+/// a framebuffer for is `attachment_extent_device_limit` — and the reviewed
+/// ceiling second, with the same slug and fields core admission uses. Neither
+/// answer narrows the request: the extent the caller asked for is the extent the
+/// refusal reports.
+pub(crate) fn refuse_attachment_extent(
+    context: &VulkanContext,
+    pass: &RenderPassDescriptor,
+) -> Result<(), ProviderError> {
+    let limits = context.physical_device_limits();
+    let device = [
+        u64::from(limits.max_framebuffer_width),
+        u64::from(limits.max_framebuffer_height),
+    ];
+    let extent_refusal = |slug: &'static str, width: u64, height: u64, maximum: [u64; 2]| {
+        capability_refusal(slug)
+            .with_field("width", FieldValue::Unsigned(width))
+            .with_field("height", FieldValue::Unsigned(height))
+            .with_field("maximum_width", FieldValue::Unsigned(maximum[0]))
+            .with_field("maximum_height", FieldValue::Unsigned(maximum[1]))
+    };
+    let extents = pass
+        .color_attachments
+        .iter()
+        .map(|attachment| (attachment.width, attachment.height))
+        .chain(pass.depth.iter().map(|depth| (depth.width, depth.height)))
+        .chain(
+            pass.stencil
+                .iter()
+                .map(|stencil| (stencil.width, stencil.height)),
+        );
+    for (width, height) in extents {
+        if width > device[0] || height > device[1] {
+            return Err(extent_refusal(
+                "attachment_extent_device_limit",
+                width,
+                height,
+                device,
+            ));
+        }
+        if width > crate::provider::REVIEWED_ATTACHMENT_CEILING[0]
+            || height > crate::provider::REVIEWED_ATTACHMENT_CEILING[1]
+        {
+            return Err(extent_refusal(
+                "attachment_dimension_limit",
+                width,
+                height,
+                crate::provider::REVIEWED_ATTACHMENT_CEILING,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `VkFormat` a render-contract attachment format names.
@@ -3798,6 +3862,7 @@ pub(crate) fn execute_present_render(
     // attachment list is not exactly one entry is outside this increment's
     // present shape.
     let previous = [previous];
+    refuse_attachment_extent(context, pass)?;
     let request = prepare_render_request(
         stages,
         pass,
@@ -9199,6 +9264,75 @@ mod tests {
             )))
         );
         assert_eq!(context.buffer_copy_counts(), (0, 0));
+    }
+
+    /// R1b (`research/docs/23` §70): the declared attachment window has two
+    /// named halves, and the rail re-asks both of the value it was handed so a
+    /// directly-constructed pass cannot skip admission. The device's own
+    /// `maxFramebuffer{Width,Height}` is asked first — it is the half that
+    /// cannot be widened by a contract change — and the reviewed ceiling
+    /// second, with the slug and fields core admission uses.
+    #[test]
+    fn attachment_extent_refusals_name_the_device_half_then_the_ceiling() {
+        let Some(context) = device_context() else {
+            return;
+        };
+        let limits = context.physical_device_limits();
+        let device = [
+            u64::from(limits.max_framebuffer_width),
+            u64::from(limits.max_framebuffer_height),
+        ];
+        let ceiling = crate::provider::REVIEWED_ATTACHMENT_CEILING;
+
+        // A request beyond the device's own framebuffer limit reports the
+        // device's number, even when it is also beyond the ceiling: that is the
+        // half no contract change can widen.
+        let mut too_wide = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        too_wide.color_attachments[0].width = device[0] + 1;
+        too_wide.color_attachments[0].height = 1;
+        let refused = refuse_attachment_extent(&context, &too_wide)
+            .expect_err("the device's own framebuffer limit is a refusal");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "attachment_extent_device_limit");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("width"),
+            Some(&FieldValue::Unsigned(device[0] + 1))
+        );
+        assert_eq!(
+            refused.fields.get("maximum_width"),
+            Some(&FieldValue::Unsigned(device[0]))
+        );
+
+        // A device at least as wide as the review still refuses an extent the
+        // reviewed ceiling does not cover, with the pair of limits admission
+        // publishes.
+        if device[0] >= ceiling[0] && device[1] >= ceiling[1] {
+            let mut over_ceiling = milestone_pass(AttachmentFormat::Rgba8Unorm);
+            over_ceiling.color_attachments[0].width = ceiling[0] + 1;
+            over_ceiling.color_attachments[0].height = ceiling[1] + 1;
+            let refused = refuse_attachment_extent(&context, &over_ceiling)
+                .expect_err("the reviewed ceiling is a refusal");
+            eprintln!("refused: {refused:?}");
+            assert_eq!(refused.slug, "attachment_dimension_limit");
+            assert_eq!(refused.class, ProviderErrorClass::Capability);
+            assert_eq!(
+                refused.fields.get("maximum_width"),
+                Some(&FieldValue::Unsigned(ceiling[0]))
+            );
+            assert_eq!(
+                refused.fields.get("maximum_height"),
+                Some(&FieldValue::Unsigned(ceiling[1]))
+            );
+
+            // The boundary extent itself is inside the window: the R1b
+            // fixture's 64×64 pass gets past this gate.
+            let mut boundary = milestone_pass(AttachmentFormat::Rgba8Unorm);
+            boundary.color_attachments[0].width = ceiling[0];
+            boundary.color_attachments[0].height = ceiling[1];
+            refuse_attachment_extent(&context, &boundary)
+                .expect("the reviewed boundary extent is inside the window");
+        }
     }
 
     /// Every attachment of one pass shares one extent; a pass whose attachments

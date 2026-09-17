@@ -219,7 +219,11 @@ impl NativeMetalProvider {
             // The render bits come from the rail itself (`crate::render`) so the
             // snapshot and the rail cannot disagree; the unit tests assert that
             // agreement against core admission on a host without Metal.
-            let render_bits = render::capability_bits();
+            // R1b (`research/docs/23` §70) makes the attachment window
+            // device-gated: the rail's reviewed ceiling clamped by this
+            // device's own 2D texture limit.
+            let render_bits =
+                render::capability_bits(render::device_attachment_dimension_limit(&device));
             // The vertex-input bits come from the same rail value, for the same
             // reason: `render::plan_vertex_input` owns the stride and index
             // footprints, and this snapshot publishes exactly the formats and
@@ -1468,6 +1472,14 @@ impl NativeMetalProvider {
         // from values, so a trace this provider cannot execute end to end is
         // refused with nothing on the queue.
         let render_contracts = self.render_contracts(trace)?;
+        // R1b (`research/docs/23` §70): the device half of the declared
+        // attachment window is asked before the plan's reviewed-ceiling check,
+        // so a trace that skipped admission is refused with the device's own
+        // answer instead of an extent the device could never open.
+        render::refuse_attachment_extent_over_device_limit(
+            trace,
+            render::device_attachment_dimension_limit(&state.device),
+        )?;
         let render_plan = render::plan_trace(
             trace,
             &pool,
@@ -2012,6 +2024,12 @@ impl NativeMetalProvider {
             // can still abandon the observation before `wait` lands it — the
             // same shape the Vulkan object rail reports.
             let render_contracts = self.render_contracts(trace)?;
+            // R1b (`research/docs/23` §70): the same device-half refusal the
+            // synchronous path asks, before this path's plan as well.
+            render::refuse_attachment_extent_over_device_limit(
+                trace,
+                render::device_attachment_dimension_limit(&state.device),
+            )?;
             let render_plan = render::plan_trace(
                 trace,
                 &pool,
