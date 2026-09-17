@@ -829,7 +829,7 @@ impl ComputeProvider for NativeMetalProvider {
                         ));
                     }
                     if !(resolved.base_len as u64).is_multiple_of(alignment) {
-                        return Err(borrowed_length_error(
+                        return Err(crate::lease_length_refusal(
                             *lease_id,
                             resolved.base_len as u64,
                             alignment,
@@ -837,14 +837,17 @@ impl ComputeProvider for NativeMetalProvider {
                     }
                     let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
                     if !resolved.base_pointer.is_multiple_of(alignment) {
-                        return Err(borrowed_alignment_error(
+                        return Err(crate::lease_alignment_refusal(
                             *lease_id,
                             resolved.base_pointer,
                             alignment as u64,
                         ));
                     }
                     if !resolved.offset.is_multiple_of(4) {
-                        return Err(borrowed_offset_error(*lease_id, resolved.offset as u64));
+                        return Err(crate::lease_offset_refusal(
+                            *lease_id,
+                            resolved.offset as u64,
+                        ));
                     }
                     Ok(ResolvedBuffer::Borrowed {
                         pointer: resolved.base_pointer as *mut u8,
@@ -1480,10 +1483,23 @@ impl NativeMetalProvider {
             trace,
             render::device_attachment_dimension_limit(&state.device),
         )?;
-        let render_plan = render::plan_trace(
+        // R3d (`research/docs/23` §72): the render rail resolves lease-backed
+        // vertex and index inputs through this provider's own registries, the
+        // same pair the compute rail's pool bindings resolve through, and the
+        // same admitted snapshot. A device that cannot map an owner window
+        // reports alignment zero here, which refuses the no-copy arm by name.
+        let render_leases = render::RenderLeaseContext {
+            staging: &self.staging,
+            borrowed: &self.borrowed,
+            resources,
+            device_epoch: self.epoch,
+            host_import_alignment: self.no_copy_alignment(),
+        };
+        let render_plan = render::plan_trace_with_leases(
             trace,
             &pool,
             &render_contracts,
+            Some(&render_leases),
             self.capabilities.depth_resolve_modes,
             self.capabilities.stencil_resolve_modes,
         )?;
@@ -1906,6 +1922,13 @@ impl NativeMetalProvider {
             self.counters
                 .uploads
                 .fetch_add(planned.plan.textures.len(), Ordering::Relaxed);
+            // R3d (`research/docs/23` §72): a pass that maps owner windows takes
+            // one hold per no-copy lease before its first mapping, and drops
+            // them once the pass's command buffer is terminal — which, on this
+            // synchronous rail, is the end of this iteration, after the encode
+            // call returned from its `waitUntilCompleted`. A pass with no
+            // no-copy input retains nothing.
+            let _retains = render::RenderInputRetains::retain(&self.borrowed, &planned.plan)?;
             match &planned.present {
                 // A present action hands its one attachment on to the target
                 // texture, whose readback is the pass's single writeback.
@@ -2030,10 +2053,20 @@ impl NativeMetalProvider {
                 trace,
                 render::device_attachment_dimension_limit(&state.device),
             )?;
-            let render_plan = render::plan_trace(
+            // R3d (`research/docs/23` §72): the deferred path resolves the same
+            // lease channel the synchronous one does, from the same snapshot.
+            let render_leases = render::RenderLeaseContext {
+                staging: &self.staging,
+                borrowed: &self.borrowed,
+                resources,
+                device_epoch: self.epoch,
+                host_import_alignment: self.no_copy_alignment(),
+            };
+            let render_plan = render::plan_trace_with_leases(
                 trace,
                 &pool,
                 &render_contracts,
+                Some(&render_leases),
                 self.capabilities.depth_resolve_modes,
                 self.capabilities.stencil_resolve_modes,
             )?;
@@ -2295,7 +2328,7 @@ impl NoCopyLeaseImporter for NativeMetalProvider {
             ));
         }
         if !borrowed.reservation.length.is_multiple_of(alignment) {
-            return Err(borrowed_length_error(
+            return Err(crate::lease_length_refusal(
                 borrowed.lease_id(),
                 borrowed.reservation.length,
                 alignment,
@@ -2303,7 +2336,7 @@ impl NoCopyLeaseImporter for NativeMetalProvider {
         }
         let alignment = usize::try_from(alignment).unwrap_or(usize::MAX);
         if !borrowed.host_pointer.is_multiple_of(alignment) {
-            return Err(borrowed_alignment_error(
+            return Err(crate::lease_alignment_refusal(
                 borrowed.lease_id(),
                 borrowed.host_pointer,
                 alignment as u64,
@@ -2326,7 +2359,7 @@ impl NoCopyLeaseImporter for NativeMetalProvider {
 }
 
 /// Page size Metal requires for `newBufferWithBytesNoCopy:` on macOS.
-fn page_size() -> u64 {
+pub(crate) fn page_size() -> u64 {
     // SAFETY: `sysconf` has no preconditions for `_SC_PAGESIZE`.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if size <= 0 {
@@ -2334,39 +2367,6 @@ fn page_size() -> u64 {
     } else {
         size as u64
     }
-}
-
-fn borrowed_alignment_error(lease_id: LeaseId, pointer: usize, alignment: u64) -> ProviderError {
-    refusal(
-        ProviderPhase::Resolve,
-        ProviderErrorClass::Capability,
-        "lease_alignment_unsupported",
-    )
-    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
-    .with_field("pointer", FieldValue::Unsigned(pointer as u64))
-    .with_field("alignment", FieldValue::Unsigned(alignment))
-}
-
-fn borrowed_length_error(lease_id: LeaseId, length: u64, alignment: u64) -> ProviderError {
-    refusal(
-        ProviderPhase::Resolve,
-        ProviderErrorClass::Capability,
-        "lease_length_unsupported",
-    )
-    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
-    .with_field("length", FieldValue::Unsigned(length))
-    .with_field("alignment", FieldValue::Unsigned(alignment))
-}
-
-fn borrowed_offset_error(lease_id: LeaseId, offset: u64) -> ProviderError {
-    refusal(
-        ProviderPhase::Resolve,
-        ProviderErrorClass::Capability,
-        "lease_offset_unsupported",
-    )
-    .with_field("lease", FieldValue::Unsigned(lease_id.get()))
-    .with_field("offset", FieldValue::Unsigned(offset))
-    .with_field("alignment", FieldValue::Unsigned(4))
 }
 
 fn next_id(counter: &mut u64) -> Result<u64, ProviderError> {
