@@ -3082,15 +3082,20 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
         try require(definition.base_vertex == nil || definition.base_vertex == 0,
                     "\(definition.id): the reviewed multisample shapes carry no base vertex")
         // The trace contract's own rule one line up: a multisampled pass opens
-        // its attachment from a clear — or, from v67 on, from `dontcare` while
-        // every unclaimed texel states the closed set its resolve may land in,
-        // which `conformance/compare.py` states explicitly
-        // (`research/docs/23` §3.3, v54 review L1/v67).
+        // its attachment from a clear — from v67 on, from `dontcare` while
+        // every unclaimed texel states the closed set its resolve may land in
+        // (`conformance/compare.py` states that half explicitly) — or, from
+        // v82 on, from `load` when the case declares the one repeated texel a
+        // seed pass writes into every sample (`research/docs/23` §3.3, v54
+        // review L1/v67/v82).
         try require(definition.attachment?.load == "clear"
                     || (definition.attachment?.load == "dontcare"
-                        && definition.wildcard_allowed_texels != nil),
+                        && definition.wildcard_allowed_texels != nil)
+                    || (definition.attachment?.load == "load"
+                        && definition.attachment?.initial_hex != nil),
                     "\(definition.id): the reviewed multisample pass opens its attachment "
-                    + "from a clear or a dontcare load with constrained wildcard texels")
+                    + "from a clear, a seeded load, or a dontcare load with constrained "
+                    + "wildcard texels")
     }
     // The wildcard channel (`research/docs/23` §3.3, v33): a case may name the
     // texels whose bytes it does not claim, and the undefined pre-pass contents
