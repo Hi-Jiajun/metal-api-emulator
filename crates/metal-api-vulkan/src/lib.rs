@@ -221,9 +221,16 @@ pub struct DeviceFaultSnapshot {
 
 impl DeviceFaultSnapshot {
     /// The record for a device that could not answer the fault query.
-    pub(crate) fn unavailable() -> Self {
+    ///
+    /// `advertised` is the physical device's answer to "does the extension
+    /// exist at all", so the bit survives a missing entry point: a device that
+    /// offers `VK_EXT_device_fault` but never hands the query over answers this
+    /// shape unchanged, and the evidence still tells "the extension is absent"
+    /// from "the query could not run". Description and counts stay empty until
+    /// the driver writes them.
+    pub(crate) fn unavailable(advertised: bool) -> Self {
         Self {
-            extension_present: false,
+            extension_present: advertised,
             description: None,
             addresses: Vec::new(),
             vendor_info_count: 0,
@@ -285,6 +292,34 @@ impl DeviceFaultSnapshot {
 
 /// Upper bound of fault addresses copied into one provider error.
 const DEVICE_FAULT_ADDRESS_FIELDS: usize = 4;
+
+/// The one `VK_EXT_device_fault` entry point, named the way ash's generated
+/// loader names it.
+const GET_DEVICE_FAULT_INFO_EXT: &CStr = c"vkGetDeviceFaultInfoEXT";
+
+/// The `vkGetDeviceFaultInfoEXT` entry point the created device hands over.
+///
+/// `device_fault::Device::new` cannot answer this question on its own: with
+/// ash's `loaded` feature a missing entry point becomes a callable stub that
+/// panics from inside an `extern "system"` frame — a panic the process cannot
+/// unwind — so the probe asks `vkGetDeviceProcAddr` the same question the
+/// generated loader asks, with the same command name.
+fn device_fault_entry_point(instance: &Instance, device: &AshDevice) -> vk::PFN_vkVoidFunction {
+    unsafe { instance.get_device_proc_addr(device.handle(), GET_DEVICE_FAULT_INFO_EXT.as_ptr()) }
+}
+
+/// Whether the fault loader may be built for a created device.
+///
+/// Enumerating a device extension is not enabling it: the spec lets
+/// `vkGetDeviceProcAddr` answer NULL for a device-level command whose extension
+/// the device was not created with, and the Windows RTX 5060 ICD does exactly
+/// that (2026-09-18). Driving the query there aborts the process, so the loader
+/// is only built when the device really hands the entry point over; a device
+/// that advertised the extension but cannot is still reported as advertised,
+/// with no addresses ([`DeviceFaultSnapshot::unavailable`]).
+fn device_fault_loader_ready(advertised: bool, entry_point: vk::PFN_vkVoidFunction) -> bool {
+    advertised && entry_point.is_some()
+}
 
 /// Vulkan name of one `VkDeviceFaultAddressTypeEXT` value.
 fn device_fault_address_type_name(address_type: i32) -> &'static str {
@@ -966,8 +1001,11 @@ pub(crate) struct VulkanContext {
     device: AshDevice,
     external_memory_host: Option<ExternalMemoryHost>,
     /// `VK_EXT_device_fault` entry points, loaded only when the device
-    /// advertises the extension.
+    /// advertises the extension *and* hands the query over.
     device_fault: Option<device_fault::Device>,
+    /// Whether the physical device advertised `VK_EXT_device_fault`, with or
+    /// without a usable entry point.
+    device_fault_advertised: bool,
     /// Diagnostic record of the last observed device loss, if any.
     device_fault_record: Mutex<Option<DeviceFaultSnapshot>>,
     /// Test-only substitution of the next driver answer at one queue boundary.
@@ -1243,9 +1281,16 @@ impl VulkanContext {
             }
         });
         // The fault query is diagnostic evidence, so the entry points are only
-        // loaded for a device that advertises the extension; an absent
-        // extension never fails device creation.
-        let device_fault = has_device_fault.then(|| device_fault::Device::new(&instance, &device));
+        // loaded for a device that advertises the extension *and* hands the
+        // query over; neither an absent extension nor one whose entry point the
+        // ICD refuses to resolve may fail device creation, and a refusal has to
+        // degrade to `DeviceFaultSnapshot::unavailable(false)` instead of reaching
+        // ash's panicking stub.
+        let device_fault = device_fault_loader_ready(
+            has_device_fault,
+            device_fault_entry_point(&instance, &device),
+        )
+        .then(|| device_fault::Device::new(&instance, &device));
 
         Ok(Self {
             entry: ManuallyDrop::new(entry),
@@ -1254,6 +1299,7 @@ impl VulkanContext {
             device,
             external_memory_host,
             device_fault,
+            device_fault_advertised: has_device_fault,
             device_fault_record: Mutex::new(None),
             driver_loss_injection: Mutex::new(None),
             queue_families,
@@ -1616,17 +1662,18 @@ impl VulkanContext {
     ///
     /// The record is diagnostic evidence and never a gate. A device that does
     /// not advertise the extension answers
-    /// [`DeviceFaultSnapshot::unavailable`]; a driver that does but refuses the
-    /// query answers the same shape with `extension_present == true` and no
-    /// addresses. Refusing a loss report because the diagnostics were
-    /// unavailable would throw away the loss itself.
+    /// [`DeviceFaultSnapshot::unavailable`]; a device that advertises it but
+    /// never handed its entry point over (the Windows RTX 5060 ICD,
+    /// 2026-09-18), and a driver that hands it over but refuses the query, both
+    /// answer the same shape with `extension_present == true` and no addresses.
+    /// Refusing a loss report because the diagnostics were unavailable would
+    /// throw away the loss itself.
     fn query_device_fault(&self) -> DeviceFaultSnapshot {
+        // The advertised bit survives a missing entry point: the field answers
+        // "did the device offer the extension", not "did the query run".
+        let mut snapshot = DeviceFaultSnapshot::unavailable(self.device_fault_advertised);
         let Some(loader) = self.device_fault.as_ref() else {
-            return DeviceFaultSnapshot::unavailable();
-        };
-        let mut snapshot = DeviceFaultSnapshot {
-            extension_present: true,
-            ..DeviceFaultSnapshot::unavailable()
+            return snapshot;
         };
         // The driver reports the counts it wants to write first; the second
         // call fills the arrays sized from that answer. `vendorBinarySize` is
@@ -9181,7 +9228,7 @@ mod tests {
         );
 
         // An unavailable record is evidence too, and it never claims a fault.
-        let unavailable: BTreeMap<String, FieldValue> = DeviceFaultSnapshot::unavailable()
+        let unavailable: BTreeMap<String, FieldValue> = DeviceFaultSnapshot::unavailable(false)
             .evidence_fields()
             .into_iter()
             .collect();
@@ -9194,6 +9241,41 @@ mod tests {
             Some(&FieldValue::Unsigned(0))
         );
         assert!(!unavailable.contains_key("device_fault_description"));
+    }
+
+    /// A device that advertises `VK_EXT_device_fault` but never hands over
+    /// `vkGetDeviceFaultInfoEXT` must not be driven.
+    ///
+    /// The Windows RTX 5060 ICD answers NULL for the entry point of a device
+    /// extension it was not created with (2026-09-18), and ash's `loaded` stub
+    /// turns a call on that answer into a panic the process cannot unwind, so
+    /// the loader has to stay off and the record has to say "advertised, no
+    /// addresses" instead of aborting the run.
+    #[test]
+    fn the_fault_loader_needs_an_entry_point_the_device_hands_over() {
+        unsafe extern "system" fn stub() {}
+        // The Windows answer: advertised, but `vkGetDeviceProcAddr` is empty.
+        assert!(!device_fault_loader_ready(true, None));
+        // A permissive ICD — the Linux loaders hand the pointer over even for
+        // an extension the device was not created with — keeps the diagnostic.
+        assert!(device_fault_loader_ready(true, Some(stub)));
+        // Nothing is loaded for a device that never advertised it.
+        assert!(!device_fault_loader_ready(false, Some(stub)));
+
+        // The advertised-but-no-entry-point record the Windows ICD produces.
+        let advertised: BTreeMap<String, FieldValue> = DeviceFaultSnapshot::unavailable(true)
+            .evidence_fields()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            advertised.get("device_fault_extension"),
+            Some(&FieldValue::Bool(true))
+        );
+        assert_eq!(
+            advertised.get("device_fault_addresses"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        assert!(!advertised.contains_key("device_fault_description"));
     }
 
     /// Only a loss carries the raw `vk::Result`: the field means "the driver
