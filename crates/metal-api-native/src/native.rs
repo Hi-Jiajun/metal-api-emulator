@@ -2015,7 +2015,15 @@ impl NativeMetalProvider {
         // present that claims success without running the render reads back the
         // sentinel, not the fragment texel (`research/docs/24` §3.1).
         if let Some(sentinel) = &present.sentinel {
-            render::upload_texels(&texture, &planned.plan, sentinel);
+            // The target inherits the pass's location-0 format
+            // (`research/docs/24` §3.2), so its texel width is that
+            // attachment's own (`research/docs/23` §78).
+            render::upload_texels(
+                &texture,
+                &planned.plan,
+                planned.plan.attachments[0].texel,
+                sentinel,
+            );
         }
         let texels =
             render::encode_present_render(&state.device, &state.queue, &planned.plan, &texture)?;

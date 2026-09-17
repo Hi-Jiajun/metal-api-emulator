@@ -95,9 +95,12 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // four colour attachments end to end, so the capability bits name
         // exactly what that rail covers — up to four attachments of the
         // declared window below, with a reviewed output module per attachment
-        // count and per format (the single-output, dual, triple and quad 8-bit
-        // modules, the single-channel float module, and the depth-only stage
-        // beside an empty colour list).
+        // count and per component shape: the single-output four-component
+        // module serves the two 8-bit UNORM layouts and `Rgba16Float` alike
+        // (`research/docs/23` §78), the dual, triple and quad modules stay
+        // reviewed for their 8-bit format lists, the single-channel float module
+        // is the one format-specific stage, and the depth-only stage stands
+        // beside an empty colour list.
         // Formats the device itself refuses are still refused before
         // `vkCreateImage` by the rail's `COLOR_ATTACHMENT` probe; the
         // capability snapshot answers which shapes the provider can express,

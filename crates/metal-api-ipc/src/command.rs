@@ -1695,6 +1695,84 @@ mod tests {
         assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
     }
 
+    /// The clear payload is one texel of the attachment's own format
+    /// (`research/docs/23` §78), and the wire carries that width through the
+    /// format byte written before the load operation — there is no length
+    /// prefix, so a payload of another width cannot be framed at all.
+    #[test]
+    fn the_clear_payload_travels_at_the_attachment_formats_own_width() {
+        let wide = ClearColor::from_bytes(&[0xf8, 0x3b, 0xf8, 0x3b, 0xf8, 0x3b, 0xf8, 0x3b])
+            .expect("one eight-byte texel");
+        let mut compiled = pipeline(&compile_request());
+        compiled.render = Some(RenderPipelineContract {
+            color_formats: vec![AttachmentFormat::Rgba16Float],
+            ..render_contract()
+        });
+        let mut attachment = render_attachment(2, 2);
+        attachment.format = AttachmentFormat::Rgba16Float;
+        attachment.load = LoadOp::Clear(wide);
+        let mut descriptor = render_pass_descriptor(&compiled, 2, 2);
+        descriptor.color_attachments = vec![attachment];
+        let trace = ComputeTrace {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            device_epoch: compiled.device_epoch,
+            operation_id: OperationId::new(22),
+            pipelines: vec![compiled.clone()],
+            encoder_dispatch_type: DispatchType::Serial,
+            passes: vec![TracePass::Render(descriptor)],
+            completion_policy: CompletionPolicy::HostReadback,
+            heap: None,
+            indirect: None,
+        };
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let decoded = CommandCodec::decode_request(&frame).unwrap();
+        assert_eq!(decoded, request, "the eight-byte clear survives the frame");
+        let CommandRequest::Submit { trace, .. } = &decoded else {
+            panic!("a render submit decodes as a submit");
+        };
+        let pass = trace.passes[0]
+            .as_render()
+            .expect("the render pass decodes as a render pass");
+        assert_eq!(pass.color_attachments[0].format.code(), 4);
+        let LoadOp::Clear(clear) = pass.color_attachments[0].load else {
+            panic!("the pass carries its clear");
+        };
+        assert_eq!(clear.as_bytes().len(), 8);
+        assert_eq!(clear, wide, "the payload is the same value, byte for byte");
+
+        // The narrow spelling for the wide format is refused *while encoding*,
+        // by name: the receiver reads the payload at the format's width, so a
+        // frame that carried four bytes here would have to desync on the next
+        // field instead of failing closed.
+        let mut narrow = request.clone();
+        let CommandRequest::Submit { trace, .. } = &mut narrow else {
+            panic!("the request is a submit");
+        };
+        let TracePass::Render(pass) = &mut trace.passes[0] else {
+            panic!("the pass is a render pass");
+        };
+        pass.color_attachments[0].load = LoadOp::Clear(ClearColor::new([0xfe; 4]));
+        let refused = CommandCodec::encode_request(&narrow)
+            .expect_err("a four-byte clear cannot be framed for an eight-byte texel");
+        eprintln!("refused: {refused:?}");
+        assert!(matches!(
+            refused,
+            CodecError::ClearLength {
+                format: 4,
+                expected: 8,
+                actual: 4,
+            }
+        ));
+        assert_eq!(
+            refused.to_string(),
+            "attachment clear for format code 4 carries 4 bytes, but its texel is 8 bytes"
+        );
+    }
+
     #[test]
     fn render_frames_carry_the_pipeline_render_contract() {
         // The tagged layout carries the table entry's render half, so the trace

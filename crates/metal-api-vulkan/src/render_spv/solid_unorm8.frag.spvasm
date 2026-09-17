@@ -6,12 +6,18 @@
 ; （两段名必须区分），所以本文件的入口名从探针的 "main" 改为 "fragment_main"，
 ; 着色器行为与探针一致（探针本身不依赖入口名）。
 ;
-; 本模块服务两个 8-bit UNORM 准入格式：VK_FORMAT_R8G8B8A8_UNORM 与
-; VK_FORMAT_B8G8R8A8_UNORM。"哪个通道落进哪个字节"是 VkFormat 决定的，不是着色器
-; 决定的，所以两个布局共用这一个 vec4 store 才是语义正确的：着色器无论哪种布局都写
-; 同一个颜色，读回字节随布局不同——
+; 本模块服务全部"四分量颜色"准入格式：VK_FORMAT_R8G8B8A8_UNORM、
+; VK_FORMAT_B8G8R8A8_UNORM，以及 v78（research/docs/23 §78）新增的
+; VK_FORMAT_R16G16B16A16_SFLOAT。"哪个通道落进哪个字节"和"每个通道按 8-bit UNORM
+; 还是按 half 存储"都是 VkFormat 决定的，不是着色器决定的，所以这些布局共用这一个
+; vec4 store 才是语义正确的：着色器无论哪种布局都写同一个颜色，读回字节随布局与存储
+; 宽度不同——
 ;   R8G8B8A8_UNORM 布局 -> 40 80 c0 ff（R,G,B,A）
 ;   B8G8R8A8_UNORM 布局 -> c0 80 40 ff（B,G,R,A）
+;   R16G16B16A16_SFLOAT 布局 -> 每次 store 的 f32 常量按 round-to-nearest-even 落到
+;     half 网格：64/255 -> 0x3404、128/255 -> 0x3804、192/255 -> 0x3c04、1.0 -> 0x3c00，
+;     小端读回即 04 34 04 38 04 3c 00 3c。half 舍入是驱动按规范做的；着色器写的是
+;     f32 颜色值本身，所以半精度舍入点正是"存储宽度由格式决定"的可证伪证据。
 ; 若再做一次通道交换（把 store 写成 b,g,r），就是替驱动重复了一次重排，
 ; 同一批字节里落的会是另一个颜色。文件名从 solid_rgba8 改为 solid_unorm8 就是这个原因。
 ;
