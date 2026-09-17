@@ -24,7 +24,7 @@ use metal_api_core::{
     AirSource, BufferBinding, BufferUpdate, ComputeExecutor, ComputeSubmission, ExecutorError,
     Function, PipelineArtifact,
 };
-use spirv::{Capability, Op};
+use spirv::{BuiltIn, Capability, Decoration, Op};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
@@ -790,6 +790,19 @@ impl TranslatedRenderStage {
             ))
         })?;
         validate_spirv_capabilities(&spirv, policy)?;
+        // Metal's clip space is +y up and Vulkan's is +y down, so a translated
+        // vertex module that writes its position unchanged would rasterize a
+        // vertically mirrored frame. The reviewed `render_spv/*.vert.spvasm`
+        // modules negate the position's y by hand (v38, `research/docs/23`
+        // §32); a module that came out of the translator gets the same
+        // alignment here (`research/docs/23` §40). Only the translated vertex
+        // arm passes through this function, so the hand-written modules and
+        // the native (macOS Metal) rail keep their own conventions.
+        let spirv = if stage == RenderStage::Vertex {
+            negate_position_y(&spirv)?
+        } else {
+            spirv
+        };
         if reflection.stage != stage.reflected_stage() {
             return Err(failure(format!(
                 "translate {} {}: the reflection reports stage {:?}",
@@ -2618,6 +2631,158 @@ fn spirv_literal_string(words: &[u32]) -> Option<String> {
     }
     let end = bytes.iter().position(|byte| *byte == 0)?;
     std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
+}
+
+/// Negate the `y` of every write to a `BuiltIn Position` output variable.
+///
+/// Metal's NDC is +y up and Vulkan's is +y down. The reviewed hand-written
+/// vertex modules carry an `OpFNegate` on the position's `y` for exactly this
+/// reason (`research/docs/23` §32, v38); a module that came out of the
+/// translator writes the position exactly as its AIR states it, so the
+/// alignment has to be put back here (`research/docs/23` §40).
+///
+/// For every `OpStore` into such a variable the rewrite inserts one
+/// `OpCompositeExtract`/`OpFNegate`/`OpCompositeInsert` triple and stores the
+/// rebuilt vector instead:
+///
+/// ```text
+/// %y  = OpCompositeExtract %float %position 1
+/// %ny = OpFNegate %float %y
+/// %p  = OpCompositeInsert %v4float %ny %position 1
+/// OpStore %gl_Position %p
+/// ```
+///
+/// This is a rewrite rather than a `TransformOptions` switch because the
+/// pinned translator exposes no such option. It stays inside the translated
+/// vertex arm: the hand-written modules never pass through it, and the native
+/// (macOS Metal) rail never sees it. A vertex module with no position store is
+/// refused rather than silently left unaligned.
+fn negate_position_y(spirv: &[u8]) -> Result<Vec<u8>, ExecutorError> {
+    if !spirv.len().is_multiple_of(4) {
+        return Err(failure("translated SPIR-V is not word aligned"));
+    }
+    let words = spirv
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+        .collect::<Vec<_>>();
+    if words.len() < 5 {
+        return Err(failure("translated SPIR-V has an invalid header"));
+    }
+    // Pass 1: the shape the rewrite needs — which variables are `Position`
+    // outputs, and the pointer/vector/float types their stores carry.
+    let mut position_variables = BTreeSet::new();
+    let mut pointer_pointee = BTreeMap::new();
+    let mut vector_components = BTreeMap::new();
+    let mut float_widths = BTreeMap::new();
+    let mut variable_types = BTreeMap::new();
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        let end = cursor
+            .checked_add(word_count)
+            .filter(|end| word_count != 0 && *end <= words.len())
+            .ok_or_else(|| {
+                failure(format!(
+                    "translated SPIR-V has a malformed instruction at word {cursor}"
+                ))
+            })?;
+        if opcode == Op::Decorate as u32 && word_count == 4 {
+            if words[cursor + 2] == Decoration::BuiltIn as u32
+                && words[cursor + 3] == BuiltIn::Position as u32
+            {
+                position_variables.insert(words[cursor + 1]);
+            }
+        } else if opcode == Op::TypePointer as u32 && word_count == 4 {
+            pointer_pointee.insert(words[cursor + 1], words[cursor + 3]);
+        } else if opcode == Op::TypeVector as u32 && word_count == 4 {
+            vector_components.insert(words[cursor + 1], words[cursor + 2]);
+        } else if opcode == Op::TypeFloat as u32 && word_count == 3 {
+            float_widths.insert(words[cursor + 1], words[cursor + 2]);
+        } else if opcode == Op::Variable as u32 && word_count >= 4 {
+            variable_types.insert(words[cursor + 2], words[cursor + 1]);
+        }
+        cursor = end;
+    }
+    if position_variables.is_empty() {
+        return Err(failure(
+            "translated vertex SPIR-V has no BuiltIn Position output",
+        ));
+    }
+    // The position pointer's pointee is a float vector; the rewrite needs the
+    // component type for the extract/negate and the vector type for the
+    // insert.
+    let mut position_types = BTreeMap::new();
+    for variable in &position_variables {
+        let pointer = variable_types.get(variable).ok_or_else(|| {
+            failure("translated vertex SPIR-V decorates a non-variable with BuiltIn Position")
+        })?;
+        let vector = pointer_pointee.get(pointer).ok_or_else(|| {
+            failure(
+                "translated vertex SPIR-V writes BuiltIn Position through an unknown pointer type",
+            )
+        })?;
+        let component = vector_components.get(vector).ok_or_else(|| {
+            failure("translated vertex SPIR-V writes BuiltIn Position to a non-vector type")
+        })?;
+        if float_widths.get(component) != Some(&32) {
+            return Err(failure(
+                "translated vertex SPIR-V writes BuiltIn Position to a non-float32 type",
+            ));
+        }
+        position_types.insert(*variable, (*vector, *component));
+    }
+    // Pass 2: insert the negation in front of every store into one of them.
+    let mut bound = words[3];
+    let mut rewritten = Vec::with_capacity(words.len() + 16);
+    rewritten.extend_from_slice(&words[..5]);
+    let mut stores = 0usize;
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let word_count = (words[cursor] >> 16) as usize;
+        let opcode = words[cursor] & 0xffff;
+        // Pass 1 checked every instruction's length.
+        let end = cursor + word_count;
+        let position = if opcode == Op::Store as u32 && word_count >= 3 {
+            position_types.get(&words[cursor + 1]).copied()
+        } else {
+            None
+        };
+        match position {
+            Some((vector, component)) => {
+                let value = words[cursor + 2];
+                let y = bound;
+                let negated = bound + 1;
+                let inserted = bound + 2;
+                bound += 3;
+                rewritten.push((5 << 16) | Op::CompositeExtract as u32);
+                rewritten.extend_from_slice(&[component, y, value, 1]);
+                rewritten.push((4 << 16) | Op::FNegate as u32);
+                rewritten.extend_from_slice(&[component, negated, y]);
+                rewritten.push((6 << 16) | Op::CompositeInsert as u32);
+                rewritten.extend_from_slice(&[vector, inserted, negated, value, 1]);
+                rewritten.push(words[cursor]);
+                rewritten.extend_from_slice(&[words[cursor + 1], inserted]);
+                if word_count > 3 {
+                    rewritten.extend_from_slice(&words[cursor + 3..end]);
+                }
+                stores += 1;
+            }
+            None => rewritten.extend_from_slice(&words[cursor..end]),
+        }
+        cursor = end;
+    }
+    if stores == 0 {
+        return Err(failure(
+            "translated vertex SPIR-V never stores to its BuiltIn Position output",
+        ));
+    }
+    rewritten[3] = bound;
+    Ok(rewritten
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<u8>>())
 }
 
 /// The device-independent shape checks plus `policy`'s capability subset.
@@ -6940,6 +7105,106 @@ mod tests {
             words.extend_from_slice(instruction);
         }
         words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// The minimal translated-vertex shape the y rewrite works on: one output
+    /// variable, optionally decorated `BuiltIn Position`, optionally stored to.
+    /// `store` and `decorate` are separate so the refusal paths can be built.
+    fn minimal_position_module(store: bool, decorate: bool) -> Vec<u8> {
+        let mut instructions: Vec<Vec<u32>> = vec![
+            vec![(2 << 16) | Op::Capability as u32, Capability::Shader as u32],
+            vec![(3 << 16) | Op::MemoryModel as u32, 0, 1],
+            vec![
+                (4 << 16) | Op::Decorate as u32,
+                4,
+                Decoration::BuiltIn as u32,
+                if decorate {
+                    BuiltIn::Position as u32
+                } else {
+                    BuiltIn::VertexIndex as u32
+                },
+            ],
+            vec![(3 << 16) | Op::TypeFloat as u32, 1, 32],
+            vec![(4 << 16) | Op::TypeVector as u32, 2, 1, 4],
+            vec![
+                (4 << 16) | Op::TypePointer as u32,
+                3,
+                spirv::StorageClass::Output as u32,
+                2,
+            ],
+            vec![
+                (4 << 16) | Op::Variable as u32,
+                3,
+                4,
+                spirv::StorageClass::Output as u32,
+            ],
+            vec![(2 << 16) | Op::TypeVoid as u32, 5],
+            vec![(3 << 16) | Op::TypeFunction as u32, 6, 5],
+            vec![
+                (5 << 16) | Op::Function as u32,
+                5,
+                7,
+                spirv::FunctionControl::NONE.bits(),
+                6,
+            ],
+            vec![(2 << 16) | Op::Label as u32, 8],
+            vec![(3 << 16) | Op::Undef as u32, 2, 9],
+        ];
+        if store {
+            instructions.push(vec![(3 << 16) | Op::Store as u32, 4, 9]);
+        }
+        instructions.push(vec![(1 << 16) | Op::Return as u32]);
+        instructions.push(vec![(1 << 16) | Op::FunctionEnd as u32]);
+        let mut words = vec![0x0723_0203, 0x0001_0400, 0, 10, 0];
+        for instruction in &instructions {
+            words.extend_from_slice(instruction);
+        }
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn negate_position_y_rewrites_the_position_store_and_refuses_unusable_modules() {
+        let module = minimal_position_module(true, true);
+        let rewritten = negate_position_y(&module).expect("the position store rewrites");
+        // The extract, the negate and the insert, and nothing else.
+        assert_eq!(rewritten.len(), module.len() + 15 * 4);
+        let words = rewritten
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+        assert_eq!(words[3], 13, "three new ids extend the bound");
+        let mut cursor = 5;
+        let mut store = None;
+        while cursor < words.len() {
+            if words[cursor] & 0xffff == Op::Store as u32 {
+                store = Some(cursor);
+            }
+            cursor += (words[cursor] >> 16) as usize;
+        }
+        let store = store.expect("the store stays");
+        let insert = store - 6;
+        let negate = insert - 4;
+        let extract = negate - 5;
+        assert_eq!(words[extract], (5 << 16) | Op::CompositeExtract as u32);
+        assert_eq!(words[negate], (4 << 16) | Op::FNegate as u32);
+        assert_eq!(words[insert], (6 << 16) | Op::CompositeInsert as u32);
+        assert_eq!(words[extract + 3], 9, "the extract reads the stored value");
+        assert_eq!(words[extract + 4], 1, "the extract reads the y component");
+        assert_eq!(words[negate + 3], words[extract + 2]);
+        assert_eq!(words[insert + 3], words[negate + 2]);
+        assert_eq!(words[insert + 5], 1, "the insert replaces the y component");
+        assert_eq!(words[store + 1], 4, "the store still targets the position");
+        assert_eq!(words[store + 2], words[insert + 2]);
+
+        let no_store = minimal_position_module(false, true);
+        let error =
+            negate_position_y(&no_store).expect_err("a position output without a store is refused");
+        assert!(error.message().contains("never stores"), "{error}");
+
+        let no_position = minimal_position_module(true, false);
+        let error =
+            negate_position_y(&no_position).expect_err("a module without a position is refused");
+        assert!(error.message().contains("no BuiltIn Position"), "{error}");
     }
 
     #[test]
