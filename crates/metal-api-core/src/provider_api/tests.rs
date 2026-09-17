@@ -68,6 +68,7 @@ struct FakeProvider {
     vertex_input: bool,
     fragment_texture: bool,
     depth_resolve: bool,
+    stencil_resolve: bool,
     heap: bool,
     icb: bool,
 }
@@ -92,6 +93,7 @@ impl FakeProvider {
             vertex_input: false,
             fragment_texture: false,
             depth_resolve: false,
+            stencil_resolve: false,
             heap: false,
             icb: false,
         }
@@ -114,6 +116,10 @@ impl FakeProvider {
     }
     fn with_depth_resolve(mut self) -> Self {
         self.depth_resolve = true;
+        self
+    }
+    fn with_stencil_resolve(mut self) -> Self {
+        self.stencil_resolve = true;
         self
     }
     fn with_heap(mut self) -> Self {
@@ -233,12 +239,16 @@ impl ComputeProvider for FakeProvider {
             } else {
                 0
             },
-            // The object rails record no stencil resolve entry yet, so the
-            // fixture provider keeps the "cannot resolve" defaults and a
-            // resolving pass is refused during admission
-            // (`research/docs/23` §3.3, v60).
-            supports_render_stencil_resolve: false,
-            stencil_resolve_modes: 0,
+            // The fixture provider executes the Sample0 stencil resolve when
+            // asked to (`with_stencil_resolve`); the default keeps the "cannot
+            // resolve" shape and a resolving pass is refused during admission
+            // (`research/docs/23` §3.3, v60/v70).
+            supports_render_stencil_resolve: self.render && self.stencil_resolve,
+            stencil_resolve_modes: if self.stencil_resolve {
+                1u32 << u32::from(contract::StencilResolveFilter::Sample0.code())
+            } else {
+                0
+            },
             // The fixture provider executes the render sampler only when the
             // texture flag is set on it, exactly as the depth resolve above
             // (`research/docs/23` §3.3, v70).
@@ -3182,6 +3192,325 @@ fn a_combined_depth_stencil_multisample_draw_records_both_faces() {
             None,
         ),
         Err(ContractError::MultisampleDepthStoreUnsupported.into())
+    );
+}
+
+/// The stored sibling of the combined pair (`research/docs/23` §3.3,
+/// v60/v70): both faces kept through their own resolve, recorded in one call.
+/// The recording is the v60 shape the trace rails execute, so the pass it
+/// becomes carries both landed identities and both filters — and every way the
+/// pair can be half-stated is refused at recording time with the contract's own
+/// error rather than silently dropped.
+#[test]
+fn a_stored_combined_depth_stencil_draw_records_both_resolves() {
+    let provider = Arc::new(
+        FakeProvider::new()
+            .with_render()
+            .with_vertex_input()
+            .with_depth_resolve()
+            .with_stencil_resolve(),
+    );
+    let device = Device::new(provider.clone());
+    // Three read-only views: the colour attachment the draw reads, and the two
+    // landings the stored pair writes its texels into. The declaring pass
+    // declares all three, which is what puts them in the trace's resources.
+    let declaring = pipeline(&device, "read:0,1,2");
+    let render_metadata = render_metadata_multi(&provider, vec![AttachmentFormat::Rgba8Unorm]);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let target = device.new_buffer_with_bytes(vec![0xfe; 16]).unwrap();
+    let view = target.view(0, 16).unwrap();
+    let depth_surface = device.new_buffer_with_bytes(vec![0xfd; 16]).unwrap();
+    let depth_view = depth_surface.view(0, 16).unwrap();
+    let stencil_surface = device.new_buffer_with_bytes(vec![0xfc; 16]).unwrap();
+    // The stencil landing is one byte per texel: four texels, four bytes
+    // (`research/docs/23` §3.3, v49).
+    let stencil_view = stencil_surface.view(0, 4).unwrap();
+    let (_, stream) = buffer(&device, 0x11);
+    let index = device
+        .new_buffer_with_bytes(vec![0, 1, 2, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let index_view = index.view(0, 16).unwrap();
+    let attachment = RenderColorAttachment {
+        view: &view,
+        format: AttachmentFormat::Rgba8Unorm,
+        load: RenderAttachmentLoad::Clear([0x11, 0x22, 0x33, 0x44]),
+        store: StoreOp::Store,
+    };
+    let state = contract::MultisampleState {
+        sample_count: contract::SampleCount::Four,
+    };
+    let stored_depth = RenderDepthAttachment {
+        width: 2,
+        height: 2,
+        load: RenderDepthLoad::Clear(1.0),
+        store: Some(contract::DepthStoreOp::Store),
+        identity: Some(contract::RenderDepthIdentity {
+            allocation_id: depth_view.allocation_id(),
+            view_id: depth_view.view_id(),
+        }),
+    };
+    let rail_owned_depth = RenderDepthAttachment {
+        store: None,
+        identity: None,
+        ..stored_depth
+    };
+    let stored_stencil = RenderStencilAttachment {
+        width: 2,
+        height: 2,
+        load: RenderStencilLoad::Clear(0),
+        store: Some(StoreOp::Store),
+        identity: Some(contract::RenderStencilIdentity {
+            allocation_id: stencil_view.allocation_id(),
+            view_id: stencil_view.view_id(),
+        }),
+    };
+    let rail_owned_stencil = RenderStencilAttachment {
+        store: None,
+        identity: None,
+        ..stored_stencil
+    };
+    let depth_test = RenderDepthTest {
+        compare: contract::CompareFunction::Less,
+        write: true,
+    };
+    let stencil_test = RenderStencilTest {
+        compare: contract::StencilCompare::Equal,
+        fail_op: contract::StencilOp::Keep,
+        depth_fail_op: contract::StencilOp::Keep,
+        pass_op: contract::StencilOp::IncrementWrap,
+        read_mask: 0xff,
+        write_mask: 0xff,
+        reference: 0,
+    };
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &view).unwrap();
+        encoder.set_buffer(1, &depth_view).unwrap();
+        encoder.set_buffer(2, &stencil_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    let mut encoder = command.render_command_encoder().unwrap();
+    encoder.set_render_pipeline_state(&render).unwrap();
+    encoder.set_vertex_buffer(0, &stream).unwrap();
+    encoder
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+
+    // One call records the whole v60 shape: the raster, the one shared surface
+    // kept through both faces' landings, and the two filters that make the
+    // stored texels observable.
+    encoder
+        .draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            stored_depth,
+            contract::DepthResolveFilter::Sample0,
+            stored_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        )
+        .unwrap();
+    encoder.end_encoding().unwrap();
+    command.commit().unwrap();
+
+    let trace = provider.traces.lock().unwrap().last().cloned().unwrap();
+    let pass = trace
+        .passes
+        .iter()
+        .find_map(TracePass::as_render)
+        .expect("the recorded draw is a render pass");
+    assert_eq!(pass.multisample, Some(state));
+    let recorded_depth = pass.depth.as_ref().expect("the pass opens a depth surface");
+    assert_eq!(recorded_depth.store, Some(contract::DepthStoreOp::Store));
+    assert_eq!(recorded_depth.identity, stored_depth.identity);
+    let recorded_stencil = pass
+        .stencil
+        .as_ref()
+        .expect("the pass opens a stencil surface");
+    assert_eq!(recorded_stencil.store, Some(StoreOp::Store));
+    assert_eq!(recorded_stencil.identity, stored_stencil.identity);
+    assert_eq!(
+        pass.depth_resolve,
+        Some(contract::MultisampleDepthResolve {
+            filter: contract::DepthResolveFilter::Sample0,
+        })
+    );
+    assert_eq!(
+        pass.stencil_resolve,
+        Some(contract::MultisampleStencilResolve {
+            filter: contract::StencilResolveFilter::Sample0,
+        })
+    );
+
+    let mut refusal = device
+        .new_command_queue()
+        .command_buffer()
+        .render_command_encoder()
+        .unwrap();
+    refusal.set_render_pipeline_state(&render).unwrap();
+    refusal.set_vertex_buffer(0, &stream).unwrap();
+    refusal
+        .set_index_buffer(&index_view, IndexFormat::Uint16)
+        .unwrap();
+    // A single-sample state is what the absent state means (`research/docs/23`
+    // §3.3, v51), so the resolving entry refuses it like its siblings do.
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            contract::MultisampleState {
+                sample_count: contract::SampleCount::One,
+            },
+            stored_depth,
+            contract::DepthResolveFilter::Sample0,
+            stored_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::SingleSampleMultisampleState.into())
+    );
+    // The pair keeps both faces or neither (`research/docs/23` §3.3, v66): a
+    // lopsided store decision is refused by name in both directions, exactly as
+    // the v68 entry refuses it.
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            stored_depth,
+            contract::DepthResolveFilter::Sample0,
+            rail_owned_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+            depth_stored: true,
+            stencil_stored: false,
+        }
+        .into())
+    );
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            rail_owned_depth,
+            contract::DepthResolveFilter::Sample0,
+            stored_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::MultisampleCombinedSurfaceUnsupported {
+            depth_stored: false,
+            stencil_stored: true,
+        }
+        .into())
+    );
+    // The v66 pair keeps neither face — the v68 entry's shape — so the
+    // resolving entry refuses it with the contract's own "resolve beside a
+    // dropped surface" error rather than recording two filters admission would
+    // refuse (`research/docs/23` §3.3, v57/v60/v70).
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            rail_owned_depth,
+            contract::DepthResolveFilter::Sample0,
+            rail_owned_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::DepthResolveWithoutStoredDepth { store: None }.into())
+    );
+    // A kept face names where its texels land (`research/docs/23` §3.3,
+    // v43/v49): a stored face without an identity is refused, one face at a
+    // time, with the contract's own error.
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            RenderDepthAttachment {
+                identity: None,
+                ..stored_depth
+            },
+            contract::DepthResolveFilter::Sample0,
+            stored_stencil,
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::DepthStoreIdentityMismatch {
+            store: Some(contract::DepthStoreOp::Store.code()),
+            identity: false,
+        }
+        .into())
+    );
+    assert_eq!(
+        refusal.draw_indexed_primitives_with_multisample_depth_stencil_resolve(
+            std::slice::from_ref(&attachment),
+            2,
+            2,
+            6,
+            1,
+            state,
+            stored_depth,
+            contract::DepthResolveFilter::Sample0,
+            RenderStencilAttachment {
+                identity: None,
+                ..stored_stencil
+            },
+            contract::StencilResolveFilter::Sample0,
+            Some(depth_test),
+            Some(stencil_test),
+            None,
+        ),
+        Err(ContractError::StencilStoreIdentityMismatch {
+            store: Some(StoreOp::Store),
+            identity: false,
+        }
+        .into())
     );
 }
 

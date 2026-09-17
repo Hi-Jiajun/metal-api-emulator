@@ -410,13 +410,23 @@ MSAA_DEPTH_RESOLVE_RAILS = ALL_RAILS
 MSAA_DEPTH_RESOLVE_MIN_EDGE_RAILS = ALL_RAILS
 MSAA_DEPTH_RESOLVE_MAX_EDGE_RAILS = ALL_RAILS
 # The v60 Sample0 case names every rail: the trace rails execute the combined
-# shape from this increment on, and the object rails follow the same recorded
-# state (`research/docs/23` §3.3, v60).
+# shape from v60 on, and from v70 both object rails carry it too — the v70
+# recording entry
+# (`draw_indexed_primitives_with_multisample_depth_stencil_resolve`) states
+# both faces of the one surface with both resolves, which is exactly this
+# case's shape (`research/docs/23` §3.3, v60/v70).
 MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS = ALL_RAILS
-# The DepthResolvedSample case names the two native trace rails alone: Vulkan
-# has no stencil mode for Metal's depth-following filter, so its rail refuses
-# the filter and the mask never carries its bit (`research/docs/23` §3.3, v60).
-MSAA_STENCIL_RESOLVE_DRS_RAILS = ("native-metal", "native-metal-provider")
+# The DepthResolvedSample case names the native rails alone — the two trace
+# ones and, from v70, the object one, which records the same shape through the
+# v70 entry. No Vulkan rail owns it: Vulkan has no stencil mode for Metal's
+# depth-following filter, so its mask can never carry the bit and the rail
+# refuses the filter structurally rather than by device
+# (`research/docs/23` §3.3, v60/v70).
+MSAA_STENCIL_RESOLVE_DRS_RAILS = (
+    "native-metal",
+    "native-metal-provider",
+    "native-metal-provider-objects",
+)
 # The mask the rails publish once the device proves the filters: Sample0|Min|
 # Max, bit `i` = filter code `i`. The v57e self-test is the native half of
 # that proof, and the RTX 5060 reports the same value; the v57f marker named
@@ -725,9 +735,10 @@ def msaa_depth_resolve_max_edge_marker(suite, rail):
 def msaa_stencil_resolve_sample0_marker(suite, rail):
     """Point the v60 Sample0 case at `rail` when that rail owes it.
 
-    The combined shape is executed by the three trace rails; the object rails
-    record no stencil-resolve entry yet, so the marker stays at the trace three
-    (`research/docs/23` §3.3, v60). Returns whether `rail` owes the case.
+    The combined shape is executed by the three trace rails, and from v70 the
+    two object rails carry it as well: the v70 recording entry states both
+    faces with both resolves, so the marker names all five rails
+    (`research/docs/23` §3.3, v60/v70). Returns whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_STENCIL_RESOLVE_SAMPLE0_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS else [other_rail(rail)])
@@ -737,9 +748,11 @@ def msaa_stencil_resolve_sample0_marker(suite, rail):
 def msaa_stencil_resolve_drs_marker(suite, rail):
     """Point the v60 DepthResolvedSample case at `rail` when that rail owes it.
 
-    The case names the two native trace rails — Vulkan has no stencil mode for
-    the depth-following filter — and the device mask then decides presence
-    (`research/docs/23` §3.3, v60). Returns whether `rail` owes the case.
+    The case names the native rails — the two trace ones, plus the object one
+    from v70, which records the same two-filter shape through the v70 entry.
+    Vulkan has no stencil mode for the depth-following filter, so its rails
+    never own the case; the device mask then decides presence on the rails that
+    do (`research/docs/23` §3.3, v60/v70). Returns whether `rail` owes the case.
     """
     suite["render_cases"][MSAA_STENCIL_RESOLVE_DRS_INDEX]["capture_rails"] = (
         [rail] if rail in MSAA_STENCIL_RESOLVE_DRS_RAILS else [other_rail(rail)])
@@ -3434,6 +3447,27 @@ class ScissorObservationTests(unittest.TestCase):
                             compare.CaptureError,
                             "is not a rail this render case runs on"):
                         compare.validate_capture(suite, digest, report, rail)
+
+    def test_v28_pins_the_stencil_resolve_fixtures_rails(self):
+        # The marker constants are the rule and the suite's own rails are the
+        # published shape, so the two have to agree: the Sample0 case names
+        # every rail (its two resolves are both Sample0, so no device is asked
+        # for a filter it cannot carry), and the DepthResolvedSample case names
+        # the native rails alone — the Vulkan rails can never carry Metal's
+        # depth-following stencil filter (`research/docs/23` §3.3, v60/v70).
+        for index, case_id, rails in (
+                (MSAA_STENCIL_RESOLVE_SAMPLE0_INDEX, MSAA_STENCIL_RESOLVE_SAMPLE0_ID,
+                 MSAA_STENCIL_RESOLVE_SAMPLE0_RAILS),
+                (MSAA_STENCIL_RESOLVE_DRS_INDEX, MSAA_STENCIL_RESOLVE_DRS_ID,
+                 MSAA_STENCIL_RESOLVE_DRS_RAILS)):
+            with self.subTest(case=case_id):
+                case = self.suite["render_cases"][index]
+                self.assertEqual(case["id"], case_id)
+                self.assertEqual(case["depth"]["store"], "store")
+                self.assertEqual(case["stencil"]["store"], "store")
+                self.assertIn("depth_resolve", case)
+                self.assertIn("stencil_resolve", case)
+                self.assertEqual(sorted(case["capture_rails"]), sorted(rails))
 
     def test_v28_pins_the_combined_depth_stencil_pair_fixture(self):
         case = self.suite["render_cases"][MSAA_DS_INDEX]
