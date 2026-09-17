@@ -29,6 +29,7 @@
 //! attachment.
 
 use ash::vk;
+use metal2vulkan::reflect::{ShaderReflection, ShaderStage};
 use metal_api_core::provider::{
     AttachmentFormat, BlendFactor, BlendOperation, BufferSource, BufferView, ClearColor,
     CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest,
@@ -38,6 +39,8 @@ use metal_api_core::provider::{
     SampleCount, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
     StoreOp, VertexBufferLayout, VertexFormat, VertexStep, Winding,
 };
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
@@ -78,6 +81,80 @@ const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
 /// names this entry, and a module that does not declare it would build a
 /// pipeline the trace did not describe.
 pub(crate) const SOLID_FRAGMENT_ENTRY: &str = "fragment_main";
+
+/// The two stages a render pipeline is built from.
+///
+/// This is the rail's own vocabulary, not the translator's: it names the two
+/// halves of a graphics pipeline and nothing else, so a caller of
+/// [`RenderStage::translate`](crate::TranslatedRenderStage) cannot ask the rail
+/// for a compute stage by mistake. The rail maps each variant onto the
+/// translator's stage and onto the SPIR-V execution model its module has to
+/// declare.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderStage {
+    Vertex,
+    Fragment,
+}
+
+impl RenderStage {
+    /// The stage's name as every refusal and every field spells it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "fragment",
+        }
+    }
+
+    /// The translator stage this one names.
+    pub(crate) const fn translator_stage(self) -> metal2vulkan::passes::Stage {
+        match self {
+            Self::Vertex => metal2vulkan::passes::Stage::Vertex,
+            Self::Fragment => metal2vulkan::passes::Stage::Fragment,
+        }
+    }
+
+    /// The reflection stage a translation of this stage reports.
+    pub(crate) const fn reflected_stage(self) -> ShaderStage {
+        match self {
+            Self::Vertex => ShaderStage::Vertex,
+            Self::Fragment => ShaderStage::Fragment,
+        }
+    }
+
+    /// The SPIR-V execution model the module has to declare.
+    pub(crate) const fn execution_model(self) -> spirv::ExecutionModel {
+        match self {
+            Self::Vertex => spirv::ExecutionModel::Vertex,
+            Self::Fragment => spirv::ExecutionModel::Fragment,
+        }
+    }
+}
+
+/// The reviewed vertex stages this rail compiles, in the order
+/// [`reviewed_vertex_module`] lists them.
+///
+/// The vertex half is the caller's module, so the rail cannot derive it from
+/// the contract the way it derives the fragment half from the format list. What
+/// it can do is enumerate the modules the review covered: a registration whose
+/// vertex module is not one of these has no reviewed semantics, and is refused
+/// unless it arrives as a translated stage with its reflection.
+///
+/// One entry per reviewed `.spvasm` source under `render_spv/`: the milestone's
+/// full-screen triangle, the caller-stream quad, the single-pixel stage the
+/// coverage fixtures collapse the triangle onto, the instanced pair's vertex
+/// half, and the depth pair's vertex half.
+const FULL_SCREEN_TRIANGLE_VERT_SPV: &[u8] =
+    include_bytes!("render_spv/fullscreen_triangle.vert.spv");
+/// Entry point [`FULL_SCREEN_TRIANGLE_VERT_SPV`] declares.
+const FULL_SCREEN_TRIANGLE_VERTEX_ENTRY: &str = "vertex_main";
+/// The reviewed vertex stage that reads the caller-held quad positions.
+const QUAD_VERTEX_SPV: &[u8] = include_bytes!("render_spv/quad_indexed.vert.spv");
+/// Entry point [`QUAD_VERTEX_SPV`] declares.
+const QUAD_VERTEX_ENTRY: &str = "vertex_buffer_main";
+/// The reviewed vertex stage that collapses the triangle onto one pixel.
+const SINGLE_PIXEL_VERT_SPV: &[u8] = include_bytes!("render_spv/single_pixel.vert.spv");
+/// Entry point [`SINGLE_PIXEL_VERT_SPV`] declares.
+const SINGLE_PIXEL_VERTEX_ENTRY: &str = "single_pixel";
 
 /// The reviewed solid fragment module for an 8-bit UNORM attachment.
 ///
@@ -337,9 +414,11 @@ fn vk_stencil_op(operation: StencilOp) -> vk::StencilOp {
 /// fields this rail consumes: the core type carries wiring identities
 /// (pipeline/view/allocation ids and a resolved byte source) that Step 3c maps,
 /// while Step 3b fixes the Vulkan-side execution against an already-chosen
-/// format, extent and clear value. The shader *pair* is not a field: the
-/// fragment half is chosen from the format by [`solid_fragment_spirv`], so a
-/// request cannot name a fragment stage the format was not compiled for.
+/// format, extent and clear value. The shader *pair* travels as the
+/// registration settled it: the fragment half is the module the registration
+/// named ([`Self::translated_fragment`]), or — for a reviewed registration — the
+/// module the format list selects by [`solid_fragment_spirv`], so a request
+/// cannot name a fragment stage the format was not compiled for.
 pub(crate) struct OffscreenRenderRequest<'a> {
     /// Colour attachments, in location order: entry `i` is the target the
     /// fragment stage's output `i` lands in. One to four entries; the rail
@@ -402,6 +481,12 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub stencil: Option<OffscreenStencilAttachment>,
     /// The vertex stage the graphics pipeline is built from.
     pub vertex: OffscreenVertexStage<'a>,
+    /// The fragment stage the graphics pipeline is built from, when the
+    /// registration carries a translated one. `None` is a reviewed
+    /// registration: its fragment module is the format list's own, derived at
+    /// execution from the attachment list, which is also where the per-format
+    /// refusals live.
+    pub translated_fragment: Option<OffscreenFragmentStage<'a>>,
     /// The caller-held vertex streams the pass binds, in binding order
     /// (`research/docs/23` §3.3). Empty for the `vertex_id` milestone.
     pub vertex_streams: Vec<VertexStream<'a>>,
@@ -572,25 +657,54 @@ pub(crate) enum IndirectReplay {
 /// rail only reads it. The fragment half is deliberately absent — it belongs to
 /// the rail, because it is a function of the attachment format.
 pub(crate) struct OffscreenVertexStage<'a> {
-    /// Entry point of the vertex-stage module.
-    pub entry: &'a str,
+    /// Entry point of the vertex-stage module, as `VkPipelineShaderStageCreateInfo`
+    /// binds it: the contract's own entry for a reviewed module, and the single
+    /// entry point the module declares for a translated one.
+    pub entry: Cow<'a, str>,
     /// Vertex-stage SPIR-V module.
     pub spirv: &'a [u8],
 }
 
+/// The fragment stage a translated registration binds.
+///
+/// The reviewed path names no fragment module here: the rail derives it from
+/// the attachment format list (`solid_fragment_stage`) and that derivation is
+/// also where the per-format refusals live. A translated registration names its
+/// own module, so the rail executes exactly the module the contract's
+/// reflection was checked against instead of the reviewed one of the format.
+pub(crate) struct OffscreenFragmentStage<'a> {
+    /// Entry point of the fragment-stage module, read from the module's own
+    /// `OpEntryPoint` (the translator emits `"main"`).
+    pub entry: String,
+    /// Fragment-stage SPIR-V module.
+    pub spirv: &'a [u8],
+}
+
 /// One host-registered render pipeline: the two compiled stage modules and the
-/// contract they were built against.
+/// contract they were built against, plus — when a module did not come from
+/// this rail's reviewed set — the reflection that describes it.
 ///
 /// The compute rail keeps one translated artifact per `PipelineId` in the
 /// provider registry; this is the render sibling of that value, stored in the
 /// same registry namespace so a trace's pipeline table stays the single source
-/// of which pipeline a pass names. The fragment module is not free-form: it is
-/// the reviewed module of the contract's colour format, which is what
-/// [`fragment_stage_is_reviewed`] binds.
+/// of which pipeline a pass names.
+///
+/// Each stage is either one of the rail's reviewed modules or a module the
+/// translator produced for this very registration, and the registration gate
+/// holds both arms ([`RenderStages::validate`]): a reviewed fragment module has
+/// to be the one the contract's colour format list selects
+/// ([`fragment_stage_is_reviewed`]), and a translated stage has to agree with
+/// the contract field by field ([`validate_translated_stage`]).
 pub(crate) struct RenderStages {
     pub contract: RenderPipelineContract,
     pub vertex_spirv: Vec<u8>,
     pub fragment_spirv: Vec<u8>,
+    /// The translation of the vertex module, when the module is not one of the
+    /// rail's reviewed vertex stages.
+    pub vertex_translation: Option<ShaderReflection>,
+    /// The translation of the fragment module, when the module is not the
+    /// reviewed module of the contract's colour format list.
+    pub fragment_translation: Option<ShaderReflection>,
 }
 
 impl RenderStages {
@@ -600,9 +714,9 @@ impl RenderStages {
     /// per-registration facts: an empty entry name, a name carrying an interior
     /// NUL and a module that is not a whole number of SPIR-V words are refused
     /// once, at registration, instead of on every submission that names the
-    /// pipeline. The same place binds the fragment stage to the contract's
-    /// colour format, for the same reason: the registration is where the pairing
-    /// is settled, so a trace never sees a pairing this rail cannot execute.
+    /// pipeline. The same place settles each stage's identity, for the same
+    /// reason: the registration is where the pairing is settled, so a trace
+    /// never sees a pair this rail cannot execute.
     pub(crate) fn validate(&self) -> Result<(), ProviderError> {
         self.contract
             .validate()
@@ -629,23 +743,104 @@ impl RenderStages {
                 );
             }
         }
-        // The fragment stage has to be the reviewed module for the format list
-        // this contract declares. The rail cannot read a module's semantics, so
-        // binding the registration to the reviewed set is what refuses "this
-        // format list, that format list's fragment stage" *before* a submission
-        // can read back bytes the format claim does not cover (review item I2,
-        // 2026-09-14): an `R32Float` pipeline handed the 8-bit module's `vec4`
-        // store is a component-shape mismatch, not a byte-order preference, and
-        // a dual-attachment pipeline handed the single-output module would
-        // never store `Location 1`.
-        if !fragment_stage_is_reviewed(self) {
-            return Err(fragment_stage_mismatch_refusal(
-                &self.contract.color_formats,
-                &self.contract.fragment_entry,
-            ));
+        self.validate_stage_pair()
+    }
+
+    /// Which module each half of the pipeline executes, and whether the rail
+    /// can account for it.
+    ///
+    /// Two arms per stage, and the execution path re-asks exactly this pair of
+    /// questions of the value it was handed, so a directly-constructed
+    /// [`RenderStages`] cannot skip the registration gate:
+    ///
+    /// * a reviewed module, identified by its bytes and the entry it declares.
+    ///   The fragment half has to be the module the contract's colour format
+    ///   list selects: the rail cannot read a module's semantics, so binding
+    ///   the registration to the reviewed set is what refuses "this format
+    ///   list, that format list's fragment stage" *before* a submission can
+    ///   read back bytes the format claim does not cover (review item I2,
+    ///   2026-09-14) — an `R32Float` pipeline handed the 8-bit module's `vec4`
+    ///   store is a component-shape mismatch, not a byte-order preference, and
+    ///   a dual-attachment pipeline handed the single-output module would never
+    ///   store `Location 1`;
+    /// * a translated module, identified by the reflection the translator
+    ///   produced beside it. The reflection is checked against the contract
+    ///   field by field, so an unreviewed module is only ever executed under a
+    ///   stated interface the contract covers.
+    ///
+    /// A stage that is neither is refused by name
+    /// (`render_stage_translation_unavailable`): the rail has no semantics for
+    /// it and will not execute it on the strength of its bytes alone.
+    pub(crate) fn validate_stage_pair(&self) -> Result<(), ProviderError> {
+        self.validate_vertex_half()?;
+        self.validate_fragment_half()?;
+        if let (Some(vertex), Some(fragment)) =
+            (&self.vertex_translation, &self.fragment_translation)
+        {
+            validate_varying_linkage(vertex, fragment, &self.contract.fragment_entry)?;
         }
         Ok(())
     }
+
+    /// The vertex half: a reviewed module under the entry it declares, or a
+    /// translated module described by its reflection.
+    fn validate_vertex_half(&self) -> Result<(), ProviderError> {
+        match &self.vertex_translation {
+            Some(reflection) => validate_translated_stage(self, RenderStage::Vertex, reflection),
+            None => {
+                if reviewed_vertex_module(&self.contract.vertex_entry, &self.vertex_spirv) {
+                    Ok(())
+                } else {
+                    Err(render_stage_translation_unavailable_refusal(
+                        RenderStage::Vertex,
+                        &self.contract.vertex_entry,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The fragment half: the reviewed module of the contract's colour format
+    /// list, or a translated module described by its reflection.
+    fn validate_fragment_half(&self) -> Result<(), ProviderError> {
+        match &self.fragment_translation {
+            Some(reflection) => validate_translated_stage(self, RenderStage::Fragment, reflection),
+            None => {
+                if fragment_stage_is_reviewed(self) {
+                    Ok(())
+                } else {
+                    Err(fragment_stage_mismatch_refusal(
+                        &self.contract.color_formats,
+                        &self.contract.fragment_entry,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Whether one registration's vertex module is one of the reviewed stages the
+/// rail compiles.
+///
+/// The reviewed vertex modules are a closed set for the same reason the
+/// fragment modules are: the rail compares the bytes it was handed against the
+/// modules whose behaviour the review covers, because it cannot read a module's
+/// semantics itself. A vertex stage outside the set is only executable as a
+/// translated stage, under the reflection that describes it
+/// ([`validate_translated_stage`]).
+fn reviewed_vertex_module(entry: &str, module: &[u8]) -> bool {
+    [
+        (
+            FULL_SCREEN_TRIANGLE_VERTEX_ENTRY,
+            FULL_SCREEN_TRIANGLE_VERT_SPV,
+        ),
+        (QUAD_VERTEX_ENTRY, QUAD_VERTEX_SPV),
+        (SINGLE_PIXEL_VERTEX_ENTRY, SINGLE_PIXEL_VERT_SPV),
+        (INSTANCED_VERTEX_ENTRY, INSTANCED_VERTEX_SPV),
+        (DEPTH_VERTEX_ENTRY, DEPTH_VERTEX_SPV),
+    ]
+    .into_iter()
+    .any(|(reviewed_entry, reviewed_module)| entry == reviewed_entry && module == reviewed_module)
 }
 
 /// Whether a registration's fragment stage is exactly the module this rail
@@ -681,6 +876,576 @@ fn fragment_stage_is_reviewed(stages: &RenderStages) -> bool {
         Err(_) => return false,
     };
     stages.contract.fragment_entry == stage.1 && stages.fragment_spirv.as_slice() == stage.0
+}
+
+/// Validate one translated stage against the contract it is registered under.
+///
+/// This is the second arm of the registration gate (the R2 increment of
+/// `research/docs/23`): a module the rail did not compile itself is executable
+/// exactly when the translation that produced it was checked against the
+/// contract, so the registration can say *what* the module does instead of only
+/// *that* it is a module. Four questions, in this order:
+///
+/// 1. identity — the reflection has to be this stage's, under the entry the
+///    contract names. The pipeline binds the module's own entry point (the
+///    translator names it; see [`module_entry_point`]), while the reflection
+///    carries the AIR function's name, so the entry check is what keeps "which
+///    function did I translate" answerable at all;
+/// 2. the module's own shape — exactly one entry point of this stage, which is
+///    what a translation of one stage produces;
+/// 3. the interface the rail does not execute yet
+///    ([`unsupported_interface_field`]) is refused by name instead of being
+///    silently ignored;
+/// 4. the contract's own shape — vertex attributes against the declared vertex
+///    layout, render targets against the declared colour format list.
+///
+/// Everything refused here is refused at registration, before any Vulkan object
+/// exists, and the same function runs again when a submission names the pipeline
+/// (`prepare_render_request`), so a directly-constructed [`RenderStages`] cannot
+/// skip the gate.
+fn validate_translated_stage(
+    stages: &RenderStages,
+    stage: RenderStage,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    let (entry, module) = match stage {
+        RenderStage::Vertex => (
+            stages.contract.vertex_entry.as_str(),
+            stages.vertex_spirv.as_slice(),
+        ),
+        RenderStage::Fragment => (
+            stages.contract.fragment_entry.as_str(),
+            stages.fragment_spirv.as_slice(),
+        ),
+    };
+    if reflection.stage != stage.reflected_stage()
+        || reflection.entry_point.as_deref() != Some(entry)
+    {
+        return Err(reflection_mismatch_refusal(stage, entry)
+            .with_field(
+                "reflected_stage",
+                FieldValue::Text(reflected_stage_name(reflection.stage).to_owned()),
+            )
+            .with_field(
+                "reflected_entry",
+                FieldValue::Text(
+                    reflection
+                        .entry_point
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_owned()),
+                ),
+            )
+            .with_detail(
+                "the reflection describes another stage or another entry than the contract names, \
+                 so the module the pipeline would bind is not the module the contract was settled \
+                 against",
+            ));
+    }
+    if module_entry_point(module, stage.execution_model()).is_none() {
+        return Err(
+            render_stage_translation_unavailable_refusal(stage, entry).with_detail(
+                "the module does not declare exactly one entry point of this stage, and the one \
+                 entry point is what the pipeline binds",
+            ),
+        );
+    }
+    if let Some(field) = unsupported_interface_field(reflection) {
+        return Err(unsupported_interface_refusal(stage, entry, field));
+    }
+    match stage {
+        RenderStage::Vertex => validate_translated_vertex(stages, entry, reflection),
+        RenderStage::Fragment => validate_translated_fragment(stages, entry, reflection),
+    }
+}
+
+/// The vertex half's own agreement with the contract.
+///
+/// The raster pipeline needs a clip position, the contract's vertex layout is
+/// the whole input side of the stage, and a vertex stage cannot write a colour
+/// attachment. Each of the three is a field-by-field comparison, so a missing or
+/// an extra reflected field is refused rather than left to a driver's vertex
+/// input state.
+fn validate_translated_vertex(
+    stages: &RenderStages,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    let mismatch = |field: &str| {
+        reflection_mismatch_refusal(RenderStage::Vertex, entry)
+            .with_field("field", FieldValue::Text(field.to_owned()))
+    };
+    match reflection.vertex_builtins {
+        Some(builtins) if builtins.writes_position => {}
+        Some(_) => {
+            return Err(mismatch("vertex_builtins").with_detail(
+                "the reflection reports no clip position, so no primitive could leave the raster",
+            ))
+        }
+        None => {
+            return Err(mismatch("vertex_builtins")
+                .with_detail("the reflection reports no vertex builtin usage at all"))
+        }
+    }
+    if !reflection.render_targets.is_empty() {
+        return Err(mismatch("render_targets").with_detail(
+            "a vertex stage writes no colour attachment; the contract's colour format list is \
+             the fragment stage's",
+        ));
+    }
+    validate_translated_vertex_attributes(stages, entry, reflection)
+}
+
+/// The contract's vertex layout against the reflection's attributes.
+///
+/// A stream the layout describes and the reflection does not read (or the
+/// reverse) is a different interface, not a preference: the pipeline's vertex
+/// input state is built from the layout, so a mismatch would either bind a
+/// stream the shader never consumes or leave a location the shader does read
+/// undefined.
+fn validate_translated_vertex_attributes(
+    stages: &RenderStages,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    let mismatch = |field: &str| {
+        reflection_mismatch_refusal(RenderStage::Vertex, entry)
+            .with_field("field", FieldValue::Text(field.to_owned()))
+    };
+    let declared = stages
+        .contract
+        .vertex_layout
+        .buffers()
+        .iter()
+        .flat_map(|buffer| buffer.attributes.iter())
+        .collect::<Vec<_>>();
+    let mut reflected = BTreeMap::new();
+    for attribute in &reflection.vertex_attributes {
+        if reflected.insert(attribute.location, attribute).is_some() {
+            return Err(mismatch("vertex_attributes")
+                .with_field(
+                    "location",
+                    FieldValue::Unsigned(u64::from(attribute.location)),
+                )
+                .with_detail("two reflected attributes share one location"));
+        }
+    }
+    if declared.len() != reflected.len() {
+        return Err(mismatch("vertex_attributes")
+            .with_field(
+                "declared_attributes",
+                FieldValue::Unsigned(declared.len() as u64),
+            )
+            .with_field(
+                "reflected_attributes",
+                FieldValue::Unsigned(reflected.len() as u64),
+            )
+            .with_detail(
+                "the contract's vertex layout and the reflection have to name the same \
+                 attributes, because the layout is what the pipeline's vertex input state is \
+                 built from",
+            ));
+    }
+    for attribute in declared {
+        let Some(reflected) = reflected.get(&attribute.location) else {
+            return Err(mismatch("vertex_attributes")
+                .with_field(
+                    "location",
+                    FieldValue::Unsigned(u64::from(attribute.location)),
+                )
+                .with_detail(
+                    "the reflection does not read the attribute the contract's vertex layout \
+                     declares at this location",
+                ));
+        };
+        if !air_type_name_names_vertex_format(reflected.type_name.as_deref(), attribute.format) {
+            return Err(mismatch("vertex_attributes")
+                .with_field(
+                    "location",
+                    FieldValue::Unsigned(u64::from(attribute.location)),
+                )
+                .with_field(
+                    "format_code",
+                    FieldValue::Unsigned(u64::from(attribute.format.code())),
+                )
+                .with_field(
+                    "type_name",
+                    FieldValue::Text(
+                        reflected
+                            .type_name
+                            .clone()
+                            .unwrap_or_else(|| "<none>".to_owned()),
+                    ),
+                )
+                .with_detail(
+                    "the reflected AIR type is not the component shape the contract declares for \
+                     this attribute",
+                ));
+        }
+    }
+    Ok(())
+}
+
+/// The fragment half's own agreement with the contract.
+///
+/// One render target per declared colour format, in location order: the count,
+/// the locations and each target's component shape. A fragment stage reads no
+/// vertex attribute and uses no vertex builtin, so either of those in the
+/// reflection is the wrong stage's interface.
+fn validate_translated_fragment(
+    stages: &RenderStages,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    let mismatch = |field: &str| {
+        reflection_mismatch_refusal(RenderStage::Fragment, entry)
+            .with_field("field", FieldValue::Text(field.to_owned()))
+    };
+    if !reflection.vertex_attributes.is_empty() {
+        return Err(mismatch("vertex_attributes").with_detail(
+            "a fragment stage reads no vertex attribute; those streams belong to the contract's \
+             vertex layout and the vertex stage",
+        ));
+    }
+    if reflection.vertex_builtins.is_some() {
+        return Err(
+            mismatch("vertex_builtins").with_detail("a fragment stage consumes no vertex builtin")
+        );
+    }
+    let declared = &stages.contract.color_formats;
+    if declared.len() != reflection.render_targets.len() {
+        return Err(mismatch("render_targets")
+            .with_field(
+                "declared_targets",
+                FieldValue::Unsigned(declared.len() as u64),
+            )
+            .with_field(
+                "reflected_targets",
+                FieldValue::Unsigned(reflection.render_targets.len() as u64),
+            )
+            .with_detail(
+                "the contract's colour format list and the reflection have to name the same \
+                 render targets; a stage that stores a location with no attachment beside it (or \
+                 skips one it has) is a different interface",
+            ));
+    }
+    for (location, (format, target)) in declared.iter().zip(&reflection.render_targets).enumerate()
+    {
+        let location = location as u32;
+        if target.location != location {
+            return Err(mismatch("render_targets")
+                .with_field("location", FieldValue::Unsigned(u64::from(location)))
+                .with_field(
+                    "reflected_location",
+                    FieldValue::Unsigned(u64::from(target.location)),
+                )
+                .with_detail(
+                    "the reflection stores this location out of order, so it would not land in \
+                     the attachment the contract declares at this position",
+                ));
+        }
+        if !air_type_name_names_attachment(target.type_name.as_deref(), *format) {
+            return Err(mismatch("render_targets")
+                .with_field("location", FieldValue::Unsigned(u64::from(location)))
+                .with_field(
+                    "format_code",
+                    FieldValue::Unsigned(u64::from(format.code())),
+                )
+                .with_field(
+                    "type_name",
+                    FieldValue::Text(
+                        target
+                            .type_name
+                            .clone()
+                            .unwrap_or_else(|| "<none>".to_owned()),
+                    ),
+                )
+                .with_detail(
+                    "the reflected AIR type is not the component shape the contract's attachment \
+                     format stores",
+                ));
+        }
+    }
+    Ok(())
+}
+
+/// The two translated stages have to describe one interface between them.
+///
+/// A vertex stage's user-varying outputs are the fragment stage's `stage_in`
+/// inputs: Vulkan requires every consumed input to have a producing output at
+/// the same `Location`. Each reflection names its own end of that pair, so the
+/// pair is checked when both halves of a registration are translated — a varying
+/// one side names and the other does not is a linkage this rail would otherwise
+/// discover as an undefined readback.
+fn validate_varying_linkage(
+    vertex: &ShaderReflection,
+    fragment: &ShaderReflection,
+    fragment_entry: &str,
+) -> Result<(), ProviderError> {
+    let produced = vertex
+        .varyings
+        .iter()
+        .map(|varying| (varying.location, varying.type_name.as_deref()))
+        .collect::<BTreeMap<_, _>>();
+    let consumed = fragment
+        .varyings
+        .iter()
+        .map(|varying| (varying.location, varying.type_name.as_deref()))
+        .collect::<BTreeMap<_, _>>();
+    let refusal = |detail: &str| {
+        reflection_mismatch_refusal(RenderStage::Fragment, fragment_entry)
+            .with_field("field", FieldValue::Text("varyings".to_owned()))
+            .with_field(
+                "produced_varyings",
+                FieldValue::Text(varying_locations(&produced)),
+            )
+            .with_field(
+                "consumed_varyings",
+                FieldValue::Text(varying_locations(&consumed)),
+            )
+            .with_detail(detail.to_owned())
+    };
+    if produced.len() != consumed.len() || produced.keys().ne(consumed.keys()) {
+        return Err(refusal(
+            "the vertex stage's varying outputs and the fragment stage's stage_in inputs have to \
+             name the same locations",
+        ));
+    }
+    for (location, produced_type) in &produced {
+        if let (Some(produced_type), Some(consumed_type)) =
+            (produced_type, consumed.get(location).copied().flatten())
+        {
+            if *produced_type != consumed_type {
+                return Err(refusal(
+                    "a varying's reflected AIR type differs between the two stages, so the two \
+                     interfaces do not match component-wise",
+                )
+                .with_field("location", FieldValue::Unsigned(u64::from(*location))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The locations of a reflected varying list, for one refusal's own fields.
+fn varying_locations(varyings: &BTreeMap<u32, Option<&str>>) -> String {
+    varyings
+        .keys()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The first reflected interface field this rail does not execute yet.
+///
+/// The list is exhaustive over the interface the rail *does* execute — the
+/// vertex attributes, the varyings, the render targets and the vertex builtins —
+/// plus everything a translation can state beyond it. Everything here is a
+/// capability fact rather than a mismatch: the translation may describe its
+/// stage perfectly and the rail still has no shape for it, so it refuses by name
+/// instead of executing the stage with that interface silently dropped.
+fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static str> {
+    [
+        (!reflection.bindings.is_empty(), "bindings"),
+        (
+            !reflection.argument_buffer_fields.is_empty(),
+            "argument_buffer_fields",
+        ),
+        (!reflection.depth_members.is_empty(), "depth_members"),
+        (reflection.depth_qualifier.is_some(), "depth_qualifier"),
+        (!reflection.stencil_members.is_empty(), "stencil_members"),
+        (reflection.tessellation.is_some(), "tessellation"),
+        (
+            !reflection.imageblock_layouts.is_empty(),
+            "imageblock_layouts",
+        ),
+        (
+            !reflection.implicit_imageblock_attachments.is_empty(),
+            "implicit_imageblock_attachments",
+        ),
+        (
+            reflection.fragment_imageblock.is_some(),
+            "fragment_imageblock",
+        ),
+        (
+            !reflection.runtime_sampler_specializations.is_empty(),
+            "runtime_sampler_specializations",
+        ),
+        (
+            !reflection.runtime_storage_image_specializations.is_empty(),
+            "runtime_storage_image_specializations",
+        ),
+        (
+            !reflection.function_constants.is_empty(),
+            "function_constants",
+        ),
+        (reflection.local_size.is_some(), "local_size"),
+        (
+            reflection.max_work_group_size.is_some(),
+            "max_work_group_size",
+        ),
+        (reflection.kernel_dispatch.is_some(), "kernel_dispatch"),
+    ]
+    .into_iter()
+    .find_map(|(present, field)| present.then_some(field))
+}
+
+/// Whether one AIR type name is the component shape a contract vertex format
+/// declares.
+///
+/// The reflected name is the AIR type the attribute was compiled as (`float3`,
+/// `uint`, …), and it is the only end of the pair that can state the component
+/// shape of the shader's own read. The arithmetic width is not part of the
+/// question: a `half2` read of a two-component stream is the same interface as
+/// its `float2` sibling, because the contract's format is what the pipeline's
+/// vertex input state is built from either way.
+fn air_type_name_names_vertex_format(type_name: Option<&str>, format: VertexFormat) -> bool {
+    match format {
+        VertexFormat::Float32x2 => matches!(type_name, Some("float2" | "half2")),
+        VertexFormat::Float32x3 => matches!(type_name, Some("float3" | "half3")),
+        VertexFormat::Float32x4 => matches!(type_name, Some("float4" | "half4")),
+        VertexFormat::Uint32 => matches!(type_name, Some("uint" | "uint1")),
+    }
+}
+
+/// Whether one AIR type name is the component shape a contract attachment
+/// format stores, for the reason [`air_type_name_names_vertex_format`] states.
+///
+/// The component *count* is what this asks about: an attachment format stores
+/// one channel per component, so a `float4` store into an 8-bit RGBA attachment
+/// is the reviewed shape, while a one-component store into the same attachment
+/// would leave three channels to a `StoreOp` nothing wrote.
+fn air_type_name_names_attachment(type_name: Option<&str>, format: AttachmentFormat) -> bool {
+    match format {
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm => {
+            matches!(type_name, Some("float4" | "half4"))
+        }
+        AttachmentFormat::R32Float => matches!(type_name, Some("float" | "float1" | "half")),
+        AttachmentFormat::R32Uint => matches!(type_name, Some("uint" | "uint1")),
+    }
+}
+
+/// The entry point name one translated module declares for `model`, or `None`
+/// when the module does not declare exactly one entry point of that stage.
+///
+/// The translator emits `OpEntryPoint … "main"` for every stage and keeps the
+/// AIR function's own name in the reflection, so the rail reads the name the
+/// pipeline has to bind out of the module itself instead of repeating the
+/// translator's literal: a module whose entry point is renamed still binds, and a
+/// module that declares two entry points of one stage (or none) is refused at
+/// registration, because the pipeline would have to pick one.
+fn module_entry_point(module: &[u8], model: spirv::ExecutionModel) -> Option<String> {
+    let words = spirv_words(module)?;
+    let mut found = None;
+    let mut cursor = 5;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        let end = cursor
+            .checked_add(word_count)
+            .filter(|end| word_count != 0 && *end <= words.len())?;
+        if opcode == spirv::Op::EntryPoint as u32 {
+            // `OpEntryPoint`: ExecutionModel, EntryPoint <id>, then the entry
+            // name as a NUL-terminated literal in the instruction's words. A
+            // shorter instruction cannot carry a name, so a module that ships
+            // one is refused rather than indexed past its own words.
+            if word_count < 4 {
+                return None;
+            }
+            if words[cursor + 1] == model as u32 {
+                if found.is_some() {
+                    return None;
+                }
+                let mut name = Vec::new();
+                for word in &words[cursor + 3..end] {
+                    name.extend_from_slice(&word.to_le_bytes());
+                }
+                let end_of_name = name.iter().position(|byte| *byte == 0)?;
+                found = Some(String::from_utf8(name[..end_of_name].to_vec()).ok()?);
+            }
+        }
+        cursor = end;
+    }
+    found
+}
+
+/// The stage name a reflection reports, spelled as this module spells stages.
+fn reflected_stage_name(stage: ShaderStage) -> &'static str {
+    match stage {
+        ShaderStage::Vertex => "vertex",
+        ShaderStage::Fragment => "fragment",
+        _ => "kernel",
+    }
+}
+
+/// The refusal for a translation that does not describe the pipeline it is
+/// registered under.
+///
+/// A capability fact: the rail will not execute a module whose stated interface
+/// disagrees with the contract, because the disagreement is exactly which bytes
+/// the pipeline would land.
+fn reflection_mismatch_refusal(stage: RenderStage, entry: &str) -> ProviderError {
+    capability_refusal("render_stage_reflection_mismatch")
+        .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+        .with_field("entry", FieldValue::Text(entry.to_owned()))
+}
+
+/// The refusal for a translated stage that names interface this rail does not
+/// execute yet.
+fn unsupported_interface_refusal(
+    stage: RenderStage,
+    entry: &str,
+    field: &'static str,
+) -> ProviderError {
+    capability_refusal("render_stage_unsupported_interface")
+        .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+        .with_field("entry", FieldValue::Text(entry.to_owned()))
+        .with_field("field", FieldValue::Text(field.to_owned()))
+        .with_detail(
+            "the translation names Metal interface this rail does not execute yet, so the stage \
+             is refused instead of being executed with that interface silently dropped",
+        )
+}
+
+/// The refusal for a stage module the rail cannot account for: neither one of
+/// its reviewed modules nor a translated module under a reflection.
+fn render_stage_translation_unavailable_refusal(stage: RenderStage, entry: &str) -> ProviderError {
+    capability_refusal("render_stage_translation_unavailable")
+        .with_field("stage", FieldValue::Text(stage.name().to_owned()))
+        .with_field("entry", FieldValue::Text(entry.to_owned()))
+        .with_detail(
+            "the stage module is neither one of this rail's reviewed modules nor a translated \
+             module described by its reflection, so the rail has no semantics it could execute",
+        )
+}
+
+/// The entry point name one stage's module declares, as the pipeline binds it.
+///
+/// A reviewed module declares the entry the contract names; a translated module
+/// declares the translator's own entry point, so the contract names the AIR
+/// function and this is where the two are told apart.
+fn bound_stage_entry<'a>(
+    stages: &'a RenderStages,
+    stage: RenderStage,
+) -> Result<Cow<'a, str>, ProviderError> {
+    let (translated, entry, module) = match stage {
+        RenderStage::Vertex => (
+            stages.vertex_translation.is_some(),
+            stages.contract.vertex_entry.as_str(),
+            stages.vertex_spirv.as_slice(),
+        ),
+        RenderStage::Fragment => (
+            stages.fragment_translation.is_some(),
+            stages.contract.fragment_entry.as_str(),
+            stages.fragment_spirv.as_slice(),
+        ),
+    };
+    if !translated {
+        return Ok(Cow::Borrowed(entry));
+    }
+    module_entry_point(module, stage.execution_model())
+        .map(Cow::Owned)
+        .ok_or_else(|| render_stage_translation_unavailable_refusal(stage, entry))
 }
 
 /// The refusal for a fragment stage that is not the reviewed module of the
@@ -792,12 +1557,11 @@ fn prepare_render_request<'a>(
             "the previous-byte list must carry one entry per colour attachment",
         ));
     }
-    if !fragment_stage_is_reviewed(stages) {
-        return Err(fragment_stage_mismatch_refusal(
-            &stages.contract.color_formats,
-            &stages.contract.fragment_entry,
-        ));
-    }
+    // The registration gate is re-asked of the value the rail was handed, so a
+    // directly-constructed `RenderStages` cannot skip it: the same two arms that
+    // settled the pairing at registration decide here, whether a stage arrived
+    // as a reviewed module or as a translation.
+    stages.validate_stage_pair()?;
     // The reviewed pair module is executed only by the fixtures whose state the
     // review covers: the depth fixture states a depth attachment and a test,
     // the stencil fixture a stencil attachment and a test, the cull fixture a
@@ -1298,8 +2062,15 @@ fn prepare_render_request<'a>(
         blend: pass.blend.clone(),
         extent,
         vertex: OffscreenVertexStage {
-            entry: &stages.contract.vertex_entry,
+            entry: bound_stage_entry(stages, RenderStage::Vertex)?,
             spirv: &stages.vertex_spirv,
+        },
+        translated_fragment: match stages.fragment_translation {
+            Some(_) => Some(OffscreenFragmentStage {
+                entry: bound_stage_entry(stages, RenderStage::Fragment)?.into_owned(),
+                spirv: &stages.fragment_spirv,
+            }),
+            None => None,
         },
         vertex_streams: streams,
         draw,
@@ -1861,30 +2632,31 @@ pub(crate) fn execute_offscreen_render(
         .iter()
         .map(|attachment| attachment.format)
         .collect::<Vec<_>>();
-    // The fragment stage is the format list's, not the caller's: `request`
-    // carries no fragment module, so this is the only place one is named and
-    // there is no pairing left to get wrong. The refusal covers the
-    // dual-combination and count shapes before any device call.
-    // The instanced fixture is the one exception (`research/docs/23` §3.3,
-    // v31): its reviewed vertex module selects the tint-storing fragment
-    // module, and every other vertex stage keeps the format list's solid
-    // module.
-    // The instanced and depth fixtures own reviewed module pairs of their own
+    // A translated registration's fragment stage is the module the translation
+    // produced, so the pipeline binds exactly the module the reflection gate
+    // checked (`request.translated_fragment`). A reviewed registration names no
+    // fragment module: the format list does, and the refusal covers the
+    // dual-combination and count shapes before any device call. The instanced
+    // and depth fixtures own reviewed module pairs of their own
     // (`research/docs/23` §3.3, v31/v36): their vertex stages select the
     // fragment module that stores the varying they forward, and every other
     // vertex stage keeps the format list's solid module.
-    let (fragment_spirv, fragment_entry_name) =
-        match depth_fragment_stage(request.vertex.entry, request.vertex.spirv, &formats)? {
-            Some(pair) => pair,
-            None => match instanced_fragment_stage(
-                request.vertex.entry,
-                request.vertex.spirv,
-                &formats,
-            )? {
+    let (fragment_spirv, fragment_entry_name) = match &request.translated_fragment {
+        Some(fragment) => (fragment.spirv, fragment.entry.as_str()),
+        None => {
+            match depth_fragment_stage(&request.vertex.entry, request.vertex.spirv, &formats)? {
                 Some(pair) => pair,
-                None => solid_fragment_stage(&formats)?,
-            },
-        };
+                None => match instanced_fragment_stage(
+                    &request.vertex.entry,
+                    request.vertex.spirv,
+                    &formats,
+                )? {
+                    Some(pair) => pair,
+                    None => solid_fragment_stage(&formats)?,
+                },
+            }
+        }
+    };
     let tiling = vk::ImageTiling::OPTIMAL;
     let vk_formats = formats
         .iter()
@@ -2215,7 +2987,7 @@ pub(crate) fn execute_offscreen_render(
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
     let fragment_words = spirv_words(fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
-    let vertex_entry = stage_entry_cstring("vertex", request.vertex.entry)?;
+    let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
     let fragment_entry = stage_entry_cstring("fragment", fragment_entry_name)?;
 
     let mut objects = OffscreenObjects::new(context);
@@ -2800,6 +3572,22 @@ pub(crate) fn execute_present_render(
             "the present rail executes exactly one colour attachment",
         ));
     };
+    // The present rail builds its fragment stage from the attachment format
+    // (`solid_fragment_spirv` below) rather than taking the registration's
+    // fragment module, so a translated registration would be executed with a
+    // stage the contract's reflection never described (its vertex half may be
+    // the registration's, its fragment half would not be). The offscreen rail
+    // is where a translated pipeline runs; a present pass beside one is refused
+    // by name instead (`research/docs/23`, R2 increment).
+    if request.translated_fragment.is_some() || stages.vertex_translation.is_some() {
+        return Err(
+            capability_refusal("render_present_translated_stage_unsupported").with_detail(
+                "the present rail binds the reviewed fragment stage of the attachment format, so \
+                 a translated pipeline is refused here instead of being executed with a stage \
+                 the registration did not name",
+            ),
+        );
+    }
     // A present attachment is the pass's only observable landing point, so a
     // `StoreOp::DontCare` present pass is the all-discarded shape the rail
     // refuses for an offscreen request (`docs/23` §3.6, v19). Core admission
@@ -2911,7 +3699,7 @@ pub(crate) fn execute_present_render(
         .ok_or_else(|| spirv_refusal("vertex SPIR-V is empty or not a multiple of four bytes"))?;
     let fragment_words = spirv_words(fragment_spirv)
         .ok_or_else(|| spirv_refusal("fragment SPIR-V is empty or not a multiple of four bytes"))?;
-    let vertex_entry = stage_entry_cstring("vertex", request.vertex.entry)?;
+    let vertex_entry = stage_entry_cstring("vertex", &request.vertex.entry)?;
     let fragment_entry = stage_entry_cstring("fragment", SOLID_FRAGMENT_ENTRY)?;
 
     // One acquire per present action, before the pass runs (`docs/24` §3.6).
@@ -6213,7 +7001,7 @@ mod tests {
 
     fn single_pixel_vertex() -> OffscreenVertexStage<'static> {
         OffscreenVertexStage {
-            entry: "single_pixel",
+            entry: "single_pixel".into(),
             spirv: SINGLE_PIXEL_VERT_SPV,
         }
     }
@@ -6222,7 +7010,7 @@ mod tests {
     /// `.spvasm` source declares.
     fn milestone_vertex() -> OffscreenVertexStage<'static> {
         OffscreenVertexStage {
-            entry: "vertex_main",
+            entry: "vertex_main".into(),
             spirv: FULL_SCREEN_TRIANGLE_VERT_SPV,
         }
     }
@@ -6241,6 +7029,8 @@ mod tests {
             fragment_spirv: solid_fragment_spirv(&[format])
                 .expect("every admitted format has a reviewed stage")
                 .to_vec(),
+            vertex_translation: None,
+            fragment_translation: None,
         }
     }
 
@@ -6260,6 +7050,8 @@ mod tests {
             ])
             .expect("the reviewed dual format list has a stage")
             .to_vec(),
+            vertex_translation: None,
+            fragment_translation: None,
         }
     }
 
@@ -6427,6 +7219,7 @@ mod tests {
                 }],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
+                translated_fragment: None,
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
                 instance_count: 1,
@@ -6720,6 +7513,7 @@ mod tests {
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -6790,6 +7584,7 @@ mod tests {
                     }],
                     extent: [2, 2],
                     vertex: single_pixel_vertex(),
+                    translated_fragment: None,
                     vertex_streams: Vec::new(),
                     draw: DrawShape::Milestone,
                     instance_count: 1,
@@ -6938,6 +7733,7 @@ mod tests {
             }],
             extent: [2, 0],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -6964,6 +7760,8 @@ mod tests {
             },
             vertex_spirv,
             fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
+            vertex_translation: None,
+            fragment_translation: None,
         };
         assert!(
             stages("vertex_main", FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec())
@@ -7380,6 +8178,7 @@ mod tests {
                 ],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
+                translated_fragment: None,
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
                 instance_count: 1,
@@ -7450,6 +8249,7 @@ mod tests {
                 ],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
+                translated_fragment: None,
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
                 instance_count: 1,
@@ -7524,6 +8324,7 @@ mod tests {
                 ],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
+                translated_fragment: None,
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
                 instance_count: 1,
@@ -7568,6 +8369,7 @@ mod tests {
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -7668,6 +8470,7 @@ mod tests {
             ],
             extent: [2, 2],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -7810,6 +8613,7 @@ mod tests {
                 }],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
+                translated_fragment: None,
                 vertex_streams: Vec::new(),
                 draw: DrawShape::Milestone,
                 instance_count: 1,
@@ -7909,6 +8713,7 @@ mod tests {
             }],
             extent: [2, 2],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -7998,6 +8803,7 @@ mod tests {
             }],
             extent: [4, 4],
             vertex: milestone_vertex(),
+            translated_fragment: None,
             vertex_streams: Vec::new(),
             draw: DrawShape::Milestone,
             instance_count: 1,
@@ -8100,6 +8906,148 @@ mod tests {
             context.queue_submission_counts().iter().sum::<usize>(),
             0,
             "the substituted loss never reached the driver"
+        );
+    }
+
+    /// One `OpEntryPoint` instruction as the module's own words, so the entry
+    /// scan can be observed without a translation: `model` is the SPIR-V
+    /// execution model, `name` the literal the instruction carries.
+    fn entry_point_instruction(model: u32, name: &str) -> Vec<u32> {
+        let mut literal = name.as_bytes().to_vec();
+        literal.push(0);
+        while !literal.len().is_multiple_of(4) {
+            literal.push(0);
+        }
+        let mut instruction = vec![0, model, 1];
+        for word in literal.chunks_exact(4) {
+            instruction.push(u32::from_le_bytes(word.try_into().expect("four-byte word")));
+        }
+        instruction[0] = ((instruction.len() as u32) << 16) | spirv::Op::EntryPoint as u32;
+        instruction
+    }
+
+    /// One `OpEntryPoint` header with no operands at all: a module that ships
+    /// one cannot be indexed past its own words.
+    fn truncated_entry_point_instruction() -> Vec<u32> {
+        vec![(1 << 16) | spirv::Op::EntryPoint as u32]
+    }
+
+    fn module_with(instructions: &[Vec<u32>]) -> Vec<u8> {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 2, 0];
+        for instruction in instructions {
+            words.extend_from_slice(instruction);
+        }
+        words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+    }
+
+    /// The rail binds the entry point a translated module declares, so the scan
+    /// is what makes "which function does this module export" answerable
+    /// without repeating the translator's own literal. A module that declares
+    /// two entry points of one stage is refused, because the pipeline would have
+    /// to pick one.
+    #[test]
+    fn module_entry_point_reads_the_single_declared_entry_and_refuses_two() {
+        let vertex_model = spirv::ExecutionModel::Vertex as u32;
+        let fragment_model = spirv::ExecutionModel::Fragment as u32;
+
+        let one = module_with(&[entry_point_instruction(vertex_model, "main")]);
+        assert_eq!(
+            module_entry_point(&one, spirv::ExecutionModel::Vertex).as_deref(),
+            Some("main")
+        );
+        // The other stage's model is not this stage's entry point.
+        assert_eq!(
+            module_entry_point(&one, spirv::ExecutionModel::Fragment),
+            None
+        );
+        let fragment_one = module_with(&[entry_point_instruction(fragment_model, "main")]);
+        assert_eq!(
+            module_entry_point(&fragment_one, spirv::ExecutionModel::Fragment).as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            module_entry_point(&fragment_one, spirv::ExecutionModel::Vertex),
+            None
+        );
+
+        let two = module_with(&[
+            entry_point_instruction(vertex_model, "first"),
+            entry_point_instruction(vertex_model, "second"),
+        ]);
+        assert_eq!(
+            module_entry_point(&two, spirv::ExecutionModel::Vertex),
+            None,
+            "two entry points of one stage leave the pipeline nothing to bind"
+        );
+
+        // A module whose last word is an `OpEntryPoint` header with no operands
+        // is refused, not indexed past: the scan reads only what the word count
+        // covers.
+        let malformed = module_with(&[truncated_entry_point_instruction()]);
+        assert_eq!(
+            module_entry_point(&malformed, spirv::ExecutionModel::Vertex),
+            None
+        );
+
+        // The reviewed modules declare their own entry names, which is the same
+        // question asked of a module the rail compiled itself.
+        assert_eq!(
+            module_entry_point(FULL_SCREEN_TRIANGLE_VERT_SPV, spirv::ExecutionModel::Vertex)
+                .as_deref(),
+            Some(FULL_SCREEN_TRIANGLE_VERTEX_ENTRY)
+        );
+        assert_eq!(
+            module_entry_point(SOLID_UNORM8_FRAG_SPV, spirv::ExecutionModel::Fragment).as_deref(),
+            Some(SOLID_FRAGMENT_ENTRY)
+        );
+    }
+
+    /// A reviewed registration binds the entry the contract names; a translated
+    /// one binds the entry the module declares. The two are told apart by which
+    /// arm of the gate the stage arrived through.
+    #[test]
+    fn a_reviewed_stage_binds_the_entry_its_contract_names() {
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        assert_eq!(
+            bound_stage_entry(&stages, RenderStage::Vertex)
+                .expect("a reviewed stage binds its contract entry")
+                .as_ref(),
+            "vertex_main"
+        );
+        assert_eq!(
+            bound_stage_entry(&stages, RenderStage::Fragment)
+                .expect("a reviewed stage binds its contract entry")
+                .as_ref(),
+            SOLID_FRAGMENT_ENTRY
+        );
+    }
+
+    /// A vertex module outside the reviewed set, handed to the reviewed
+    /// registration, is refused by name: the rail has no reflection to check it
+    /// against and will not execute it on the strength of its bytes alone.
+    #[test]
+    fn a_registration_refuses_a_vertex_module_outside_the_reviewed_set() {
+        let mut stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        // The reviewed fragment module is a well-formed SPIR-V module and a
+        // fragment stage: it is not one of the reviewed *vertex* stages, which
+        // is exactly the module the rail cannot account for.
+        stages.vertex_spirv = SOLID_UNORM8_FRAG_SPV.to_vec();
+        let refused = stages
+            .validate()
+            .expect_err("a vertex module the rail did not compile is not a reviewed stage");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_translation_unavailable");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("entry"),
+            Some(&FieldValue::Text("vertex_main".to_owned()))
         );
     }
 }

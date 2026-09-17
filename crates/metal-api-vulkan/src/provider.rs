@@ -65,19 +65,22 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         storage_modes: vec![StorageMode::OwnedBytes],
         host_readback: true,
         submit_only: false,
-        // The offscreen render rail is admitted: `render.rs` executes one or
-        // two colour attachments end to end, so the capability bits name
-        // exactly what that rail covers — up to two 2×2 attachments, with the
-        // dual-output module reviewed for `[Rgba8Unorm, Rgba8Unorm]` only.
+        // The offscreen render rail is admitted: `render.rs` executes one to
+        // four colour attachments end to end, so the capability bits name
+        // exactly what that rail covers — up to four 2×2 attachments, with a
+        // reviewed output module per attachment count and per format (the
+        // single-output, dual, triple and quad 8-bit modules, the
+        // single-channel float module, and the depth-only stage beside an empty
+        // colour list).
         // Formats the device itself refuses are still refused before
         // `vkCreateImage` by the rail's `COLOR_ATTACHMENT` probe; the
         // capability snapshot answers which shapes the provider can express,
         // and the device answers which of those it can run.
         supports_render_passes: true,
-        // The reviewed dual-output module writes exactly two locations, so the
-        // capability bit reports 2 and the rail typed-refuses a three- or
-        // four-attachment pass (`render_mrt_attachment_count_unsupported`)
-        // instead of silently rendering the first two locations.
+        // The reviewed modules cover one to four locations, so the snapshot
+        // reports the contract's own ceiling; the rail still typed-refuses a
+        // pass beyond it (`render_mrt_attachment_count_unsupported`) instead of
+        // silently rendering a subset of the locations.
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),

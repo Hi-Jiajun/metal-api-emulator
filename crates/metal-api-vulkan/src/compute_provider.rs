@@ -110,6 +110,27 @@ pub struct RenderPipelineRequest {
     pub logical_digest: SemanticDigest,
 }
 
+/// One render pipeline a host asks a provider context to own, built from two
+/// stages the translator produced.
+///
+/// This is [`RenderPipelineRequest`]'s sibling for modules the rail did not
+/// compile itself: `vertex`/`fragment` carry the SPIR-V the translator returned
+/// beside the reflection of the AIR it came from, and the registration gate
+/// checks each reflection against `contract` field by field
+/// (`render_stage_reflection_mismatch`, `render_stage_unsupported_interface`,
+/// `render_stage_translation_unavailable`). The modules are executed as
+/// registered — the rail binds each module's own entry point — so the pipeline
+/// runs the translation and not the reviewed module of the format list.
+///
+/// The contract's entry names are the AIR function names the translations
+/// started from, which is the identity the pipeline table reports.
+pub struct TranslatedRenderPipelineRequest {
+    pub contract: RenderPipelineContract,
+    pub vertex: crate::TranslatedRenderStage,
+    pub fragment: crate::TranslatedRenderStage,
+    pub logical_digest: SemanticDigest,
+}
+
 /// One planned render pass: the descriptor a trace carries and the stage
 /// modules the provider registered for the pipeline it names.
 struct PlannedRenderPass {
@@ -633,15 +654,71 @@ impl VulkanComputeProvider {
         &self,
         request: RenderPipelineRequest,
     ) -> Result<CompiledComputePipeline, ProviderError> {
-        self.ensure_usable()?;
+        let RenderPipelineRequest {
+            contract,
+            vertex_spirv,
+            fragment_spirv,
+            logical_digest,
+        } = request;
         let stages = render::RenderStages {
-            contract: request.contract,
-            vertex_spirv: request.vertex_spirv,
-            fragment_spirv: request.fragment_spirv,
+            contract,
+            vertex_spirv,
+            fragment_spirv,
+            vertex_translation: None,
+            fragment_translation: None,
         };
+        self.register_render_stages(stages, logical_digest)
+    }
+
+    /// Register one offscreen render pipeline from two translated stages.
+    ///
+    /// The sibling of [`Self::register_render_pipeline`] for modules the rail
+    /// did not compile itself (`research/docs/23`, R2 increment): the caller
+    /// hands the SPIR-V the translator returned *and* the reflection of the AIR
+    /// it came from, and the registration gate checks each reflection against
+    /// the contract — stage, entry, vertex attributes against the declared
+    /// vertex layout, render targets against the declared colour format list,
+    /// and the varyings of the two stages against each other. Nothing about the
+    /// pipeline is inferred from the module bytes.
+    ///
+    /// The returned metadata is the same table entry
+    /// [`Self::register_render_pipeline`] mints, and both registrations flow
+    /// through one registration gate and one registry slot.
+    pub fn register_translated_render_pipeline(
+        &self,
+        request: TranslatedRenderPipelineRequest,
+    ) -> Result<CompiledComputePipeline, ProviderError> {
+        let TranslatedRenderPipelineRequest {
+            contract,
+            vertex,
+            fragment,
+            logical_digest,
+        } = request;
+        let stages = render::RenderStages {
+            contract,
+            vertex_spirv: vertex.spirv,
+            fragment_spirv: fragment.spirv,
+            vertex_translation: Some(vertex.reflection),
+            fragment_translation: Some(fragment.reflection),
+        };
+        self.register_render_stages(stages, logical_digest)
+    }
+
+    /// The one registration path both render entry points take.
+    ///
+    /// Structural and interface validation ([`render::RenderStages::validate`]),
+    /// the table metadata and the registry insertion live here so the reviewed
+    /// and the translated registration cannot drift apart: they are the same
+    /// pipeline to the trace table, the registry and the execution path.
+    fn register_render_stages(
+        &self,
+        stages: render::RenderStages,
+        logical_digest: SemanticDigest,
+    ) -> Result<CompiledComputePipeline, ProviderError> {
+        self.ensure_usable()?;
         stages.validate()?;
         let function = FunctionIdentity {
-            logical_digest: request.logical_digest,
+            logical_digest,
             entry_name: stages.contract.vertex_entry.clone(),
             // The registration hands the rail compiled stage modules, i.e. a
             // Metal-side binary rather than source text. The field is table
