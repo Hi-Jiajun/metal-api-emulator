@@ -27,7 +27,7 @@ use crate::provider::{
     RenderPipelineStage, ResourceTableSnapshot, SamplerPolicy, StageBufferView, StorageMode,
     StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT,
     MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX,
-    MAX_RENDER_TEXTURES, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,14 +95,15 @@ pub enum Error {
     /// An index buffer is already bound. One pass draws through one index
     /// buffer, exactly as its descriptor holds one `indices` binding.
     IndexBufferAlreadyBound,
-    /// One texture binding index holds two textures, so the pass's positional
-    /// binding order would name two sampled surfaces for one binding
-    /// (`research/docs/23` §3.3, v70).
+    /// One texture binding index holds two textures, so the pass's binding list
+    /// would name two sampled surfaces for one `[[texture(n)]]` argument
+    /// (`research/docs/23` §3.3, v70/v104).
     FragmentTextureAlreadyBound {
         index: u32,
     },
-    /// A texture binding index is at or past [`MAX_RENDER_TEXTURES`], which is
-    /// the cap the pass's own descriptor carries.
+    /// A texture binding index is at or past [`MAX_RENDER_TEXTURE_INDEX`],
+    /// which is the fragment stage's own `[[texture(n)]]` bound
+    /// (`research/docs/23` §3.3, v104).
     FragmentTextureIndexOutOfRange {
         index: u32,
         maximum: usize,
@@ -3097,12 +3098,16 @@ impl RenderCommandEncoder {
     }
 
     /// Bind one sampled texture the fragment stage reads at `index`
-    /// (`research/docs/23` §3.3, v70).
+    /// (`research/docs/23` §3.3, v70/v104).
     ///
-    /// `index` is the binding the pass's descriptor carries positionally, and
-    /// a texture from another device is [`Error::ForeignTexture`]. A repeated
-    /// index is [`Error::FragmentTextureAlreadyBound`] and an index at or past
-    /// [`MAX_RENDER_TEXTURES`] is
+    /// `index` is the fragment stage's own `[[texture(index)]]` argument — the
+    /// same index the pipeline's declaration names and the pass's texture list
+    /// carries, canonical order and all — so the bindings a recorder holds need
+    /// not start at zero: the census's `[[texture(3)]]` shape binds one texture
+    /// and nothing below it. A texture from another device is
+    /// [`Error::ForeignTexture`]. A repeated index is
+    /// [`Error::FragmentTextureAlreadyBound`] and an index at or past
+    /// [`MAX_RENDER_TEXTURE_INDEX`] is
     /// [`Error::FragmentTextureIndexOutOfRange`], exactly as the vertex
     /// streams' two refusals spell their own binding.
     ///
@@ -3123,10 +3128,10 @@ impl RenderCommandEncoder {
         if self.fragment_textures.contains_key(&index) {
             return Err(Error::FragmentTextureAlreadyBound { index });
         }
-        if usize::try_from(index).unwrap_or(usize::MAX) >= MAX_RENDER_TEXTURES {
+        if index >= MAX_RENDER_TEXTURE_INDEX {
             return Err(Error::FragmentTextureIndexOutOfRange {
                 index,
-                maximum: MAX_RENDER_TEXTURES,
+                maximum: MAX_RENDER_TEXTURE_INDEX as usize,
             });
         }
         self.fragment_textures.insert(index, texture.clone());

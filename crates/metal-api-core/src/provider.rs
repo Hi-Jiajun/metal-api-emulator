@@ -1875,6 +1875,27 @@ pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 /// (`render_texture_limit`).
 pub const MAX_RENDER_TEXTURES: usize = 8;
 
+/// The highest texture index a render texture declaration or pass binding may
+/// carry (`research/docs/23` §3.3, v104).
+///
+/// A sampled texture is addressed inside the fragment stage's own Metal
+/// texture argument table (`[[texture(N)]]` for the fragment function's
+/// argument), and the guest's own binding is not always a low index: the census
+/// that followed `v103` found 49.2% of the first-failure lines declaring
+/// `[[texture(0)]]` while the draw bound `[[texture(3)]]`. The *count* cap
+/// ([`MAX_RENDER_TEXTURES`]) and the *index* bound are two different facts, so
+/// they are two constants — exactly as the stage-buffer face's count and index
+/// are ([`MAX_RENDER_STAGE_BUFFERS`] / [`MAX_RENDER_STAGE_BUFFER_INDEX`]).
+///
+/// Sixteen is the Vulkan floor rather than this contract's invention: every
+/// admitted device guarantees `maxPerStageDescriptorSampledImages >= 16`, and
+/// the pinned translator projects Metal texture index `n` into binding
+/// `32 + n`, so indices below this bound stay inside the sampled-image band a
+/// descriptor set may hold. A declaration or binding at or above it is refused
+/// by name (`render_texture_index_unsupported`) rather than handed to a rail
+/// whose layout the review did not cover.
+pub const MAX_RENDER_TEXTURE_INDEX: u32 = 16;
+
 /// The runtime samplers a render pass may declare, and the largest
 /// `[[sampler(n)]]` index a render texture declaration may pair with
 /// (`research/docs/23` §3.3, v102).
@@ -2299,40 +2320,45 @@ pub fn validate_vertex_buffer_binding(
     Ok(())
 }
 
-/// Validate one sampled texture bound at `index` (`research/docs/23` §3.3,
-/// v70).
+/// Validate one sampled texture bound in a pass's texture list
+/// (`research/docs/23` §3.3, v70/v104).
 ///
-/// The entry's position in [`RenderPassDescriptor::textures`] is the fragment
-/// texture binding both rails use, so the view's own `metal_binding` has to
-/// agree with it — the same rule [`validate_vertex_buffer_binding`] states for
-/// vertex streams. The render-sampler increment reads, and only reads, a
-/// single-sample surface: a writable binding is a `Storage` access the
-/// reviewed fragment stage has no shape for, and a multisampled one is not a
-/// texel the sampling instruction can reduce on either rail.
+/// `position` is the entry's place inside
+/// [`RenderPassDescriptor::textures`] — the list's own canonical order — and
+/// not the binding it fills: the view's own `metal_binding` names the fragment
+/// stage's `[[texture(n)]]` argument, and since `v104` that index is stated
+/// rather than implied by the position, so a list may skip an index (the shape
+/// the census found behind 49.2% of its first-failure lines: the stage declares
+/// `[[texture(0)]]` while the draw binds `[[texture(3)]]`). The position is
+/// what a refusal about this entry quotes; the index's own ceiling and the
+/// list's canonical order and uniqueness are
+/// [`RenderPassDescriptor::validate`]'s rules, because they are facts about the
+/// list rather than about one entry.
+///
+/// The render-sampler increment reads, and only reads, a single-sample surface:
+/// a writable binding is a `Storage` access the reviewed fragment stage has no
+/// shape for, and a multisampled one is not a texel the sampling instruction
+/// can reduce on either rail.
 pub fn validate_render_texture_binding(
-    index: usize,
+    position: usize,
     texture: &TextureView,
 ) -> Result<(), ContractError> {
     texture.validate_shape()?;
-    let expected = u32::try_from(index).map_err(|_| ContractError::RenderTextureLimitExceeded {
-        requested: index,
-        maximum: MAX_RENDER_TEXTURES,
-    })?;
-    if texture.metal_binding != expected {
-        return Err(ContractError::RenderTextureBindingMismatch {
-            index,
-            metal_binding: texture.metal_binding,
+    if texture.metal_binding >= MAX_RENDER_TEXTURE_INDEX {
+        return Err(ContractError::RenderTextureIndexExceeded {
+            index: texture.metal_binding,
+            maximum: MAX_RENDER_TEXTURE_INDEX,
         });
     }
     if texture.access != TextureAccess::Sampled {
         return Err(ContractError::RenderTextureAccessUnsupported {
-            index,
+            index: position,
             access: texture.access,
         });
     }
     if texture.sample_count != 1 {
         return Err(ContractError::RenderTextureSampleCountUnsupported {
-            index,
+            index: position,
             sample_count: texture.sample_count,
         });
     }
@@ -3866,19 +3892,22 @@ pub struct RenderPassDescriptor {
     /// offscreen trace leaves the field `None` and keeps the pre-present bytes
     /// exactly (`docs/24` §4.3).
     pub present: Option<PresentDescriptor>,
-    /// Sampled textures the pass's fragment stage reads, in binding order:
-    /// entry `i` is fragment texture binding `i` (`research/docs/23` §3.3,
-    /// v70).
+    /// Sampled textures the pass's fragment stage reads, in canonical binding
+    /// order (`research/docs/23` §3.3, v70/v104).
     ///
     /// Each entry is a read-only [`TextureView`] that carries its own bytes,
     /// so the object API can bind a caller's texture into a trace that has no
     /// compute pass at all — the same rule the vertex and index streams
-    /// follow. The entry's position is the binding index,
-    /// [`validate_render_texture_binding`] holds the view's own `metal_binding`
-    /// to it, and the list is capped at [`MAX_RENDER_TEXTURES`] single-sample
-    /// 2D surfaces (`research/docs/23` §3.3, v70/v102) — the reviewed stage
-    /// samples one, and the translated stage samples as many as its own
-    /// reflection names. A pass that binds none keeps the exact pre-v70 bytes.
+    /// follow. An entry's own `metal_binding` *is* the fragment stage's
+    /// `[[texture(n)]]` argument — the census's `[[texture(3)]]` shape is a
+    /// list holding that one entry — while the order is the list's own
+    /// canonical order: ascending, every index once, every index below
+    /// [`MAX_RENDER_TEXTURE_INDEX`], all of them
+    /// [`RenderPassDescriptor::validate`]'s rules. The list is capped at
+    /// [`MAX_RENDER_TEXTURES`] single-sample 2D surfaces (`research/docs/23`
+    /// §3.3, v70/v102) — the reviewed stage samples one, and the translated
+    /// stage samples as many as its own reflection names. A pass that binds
+    /// none keeps the exact pre-v70 bytes.
     pub textures: Vec<TextureView>,
     /// The runtime samplers the fragment stage executes with, in canonical
     /// order (`research/docs/23` §3.3, v102).
@@ -4083,14 +4112,17 @@ impl RenderPassDescriptor {
                 return Err(ContractError::StencilResolveWithoutDepthResolve);
             }
         }
-        // Fragment texture bindings (`research/docs/23` §3.3, v70): the
-        // render-sampler shape is a read-only, single-sample 2D texture whose
-        // position is its binding. The count against the contract's own
-        // ceiling and the view's shape are structural; whether the *device*
-        // admits the format or the count at all stays admission's capability
-        // question (`render_texture_format_unsupported` /
-        // `render_texture_limit`), exactly as the colour formats split
-        // between this validator and `admit_render_passes`.
+        // Fragment texture bindings (`research/docs/23` §3.3, v70/v104): the
+        // render-sampler shape is a read-only, single-sample 2D texture. The
+        // list is canonical — ascending `metal_binding`, no index twice — and
+        // the index is the view's own statement of the fragment stage's
+        // `[[texture(n)]]` argument rather than its position, so a list may
+        // skip an index. The count against the contract's own ceiling and the
+        // view's shape are structural; whether the *device* admits the format
+        // or the count at all stays admission's capability question
+        // (`render_texture_format_unsupported` / `render_texture_limit`),
+        // exactly as the colour formats split between this validator and
+        // `admit_render_passes`.
         if self.textures.len() > MAX_RENDER_TEXTURES {
             return Err(ContractError::RenderTextureLimitExceeded {
                 requested: self.textures.len(),
@@ -4098,7 +4130,17 @@ impl RenderPassDescriptor {
             });
         }
         let mut sampled_views = BTreeMap::new();
+        let mut previous: Option<u32> = None;
         for (index, texture) in self.textures.iter().enumerate() {
+            if previous.is_some_and(|previous| previous >= texture.metal_binding) {
+                if previous == Some(texture.metal_binding) {
+                    return Err(ContractError::DuplicateBinding(texture.metal_binding));
+                }
+                return Err(ContractError::NonCanonicalBindingOrder(
+                    "render texture bindings",
+                ));
+            }
+            previous = Some(texture.metal_binding);
             validate_render_texture_binding(index, texture)?;
             if sampled_views.insert(texture.view_id, ()).is_some() {
                 return Err(ContractError::DuplicateView(texture.view_id));
@@ -4672,7 +4714,7 @@ pub struct RenderPipelineContract {
     /// [`Self::validate_against`] holds the two lists to each other.
     pub stage_buffers: Vec<StageBufferBinding>,
     /// Sampled textures the fragment stage reads, in canonical order
-    /// (`research/docs/23` §3.3, v100).
+    /// (`research/docs/23` §3.3, v100/v104).
     ///
     /// This is the pipeline-level half of the pass's
     /// [`RenderPassDescriptor::textures`], and it reuses the compute face's
@@ -4680,19 +4722,21 @@ pub struct RenderPipelineContract {
     /// about a sampled binding — the Metal index, the read-only access, the
     /// dimensionality, the texel format and the sampler state the module's
     /// sampling operations were lowered against — and only their *namespaces*
-    /// differ. A compute pass pairs a declaration with its bound views by
-    /// `metal_binding`; a render pass's texture list *is* its binding space
-    /// (`RenderPassDescriptor::validate` requires `metal_binding` to equal the
-    /// position), so entry `i` here is the fragment stage's `[[texture(i)]]`
-    /// and pairs with `pass.textures[i]`.
+    /// differ. Both faces pair a declaration with its bound views by
+    /// `metal_binding`, which is the fragment stage's `[[texture(n)]]`
+    /// argument: the list is canonical (ascending, unique, each index below
+    /// [`MAX_RENDER_TEXTURE_INDEX`]) but *not* positional, so an entry that
+    /// skips an index states the guest shape the census found behind 49.2% of
+    /// its first-failure lines — a fragment stage declaring `[[texture(0)]]`
+    /// while the draw binds `[[texture(3)]]` (`v104`).
     ///
     /// The sampler state is the render-side sibling of the compute narrow
     /// class's C1b rule (`research/docs/26` §21.3): it is a *declaration*, not
     /// a request knob, because the fragment stage's sampling operations were
     /// lowered against one state and a rail that creates another one silently
-    /// changes which texels a read returns. Entry order, the position-equals-
-    /// binding rule, the sampler-presence rule and the bounded-read rule are
-    /// [`Self::validate`]'s; the agreement with the pass is
+    /// changes which texels a read returns. Entry order, the index bound, the
+    /// sampler-presence rule and the bounded-read rule are
+    /// [`Self::validate`]'s; the agreement with the pass, index by index, is
     /// [`Self::validate_against`]'s; whether the *module* the registration
     /// names carries that same state is the execution rail's, exactly as it is
     /// for compute.
@@ -4892,20 +4936,26 @@ impl RenderPipelineContract {
                 });
             }
         }
-        // The sampled textures pair by position (`research/docs/23` §3.3,
-        // v100): the pass's texture list *is* the fragment stage's
-        // `[[texture(n)]]` space, so declaration `i` and `pass.textures[i]`
-        // describe one binding, and the two sides have to agree about its
-        // access, dimensionality and format. The list length is compared
-        // implicitly, in both directions: a declaration without a bound view
-        // would leave a descriptor the fragment stage reads undefined, and a
-        // bound view without a declaration would fill a slot the pipeline
-        // never said how to read. What the declaration adds beyond the view's
-        // own shape is the sampler state the module's samples were lowered
-        // against and the read's own bounded reach, which is why a binding has
-        // to be declared at all.
-        for (index, declared) in self.textures.iter().enumerate() {
-            let Some(bound) = pass.textures.get(index) else {
+        // The sampled textures pair by `metal_binding` (`research/docs/23`
+        // §3.3, v100/v104): the pass's texture list and the declaration list
+        // are two statements of one `[[texture(n)]]` space, so the declaration
+        // named `n` and the pass's binding at `n` describe one binding and the
+        // two sides have to agree about its access, dimensionality and format.
+        // The lists pair in both directions — a declaration without a bound
+        // view would leave a descriptor the fragment stage reads undefined, and
+        // a bound view without a declaration would fill a slot the pipeline
+        // never said how to read — and each of them is canonical on its own
+        // (ascending, unique), which is what makes the walk below a pairing
+        // rather than a guess. What the declaration adds beyond the view's own
+        // shape is the sampler state the module's samples were lowered against
+        // and the read's own bounded reach, which is why a binding has to be
+        // declared at all.
+        for declared in &self.textures {
+            let Some(bound) = pass
+                .textures
+                .iter()
+                .find(|bound| bound.metal_binding == declared.metal_binding)
+            else {
                 return Err(ContractError::MissingTextureBinding {
                     binding: declared.metal_binding,
                 });
@@ -4957,8 +5007,12 @@ impl RenderPipelineContract {
                 }
             }
         }
-        for (index, bound) in pass.textures.iter().enumerate() {
-            if self.textures.get(index).is_none() {
+        for bound in &pass.textures {
+            if !self
+                .textures
+                .iter()
+                .any(|declared| declared.metal_binding == bound.metal_binding)
+            {
                 return Err(ContractError::UndeclaredTextureBinding {
                     binding: bound.metal_binding,
                 });
@@ -5017,13 +5071,14 @@ impl RenderPipelineContract {
 /// (`research/docs/23` §3.3, v100).
 ///
 /// Every rule is a fact the declaration list alone can answer: the count stays
-/// inside the first increment's cap, the list is canonical and *positional*
-/// (entry `i` is the fragment stage's `[[texture(i)]]`, so it pairs with
-/// `pass.textures[i]`), a declaration states a sampler exactly when its access
-/// is the sampled one — the same half-statement rule C1b's storage-image
-/// sibling states — and the reach is the bounded one: the render sampler reads
-/// a whole, tightly packed view, which is the unit the pass's own extent rule
-/// and the lease channel are stated in.
+/// inside the first increment's cap, every index stays below
+/// [`MAX_RENDER_TEXTURE_INDEX`], the list is canonical (ascending
+/// `metal_binding`, no index twice) with each entry stating the fragment
+/// stage's own `[[texture(n)]]` argument, a declaration states a sampler
+/// exactly when its access is the sampled one — the same half-statement rule
+/// C1b's storage-image sibling states — and the reach is the bounded one: the
+/// render sampler reads a whole, tightly packed view, which is the unit the
+/// pass's own extent rule and the lease channel are stated in.
 fn validate_render_texture_declarations(
     bindings: &[TextureBindingContract],
 ) -> Result<(), ContractError> {
@@ -5034,7 +5089,7 @@ fn validate_render_texture_declarations(
         });
     }
     let mut previous: Option<u32> = None;
-    for (index, binding) in bindings.iter().enumerate() {
+    for binding in bindings {
         if previous.is_some_and(|previous| previous >= binding.metal_binding) {
             if previous == Some(binding.metal_binding) {
                 return Err(ContractError::DuplicateBinding(binding.metal_binding));
@@ -5044,15 +5099,10 @@ fn validate_render_texture_declarations(
             ));
         }
         previous = Some(binding.metal_binding);
-        let expected =
-            u32::try_from(index).map_err(|_| ContractError::RenderTextureLimitExceeded {
-                requested: index,
-                maximum: MAX_RENDER_TEXTURES,
-            })?;
-        if binding.metal_binding != expected {
-            return Err(ContractError::RenderTextureBindingMismatch {
-                index,
-                metal_binding: binding.metal_binding,
+        if binding.metal_binding >= MAX_RENDER_TEXTURE_INDEX {
+            return Err(ContractError::RenderTextureIndexExceeded {
+                index: binding.metal_binding,
+                maximum: MAX_RENDER_TEXTURE_INDEX,
             });
         }
         // A sampled binding states *one* of the two sampler forms
@@ -9967,11 +10017,11 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "render_input_access_unsupported",
         ),
-        // Render sampler contract (`research/docs/23` §3.3, v70). The access
-        // and the contract ceiling are the same first-increment narrowings the
-        // vertex-input bits above are, so they keep their own capability
-        // slugs; the binding label and the read/write conflict are
-        // caller-fixable trace shape.
+        // Render sampler contract (`research/docs/23` §3.3, v70/v104). The
+        // access, the count ceiling and the index bound are the same
+        // first-increment narrowings the vertex-input bits and the stage
+        // buffer face's own bound are, so they keep their own capability slugs;
+        // the read/write conflict is caller-fixable trace shape.
         E::RenderTextureAccessUnsupported { .. } => (
             ProviderErrorClass::Capability,
             "render_texture_access_unsupported",
@@ -9979,6 +10029,10 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::RenderTextureLimitExceeded { .. } => (
             ProviderErrorClass::Capability,
             "render_texture_limit",
+        ),
+        E::RenderTextureIndexExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_index_unsupported",
         ),
         E::RenderTextureSampleCountUnsupported { .. } => {
             (ProviderErrorClass::Args, "texture_shape_mismatch")
@@ -10062,7 +10116,6 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::VertexLayoutBindingMismatch { .. }
         | E::VertexBufferBindingMismatch { .. }
         | E::IndexBufferBindingMismatch { .. }
-        | E::RenderTextureBindingMismatch { .. }
         | E::RenderTextureAttachmentConflict { .. }
         | E::MissingTextureBinding { .. }
         | E::UndeclaredTextureBinding { .. }
@@ -11951,11 +12004,16 @@ pub enum ContractError {
         requested: usize,
         maximum: usize,
     },
-    /// A sampled texture's own binding label does not match its position in
-    /// the pass's texture list.
-    RenderTextureBindingMismatch {
-        index: usize,
-        metal_binding: u32,
+    /// A sampled texture's own binding label, or a render texture
+    /// declaration's index, is at or above [`MAX_RENDER_TEXTURE_INDEX`]
+    /// (`research/docs/23` §3.3, v104).
+    ///
+    /// The binding label is the fragment stage's `[[texture(n)]]` argument and
+    /// the pass's own list order is the canonical order, so the index and the
+    /// position are two different facts and the index carries the ceiling.
+    RenderTextureIndexExceeded {
+        index: u32,
+        maximum: u32,
     },
     /// A render texture binding is not the read-only sampling this increment
     /// executes.
@@ -11981,8 +12039,8 @@ pub enum ContractError {
     /// pass's own extent rule, the lease channel and the readback are stated
     /// in — so a declaration whose reach cannot be bounded is refused by name
     /// instead of executed against texels nobody sized. The index is the
-    /// declaration's own position, which is the fragment stage's
-    /// `[[texture(n)]]` and the pass's `textures[n]`.
+    /// declaration's own `metal_binding`, which is the fragment stage's
+    /// `[[texture(n)]]` and the pass's own binding at that index.
     RenderTextureFootprintProofUnsupported {
         index: u32,
         proof: TextureFootprintProof,
@@ -12839,12 +12897,9 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render pass binds {requested} sampled textures, above the contract maximum {maximum}"
             ),
-            Self::RenderTextureBindingMismatch {
-                index,
-                metal_binding,
-            } => write!(
+            Self::RenderTextureIndexExceeded { index, maximum } => write!(
                 formatter,
-                "render texture {index} carries binding label {metal_binding}, but its position is its binding"
+                "render texture binding index {index} is at or past the render contract's own texture index bound {maximum}"
             ),
             Self::RenderTextureAccessUnsupported { index, access } => write!(
                 formatter,
@@ -20576,6 +20631,43 @@ mod tests {
         value
     }
 
+    /// The same fixture with the texture *indexes* the caller names
+    /// (`research/docs/23` §3.3, v104): the render half declares one sampled
+    /// texture per index and the pass binds one freshly identified view at
+    /// each of them, so the two lists agree index by index. A list that skips
+    /// an index is the census's own `[[texture(3)]]` shape; a list that repeats
+    /// one or walks backwards is the shape the list's canonical order refuses.
+    fn render_texture_trace_at(bindings: &[u32]) -> ComputeTrace {
+        let mut value = render_texture_trace();
+        let mut views = Vec::with_capacity(bindings.len());
+        for (position, binding) in bindings.iter().enumerate() {
+            let mut view = sampled_texture_view(*binding);
+            // One declaration per entry, so two entries at one index are a
+            // duplicate binding rather than the duplicate-identity refusal
+            // that one view sampled twice states.
+            view.view_id = ViewId::new(83 + position as u64);
+            view.allocation_id = AllocationId::new(53 + position as u64);
+            views.push(view);
+        }
+        render_entry(&mut value).textures = views;
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures = bindings
+                .iter()
+                .map(|binding| {
+                    TextureBindingContract::sampled(
+                        *binding,
+                        TextureFormat::Rgba8Unorm,
+                        SamplerPolicy {
+                            filter: SamplerFilter::Nearest,
+                            address: SamplerAddressMode::ClampToEdge,
+                        },
+                    )
+                })
+                .collect();
+        }
+        value
+    }
+
     /// The render snapshot extended with the three render-sampler bits.
     fn render_texture_capabilities() -> ProviderCapabilities {
         let mut provider = render_capabilities();
@@ -20892,20 +20984,113 @@ mod tests {
             .expect("the pre-v70 pass keeps admitting without the bits");
     }
 
+    /// The render texture face's binding rules (`research/docs/23` §3.3,
+    /// v70/v104): each entry's own `metal_binding` is the fragment stage's
+    /// `[[texture(n)]]` argument, so a list may skip an index, while the count
+    /// cap, the index bound, the canonical order, the read-only access and the
+    /// single-sample shape stay refusals by name.
     #[test]
-    fn render_texture_bindings_are_positional_read_only_and_single_sample() {
-        // The entry's position is the binding, exactly as a vertex stream's:
-        // a view that carries another label would name a binding the pass does
-        // not have.
-        let mut value = render_texture_trace();
-        render_entry(&mut value).textures = vec![sampled_texture_view(1)];
+    fn render_texture_bindings_are_indexed_read_only_and_single_sample() {
+        // The list is *indexed* rather than positional (`v104`): each view's
+        // own `metal_binding` is the fragment stage's `[[texture(n)]]`
+        // argument, so a list that has to skip an index is a shape this
+        // contract states. 5156 of census v11's 10477 first-failure lines were
+        // exactly this shape — a fragment stage declaring `[[texture(0)]]`
+        // while the draw bound `[[texture(3)]]` — which is why the census's
+        // first gate is the one this increment opens.
+        render_texture_trace_at(&[3])
+            .validate()
+            .expect("one binding at index 3 is a list this contract states");
+        render_texture_trace_at(&[1, 3])
+            .validate()
+            .expect("two bindings at two of the fragment stage's own indexes are canonical");
+        // The pre-v104 shape is the same rule with no gap, so it keeps its own
+        // bytes and its admission path.
+        render_texture_trace_at(&[0])
+            .validate()
+            .expect("the dense list is the indexed rule's own special case");
+
+        // The index carries its own bound (`v104`): the fragment stage's
+        // argument table is wider than the list's count cap, so a *count* rule
+        // cannot state where a binding may sit, and the index that reaches the
+        // translator's own band is refused by name.
         assert_eq!(
-            value.validate(),
-            Err(ContractError::RenderTextureBindingMismatch {
-                index: 0,
-                metal_binding: 1,
+            render_texture_trace_at(&[MAX_RENDER_TEXTURE_INDEX]).validate(),
+            Err(ContractError::RenderTextureIndexExceeded {
+                index: MAX_RENDER_TEXTURE_INDEX,
+                maximum: MAX_RENDER_TEXTURE_INDEX,
             })
         );
+
+        // The declaration list's own canonical rules: one index twice, and a
+        // list that walks backwards, are the same two refusals the compute
+        // faces and the stage-buffer list state.
+        assert_eq!(
+            render_texture_trace_at(&[3, 3]).validate(),
+            Err(ContractError::DuplicateBinding(3))
+        );
+        assert_eq!(
+            render_texture_trace_at(&[3, 1]).validate(),
+            Err(ContractError::NonCanonicalBindingOrder(
+                "render texture declarations"
+            ))
+        );
+
+        // The pass's own list answers the same two rules, and asks them of its
+        // own entries: the declarations are canonical while the pass's two
+        // bindings walk backwards.
+        let mut reversed = render_texture_trace_at(&[1, 3]);
+        let mut first = sampled_texture_view(1);
+        first.view_id = ViewId::new(91);
+        first.allocation_id = AllocationId::new(61);
+        let mut second = sampled_texture_view(3);
+        second.view_id = ViewId::new(93);
+        second.allocation_id = AllocationId::new(63);
+        render_entry(&mut reversed).textures = vec![second, first];
+        assert_eq!(
+            reversed.validate(),
+            Err(ContractError::NonCanonicalBindingOrder(
+                "render texture bindings"
+            ))
+        );
+        let mut repeated = render_texture_trace_at(&[3]);
+        let mut again = sampled_texture_view(3);
+        again.view_id = ViewId::new(94);
+        again.allocation_id = AllocationId::new(64);
+        render_entry(&mut repeated).textures = vec![sampled_texture_view(3), again];
+        assert_eq!(repeated.validate(), Err(ContractError::DuplicateBinding(3)));
+
+        // The pairing is index by index in both directions, and it is the
+        // *pair* rule rather than either list's own: a declaration without a
+        // bound view would leave a descriptor the fragment stage reads
+        // undefined, and a bound view without a declaration would fill a slot
+        // the pipeline never said how to read.
+        let pair = |value: &mut ComputeTrace| -> Result<(), ContractError> {
+            let contract = value.pipelines[0]
+                .render
+                .clone()
+                .expect("the fixture registers a render half");
+            contract.validate_against(render_entry(value), None)
+        };
+        let mut unbound = render_texture_trace_at(&[3]);
+        render_entry(&mut unbound).textures.clear();
+        assert_eq!(
+            pair(&mut unbound),
+            Err(ContractError::MissingTextureBinding { binding: 3 })
+        );
+        let mut undeclared = render_texture_trace_at(&[3]);
+        let mut other = sampled_texture_view(5);
+        other.view_id = ViewId::new(95);
+        other.allocation_id = AllocationId::new(65);
+        render_entry(&mut undeclared).textures.push(other);
+        assert_eq!(
+            pair(&mut undeclared),
+            Err(ContractError::UndeclaredTextureBinding { binding: 5 })
+        );
+        // Control: the very same two lists, paired index by index, are the
+        // shape the refusals above measure against.
+        let mut agreeing = render_texture_trace_at(&[3]);
+        pair(&mut agreeing).expect("one declaration pairs with its own binding");
 
         // A storage binding is the writeback the reviewed fragment stage has
         // no shape for; the refusal is the same capability class the vertex

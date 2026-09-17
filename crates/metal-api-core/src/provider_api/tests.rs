@@ -1814,10 +1814,10 @@ fn a_recording_can_load_its_attachment_instead_of_clearing_it() {
 #[test]
 fn a_recording_binds_one_fragment_texture_in_binding_order() {
     // The object-API half of the render sampler (`research/docs/23` §3.3,
-    // v70): the encoder binds one texture, the pass it records carries the
-    // binding positionally with the texture's own bytes, and the two binding
-    // refusals are the vertex streams' own (a repeated index, an index past
-    // the contract's cap).
+    // v70): the encoder binds one texture, the pass it records carries that
+    // binding with the texture's own bytes, and the two binding refusals are
+    // the vertex streams' own (a repeated index, an index past the contract's
+    // own bound).
     let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
     let device = Device::new(provider.clone());
     let declaring = device.compile_pipeline(request("declare")).unwrap();
@@ -1866,15 +1866,18 @@ fn a_recording_binds_one_fragment_texture_in_binding_order() {
             encoder.set_fragment_texture(0, &sampled),
             Err(Error::FragmentTextureAlreadyBound { index: 0 })
         ));
-        // The binding space is the contract's ceiling (`v102`): the entry at or
-        // past [`MAX_RENDER_TEXTURES`] is the one refused by name, and the
-        // indexes below it are the ones the wider contract admits.
+        // The binding space is the fragment stage's own `[[texture(n)]]` table
+        // (`v104`): the index at or past [`MAX_RENDER_TEXTURE_INDEX`] is the
+        // one refused by name, and the indexes below it are the ones the wider
+        // contract admits — the list's *count* is the other ceiling, and the
+        // contract's own `render_texture_limit` states it.
         assert!(matches!(
-            encoder.set_fragment_texture(MAX_RENDER_TEXTURES as u32, &sampled),
+            encoder.set_fragment_texture(MAX_RENDER_TEXTURE_INDEX, &sampled),
             Err(Error::FragmentTextureIndexOutOfRange {
                 index,
-                maximum: 8,
-            }) if index == MAX_RENDER_TEXTURES as u32
+                maximum,
+            }) if index == MAX_RENDER_TEXTURE_INDEX
+                && maximum == MAX_RENDER_TEXTURE_INDEX as usize
         ));
         encoder
             .draw_render_pass(
@@ -1909,6 +1912,139 @@ fn a_recording_binds_one_fragment_texture_in_binding_order() {
                 .collect()
         )
     );
+}
+
+/// The render metadata of a pipeline whose fragment stage reads the texture at
+/// `index` (`research/docs/23` §3.3, v104): the census's own shape, one
+/// `[[texture(3)]]` and nothing below it.
+fn render_metadata_with_fragment_texture_at(
+    provider: &FakeProvider,
+    index: u32,
+) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    if let Some(render) = metadata.render.as_mut() {
+        render.textures = vec![TextureBindingContract::sampled(
+            index,
+            TextureFormat::Rgba8Unorm,
+            crate::provider::SamplerPolicy {
+                filter: crate::provider::SamplerFilter::Nearest,
+                address: crate::provider::SamplerAddressMode::ClampToEdge,
+            },
+        )];
+    }
+    metadata
+}
+
+/// The object rail's half of the indexed texture face (`research/docs/23` §3.3,
+/// v104): a caller binds the index the fragment stage's own `[[texture(n)]]`
+/// argument names, the recorded pass carries that index rather than a
+/// position, and the contract pairs the two lists by it — so the one texture a
+/// draw binds may sit at index 3 with nothing below it.
+#[test]
+fn a_recording_carries_the_fragment_texture_index_the_caller_bound() {
+    let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
+    let device = Device::new(provider.clone());
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let render_metadata = render_metadata_with_fragment_texture_at(&provider, 3);
+    provider
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(render_metadata.pipeline_id);
+    let render = device.render_pipeline(&render_metadata).unwrap();
+
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 64]).unwrap();
+    let attachment_view = attachment.view(0, 64).unwrap();
+    let texels = (0..4u8)
+        .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+        .collect::<Vec<_>>();
+    let sampled = device
+        .new_texture_with_bytes(TextureFormat::Rgba8Unorm, 4, 4, texels)
+        .unwrap();
+
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&render).unwrap();
+        encoder.set_fragment_texture(3, &sampled).unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                4,
+                4,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .expect("the sparse binding records under its own index");
+        encoder.end_encoding().unwrap();
+    }
+    command.commit().unwrap();
+    command.wait_until_completed().unwrap();
+
+    // One entry, at index 3, with the texture's own identity: the index is the
+    // caller's own statement rather than the entry's position, which is what
+    // lets the trace pair it with the pipeline's declaration.
+    let textures = provider.last_render_textures();
+    assert_eq!(textures.len(), 1, "one fragment texture reaches the trace");
+    assert_eq!(textures[0].metal_binding, 3);
+    assert_eq!(textures[0].view_id, sampled.view_id());
+
+    // The other direction of the pairing stays the contract's own: the same
+    // recording under a registration that declares nothing at index 3 is the
+    // core pair rule's refusal rather than a bound slot the module never named.
+    let undeclared = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
+    let device = Device::new(undeclared.clone());
+    let declaring = device.compile_pipeline(request("declare")).unwrap();
+    let dense = render_metadata_with_fragment_texture(&undeclared);
+    undeclared
+        .pipelines
+        .lock()
+        .unwrap()
+        .insert(dense.pipeline_id);
+    let dense = device.render_pipeline(&dense).unwrap();
+    let attachment = device.new_buffer_with_bytes(vec![0xfe; 64]).unwrap();
+    let attachment_view = attachment.view(0, 64).unwrap();
+    let sampled = device
+        .new_texture_with_bytes(
+            TextureFormat::Rgba8Unorm,
+            4,
+            4,
+            (0..4u8)
+                .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let command = device.new_command_queue().command_buffer();
+    {
+        let mut encoder = command.compute_command_encoder().unwrap();
+        encoder.set_compute_pipeline_state(&declaring).unwrap();
+        encoder.set_buffer(0, &attachment_view).unwrap();
+        dispatch(&mut encoder).unwrap();
+        encoder.end_encoding().unwrap();
+    }
+    {
+        let mut encoder = command.render_command_encoder().unwrap();
+        encoder.set_render_pipeline_state(&dense).unwrap();
+        encoder.set_fragment_texture(3, &sampled).unwrap();
+        encoder
+            .draw_render_pass(
+                &attachment_view,
+                AttachmentFormat::Rgba8Unorm,
+                4,
+                4,
+                RenderAttachmentLoad::Clear([0xfe; 4]),
+                None,
+            )
+            .expect_err("the registration declares index 0, not 3");
+    }
 }
 
 /// The render metadata one stage-buffer case's pipeline carries

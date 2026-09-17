@@ -2946,6 +2946,12 @@ fn put_render_pass(
 /// (`research/docs/23` §3.3, v70): a `u8` count and that many full
 /// [`TextureView`]s, source bytes and all.
 ///
+/// Each entry travels as a full [`TextureView`] for the same reason a stage
+/// buffer does: the view's own `metal_binding` is the fragment stage's
+/// `[[texture(n)]]` argument (`v104`), so the index travels with the entry
+/// rather than being implied by its position — a list that skips an index keeps
+/// its own bytes and a dense list keeps exactly the bytes it always had.
+///
 /// The count is bound here the way the decoder bounds it: a pass that binds
 /// more textures than [`MAX_RENDER_TEXTURES`] is refused before a single view
 /// is written, so a refused frame never carries a partial block.

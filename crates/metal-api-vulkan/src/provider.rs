@@ -206,8 +206,9 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // rail's shape gates rather than silently narrowed. The binding count
         // is the contract's own ceiling (`research/docs/23` §3.3, v102): a
         // *translated* fragment stage samples as many textures as its
-        // reflection names, so the rail declares the list's cap, while the
-        // reviewed pair's one-texture window is refused at registration and at
+        // reflection names, wherever its own `[[texture(n)]]` arguments sit
+        // (`v104`), so the rail declares the list's cap, while the reviewed
+        // pair's one-texture window — index zero included — is refused at
         // execution by name (`render_texture_stage_unsupported`).
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
