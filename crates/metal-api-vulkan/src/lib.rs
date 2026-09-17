@@ -37,8 +37,9 @@ mod render;
 
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
-    VulkanComputeProvider,
+    TranslatedRenderPipelineRequest, VulkanComputeProvider,
 };
+pub use render::RenderStage;
 
 const FENCE_TIMEOUT_NS: u64 = 20_000_000_000;
 const MAX_SERIAL_DISPATCHES: usize = 8;
@@ -575,6 +576,108 @@ impl TranslatedComputePipeline {
         translator_revision: Option<SemanticDigest>,
     ) -> Result<PipelineContract, ExecutorError> {
         provider::pipeline_contract(&self.reflection, translator_revision)
+    }
+}
+
+/// One translated render stage: the SPIR-V module and the reflection of the AIR
+/// it came from.
+///
+/// [`TranslatedComputePipeline`] is this value's compute sibling. Both run the
+/// same translator over the same narrow input set (sanitized LLVM IR or one raw
+/// or offset-zero-wrapped AIR module), but they answer different questions: a
+/// compute pipeline owns the dispatch contract, while a render stage is one half
+/// of a graphics pipeline, so it is checked against a host's
+/// [`RenderPipelineContract`](metal_api_core::provider::RenderPipelineContract)
+/// when the pair is registered
+/// ([`VulkanComputeProvider::register_translated_render_pipeline`]).
+///
+/// The stage the caller names is the one the translator is asked for
+/// ([`RenderStage`]), not the one the AIR happens to declare: a stage whose
+/// reflection reports a different one is refused here, at translation, instead
+/// of reaching a registration that would describe it wrongly.
+pub struct TranslatedRenderStage {
+    pub(crate) stage: RenderStage,
+    pub(crate) spirv: Vec<u8>,
+    pub(crate) reflection: ShaderReflection,
+}
+
+impl TranslatedRenderStage {
+    /// Translate one render stage from `function`'s AIR.
+    ///
+    /// `stage` names the stage to translate; `function` carries the module's
+    /// AIR and the entry name the pipeline table reports. The returned module is
+    /// validated for the SPIR-V capabilities this rail enables, exactly as the
+    /// compute path is, so a module this provider could not create is refused
+    /// before it reaches a registration.
+    pub fn translate(stage: RenderStage, function: &Function) -> Result<Self, ExecutorError> {
+        // The kernel options do not apply to a graphics stage: `TransformOptions`
+        // defaults carry the API's own defaults (amplification 1, no sampled
+        // raster count, no specialized sampler), and the render rail supplies
+        // its pipeline state itself.
+        let options = TransformOptions::default();
+        let scratch = ScratchDir::new()?;
+        let translated = match function.air_source() {
+            AirSource::SanitizedLl(source) => metal2vulkan::translate_sanitized_native_reflected(
+                source,
+                stage.translator_stage(),
+                scratch.path(),
+                options,
+            ),
+            AirSource::Binary(source) => {
+                let input = scratch.path().join("input.air");
+                std::fs::write(&input, source).map_err(|error| {
+                    failure(format!(
+                        "write binary AIR scratch {}: {error}",
+                        input.display()
+                    ))
+                })?;
+                let input = input
+                    .to_str()
+                    .ok_or_else(|| failure("binary AIR scratch path is not valid UTF-8"))?;
+                metal2vulkan::translate_reflected_with_options(
+                    input,
+                    stage.translator_stage(),
+                    scratch.path(),
+                    options,
+                )
+            }
+        };
+        let (spirv, reflection) = translated.map_err(|error| {
+            failure(format!(
+                "translate {} {}: {error}",
+                stage.name(),
+                function.name()
+            ))
+        })?;
+        validate_spirv_capabilities(&spirv)?;
+        if reflection.stage != stage.reflected_stage() {
+            return Err(failure(format!(
+                "translate {} {}: the reflection reports stage {:?}",
+                stage.name(),
+                function.name(),
+                reflection.stage
+            )));
+        }
+        Ok(Self {
+            stage,
+            spirv,
+            reflection,
+        })
+    }
+
+    /// The stage this module was translated for.
+    pub const fn stage(&self) -> RenderStage {
+        self.stage
+    }
+
+    /// The translated SPIR-V module.
+    pub fn spirv(&self) -> &[u8] {
+        &self.spirv
+    }
+
+    /// The reflection of the AIR the module was translated from.
+    pub fn reflection(&self) -> &ShaderReflection {
+        &self.reflection
     }
 }
 

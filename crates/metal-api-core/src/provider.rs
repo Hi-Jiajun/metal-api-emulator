@@ -6307,10 +6307,13 @@ pub struct ProviderCapabilities {
     pub host_readback: bool,
     pub submit_only: bool,
     /// Whether this snapshot can execute the render pass shape of
-    /// `research/docs/23`. Defaults to `false` everywhere: neither the Vulkan
-    /// nor the native provider executes graphics work today, so a
-    /// render-bearing trace is refused during admission instead of being
-    /// silently downgraded.
+    /// `research/docs/23`. Defaults to `false`, which keeps a render-bearing
+    /// trace out of a snapshot whose rail does not execute graphics work:
+    /// admission refuses it instead of downgrading it silently. Both rails that
+    /// publish `true` execute the pass — the Vulkan rail in `render.rs`
+    /// (offscreen, depth/stencil, multisample and present shapes), the native
+    /// rail in `metal-api-native/src/render.rs` — and each declares the subset
+    /// it covers through the capability fields below.
     pub supports_render_passes: bool,
     /// Colour attachment slots the render track may address. `0` means the
     /// snapshot cannot render at all; the first render increment caps this at
