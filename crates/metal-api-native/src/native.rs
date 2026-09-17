@@ -3006,6 +3006,10 @@ mod tests {
         declared: BufferView,
         attachment_size: u64,
     ) -> (ComputeTrace, ResourceTableSnapshot) {
+        // Both ids are copied before the trace takes ownership of the view
+        // (`BufferView` is not `Copy`), so the snapshot below can still name the
+        // caller's own identity.
+        let declared_allocation = declared.allocation_id;
         let trace = ComputeTrace {
             schema_version: PROVIDER_SCHEMA_VERSION,
             device_epoch: provider.device_epoch(),
@@ -3034,6 +3038,22 @@ mod tests {
                     size,
                 })
                 .expect("the fixture's allocation");
+        }
+        // The budget test mints one fresh identity per seeding pass
+        // (`AllocationId::new(100 + index)`), so the caller's own declared
+        // attachment has to reach the snapshot too. Without a device this test
+        // returns before its loop and the omission is invisible; with one, the
+        // first seeding pass is refused as `unknown allocation`. `resident_trace`
+        // is the fixture's single registration point, so the declared identity
+        // joins the fixed four here.
+        if resources.allocation(declared_allocation).is_none() {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: declared_allocation,
+                    owner_epoch: provider.device_epoch(),
+                    size: attachment_size,
+                })
+                .expect("the fixture's declared allocation");
         }
         (trace, resources)
     }
