@@ -3787,8 +3787,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             allocation: attachment.allocation, view: attachment.view,
             width: attachment.width, height: attachment.height,
             load: attachment.load, store: attachment.store,
-            clearComponents: clearComponents, initial: initial, expected: expected,
-            seedComponents: seedComponents,
+            clearComponents: clearComponents, initial: initial,
+            seedComponents: seedComponents, expected: expected,
             wildcardBytes: wildcardBytes, allowedBytes: allowedBytes,
             pixelFormat: pixelFormat, rule: validatedRule))
     }
