@@ -409,6 +409,47 @@ impl Device {
         height: u64,
         bytes: Vec<u8>,
     ) -> Result<Texture, Error> {
+        self.new_texture(
+            contract::TextureAccess::Sampled,
+            format,
+            width,
+            height,
+            bytes,
+        )
+    }
+
+    /// Declare one storage texture — the object a kernel's
+    /// `texture2d<float, access::write|read_write>` argument binds — with its
+    /// initial contents. The shape validation is the sampled constructor's;
+    /// what changes is the access the handle's views carry and the fact that
+    /// the bytes are a landing rather than a read-only source
+    /// (`research/docs/26` §21.4, C2): when a command that names this texture
+    /// completes, its whole tightly packed extent is written back into the
+    /// handle, and [`Texture::read`] observes those bytes.
+    pub fn new_storage_texture_with_bytes(
+        &self,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
+        self.new_texture(
+            contract::TextureAccess::Storage,
+            format,
+            width,
+            height,
+            bytes,
+        )
+    }
+
+    fn new_texture(
+        &self,
+        access: contract::TextureAccess,
+        format: contract::TextureFormat,
+        width: u64,
+        height: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Texture, Error> {
         if width == 0 || height == 0 {
             return Err(ApiError::ZeroSize.into());
         }
@@ -435,7 +476,11 @@ impl Device {
                 format,
                 width,
                 height,
-                bytes,
+                length: bytes.len(),
+                access,
+                bytes: Mutex::new(bytes),
+                reservations: Mutex::new(Vec::new()),
+                available: Condvar::new(),
             }),
         })
     }
@@ -1074,9 +1119,12 @@ struct BufferInner {
     available: Condvar,
 }
 
-/// One sampled texture declared through the object API. The snapshot is the
-/// owned bytes captured at declaration time; the provider uploads them once per
-/// submission (`research/docs/16` §4.7).
+/// One texture declared through the object API. The bytes are the snapshot the
+/// provider uploads; a storage texture's handle is also the landing a completed
+/// command writes back into (`research/docs/26` §21.4, C2), exactly as a
+/// `Buffer`'s bytes are its landing. The whole texture is one in-flight
+/// reservation unit (`research/docs/16` §2), so a landing cannot interleave
+/// with CPU access or with a sibling command that names the same texture.
 struct TextureInner {
     owner: Arc<DeviceState>,
     allocation_id: AllocationId,
@@ -1084,10 +1132,16 @@ struct TextureInner {
     format: contract::TextureFormat,
     width: u64,
     height: u64,
-    bytes: Vec<u8>,
+    length: usize,
+    access: contract::TextureAccess,
+    bytes: Mutex<Vec<u8>>,
+    reservations: Mutex<Vec<RangeHold>>,
+    available: Condvar,
 }
 
-/// A sampled texture handle. Clone is cheap and shares the same allocation.
+/// A texture handle: a sampled texture is a read-only source, and a storage
+/// texture a compute write target whose completion updates this handle's own
+/// bytes. Clone is cheap and shares the same allocation.
 #[derive(Clone)]
 pub struct Texture {
     inner: Arc<TextureInner>,
@@ -1110,9 +1164,83 @@ impl Texture {
         (self.inner.width, self.inner.height)
     }
 
+    /// The access every view this handle declares carries: `Sampled` for a
+    /// texture declared through [`Device::new_texture_with_bytes`], `Storage`
+    /// for one declared through [`Device::new_storage_texture_with_bytes`].
+    pub fn access(&self) -> contract::TextureAccess {
+        self.inner.access
+    }
+
+    /// The bytes this texture currently holds: its declared initial contents
+    /// until a completed storage landing replaces them, exactly as
+    /// [`Buffer::read`] observes a buffer writeback. Waits while an in-flight
+    /// command holds a conflicting access (a read waits only on a writer), so a
+    /// caller never observes half a landing.
+    pub fn read(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.lock_unreserved(false)?.clone())
+    }
+
+    /// Wait until no in-flight reservation conflicts with the whole texture,
+    /// then hold the bytes. `Buffer::lock_unreserved`'s whole-resource sibling:
+    /// the first increment reserves the whole texture, so the recheck is the
+    /// same read-read-allowed rule on one `[0, length)` range.
+    fn lock_unreserved(&self, write: bool) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
+        let end = self.inner.length;
+        loop {
+            let mut reservations = lock(&self.inner.reservations, "provider texture reservation")?;
+            while ranges_conflict(&reservations, 0, end, write) {
+                reservations = self
+                    .inner
+                    .available
+                    .wait(reservations)
+                    .map_err(|_| ApiError::StatePoisoned("provider texture reservation"))?;
+            }
+            drop(reservations);
+            let bytes = lock(&self.inner.bytes, "provider texture")?;
+            let clear = !ranges_conflict(
+                &lock(&self.inner.reservations, "provider texture reservation")?,
+                0,
+                end,
+                write,
+            );
+            if clear {
+                return Ok(bytes);
+            }
+            drop(bytes);
+        }
+    }
+
+    /// Register the whole texture against one submission, waiting while any
+    /// in-flight command holds a conflicting access. A sampled texture is a
+    /// read; a storage texture is the write its landing performs, so two
+    /// storage commands naming one texture serialize instead of interleaving.
+    fn reserve(&self) -> Result<TextureReservation, Error> {
+        let identity = next_id()?;
+        let write = self.inner.access == contract::TextureAccess::Storage;
+        let end = self.inner.length;
+        let mut reservations = lock(&self.inner.reservations, "provider texture reservation")?;
+        while ranges_conflict(&reservations, 0, end, write) {
+            reservations = self
+                .inner
+                .available
+                .wait(reservations)
+                .map_err(|_| ApiError::StatePoisoned("provider texture reservation"))?;
+        }
+        reservations.push(RangeHold {
+            reservation: identity,
+            start: 0,
+            end,
+            write,
+        });
+        Ok(TextureReservation {
+            inner: Arc::clone(&self.inner),
+            identity,
+        })
+    }
+
     /// The contract view for one binding, mirroring `BufferView`'s snapshot.
-    fn view(&self, metal_binding: u32) -> contract::TextureView {
-        contract::TextureView {
+    fn view(&self, metal_binding: u32) -> Result<contract::TextureView, Error> {
+        Ok(contract::TextureView {
             view_id: self.inner.view_id,
             metal_binding,
             allocation_id: self.inner.allocation_id,
@@ -1123,9 +1251,43 @@ impl Texture {
             depth: 1,
             array_length: 1,
             sample_count: 1,
-            access: contract::TextureAccess::Sampled,
-            source: contract::TextureSource::OwnedBytes(self.inner.bytes.clone()),
+            access: self.inner.access,
+            source: contract::TextureSource::OwnedBytes(
+                lock(&self.inner.bytes, "provider texture")?.clone(),
+            ),
+        })
+    }
+}
+
+/// Commit-through-completion reservation for one whole texture.
+/// [`BufferReservation`]'s sibling: the guard is held from the commit-time
+/// snapshot through the landing, and dropping it wakes CPU readers and sibling
+/// commands even when a pending command is abandoned.
+struct TextureReservation {
+    inner: Arc<TextureInner>,
+    identity: u64,
+}
+impl TextureReservation {
+    fn allocation_id(&self) -> AllocationId {
+        self.inner.allocation_id
+    }
+    fn view_id(&self) -> ViewId {
+        self.inner.view_id
+    }
+    fn lock_bytes(&self) -> Result<MutexGuard<'_, Vec<u8>>, Error> {
+        lock(&self.inner.bytes, "provider texture")
+    }
+}
+impl Drop for TextureReservation {
+    fn drop(&mut self) {
+        fn release(holds: &mut Vec<RangeHold>, identity: u64) {
+            holds.retain(|hold| hold.reservation != identity);
         }
+        match self.inner.reservations.lock() {
+            Ok(mut reservations) => release(&mut reservations, self.identity),
+            Err(poisoned) => release(&mut poisoned.into_inner(), self.identity),
+        }
+        self.inner.available.notify_all();
     }
 }
 
@@ -1421,10 +1583,42 @@ fn reserve_buffers(passes: &[RecordedPass]) -> Result<Vec<BufferReservation>, Er
         .collect()
 }
 
+/// Reserve every texture a command touches, in identity order.
+///
+/// One range per texture — the whole resource (`research/docs/16` §2) — with
+/// the access the object itself declares: a sampled texture is a read and a
+/// storage texture the write its landing performs. Identity order is the same
+/// cycle guard `reserve_buffers` uses: two commands naming overlapping textures
+/// take their holds in one order, so neither can wait on the other's hold.
+fn reserve_textures(textures: &[Texture]) -> Result<Vec<TextureReservation>, Error> {
+    let mut ordered = textures.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|texture| texture.allocation_id());
+    let mut reservations = Vec::with_capacity(ordered.len());
+    for texture in ordered {
+        reservations.push(texture.reserve()?);
+    }
+    Ok(reservations)
+}
+
+/// Everything one commit holds in flight until its landing: the byte ranges of
+/// the buffers it touches and the whole-resource holds of the textures it
+/// names. One value keeps both halves together through the deferred completion,
+/// so a storage image's writeback lands under the same guards a buffer's does
+/// (`research/docs/26` §21.4, C2).
+struct CommandReservations {
+    buffers: Vec<BufferReservation>,
+    textures: Vec<TextureReservation>,
+}
+
 /// Validate every writeback range before copying any host byte, then land all
-/// of them under the reservations held by the caller.
+/// of them under the reservations held by the caller: buffer ranges land in the
+/// buffer's own bytes, and a storage image lands its whole tightly packed extent
+/// in the texture's bytes (`research/docs/26` §21.4, C2). Both are the same
+/// identity-keyed channel; the identity decides the target, and an identity no
+/// reservation holds is refused by name rather than dropped.
 fn apply_writebacks(
     reservations: &[BufferReservation],
+    textures: &[TextureReservation],
     writebacks: &[BufferWriteback],
 ) -> Result<(), Error> {
     if writebacks.is_empty() {
@@ -1436,10 +1630,42 @@ fn apply_writebacks(
         .map(|(position, reservation)| (reservation.allocation_id(), position))
         .collect::<BTreeMap<_, _>>();
     let mut writes = Vec::with_capacity(writebacks.len());
+    let mut texture_writes = Vec::new();
     for writeback in writebacks {
-        let position = *positions
-            .get(&writeback.allocation_id)
-            .ok_or(ContractError::UnknownAllocation(writeback.allocation_id))?;
+        let Some(position) = positions.get(&writeback.allocation_id) else {
+            // A texture identity keys the second target: core admission has
+            // already refused an unknown identity, a read-only texture, a short
+            // landing and an offset landing against the trace, so this arm
+            // rechecks the shape of the one target kind left.
+            let texture = textures
+                .iter()
+                .find(|texture| {
+                    texture.allocation_id() == writeback.allocation_id
+                        && texture.view_id() == writeback.view_id
+                })
+                .ok_or(ContractError::UnknownWriteback {
+                    allocation: writeback.allocation_id,
+                    view: writeback.view_id,
+                })?;
+            if writeback.offset != 0 {
+                return Err(ContractError::WritebackRangeOutOfBounds {
+                    view: writeback.view_id,
+                    offset: writeback.offset,
+                    end: writeback
+                        .offset
+                        .saturating_add(writeback.bytes.len() as u64),
+                    view_offset: 0,
+                    view_end: texture.inner.length as u64,
+                }
+                .into());
+            }
+            if writeback.bytes.len() != texture.inner.length {
+                return Err(ContractError::IncompleteWriteback(writeback.view_id).into());
+            }
+            texture_writes.push((texture, &writeback.bytes));
+            continue;
+        };
+        let position = *position;
         let offset = usize::try_from(writeback.offset)
             .map_err(|_| ContractError::ArithmeticOverflow("writeback offset"))?;
         let end = checked_range(
@@ -1455,6 +1681,9 @@ fn apply_writebacks(
     }
     for (position, offset, end, bytes) in writes {
         guards[position][offset..end].copy_from_slice(bytes);
+    }
+    for (texture, bytes) in texture_writes {
+        texture.lock_bytes()?.copy_from_slice(bytes);
     }
     Ok(())
 }
@@ -1702,7 +1931,7 @@ struct CommandInner {
 struct PendingCompletion {
     token: CompletionToken,
     trace: ComputeTrace,
-    reservations: Vec<BufferReservation>,
+    reservations: CommandReservations,
 }
 
 enum ExecutionOutcome {
@@ -1835,8 +2064,11 @@ impl CommandBuffer {
         };
         let mut token = None;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let reservations = reserve_buffers(&passes)?;
             let textures = collect_textures(&passes);
+            let reservations = CommandReservations {
+                buffers: reserve_buffers(&passes)?,
+                textures: reserve_textures(&textures)?,
+            };
             self.execute(&passes, reservations, textures, heap, indirect, &mut token)
         }))
         .unwrap_or(Err(Error::ProviderPanicked));
@@ -1934,7 +2166,7 @@ impl CommandBuffer {
     fn execute(
         &self,
         passes: &[RecordedPass],
-        reservations: Vec<BufferReservation>,
+        reservations: CommandReservations,
         textures: Vec<Texture>,
         heap: Option<Heap>,
         indirect: Option<IndirectCommandBuffer>,
@@ -1943,7 +2175,7 @@ impl CommandBuffer {
         let owner = &self.shared.owner;
         let mut positions = BTreeMap::new();
         let mut resources = ResourceTableSnapshot::new();
-        for (position, reservation) in reservations.iter().enumerate() {
+        for (position, reservation) in reservations.buffers.iter().enumerate() {
             positions.insert(reservation.allocation_id(), position);
             resources.insert_allocation(AllocationRecord {
                 allocation_id: reservation.allocation_id(),
@@ -1955,7 +2187,7 @@ impl CommandBuffer {
             resources.insert_allocation(AllocationRecord {
                 allocation_id: texture.inner.allocation_id,
                 owner_epoch: owner.epoch,
-                size: u64::try_from(texture.inner.bytes.len()).unwrap_or(u64::MAX),
+                size: u64::try_from(texture.inner.length).unwrap_or(u64::MAX),
             })?;
         }
         // The host bytes must stay stable only while the trace snapshots them:
@@ -1966,8 +2198,8 @@ impl CommandBuffer {
         // guards before `submit` cannot admit a conflicting CPU write. It does
         // let a sibling command with a disjoint range of the same allocation
         // take its own snapshot while this one is still inside `submit`.
-        let mut guards = Vec::with_capacity(reservations.len());
-        for reservation in &reservations {
+        let mut guards = Vec::with_capacity(reservations.buffers.len());
+        for reservation in &reservations.buffers {
             guards.push(reservation.lock_bytes()?);
         }
         let mut pipelines = BTreeMap::<PipelineId, CompiledComputePipeline>::new();
@@ -2016,7 +2248,7 @@ impl CommandBuffer {
                         textures: textures
                             .iter()
                             .map(|(binding, texture)| texture.view(*binding))
-                            .collect(),
+                            .collect::<Result<Vec<_>, _>>()?,
                     }));
                 }
                 RecordedPass::Render { pipeline, target } => {
@@ -2080,7 +2312,11 @@ impl CommandBuffer {
                 if observed != submission.completion {
                     return Err(Error::CompletionObservationMismatch);
                 }
-                apply_writebacks(&reservations, &submission.writebacks)?;
+                apply_writebacks(
+                    &reservations.buffers,
+                    &reservations.textures,
+                    &submission.writebacks,
+                )?;
                 Ok(ExecutionOutcome::Completed(submission))
             }
             CompletionDisposition::Submitted { token: submitted } => {
@@ -2176,7 +2412,11 @@ impl CommandBuffer {
             CompletionDisposition::CompletedVisible { token } if token == pending.token => {}
             _ => return Err(Error::CompletionObservationMismatch),
         }
-        apply_writebacks(&pending.reservations, &readback.writebacks)?;
+        apply_writebacks(
+            &pending.reservations.buffers,
+            &pending.reservations.textures,
+            &readback.writebacks,
+        )?;
         Ok(ProviderSubmission {
             completion: readback.completion,
             writebacks: readback.writebacks,
@@ -2276,6 +2516,32 @@ impl ComputeCommandEncoder {
                 return Err(ContractError::UnknownBinding(*binding).into());
             }
         }
+        // The texture face gets the same two directions the buffer face does,
+        // at the same recorder boundary (`research/docs/26` §21.3, step 1): a
+        // declaration the pass never bound would leave a descriptor the module
+        // reads undefined, and a bound texture the declaration never named
+        // would fill a slot the module said nothing about. Access, shape and
+        // format stay with the pass's own admission, exactly as buffer access
+        // does.
+        for slot in &pipeline.metadata().contract.texture_bindings {
+            if !self.textures.contains_key(&slot.metal_binding) {
+                return Err(ContractError::MissingTextureBinding {
+                    binding: slot.metal_binding,
+                }
+                .into());
+            }
+        }
+        for binding in self.textures.keys() {
+            if !pipeline
+                .metadata()
+                .contract
+                .texture_bindings
+                .iter()
+                .any(|slot| slot.metal_binding == *binding)
+            {
+                return Err(ContractError::UndeclaredTextureBinding { binding: *binding }.into());
+            }
+        }
         let mut inner = lock(&self.shared.inner, "provider command")?;
         let maximum = usize::try_from(self.shared.owner.capabilities.max_passes)
             .unwrap_or(usize::MAX)
@@ -2348,6 +2614,27 @@ impl ComputeCommandEncoder {
                 .any(|slot| slot.metal_binding == *binding)
             {
                 return Err(ContractError::UnknownBinding(*binding).into());
+            }
+        }
+        // The indirect replay's binding table is the encoder's, exactly as a
+        // direct dispatch's is, so the texture face is paired here too.
+        for slot in &pipeline.metadata().contract.texture_bindings {
+            if !self.textures.contains_key(&slot.metal_binding) {
+                return Err(ContractError::MissingTextureBinding {
+                    binding: slot.metal_binding,
+                }
+                .into());
+            }
+        }
+        for binding in self.textures.keys() {
+            if !pipeline
+                .metadata()
+                .contract
+                .texture_bindings
+                .iter()
+                .any(|slot| slot.metal_binding == *binding)
+            {
+                return Err(ContractError::UndeclaredTextureBinding { binding: *binding }.into());
             }
         }
         let mut inner = lock(&self.shared.inner, "provider command")?;
@@ -4017,7 +4304,7 @@ impl RenderCommandEncoder {
                 .fragment_textures
                 .iter()
                 .map(|(binding, texture)| texture.view(*binding))
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             present,
             draw,
         };

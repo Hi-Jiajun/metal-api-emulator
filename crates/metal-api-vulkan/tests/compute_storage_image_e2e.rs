@@ -451,13 +451,13 @@ fn the_deferred_completion_path_publishes_the_storage_image_landing() {
 }
 
 #[test]
-fn the_object_api_still_names_a_storage_image_outside_its_texture_face() {
-    // The object model's `Texture` is the sampled face (`research/docs/16`
-    // §4.4): `set_texture` declares the view as `Sampled`, so a pass naming a
-    // storage-image pipeline is refused by the core pair rule with the binding
-    // and both accesses. The storage image executes through the trace/writeback
-    // channel the reading above uses; the object face keeps its read-only
-    // boundary instead of binding a descriptor the object never declared.
+fn a_sampled_object_against_a_storage_declaration_is_refused_by_name() {
+    // The object face carries the storage image on both rails from E-CO1 on
+    // (`tests/compute_object_texture_e2e.rs`), but the mistake this test names
+    // stays expressible: a `new_texture_with_bytes` handle is `Sampled`
+    // (`research/docs/16` §4.4), so pairing it with a storage-image pipeline is
+    // still refused by the core pair rule with the binding and both accesses
+    // instead of binding a read-only descriptor to a writable module.
     let Some(executor) = executor() else {
         return;
     };
