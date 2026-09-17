@@ -12157,12 +12157,14 @@ mod tests {
     }
 
     /// The stage-buffer marker rule the capability flip moved
-    /// (`research/docs/23` §83, R9g/R9k): the reviewed pair may name the two
-    /// native trace rails beside the Vulkan one, because both of them compile
-    /// and bind the module it pins, while the translated pair stays on the one
-    /// rail that translates its AIR. Neither arm may name an object rail, which
-    /// binds no stage buffer at all, and an unnamed rail would let a capture
-    /// drop the bindings rather than refuse the case.
+    /// (`research/docs/23` §83, R9g/R9k; §87, the object entry point): the
+    /// reviewed pair may name the two native trace rails beside the Vulkan one,
+    /// because both of them compile and bind the module it pins, while the
+    /// translated pair stays on the rails that translate its AIR. The object
+    /// rails bind the slots through the object API's own entry point, so a
+    /// marker that names them stays valid too; a marker naming a rail outside
+    /// the arm's list would let a capture drop the bindings rather than refuse
+    /// the case.
     #[test]
     fn the_stage_buffer_marker_names_the_rails_that_bind_its_slots() {
         let suite: Suite =
@@ -12181,17 +12183,13 @@ mod tests {
         validate_render_case(&suite, case("stage_buffer_write_affine_2x2"))
             .expect("the translated pair keeps the rail that translates its AIR");
 
-        // An object rail binds no stage buffer, so naming one is refused even
-        // beside the rails that do.
+        // The object rails bind the same slots through the object API's own
+        // entry point (`research/docs/23` §3.3, v87), so naming one beside the
+        // rails that already do stays valid.
         let mut object = case("stage_buffer_borrowed_tint_2x2").clone();
         object.capture_rails = vec!["vulkan".to_owned(), "vulkan-objects".to_owned()];
-        let refused = validate_render_case(&suite, &object).unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("runs on the rails that bind its slots"),
-            "unexpected refusal: {refused}"
-        );
+        validate_render_case(&suite, &object)
+            .expect("the object rails bind the slots this case declares");
 
         // A translated pair's AIR is only executable on the rail that
         // translates it, so a native rail named beside the Vulkan one is
