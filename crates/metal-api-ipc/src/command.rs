@@ -1417,7 +1417,7 @@ mod tests {
     use metal_api_core::provider::{
         AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment,
         BlendFactor, BlendOperation, BufferAccess, BufferBindingContract, BufferLease,
-        BufferSource, BufferView, BufferWriteback, ClearColor, CompareFunction,
+        BufferSource, BufferView, BufferWriteback, ClearColor, ColorWriteMask, CompareFunction,
         CompiledComputePipeline, CompletionDisposition, CompletionPolicy, CompletionReadback,
         CompletionToken, ComputePass, ComputeProvider, ComputeTrace, CullMode, DepthFormat,
         DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
@@ -3084,11 +3084,14 @@ mod tests {
         };
         pass.blend = Some(RenderPassBlend {
             attachments: vec![BlendAttachment {
+                enabled: true,
                 source_rgb: BlendFactor::SourceAlpha,
                 destination_rgb: BlendFactor::OneMinusSourceAlpha,
                 source_alpha: BlendFactor::SourceAlpha,
                 destination_alpha: BlendFactor::OneMinusSourceAlpha,
                 operation: BlendOperation::Add,
+                alpha_operation: BlendOperation::Add,
+                write_mask: ColorWriteMask::ALL,
             }],
         });
         trace
@@ -3119,6 +3122,67 @@ mod tests {
             "the plain pass keeps the vertex-only feature byte"
         );
         assert!(!plain_frame.windows(2).any(|pair| pair == [0x10, 0x81]));
+    }
+
+    /// The v40 blend section is five bytes per entry — the four factor codes
+    /// and one operation — for an entry that blends with every channel written
+    /// (`research/docs/23` §3.3, v40/v100). A pass that states one of the later
+    /// fields has no position in those bytes, so the encoder refuses it by name
+    /// rather than framing a state the receiver would read as the v40 shape.
+    #[test]
+    fn a_blend_state_the_v40_section_cannot_carry_is_refused_by_name() {
+        fn disabled(attachment: &mut BlendAttachment) {
+            attachment.enabled = false;
+        }
+        fn own_alpha_operation(attachment: &mut BlendAttachment) {
+            attachment.alpha_operation = BlendOperation::Subtract;
+        }
+        fn masked(attachment: &mut BlendAttachment) {
+            attachment.write_mask = ColorWriteMask::RED;
+        }
+        type Reshape = fn(&mut BlendAttachment);
+        let cases: [(Reshape, &str); 3] = [
+            (disabled, "blendingEnabled = false"),
+            (own_alpha_operation, "an alpha operation of its own"),
+            (masked, "a colour write mask"),
+        ];
+        for (reshape, field) in cases {
+            let mut trace = blend_trace();
+            let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+                panic!("the fixture is a render pass");
+            };
+            let blend = pass
+                .blend
+                .as_mut()
+                .expect("the fixture states one blend entry");
+            reshape(&mut blend.attachments[0]);
+            let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+                trace,
+                resources: resources(),
+            })
+            .expect_err("the v40 section cannot carry the state");
+            eprintln!("refused: {refused}");
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "colour attachment 0's blend state states {field}, which the v40 blend \
+                     section cannot carry"
+                )
+            );
+            // And the shape the section *can* carry still frames.
+            let carried = CommandCodec::encode_request(&CommandRequest::Submit {
+                trace: blend_trace(),
+                resources: resources(),
+            })
+            .expect("the v40 shape frames");
+            assert_eq!(
+                CommandCodec::decode_request(&carried).unwrap(),
+                CommandRequest::Submit {
+                    trace: blend_trace(),
+                    resources: resources(),
+                }
+            );
+        }
     }
 
     /// A render trace whose pass opens the rail-owned depth attachment in the
@@ -3823,11 +3887,14 @@ mod tests {
         };
         pass.blend = Some(RenderPassBlend {
             attachments: vec![BlendAttachment {
+                enabled: true,
                 source_rgb: BlendFactor::SourceAlpha,
                 destination_rgb: BlendFactor::OneMinusSourceAlpha,
                 source_alpha: BlendFactor::SourceAlpha,
                 destination_alpha: BlendFactor::OneMinusSourceAlpha,
                 operation: BlendOperation::Add,
+                alpha_operation: BlendOperation::Add,
+                write_mask: ColorWriteMask::ALL,
             }],
         });
         let request = CommandRequest::Submit {

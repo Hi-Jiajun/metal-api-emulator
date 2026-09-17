@@ -13,12 +13,12 @@ use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AliasMode, AllocationId, AllocationRecord,
     AttachmentFormat, BlendAttachment, BlendFactor, BlendOperation, BufferAccess,
     BufferBindingContract, BufferLease, BufferSource, BufferView, BufferWriteback, ClearColor,
-    CompareFunction, CompiledComputePipeline, CompletionDisposition, CompletionPolicy,
-    CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode, DepthFormat,
-    DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind,
-    DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource, HeapDescriptor,
-    HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding, IndexFormat,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    ColorWriteMask, CompareFunction, CompiledComputePipeline, CompletionDisposition,
+    CompletionPolicy, CompletionReadback, CompletionToken, ComputePass, ComputeTrace, CullMode,
+    DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch,
+    DispatchKind, DispatchType, FieldValue, FootprintProof, FunctionIdentity, FunctionSource,
+    HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource, IndexBufferBinding,
+    IndexFormat, IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
     IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseReservation, LoadOp,
     MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
     PipelineCompileRequest, PipelineContract, PipelineId, PresentDescriptor, PresentMode,
@@ -2847,7 +2847,26 @@ fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecErr
                     }
                     if let Some(blend) = &pass.blend {
                         encoder.u64(blend.attachments.len() as u64);
-                        for attachment in &blend.attachments {
+                        for (location, attachment) in blend.attachments.iter().enumerate() {
+                            // The v40 section is five bytes per entry: the four
+                            // factor codes and one operation code, for an entry
+                            // that blends with every channel written
+                            // (`research/docs/23` §3.3, v100). A pass that
+                            // states the later fields is refused by name here
+                            // rather than framed as the v40 shape it is not.
+                            if !attachment.is_v40_shape() {
+                                let field = if !attachment.enabled {
+                                    "blendingEnabled = false"
+                                } else if attachment.alpha_operation != attachment.operation {
+                                    "an alpha operation of its own"
+                                } else {
+                                    "a colour write mask"
+                                };
+                                return Err(CodecError::RenderBlendStateUnsupported {
+                                    location,
+                                    field,
+                                });
+                            }
                             encoder.u8(attachment.source_rgb.code());
                             encoder.u8(attachment.destination_rgb.code());
                             encoder.u8(attachment.source_alpha.code());
@@ -3744,11 +3763,19 @@ fn get_render_ext_sections(
                     value: 0,
                 })?;
             attachments.push(BlendAttachment {
+                // The section is the v40 shape, so every frame it carries
+                // decodes as blending enabled with one operation for both
+                // channel pairs and every channel written
+                // (`research/docs/23` §3.3, v40/v100); the later fields travel
+                // with their own section when the wire carries them.
+                enabled: true,
                 source_rgb,
                 destination_rgb,
                 source_alpha,
                 destination_alpha,
                 operation,
+                alpha_operation: operation,
+                write_mask: ColorWriteMask::ALL,
             });
         }
         pass.blend = Some(RenderPassBlend { attachments });

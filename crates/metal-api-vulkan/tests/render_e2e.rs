@@ -27,19 +27,20 @@
 //! and one submission carries both rails' writebacks.
 
 use metal_api_core::provider::{
-    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BorrowedLease, BufferAccess,
-    BufferLease, BufferSource, BufferView, ClearColor, CompiledComputePipeline,
-    CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider, ComputeTrace, Dispatch,
-    DispatchKind, DispatchType, FieldValue, FootprintProof, IndexBufferBinding, IndexFormat,
-    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
-    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
-    LeaseReservation, LoadOp, MultisampleState, NoCopyLeaseImporter, OperationId, PipelineId,
-    PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderAttachment, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount,
-    SemanticDigest, StageBufferBinding, StageBufferView, StagedLease, StoreOp, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    AcquirePolicy, AllocationId, AllocationRecord, AttachmentFormat, BlendAttachment, BlendFactor,
+    BlendOperation, BorrowedLease, BufferAccess, BufferLease, BufferSource, BufferView, ClearColor,
+    ColorWriteMask, CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass,
+    ComputeProvider, ComputeTrace, Dispatch, DispatchKind, DispatchType, FieldValue,
+    FootprintProof, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
+    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
+    InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp, MultisampleState,
+    NoCopyLeaseImporter, OperationId, PipelineId, PresentDescriptor, PresentMode, PresentTarget,
+    ProviderCapabilities, ProviderError, ProviderErrorClass, ProviderPhase, RenderAttachment,
+    RenderPassBlend, RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage,
+    ResourceTableSnapshot, SampleCount, SemanticDigest, StageBufferBinding, StageBufferView,
+    StagedLease, StoreOp, TextureAccess, TextureFormat, TextureSource, TextureType, TextureView,
+    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, ViewId,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -379,6 +380,15 @@ fn fixture(format: AttachmentFormat) -> Option<Fixture> {
     fixture_with_stage(format, reviewed_fragment_spirv(format))
 }
 
+/// The render pass of a fixture's trace, for the tests that state one of its
+/// fields (`research/docs/23` §3.3, v100).
+fn render_pass_of(fixture: &mut Fixture) -> &mut RenderPassDescriptor {
+    match fixture.trace.passes.last_mut() {
+        Some(TracePass::Render(pass)) => pass,
+        _ => panic!("the fixture's last pass is its render pass"),
+    }
+}
+
 fn submit_fixture(fixture: &Fixture) -> Vec<(ViewId, Vec<u8>)> {
     let admitted = fixture
         .provider
@@ -479,6 +489,247 @@ fn render_pass_trace_executes_and_lands_attachment_bytes_through_writeback() {
         .release_render_pipeline(&metadata)
         .expect_err("a released registration cannot be released twice");
     assert_eq!(refused.slug, "unknown_render_pipeline");
+}
+
+/// A viewport of the pass's own (`research/docs/23` §3.1, v100): the rect NDC
+/// maps onto. The covering default is measured first in the same run, so the
+/// two readings differ only in the viewport: the declared rect paints exactly
+/// the texels it covers and leaves the rest holding the load op's bytes.
+#[test]
+fn a_declared_viewport_moves_and_shrinks_the_raster() {
+    let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    // Control: the covering default every earlier increment published.
+    let writebacks = submit_fixture(&fixture);
+    let covering = attachment_readback(&fixture, &writebacks);
+    let covered = expected_texels(fixture.format);
+    assert_eq!(covering, covered.repeat(4));
+
+    // The declared rect: origin (1, 1), one texel wide and one tall. Texel
+    // (1, 1) is the only one whose centre lies inside the rect, so the other
+    // three keep the clear's bytes — the frame the rect states rather than the
+    // frame the attachment covers.
+    render_pass_of(&mut fixture).viewport = [1, 1, 1, 1];
+    let writebacks = submit_fixture(&fixture);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    let clear = clear_bytes(fixture.format);
+    let expected = [
+        clear.as_slice(),
+        clear.as_slice(),
+        clear.as_slice(),
+        covered.as_slice(),
+    ]
+    .concat();
+    eprintln!(
+        "viewport [1, 1, 1, 1] readback: {} (clear sentinel per texel: {}, fragment texel: {})",
+        hex(&attachment),
+        hex(&clear),
+        hex(&covered)
+    );
+    assert_eq!(attachment.len(), 16);
+    assert_eq!(attachment, expected);
+    assert_eq!(
+        &attachment[12..16],
+        covered.as_slice(),
+        "the covered texel is the one whose centre lies inside the declared rect"
+    );
+}
+
+/// The write mask is not part of the blend (`research/docs/23` §3.3, v100): an
+/// attachment that does not blend still writes only the channels its mask
+/// names, and the channels it leaves out keep the load op's own bytes.
+#[test]
+fn a_write_mask_keeps_the_unwritten_channels_in_their_load_bytes() {
+    let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let pass = render_pass_of(&mut fixture);
+    pass.blend = Some(RenderPassBlend {
+        attachments: vec![BlendAttachment {
+            enabled: false,
+            source_rgb: BlendFactor::One,
+            destination_rgb: BlendFactor::Zero,
+            source_alpha: BlendFactor::One,
+            destination_alpha: BlendFactor::Zero,
+            operation: BlendOperation::Add,
+            alpha_operation: BlendOperation::Add,
+            write_mask: ColorWriteMask::RED.union(ColorWriteMask::ALPHA),
+        }],
+    });
+    let writebacks = submit_fixture(&fixture);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    let covered = expected_texels(fixture.format);
+    let clear = clear_bytes(fixture.format);
+    // Red and alpha are the draw's own channels; green and blue keep the
+    // clear. One texel's worth of bytes, repeated over the four texels the
+    // covering viewport paints.
+    let mut texel = clear.clone();
+    texel[0] = covered[0];
+    texel[3] = covered[3];
+    eprintln!(
+        "write mask red|alpha readback: {} (cover-all texel would be {}, clear texel is {})",
+        hex(&attachment),
+        hex(&covered),
+        hex(&clear)
+    );
+    assert_eq!(attachment, texel.repeat(4));
+    assert_ne!(texel, covered);
+}
+
+/// A blend entry reads the attachment's own contents (`research/docs/23` §3.3,
+/// v100): the colour pair adds the fragment output to the load's bytes while
+/// the alpha pair keeps the destination. Two different equations in one entry
+/// are exactly what the separate alpha operation and factor pair state, and the
+/// load is a colour of its own so both halves are observable in the readback.
+#[test]
+fn a_blend_entry_mixes_the_fragment_output_with_the_load() {
+    let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let pass = render_pass_of(&mut fixture);
+    pass.color_attachments[0].load = LoadOp::Clear(ClearColor::new([0x10, 0x10, 0x10, 0x10]));
+    pass.blend = Some(RenderPassBlend {
+        attachments: vec![BlendAttachment {
+            enabled: true,
+            source_rgb: BlendFactor::One,
+            destination_rgb: BlendFactor::One,
+            source_alpha: BlendFactor::Zero,
+            destination_alpha: BlendFactor::One,
+            operation: BlendOperation::Add,
+            alpha_operation: BlendOperation::Add,
+            write_mask: ColorWriteMask::ALL,
+        }],
+    });
+    let writebacks = submit_fixture(&fixture);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    // rgb: src + dst = 0x40 + 0x10, 0x80 + 0x10, 0xc0 + 0x10; alpha: dst.
+    let expected = [0x50_u8, 0x90, 0xd0, 0x10].repeat(4);
+    eprintln!(
+        "blend rgb = source + destination, alpha = destination, load = 10 10 10 10: {}",
+        hex(&attachment)
+    );
+    assert_eq!(attachment, expected);
+
+    // The operation's other half: subtracting the load from the output lands
+    // the same texels one subtraction down, which the sum above cannot be
+    // mistaken for.
+    render_pass_of(&mut fixture)
+        .blend
+        .as_mut()
+        .expect("the entry is stated")
+        .attachments[0]
+        .operation = BlendOperation::Subtract;
+    let writebacks = submit_fixture(&fixture);
+    let attachment = readback(&writebacks, ATTACHMENT_VIEW);
+    let expected = [0x30_u8, 0x70, 0xb0, 0x10].repeat(4);
+    eprintln!(
+        "blend rgb = source - destination, alpha = destination, load = 10 10 10 10: {}",
+        hex(&attachment)
+    );
+    assert_eq!(attachment, expected);
+}
+
+/// The viewport is a rect inside the raster (`research/docs/23` §3.1, v100):
+/// one that reaches outside is refused by name with the extent the rule
+/// measured it against, rather than clipped to a frame neither rail declared.
+#[test]
+fn a_viewport_that_reaches_outside_the_attachment_is_refused_by_name() {
+    let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    render_pass_of(&mut fixture).viewport = [1, 0, 2, 2];
+    let refused = fixture
+        .provider
+        .capabilities()
+        .validate_trace(fixture.trace.clone(), fixture.resources.clone())
+        .expect_err("a rect that reaches outside the attachment is refused");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "viewport_extent_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Capability);
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some(
+            "viewport [origin_x, origin_y, width, height] [1, 0, 2, 2] is not inside the pass's \
+             attachment extent [2, 2]"
+        )
+    );
+}
+
+/// The blend families this increment cannot execute are refused by name
+/// (`research/docs/23` §3.3, v100): the blend constant, the fragment shader's
+/// second colour output, and `SourceAlphaSaturated` in a destination slot.
+#[test]
+fn the_blend_families_this_increment_cannot_execute_are_refused_by_name() {
+    let entry = |factor: BlendFactor| BlendAttachment {
+        enabled: true,
+        source_rgb: factor,
+        destination_rgb: BlendFactor::One,
+        source_alpha: BlendFactor::One,
+        destination_alpha: BlendFactor::Zero,
+        operation: BlendOperation::Add,
+        alpha_operation: BlendOperation::Add,
+        write_mask: ColorWriteMask::ALL,
+    };
+    let cases = [
+        (
+            entry(BlendFactor::BlendColor),
+            "blend_constant_unsupported",
+            ProviderErrorClass::Capability,
+            "colour attachment 0's source rgb blend factor BlendColor reads the blend constant, \
+             which this pass does not carry",
+        ),
+        (
+            entry(BlendFactor::Source1Alpha),
+            "blend_dual_source_unsupported",
+            ProviderErrorClass::Capability,
+            "colour attachment 0's source rgb blend factor Source1Alpha reads the fragment \
+             shader's second colour output, which the reviewed stages do not declare",
+        ),
+    ];
+    for (attachment, slug, class, detail) in cases {
+        let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+            return;
+        };
+        render_pass_of(&mut fixture).blend = Some(RenderPassBlend {
+            attachments: vec![attachment],
+        });
+        let refused = fixture
+            .provider
+            .capabilities()
+            .validate_trace(fixture.trace.clone(), fixture.resources.clone())
+            .expect_err("the blend family is refused");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, slug);
+        assert_eq!(refused.class, class);
+        assert_eq!(refused.detail.as_deref(), Some(detail));
+    }
+
+    // The destination slot keeps its own rule, and it is the caller's shape
+    // rather than a device limit.
+    let Some(mut fixture) = fixture(AttachmentFormat::Rgba8Unorm) else {
+        return;
+    };
+    let mut attachment = entry(BlendFactor::One);
+    attachment.destination_alpha = BlendFactor::SourceAlphaSaturated;
+    render_pass_of(&mut fixture).blend = Some(RenderPassBlend {
+        attachments: vec![attachment],
+    });
+    let refused = fixture
+        .provider
+        .capabilities()
+        .validate_trace(fixture.trace.clone(), fixture.resources.clone())
+        .expect_err("a destination-slot sourceAlphaSaturated is refused");
+    eprintln!("refused: {refused:?}");
+    assert_eq!(refused.slug, "blend_factor_slot_unsupported");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some(
+            "colour attachment 0's destination alpha blend factor SourceAlphaSaturated is not one \
+             the two APIs define in a destination slot"
+        )
+    );
 }
 
 /// The same trace shape through every admitted colour format: the format selects

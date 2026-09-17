@@ -7,24 +7,25 @@ use metal_api_core::provider::ComputeProvider;
 use metal_api_core::provider::{
     AcquirePolicy, AffineAccess, AffineTerm, AllocationId, AllocationRecord, AttachmentFormat,
     BlendAttachment, BlendFactor, BlendOperation, BufferAccess, BufferLease, BufferSource,
-    BufferSourceKind, BufferView, ClearColor, CompareFunction, CompiledComputePipeline,
-    CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace, CullMode, DepthFormat,
-    DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, Dispatch, DispatchKind,
-    DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload, HeapPlacement, HeapResource,
-    HostRegion, IndexBufferBinding, IndexFormat, IndirectCommandBufferDescriptor,
-    IndirectCommandDescriptor, IndirectCommandKind, IndirectCommandPayload, IndirectCommandRange,
-    InitialState, LeaseId, LeaseImporter, LeaseReservation, LoadOp, MultisampleDepthResolve,
-    MultisampleState, MultisampleStencilResolve, NoCopyLeaseImporter, OperationId,
-    PipelineCompileRequest, PipelineProvider, PresentDescriptor, PresentMode, PresentTarget,
-    QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
-    RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource, StageBufferBinding,
-    StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-    StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
+    BufferSourceKind, BufferView, ClearColor, ColorWriteMask, CompareFunction,
+    CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeTrace,
+    CullMode, DepthFormat, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch,
+    Dispatch, DispatchKind, DispatchType, FootprintProof, HeapDescriptor, HeapId, HeapPayload,
+    HeapPlacement, HeapResource, HostRegion, IndexBufferBinding, IndexFormat,
+    IndirectCommandBufferDescriptor, IndirectCommandDescriptor, IndirectCommandKind,
+    IndirectCommandPayload, IndirectCommandRange, InitialState, LeaseId, LeaseImporter,
+    LeaseReservation, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
+    NoCopyLeaseImporter, OperationId, PipelineCompileRequest, PipelineProvider, PresentDescriptor,
+    PresentMode, PresentTarget, QueuePriority, QueueSchedulingPolicy, RenderAttachment,
+    RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment,
+    RenderStencilIdentity, ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION,
+    RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -9253,8 +9254,15 @@ fn case_blend(case: &RenderCase) -> Result<Option<RenderPassBlend>> {
             Ok(match name {
                 "zero" => BlendFactor::Zero,
                 "one" => BlendFactor::One,
+                "source_color" => BlendFactor::SourceColor,
+                "one_minus_source_color" => BlendFactor::OneMinusSourceColor,
                 "source_alpha" => BlendFactor::SourceAlpha,
                 "one_minus_source_alpha" => BlendFactor::OneMinusSourceAlpha,
+                "destination_color" => BlendFactor::DestinationColor,
+                "one_minus_destination_color" => BlendFactor::OneMinusDestinationColor,
+                "destination_alpha" => BlendFactor::DestinationAlpha,
+                "one_minus_destination_alpha" => BlendFactor::OneMinusDestinationAlpha,
+                "source_alpha_saturated" => BlendFactor::SourceAlphaSaturated,
                 other => {
                     return Err(format!(
                         "render case {}: unsupported blend factor {other:?}",
@@ -9264,21 +9272,34 @@ fn case_blend(case: &RenderCase) -> Result<Option<RenderPassBlend>> {
                 }
             })
         };
+        let operation = match definition.operation.as_str() {
+            "add" => BlendOperation::Add,
+            "subtract" => BlendOperation::Subtract,
+            "reverse_subtract" => BlendOperation::ReverseSubtract,
+            "min" => BlendOperation::Min,
+            "max" => BlendOperation::Max,
+            other => {
+                return Err(format!(
+                    "render case {}: unsupported blend operation {other:?}",
+                    case.id
+                )
+                .into())
+            }
+        };
         attachments.push(BlendAttachment {
+            // The suite's blend case is the v40 shape one field wider
+            // (`research/docs/23` §3.3, v40/v100): the wire's blend section
+            // carries one operation per entry and no mask, so a case states
+            // blending enabled, one operation for both channel pairs and every
+            // channel written until the section grows.
+            enabled: true,
             source_rgb: factor(&definition.source_rgb)?,
             destination_rgb: factor(&definition.destination_rgb)?,
             source_alpha: factor(&definition.source_alpha)?,
             destination_alpha: factor(&definition.destination_alpha)?,
-            operation: match definition.operation.as_str() {
-                "add" => BlendOperation::Add,
-                other => {
-                    return Err(format!(
-                        "render case {}: unsupported blend operation {other:?}",
-                        case.id
-                    )
-                    .into())
-                }
-            },
+            operation,
+            alpha_operation: operation,
+            write_mask: ColorWriteMask::ALL,
         });
     }
     Ok(Some(RenderPassBlend { attachments }))

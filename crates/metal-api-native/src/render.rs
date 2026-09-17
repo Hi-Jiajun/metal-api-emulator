@@ -82,18 +82,18 @@ use foreign_types::ForeignType;
 use metal::{
     Buffer, CommandQueue, CompileOptions, DepthStencilDescriptor, Device,
     IndirectCommandBufferDescriptor, MTLBlendFactor, MTLBlendOperation, MTLClearColor,
-    MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLFeatureSet, MTLIndexType,
-    MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
-    MTLResourceOptions, MTLSize, MTLStencilOperation, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport,
-    MTLWinding, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
-    RenderPipelineDescriptor, RenderPipelineState, StencilDescriptor, Texture, TextureDescriptor,
-    VertexDescriptor,
+    MTLColorWriteMask, MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLFeatureSet,
+    MTLIndexType, MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStencilOperation, MTLStorageMode,
+    MTLStoreAction, MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction,
+    MTLViewport, MTLWinding, NSInteger, NSRange, NSUInteger,
+    RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
+    RenderPipelineState, StencilDescriptor, Texture, TextureDescriptor, VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
 use metal_api_core::provider::{
-    BlendFactor, BlendOperation, CompareFunction, CullMode as ContractCullMode, StencilCompare,
-    StencilOp, Winding as ContractWinding,
+    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode as ContractCullMode,
+    StencilCompare, StencilOp, Winding as ContractWinding,
 };
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
@@ -4508,9 +4508,9 @@ fn contract_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "attachment_count_unsupported",
         ),
-        E::ViewportOriginUnsupported { .. } => (
+        E::ViewportOutsideAttachment { .. } => (
             ProviderErrorClass::Capability,
-            "viewport_origin_unsupported",
+            "viewport_extent_unsupported",
         ),
         E::DrawVertexCountMismatch { .. } => {
             (ProviderErrorClass::Capability, "draw_shape_unsupported")
@@ -5705,10 +5705,12 @@ fn encode_into_and_readback(
         }
         stage_buffers.push(buffer);
     }
-    // The viewport is explicit because the contract carries it, even though
-    // the first increment only accepts the attachment-covering default. The
-    // scissor below it is the pass's own rectangle when it declares one
-    // (`research/docs/23` §3.3, v29).
+    // The viewport is the pass's own rect (`research/docs/23` §3.3, v100): the
+    // covering default is inside the attachments' extent, and a pass that
+    // declares a smaller or offset rect states the rect this encoder records,
+    // so the texels it does not cover keep the load's own bytes. The scissor
+    // below it is the pass's own rectangle when it declares one, and the render
+    // area otherwise (`research/docs/23` §3.3, v29).
     encoder.set_viewport(MTLViewport {
         originX: f64::from(planned.viewport[0]),
         originY: f64::from(planned.viewport[1]),
@@ -6063,7 +6065,14 @@ pub(crate) fn present_target_texture(
     Ok(unsafe { Texture::from_ptr(pointer) })
 }
 
-/// One contract blend factor as the `MTLBlendFactor` it names.
+/// One contract blend factor as the `MTLBlendFactor` it names
+/// (`research/docs/23` §3.3, v40/v100).
+///
+/// Every arm is total over the contract's list: the two families core refuses
+/// by name still have a `MTLBlendFactor` of the same meaning, and the contract
+/// is where that decision lives. Metal reads none of them unless the colour
+/// attachment's blend enable is set, which is the condition the refusals
+/// state.
 #[cfg(target_os = "macos")]
 const fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
     match factor {
@@ -6071,15 +6080,46 @@ const fn metal_blend_factor(factor: BlendFactor) -> MTLBlendFactor {
         BlendFactor::One => MTLBlendFactor::One,
         BlendFactor::SourceAlpha => MTLBlendFactor::SourceAlpha,
         BlendFactor::OneMinusSourceAlpha => MTLBlendFactor::OneMinusSourceAlpha,
+        BlendFactor::SourceColor => MTLBlendFactor::SourceColor,
+        BlendFactor::OneMinusSourceColor => MTLBlendFactor::OneMinusSourceColor,
+        BlendFactor::DestinationColor => MTLBlendFactor::DestinationColor,
+        BlendFactor::OneMinusDestinationColor => MTLBlendFactor::OneMinusDestinationColor,
+        BlendFactor::DestinationAlpha => MTLBlendFactor::DestinationAlpha,
+        BlendFactor::OneMinusDestinationAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
+        BlendFactor::SourceAlphaSaturated => MTLBlendFactor::SourceAlphaSaturated,
+        BlendFactor::BlendColor => MTLBlendFactor::BlendColor,
+        BlendFactor::OneMinusBlendColor => MTLBlendFactor::OneMinusBlendColor,
+        BlendFactor::BlendAlpha => MTLBlendFactor::BlendAlpha,
+        BlendFactor::OneMinusBlendAlpha => MTLBlendFactor::OneMinusBlendAlpha,
+        BlendFactor::Source1Color => MTLBlendFactor::Source1Color,
+        BlendFactor::OneMinusSource1Color => MTLBlendFactor::OneMinusSource1Color,
+        BlendFactor::Source1Alpha => MTLBlendFactor::Source1Alpha,
+        BlendFactor::OneMinusSource1Alpha => MTLBlendFactor::OneMinusSource1Alpha,
     }
 }
 
-/// One contract blend operation as the `MTLBlendOperation` it names.
+/// One contract blend operation as the `MTLBlendOperation` it names
+/// (`research/docs/23` §3.3, v40/v100).
 #[cfg(target_os = "macos")]
 const fn metal_blend_operation(operation: BlendOperation) -> MTLBlendOperation {
     match operation {
         BlendOperation::Add => MTLBlendOperation::Add,
+        BlendOperation::Subtract => MTLBlendOperation::Subtract,
+        BlendOperation::ReverseSubtract => MTLBlendOperation::ReverseSubtract,
+        BlendOperation::Min => MTLBlendOperation::Min,
+        BlendOperation::Max => MTLBlendOperation::Max,
     }
+}
+
+/// One contract write mask as Metal's own `MTLColorWriteMask`
+/// (`research/docs/23` §3.3, v100).
+///
+/// The contract's spelling is already Metal's — alpha first from the low end —
+/// so this is the identity on the four channel bits; naming it keeps the two
+/// rails' mappings symmetric, because Vulkan's bit order is not this one.
+#[cfg(target_os = "macos")]
+const fn metal_color_write_mask(mask: ColorWriteMask) -> MTLColorWriteMask {
+    MTLColorWriteMask::from_bits_truncate(mask.bits() as NSUInteger)
 }
 
 /// One contract stencil comparison as the `MTLCompareFunction` it names
@@ -6478,13 +6518,20 @@ fn render_pipeline_state(
             .as_ref()
             .and_then(|blend| blend.attachments.get(index))
         {
-            color.set_blending_enabled(true);
+            // The entry is Metal's `MTLRenderPipelineColorAttachmentDescriptor`
+            // (`research/docs/23` §3.3, v40/v100): whether this attachment
+            // blends at all, the two operations (Metal spells them
+            // `rgbBlendOperation` and `alphaBlendOperation`), the four factors,
+            // and the write mask, which Metal applies after blending and reads
+            // whether or not the entry blends.
+            color.set_blending_enabled(blend.enabled);
             color.set_rgb_blend_operation(metal_blend_operation(blend.operation));
-            color.set_alpha_blend_operation(metal_blend_operation(blend.operation));
+            color.set_alpha_blend_operation(metal_blend_operation(blend.alpha_operation));
             color.set_source_rgb_blend_factor(metal_blend_factor(blend.source_rgb));
             color.set_destination_rgb_blend_factor(metal_blend_factor(blend.destination_rgb));
             color.set_source_alpha_blend_factor(metal_blend_factor(blend.source_alpha));
             color.set_destination_alpha_blend_factor(metal_blend_factor(blend.destination_alpha));
+            color.set_write_mask(metal_color_write_mask(blend.write_mask));
         }
     }
     device
@@ -6658,19 +6705,20 @@ fn resource_refusal(slug: &'static str) -> ProviderError {
 mod tests {
     use super::*;
     use metal_api_core::provider::{
-        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BorrowedLease, BufferAccess,
-        BufferBindingContract, BufferLease, BufferSource, CompareFunction, CompiledComputePipeline,
-        CompletionPolicy, ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch,
-        Dispatch, DispatchKind, DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
+        AcquirePolicy, AliasMode, AllocationId, AllocationRecord, BlendAttachment, BlendFactor,
+        BlendOperation, BorrowedLease, BufferAccess, BufferBindingContract, BufferLease,
+        BufferSource, ColorWriteMask, CompareFunction, CompiledComputePipeline, CompletionPolicy,
+        ComputePass, DepthFormat, DepthLoadOp, DepthStoreOp, DeviceEpoch, Dispatch, DispatchKind,
+        DispatchType, FootprintProof, FunctionIdentity, FunctionSource,
         IndirectCommandBufferDescriptor, IndirectCommandKind, IndirectCommandPayload,
         IndirectCommandRange, InitialState, LeaseId, LeaseRegistry, LeaseReservation,
         MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
         PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
-        RenderDepthAttachment, RenderDepthIdentity, RenderPipelineStage, RenderStencilAttachment,
-        RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest, StageBufferBinding,
-        StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-        StencilResolveFilter, StencilTest, StorageMode, TextureAccess, VertexAttribute,
-        VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        RenderDepthAttachment, RenderDepthIdentity, RenderPassBlend, RenderPipelineStage,
+        RenderStencilAttachment, RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest,
+        StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat,
+        StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode, TextureAccess,
+        VertexAttribute, VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -8444,6 +8492,47 @@ mod tests {
             .expect("a four-by-four attachment is within the declared extent");
         assert_eq!(plan.extent, [4, 4]);
         assert_eq!(plan.attachments[0].texel.bytes, 64);
+    }
+
+    #[test]
+    fn plan_carries_a_declared_viewport_and_a_masked_blend_entry() {
+        // v100: the plan is the one description both the encoder and the
+        // pipeline are built from, so the pass's own rect and its
+        // per-attachment blend state have to reach it unchanged. The two
+        // rails' device readings are the same fields' execution.
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.viewport = [1, 1, 1, 1];
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![BlendAttachment {
+                enabled: false,
+                source_rgb: BlendFactor::One,
+                destination_rgb: BlendFactor::Zero,
+                source_alpha: BlendFactor::One,
+                destination_alpha: BlendFactor::Zero,
+                operation: BlendOperation::Add,
+                alpha_operation: BlendOperation::Subtract,
+                write_mask: ColorWriteMask::RED.union(ColorWriteMask::ALPHA),
+            }],
+        });
+        let pipeline = milestone_pipeline();
+        let plan = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect("a rect inside the attachment is the increment's shape");
+        assert_eq!(plan.viewport, [1, 1, 1, 1]);
+        assert_eq!(plan.extent, [2, 2]);
+        let blend = plan
+            .blend
+            .as_ref()
+            .expect("the entry travels with the plan");
+        assert!(!blend.attachments[0].enabled);
+        assert_eq!(
+            blend.attachments[0].alpha_operation,
+            BlendOperation::Subtract
+        );
+        assert_eq!(
+            blend.attachments[0].write_mask,
+            ColorWriteMask::RED.union(ColorWriteMask::ALPHA)
+        );
+        assert_eq!(blend.attachments[0].write_mask.bits(), 0x9);
     }
 
     #[test]
