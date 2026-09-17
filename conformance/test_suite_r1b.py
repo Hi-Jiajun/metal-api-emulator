@@ -55,13 +55,13 @@ class AttachmentWindowTests(unittest.TestCase):
         return compare._render_plan(compare._suite_plan(suite), suite)
 
     def test_the_three_review_surfaces_share_the_ceiling(self):
-        # The comparator's ceiling is the number the fixtures measure; the Rust
-        # rails and the Swift oracle state the same number in their own sources
-        # (`crates/metal-api-vulkan/src/provider.rs`,
-        # `crates/metal-api-native/src/render.rs`,
-        # `examples/metal-smoke/src/bin/provider-capture.rs`,
-        # `conformance/NativeOracle.swift`), and the boundary case sits on it.
-        self.assertEqual(compare.REVIEWED_ATTACHMENT_CEILING, CEILING)
+        # R1b pinned the ceiling at 64 and moved the boundary case onto it. R5a
+        # (`research/docs/23` §73) widened the window to 2048 and moved the
+        # boundary with it, so what this file keeps is the R1b fixtures' own
+        # claim: both are still inside the current window, and the 64×64 case
+        # is still the sampled identity it was. The shared-ceiling check across
+        # the four sources lives in `test_suite_r5a.py`, on the new boundary.
+        self.assertGreaterEqual(compare.REVIEWED_ATTACHMENT_CEILING, CEILING)
         boundary = self.case(SAMPLED_64_ID)
         self.assertEqual((boundary["attachment"]["width"], boundary["attachment"]["height"]),
                          (CEILING, CEILING))
@@ -131,10 +131,11 @@ class AttachmentWindowTests(unittest.TestCase):
 
     def test_one_texel_beyond_the_ceiling_is_refused(self):
         # The committed boundary case is the window's own edge; one texel more
-        # is the refusal the widening moved out from four texels per axis.
-        over = CEILING + 1
+        # is the refusal the widenings moved out from four texels per axis to
+        # 64 (R1b) and then to 2048 (R5a).
+        over = compare.REVIEWED_ATTACHMENT_CEILING + 1
         self.refused(lambda case: case["attachment"].update(width=over),
-                     f"one to {CEILING} texels per axis")
+                     f"one to {compare.REVIEWED_ATTACHMENT_CEILING} texels per axis")
 
     def test_the_committed_boundary_case_is_admitted(self):
         # The "one texel beyond" refusal above is a boundary only because the

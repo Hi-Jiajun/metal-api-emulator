@@ -477,8 +477,10 @@ pub(crate) const MAX_VERTEX_BUFFERS: u32 = metal_api_core::provider::MAX_VERTEX_
 /// window is this ceiling clamped by the device's own 2D texture limit
 /// ([`attachment_dimension_window`], [`device_attachment_dimension_limit`]).
 /// Widening the ceiling further is a deliberate change that owes a boundary
-/// fixture at the new value.
-pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [64, 64];
+/// fixture at the new value. R5a (`research/docs/23` §73) takes that step for
+/// the desktop sizes the guest profile measured: the 2048×2048 boundary, which
+/// every Apple GPU family's 16384-texel 2D limit covers.
+pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [2048, 2048];
 
 /// The attachment window a device with this 2D texture limit declares.
 ///
@@ -5217,9 +5219,10 @@ mod tests {
 
     #[test]
     fn plan_accepts_the_reviewed_window_boundary() {
-        // R1b (`research/docs/23` §70): the boundary extent the new fixture
-        // pins plans with the whole texel count, so the declared window is
-        // executable on the host before any Metal object exists.
+        // R1b (`research/docs/23` §70) pinned 64×64; R5a (§73) moves the
+        // boundary to 2048×2048. The boundary extent the new fixture pins plans
+        // with the whole texel count, so the declared window is executable on
+        // the host before any Metal object exists.
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
         pass.viewport = [
             0,
@@ -5233,8 +5236,18 @@ mod tests {
         let pipeline = milestone_pipeline();
         let plan = plan_pass(&milestone_request(&pass, &pipeline, None))
             .expect("the reviewed boundary extent is within the declared window");
-        assert_eq!(plan.extent, [64, 64]);
-        assert_eq!(plan.texel_bytes, 64 * 64 * 4);
+        assert_eq!(
+            plan.extent,
+            [
+                REVIEWED_ATTACHMENT_CEILING[0] as u32,
+                REVIEWED_ATTACHMENT_CEILING[1] as u32
+            ]
+        );
+        assert_eq!(
+            plan.texel_bytes,
+            usize::try_from(REVIEWED_ATTACHMENT_CEILING[0] * REVIEWED_ATTACHMENT_CEILING[1] * 4)
+                .expect("the reviewed window's texel bytes fit a host usize")
+        );
     }
 
     #[test]

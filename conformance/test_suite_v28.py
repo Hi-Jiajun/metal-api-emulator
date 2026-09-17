@@ -223,6 +223,10 @@ SAMPLED_EXPECTED = SAMPLED_TEXELS
 # measured by the sampler's own identity. Both follow the v70 case.
 FULL_COVER_16X16_ID = "full_cover_16x16"
 SAMPLED_64_ID = "sampled_texel_64x64"
+# R5a (`research/docs/23` §73): the reviewed window's own boundary, a 2048x2048
+# sampled attachment whose expectation is the reviewed per-texel rule instead of
+# four million texels of hex.
+SAMPLED_RULE_2048_ID = "sampled_rule_2048x2048"
 REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID,
                   DEPTH_STORE_ID, DEPTH_ONLY_ID, DEPTH_NO_COLOUR_ID,
                   STENCIL_ID, STENCIL_STORE_ID, ALIGNMENT_ID, CULL_ID, BLEND_ID,
@@ -231,7 +235,7 @@ REVIEWED_ORDER = (RENDER_ID, INSTANCED_ID, WILDCARD_ID, BASE_VERTEX_ID, DEPTH_ID
                   MSAA_STENCIL_RESOLVE_SAMPLE0_ID, MSAA_STENCIL_RESOLVE_DRS_ID,
                   MSAA_UNIFORM_2X_ID, MSAA_UNIFORM_8X_ID, MSAA_DS_ID,
                   MSAA_EDGE_2X_ID, MSAA_EDGE_8X_ID, SAMPLED_ID,
-                  FULL_COVER_16X16_ID, SAMPLED_64_ID)
+                  FULL_COVER_16X16_ID, SAMPLED_64_ID, SAMPLED_RULE_2048_ID)
 ATTACHMENT = (900, 910, 0, 64)
 PROBE = (920, 930, 4)
 QUAD_VIEW = (1000, 1010, 0, 32)
@@ -914,6 +918,13 @@ FULL_COVER_16X16_EXPECTED = OUTPUT * (16 * 16)
 SAMPLED_64_ATTACHMENT = (900, 910, 0, 64 * 64 * 4)
 SAMPLED_64_TEXELS = "".join(f"{x:02x}{y:02x}{x + y:02x}ff"
                             for y in range(64) for x in range(64))
+# The R5a wide fixture (`research/docs/23` §73): the reviewed window's own
+# 2048x2048 boundary, whose declaring view is 16 MiB and whose expectation is
+# the reviewed per-texel rule — the digest below is the whole plane's, and the
+# two rectangles are the windows a capture reports verbatim.
+SAMPLED_RULE_2048_ATTACHMENT = (1240, 1250, 0, 2048 * 2048 * 4)
+SAMPLED_RULE_2048_DIGEST = "2cdc79e97134903dd8e7d89ebf45061888e46504ab20d7921a2c466abf037bf9"
+SAMPLED_RULE_2048_WINDOWS = ((0, 0, 64, 64), (1984, 1984, 64, 64))
 
 
 def full_cover_16x16_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -959,6 +970,48 @@ def r1b_results(provider_backend=True):
     """Both R1b landings, in the order the suite pins them."""
     return [full_cover_16x16_result(provider_backend),
             sampled_64_result(provider_backend)]
+
+
+def sampled_rule_2048_result(provider_backend=True, copy_in=3, copy_out=2):
+    """The R5a wide landing (`research/docs/23` §73).
+
+    The two declared readback windows' bytes come from the comparator's own rule
+    implementation — the fixture does not spell them out, and neither does a
+    capture — while the digest of the whole plane is pinned here as a literal,
+    so a regression in the rule's arithmetic fails this file rather than
+    silently updating the expectation.
+    """
+    windows = [{"x": x, "y": y, "width": window_width, "height": window_height,
+                "bytes_hex": compare._rule_window_bytes(
+                    compare.XY_U16LE_V1, (x, y, window_width, window_height)).hex()}
+               for x, y, window_width, window_height in SAMPLED_RULE_2048_WINDOWS]
+    result = {
+        "id": SAMPLED_RULE_2048_ID,
+        "completion": "CompletedVisible",
+        "writebacks": [{"allocation": SAMPLED_RULE_2048_ATTACHMENT[0],
+                        "view": SAMPLED_RULE_2048_ATTACHMENT[1],
+                        "offset": SAMPLED_RULE_2048_ATTACHMENT[2],
+                        "bytes_sha256": SAMPLED_RULE_2048_DIGEST,
+                        "bytes_length": SAMPLED_RULE_2048_ATTACHMENT[3],
+                        "observed_windows": windows}],
+        "allocations": [{"allocation": SAMPLED_RULE_2048_ATTACHMENT[0],
+                         "bytes_sha256": SAMPLED_RULE_2048_DIGEST,
+                         "bytes_length": SAMPLED_RULE_2048_ATTACHMENT[3]}],
+    }
+    if provider_backend:
+        result["copy_in"], result["copy_out"] = copy_in, copy_out
+    return result
+
+
+def r5a_results(provider_backend=True):
+    """The R5a rule landing (`research/docs/23` §73).
+
+    The observed form is the plane's digest and the two declared readback
+    windows instead of four million texels of hex: the synthetic capture
+    reports what the comparator independently recomputes from the rule, so a
+    report built here is the shape a rail owes.
+    """
+    return [sampled_rule_2048_result(provider_backend)]
 
 
 def msaa_edge_8x_result(provider_backend=True, copy_in=2, copy_out=2):
@@ -1463,6 +1516,7 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(render_result(rail != "native-metal"))
             report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].extend(r1b_results(rail != "native-metal"))
+            report["results"].extend(r5a_results(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
@@ -1550,6 +1604,7 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].extend(r1b_results(rail != "native-metal"))
+            report["results"].extend(r5a_results(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
                 report["results"].append(base_vertex_result(rail != "native-metal"))
@@ -1624,6 +1679,7 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(render_result(rail != "native-metal"))
             report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].extend(r1b_results(rail != "native-metal"))
+            report["results"].extend(r5a_results(rail != "native-metal"))
             if rail in INSTANCED_RAILS:
                 report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
@@ -1702,6 +1758,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(render_result())
         report["results"].append(sampled_result())
         report["results"].extend(r1b_results())
+        report["results"].extend(r5a_results())
         report["results"].append(instanced_result())
         report["results"].append(wildcard_result())
         report["results"].append(base_vertex_result())
@@ -2821,6 +2878,7 @@ class ScissorObservationTests(unittest.TestCase):
         report["results"].append(render_result())
         report["results"].append(sampled_result())
         report["results"].extend(r1b_results())
+        report["results"].extend(r5a_results())
         report["results"].append(instanced_result())
         report["results"].append(base_vertex_result())
         report["results"].append(depth_result())
@@ -2873,6 +2931,7 @@ class ScissorObservationTests(unittest.TestCase):
             report["results"].append(instanced_result(rail != "native-metal"))
             report["results"].append(sampled_result(rail != "native-metal"))
             report["results"].extend(r1b_results(rail != "native-metal"))
+            report["results"].extend(r5a_results(rail != "native-metal"))
             report["results"].append(wildcard_result(rail != "native-metal"))
             if rail in BASE_VERTEX_RAILS:
                 report["results"].append(base_vertex_result(rail != "native-metal"))

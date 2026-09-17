@@ -101,12 +101,14 @@ class QuadExtentObservationTests(unittest.TestCase):
 
     def test_v26_refuses_an_axis_beyond_the_reviewed_ceiling(self):
         # The reviewed window is 64 texels per axis from R1b on
-        # (`research/docs/23` §70); the v26 fixture's own extent is unchanged,
-        # so the probe is one texel beyond the ceiling.
+        # (`research/docs/23` §70) and 2048 from R5a (§73); the v26 fixture's
+        # own extent is unchanged, so the probe is one texel beyond the ceiling.
         broken = copy.deepcopy(self.suite)
-        broken["render_cases"][0]["attachment"]["width"] = 65
+        broken["render_cases"][0]["attachment"]["width"] = (
+            compare.REVIEWED_ATTACHMENT_CEILING + 1)
         with self.assertRaisesRegex(compare.CaptureError,
-                                    "one to 64 texels per axis"):
+                                    f"one to {compare.REVIEWED_ATTACHMENT_CEILING} "
+                                    "texels per axis"):
             compare._render_plan(compare._suite_plan(broken), broken)
 
     def test_v26_refuses_a_short_expectation(self):
