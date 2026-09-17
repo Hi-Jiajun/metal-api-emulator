@@ -889,23 +889,52 @@ pub(crate) fn attachment_dimension_window(device_2d_texture_limit: u64) -> [u64;
 /// rather than 0.
 pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
 
-/// The stage-buffer bits the provider declares (`research/docs/23` §83, R9g).
+/// The stage-buffer bits the provider declares (`research/docs/23` §83, §92,
+/// R9g/R9k).
 ///
 /// The bits name this rail's own window: the reviewed
 /// `conformance/shaders/render_stage_buffer_2x2.metal` module, whose vertex
 /// stage reads its three positions and whose fragment stage its one `float4`
 /// from their own `[[buffer(0)]]` arguments — the slots the encoder fills with
-/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`.
+/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`
+/// — and the writable arm `conformance/shaders/render_stage_buffer_write_2x2.metal`
+/// adds beside it (the readable source, the write-only sink and the read-write
+/// accumulator).
 ///
-/// Flip evidence (pending): the increment after this one reads the Apple
-/// device's own frame — the `native-oracle-build` job's "Run native
-/// stage-buffer self-test when a Metal device is eligible" step reporting the
-/// covered texel's bytes instead of the `fefefefe` clear sentinel. Until that
-/// run lands, both fields stay at their defaults, so core admission refuses a
+/// Flip evidence (`research/docs/23` §83, §92): two `native-oracle-build`
+/// readings on Apple Paravirtual devices, both from the "…when a Metal device
+/// is eligible" steps whose probe answered `eligible: true` rather than the
+/// `SKIP` an ineligible runner prints. The first is CI run `35225235455` (commit
+/// `6b86a50`, archived in `evidence/apple-native-stage-buffer-2026-09-17/`),
+/// whose `--stage-buffer-selftest` printed
+/// `stage_buffer_selftest: PASS (stage_buffer_positions_2x2 4080c0ff… /
+/// 00ff00ff… / 4080c0ff×4)` — the three runs whose covered texel moved with the
+/// bytes each stage's own `[[buffer(0)]]` carried. The second is CI run
+/// `35233984141` (job `native-oracle-build`, commit `81f9599`, this branch's own
+/// base), which read both halves on one device — macOS 15.7.9 (Build 24G830):
+/// the same `stage_buffer_selftest: PASS (…)` line and
+/// `stage_buffer_write_selftest: PASS (stage_buffer_write_2x2 frames=[…]
+/// sinks=[…] accumulators=[…])`, the writable module landing the frame, the
+/// sink and the accumulator. The same job's native provider capture still
+/// skipped both suite cases ("…binds no stage buffers; the case is marked for
+/// vulkan"), which is the pre-flip state this increment removes. Before the
+/// flip both fields were at their defaults, so core admission refused a
 /// stage-buffer pass with `render_stage_buffer_unsupported` instead of
-/// executing it through a path no device reading has confirmed. A green job
-/// whose log said `SKIP` is not that evidence: `SKIP` means the probe found no
-/// eligible device, which is exactly the state the bit stays closed for.
+/// executing a path no device reading had confirmed.
+///
+/// What stays refused after the flip is the shape the reviewed modules do not
+/// cover, and each refusal is by name rather than a silent drop: a pipeline
+/// whose stages come from a *translated* AIR pair ([`reviewed_module_for`]
+/// selects the reviewed MSL modules alone, so the pair has no module to pair
+/// its declarations with), a declaration the selected module does not read
+/// (`render_stage_buffer_stage_unsupported`), an access or extent the module's
+/// own argument disagrees with (`render_stage_reflection_mismatch`), an
+/// `Unbounded` footprint, and an affine reach past the declared window. What
+/// the flip does *not* claim is a device reading for every shape the rail now
+/// executes: the writable pair's reading is the `--stage-buffer-write-selftest`
+/// run rather than a suite case (its suite case pins AIR), and a presenting
+/// pass that binds a writable slot executes without a device reading of its
+/// own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StageBufferCapabilityBits {
     pub(crate) supports_render_stage_buffers: bool,
@@ -917,8 +946,8 @@ pub(crate) struct StageBufferCapabilityBits {
 /// `crate::icb` state their own pending bits in.
 pub(crate) fn stage_buffer_capability_bits() -> StageBufferCapabilityBits {
     StageBufferCapabilityBits {
-        supports_render_stage_buffers: false,
-        max_render_stage_buffers: 0,
+        supports_render_stage_buffers: true,
+        max_render_stage_buffers: MAX_RENDER_STAGE_BUFFERS,
     }
 }
 
@@ -989,6 +1018,13 @@ pub(crate) const MAX_PRESENT_TARGETS: u32 = metal_api_core::provider::MAX_PRESEN
 /// The first presentation increment's image cap, same rule as
 /// [`MAX_PRESENT_TARGETS`].
 pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PRESENT_IMAGE_COUNT;
+
+/// The stage-buffer cap the first stage-buffer increment declares, same rule as
+/// [`MAX_PRESENT_TARGETS`]: core's own ceiling, spelled once so the snapshot
+/// and its tests cannot drift from the contract's value
+/// (`research/docs/23` §3.3, v83).
+pub(crate) const MAX_RENDER_STAGE_BUFFERS: u32 =
+    metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32;
 
 /// The largest instance count the instancing increment executes
 /// (`research/docs/23` §3.3, v31). Same rule as the Vulkan rail's ceiling: the
@@ -6781,6 +6817,52 @@ mod tests {
         }
     }
 
+    /// The trace-table entry the reviewed stage-buffer pair's registration hands
+    /// back: the milestone's own pipeline id, so the pass this fixture states
+    /// names it, the reviewed module's vertex entry and the stage-buffer
+    /// contract itself (`research/docs/23` §83, R9g).
+    fn stage_buffer_table_entry() -> CompiledComputePipeline {
+        CompiledComputePipeline {
+            device_epoch: DeviceEpoch::new(3),
+            pipeline_id: PipelineId::new(3),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("render-stage-buffer-fixture", vec![61])
+                    .unwrap(),
+                entry_name: STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+                source: FunctionSource::MetalSource,
+            },
+            contract: render_table_contract(),
+            render: Some(stage_buffer_pipeline()),
+        }
+    }
+
+    /// The reviewed stage-buffer trace and the resource namespace it needs
+    /// (`research/docs/23` §83, R9g): the milestone's declaration pass, then the
+    /// 2x2 render pass whose two `[[buffer(0)]]` slots the case's own views
+    /// fill. This is the shape core admission's third render gate walks, so the
+    /// capability snapshot's stage-buffer pair is read against it.
+    fn stage_buffer_trace(load: LoadOp) -> (ComputeTrace, ResourceTableSnapshot) {
+        let (mut trace, mut resources) = milestone_trace(load);
+        trace.pipelines[1] = stage_buffer_table_entry();
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the milestone trace ends with its render pass");
+        };
+        *pass = stage_buffer_pass(load);
+        for (allocation, size) in [
+            (AllocationId::new(63), STAGE_BUFFER_VERTEX_BYTES),
+            (AllocationId::new(64), STAGE_BUFFER_FRAGMENT_BYTES),
+        ] {
+            resources
+                .insert_allocation(AllocationRecord {
+                    allocation_id: allocation,
+                    owner_epoch: DeviceEpoch::new(3),
+                    size,
+                })
+                .unwrap();
+        }
+        (trace, resources)
+    }
+
     /// One plan's stage-buffer binding table, as the evidence line spells it
     /// (`research/docs/23` §83, R9g): the slot each binding fills in its own
     /// stage's `[[buffer(N)]]` namespace, the offset the encoder binds it at,
@@ -6945,15 +7027,21 @@ mod tests {
         assert_eq!(refused.slug, "trace_contract_invalid");
         assert_eq!(refused.class, ProviderErrorClass::Args);
 
-        // The snapshot keeps the fail-closed default: the bit is off and the
-        // limit is zero, so core admission refuses the shape before this rail
-        // is even asked. Flipping it is the increment after an Apple device
-        // reading, not part of this one.
+        // The snapshot and the rail now declare the same window: the pair of
+        // declarations above is what the Apple device readings
+        // (`stage_buffer_selftest` / `stage_buffer_write_selftest`) flipped, so
+        // the bits are the production spelling's own and core admission admits
+        // the shape instead of refusing it by name. The pre-flip refusal stays
+        // pinned on a constructed snapshot
+        // (`the_pre_flip_snapshot_refuses_a_stage_buffer_trace`).
         let bits = capability_bits(2048);
         assert!(!bits.supports_render_passes || bits.max_color_attachments > 0);
         let capabilities = capabilities(&bits);
-        assert!(!capabilities.supports_render_stage_buffers);
-        assert_eq!(capabilities.max_render_stage_buffers, 0);
+        assert!(capabilities.supports_render_stage_buffers);
+        assert_eq!(
+            capabilities.max_render_stage_buffers,
+            MAX_RENDER_STAGE_BUFFERS
+        );
     }
 
     /// A stage buffer resolves through the same three-armed source channel a
@@ -7626,14 +7714,19 @@ mod tests {
         assert_eq!(refused.slug, "trace_contract_invalid");
         assert_eq!(refused.class, ProviderErrorClass::Args);
 
-        // The snapshot keeps the fail-closed default: the bit is off and the
-        // limit is zero, so core admission refuses a stage-buffer trace before
-        // this rail is even asked. Flipping it is the increment after an Apple
-        // device reading, not part of this one.
+        // The writable arm is inside the same declared window the read-only
+        // arm is (`stage_buffer_capability_bits`): the snapshot declares the
+        // pair and the cap, and the refusals above are the shapes the reviewed
+        // modules still answer by name. The pre-flip refusal stays pinned on a
+        // constructed snapshot
+        // (`the_pre_flip_snapshot_refuses_a_stage_buffer_trace`).
         let bits = capability_bits(2048);
         let capabilities = capabilities(&bits);
-        assert!(!capabilities.supports_render_stage_buffers);
-        assert_eq!(capabilities.max_render_stage_buffers, 0);
+        assert!(capabilities.supports_render_stage_buffers);
+        assert_eq!(
+            capabilities.max_render_stage_buffers,
+            MAX_RENDER_STAGE_BUFFERS
+        );
     }
 
     /// The affine bound over an *indexed draw whose index view is a lease* is
@@ -9422,20 +9515,39 @@ mod tests {
     }
 
     /// The capability snapshot the macOS provider builds, with the render bits
-    /// taken from the value under test and the compute bits from `native.rs`.
+    /// taken from the value under test, the stage-buffer pair from the rail's
+    /// own spelling and the compute bits from `native.rs`.
     fn capabilities(bits: &RenderCapabilityBits) -> ProviderCapabilities {
-        capabilities_with(bits, &vertex_input_capability_bits())
+        capabilities_with(
+            bits,
+            &vertex_input_capability_bits(),
+            &stage_buffer_capability_bits(),
+        )
     }
 
-    /// The same snapshot with the vertex-input bits spelled out, so a test can
-    /// construct the pre-flip declaration (`native.rs` takes both from the rail).
+    /// The same snapshot with the stage-buffer pair closed, so a test can
+    /// construct the pre-flip declaration (`native.rs` takes the pair from
+    /// [`stage_buffer_capability_bits`], which is the value the flip moved).
+    fn capabilities_before_the_stage_buffer_flip(
+        bits: &RenderCapabilityBits,
+    ) -> ProviderCapabilities {
+        let mut capabilities = capabilities(bits);
+        capabilities.supports_render_stage_buffers = false;
+        capabilities.max_render_stage_buffers = 0;
+        capabilities
+    }
+
+    /// The same snapshot with the vertex-input bits and the stage-buffer pair
+    /// spelled out, so a test can construct the pre-flip declaration
+    /// (`native.rs` takes all three from the rail).
     fn capabilities_with(
         bits: &RenderCapabilityBits,
         vertex: &VertexInputCapabilityBits,
+        stage_buffers: &StageBufferCapabilityBits,
     ) -> ProviderCapabilities {
         ProviderCapabilities {
-            supports_render_stage_buffers: false,
-            max_render_stage_buffers: 0,
+            supports_render_stage_buffers: stage_buffers.supports_render_stage_buffers,
+            max_render_stage_buffers: stage_buffers.max_render_stage_buffers,
             max_passes: 8,
             supports_threads_exact: true,
             supports_threadgroups: false,
@@ -10560,6 +10672,60 @@ mod tests {
         );
     }
 
+    /// The stage-buffer pair the Apple device readings flipped
+    /// (`stage_buffer_capability_bits`): the declared bits are the rail's own
+    /// window, the limit is core's ceiling rather than a second number, and
+    /// admission admits the reviewed stage-buffer trace — the shape both
+    /// readings executed on device (`--stage-buffer-selftest`,
+    /// `--stage-buffer-write-selftest`).
+    #[test]
+    fn declared_stage_buffer_capabilities_admit_what_the_rail_plans() {
+        let bits = stage_buffer_capability_bits();
+        assert!(bits.supports_render_stage_buffers);
+        assert_eq!(bits.max_render_stage_buffers, MAX_RENDER_STAGE_BUFFERS);
+        assert_eq!(
+            bits.max_render_stage_buffers,
+            metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS as u32
+        );
+
+        let (trace, resources) = stage_buffer_trace(LoadOp::Clear(sentinel()));
+        capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+            .admit(&trace, &resources)
+            .expect("the declared bits admit the reviewed stage-buffer trace");
+
+        // A trace whose passes bind no stage buffer keeps the pre-v83
+        // admission path: the flipped gate widens nothing else.
+        let (milestone, milestone_resources) = milestone_trace(LoadOp::Clear(sentinel()));
+        capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+            .admit(&milestone, &milestone_resources)
+            .expect("a pass that binds no stage buffer keeps its own admission");
+    }
+
+    /// The pre-flip snapshot — the same bits with the stage-buffer gate closed
+    /// — still refuses the reviewed trace in the third render gate
+    /// (`render_stage_buffer_unsupported`), after the render gate admitted the
+    /// pass itself. Keeping the refusal pinned on a constructed snapshot is
+    /// what makes the flipped production bits above falsifiable: it is the same
+    /// trace and the same gate, only the declaration differs.
+    #[test]
+    fn the_pre_flip_snapshot_refuses_a_stage_buffer_trace() {
+        let (trace, resources) = stage_buffer_trace(LoadOp::Clear(sentinel()));
+        let refused =
+            capabilities_before_the_stage_buffer_flip(&capability_bits(APPLE_2D_TEXTURE_CEILING))
+                .admit(&trace, &resources)
+                .unwrap_err();
+        assert_eq!(refused.slug, "render_stage_buffer_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        // The refusal names the pass and the number of bindings the snapshot
+        // would have to drop.
+        assert_eq!(refused.fields.get("pass"), Some(&FieldValue::Unsigned(1)));
+        assert_eq!(
+            refused.fields.get("bindings"),
+            Some(&FieldValue::Unsigned(2))
+        );
+    }
+
     /// The host-side half of the present plan: the descriptor is borrowed from
     /// the pass and the sentinel is expanded to the target's whole extent, so
     /// the macOS present path only has to upload it.
@@ -11241,9 +11407,13 @@ mod tests {
         // are read, which is the order capability admission documents.
         let mut closed = vertex_input_capability_bits();
         closed.max_vertex_buffers = 0;
-        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &closed)
-            .admit(&trace, &resources)
-            .unwrap_err();
+        let refused = capabilities_with(
+            &capability_bits(APPLE_2D_TEXTURE_CEILING),
+            &closed,
+            &stage_buffer_capability_bits(),
+        )
+        .admit(&trace, &resources)
+        .unwrap_err();
         assert_eq!(refused.slug, "vertex_buffer_limit");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
         assert_eq!(refused.phase, ProviderPhase::Resolve);
@@ -11255,9 +11425,13 @@ mod tests {
         // Closed index widths: the same trace, refused one gate later.
         let mut no_indices = vertex_input_capability_bits();
         no_indices.supported_index_formats = Vec::new();
-        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &no_indices)
-            .admit(&trace, &resources)
-            .unwrap_err();
+        let refused = capabilities_with(
+            &capability_bits(APPLE_2D_TEXTURE_CEILING),
+            &no_indices,
+            &stage_buffer_capability_bits(),
+        )
+        .admit(&trace, &resources)
+        .unwrap_err();
         assert_eq!(refused.slug, "index_format_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
 
@@ -11265,9 +11439,13 @@ mod tests {
         // gate reads, after the pass and the layout already agreed.
         let mut no_formats = vertex_input_capability_bits();
         no_formats.supported_vertex_formats = Vec::new();
-        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &no_formats)
-            .admit(&trace, &resources)
-            .unwrap_err();
+        let refused = capabilities_with(
+            &capability_bits(APPLE_2D_TEXTURE_CEILING),
+            &no_formats,
+            &stage_buffer_capability_bits(),
+        )
+        .admit(&trace, &resources)
+        .unwrap_err();
         assert_eq!(refused.slug, "vertex_format_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
     }

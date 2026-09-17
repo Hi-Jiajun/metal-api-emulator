@@ -7,10 +7,12 @@ positions through an *affine* footprint and whose fragment stage writes a
 through a *borrowed* lease (`research/docs/23` §90, R9i).
 
 These are comparator and schema checks, not GPU execution evidence: they pin the
-declarations the two rails execute, the two landings the capture owes (the
+declarations the rails execute, the two landings the capture owes (the
 attachment and the writable slot's own writeback), the copy counters those
-landings move, and the refusals every disagreement has to hit — on Linux,
-without a GPU or a compiler.
+landings move, which rails each arm may name (`research/docs/23` §83: the
+reviewed pair runs on the three rails that compile the module it pins, while
+the translated pair stays on the one rail that translates its AIR), and the
+refusals every disagreement has to hit — on Linux, without a GPU or a compiler.
 """
 
 import copy
@@ -77,7 +79,7 @@ def declaring_images(suite, case):
     return {allocation: bytes(data) for allocation, data in images.items()}
 
 
-def render_result(suite, case, counts=True):
+def render_result(suite, case, counts=True, provider=True):
     """The capture result one stage-buffer render case owes.
 
     The observation is the attachment's own landing plus — for a case whose
@@ -87,6 +89,11 @@ def render_result(suite, case, counts=True):
     bytes travel through the render input channel and move no counter, while
     the landing it receives is one more written allocation
     (`research/docs/23` §3.3, v86).
+
+    `provider` is the rail's own half: the Swift oracle places the bytes in its
+    own buffers rather than importing an owner's window, so it reports no
+    source arm at all — the same split the compute cases' lease section makes
+    (`research/docs/23` §90, R9i).
     """
     declaring = case_by_id(suite, case["declaring_case"])
     images = declaring_images(suite, declaring)
@@ -113,14 +120,14 @@ def render_result(suite, case, counts=True):
         "allocations": [{"allocation": allocation, "bytes_hex": image.hex()}
                         for allocation, image in sorted(allocations.items())],
     }
-    if counts:
+    if counts and provider:
         result["copy_in"] = len(images)
         result["copy_out"] = len(landing_allocations | {920})
     # A case reports the source arm of each slot exactly when the suite
     # declares a lease arm (`research/docs/23` §90, R9i): the owned-only case
     # keeps the result shape every pre-R9i fixture has.
-    if any(entry.get("storage_mode", "owned_bytes") != "owned_bytes"
-           for entry in case["stage_buffers"]):
+    if provider and any(entry.get("storage_mode", "owned_bytes") != "owned_bytes"
+                        for entry in case["stage_buffers"]):
         result["storage_modes"] = [
             {"view": entry["view"], "mode": entry.get("storage_mode", "owned_bytes")}
             for entry in case["stage_buffers"]
@@ -137,7 +144,12 @@ def capture_for(suite, digest=None, backend="vulkan"):
     """
     digest = digest or suite_digest(suite)
     report = synthetic_report(suite, digest, backend)
-    report["results"].extend(render_result(suite, case) for case in suite["render_cases"])
+    # Each capture reports exactly the render cases its own rail's marker names
+    # (`research/docs/23` §1.2): the reviewed case's three rails each owe it,
+    # while the translated case stays out of every capture but the Vulkan one.
+    report["results"].extend(render_result(suite, case, provider=backend != "native-metal")
+                             for case in suite["render_cases"]
+                             if backend in case["capture_rails"])
     return report
 
 
@@ -154,8 +166,17 @@ class StageBufferDeclarationTests(unittest.TestCase):
         self.assertEqual([case["id"] for case in suite["cases"]],
                          [DECLARING_SINK_ID, DECLARING_LEASE_ID])
         self.assertEqual([case["id"] for case in suite["render_cases"]], [WRITE_ID, LEASE_ID])
-        for case in suite["render_cases"]:
-            self.assertEqual(case["capture_rails"], ["vulkan"])
+        # The two arms name different rails (`research/docs/23` §83). The
+        # translated pair is executable on the one rail that translates its AIR,
+        # while the reviewed pair runs on the three rails that compile the MSL
+        # module it pins: the Vulkan trace rail, the Swift oracle and the Rust
+        # native provider, whose stage-buffer bits the Apple device readings
+        # flipped (R9g/R9k). Neither arm may name an object rail, which binds no
+        # stage buffer at all, and the reviewed arm's marker is what makes the
+        # native captures owe the case rather than omit it.
+        self.assertEqual(render_case_by_id(suite, WRITE_ID)["capture_rails"], ["vulkan"])
+        self.assertEqual(render_case_by_id(suite, LEASE_ID)["capture_rails"],
+                         ["vulkan", "native-metal", "native-metal-provider"])
 
     def test_the_translated_case_pins_its_two_air_modules_and_no_msl_sibling(self):
         case = render_case_by_id(committed_suite(), WRITE_ID)
@@ -297,17 +318,48 @@ class StageBufferCaptureTests(unittest.TestCase):
         del self.result(report, LEASE_ID)["storage_modes"]
         self.reject("has to report the source arm", report)
 
-    def test_the_reference_oracle_is_not_a_provider_so_it_reports_no_arms(self):
-        # `native-metal` is the Swift reference oracle: it compiles MSL, not
-        # AIR, and its rail publishes no stage-buffer capability, so the cases'
-        # marker leaves it out and a capture that reported one anyway is
-        # refused. (Its "not a provider, so it reports no arm" branch is the
-        # defensive sibling of the compute path's rule and is unreachable while
-        # the marker is pinned to the Vulkan trace rail.)
+    def test_the_reference_oracle_runs_the_reviewed_case_and_reports_no_arms(self):
+        # `native-metal` is the Swift reference oracle: it compiles the reviewed
+        # MSL module the case pins, so the reviewed case's marker names it and
+        # its capture owes the case (`research/docs/23` §83, R9g). It places the
+        # bytes in its own buffers rather than importing an owner's window, so
+        # it is not a provider and reports no source arm — the same split the
+        # compute path's rule makes (`research/docs/23` §90, R9i).
         report = capture_for(self.suite, backend="native-metal")
-        del self.result(report, LEASE_ID)["storage_modes"]
-        self.reject("native-metal is not a rail this render case runs on",
-                    report, backend="native-metal")
+        self.validate(report, backend="native-metal")
+        # A capture of that rail that claims an arm it did not execute is
+        # refused by name.
+        self.result(report, LEASE_ID)["storage_modes"] = [
+            {"view": entry["view"], "mode": entry.get("storage_mode", "owned_bytes")}
+            for entry in render_case_by_id(self.suite, LEASE_ID)["stage_buffers"]
+        ]
+        self.reject("native-metal is not a provider, so it cannot report a source arm", report,
+                    backend="native-metal")
+
+    def test_the_translated_case_cannot_name_a_native_rail(self):
+        # Only the Vulkan rails translate the AIR the writable arm pins, so
+        # naming a native rail there would claim a capture that rail cannot
+        # report (`research/docs/23` §3.3, v84/v86).
+        suite = committed_suite()
+        render_case_by_id(suite, WRITE_ID)["capture_rails"] = [
+            "vulkan", "native-metal-provider"]
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "a stage-buffer case runs on the rails that bind its slots"):
+            compare._render_plan(compare._suite_plan(suite), suite)
+
+    def test_the_reviewed_case_may_name_the_object_rails_and_the_native_window(self):
+        # The reviewed arm may name the object rails from the increment that
+        # gave the object API its stage-buffer entry point on, and the shipped
+        # marker is the native window the Apple device readings opened
+        # (`research/docs/23` §3.3, v83/§87): a mutation that keeps the marker
+        # inside the arm's list is accepted, and the committed marker itself is
+        # the three-rail window.
+        suite = committed_suite()
+        self.assertEqual(render_case_by_id(suite, LEASE_ID)["capture_rails"],
+                         ["vulkan", "native-metal", "native-metal-provider"])
+        render_case_by_id(suite, LEASE_ID)["capture_rails"] = [
+            "vulkan", "vulkan-objects"]
+        compare._render_plan(compare._suite_plan(suite), suite)
 
 
 class StageBufferRefusalTests(unittest.TestCase):
@@ -400,9 +452,15 @@ class StageBufferRefusalTests(unittest.TestCase):
             case["stage_buffers"][2], case["stage_buffers"][0])
         self.reject("vertex bindings before fragment bindings")
 
-    def test_a_translated_case_naming_another_rail_is_refused(self):
+    def test_a_translated_case_naming_a_native_rail_is_refused(self):
+        # The marker has to stay inside the arm's own list: a translated case
+        # pins AIR only the Vulkan rails translate (`research/docs/23` §3.3,
+        # v84/v86), so a native rail named here would claim a capture that rail
+        # cannot report.
         self.render_case(WRITE_ID)["capture_rails"] = ["vulkan", "vulkan-objects"]
-        self.reject("runs on the Vulkan trace rail alone")
+        self.validate()
+        self.render_case(WRITE_ID)["capture_rails"] = ["vulkan", "native-metal"]
+        self.reject("capture_rails has to stay inside that list")
 
     def test_a_case_carrying_both_source_spellings_is_refused(self):
         case = self.render_case(WRITE_ID)

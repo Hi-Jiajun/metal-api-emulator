@@ -67,12 +67,24 @@ MAX_RENDER_STAGE_BUFFER_INDEX = 16
 # (`metal_api_core::provider::RENDER_AFFINE_AXES`): `0` is the vertex index,
 # `1` the instance index.
 RENDER_AFFINE_AXES = 2
-# The Vulkan trace rail: the reference rail every stage-buffer case names
-# (`research/docs/23` §3.3, v83-v87).
+# The Vulkan trace rail: the one rail that translates a stage-buffer case's AIR
+# stages (`research/docs/23` §3.3, v83-v86).
 VULKAN_TRACE_RAIL = "vulkan"
 # The Vulkan object rails (`research/docs/23` §3.3, v87): one marker covers the
-# synchronous and the deferred run, because both captures report this backend.
+# synchronous and the deferred run, because both captures report this backend,
+# and the object API binds stage buffers from v87's own entry point on.
 VULKAN_OBJECTS_RAIL = "vulkan-objects"
+# The rails that bind a *reviewed* stage-buffer case's slots (`research/docs/23`
+# §83, R9g): the Vulkan trace rail and the two native faces, which compile the
+# reviewed MSL module the case pins — the Swift oracle through its own render
+# encoder and the Rust native provider through the same module the rail
+# embeds. A translated case's AIR pair is only executable on the rail whose
+# translator mints its descriptor sets, so that arm names the Vulkan rails.
+STAGE_BUFFER_RAILS = (VULKAN_TRACE_RAIL, "native-metal", "native-metal-provider")
+# The rails a *translated* stage-buffer case may name: the Vulkan trace rail
+# translates its AIR, and the object rails bind its slots through the object
+# API's own stage-buffer entry point (`research/docs/23` §3.3, v87).
+TRANSLATED_STAGE_BUFFER_RAILS = (VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL)
 
 # One stage-buffer slot a render case declares (`research/docs/23` §3.3,
 # v83-v86): the pipeline's declaration (`stage`, `index`, `access`, `footprint`)
@@ -3260,27 +3272,25 @@ def _render_plan(plan, suite):
                  and all(isinstance(rail, str) and rail in ALLOCATION_OBSERVATIONS
                          for rail in rails),
                  f"{where}: capture_rails has to name distinct known backends")
-        # The rails a stage-buffer case runs on (`research/docs/23` §3.3,
-        # v83-v87). The v31 increment pinned the marker to the Vulkan trace rail
-        # alone: the object API bound no stage buffers, the native rails
-        # translate no AIR and publish no render stage-buffer capability, and the
-        # Swift oracle compiles no AIR, so naming another rail would claim an
-        # observation that rail cannot report. The object rails gained their own
-        # entry point in the increment that follows, so a case of that suite may
-        # name them beside the trace rail — one marker covers the synchronous and
-        # the deferred run, because both captures report the object backend —
-        # while the native rails and the oracle stay out of every such marker.
+        # A stage-buffer case names the rails that bind its slots
+        # (`research/docs/23` §3.3, v83-v87), and the two arms name different
+        # ones. A *translated* case pins two AIR modules only the Vulkan rails
+        # translate, and the object rails bind its slots through the object
+        # API's own entry point. A *reviewed* case pins the MSL module the two
+        # native faces compile — the Swift oracle through its own render encoder
+        # and the native provider through the same bytes the rail embeds — so it
+        # may name those beside the Vulkan rails, now that the Apple device
+        # readings flipped `supports_render_stage_buffers` (R9g/R9k, §83/§92).
+        # Either way the marker stays a subset of the arm's list: a case that
+        # names a rail outside it would claim a capture that rail cannot report.
         if case.get("stage_buffers"):
-            if suite["suite"] == "compute-buffer-v31":
-                pinned = [VULKAN_TRACE_RAIL]
-                refusal = ("a stage-buffer case runs on the Vulkan trace rail alone, so its "
-                           "capture_rails has to be [\"vulkan\"]")
+            if case.get("translated_stages") is not None:
+                allowed = TRANSLATED_STAGE_BUFFER_RAILS
             else:
-                pinned = [VULKAN_TRACE_RAIL, VULKAN_OBJECTS_RAIL]
-                refusal = ("a stage-buffer case runs on the Vulkan trace rail and its object "
-                           "rails, so its capture_rails has to be [\"vulkan\", "
-                           "\"vulkan-objects\"]")
-            _require(rails == pinned, f"{where}: {refusal}")
+                allowed = STAGE_BUFFER_RAILS + (VULKAN_OBJECTS_RAIL,)
+            _require(rails and all(rail in allowed for rail in rails),
+                     f"{where}: a stage-buffer case runs on the rails that bind its slots ("
+                     + ", ".join(allowed) + "), so its capture_rails has to stay inside that list")
 
         # Every attachment resolves against the declaring case's own table:
         # one of its declared views has to be the attachment, it has to be

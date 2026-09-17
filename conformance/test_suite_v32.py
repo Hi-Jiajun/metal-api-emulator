@@ -172,7 +172,14 @@ class StageBufferSuiteTests(unittest.TestCase):
             carried = copy.deepcopy(render_case_by_id(suite, case_id))
             original = copy.deepcopy(render_case_by_id(previous, case_id))
             self.assertEqual(carried.pop("capture_rails"), RAILS)
-            self.assertEqual(original.pop("capture_rails"), ["vulkan"])
+            if case_id == WRITE_ID:
+                # The translated case stays on the Vulkan trace rail.
+                self.assertEqual(original.pop("capture_rails"), ["vulkan"])
+            else:
+                # The reviewed case names the native window the Apple device
+                # readings opened (`research/docs/23` §3.3, v83).
+                self.assertEqual(original.pop("capture_rails"),
+                                 ["vulkan", "native-metal", "native-metal-provider"])
             self.assertEqual(carried, original)
 
     def test_the_staged_case_is_the_borrowed_case_with_the_staged_arm(self):
@@ -279,13 +286,14 @@ class StageBufferCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(compare.CaptureError, "missing cases"):
             check(self.suite, report, "vulkan-objects")
 
-    def test_a_native_rail_marker_is_refused(self):
-        # The native rails translate no AIR and publish no render stage-buffer
-        # capability, so a case that named one would claim an observation that
-        # rail cannot report (`research/docs/23` §3.3, v83).
-        case = render_case_by_id(self.suite, STAGED_ID)
+    def test_a_translated_case_cannot_name_a_native_rail(self):
+        # The translated arm pins AIR only the Vulkan rails translate, so a
+        # native rail named there would claim an observation that rail cannot
+        # report (`research/docs/23` §3.3, v83/v87).
+        case = render_case_by_id(self.suite, WRITE_ID)
         case["capture_rails"] = RAILS + ["native-metal-provider"]
-        with self.assertRaisesRegex(compare.CaptureError, "capture_rails has to be"):
+        with self.assertRaisesRegex(compare.CaptureError,
+                                    "capture_rails has to stay inside that list"):
             compare._render_plan(compare._suite_plan(self.suite), self.suite)
 
 
@@ -310,11 +318,11 @@ class StageBufferRefusalTests(unittest.TestCase):
         return next(entry for entry in case["stage_buffers"]
                     if entry["stage"] == stage and entry["index"] == index)
 
-    def test_a_trace_only_marker_is_refused(self):
-        # The suite's one marker statement: every stage-buffer case of this
-        # increment runs on the trace rail and the object rails.
-        self.render_case(STAGED_ID)["capture_rails"] = ["vulkan"]
-        self.reject("capture_rails has to be")
+    def test_a_marker_naming_no_rail_is_refused(self):
+        # The marker has to name at least one rail: an empty list is not a
+        # capture any backend can answer (`research/docs/23` §3.3, v87).
+        self.render_case(STAGED_ID)["capture_rails"] = []
+        self.reject("capture_rails")
 
     def test_a_staged_arm_without_its_owner_window_is_refused(self):
         del self.slot(STAGED_ID)["allocation_size"]

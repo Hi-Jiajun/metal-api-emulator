@@ -311,18 +311,19 @@ impl NativeMetalProvider {
             // Apple GPU; they come from one spelling (`crate::icb`) so the
             // snapshot and the flip condition cannot drift.
             let icb_bits = icb::icb_capability_bits();
-            // The stage-buffer bits stay closed until the Apple device run
-            // lands (`--stage-buffer-selftest`); they come from one spelling
-            // (`crate::render`) so the snapshot and the flip condition cannot
-            // drift.
+            // The stage-buffer bits are open as of the Apple device readings
+            // (`--stage-buffer-selftest` and `--stage-buffer-write-selftest`,
+            // `render::stage_buffer_capability_bits`); they come from one
+            // spelling (`crate::render`) so the snapshot and the flip condition
+            // cannot drift.
             let stage_buffer_bits = render::stage_buffer_capability_bits();
             let capabilities = ProviderCapabilities {
                 // The stage-buffer face's own window (`research/docs/23` §83,
-                // R9g): the reviewed module and the encoder's
-                // `setVertexBuffer`/`setFragmentBuffer` binding exist, but no
-                // Apple device reading has confirmed the frame yet, so the bit
-                // stays closed and core admission refuses the shape by name
-                // instead of executing it unmeasured.
+                // §92, R9g/R9k): the reviewed modules and the encoder's
+                // `setVertexBuffer`/`setFragmentBuffer` binding are the shape
+                // the two Apple device readings confirmed, so the snapshot
+                // declares the pair and core admission admits the reviewed
+                // stage-buffer trace instead of refusing it by name.
                 supports_render_stage_buffers: stage_buffer_bits.supports_render_stage_buffers,
                 max_render_stage_buffers: stage_buffer_bits.max_render_stage_buffers,
                 max_passes: 8,

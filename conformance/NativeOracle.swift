@@ -654,10 +654,11 @@ private struct RenderCaseDefinition: Decodable {
     let metal: RenderSourcePin?
     /// The stage-buffer slots the case's pipeline declares and its pass binds
     /// (`research/docs/23` §3.3, v83-v86), or `nil` for every pre-v83 case.
-    /// This oracle executes none of them: the native rail publishes no render
-    /// stage-buffer capability at this revision and compiles no AIR, so a case
-    /// that declares a slot is marked for the Vulkan trace rail alone and this
-    /// rail refuses to claim it (`validateRenderCase`).
+    /// This oracle executes the *reviewed* arm — the case that pins the module
+    /// the `--stage-buffer-selftest` run measured — by binding each slot at its
+    /// own stage's index; the *translated* arm pins two AIR modules this oracle
+    /// compiles no part of, so a case that carries those is refused by name for
+    /// this rail (`validateRenderCase`).
     let stage_buffers: [RenderStageBufferDefinition]?
     /// The two AIR modules a translated case's stages come from
     /// (`research/docs/23` §3.3, v84), or `nil` for a reviewed case, which
@@ -841,6 +842,73 @@ private struct RenderStageBufferDefinition: Decodable {
     let stage: String
     let index: UInt32
     let access: String
+    /// The declared byte footprint (`research/docs/23` §3.3, v86): the static
+    /// ceiling the reviewed pair states, or the affine access set a translated
+    /// module's reflection states.
+    let footprint: StageBufferFootprintDefinition
+    /// The view the case binds at this slot: identity, range and bytes.
+    let allocation: UInt64
+    let view: UInt64
+    let offset: UInt64
+    let length: UInt64
+    let initial_hex: String
+    /// The owner window a lease arm states, or `nil` for the owned arm.
+    let allocation_size: UInt64?
+    let storage_mode: String?
+    /// The bytes a writable slot's writeback lands, or `nil` for a read-only
+    /// one.
+    let expected_hex: String?
+}
+
+/// One stage-buffer slot's declared footprint (`research/docs/23` §3.3, v86).
+///
+/// Two arms exist and no third, exactly as the contract states them: a static
+/// ceiling in bytes, or the affine access set a translated module's reflection
+/// states. Both halves are decoded so a suite that states neither, or both, is
+/// refused by name rather than read as one of the two.
+private struct StageBufferFootprintDefinition: Decodable {
+    struct StaticCeiling: Decodable {
+        let max_bytes: UInt64
+    }
+
+    struct AffineAccess: Decodable {
+        struct Term: Decodable {
+            let axis: Int
+            let stride: UInt64
+        }
+
+        let base_offset: UInt64
+        let access_size: UInt64
+        let terms: [Term]
+    }
+
+    struct Affine: Decodable {
+        let accesses: [AffineAccess]
+    }
+
+    // `static` is a Swift keyword, so the key needs backticks on both sides of
+    // the decode.
+    let `static`: StaticCeiling?
+    let affine: Affine?
+}
+
+/// One stage-buffer slot a *reviewed* stage-buffer case declares, in the form
+/// the runner binds (`research/docs/23` §83, R9g).
+///
+/// The oracle places the case's own bytes in its own `MTLBuffer` at the slot's
+/// own stage namespace and index, so the three source arms differ only in what
+/// they state about the owner window (`research/docs/23` §90, R9i) — which is
+/// why the arm is validated here and not carried as a field.
+private struct ValidatedStageBuffer {
+    /// The stage whose `[[buffer(index)]]` argument this slot fills: `vertex`
+    /// or `fragment`, the two spellings the contract admits.
+    let stage: String
+    let index: UInt32
+    /// The bytes the case's view carries, exactly its declared length.
+    let bytes: Data
+    /// The declared static ceiling, already proven to cover the reviewed
+    /// module's own reach.
+    let footprint: UInt64
 }
 
 /// The two AIR modules a translated render case's stages come from
@@ -860,6 +928,11 @@ private struct ValidatedRender {
     /// One entry per bound vertex stream, in binding order, with the bytes the
     /// case's own views carry. Empty for the `vertex_id` shape.
     let vertexStreams: [ValidatedVertexStream]
+    /// One entry per stage-buffer slot the case declares, in the contract's
+    /// canonical order (vertex bindings before fragment bindings, ascending
+    /// inside each stage). Empty for every case that declares none
+    /// (`research/docs/23` §3.3, v83-v86).
+    let stageBuffers: [ValidatedStageBuffer]
     /// The index buffer of an indexed case, with its footprint and index values
     /// already proved against the streams above.
     let indexStream: ValidatedIndexStream?
@@ -2758,45 +2831,179 @@ private func loadRenderSource(_ pin: RenderSourcePin, root: URL) throws -> Data 
 }
 
 @available(macOS 11.0, *)
-/// Validate one stage-buffer render case's metadata and refuse to execute it
-/// (`research/docs/23` §3.3, v83-v86).
+/// Validate one *translated* stage-buffer case's pins (`research/docs/23` §3.3,
+/// v84-v86) and refuse to execute it.
 ///
-/// This oracle compiles MSL, not the AIR a translated case pins, and the native
-/// rail publishes no render stage-buffer capability at this revision — its
-/// `stage_buffer_capability_bits()` reports `supports_render_stage_buffers =
-/// false`, so a native capture could only drop the bindings. The case is
-/// therefore marked for the Vulkan trace rail alone, and that rule is what this
-/// function enforces: a suite that named a native rail here would claim an
-/// observation no native capture can report.
+/// A translated case's two stages are AIR, and this oracle compiles MSL: the
+/// only rail that turns that pair into an executable pipeline is the Vulkan
+/// trace rail, whose translator the case's own descriptor sets come from. A
+/// suite that named this rail here would claim an observation this oracle
+/// cannot report, so the marker rule is refused by name — and the pinned AIR
+/// sources are still verified, so a suite cannot leave a dangling fixture
+/// behind a case this rail skips.
 ///
-/// The returned value is a placeholder that is never read: the runner selects
-/// the cases it executes by the same marker this function pins, and the marker
-/// rule is what keeps this rail out of the case. The pinned sources are still
-/// verified, so a suite cannot leave a dangling fixture behind a skipped case.
-private func validateStageBufferRenderCase(_ definition: RenderCaseDefinition,
-                                           _ stageBuffers: [RenderStageBufferDefinition],
-                                           root: URL) throws -> ValidatedRender {
-    try require(!definition.capture_rails.contains(where: { $0.hasPrefix("native-metal") }),
-                "\(definition.id): the native rails execute no stage-buffer case yet: mark it "
-                + "for the Vulkan trace rail, which binds the slots this case declares")
+/// The writable arm's suite case is this translated pair, which is why the
+/// writable slots are refused here rather than bound (see
+/// [`validateReviewedStageBufferSlots`]): the writable *device* reading is the
+/// `--stage-buffer-write-selftest` run of the reviewed writable module, and the
+/// native rail's plan half covers the same declarations (`render.rs`).
+private func validateTranslatedStageBufferCase(_ definition: RenderCaseDefinition,
+                                                _ stageBuffers: [RenderStageBufferDefinition],
+                                                root: URL) throws -> ValidatedRender {
+    try require(!definition.capture_rails.contains("native-metal"),
+                "\(definition.id): this oracle compiles the reviewed MSL modules, not the AIR "
+                + "the translated stage-buffer case pins: mark it for the Vulkan trace rail, "
+                + "which translates that pair")
+    guard let translated = definition.translated_stages else {
+        throw OracleError("\(definition.id): a stage-buffer case pins the sources its stages "
+                          + "read")
+    }
+    for pin in [translated.vertex, translated.fragment] {
+        _ = try loadRenderSource(pin, root: root)
+    }
     for slot in stageBuffers {
         try require(slot.stage == "vertex" || slot.stage == "fragment",
                     "\(definition.id): unknown stage-buffer stage \"\(slot.stage)\"")
         try require(["read", "write", "read_write"].contains(slot.access),
                     "\(definition.id): unknown stage-buffer access \"\(slot.access)\"")
     }
-    if let translated = definition.translated_stages {
-        for pin in [translated.vertex, translated.fragment] {
-            _ = try loadRenderSource(pin, root: root)
-        }
-    } else if let metal = definition.metal {
-        _ = try loadRenderSource(metal, root: root)
-    } else {
-        throw OracleError("\(definition.id): a stage-buffer case pins the sources its stages "
-                          + "read")
-    }
     return ValidatedRender(definition: definition, source: "", attachments: [],
-                           vertexStreams: [], indexStream: nil, depth: nil, stencil: nil)
+                           vertexStreams: [], stageBuffers: [], indexStream: nil,
+                           depth: nil, stencil: nil)
+}
+
+@available(macOS 11.0, *)
+/// Validate one *reviewed* stage-buffer case's slots and hand the runner the
+/// bindings it has to state (`research/docs/23` §83, R9g; §90, R9i).
+///
+/// The case pins the reviewed `conformance/shaders/render_stage_buffer_2x2.metal`
+/// module — the module the `--stage-buffer-selftest` run measured on an Apple
+/// device, whose two stages read their own `[[buffer(0)]]` argument — so this
+/// oracle can execute it: each slot's bytes go into an `MTLBuffer` the encoder
+/// binds at that stage's own index, exactly as the Rust rail's `plan_stage_buffers`
+/// resolves the same declarations.
+///
+/// The rules mirror the two other review surfaces (`compare.py`'s
+/// `_stage_buffer_section` and `provider-capture`'s `reviewed_stage_buffer_geometry`)
+/// field by field, because all three have to admit the same fixture: the
+/// contract's canonical list (vertex before fragment, ascending inside each
+/// stage, one slot each), the reviewed pair's own two read-only slots, a static
+/// ceiling that covers the module's fixed reach, a view whose bytes cover that
+/// ceiling, the owner window of a lease arm, and no expectation on a read-only
+/// slot. The writable arm is refused by name: its suite case is the translated
+/// AIR pair above, and the reviewed writable module's device reading is the
+/// `--stage-buffer-write-selftest` run.
+private func validateReviewedStageBufferSlots(_ definition: RenderCaseDefinition,
+                                              _ stageBuffers: [RenderStageBufferDefinition],
+                                              root: URL) throws -> [ValidatedStageBuffer] {
+    guard let metal = definition.metal else {
+        throw OracleError("\(definition.id): a reviewed stage-buffer case pins the module its "
+                          + "stages read")
+    }
+    let reviewed = reviewedStageBufferModule()
+    try require(metal == reviewed.metal,
+                "\(definition.id): unreviewed stage-buffer module identity")
+    _ = try loadRenderSource(metal, root: root)
+    try require(definition.vertex_entry == reviewed.vertex_entry
+                && definition.fragment_entry == reviewed.fragment_entry,
+                "\(definition.id): unreviewed stage-buffer entry pair")
+    // The stages read their bytes from their own buffers, so the draw carries
+    // no stream, layout or index buffer and states the reviewed three-vertex
+    // `vertex_id` triangle (`research/docs/23` §3.3, v83). Its instance count is
+    // the reviewed one, because the pair's reach is stated in vertices alone.
+    try require(definition.vertex_layout == nil && definition.vertex_buffers == nil
+                && definition.indices == nil,
+                "\(definition.id): a stage-buffer case binds no vertex stream, layout or index "
+                + "buffer")
+    try require(definition.vertices == 3,
+                "\(definition.id): the reviewed stage-buffer geometry draws three vertices")
+    try require((definition.instance_count ?? 1) == 1,
+                "\(definition.id): the reviewed stage-buffer geometry draws one instance")
+    try require((definition.base_vertex ?? 0) == 0,
+                "\(definition.id): a stage-buffer case has no index buffer to add a base vertex "
+                + "to")
+    try require(stageBuffers.count == 2,
+                "\(definition.id): the reviewed stage-buffer pair declares two slots")
+    // The reviewed module's own argument list (`render.rs::REVIEWED_STAGE_BUFFER_*`):
+    // vertex `[[buffer(0)]]` reads three `float32x2` positions and fragment
+    // `[[buffer(0)]]` one `float32x4` tint, both with a static reach.
+    let reflected = [("vertex", UInt32(0), UInt64(24)), ("fragment", UInt32(0), UInt64(16))]
+    var slots = [ValidatedStageBuffer]()
+    var seen = [String]()
+    var identity = [(UInt64, UInt64)]()
+    for (position, slot) in stageBuffers.enumerated() {
+        let expected = reflected[position]
+        try require(slot.stage == expected.0 && slot.index == expected.1,
+                    "\(definition.id): the reviewed pair's slot \(position) is "
+                    + "\(expected.0)/\(expected.1), not \"\(slot.stage)\"/\(slot.index)")
+        try require(slot.access == "read",
+                    "\(definition.id): stage buffer \(slot.stage)/\(slot.index) declares "
+                    + "\"\(slot.access)\": the reviewed pair's slots are read-only, and the "
+                    + "writable arm's device reading is --stage-buffer-write-selftest")
+        let name = "\(slot.stage)/\(slot.index)"
+        try require(!seen.contains(name),
+                    "\(definition.id): stage buffer \(name) is declared twice")
+        seen.append(name)
+        guard let ceiling = slot.footprint.static, slot.footprint.affine == nil else {
+            throw OracleError("\(definition.id): stage buffer \(name) states one of the two "
+                              + "footprint arms: the reviewed pair's slots are static ceilings, "
+                              + "and an affine reach belongs to a translated module")
+        }
+        try require(ceiling.max_bytes >= expected.2,
+                    "\(definition.id): stage buffer \(name) declares \(ceiling.max_bytes) bytes, "
+                    + "past the reviewed module's own \(expected.2)")
+        try require(slot.allocation != 0 && slot.view != 0,
+                    "\(definition.id): stage buffer \(name) has to name a view identity")
+        let bytes = try decodeHex(slot.initial_hex,
+                                  context: "\(definition.id) stage buffer \(name)")
+        try require(UInt64(bytes.count) == slot.length,
+                    "\(definition.id): stage buffer \(name) declares \(slot.length) bytes of view "
+                    + "but \(bytes.count) bytes of data")
+        try require(ceiling.max_bytes <= slot.length,
+                    "\(definition.id): stage buffer \(name) declares a \(ceiling.max_bytes)-byte "
+                    + "footprint its \(slot.length)-byte view does not cover")
+        if slot.expected_hex != nil {
+            throw OracleError("\(definition.id): stage buffer \(name) is read-only, so it "
+                              + "carries no expectation")
+        }
+        // The three source arms (`research/docs/23` §90, R9i): an owned slot
+        // states no owner window, the two lease arms state one the view fits
+        // inside. The oracle places the same bytes either way, so the arm is a
+        // declaration rule here rather than a second code path.
+        let mode = slot.storage_mode ?? "owned_bytes"
+        try require(["owned_bytes", "staged_lease", "borrowed_no_copy"].contains(mode),
+                    "\(definition.id): stage buffer \(name) has unknown storage mode \"\(mode)\"")
+        if mode == "owned_bytes" {
+            try require(slot.allocation_size == nil,
+                        "\(definition.id): stage buffer \(name) is owned, so it states no owner "
+                        + "window")
+        } else {
+            guard let window = slot.allocation_size else {
+                throw OracleError("\(definition.id): stage buffer \(name) states the owner "
+                                  + "window of its lease arm")
+            }
+            // The two sums are checked in the safe order: a suite whose offset
+            // lies past its own window is refused rather than overflow-trapped.
+            try require(slot.offset <= window && slot.length <= window - slot.offset,
+                        "\(definition.id): stage buffer \(name) lies outside its owner's "
+                        + "registration")
+        }
+        identity.append((slot.allocation, slot.view))
+        slots.append(ValidatedStageBuffer(stage: slot.stage, index: slot.index,
+                                          bytes: bytes, footprint: ceiling.max_bytes))
+    }
+    // A slot's view is its own byte string: the case's attachment is the
+    // declaring pass's pool view, so one identity cannot stand for both
+    // (`research/docs/23` §3.3, v86).
+    let attachments = try colorAttachments(definition)
+    for attachment in attachments {
+        for (allocation, view) in identity {
+            try require(allocation != attachment.allocation || view != attachment.view,
+                        "\(definition.id): the stage buffers declare their own bytes, so they "
+                        + "cannot reuse the attachment's view")
+        }
+    }
+    return slots
 }
 
 private func loadRenderCases(_ suite: SuiteDefinition, root: URL) throws -> [ValidatedRender] {
@@ -2862,16 +3069,31 @@ private func instancedTintTexels(_ stream: ValidatedVertexStream,
 @available(macOS 11.0, *)
 private func validateRenderCase(_ definition: RenderCaseDefinition,
                                 root: URL) throws -> ValidatedRender {
-    // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) is the one
-    // render case this oracle does not execute: `crates/metal-api-native/src/render.rs`
-    // publishes `supports_render_stage_buffers = false` at this revision, and a
-    // *translated* case pins two AIR modules this oracle does not compile. The
-    // case is therefore marked for the Vulkan trace rail alone, and the marker
-    // is refused here rather than read as an ordinary render case.
-    if let stageBuffers = definition.stage_buffers, !stageBuffers.isEmpty {
-        return try validateStageBufferRenderCase(definition, stageBuffers, root: root)
+    // The stage-buffer shape (`research/docs/23` §3.3, v83-v86) arrives in two
+    // arms. A *translated* case pins two AIR modules this oracle compiles no
+    // part of, so it keeps its own validation and is refused by name for this
+    // rail. A *reviewed* case pins the MSL module the `--stage-buffer-selftest`
+    // run measured, so its slots are validated here and the case then follows
+    // the same attachment, draw and expectation path every other case takes —
+    // the module the reviewed pair selects is not the shape-selected one, which
+    // is why the selection happens here rather than in [`reviewedModule(for:)`].
+    var stageBufferSlots = [ValidatedStageBuffer]()
+    var stageBufferArm = false
+    if let declared = definition.stage_buffers, !declared.isEmpty {
+        if definition.translated_stages != nil {
+            return try validateTranslatedStageBufferCase(definition, declared, root: root)
+        }
+        stageBufferSlots = try validateReviewedStageBufferSlots(definition, declared, root: root)
+        stageBufferArm = true
     }
-    let reviewed = try reviewedModule(for: definition)
+    // The `try` covers the shape-selected arm alone, so the two selections are
+    // stated as branches rather than as a ternary the keyword cannot sit in.
+    let reviewed: ReviewedRenderModule
+    if stageBufferArm {
+        reviewed = reviewedStageBufferModule()
+    } else {
+        reviewed = try reviewedModule(for: definition)
+    }
     try require(definition.vertex_entry == reviewed.vertex_entry
                 && definition.fragment_entry == reviewed.fragment_entry
                 && definition.metal == reviewed.metal,
@@ -4417,7 +4639,8 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
     }
     return ValidatedRender(definition: definition, source: source,
                            attachments: validatedAttachments,
-                           vertexStreams: vertexStreams, indexStream: indexStream,
+                           vertexStreams: vertexStreams, stageBuffers: stageBufferSlots,
+                           indexStream: indexStream,
                            depth: validatedDepth, stencil: validatedStencil)
 }
 
@@ -5334,6 +5557,28 @@ private func runRenderCase(_ fixture: ValidatedRender, device: MTLDevice,
         encoder.setVertexBuffer(buffer,
                                 offset: try hostOffset(stream.offset, id: definition.id),
                                 index: stream.binding)
+    }
+    // The reviewed stage-buffer slots (`research/docs/23` §83, R9g): each slot's
+    // bytes go into their own `MTLBuffer`, bound at that stage's own
+    // `[[buffer(index)]]` namespace — `setVertexBuffer` for the vertex stage and
+    // `setFragmentBuffer` for the fragment one, the two calls the module's two
+    // argument lists belong to. The case's own bytes are what the rail's
+    // `plan_stage_buffers` resolves for the same declarations, so the frame the
+    // readback compares is the one the pinned fixture states. The local keeps
+    // the buffers alive until the command buffer has completed.
+    var stageBufferBuffers = [MTLBuffer]()
+    for slot in fixture.stageBuffers {
+        let buffer = try makeStreamBuffer(device: device, id: definition.id,
+                                          offset: 0, bytes: slot.bytes)
+        stageBufferBuffers.append(buffer)
+        switch slot.stage {
+        case "vertex":
+            encoder.setVertexBuffer(buffer, offset: 0, index: Int(slot.index))
+        case "fragment":
+            encoder.setFragmentBuffer(buffer, offset: 0, index: Int(slot.index))
+        default:
+            throw OracleError("\(definition.id): unknown stage-buffer stage \"\(slot.stage)\"")
+        }
     }
     // The reviewed render sampler's own texture (`research/docs/23` §3.3,
     // v70): shared storage, `shaderRead` usage and the case's uploaded texels,
