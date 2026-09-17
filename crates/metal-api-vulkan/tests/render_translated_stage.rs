@@ -231,6 +231,7 @@ fn translated_contract(color_formats: Vec<AttachmentFormat>) -> RenderPipelineCo
         fragment_entry: FRAGMENT_ENTRY.to_owned(),
         color_formats,
         vertex_layout: VertexLayout::None,
+        textures: Vec::new(),
     }
 }
 
@@ -247,6 +248,7 @@ fn stage_buffer_contract(
         fragment_entry: fragment_entry.to_owned(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: VertexLayout::None,
+        textures: Vec::new(),
     }
 }
 
@@ -271,6 +273,7 @@ fn reviewed_contract() -> RenderPipelineContract {
         fragment_entry: REVIEWED_FRAGMENT_ENTRY.to_owned(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: VertexLayout::None,
+        textures: Vec::new(),
     }
 }
 
@@ -649,6 +652,7 @@ fn translated_vertex_stages_land_the_metal_ndc_mapping() {
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex,
             fragment,
@@ -1362,6 +1366,7 @@ fn a_translation_consuming_an_unproduced_varying_is_refused() {
                 fragment_entry: VARYING_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex,
             fragment,
@@ -1478,6 +1483,7 @@ fn two_stream_contract() -> RenderPipelineContract {
         fragment_entry: FRAGMENT_ENTRY.to_owned(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: two_stream_layout(),
+        textures: Vec::new(),
     }
 }
 

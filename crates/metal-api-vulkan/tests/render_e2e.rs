@@ -37,9 +37,10 @@ use metal_api_core::provider::{
     PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderAttachment, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount,
-    SemanticDigest, StageBufferBinding, StageBufferView, StagedLease, StoreOp, TextureAccess,
-    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+    SamplerAddressMode, SamplerFilter, SamplerPolicy, SemanticDigest, StageBufferBinding,
+    StageBufferView, StagedLease, StoreOp, TextureAccess, TextureBindingContract, TextureFormat,
+    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
+    VertexFormat, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -266,6 +267,7 @@ fn register_render(
             fragment_entry: "fragment_main".to_owned(),
             color_formats: vec![format],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         },
         vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
         fragment_spirv: fragment_spirv.to_vec(),
@@ -559,6 +561,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
             fragment_spirv: SOLID_UNORM8_DUAL_FRAG_SPV.to_vec(),
@@ -771,6 +774,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
             fragment_spirv: SOLID_UNORM8_DUAL_FRAG_SPV.to_vec(),
@@ -1768,6 +1772,46 @@ fn a_presenting_pass_with_a_render_texture_is_refused_by_name() {
         access: TextureAccess::Sampled,
         source: TextureSource::OwnedBytes(sampled_texels()[..16].to_vec()),
     }];
+    // The declaration travels with the pipeline (`research/docs/23` §3.3,
+    // v100), so a trace that binds a texture names a registration that states
+    // one. This test registers that registration — the reviewed solid pair's
+    // own two modules, under a declaration neither of them reads — and points
+    // the pass at it, so what it measures is the *present rail*'s own refusal
+    // rather than the contract's pair rules.
+    let declaring = fixture
+        .provider
+        .register_render_pipeline(RenderPipelineRequest {
+            contract: RenderPipelineContract {
+                stage_buffers: Vec::new(),
+                vertex_entry: "vertex_main".to_owned(),
+                fragment_entry: "fragment_main".to_owned(),
+                color_formats: vec![AttachmentFormat::Rgba8Unorm],
+                vertex_layout: VertexLayout::None,
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    SamplerPolicy {
+                        filter: SamplerFilter::Nearest,
+                        address: SamplerAddressMode::ClampToEdge,
+                    },
+                )],
+            },
+            vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
+            fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
+            logical_digest: SemanticDigest::new(
+                "metal-smoke-fixture-v1",
+                b"render_e2e_declaring_solid_stages".to_vec(),
+            )
+            .expect("digest"),
+        })
+        .expect("the declaring solid registration is well formed");
+    let named = pass.pipeline;
+    for pipeline in trace.pipelines.iter_mut() {
+        if pipeline.pipeline_id == named {
+            *pipeline = declaring.clone();
+        }
+    }
+    pass.pipeline = declaring.pipeline_id;
     let admitted = fixture
         .provider
         .capabilities()
@@ -1957,6 +2001,7 @@ fn vertex_input_fixture_with_raster(
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: quad_layout(),
+                textures: Vec::new(),
             },
             vertex_spirv: QUAD_VERT_SPV.to_vec(),
             fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
@@ -2901,6 +2946,17 @@ fn sampled_fixture() -> Option<(
                 fragment_entry: "fragment_main".to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                // The pair's declaration (`research/docs/23` §3.3, v100): the
+                // sampling module reads the pass's one texture at binding 0,
+                // with the state its MSL sibling's `constexpr sampler` carries.
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    SamplerPolicy {
+                        filter: SamplerFilter::Nearest,
+                        address: SamplerAddressMode::ClampToEdge,
+                    },
+                )],
             },
             vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
             fragment_spirv: SAMPLED_UNORM8_FRAG_SPV.to_vec(),
@@ -3045,8 +3101,15 @@ fn a_render_pass_samples_its_texture_and_lands_the_texels() {
         Err(error) => error,
     };
     eprintln!("sampling without a texture refused: {refused:?}");
-    assert_eq!(refused.slug, "render_texture_binding_required");
-    assert_eq!(refused.class, ProviderErrorClass::Capability);
+    // The refusal the pair rules state is the contract's own
+    // (`research/docs/23` §3.3, v100): the registration declared a texture the
+    // pass does not bind, so no rail ever sees the unbound descriptor.
+    assert_eq!(refused.slug, "trace_contract_invalid");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+    assert!(refused
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("declares texture binding 0")));
 }
 
 /// The present rail binds the format's solid fragment module rather than the
@@ -3082,22 +3145,24 @@ fn a_presenting_pass_beside_the_sampling_pair_is_refused_by_name() {
     assert_eq!(refused.slug, "render_texture_stage_unsupported");
     assert_eq!(refused.class, ProviderErrorClass::Capability);
 
-    // The same pass without its binding: the sampling pair needs its texture,
-    // and the present rail still refuses rather than sampling nothing.
+    // The same pass without its binding: the pair rules refuse it
+    // (`research/docs/23` §3.3, v100) before the present rail's own arm runs,
+    // because the registration declared the very texture this pass dropped.
     let mut unbound = presenting.clone();
     if let Some(TracePass::Render(pass)) = unbound.passes.last_mut() {
         pass.textures = Vec::new();
     }
-    let admitted = provider
+    let refused = provider
         .capabilities()
         .validate_trace(unbound, resources)
-        .expect("the unbound declaration stays well formed");
-    let refused = provider
-        .submit(admitted)
-        .expect_err("the sampling pair without its texture is not the present rail's shape");
+        .expect_err("the sampling pair's declaration names a texture this pass no longer binds");
     eprintln!("sampling pair without a texture refused beside a present pass: {refused:?}");
-    assert_eq!(refused.slug, "render_texture_binding_required");
-    assert_eq!(refused.class, ProviderErrorClass::Capability);
+    assert_eq!(refused.slug, "trace_contract_invalid");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+    assert!(refused
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("declares texture binding 0")));
 }
 
 /// Submit one sampled trace exactly as the milestone case does and land the
@@ -3832,6 +3897,7 @@ fn a_device_loss_rebuild_retires_resident_targets() {
                     fragment_entry: "fragment_main".to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: quad_layout(),
+                    textures: Vec::new(),
                 },
                 vertex_spirv: QUAD_VERT_SPV.to_vec(),
                 fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
@@ -4154,6 +4220,7 @@ fn stage_buffer_fixture() -> Option<(
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
                 stage_buffers: stage_buffer_declarations(),
+                textures: Vec::new(),
             },
             vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
@@ -4168,6 +4235,7 @@ fn stage_buffer_fixture() -> Option<(
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
                 stage_buffers: stage_buffer_declarations(),
+                textures: Vec::new(),
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
             fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),
@@ -4394,6 +4462,7 @@ fn the_reviewed_stage_buffer_pair_requires_its_two_bindings() {
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
                 stage_buffers: Vec::new(),
+                textures: Vec::new(),
             },
             vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
@@ -4520,6 +4589,7 @@ fn translated_stage_buffer_fixture(
                     // One `float4` load is the whole reach of the fixture.
                     footprint: FootprintProof::Static { max_bytes: 16 },
                 }],
+                textures: Vec::new(),
             },
             vertex,
             fragment,
@@ -4840,6 +4910,7 @@ fn a_presenting_stage_buffer_pair_requires_its_two_bindings() {
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
                 stage_buffers: Vec::new(),
+                textures: Vec::new(),
             },
             vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
@@ -5004,6 +5075,7 @@ fn write_stage_buffer_registration(
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
             stage_buffers: declarations,
+            textures: Vec::new(),
         },
         vertex,
         fragment,
@@ -5327,6 +5399,7 @@ fn the_writable_stage_buffer_face_refuses_what_it_cannot_land() {
                     access: BufferAccess::Write,
                     footprint: FootprintProof::Static { max_bytes: 24 },
                 }],
+                textures: Vec::new(),
             },
             vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
@@ -5493,6 +5566,7 @@ fn affine_stage_buffer_registration(
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
             stage_buffers: vec![declaration],
+            textures: Vec::new(),
         },
         vertex,
         fragment,
