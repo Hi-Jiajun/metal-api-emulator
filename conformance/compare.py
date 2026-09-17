@@ -19,6 +19,15 @@ MAX_ALLOCATION_BYTES = 1_048_576
 MAX_SERIAL_RESOURCES = 64
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
+# The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
+# window the render rails' fixtures measure. The rails declare the smaller of
+# this ceiling and the device's own framebuffer limit, so a fixture at the
+# ceiling is inside every conformant device's window (Vulkan's minimum
+# `maxFramebufferWidth` is 4096; Metal's 2D texture ceiling is 16384) and the
+# boundary case below runs unconditionally. A wider extent is a deliberate
+# change that owes a boundary fixture at the new value, in all three review
+# surfaces.
+REVIEWED_ATTACHMENT_CEILING = 64
 ALLOCATION_OBSERVATIONS = {
     "native-metal": "gpu-buffer-readback",
     "vulkan": "host-writeback-landing",
@@ -2075,12 +2084,16 @@ def _render_plan(plan, suite):
             width = _integer(attachment.get("width"), f"{attachment_where}.width", 1)
             height = _integer(attachment.get("height"), f"{attachment_where}.height", 1)
             # The rail executes attachments up to `max_attachment_dimension`
-            # (`research/docs/23` §3.3, v27): the reviewed fragment stages are
-            # extent-independent, so any 1..=4 square or rectangle is a shape a
-            # fixture may pin, as long as every attachment of one pass shares it.
-            _require(1 <= width <= 4 and 1 <= height <= 4,
-                     f"{attachment_where}: the attachment extent is one to four "
-                     "texels per axis")
+            # (`research/docs/23` §3.3, v27; widened by R1b, §70): the reviewed
+            # fragment stages are extent-independent, so any 1..=64 square or
+            # rectangle is a shape a fixture may pin, as long as every
+            # attachment of one pass shares it. The ceiling is the reviewed
+            # window every conformant device's declared window covers — the
+            # 16×16 case and the 64×64 boundary measure it.
+            _require(1 <= width <= REVIEWED_ATTACHMENT_CEILING
+                     and 1 <= height <= REVIEWED_ATTACHMENT_CEILING,
+                     f"{attachment_where}: the attachment extent is one to "
+                     f"{REVIEWED_ATTACHMENT_CEILING} texels per axis")
             viewport = _list(case["viewport"], f"{attachment_where}.viewport")
             _require(viewport == [0, 0, width, height],
                      f"{attachment_where}: the viewport must cover the attachment")

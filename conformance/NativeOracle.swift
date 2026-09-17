@@ -21,6 +21,14 @@ import Darwin
 private let maximumFileBytes = 1_048_576
 private let maximumAllocationBytes: UInt64 = 1_048_576
 private let maximumPassCount = 8
+/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
+/// window the oracle validates every render fixture against. The rails declare
+/// the smaller of this ceiling and their device's own framebuffer limit, so a
+/// fixture at the ceiling is inside every conformant device's window (Metal's
+/// 2D texture ceiling is 16384, and the Apple Paravirtual device this oracle
+/// runs on answers that). Widening it is a deliberate change that owes a
+/// boundary fixture at the new value, in all three review surfaces.
+private let reviewedAttachmentCeiling = 64
 
 private struct OracleError: Error, CustomStringConvertible {
     let description: String
@@ -1272,6 +1280,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
         try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == 64 }
                     && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
                     "\(definition.id): expected a 64-byte read buffer at 0 and a write buffer at 1")
+    case "render_declaring_attachment_16x16", "render_declaring_attachment_64x64":
+        // R1b's declaring cases (`research/docs/23` §70): the same v27 kernel
+        // over the wider attachment view — 1024 bytes for the 16x16 case and
+        // 16384 for the 64x64 boundary — beside the same 4-byte output view.
+        // The view's byte range is the extent the render case restates, which
+        // is what keeps the declaring pass and the attachment in step.
+        let extent: UInt64 = definition.id == "render_declaring_attachment_16x16" ? 1024 : 16384
+        try require(definition.entry == "copy_word"
+                    && definition.grid == [1, 1, 1] && definition.local == [1, 1, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 2, "\(definition.id): expected two buffers")
+        try require(definition.buffers.contains { $0.binding == 0 && $0.access == "read" && $0.length == extent }
+                    && definition.buffers.contains { $0.binding == 1 && $0.access == "write" && $0.length == 4 },
+                    "\(definition.id): expected a \(extent)-byte read buffer at 0 and a write "
+                    + "buffer at 1")
     case "render_declaring_depth_store":
         // v43's declaring case: the reviewed copy_word_with_witness kernel
         // reads one word from each of the two declaring views — the colour
@@ -1709,7 +1732,9 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v28":
         expectedIDs = ["render_declaring_quad_extent", "render_declaring_depth_store",
                        "render_declaring_depth_resolve", "render_declaring_stencil_store",
-                       "render_declaring_stencil_resolve"]
+                       "render_declaring_stencil_resolve",
+                       "render_declaring_attachment_16x16",
+                       "render_declaring_attachment_64x64"]
     default:
         throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
     }
@@ -2833,9 +2858,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     || attachment.format == "bgra8_unorm"
                     || attachment.format == "r32float",
                     "\(definition.id): unsupported attachment format")
-        try require(attachment.width >= 1 && attachment.width <= 4
-                    && attachment.height >= 1 && attachment.height <= 4,
-                    "\(definition.id): the attachment extent is one to four texels per axis")
+        // The reviewed window per axis (R1b, `research/docs/23` §70): the
+        // native rail declares the smaller of this ceiling and its device's own
+        // 2D texture limit, and every conformant device's limit is far above
+        // the ceiling (Metal's is 16384), so the 16x16 case and the 64x64
+        // boundary are inside the window unconditionally.
+        try require(attachment.width >= 1 && attachment.width <= reviewedAttachmentCeiling
+                    && attachment.height >= 1 && attachment.height <= reviewedAttachmentCeiling,
+                    "\(definition.id): the attachment extent is one to "
+                    + "\(reviewedAttachmentCeiling) texels per axis")
         try require(attachment.allocation > 0 && attachment.view > 0,
                     "\(definition.id): zero attachment identity")
         try require(attachment.store == "store" || attachment.store == "dontcare",
