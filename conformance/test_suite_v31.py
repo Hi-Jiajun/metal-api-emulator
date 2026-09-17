@@ -228,7 +228,10 @@ class StageBufferDeclarationTests(unittest.TestCase):
         case = render_case_by_id(committed_suite(), LEASE_ID)
         tint = next(entry for entry in case["stage_buffers"] if entry["stage"] == "fragment")
         self.assertEqual(tint["storage_mode"], "borrowed_no_copy")
-        self.assertEqual(tint["allocation_size"], 4096)
+        # One Apple silicon host-import page (16 KiB): a borrowed window is the
+        # owner's own mapping, so the allocation has to cover the page the
+        # provider rounds the 16-byte view up to (`research/docs/23` §90).
+        self.assertEqual(tint["allocation_size"], 16384)
         self.assertEqual(tint["initial_hex"], TINT)
         # The owned slot states no owner window, so the two arms cannot be
         # confused by a field either of them leaves out.

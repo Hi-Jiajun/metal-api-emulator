@@ -264,7 +264,7 @@
           "view": 1230,
           "offset": 0,
           "length": 16,
-          "allocation_size": 4096,
+          "allocation_size": 16384,
           "storage_mode": "borrowed_no_copy",
           "initial_hex": "8180803e8180003fc1c0403f0000803f"
         }

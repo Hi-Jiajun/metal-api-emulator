@@ -205,7 +205,8 @@ class StageBufferSuiteTests(unittest.TestCase):
         case = render_case_by_id(suite, STAGED_ID)
         tint = next(entry for entry in case["stage_buffers"] if entry["stage"] == "fragment")
         self.assertEqual(tint["storage_mode"], "staged_lease")
-        self.assertEqual(tint["allocation_size"], 4096)
+        # One Apple silicon host-import page (16 KiB), as in v31.
+        self.assertEqual(tint["allocation_size"], 16384)
         self.assertEqual(tint["initial_hex"], TINT)
         # The owner window is the view's own range inside the registration, and
         # a lease-armed case declares one view per allocation (`docs/23` §90).
