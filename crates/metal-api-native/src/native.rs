@@ -1887,6 +1887,13 @@ impl NativeMetalProvider {
     ) -> Result<Vec<BufferWriteback>, ProviderError> {
         let mut writebacks = Vec::with_capacity(plan.len());
         for planned in plan {
+            // One copy-in per sampled texture the encoder uploads into its own
+            // `MTLTexture` (`research/docs/23` §3.3, v70). A texture upload is
+            // a copy-in like a buffer upload, so the v11 count contract sees
+            // one operation per touched allocation, matching the Vulkan rail.
+            self.counters
+                .uploads
+                .fetch_add(planned.plan.textures.len(), Ordering::Relaxed);
             match &planned.present {
                 // A present action hands its one attachment on to the target
                 // texture, whose readback is the pass's single writeback.
