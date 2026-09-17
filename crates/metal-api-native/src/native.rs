@@ -438,6 +438,17 @@ impl NativeMetalProvider {
                 supported_render_texture_formats: render_bits
                     .supported_render_texture_formats
                     .clone(),
+                // The compute-side texture bits name the shape this rail has
+                // executed since v11 (`research/docs/16` §4.8, `docs/26`
+                // §21.3): `native.rs` creates one `MTLTexture` per sampled
+                // view through `replace_region` and binds it at its own
+                // `[[texture(n)]]` slot with `set_texture`. The bits admit
+                // exactly that shape — D2, single-sample, `R32Uint`, one
+                // binding — and the v11/v12 suites observe it on the Apple
+                // rail (`conformance/run_native.py`).
+                supports_compute_texture_sampling: true,
+                max_compute_textures: MAX_COMPUTE_TEXTURES as u32,
+                supported_compute_texture_formats: vec![TextureFormat::R32Uint],
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).
@@ -2737,6 +2748,7 @@ fn render_table_contract() -> PipelineContract {
         push_constant_offset: 0,
         push_constant_bytes: 0,
         buffer_bindings: Vec::new(),
+        texture_bindings: Vec::new(),
         shader_capabilities: Vec::new(),
         translator_revision: None,
     }

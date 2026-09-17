@@ -18,8 +18,8 @@ use metal_api_core::provider::{
     PipelineProvider, PresentDescriptor, ProviderCapabilities, ProviderError, ProviderErrorClass,
     ProviderHealth, ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment,
     RenderPassDescriptor, RenderPipelineContract, ResourceTableSnapshot, Retryability,
-    SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId, TerminalState, TracePass,
-    ValidatedComputeTrace, ViewId,
+    SamplerPolicy, SemanticDigest, ShaderSource, StagedLease, StorageMode, SubmissionId,
+    TerminalState, TracePass, ValidatedComputeTrace, ViewId,
 };
 use metal_api_core::provider::{
     queue_priorities_for_device, BorrowedLease, BorrowedLeaseRegistry, NoCopyLeaseImporter,
@@ -2590,6 +2590,14 @@ impl ComputeProvider for VulkanComputeProvider {
             .lock()
             .map_err(|_| registry_poisoned())?
             .admit(trace, admitted.resources())?;
+        // The compute texture sampler gate (`research/docs/26` §21.3): this
+        // rail creates one combined image sampler per texture binding, and the
+        // one state it can create is the translator's synthesized read
+        // sampler. A contract that declares another state is refused by name
+        // here — before any device object exists — instead of being executed
+        // with a sampler whose filtering would silently change which texels
+        // the module reads.
+        refuse_uncreatable_texture_samplers(trace)?;
         // The indirect dispatch the compute rail replays, resolved and shape
         // checked before any compute resource exists. The render rail owns the
         // draw half; `None` here means the compute sequence dispatches directly.
@@ -3333,9 +3341,54 @@ fn render_pipeline_table_contract() -> PipelineContract {
         push_constant_offset: 0,
         push_constant_bytes: 0,
         buffer_bindings: Vec::new(),
+        texture_bindings: Vec::new(),
         shader_capabilities: Vec::new(),
         translator_revision: None,
     }
+}
+
+/// Refuse a compute texture declaration whose sampler state this rail cannot
+/// create (`research/docs/26` §21.3, step 2).
+///
+/// The rail binds each sampled texture as a combined image sampler, and the
+/// one state its synthesis carries is [`SamplerPolicy::synthesized_read`]:
+/// nearest filtering under a clamped address mode. A declaration that states
+/// anything else would be executed with different filtering than the module
+/// was lowered against — a difference that changes which texels a read returns
+/// without changing the request — so it is a capability refusal with the
+/// binding and both state halves in its fields rather than a silently
+/// substituted sampler.
+fn refuse_uncreatable_texture_samplers(trace: &ComputeTrace) -> Result<(), ProviderError> {
+    for pass in trace.compute_passes() {
+        let Ok(requested) = trace.pipeline(pass.pipeline) else {
+            // A missing table entry is the identity walk's refusal, not this
+            // gate's; skipping keeps the two from reporting the same defect
+            // under two names.
+            continue;
+        };
+        for declared in &requested.contract.texture_bindings {
+            if declared.sampler != SamplerPolicy::synthesized_read() {
+                return Err(refusal(
+                    ProviderPhase::Resolve,
+                    ProviderErrorClass::Capability,
+                    "compute_texture_sampler_unsupported",
+                )
+                .with_field(
+                    "binding",
+                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
+                )
+                .with_field(
+                    "filter",
+                    FieldValue::Text(format!("{:?}", declared.sampler.filter)),
+                )
+                .with_field(
+                    "address",
+                    FieldValue::Text(format!("{:?}", declared.sampler.address)),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn unknown_completion(token: CompletionToken) -> ProviderError {
@@ -3527,6 +3580,88 @@ mod tests {
             exhausted.fields.get("abandoned_bytes"),
             Some(&FieldValue::Unsigned(512))
         );
+    }
+
+    #[test]
+    fn a_texture_contract_states_the_one_sampler_this_rail_creates() {
+        use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+        // The declaration the rail's own synthesis carries is admitted.
+        refuse_uncreatable_texture_samplers(&texture_sampler_trace(
+            SamplerPolicy::synthesized_read(),
+        ))
+        .expect("the synthesized read sampler is what this rail creates");
+
+        // Either half of the state can move it away from that answer, and each
+        // refusal names the binding and both halves (`research/docs/26`
+        // §21.3).
+        for (filter, address) in [
+            (SamplerFilter::Linear, SamplerAddressMode::ClampToEdge),
+            (SamplerFilter::Nearest, SamplerAddressMode::Repeat),
+        ] {
+            let refusal =
+                refuse_uncreatable_texture_samplers(&texture_sampler_trace(SamplerPolicy {
+                    filter,
+                    address,
+                }))
+                .expect_err("a state this rail cannot create is a refusal");
+            eprintln!("compute texture sampler refusal: {refusal:?}");
+            assert_eq!(refusal.slug, "compute_texture_sampler_unsupported");
+            assert_eq!(refusal.class, ProviderErrorClass::Capability);
+            assert_eq!(
+                refusal.fields.get("binding"),
+                Some(&FieldValue::Unsigned(0))
+            );
+            assert_eq!(
+                refusal.fields.get("filter"),
+                Some(&FieldValue::Text(format!("{filter:?}")))
+            );
+            assert_eq!(
+                refusal.fields.get("address"),
+                Some(&FieldValue::Text(format!("{address:?}")))
+            );
+        }
+    }
+
+    /// One compute pass whose pipeline contract declares a texture binding with
+    /// the given sampler state. Only the gate under test reads it: no device,
+    /// no resources and no texture view are needed.
+    fn texture_sampler_trace(sampler: SamplerPolicy) -> ComputeTrace {
+        use metal_api_core::provider::{
+            FunctionSource, TextureAccess, TextureBindingContract, TextureFootprintProof,
+            TextureFormat, TextureType,
+        };
+
+        let mut trace = ordering_trace(vec![TracePass::Compute(ordering_compute_pass(7))]);
+        trace.pipelines.push(CompiledComputePipeline {
+            device_epoch: trace.device_epoch,
+            pipeline_id: PipelineId::new(2),
+            function: FunctionIdentity {
+                logical_digest: SemanticDigest::new("fixture", vec![9]).unwrap(),
+                entry_name: "read_texture_2d".to_owned(),
+                source: FunctionSource::BinaryAir,
+            },
+            contract: PipelineContract {
+                dispatch_kind: DispatchKind::ThreadsExact,
+                required_local_size: None,
+                fixed_grid: None,
+                push_constant_offset: 0,
+                push_constant_bytes: 0,
+                buffer_bindings: Vec::new(),
+                texture_bindings: vec![TextureBindingContract {
+                    metal_binding: 0,
+                    access: TextureAccess::Sampled,
+                    texture_type: TextureType::D2,
+                    format: TextureFormat::R32Uint,
+                    sampler,
+                    footprint: TextureFootprintProof::WholeView,
+                }],
+                shader_capabilities: Vec::new(),
+                translator_revision: None,
+            },
+            render: None,
+        });
+        trace
     }
 
     #[test]

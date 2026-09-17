@@ -2815,6 +2815,33 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            // The texture face is compared the same way (`research/docs/26`
+            // §21.3, step 1): the contract the harness registered must name the
+            // case's own texture bindings, or the pairing the provider enforces
+            // would be against a declaration the fixture never stated.
+            let mut expected_textures = Vec::with_capacity(case.textures.len());
+            for texture in &case.textures {
+                let format = match texture.format.as_str() {
+                    "r32_uint" => TextureFormat::R32Uint,
+                    _ => return Err("unsupported texture format".into()),
+                };
+                let access = match texture.access.as_str() {
+                    "sampled" => TextureAccess::Sampled,
+                    "storage" => TextureAccess::Storage,
+                    _ => return Err("unsupported texture access".into()),
+                };
+                expected_textures.push((texture.binding, format, access));
+            }
+            if compiled
+                .contract
+                .texture_bindings
+                .iter()
+                .map(|binding| (binding.metal_binding, binding.format, binding.access))
+                .collect::<Vec<_>>()
+                != expected_textures
+            {
+                return Err("compiled texture reflection differs from the fixture layout".into());
+            }
         }
         let before = counters.read();
         // A heap case is owed only by the rails its marker names
@@ -3171,6 +3198,14 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "render_declaring_attachment_16x16",
             "render_declaring_attachment_64x64",
             "render_declaring_attachment_2048x2048",
+        ],
+        // The compute texture face's content pair (`research/docs/26` §21.3):
+        // one kernel, two texture payloads, two different writebacks, so a
+        // readback that ignores the texture's own bytes fails a real capture
+        // instead of agreeing with a constant expectation.
+        (1, "compute-buffer-v29") => &[
+            "sampled_cell_ascending_content",
+            "sampled_cell_descending_content",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -6925,6 +6960,16 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             "read_texture_2d_cell",
             [4, 4, 1],
             [1, 1, 1],
+            &[(0, "write", 64)][..],
+        ),
+        // v29: the v12 kernel over two different payloads — ascending and
+        // descending cell values — so the writeback has to follow the
+        // texture's own bytes instead of a constant (`research/docs/26`
+        // §21.3).
+        "sampled_cell_ascending_content" | "sampled_cell_descending_content" => (
+            "read_texture_2d_cell",
+            [4, 4, 1],
+            [4, 4, 1],
             &[(0, "write", 64)][..],
         ),
         // v13: the declaring pass of the render suite reads the attachment's
@@ -10870,6 +10915,7 @@ mod tests {
                             },
                         })
                         .collect(),
+                    texture_bindings: Vec::new(),
                     shader_capabilities: Vec::new(),
                     translator_revision: None,
                 },

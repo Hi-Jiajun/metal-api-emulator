@@ -1787,6 +1787,21 @@ private func validateShape(_ definition: CaseDefinition, suite: String,
                     && definition.textures?[0].height == 4
                     && definition.textures?[0].access == "sampled",
                     "\(definition.id): expected one 4x4 sampled texture")
+    case "sampled_cell_ascending_content", "sampled_cell_descending_content":
+        try require(suite == "compute-buffer-v29" && definition.entry == "read_texture_2d_cell"
+                    && definition.grid == [4, 4, 1] && definition.local == [4, 4, 1],
+                    "\(definition.id): unsupported entry or dispatch shape")
+        try require(definition.buffers.count == 1
+                    && definition.buffers[0].binding == 0
+                    && definition.buffers[0].access == "write"
+                    && definition.buffers[0].length == 64,
+                    "\(definition.id): expected one 64-byte write-only output buffer")
+        try require(definition.textures?.count == 1
+                    && definition.textures?[0].binding == 0
+                    && definition.textures?[0].width == 4
+                    && definition.textures?[0].height == 4
+                    && definition.textures?[0].access == "sampled",
+                    "\(definition.id): expected one 4x4 sampled texture")
     default:
         throw OracleError("Unsupported case: \(definition.id)")
     }
@@ -2033,8 +2048,10 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
                        "render_declaring_attachment_16x16",
                        "render_declaring_attachment_64x64",
                        "render_declaring_attachment_2048x2048"]
+    case "compute-buffer-v29":
+        expectedIDs = ["sampled_cell_ascending_content", "sampled_cell_descending_content"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v28 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v29 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")

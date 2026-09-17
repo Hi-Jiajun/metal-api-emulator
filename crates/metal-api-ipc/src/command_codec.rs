@@ -1788,6 +1788,7 @@ fn get_contract(decoder: &mut Decoder<'_>) -> Result<PipelineContract, CodecErro
         push_constant_offset,
         push_constant_bytes,
         buffer_bindings,
+        texture_bindings: Vec::new(),
         shader_capabilities,
         translator_revision,
     })
@@ -4376,6 +4377,9 @@ fn get_capabilities_legacy(decoder: &mut Decoder<'_>) -> Result<ProviderCapabili
         max_invocations,
         max_group_count,
         max_storage_buffer_descriptors,
+        supports_compute_texture_sampling: false,
+        max_compute_textures: 0,
+        supported_compute_texture_formats: Vec::new(),
         max_buffer_range,
         max_push_constant_bytes,
         alias_mode,

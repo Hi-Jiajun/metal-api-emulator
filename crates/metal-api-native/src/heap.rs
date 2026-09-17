@@ -235,6 +235,7 @@ mod tests {
                             footprint: FootprintProof::Static { max_bytes: 4 },
                         },
                     ],
+                    texture_bindings: Vec::new(),
                     shader_capabilities: Vec::new(),
                     translator_revision: None,
                 },
