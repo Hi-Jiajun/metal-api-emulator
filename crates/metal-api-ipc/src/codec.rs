@@ -190,6 +190,32 @@ pub enum CodecError {
         count: usize,
         maximum: usize,
     },
+    /// A compute texture declaration block carried more entries than the
+    /// shape's own cap (`research/docs/23` §91). The block's count is one
+    /// byte, so this is the protocol's bound; the codec refuses anything above
+    /// [`metal_api_core::provider::MAX_COMPUTE_TEXTURES`] before a frame is
+    /// written.
+    ComputeTextureCount {
+        count: usize,
+        maximum: usize,
+    },
+    /// A capability snapshot declared more compute-side sampling formats than
+    /// the protocol bound (`research/docs/23` §91).
+    ComputeTextureFormatCount {
+        count: usize,
+        maximum: usize,
+    },
+    /// A pipeline-table entry carried a render half *and* a compute contract
+    /// that declares texture bindings (`research/docs/23` §91).
+    ///
+    /// The render kinds' bodies are fixed — a decoder reads the render half
+    /// exactly where the pre-v87 encoder wrote it — so there is no position
+    /// the declaration block could take without a new kind per combination.
+    /// The sender refuses the combination by name instead of writing a frame
+    /// the receiver would have to desync on.
+    ComputeTextureDeclarationsWithRenderHalf {
+        declarations: usize,
+    },
     /// A wide feature that describes the depth attachment arrived without one.
     /// The store action and the identity are properties *of* the depth
     /// attachment, so either bit without the depth section names a surface the
@@ -341,6 +367,19 @@ impl fmt::Display for CodecError {
             Self::RenderStageBufferCount { count, maximum } => write!(
                 formatter,
                 "stage buffer list carries {count} bindings, maximum {maximum}"
+            ),
+            Self::ComputeTextureCount { count, maximum } => write!(
+                formatter,
+                "compute texture declaration block carries {count} bindings, maximum {maximum}"
+            ),
+            Self::ComputeTextureFormatCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} compute texture formats, maximum {maximum}"
+            ),
+            Self::ComputeTextureDeclarationsWithRenderHalf { declarations } => write!(
+                formatter,
+                "a render pipeline entry carries {declarations} compute texture declarations, \
+                 a block the render kinds cannot frame"
             ),
             Self::DepthFeatureWithoutAttachment(features) => write!(
                 formatter,

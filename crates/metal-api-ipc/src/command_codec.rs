@@ -26,13 +26,14 @@ use metal_api_core::provider::{
     ProviderPhase, ProviderSubmission, QueuePriority, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest, ShaderSource,
-    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
-    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
-    TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    ResourceTableSnapshot, Retryability, SampleCount, SamplerAddressMode, SamplerFilter,
+    SamplerPolicy, SemanticDigest, ShaderSource, StageBufferBinding, StageBufferView, StagedLease,
+    StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
+    StorageMode, StoreOp, SubmissionId, TextureAccess, TextureBindingContract,
+    TextureFootprintProof, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
-    MAX_COLOR_ATTACHMENTS, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_VERTEX_ATTRIBUTES,
-    MAX_VERTEX_BUFFERS,
+    MAX_COLOR_ATTACHMENTS, MAX_COMPUTE_TEXTURES, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    MAX_VERTEX_ATTRIBUTES, MAX_VERTEX_BUFFERS,
 };
 use std::io::{Read, Write};
 
@@ -86,6 +87,27 @@ const SUBMIT_RENDER_REQUEST: u8 = 0x0f;
 /// the tagged heap/ICB tail, the same additive policy the render and present
 /// tags used (`research/docs/25-heaps与ICB设计.md` §4.5).
 const SUBMIT_HEAP_ICB_REQUEST: u8 = 0x10;
+/// Submit a compute-only trace whose pipeline table carries compute texture
+/// declarations.
+///
+/// The pre-render layout has no section a contract's texture declarations
+/// could travel in — every byte of it is the shape the first compute frame
+/// wrote — so a table entry that declares textures needs the tagged layout.
+/// A compute-only trace whose table carries no such declaration keeps
+/// travelling under [`SUBMIT_REQUEST`] with the exact pre-render bytes, so
+/// this tag is only ever emitted for the texture-bearing shape. An older
+/// decoder answers `UnknownCommandTag` for it instead of misreading the
+/// tagged pass list, the same additive policy every tag above used
+/// (`research/docs/23` §91).
+const SUBMIT_COMPUTE_TEXTURES_REQUEST: u8 = 0x11;
+/// Release a pipeline whose compute contract declares texture bindings.
+///
+/// A release request carries the whole pipeline, and the native rail compares
+/// that value against the registration it holds, so dropping the declaration
+/// list here would make every textured release answer
+/// `pipeline_identity_mismatch`. A pipeline that declares no texture keeps
+/// [`RELEASE_PIPELINE_REQUEST`] and its exact bytes.
+const RELEASE_PIPELINE_TEXTURES_REQUEST: u8 = 0x12;
 
 const CAPABILITIES_RESPONSE: u8 = 0x01;
 const COMPILED_RESPONSE: u8 = 0x02;
@@ -103,6 +125,14 @@ const QUEUE_PRIORITIES_RESPONSE: u8 = 0x09;
 /// tag; every compute-only provider keeps sending the legacy
 /// [`CAPABILITIES_RESPONSE`] bytes.
 const RENDER_CAPABILITIES_RESPONSE: u8 = 0x0a;
+/// A compiled pipeline whose compute contract declares texture bindings
+/// (`research/docs/23` §91).
+///
+/// [`COMPILED_RESPONSE`] carries the pre-render compute half, which has no
+/// section for the declaration block; a compile whose reflection found
+/// sampled textures takes this tag instead. A compilation that declares none
+/// keeps the legacy tag and its exact bytes.
+const COMPILED_TEXTURES_RESPONSE: u8 = 0x0b;
 const ERROR_RESPONSE: u8 = 0x7f;
 
 /// Pass discriminator inside the tagged trace layout.
@@ -364,6 +394,19 @@ const PIPELINE_KIND_RENDER_MRT: u8 = 0x02;
 /// [`CodecError::UnknownPipelineTag`] for it.
 const PIPELINE_KIND_RENDER_STAGE_BUFFERS: u8 = 0x03;
 
+/// Compute entry whose contract declares the texture bindings its module
+/// reads (`research/docs/23` §91).
+///
+/// The compute half the pre-render layout established has no section for the
+/// declaration block — every byte of it is what the first compiled pipeline
+/// wrote — so the block needs a kind of its own behind the same kind byte
+/// [`PIPELINE_KIND_RENDER_STAGE_BUFFERS`] used for its own block. The body is
+/// the compute half exactly as [`put_pipeline`] writes it, with the
+/// declaration block appended after the contract; a contract that declares
+/// nothing keeps `PIPELINE_KIND_COMPUTE` and its exact bytes, and a decoder
+/// that predates this tag answers [`CodecError::UnknownPipelineTag`] for it.
+const PIPELINE_KIND_COMPUTE_TEXTURES: u8 = 0x04;
+
 /// Maximum number of passes one tagged trace frame may carry.
 ///
 /// The legacy layout keeps its previous (payload-bounded) behaviour; this
@@ -472,6 +515,30 @@ const CAPABILITY_RENDER_TEXTURE_TAIL: u8 = 0x20;
 /// with.
 const CAPABILITY_STAGE_BUFFER_TAIL: u8 = 0x40;
 
+/// Presence tag of the capability tail's compute-texture block
+/// (`research/docs/23` §91).
+///
+/// The block is the tail's eighth and newest optional section: one presence
+/// tag, one bool, one `u32` binding cap and the admitted texture formats, the
+/// same shape the render-sampler block uses — the compute-side sibling of the
+/// three bits that block carries. It follows the stage-buffer block when the
+/// snapshot declares any of the three compute-texture bits, so a snapshot
+/// that declares the capability without any earlier block still keeps the
+/// decoder's position rules unambiguous. A snapshot whose three bits stay at
+/// their defaults keeps the shorter frame and the decoder reads the missing
+/// block as `false`/`0`/empty: the "cannot sample compute-side" defaults
+/// provider admission refuses a texture-bearing compute pass with.
+const CAPABILITY_COMPUTE_TEXTURE_TAIL: u8 = 0x80;
+
+/// Maximum texture formats one capability snapshot may declare as compute-side
+/// sampling sources.
+///
+/// The contract's own list is the closed five-value [`TextureFormat`] family,
+/// so this bound can never refuse a well-formed snapshot; it only stops a
+/// corrupt count from driving the decoder — the same rule
+/// [`MAX_SUPPORTED_RENDER_TEXTURE_FORMATS`] states for the render side.
+pub const MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS: usize = 8;
+
 /// Maximum texture formats one capability snapshot may declare as render-pass
 /// sampling sources.
 ///
@@ -578,10 +645,17 @@ impl CommandCodec {
                 put_queue_priorities(&mut encoder, tiers)?;
             }
             CommandRequest::Submit { trace, resources } => {
+                // The frame tag is a function of the payload shape, so a
+                // compute-only trace whose table carries compute texture
+                // declarations takes a tag of its own rather than the
+                // render tag whose comment promises a render pass
+                // (`research/docs/23` §91).
                 encoder.u8(if trace.has_heap_or_icb() {
                     SUBMIT_HEAP_ICB_REQUEST
                 } else if trace.has_render_passes() {
                     SUBMIT_RENDER_REQUEST
+                } else if trace_carries_compute_texture_declarations(trace) {
+                    SUBMIT_COMPUTE_TEXTURES_REQUEST
                 } else {
                     SUBMIT_REQUEST
                 });
@@ -602,8 +676,21 @@ impl CommandCodec {
                 put_token(&mut encoder, token);
             }
             CommandRequest::ReleasePipeline { pipeline } => {
-                encoder.u8(RELEASE_PIPELINE_REQUEST);
-                put_pipeline(&mut encoder, pipeline);
+                // A textured registration must travel whole: the native rail
+                // compares the released value against the registration it
+                // holds, so the declaration list cannot be dropped here
+                // (`research/docs/23` §91).
+                if pipeline.contract.texture_bindings.is_empty() {
+                    encoder.u8(RELEASE_PIPELINE_REQUEST);
+                    put_pipeline(&mut encoder, pipeline);
+                } else {
+                    encoder.u8(RELEASE_PIPELINE_TEXTURES_REQUEST);
+                    put_pipeline(&mut encoder, pipeline);
+                    put_compute_texture_declarations(
+                        &mut encoder,
+                        &pipeline.contract.texture_bindings,
+                    )?;
+                }
             }
             CommandRequest::ReleaseCompletion { token } => {
                 encoder.u8(RELEASE_COMPLETION_REQUEST);
@@ -646,6 +733,12 @@ impl CommandCodec {
                 // document.
                 if capabilities.declares_render_support()
                     || declares_render_stage_buffer_support(capabilities)
+                    // The compute texture bits follow the same rule one
+                    // section later (`research/docs/23` §91): a snapshot that
+                    // declares only the three of them would otherwise keep
+                    // sending the legacy payload and its declaration would be
+                    // lost on the wire.
+                    || declares_compute_texture_support(capabilities)
                 {
                     encoder.u8(RENDER_CAPABILITIES_RESPONSE);
                     put_epoch(&mut encoder, *epoch);
@@ -661,8 +754,20 @@ impl CommandCodec {
                 put_health(&mut encoder, *health);
             }
             CommandResponse::Compiled { pipeline } => {
-                encoder.u8(COMPILED_RESPONSE);
-                put_pipeline(&mut encoder, pipeline);
+                // The compiled response carries the compute half, so a
+                // contract that declares texture bindings needs the tag whose
+                // body has room for the block (`research/docs/23` §91).
+                if pipeline.contract.texture_bindings.is_empty() {
+                    encoder.u8(COMPILED_RESPONSE);
+                    put_pipeline(&mut encoder, pipeline);
+                } else {
+                    encoder.u8(COMPILED_TEXTURES_RESPONSE);
+                    put_pipeline(&mut encoder, pipeline);
+                    put_compute_texture_declarations(
+                        &mut encoder,
+                        &pipeline.contract.texture_bindings,
+                    )?;
+                }
             }
             CommandResponse::Imported => encoder.u8(IMPORTED_RESPONSE),
             CommandResponse::Submitted { submission } => {
@@ -841,6 +946,10 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
             trace: get_trace_tagged(&mut decoder, true)?,
             resources: get_resources(&mut decoder)?,
         },
+        SUBMIT_COMPUTE_TEXTURES_REQUEST => CommandRequest::Submit {
+            trace: get_trace_tagged(&mut decoder, false)?,
+            resources: get_resources(&mut decoder)?,
+        },
         WAIT_REQUEST => CommandRequest::Wait {
             token: get_token(&mut decoder)?,
             timeout: std::time::Duration::from_millis(decoder.u64()?),
@@ -854,6 +963,11 @@ fn decode_request_payload(payload: &[u8]) -> Result<CommandRequest, CodecError> 
         RELEASE_PIPELINE_REQUEST => CommandRequest::ReleasePipeline {
             pipeline: get_pipeline(&mut decoder)?,
         },
+        RELEASE_PIPELINE_TEXTURES_REQUEST => {
+            let mut pipeline = get_pipeline(&mut decoder)?;
+            pipeline.contract.texture_bindings = get_compute_texture_declarations(&mut decoder)?;
+            CommandRequest::ReleasePipeline { pipeline }
+        }
         RELEASE_COMPLETION_REQUEST => CommandRequest::ReleaseCompletion {
             token: get_token(&mut decoder)?,
         },
@@ -884,6 +998,11 @@ fn decode_response_payload(payload: &[u8]) -> Result<CommandResponse, CodecError
         COMPILED_RESPONSE => CommandResponse::Compiled {
             pipeline: get_pipeline(&mut decoder)?,
         },
+        COMPILED_TEXTURES_RESPONSE => {
+            let mut pipeline = get_pipeline(&mut decoder)?;
+            pipeline.contract.texture_bindings = get_compute_texture_declarations(&mut decoder)?;
+            CommandResponse::Compiled { pipeline }
+        }
         IMPORTED_RESPONSE => CommandResponse::Imported,
         SUBMITTED_RESPONSE => CommandResponse::Submitted {
             submission: get_submission(&mut decoder)?,
@@ -1500,7 +1619,12 @@ fn get_footprint(decoder: &mut Decoder<'_>) -> Result<FootprintProof, CodecError
 ///
 /// The pre-render layout carries exactly these bytes, so this function stays
 /// the legacy encoder for `Compiled`, `ReleasePipeline` and any compute-only
-/// trace; the render half travels through [`put_pipeline_tagged`] only.
+/// trace. Those three frames have no section a compute texture declaration
+/// block could travel in, so a contract that declares one takes a tag of its
+/// own at each site (`COMPILED_TEXTURES_RESPONSE`,
+/// `RELEASE_PIPELINE_TEXTURES_REQUEST`, [`PIPELINE_KIND_COMPUTE_TEXTURES`])
+/// and this body stays the unchanged half every one of them writes first; the
+/// render half travels through [`put_pipeline_tagged`] only.
 fn put_pipeline(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
     put_epoch(encoder, pipeline.device_epoch);
     encoder.u64(pipeline.pipeline_id.get());
@@ -1510,20 +1634,37 @@ fn put_pipeline(encoder: &mut Encoder, pipeline: &CompiledComputePipeline) {
 
 /// Encode one pipeline-table entry of the tagged layout: the entry kind, then
 /// the compute half, then the render half when the entry carries one.
+///
+/// A compute contract that declares texture bindings takes
+/// [`PIPELINE_KIND_COMPUTE_TEXTURES`], whose body is the compute half with the
+/// declaration block appended (`research/docs/23` §91). An entry that carries
+/// both a render half and a compute contract declaring textures is refused by
+/// name: the render kinds' bodies are fixed, so a decoder could not tell where
+/// such a block would sit.
 fn put_pipeline_tagged(
     encoder: &mut Encoder,
     pipeline: &CompiledComputePipeline,
 ) -> Result<(), CodecError> {
     match &pipeline.render {
         Some(contract) => {
+            if !pipeline.contract.texture_bindings.is_empty() {
+                return Err(CodecError::ComputeTextureDeclarationsWithRenderHalf {
+                    declarations: pipeline.contract.texture_bindings.len(),
+                });
+            }
             let kind = render_pipeline_kind(contract)?;
             encoder.u8(kind);
             put_pipeline(encoder, pipeline);
             put_render_pipeline_contract(encoder, contract, kind)?;
         }
-        None => {
+        None if pipeline.contract.texture_bindings.is_empty() => {
             encoder.u8(PIPELINE_KIND_COMPUTE);
             put_pipeline(encoder, pipeline);
+        }
+        None => {
+            encoder.u8(PIPELINE_KIND_COMPUTE_TEXTURES);
+            put_pipeline(encoder, pipeline);
+            put_compute_texture_declarations(encoder, &pipeline.contract.texture_bindings)?;
         }
     }
     Ok(())
@@ -1666,6 +1807,92 @@ fn get_render_pipeline_stage(decoder: &mut Decoder<'_>) -> Result<RenderPipeline
     }
 }
 
+/// Whether any pipeline in this trace declares compute texture bindings
+/// (`research/docs/23` §91).
+///
+/// This is the discriminator behind two decisions that have to agree: the
+/// payload tag [`encode_request_payload`] writes, and whether [`put_trace`]
+/// tags its pass list and pipeline table. A compute-only trace that carries no
+/// declaration answers `false` on both sides and keeps the exact pre-render
+/// bytes; one that carries a declaration is the shape the tagged layout and
+/// [`SUBMIT_COMPUTE_TEXTURES_REQUEST`] exist for.
+fn trace_carries_compute_texture_declarations(trace: &ComputeTrace) -> bool {
+    trace
+        .pipelines
+        .iter()
+        .any(|pipeline| !pipeline.contract.texture_bindings.is_empty())
+}
+
+/// Encode one compute contract's texture declaration block
+/// (`research/docs/23` §91): a `u8` count and that many
+/// `(binding, access, type, format, sampler, footprint)` tuples, in the
+/// canonical order the contract's own rules state.
+///
+/// The block is what lets a remote provider run the pairing rules
+/// `ComputePass::validate` states instead of refusing every bound texture as
+/// undeclared: the request carries the views, this carries the module's own
+/// declaration the request is paired against. The list is bound the way every
+/// other length prefix is — a count above [`MAX_COMPUTE_TEXTURES`] is refused
+/// before a single tuple is written, so a refused registration never emits a
+/// partial block.
+fn put_compute_texture_declarations(
+    encoder: &mut Encoder,
+    bindings: &[TextureBindingContract],
+) -> Result<(), CodecError> {
+    if bindings.len() > MAX_COMPUTE_TEXTURES {
+        return Err(CodecError::ComputeTextureCount {
+            count: bindings.len(),
+            maximum: MAX_COMPUTE_TEXTURES,
+        });
+    }
+    encoder.u8(bindings.len() as u8);
+    for binding in bindings {
+        encoder.u32(binding.metal_binding);
+        put_texture_access(encoder, binding.access);
+        put_texture_type(encoder, binding.texture_type);
+        put_texture_format(encoder, binding.format);
+        put_sampler_filter(encoder, binding.sampler.filter);
+        put_sampler_address(encoder, binding.sampler.address);
+        put_texture_footprint(encoder, binding.footprint);
+    }
+    Ok(())
+}
+
+/// Decode one compute texture declaration block (`research/docs/23` §91).
+///
+/// The count is read as one byte and refused above the shape's own cap before
+/// a single tuple — or a `Vec` of that length — is produced, so a corrupt
+/// count cannot drive the decoder. Every enum in a tuple is refused by name
+/// rather than folded onto a neighbour, because the declaration is what the
+/// pass is paired against: a filter the decoder guessed would change which
+/// texels a remote read returns.
+fn get_compute_texture_declarations(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<TextureBindingContract>, CodecError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_COMPUTE_TEXTURES {
+        return Err(CodecError::ComputeTextureCount {
+            count,
+            maximum: MAX_COMPUTE_TEXTURES,
+        });
+    }
+    let mut bindings = Vec::with_capacity(count);
+    for _ in 0..count {
+        bindings.push(TextureBindingContract {
+            metal_binding: decoder.u32()?,
+            access: get_texture_access(decoder)?,
+            texture_type: get_texture_type(decoder)?,
+            format: get_texture_format(decoder)?,
+            sampler: SamplerPolicy {
+                filter: get_sampler_filter(decoder)?,
+                address: get_sampler_address(decoder)?,
+            },
+            footprint: get_texture_footprint(decoder)?,
+        });
+    }
+    Ok(bindings)
+}
+
 /// Bound one contract's colour-format list.
 ///
 /// The list is read as a length prefix on the wire and as a plain slice when
@@ -1753,11 +1980,20 @@ fn get_pipeline(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipeline, Co
 }
 
 /// Decode one pipeline-table entry of the tagged layout.
+///
+/// [`PIPELINE_KIND_COMPUTE_TEXTURES`] is the one kind whose compute half is
+/// followed by a compute texture declaration block
+/// (`research/docs/23` §91); every other kind's body keeps the shape it always
+/// had.
 fn get_pipeline_tagged(decoder: &mut Decoder<'_>) -> Result<CompiledComputePipeline, CodecError> {
     let kind = decoder.u8()?;
     let mut pipeline = get_pipeline(decoder)?;
     pipeline.render = match kind {
         PIPELINE_KIND_COMPUTE => None,
+        PIPELINE_KIND_COMPUTE_TEXTURES => {
+            pipeline.contract.texture_bindings = get_compute_texture_declarations(decoder)?;
+            None
+        }
         PIPELINE_KIND_RENDER | PIPELINE_KIND_RENDER_MRT | PIPELINE_KIND_RENDER_STAGE_BUFFERS => {
             Some(get_render_pipeline_contract(decoder, kind)?)
         }
@@ -1970,6 +2206,11 @@ fn get_contract(decoder: &mut Decoder<'_>) -> Result<PipelineContract, CodecErro
         push_constant_offset,
         push_constant_bytes,
         buffer_bindings,
+        // The pre-render contract body has no texture declaration section, so
+        // this half always decodes with an empty list; the tags that carry the
+        // block (`PIPELINE_KIND_COMPUTE_TEXTURES`,
+        // `COMPILED_TEXTURES_RESPONSE`, `RELEASE_PIPELINE_TEXTURES_REQUEST`)
+        // fill it in after this call (`research/docs/23` §91).
         texture_bindings: Vec::new(),
         shader_capabilities,
         translator_revision,
@@ -2103,6 +2344,73 @@ fn get_texture_access(decoder: &mut Decoder<'_>) -> Result<TextureAccess, CodecE
     }
 }
 
+/// One sampler filter code (`research/docs/23` §91).
+///
+/// The two codes are the enum's own order — nearest `0`, linear `1` — and any
+/// other byte keeps its named refusal, because a provider that substituted a
+/// filter would change which texels a remote read returns.
+fn put_sampler_filter(encoder: &mut Encoder, filter: SamplerFilter) {
+    encoder.u8(match filter {
+        SamplerFilter::Nearest => 0,
+        SamplerFilter::Linear => 1,
+    });
+}
+
+fn get_sampler_filter(decoder: &mut Decoder<'_>) -> Result<SamplerFilter, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(SamplerFilter::Nearest),
+        1 => Ok(SamplerFilter::Linear),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "sampler filter",
+            value,
+        }),
+    }
+}
+
+/// One sampler address code (`research/docs/23` §91), ordered like the enum:
+/// clamp-to-edge `0`, repeat `1`.
+fn put_sampler_address(encoder: &mut Encoder, address: SamplerAddressMode) {
+    encoder.u8(match address {
+        SamplerAddressMode::ClampToEdge => 0,
+        SamplerAddressMode::Repeat => 1,
+    });
+}
+
+fn get_sampler_address(decoder: &mut Decoder<'_>) -> Result<SamplerAddressMode, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(SamplerAddressMode::ClampToEdge),
+        1 => Ok(SamplerAddressMode::Repeat),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "sampler address",
+            value,
+        }),
+    }
+}
+
+/// One texture footprint code (`research/docs/23` §91).
+///
+/// The proof is a two-value family — the whole view `0`, unbounded `1` — and
+/// `Unbounded` travels rather than being dropped: the trace validator is what
+/// refuses it by name, so the wire has to carry the module's own statement
+/// instead of making it look like a bounded read.
+fn put_texture_footprint(encoder: &mut Encoder, footprint: TextureFootprintProof) {
+    encoder.u8(match footprint {
+        TextureFootprintProof::WholeView => 0,
+        TextureFootprintProof::Unbounded => 1,
+    });
+}
+
+fn get_texture_footprint(decoder: &mut Decoder<'_>) -> Result<TextureFootprintProof, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TextureFootprintProof::WholeView),
+        1 => Ok(TextureFootprintProof::Unbounded),
+        value => Err(CodecError::UnknownEnumValue {
+            field: "texture footprint",
+            value,
+        }),
+    }
+}
+
 fn put_texture_source(encoder: &mut Encoder, source: &TextureSource) {
     match source {
         TextureSource::OwnedBytes(bytes) => {
@@ -2216,12 +2524,16 @@ fn get_completion_policy(decoder: &mut Decoder<'_>) -> Result<CompletionPolicy, 
 
 /// Encode one trace, choosing the pass layout from its own contents.
 ///
-/// A compute-only trace writes the pre-render pass bytes; a render-bearing
-/// trace tags every pass. The caller writes the matching payload tag, so
-/// `SUBMIT_REQUEST` frames keep their exact legacy bytes and
-/// `SUBMIT_RENDER_REQUEST` frames are self-describing.
+/// A compute-only trace whose table carries no compute texture declaration
+/// writes the pre-render bytes; a render-bearing trace, a heap/ICB-bearing
+/// trace and a compute-only trace whose table declares textures tag every
+/// pass. The caller writes the matching payload tag, so `SUBMIT_REQUEST`
+/// frames keep their exact legacy bytes and every tagged frame is
+/// self-describing.
 fn put_trace(encoder: &mut Encoder, trace: &ComputeTrace) -> Result<(), CodecError> {
-    let tagged = trace.has_render_passes() || trace.has_heap_or_icb();
+    let tagged = trace.has_render_passes()
+        || trace.has_heap_or_icb()
+        || trace_carries_compute_texture_declarations(trace);
     if tagged && trace.passes.len() > MAX_TAGGED_TRACE_PASSES {
         return Err(CodecError::TracePassCount {
             count: trace.passes.len(),
@@ -4472,6 +4784,21 @@ fn declares_render_stage_buffer_support(capabilities: &ProviderCapabilities) -> 
     capabilities.supports_render_stage_buffers || capabilities.max_render_stage_buffers != 0
 }
 
+/// Whether any compute texture capability bit differs from its default
+/// (`research/docs/23` §91).
+///
+/// [`ProviderCapabilities::declares_render_support`] answers this question for
+/// every render bit; the three bits C1 added to the compute face live in this
+/// codec's own predicate for the same reason the stage buffer pair beside it
+/// does: the capability payload is this crate's to keep, so a declared bit
+/// cannot be dropped on the wire — the exact failure every other `declares_*`
+/// predicate exists to prevent.
+fn declares_compute_texture_support(capabilities: &ProviderCapabilities) -> bool {
+    capabilities.supports_compute_texture_sampling
+        || capabilities.max_compute_textures != 0
+        || !capabilities.supported_compute_texture_formats.is_empty()
+}
+
 /// Encode a capability snapshot, including its render bits.
 ///
 /// Only [`RENDER_CAPABILITIES_RESPONSE`] frames use this layout. A snapshot
@@ -4565,6 +4892,12 @@ fn put_capabilities(
         // reads by position before the tag, so the declaration cannot be
         // dropped on the wire.
         || declares_render_stage_buffer_support(capabilities)
+        // The compute texture block follows the same rule once more
+        // (`research/docs/23` §91): a snapshot that declares only the three
+        // compute texture bits still has to write the heap/ICB half the
+        // decoder reads by position before the tag, so the declaration cannot
+        // be dropped on the wire.
+        || declares_compute_texture_support(capabilities)
     {
         encoder.bool(capabilities.supports_heaps);
         encoder.u64(capabilities.max_heap_bytes);
@@ -4674,6 +5007,29 @@ fn put_capabilities(
             encoder.u8(CAPABILITY_STAGE_BUFFER_TAIL);
             encoder.bool(capabilities.supports_render_stage_buffers);
             encoder.u32(capabilities.max_render_stage_buffers);
+        }
+        // The compute-texture block is the tail's newest section and follows
+        // the stage-buffer half when the snapshot declares any of its three
+        // bits (`research/docs/23` §91). It repeats the render-sampler
+        // block's shape: the bit that answers "does this device sample
+        // compute-side at all", the binding cap admission counts against, and
+        // the closed list of formats it can create a view for.
+        if declares_compute_texture_support(capabilities) {
+            encoder.u8(CAPABILITY_COMPUTE_TEXTURE_TAIL);
+            encoder.bool(capabilities.supports_compute_texture_sampling);
+            encoder.u32(capabilities.max_compute_textures);
+            if capabilities.supported_compute_texture_formats.len()
+                > MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS
+            {
+                return Err(CodecError::ComputeTextureFormatCount {
+                    count: capabilities.supported_compute_texture_formats.len(),
+                    maximum: MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS,
+                });
+            }
+            encoder.u64(capabilities.supported_compute_texture_formats.len() as u64);
+            for format in &capabilities.supported_compute_texture_formats {
+                put_texture_format(encoder, *format);
+            }
         }
     }
     Ok(())
@@ -4957,6 +5313,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
         && tag != CAPABILITY_RENDER_TEXTURE_TAIL
         && tag != CAPABILITY_STAGE_BUFFER_TAIL
+        && tag != CAPABILITY_COMPUTE_TEXTURE_TAIL
     {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
@@ -4972,6 +5329,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
             && tag != CAPABILITY_STAGE_BUFFER_TAIL
+            && tag != CAPABILITY_COMPUTE_TEXTURE_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -4987,6 +5345,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
             && tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
             && tag != CAPABILITY_STAGE_BUFFER_TAIL
+            && tag != CAPABILITY_COMPUTE_TEXTURE_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -5005,6 +5364,7 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         if tag != CAPABILITY_STENCIL_RESOLVE_TAIL
             && tag != CAPABILITY_RENDER_TEXTURE_TAIL
             && tag != CAPABILITY_STAGE_BUFFER_TAIL
+            && tag != CAPABILITY_COMPUTE_TEXTURE_TAIL
         {
             return Err(CodecError::UnknownCapabilityTail(tag));
         }
@@ -5050,15 +5410,45 @@ fn get_capabilities(decoder: &mut Decoder<'_>) -> Result<ProviderCapabilities, C
         }
         tag = decoder.u8()?;
     }
-    // The stage-buffer block is the tail's seventh and newest optional section
+    // The stage-buffer block is the tail's seventh optional section
     // (`research/docs/23` §3.3, v83): it follows the render-sampler block when
     // present, and reads the bool plus the binding cap. A snapshot that
     // declares only this block writes its own tag directly, exactly as the
-    // sections before it do.
-    if tag != CAPABILITY_STAGE_BUFFER_TAIL {
+    // sections before it do. The compute-texture block may follow it, so the
+    // walk continues while bytes remain.
+    if tag == CAPABILITY_STAGE_BUFFER_TAIL {
+        capabilities.supports_render_stage_buffers = decoder.bool()?;
+        capabilities.max_render_stage_buffers = decoder.u32()?;
+        if decoder.remaining() == 0 {
+            return Ok(capabilities);
+        }
+        tag = decoder.u8()?;
+    }
+    // The compute-texture block is the tail's eighth and newest optional
+    // section (`research/docs/23` §91): it follows the stage-buffer block when
+    // present, and reads the bool, the binding cap and the admitted texture
+    // formats. It is the last section this decoder knows, so a tag that is
+    // not it describes a section the walk cannot skip to.
+    if tag != CAPABILITY_COMPUTE_TEXTURE_TAIL {
         return Err(CodecError::UnknownCapabilityTail(tag));
     }
-    capabilities.supports_render_stage_buffers = decoder.bool()?;
-    capabilities.max_render_stage_buffers = decoder.u32()?;
+    capabilities.supports_compute_texture_sampling = decoder.bool()?;
+    capabilities.max_compute_textures = decoder.u32()?;
+    let compute_texture_format_count =
+        usize::try_from(decoder.u64()?).map_err(|_| CodecError::ComputeTextureFormatCount {
+            count: usize::MAX,
+            maximum: MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS,
+        })?;
+    if compute_texture_format_count > MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS {
+        return Err(CodecError::ComputeTextureFormatCount {
+            count: compute_texture_format_count,
+            maximum: MAX_SUPPORTED_COMPUTE_TEXTURE_FORMATS,
+        });
+    }
+    let mut supported_compute_texture_formats = Vec::with_capacity(compute_texture_format_count);
+    for _ in 0..compute_texture_format_count {
+        supported_compute_texture_formats.push(get_texture_format(decoder)?);
+    }
+    capabilities.supported_compute_texture_formats = supported_compute_texture_formats;
     Ok(capabilities)
 }
