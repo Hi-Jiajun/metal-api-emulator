@@ -1624,7 +1624,12 @@ fn discarded_only_attachments(trace: &ComputeTrace) -> BTreeSet<(AllocationId, V
             StoreOp::Store => {
                 stored.insert(identity);
             }
-            StoreOp::DontCare => {
+            // A resident store is the `Store` half's sibling on the Vulkan
+            // rail (`research/docs/23` §76, R7): this rail refuses a trace that
+            // declares one (`plan_trace`), so reaching here means a
+            // hand-built plan — and the bytes land nowhere a collect can read,
+            // exactly as a discarded attachment's do.
+            StoreOp::Resident | StoreOp::DontCare => {
                 discarded.insert(identity);
             }
         }

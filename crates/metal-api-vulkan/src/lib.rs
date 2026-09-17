@@ -37,7 +37,8 @@ mod render;
 
 pub use compute_provider::{
     CompiledComputePipeline, HeapPlacementObservation, IcbReplayObservation, RenderPipelineRequest,
-    TranslatedRenderPipelineRequest, VulkanComputeProvider, PRESENT_TARGET_BUDGET,
+    ResidentTargetRetirement, TranslatedRenderPipelineRequest, VulkanComputeProvider,
+    PRESENT_TARGET_BUDGET, RESIDENT_TARGET_BUDGET,
 };
 pub use render::RenderStage;
 
