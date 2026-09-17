@@ -1181,6 +1181,39 @@ private struct StageBufferSelfTestReport: Encodable {
     let platform: String
 }
 
+/// One writable stage-buffer run's observation (`research/docs/23` §92, R9k):
+/// the four `[[buffer(N)]]` payloads the pass bound — the vertex stage's
+/// positions, the fragment stage's readable source and the previous bytes its
+/// read-write accumulator held — and the three readings the pass left behind:
+/// the attachment's texels, the sink's bytes and the accumulator's bytes after
+/// the read-modify-write.
+private struct StageBufferWriteObservation: Encodable {
+    let positions_hex: String
+    let source_hex: String
+    let accumulator_initial_hex: String
+    let attachment_hex: String
+    let sink_hex: String
+    let accumulator_hex: String
+}
+
+/// The one-device writable stage-buffer check's report (`research/docs/23`
+/// §92, R9k).
+///
+/// The reviewed run's observation travels in the same
+/// writeback/allocation shape every other report uses — one entry per landing,
+/// the attachment's texels first and then the two writable bindings in
+/// canonical order — and both runs travel beside it, so a reader can see the
+/// frame, the sink and the accumulator all move when the payload does.
+private struct StageBufferWriteSelfTestReport: Encodable {
+    let id: String
+    let completion: String
+    let writebacks: [Writeback]
+    let allocations: [AllocationResult]
+    let observations: [StageBufferWriteObservation]
+    let device: String
+    let platform: String
+}
+
 private struct DeviceProbe: Encodable {
     let schema_version: UInt64 = 1
     let kind = "metal-device-probe"
@@ -1226,6 +1259,10 @@ private struct Options {
     /// carries a default so every existing call site keeps its argument list;
     /// the parser below is the only caller that sets it.
     var stageBufferSelfTest = false
+    /// The writable stage-buffer self-test's flag (`research/docs/23` §92,
+    /// R9k), defaulted for the same reason: the parser below is the only caller
+    /// that sets it.
+    var stageBufferWriteSelfTest = false
 }
 
 private let usage = """
@@ -1240,6 +1277,7 @@ Usage: native-metal-oracle --suite PATH [--output PATH]
        native-metal-oracle --depth-resolve-selftest
        native-metal-oracle --stencil-resolve-selftest
        native-metal-oracle --stage-buffer-selftest
+       native-metal-oracle --stage-buffer-write-selftest
        native-metal-oracle --help
 
 Capture the supported suite using native Metal on Apple silicon macOS 11+.
@@ -1313,6 +1351,19 @@ setFragmentBuffer. It fails unless the covered top-left texel carries each
 run's own tint (40 80 c0 ff, then 00 ff 00 ff) instead of the sentinel, and the
 full-screen run moves the reviewed tint into all four texels. It cannot be
 combined with other options.
+--stage-buffer-write-selftest needs no suite: it compiles the reviewed
+shaders/render_stage_buffer_write_2x2.metal module and runs it twice against a
+fresh 2x2 rgba8_unorm attachment cleared to the fefefefe sentinel — the
+reviewed three-vertex triangle with the reviewed tint, then the full-screen
+positions with a green source — binding the vertex stage's own [[buffer(0)]]
+positions, the fragment stage's readable [[buffer(0)]] source, its write-only
+[[buffer(1)]] sink and its read-write [[buffer(2)]] accumulator with
+setVertexBuffer and setFragmentBuffer. It fails unless the attachment, the
+sink and the accumulator each carry that run's own bytes: the frame is the
+source payload (40 80 c0 ff on one texel, then 00 ff 00 ff on all four), the
+sink holds the source payload rather than the zeros it started from, and the
+accumulator holds its previous 0.25 plus one. It cannot be combined with other
+options.
 The 20-second completion timeout does not cancel submitted GPU work.
 """
 
@@ -1386,9 +1437,27 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
             try require(!stageBufferSelfTest, "Duplicate --stage-buffer-selftest option")
             stageBufferSelfTest = true
             index += 1
+        case "--stage-buffer-write-selftest":
+            try require(!stageBufferWriteSelfTest,
+                        "Duplicate --stage-buffer-write-selftest option")
+            stageBufferWriteSelfTest = true
+            index += 1
         default:
             throw OracleError("Unknown argument: \(argument)\n\(usage)")
         }
+    }
+    if stageBufferWriteSelfTest {
+        // Checked first, like the stage-buffer flag below it, so a combination
+        // is refused here rather than silently dropping whichever flag an
+        // earlier block returned false for.
+        try require(suite == nil && output == nil && !validateOnly && !probe && !renderSelfTest
+                    && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest
+                    && !depthResolveSelfTest && !stencilResolveSelfTest && !stageBufferSelfTest,
+                    "--stage-buffer-write-selftest cannot be combined with --suite, --output, --validate-suite, --probe, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, --stencil-resolve-selftest, or --stage-buffer-selftest")
+        return Options(suite: nil, output: nil, validateOnly: false, probe: false,
+                       renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
+                       mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
+                       stencilResolveSelfTest: false, stageBufferWriteSelfTest: true)
     }
     if stageBufferSelfTest {
         // Checked before the other self-tests so a combination is refused here
@@ -1396,8 +1465,9 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
         // returned false for.
         try require(suite == nil && output == nil && !validateOnly && !probe && !renderSelfTest
                     && !presentSelfTest && !vertexSelfTest && !mrtSelfTest && !heapSelfTest
-                    && !depthResolveSelfTest && !stencilResolveSelfTest,
-                    "--stage-buffer-selftest cannot be combined with --suite, --output, --validate-suite, --probe, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, or --stencil-resolve-selftest")
+                    && !depthResolveSelfTest && !stencilResolveSelfTest
+                    && !stageBufferWriteSelfTest,
+                    "--stage-buffer-selftest cannot be combined with --suite, --output, --validate-suite, --probe, --render-selftest, --present-selftest, --vertex-selftest, --mrt-selftest, --heap-selftest, --depth-resolve-selftest, --stencil-resolve-selftest, or --stage-buffer-write-selftest")
         return Options(suite: nil, output: nil, validateOnly: false, probe: false,
                        renderSelfTest: false, presentSelfTest: false, vertexSelfTest: false,
                        mrtSelfTest: false, heapSelfTest: false, depthResolveSelfTest: false,
@@ -2252,6 +2322,28 @@ private func reviewedStageBufferModule() -> ReviewedRenderModule {
         fragment_entry: "render_stage_buffer_tint",
         metal: RenderSourcePin(path: "shaders/render_stage_buffer_2x2.metal",
                                sha256: "63c4d5ba60c187437d749d957033778f479bc9ecb3f0a408eeabe6095dba0de6"),
+        buffers: nil)
+}
+
+/// The reviewed writable stage-buffer module (`research/docs/23` §92, R9k): the
+/// provider rail's own module (`crates/metal-api-native/src/render.rs`,
+/// `REVIEWED_STAGE_BUFFER_WRITE_SOURCE`) written with the same pinned bytes, so
+/// the oracle executes exactly the source the Rust rail compiles.
+///
+/// The vertex stage reads its positions out of its own `[[buffer(0)]]`
+/// argument with a vertex-index stride, and the fragment stage reads
+/// `[[buffer(0)]]`, writes `[[buffer(1)]]` and reads and writes
+/// `[[buffer(2)]]` — the three access arms this increment executes. Like the
+/// R9g pair the module carries no `buffers` layout: the vertex stage's
+/// `vertex_id` selects the record inside its own buffer argument rather than a
+/// record assembled from an `[[stage_in]]` stream.
+private func reviewedStageBufferWriteModule() -> ReviewedRenderModule {
+    ReviewedRenderModule(
+        vertex_entry: "render_stage_buffer_write_vertex",
+        fragment_entry: "render_stage_buffer_write_tint",
+        metal: RenderSourcePin(
+            path: "shaders/render_stage_buffer_write_2x2.metal",
+            sha256: "b1865c05ac79e7afe4a328838a821578949e9d130443ce6d8393810fd064ec49"),
         buffers: nil)
 }
 
@@ -5919,6 +6011,254 @@ private func stageBufferSelfTest() throws -> StageBufferSelfTestReport {
         platform: eligibility.platform)
 }
 
+/// One run of the writable stage-buffer self-test (`research/docs/23` §92,
+/// R9k): the four `[[buffer(N)]]` payloads are bound at their stages' own
+/// slots, the triangle is drawn, and the attachment's texels beside the two
+/// writable buffers' bytes are read back once the command buffer completed.
+///
+/// The sink starts as zeros — a rail that executed the pass but landed nothing
+/// would hand them back — and the accumulator starts at the caller's
+/// `0.25` payload, which the stage adds one to.
+@available(macOS 11.0, *)
+private func runStageBufferWritePass(device: MTLDevice, queue: MTLCommandQueue,
+                                     pipeline: MTLRenderPipelineState,
+                                     positions: Data, source: Data,
+                                     accumulator: Data,
+                                     id: String) throws -> (attachment: Data, sink: Data,
+                                                            accumulator: Data) {
+    let width = 2
+    let height = 2
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: width,
+        height: height,
+        mipmapped: false)
+    descriptor.usage = .renderTarget
+    descriptor.storageMode = .shared
+    guard let target = device.makeTexture(descriptor: descriptor) else {
+        throw OracleError("\(id): cannot allocate the colour attachment")
+    }
+    target.label = "native oracle: \(id)"
+    let positionsBuffer = try makeStreamBuffer(device: device, id: id, offset: 0,
+                                               bytes: positions)
+    let sourceBuffer = try makeStreamBuffer(device: device, id: id, offset: 0, bytes: source)
+    let sinkBuffer = try makeStreamBuffer(device: device, id: id, offset: 0,
+                                          bytes: Data(count: source.count))
+    let accumulatorBuffer = try makeStreamBuffer(device: device, id: id, offset: 0,
+                                                 bytes: accumulator)
+    let pass = MTLRenderPassDescriptor()
+    // `colorAttachments[i]` is an implicitly unwrapped optional on the Swift
+    // side of Metal; referencing a member before unwrapping is a compile error
+    // under `-warnings-as-errors`, so unwrap it explicitly.
+    guard let color = pass.colorAttachments[0] else {
+        throw OracleError("\(id): cannot reach colour attachment 0")
+    }
+    color.texture = target
+    color.loadAction = .clear
+    color.clearColor = MTLClearColor(red: Double(0xfe) / 255.0,
+                                     green: Double(0xfe) / 255.0,
+                                     blue: Double(0xfe) / 255.0,
+                                     alpha: Double(0xfe) / 255.0)
+    color.storeAction = .store
+    guard let commandBuffer = queue.makeCommandBuffer() else {
+        throw OracleError("\(id): cannot create a command buffer")
+    }
+    try require(commandBuffer.retainedReferences,
+                "\(id): command buffer does not retain resources")
+    commandBuffer.label = "native oracle: \(id)"
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        throw OracleError("\(id): cannot create a render encoder")
+    }
+    encoder.setRenderPipelineState(pipeline)
+    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                    width: Double(width), height: Double(height),
+                                    znear: 0, zfar: 1))
+    // The vertex stage's own `[[buffer(0)]]` positions, and the fragment
+    // stage's three slots: the readable source, the write-only sink and the
+    // read-write accumulator. Each stage's index space is its own, exactly as
+    // `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`
+    // state, and the fragment stage's `0`, `1` and `2` are three different
+    // arms of the reviewed module's argument table.
+    encoder.setVertexBuffer(positionsBuffer, offset: 0, index: 0)
+    encoder.setFragmentBuffer(sourceBuffer, offset: 0, index: 0)
+    encoder.setFragmentBuffer(sinkBuffer, offset: 0, index: 1)
+    encoder.setFragmentBuffer(accumulatorBuffer, offset: 0, index: 2)
+    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    encoder.endEncoding()
+    let completed = DispatchSemaphore(value: 0)
+    commandBuffer.addCompletedHandler { _ in completed.signal() }
+    commandBuffer.commit()
+    guard completed.wait(timeout: .now() + .seconds(20)) == .success else {
+        throw OracleError("\(id): GPU completion timed out after 20 seconds; submitted work was not cancelled")
+    }
+    try require(commandBuffer.status == .completed && commandBuffer.error == nil,
+                "\(id): Metal execution failed (status \(commandBuffer.status.rawValue)): \(String(describing: commandBuffer.error))")
+    var observed = Data(count: width * height * 4)
+    observed.withUnsafeMutableBytes { bytes in
+        if let destination = bytes.baseAddress {
+            target.getBytes(destination,
+                            bytesPerRow: width * 4,
+                            from: MTLRegionMake2D(0, 0, width, height),
+                            mipmapLevel: 0)
+        }
+    }
+    // The two writable bindings are shared-storage buffers, so the bytes the
+    // device wrote are CPU-visible once the command buffer is completed —
+    // exactly the read the Rust rail's `encode_into_and_readback` performs.
+    let sinkObserved = Data(bytes: sinkBuffer.contents(), count: source.count)
+    let accumulatorObserved = Data(bytes: accumulatorBuffer.contents(), count: accumulator.count)
+    return (observed, sinkObserved, accumulatorObserved)
+}
+
+/// The writable stage-buffer milestone's own fixture, constructed in code
+/// (`research/docs/23` §92, R9k).
+///
+/// This is the one-device check the native provider's stage-buffer write arm
+/// points at, beside the R9g read-only one: the reviewed module's vertex stage
+/// reads its positions out of its own `[[buffer(0)]]` with a vertex-index
+/// stride, and its fragment stage reads `[[buffer(0)]]`, writes `[[buffer(1)]]`
+/// and reads and writes `[[buffer(2)]]`. Two runs prove the three arms
+/// together: the reviewed triangle with the reviewed tint lands `40 80 c0 ff`
+/// on one texel, the sink carries the tint the stage wrote rather than the
+/// zeros it started from, and the accumulator carries its previous `0.25` plus
+/// one; the full-screen positions with a green source move all three readings
+/// to the second run's own bytes. A rail that ignores any slot cannot report
+/// both runs, and a green job whose log said `SKIP` is not that reading.
+@available(macOS 11.0, *)
+private func stageBufferWriteSelfTest() throws -> StageBufferWriteSelfTestReport {
+    let reviewed = reviewedStageBufferWriteModule()
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let sourceBytes = try loadRenderSource(reviewed.metal, root: root)
+    guard let source = String(data: sourceBytes, encoding: .utf8) else {
+        throw OracleError("stage-buffer write selftest: reviewed MSL source is not UTF-8")
+    }
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw OracleError("No default Metal device is available; the stage-buffer write self-test requires an Apple silicon Mac")
+    }
+    let eligibility = assessDevice(device)
+    try require(eligibility.eligible,
+                "This oracle requires a named Apple silicon GPU with nonuniform threadgroups and unified memory")
+    guard let queue = device.makeCommandQueue() else {
+        throw OracleError("Cannot create a Metal command queue")
+    }
+    diagnostic("native stage-buffer write self-test: device=\(device.name) platform=\(eligibility.platform)")
+    let library = try device.makeLibrary(source: source, options: nil)
+    guard let vertexFunction = library.makeFunction(name: reviewed.vertex_entry) else {
+        throw OracleError("stage-buffer write selftest: vertex entry \(reviewed.vertex_entry) was not found")
+    }
+    guard let fragmentFunction = library.makeFunction(name: reviewed.fragment_entry) else {
+        throw OracleError("stage-buffer write selftest: fragment entry \(reviewed.fragment_entry) was not found")
+    }
+    let pipelineDescriptor = MTLRenderPipelineDescriptor()
+    pipelineDescriptor.label = "native oracle: stage-buffer write selftest"
+    pipelineDescriptor.vertexFunction = vertexFunction
+    pipelineDescriptor.fragmentFunction = fragmentFunction
+    // Every argument arrives through `[[buffer(N)]]`, so the pipeline carries
+    // no `MTLVertexDescriptor`: the vertex stage's `vertex_id` selects the
+    // record inside its own buffer rather than assembling one from a stream.
+    pipelineDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+    let pipeline = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+
+    // (-1,1), (0.25,1), (-1,-0.25): the triangle whose pixels cover the 2x2
+    // attachment's top-left texel centre and no other texel centre — the same
+    // geometry the R9g pair binds, here read through the affine stride.
+    let reviewedPositions = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbe,
+    ])
+    // (-1,-1), (3,-1), (-1,3): the oversize triangle that covers every texel
+    // centre, so the second run cannot be confused with the first.
+    let fullScreenPositions = Data([
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x80, 0xbf, 0x00, 0x00, 0x40, 0x40,
+    ])
+    // (64/255, 128/255, 192/255, 1) as `float32`: the same bytes the Rust
+    // fixture's source view carries, which the attachment stores as `40 80 c0 ff`.
+    let reviewedSource = Data([
+        0x81, 0x80, 0x80, 0x3e, 0x81, 0x80, 0x00, 0x3f,
+        0xc1, 0xc0, 0x40, 0x3f, 0x00, 0x00, 0x80, 0x3f,
+    ])
+    // (0,1,0,1): the second run's source, which the attachment stores as
+    // `00 ff 00 ff` in every texel.
+    let greenSource = Data([
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+    ])
+    // 0.25 in every component: the read-write binding's previous value, one
+    // the stage adds one to (`1.25` afterwards, and `2.0` for the green run's
+    // two one-components).
+    let reviewedAccumulator = Data([
+        0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3e,
+        0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x80, 0x3e,
+    ])
+
+    let sentinel = "fefefefe"
+    let reviewedFrame = "4080c0ff" + sentinel + sentinel + sentinel
+    let fullScreenFrame = String(repeating: "00ff00ff", count: 4)
+    let reviewedAccumulatorAfter = String(repeating: "0000a03f", count: 4)
+    let greenAccumulatorAfter = "0000a03f" + "00000040" + "0000a03f" + "00000040"
+
+    let first = try runStageBufferWritePass(device: device, queue: queue, pipeline: pipeline,
+                                            positions: reviewedPositions,
+                                            source: reviewedSource,
+                                            accumulator: reviewedAccumulator,
+                                            id: "stage_buffer_write_2x2")
+    try require(hex(first.attachment) == reviewedFrame,
+                "stage-buffer write selftest: the reviewed run landed \(hex(first.attachment)) instead of \(reviewedFrame)")
+    try require(hex(first.sink) == hex(reviewedSource),
+                "stage-buffer write selftest: the sink holds \(hex(first.sink)) instead of the source payload \(hex(reviewedSource))")
+    try require(hex(first.accumulator) == reviewedAccumulatorAfter,
+                "stage-buffer write selftest: the accumulator holds \(hex(first.accumulator)) instead of \(reviewedAccumulatorAfter)")
+    let second = try runStageBufferWritePass(device: device, queue: queue, pipeline: pipeline,
+                                             positions: fullScreenPositions,
+                                             source: greenSource,
+                                             accumulator: reviewedAccumulator,
+                                             id: "stage_buffer_write_2x2 full-screen green")
+    try require(hex(second.attachment) == fullScreenFrame,
+                "stage-buffer write selftest: the full-screen run landed \(hex(second.attachment)) instead of \(fullScreenFrame)")
+    try require(hex(second.sink) == hex(greenSource),
+                "stage-buffer write selftest: the full-screen sink holds \(hex(second.sink)) instead of \(hex(greenSource))")
+    try require(hex(second.accumulator) == greenAccumulatorAfter,
+                "stage-buffer write selftest: the full-screen accumulator holds \(hex(second.accumulator)) instead of \(greenAccumulatorAfter)")
+    diagnostic("native stage-buffer write self-test: reviewed frame=\(hex(first.attachment)) "
+               + "sink=\(hex(first.sink)) accumulator=\(hex(first.accumulator)) "
+               + "full frame=\(hex(second.attachment)) sink=\(hex(second.sink)) "
+               + "accumulator=\(hex(second.accumulator))")
+    return StageBufferWriteSelfTestReport(
+        id: "stage_buffer_write_2x2",
+        completion: "CompletedVisible",
+        writebacks: [
+            Writeback(allocation: 900, view: 910, offset: 0,
+                      bytes_hex: hex(first.attachment)),
+            Writeback(allocation: 901, view: 911, offset: 0, bytes_hex: hex(first.sink)),
+            Writeback(allocation: 902, view: 912, offset: 0,
+                      bytes_hex: hex(first.accumulator)),
+        ],
+        allocations: [
+            AllocationResult(allocation: 900, image: first.attachment),
+            AllocationResult(allocation: 901, image: first.sink),
+            AllocationResult(allocation: 902, image: first.accumulator),
+        ],
+        observations: [
+            StageBufferWriteObservation(positions_hex: hex(reviewedPositions),
+                                        source_hex: hex(reviewedSource),
+                                        accumulator_initial_hex: hex(reviewedAccumulator),
+                                        attachment_hex: hex(first.attachment),
+                                        sink_hex: hex(first.sink),
+                                        accumulator_hex: hex(first.accumulator)),
+            StageBufferWriteObservation(positions_hex: hex(fullScreenPositions),
+                                        source_hex: hex(greenSource),
+                                        accumulator_initial_hex: hex(reviewedAccumulator),
+                                        attachment_hex: hex(second.attachment),
+                                        sink_hex: hex(second.sink),
+                                        accumulator_hex: hex(second.accumulator)),
+        ],
+        device: device.name,
+        platform: eligibility.platform)
+}
+
 /// The heap milestone's own fixture, constructed in code.
 ///
 /// This is the one-device heap check (`research/docs/25` §6 Step 7a): two
@@ -7061,6 +7401,17 @@ do {
         // the report carries. The whole report is the evidence; the CI step's
         // validator refuses anything but the reviewed texels.
         let result = try stageBufferSelfTest()
+        try writeJSON(result)
+        exit(EXIT_SUCCESS)
+    }
+    if options.stageBufferWriteSelfTest {
+        // The writable stage-buffer milestone's one-device check
+        // (`research/docs/23` §92, R9k): the reviewed module's four
+        // `[[buffer(N)]]` arguments bound at their stages' own slots, two runs
+        // whose frames, sink bytes and accumulator bytes the report carries.
+        // The whole report is the evidence; the CI step's validator refuses
+        // anything but the reviewed readings.
+        let result = try stageBufferWriteSelfTest()
         try writeJSON(result)
         exit(EXIT_SUCCESS)
     }

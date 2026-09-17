@@ -59,14 +59,15 @@
 use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
-    AttachmentFormat, BorrowedLeaseRegistry, BorrowedView, BufferAccess, BufferSource, BufferView,
-    BufferWriteback, ClearColor, ComputeTrace, ContractError, DepthResolveFilter, DepthStoreOp,
-    DepthTest, DeviceEpoch, FieldValue, FootprintProof, IndexBufferBinding, IndexFormat,
-    IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, PipelineId, PresentDescriptor,
-    PresentMode, ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
-    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot,
-    SampleCount, StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource,
-    TextureType, TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
+    AffineAccess, AffineTerm, AllocationId, AttachmentFormat, BorrowedLeaseRegistry, BorrowedView,
+    BufferAccess, BufferSource, BufferView, BufferWriteback, ClearColor, ComputeTrace,
+    ContractError, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue,
+    FootprintProof, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor, LeaseId,
+    LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
+    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
+    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount,
+    StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
+    TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
@@ -263,6 +264,201 @@ pub(crate) const STAGE_BUFFER_VERTEX_BYTES: u64 = 24;
 /// Bytes the reviewed fragment stage reads: one `float4` tint.
 pub(crate) const STAGE_BUFFER_FRAGMENT_BYTES: u64 = 16;
 
+/// The reviewed writable stage-buffer module (`research/docs/23` §92, R9k):
+/// the native rail's sibling of the two shapes R9f executes on the Vulkan rail
+/// through translated modules — the write half's `source`/`sink` pair and the
+/// affine half's strided `positions[vertex_id]` read.
+///
+/// The module shares the milestone's shape — `VertexLayout::None`, one
+/// `Rgba8Unorm` location — so it is selected by its entry pair, exactly as the
+/// render sampler's and the R9g stage-buffer pair are: a registration has no
+/// pass to look at, and the pass that binds these slots is exactly the one that
+/// names these entries.
+pub(crate) const REVIEWED_STAGE_BUFFER_WRITE_SOURCE: &str =
+    include_str!("../../../conformance/shaders/render_stage_buffer_write_2x2.metal");
+
+/// Vertex entry of the reviewed writable stage-buffer module: three positions
+/// from the stage's own `[[buffer(0)]]`, read with a vertex-index stride.
+pub(crate) const STAGE_BUFFER_WRITE_VERTEX_ENTRY: &str = "render_stage_buffer_write_vertex";
+
+/// Fragment entry of the reviewed writable stage-buffer module: one readable
+/// `source`, one writable `sink` and one read-write `accumulator`, each a
+/// `float4` in its own `[[buffer(N)]]` argument (`research/docs/23` §92, R9k).
+pub(crate) const STAGE_BUFFER_WRITE_FRAGMENT_ENTRY: &str = "render_stage_buffer_write_tint";
+
+/// The writable module's vertex-stage binding inside that stage's own
+/// `[[buffer(N)]]` index space: the positions the draw's vertices index into.
+pub(crate) const STAGE_BUFFER_WRITE_VERTEX_BINDING: u32 = 0;
+
+/// Bytes one vertex-index step of the readable positions reaches: two `float`
+/// components, four bytes each, eight bytes apart — the two-access affine set
+/// [`STAGE_BUFFER_WRITE_VERTEX_ACCESSES`] states.
+pub(crate) const STAGE_BUFFER_WRITE_VERTEX_STRIDE: u64 = 8;
+
+/// The writable module's fragment-stage binding of the readable `source`.
+pub(crate) const STAGE_BUFFER_WRITE_SOURCE_BINDING: u32 = 0;
+
+/// The writable module's fragment-stage binding of the write-only `sink`.
+pub(crate) const STAGE_BUFFER_WRITE_SINK_BINDING: u32 = 1;
+
+/// The writable module's fragment-stage binding of the read-write
+/// `accumulator`.
+pub(crate) const STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING: u32 = 2;
+
+/// Bytes the readable `source` argument is (one `float4`), which is also the
+/// extent the `sink` argument is written over and the extent the `accumulator`
+/// argument is read and written over.
+pub(crate) const STAGE_BUFFER_WRITE_TEXEL_BYTES: u64 = 16;
+
+/// The reflected reach of the module's vertex-stage `[[buffer(0)]]` argument
+/// (`research/docs/23` §3.3, v86): two four-byte accesses strided by
+/// [`STAGE_BUFFER_WRITE_VERTEX_STRIDE`] over the draw's vertex index, axis 0 of
+/// [`metal_api_core::provider::RENDER_AFFINE_AXES`]. The set is the one
+/// `crates/metal-api-vulkan/tests/fixtures/render_stage_buffer_positions.vert.ll`
+/// translates to for the same read, so the two rails pair one measurement.
+pub(crate) const STAGE_BUFFER_WRITE_VERTEX_ACCESSES: [ReviewedAffineAccess; 2] = [
+    ReviewedAffineAccess {
+        base_offset: 0,
+        access_size: 4,
+        terms: &[ReviewedAffineTerm { axis: 0, stride: 8 }],
+    },
+    ReviewedAffineAccess {
+        base_offset: 4,
+        access_size: 4,
+        terms: &[ReviewedAffineTerm { axis: 0, stride: 8 }],
+    },
+];
+
+/// The byte reach one reviewed `[[buffer(N)]]` argument states
+/// (`research/docs/23` §3.3, v86/v92).
+///
+/// The two arms are the two the contract's [`FootprintProof`] states, one
+/// level down: a fixed extent the module's own read reaches, or the reflected
+/// `constant + stride * invocation index` access set. A reviewed module whose
+/// read depends on the draw states the affine arm, and the registration pairs
+/// it with an affine declaration of the same set — a static declaration is a
+/// ceiling the draw's own count can outgrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewedStageBufferReach {
+    /// A fixed byte extent, the shape every pre-R9k reviewed argument states.
+    Static { max_bytes: u64 },
+    /// The reflected affine accesses, in the contract's own terms.
+    Affine {
+        accesses: &'static [ReviewedAffineAccess],
+    },
+}
+
+impl ReviewedStageBufferReach {
+    /// The byte extent this reach covers over a draw's `[vertex, instance]`
+    /// counts, by the same arithmetic the core contract evaluates its
+    /// declarations with (`research/docs/23` §3.3, v86): the maximum over the
+    /// accesses of `base + size + Σ (count - 1) * stride`. `None` means the
+    /// expression overflows `u64`, which is a proof this rail refuses by name
+    /// rather than flattens.
+    fn required_bytes(&self, counts: [u64; 2]) -> Option<u64> {
+        match self {
+            Self::Static { max_bytes } => Some(*max_bytes),
+            Self::Affine { accesses } => {
+                let mut required = 0_u64;
+                for access in *accesses {
+                    let mut end = access.base_offset.checked_add(access.access_size)?;
+                    for term in access.terms {
+                        let count = counts.get(usize::from(term.axis))?;
+                        let maximum = count.saturating_sub(1);
+                        end = end.checked_add(maximum.checked_mul(term.stride)?)?;
+                    }
+                    required = required.max(end);
+                }
+                Some(required)
+            }
+        }
+    }
+
+    /// The reach as the contract's own access set, which is what the
+    /// registration pairs an affine declaration against: a static extent is one
+    /// term-less access over its whole width, exactly as a translated static
+    /// range becomes one in the Vulkan rail's reflection
+    /// (`crates/metal-api-vulkan/src/render.rs`, `reflected_affine_accesses`).
+    fn accesses(&self) -> Vec<AffineAccess> {
+        match self {
+            Self::Static { max_bytes } => vec![AffineAccess {
+                base_offset: 0,
+                access_size: *max_bytes,
+                terms: Vec::new(),
+            }],
+            Self::Affine { accesses } => accesses
+                .iter()
+                .map(|access| AffineAccess {
+                    base_offset: access.base_offset,
+                    access_size: access.access_size,
+                    terms: access
+                        .terms
+                        .iter()
+                        .map(|term| AffineTerm {
+                            axis: term.axis,
+                            stride: term.stride,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this reach is the affine arm, which is what a vertex stage that
+    /// reads its positions out of a stage buffer states — and therefore what
+    /// bounds its `vertex_id` values instead of the reviewed full-screen
+    /// triangle's own three-vertex count ([`FULL_SCREEN_TRIANGLE_VERTICES`]).
+    pub(crate) const fn is_affine(&self) -> bool {
+        matches!(self, Self::Affine { .. })
+    }
+}
+
+/// One access of a reviewed argument's affine reach, in the contract's own
+/// terms but as a `'static` value a module table can carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewedAffineAccess {
+    pub(crate) base_offset: u64,
+    pub(crate) access_size: u64,
+    pub(crate) terms: &'static [ReviewedAffineTerm],
+}
+
+/// One `stride * axis` term of a reviewed affine reach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewedAffineTerm {
+    pub(crate) axis: u8,
+    pub(crate) stride: u64,
+}
+
+/// One normalized affine access: base offset, access size and the ascending
+/// `(axis, stride)` terms (`research/docs/23` §3.3, v86).
+type NormalizedAffineAccess = (u64, u64, Vec<(u8, u64)>);
+
+/// The order- and duplicate-insensitive form of one affine access set: what the
+/// two ends of the registration pairing compare.
+///
+/// The same normal form the Vulkan rail's translated pairing uses
+/// (`crates/metal-api-vulkan/src/render.rs`, `affine_access_set`): a
+/// declaration is free to state the module's accesses in any order, and the
+/// term list inside one access is a set too, so both degrees of freedom are
+/// dropped before "the same access set" becomes one comparison.
+fn affine_access_set(accesses: &[AffineAccess]) -> Vec<NormalizedAffineAccess> {
+    let mut normalized = accesses
+        .iter()
+        .map(|access| {
+            let mut terms = access
+                .terms
+                .iter()
+                .map(|term| (term.axis, term.stride))
+                .collect::<Vec<_>>();
+            terms.sort_unstable();
+            (access.base_offset, access.access_size, terms)
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
 /// One `[[buffer(N)]]` argument a reviewed module reads, as the registration
 /// gate pairs it with the contract's declaration (`research/docs/23` §83,
 /// R9g).
@@ -271,18 +467,19 @@ pub(crate) const STAGE_BUFFER_FRAGMENT_BYTES: u64 = 16;
 /// translated stage carries: its argument list is fixed by the pinned source
 /// bytes, so this table is what the registration pairs the contract's
 /// `StageBufferBinding` list against — stage, index, access and the byte
-/// extent the module's own read reaches.
+/// reach the module's own read and write state ([`ReviewedStageBufferReach`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewedStageBufferSlot {
     /// Which stage reads the argument.
     pub(crate) stage: RenderPipelineStage,
     /// The `[[buffer(index)]]` number inside that stage's own index space.
     pub(crate) index: u32,
-    /// How the stage uses the bytes. Every reviewed argument is read-only.
+    /// How the stage uses the bytes: the read-only arms of the pre-R9k
+    /// modules, and the write and read-write arms of the R9k writable module.
     pub(crate) access: BufferAccess,
-    /// Bytes the module's own read reaches; the contract's declared static
-    /// footprint has to cover it.
-    pub(crate) max_bytes: u64,
+    /// The reach the module's own read and write states; the contract's
+    /// declaration has to cover a static arm and *be* an affine one.
+    pub(crate) reach: ReviewedStageBufferReach,
 }
 
 /// One reviewed render module and the (vertex-input shape, colour-format
@@ -319,7 +516,7 @@ pub(crate) struct ReviewedModule {
 
 /// The reviewed modules, one per (vertex-input shape, colour-format shape)
 /// pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 11] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 12] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
@@ -428,13 +625,65 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 11] = [
                 stage: RenderPipelineStage::Vertex,
                 index: STAGE_BUFFER_VERTEX_BINDING,
                 access: BufferAccess::Read,
-                max_bytes: STAGE_BUFFER_VERTEX_BYTES,
+                reach: ReviewedStageBufferReach::Static {
+                    max_bytes: STAGE_BUFFER_VERTEX_BYTES,
+                },
             },
             ReviewedStageBufferSlot {
                 stage: RenderPipelineStage::Fragment,
                 index: STAGE_BUFFER_FRAGMENT_BINDING,
                 access: BufferAccess::Read,
-                max_bytes: STAGE_BUFFER_FRAGMENT_BYTES,
+                reach: ReviewedStageBufferReach::Static {
+                    max_bytes: STAGE_BUFFER_FRAGMENT_BYTES,
+                },
+            },
+        ],
+    },
+    // The reviewed writable stage-buffer fixture (`research/docs/23` §92,
+    // R9k): the one module whose stage buffers are not all read-only — its
+    // fragment stage writes `[[buffer(1)]]` and reads and writes
+    // `[[buffer(2)]]` — and the one whose vertex stage reads its positions with
+    // a vertex-index stride instead of from a fixed three-record extent. It
+    // shares the milestone's `vertex_id` + one-`Rgba8Unorm`-location shape, so
+    // its entry pair is what selects it.
+    ReviewedModule {
+        source: REVIEWED_STAGE_BUFFER_WRITE_SOURCE,
+        path: "conformance/shaders/render_stage_buffer_write_2x2.metal",
+        vertex_entry: STAGE_BUFFER_WRITE_VERTEX_ENTRY,
+        fragment_entry: STAGE_BUFFER_WRITE_FRAGMENT_ENTRY,
+        binds_buffers: false,
+        stage_buffers: &[
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Vertex,
+                index: STAGE_BUFFER_WRITE_VERTEX_BINDING,
+                access: BufferAccess::Read,
+                reach: ReviewedStageBufferReach::Affine {
+                    accesses: &STAGE_BUFFER_WRITE_VERTEX_ACCESSES,
+                },
+            },
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_SOURCE_BINDING,
+                access: BufferAccess::Read,
+                reach: ReviewedStageBufferReach::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
+            },
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_SINK_BINDING,
+                access: BufferAccess::Write,
+                reach: ReviewedStageBufferReach::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
+            },
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING,
+                access: BufferAccess::ReadWrite,
+                reach: ReviewedStageBufferReach::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
             },
         ],
     },
@@ -571,6 +820,17 @@ pub(crate) fn reviewed_module_for(
         && contract.color_formats == [AttachmentFormat::Rgba8Unorm]
     {
         return Some(&REVIEWED_MODULES[10]);
+    }
+    // The writable stage-buffer pair (`research/docs/23` §92, R9k) is selected
+    // by its entry pair for the same reason: it shares the milestone's shape,
+    // and the pass that binds a `Write` or `ReadWrite` slot is exactly the one
+    // that names these two entries.
+    if contract.vertex_entry == STAGE_BUFFER_WRITE_VERTEX_ENTRY
+        && contract.fragment_entry == STAGE_BUFFER_WRITE_FRAGMENT_ENTRY
+        && matches!(contract.vertex_layout, VertexLayout::None)
+        && contract.color_formats == [AttachmentFormat::Rgba8Unorm]
+    {
+        return Some(&REVIEWED_MODULES[11]);
     }
     None
 }
@@ -1554,28 +1814,48 @@ impl PlannedIndexStream<'_> {
 }
 
 /// One stage buffer the pass binds, resolved before any Metal object exists
-/// (`research/docs/23` §83, R9g).
+/// (`research/docs/23` §83/R9g, §92/R9k).
 ///
 /// The entry names its stage explicitly: the two stages' `[[buffer(N)]]` index
 /// spaces are independent, so the index alone cannot say which namespace it
-/// fills. `bytes` is the reviewed module's own read extent — the fact the
-/// registration paired the declaration against — and the encoder binds the
-/// resolved buffer at `index` in the stage's own namespace.
+/// fills. `bytes` is the reviewed module's own reach over *this* draw — the
+/// fact the registration paired the declaration against, evaluated over the
+/// draw's counts for the affine arm — and the encoder binds the resolved buffer
+/// at `index` in the stage's own namespace.
+///
+/// A writable binding is also a landing (`research/docs/23` §3.3, v86/v92): the
+/// view identity, offset and length here are the ones the pass's own view
+/// declares, which is what the post-fence readback publishes as one complete
+/// [`BufferWriteback`] for that view.
 #[derive(Debug)]
 pub(crate) struct PlannedStageBuffer<'a> {
-    /// Which stage reads the binding.
+    /// Which stage reads or writes the binding.
     pub(crate) stage: RenderPipelineStage,
     /// The `[[buffer(index)]]` number inside that stage's namespace, i.e. the
     /// `setVertexBuffer(_:offset:index:)` / `setFragmentBuffer(_:offset:index:)`
     /// index the encoder binds.
     pub(crate) index: u32,
-    /// Bytes the reviewed module's read reaches.
+    /// Bytes the reviewed module's read and write reach over this draw.
     pub(crate) bytes: u64,
     /// Where this binding's bytes come from, through the same three-armed
     /// channel every other render input uses.
     pub(crate) source: PlannedInputSource<'a>,
-    /// The view's offset inside its allocation.
+    /// The view's offset inside its allocation, which is also the offset a
+    /// writeback of this view carries.
     pub(crate) offset: u64,
+    /// The identity of the view this binding lands in, for a writable binding.
+    /// Read-only bindings carry it too, so the plan's one binding table is the
+    /// whole record of what the pass bound.
+    pub(crate) view_id: ViewId,
+    pub(crate) allocation_id: AllocationId,
+    /// How the stage uses the bytes. A writable binding is the arm the rail
+    /// reads back after the pass's fence and publishes through the writeback
+    /// channel.
+    pub(crate) access: BufferAccess,
+    /// Bytes the view declares, which is the extent a writeback publishes
+    /// (`BufferWriteback` carries the view's whole extent, not the module's
+    /// reach inside it).
+    pub(crate) length: u64,
 }
 
 impl PlannedStageBuffer<'_> {
@@ -1618,10 +1898,19 @@ impl PlannedStageBuffer<'_> {
 /// binding index both rails use, and core admission already holds each view's
 /// own `metal_binding` to it ([`validate_vertex_buffer_binding`]), which `plan`
 /// re-runs before this function.
+///
+/// `vertex_positions_carried_by_stage_buffer` is the one draw shape a stream
+/// cannot bound: a `vertex_id`-shaped module that reads its positions out of a
+/// stage buffer states its own affine reach, and that reach — not the reviewed
+/// full-screen triangle's three records — is what covers the indices the draw
+/// names (`research/docs/23` §92, R9k). The flag is the caller's answer for the
+/// module it selected, so this proof and the stage-buffer proof read one
+/// measurement of the draw.
 fn plan_vertex_input<'a>(
     pass: &'a RenderPassDescriptor,
     pipeline: &RenderPipelineContract,
     leases: Option<&RenderLeaseContext<'_>>,
+    vertex_positions_carried_by_stage_buffer: bool,
 ) -> Result<(Vec<PlannedVertexStream<'a>>, Option<PlannedIndexStream<'a>>), ProviderError> {
     let mut streams = Vec::with_capacity(pass.vertex_buffers.len());
     // One layout entry per bound stream, in binding order; core admission
@@ -1724,8 +2013,15 @@ fn plan_vertex_input<'a>(
             // The `vertex_id` shape binds no stream to bound its index values:
             // the reviewed module generates exactly
             // `FULL_SCREEN_TRIANGLE_VERTICES` positions, so an index at or above
-            // that count would read a position the module does not carry.
+            // that count would read a position the module does not carry. A
+            // reviewed module that reads its positions *out of a stage buffer*
+            // states its own reach instead (`research/docs/23` §92, R9k): the
+            // affine declaration paired with that slot is proven over the same
+            // `base_vertex + highest index + 1` count
+            // ([`plan_stage_buffers`]), so the record every `vertex_id` names is
+            // covered by the buffer's own proof rather than by this clamp.
             if pass.vertex_buffers.is_empty()
+                && !vertex_positions_carried_by_stage_buffer
                 && required_span > u64::from(FULL_SCREEN_TRIANGLE_VERTICES)
             {
                 return Err(index_value_refusal(
@@ -1836,24 +2132,48 @@ fn render_input_refusal(
 }
 
 /// Resolve a pass's stage buffer bindings from the pass itself
-/// (`research/docs/23` §83, R9g).
+/// (`research/docs/23` §83/R9g, §92/R9k).
 ///
 /// Both halves of the pairing are answered before this runs: the registration
 /// gate paired the contract's declarations with the reviewed module's own
 /// `[[buffer(N)]]` arguments ([`validate_reviewed_stage_buffers`]), and
 /// `validate_against` paired the pass's views with the declarations — so every
-/// view here is one the module reads, at its own slot, with the declared
-/// extent covering the module's read. What this walk adds is the rail's own
-/// three-armed source channel ([`resolve_render_input`]): a binding declares
-/// its bytes, names a staged lease, or names an owner window to map, exactly as
-/// a vertex stream does, and the proof repeats the vertex rule that the
-/// *resolved* input covers the module's read — a footprint proved over a copy
-/// could pass while the device reads different bytes.
+/// view here is one the module reads or writes, at its own slot, with the
+/// declared extent covering the module's reach. What this walk adds is the
+/// rail's own three-armed source channel ([`resolve_render_input`]): a binding
+/// declares its bytes, names a staged lease, or names an owner window to map,
+/// exactly as a vertex stream does, and the proof repeats the vertex rule that
+/// the *resolved* input covers the module's reach — a footprint proved over a
+/// copy could pass while the device reads different bytes.
+///
+/// An affine reach is evaluated over the draw's own counts by the same
+/// arithmetic the core contract uses (`render_affine_axis_counts` /
+/// `render_affine_required_bytes`, `crates/metal-api-core/src/provider.rs`,
+/// `research/docs/23` §3.3, v86): axis 0 is `vertices` for a non-indexed draw
+/// and `base_vertex + highest index + 1` for an indexed one — the highest index
+/// read from the *resolved* index bytes the vertex-stream proof already
+/// resolved ([`PlannedIndexStream::vertex_span`]), so the two proofs share one
+/// measurement of the draw — with axis 1 the pass's instance count. An
+/// expression that cannot be evaluated here (one that overflows `u64`) is
+/// refused by name rather than admitted against a bound nothing states.
 fn plan_stage_buffers<'a>(
     pass: &'a RenderPassDescriptor,
     module: &ReviewedModule,
     leases: Option<&RenderLeaseContext<'_>>,
+    indices: Option<&PlannedIndexStream<'a>>,
 ) -> Result<Vec<PlannedStageBuffer<'a>>, ProviderError> {
+    // The two invocation counts an affine reach is bounded by
+    // (`render_affine_axis_counts`): the vertex indices the draw can name and
+    // its instances. A non-indexed draw names `0..vertices`; an indexed one
+    // names `base_vertex + index` for every index the pass's own buffer holds,
+    // which is the span [`plan_index_stream`] read out of the resolved bytes.
+    let counts = match indices {
+        None => Some([u64::from(pass.vertices), u64::from(pass.instance_count)]),
+        Some(indices) => indices
+            .base_vertex
+            .checked_add(indices.vertex_span)
+            .map(|vertices| [vertices, u64::from(pass.instance_count)]),
+    };
     let mut bindings = Vec::with_capacity(pass.stage_buffers.len());
     for binding in &pass.stage_buffers {
         // The slot the registration paired this declaration with. Both walks
@@ -1880,7 +2200,27 @@ fn plan_stage_buffers<'a>(
                     )
             })?;
         let source = resolve_render_input(&binding.view, leases, RenderInputRole::StageBuffer)?;
-        if u64::try_from(source.len()).unwrap_or(u64::MAX) < slot.max_bytes {
+        // The module's own reach over this draw: a fixed extent as it stands,
+        // an affine one evaluated over the counts above. An evaluation that
+        // overflows is a proof this rail refuses by name, exactly as the
+        // contract refuses the evaluation it cannot state.
+        let required = counts
+            .and_then(|counts| slot.reach.required_bytes(counts))
+            .ok_or_else(|| {
+                capability_refusal("render_stage_buffer_footprint_unsupported")
+                    .with_field("stage", FieldValue::Text(binding.stage.name().to_owned()))
+                    .with_field(
+                        "binding",
+                        FieldValue::Unsigned(u64::from(binding.view.metal_binding)),
+                    )
+                    .with_field("view", FieldValue::Unsigned(binding.view.view_id.get()))
+                    .with_detail(
+                        "the reviewed module's affine reach cannot be evaluated over this draw's \
+                         own counts, so the rail has no bound the binding's bytes are proven \
+                         against",
+                    )
+            })?;
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) < required {
             return Err(
                 capability_refusal("render_stage_buffer_footprint_unsupported")
                     .with_field("stage", FieldValue::Text(binding.stage.name().to_owned()))
@@ -1889,24 +2229,28 @@ fn plan_stage_buffers<'a>(
                         FieldValue::Unsigned(u64::from(binding.view.metal_binding)),
                     )
                     .with_field("view", FieldValue::Unsigned(binding.view.view_id.get()))
-                    .with_field("required_bytes", FieldValue::Unsigned(slot.max_bytes))
+                    .with_field("required_bytes", FieldValue::Unsigned(required))
                     .with_field(
                         "resolved_bytes",
                         FieldValue::Unsigned(u64::try_from(source.len()).unwrap_or(u64::MAX)),
                     )
                     .with_detail(
-                        "the reviewed module's read reaches past the bytes this rail resolved for \
-                     the binding, and the device reads the resolved mapping rather than a copy \
-                     of it",
+                        "the reviewed module's reach over this draw passes the bytes this rail \
+                         resolved for the binding, and the device reads the resolved mapping \
+                         rather than a copy of it",
                     ),
             );
         }
         bindings.push(PlannedStageBuffer {
             stage: binding.stage,
             index: binding.view.metal_binding,
-            bytes: slot.max_bytes,
+            bytes: required,
             source,
             offset: binding.view.offset,
+            view_id: binding.view.view_id,
+            allocation_id: binding.view.allocation_id,
+            access: binding.view.access,
+            length: binding.view.length,
         });
     }
     Ok(bindings)
@@ -3084,7 +3428,22 @@ pub(crate) fn plan_with_leases<'a>(
     // The vertex-input half: the streams with their bytes and their footprints.
     // Planned after the attachment because a stream is the draw's own input,
     // exactly as the attachment is its output.
-    let (vertex_streams, indices) = plan_vertex_input(request.pass, request.pipeline, leases)?;
+    // A reviewed module that reads its positions out of a stage buffer
+    // (`research/docs/23` §92, R9k) is the one shape whose `vertex_id` values a
+    // stream never bounds: the flag below is what tells the index proof which
+    // reach covers them.
+    let vertex_positions_carried_by_stage_buffer = module.is_some_and(|module| {
+        module
+            .stage_buffers
+            .iter()
+            .any(|slot| slot.stage == RenderPipelineStage::Vertex && slot.reach.is_affine())
+    });
+    let (vertex_streams, indices) = plan_vertex_input(
+        request.pass,
+        request.pipeline,
+        leases,
+        vertex_positions_carried_by_stage_buffer,
+    )?;
     if request.initial.len() != attachments.len() {
         return Err(
             args_refusal("render_attachment_initial_mismatch").with_detail(format!(
@@ -3320,13 +3679,15 @@ pub(crate) fn plan_with_leases<'a>(
         }
     }
     let module = module.expect("the source check above refused a shape without a module");
-    // The pass's stage buffers (`research/docs/23` §83, R9g): the registration
-    // gate paired every declaration with one of the module's own
+    // The pass's stage buffers (`research/docs/23` §83/R9g, §92/R9k): the
+    // registration gate paired every declaration with one of the module's own
     // `[[buffer(N)]]` arguments, so this walk resolves the pass's views through
     // the same three-armed source channel the vertex and index streams use and
-    // proves the module's reach against the bytes it resolved. Empty for every
-    // pass that declares none, which is every pre-R9g plan.
-    let stage_buffers = plan_stage_buffers(request.pass, module, leases)?;
+    // proves the module's reach against the bytes it resolved — over the draw's
+    // own counts for an affine reach, read from the same resolved index stream
+    // the vertex proof just took. Empty for every pass that declares none,
+    // which is every pre-R9g plan.
+    let stage_buffers = plan_stage_buffers(request.pass, module, leases, indices.as_ref())?;
     Ok(RenderPlan {
         source: module.source,
         module_path: module.path,
@@ -3652,20 +4013,72 @@ fn validate_reviewed_stage_buffers(
                      interface the module states",
                 ));
         }
-        let FootprintProof::Static { max_bytes } = declared.footprint else {
-            return Err(mismatch(declared).with_detail(
-                "the reviewed module's read is a static byte extent, and this rail executes stage \
-                 buffers whose declared reach is one too",
-            ));
-        };
-        if max_bytes < slot.max_bytes {
-            return Err(mismatch(declared)
-                .with_field("declared_bytes", FieldValue::Unsigned(max_bytes))
-                .with_field("reflected_bytes", FieldValue::Unsigned(slot.max_bytes))
-                .with_detail(
-                    "the reviewed module reads past the declared extent, and the pass's view is \
-                     proven against the declaration rather than the module",
+        // The two footprint arms state the same measurement at different
+        // levels, so they are paired differently (`research/docs/23` §3.3,
+        // v86/v92) — the rule the Vulkan rail's translated pairing states,
+        // restated for a reviewed slot table. A *static* declaration is a
+        // ceiling the module's fixed reach has to fit under, while an *affine*
+        // declaration is the measurement itself: the two ends have to be the
+        // same access set, because a ceiling a draw can outgrow is not what an
+        // affine reach needs.
+        match (&declared.footprint, slot.reach) {
+            (
+                FootprintProof::Static { max_bytes },
+                ReviewedStageBufferReach::Static {
+                    max_bytes: reflected,
+                },
+            ) => {
+                if *max_bytes < reflected {
+                    return Err(mismatch(declared)
+                        .with_field("declared_bytes", FieldValue::Unsigned(*max_bytes))
+                        .with_field("reflected_bytes", FieldValue::Unsigned(reflected))
+                        .with_detail(
+                            "the reviewed module reads past the declared extent, and the pass's \
+                             view is proven against the declaration rather than the module",
+                        ));
+                }
+            }
+            (
+                FootprintProof::Static { max_bytes },
+                ReviewedStageBufferReach::Affine { accesses },
+            ) => {
+                return Err(mismatch(declared)
+                    .with_field("declared_bytes", FieldValue::Unsigned(*max_bytes))
+                    .with_field(
+                        "reflected_accesses",
+                        FieldValue::Unsigned(accesses.len() as u64),
+                    )
+                    .with_detail(
+                        "the reviewed module's reach grows with the draw's own vertex index, and \
+                         the declaration states one static byte extent: a ceiling the draw can \
+                         outgrow is not the measurement this module states",
+                    ));
+            }
+            (FootprintProof::Affine { accesses }, reach) => {
+                let reflected = reach.accesses();
+                if affine_access_set(accesses) != affine_access_set(&reflected) {
+                    return Err(mismatch(declared)
+                        .with_field(
+                            "declared_accesses",
+                            FieldValue::Unsigned(accesses.len() as u64),
+                        )
+                        .with_field(
+                            "reflected_accesses",
+                            FieldValue::Unsigned(reflected.len() as u64),
+                        )
+                        .with_detail(
+                            "the declaration and the module state different affine access sets, \
+                             and this arm pairs two measurements of one module rather than a \
+                             ceiling with a reach",
+                        ));
+                }
+            }
+            (FootprintProof::Unbounded, _) => {
+                return Err(mismatch(declared).with_detail(
+                    "the declared footprint is unbounded, which the render contract does not \
+                     admit for a stage buffer at all",
                 ));
+            }
         }
     }
     for slot in module.stage_buffers {
@@ -4047,7 +4460,10 @@ impl TraceRenderPlan<'_> {
     /// *stored* landing view, in location order, followed by the stored depth
     /// attachment's own when the pass has one (`research/docs/23` §3.3, v43)
     /// and then the stored stencil attachment's own (`research/docs/23` §3.3,
-    /// v49).
+    /// v49). The writable stage buffers come last, after the attachments' own
+    /// landings (`research/docs/23` §3.3, v86/v92): their bytes are the pass's
+    /// other observable output, read beside the texels that same submission
+    /// wrote.
     ///
     /// The view identity, allocation and offset are each landing view's own, so
     /// resource admission, lease bookkeeping and readback consumers need no
@@ -4123,22 +4539,32 @@ impl TraceRenderPlan<'_> {
                 bytes: texels,
             });
         }
-        writebacks
-    }
-
-    /// The single writeback a present pass's one attachment becomes.
-    pub(crate) fn writeback(&self, texels: Vec<u8>) -> BufferWriteback {
-        // A present action hands its one attachment on through the writeback
-        // channel, and a resident target beside it is refused by name
-        // (`research/docs/23` §76, R7), so the one landing is always resolved
-        // here.
-        let landing = self.landings[0].expect("the present pass's one attachment lands");
-        BufferWriteback {
-            view_id: landing.view_id,
-            allocation_id: landing.allocation_id,
-            offset: landing.offset,
-            bytes: texels,
+        // A writable stage buffer is a landing like a stored attachment
+        // (`research/docs/23` §3.3, v86/v92): one complete writeback for the
+        // view the trace declared, in the pass's canonical binding order and in
+        // the same byte-keyed channel. The encoder reads back exactly the
+        // writable bindings, in that order, so the two lists advance together —
+        // the `debug_assert` keeps a hand-built plan from publishing one
+        // binding's bytes under the next one's identity.
+        let writable = self
+            .plan
+            .stage_buffers
+            .iter()
+            .filter(|binding| binding.access.is_writable());
+        debug_assert_eq!(
+            readback.stage_buffers.len(),
+            writable.clone().count(),
+            "the encoder reads back one stage buffer per writable binding",
+        );
+        for (binding, landing) in writable.zip(readback.stage_buffers) {
+            writebacks.push(BufferWriteback {
+                view_id: binding.view_id,
+                allocation_id: binding.allocation_id,
+                offset: binding.offset,
+                bytes: landing.bytes,
+            });
         }
+        writebacks
     }
 }
 
@@ -4503,6 +4929,25 @@ pub(crate) struct RenderReadback {
     pub(crate) attachments: Vec<Vec<u8>>,
     pub(crate) depth: Option<Vec<u8>>,
     pub(crate) stencil: Option<Vec<u8>>,
+    /// The bytes every *writable* stage buffer holds after the pass, in
+    /// canonical binding order (`research/docs/23` §3.3, v86/v92). Empty for
+    /// every pass whose stage buffers are read-only, which is the shape every
+    /// pre-R9k pass states.
+    pub(crate) stage_buffers: Vec<StageBufferReadback>,
+}
+
+/// One writable stage buffer's bytes, read once the pass's fence has signalled
+/// (`research/docs/23` §3.3, v86/v92).
+///
+/// The entry names the binding the way the contract does — stage plus the index
+/// inside that stage's own namespace — so the writeback the plan publishes is
+/// resolved against the pass's own view without re-deriving the slot from a
+/// position.
+#[derive(Debug)]
+pub(crate) struct StageBufferReadback {
+    pub(crate) stage: RenderPipelineStage,
+    pub(crate) index: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Execute one offscreen render pass and return its tightly packed texel bytes,
@@ -4646,21 +5091,21 @@ fn refuse_unresolved_resident_targets(
 /// pass's attachment into it and reads the target back after `wait`, but it
 /// neither creates nor destroys the texture. The acquire/present counts live in
 /// `native.rs`, which calls this between its two counter increments.
+///
+/// The whole readback is returned rather than the target's texels alone
+/// (`research/docs/23` §92, R9k): a present pass may bind stage buffers beside
+/// its attachment, and a writable one lands exactly as it does on the offscreen
+/// rail — the caller publishes the attachment and every writable binding
+/// through one writeback list.
 #[cfg(target_os = "macos")]
 pub(crate) fn encode_present_render(
     device: &Device,
     queue: &CommandQueue,
     planned: &RenderPlan<'_>,
     target: &Texture,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<RenderReadback, ProviderError> {
     objc::rc::autoreleasepool(|| {
-        let readbacks =
-            encode_into_and_readback(device, queue, planned, std::slice::from_ref(target), None)?;
-        readbacks
-            .attachments
-            .into_iter()
-            .next()
-            .ok_or_else(|| resource_refusal("metal_render_attachment_descriptor_unavailable"))
+        encode_into_and_readback(device, queue, planned, std::slice::from_ref(target), None)
     })
 }
 
@@ -5091,16 +5536,19 @@ fn encode_into_and_readback(
         );
         stream_buffers.push(buffer);
     }
-    // The pass's stage buffers (`research/docs/23` §83, R9g), bound at the
-    // slot each stage's own `[[buffer(N)]]` namespace names: a vertex binding
-    // is a `setVertexBuffer(_:offset:index:)` and a fragment binding a
+    // The pass's stage buffers (`research/docs/23` §83/R9g, §92/R9k), bound at
+    // the slot each stage's own `[[buffer(N)]]` namespace names: a vertex
+    // binding is a `setVertexBuffer(_:offset:index:)` and a fragment binding a
     // `setFragmentBuffer(_:offset:index:)`, so a vertex `0` and a fragment `0`
-    // fill two different slots. Every binding in the plan is read-only — the
-    // contract admits `BufferAccess::Read` alone, and the write-back landing a
-    // writable binding would need is a separate increment — so the encoder
-    // hands Metal the buffer and nothing else. The MTLBuffers are kept for the
-    // whole call beside the streams' own, for the same reason: they have to
-    // outlive the encoder that reads them.
+    // fill two different slots. A writable binding is bound exactly the same
+    // way — Metal has no read-only view of a buffer — and the readback below
+    // reads its bytes back out of the same `MTLBuffer` once the fence has
+    // signalled, which is what makes the write a landing rather than a dropped
+    // side effect (`research/docs/23` §3.3, v86/v92). The MTLBuffers are kept
+    // for the whole call beside the streams' own, for the same reason: they
+    // have to outlive the encoder that reads them — and, for the writable ones,
+    // the readback that observes what it wrote.
+    let mut stage_buffers = Vec::with_capacity(planned.stage_buffers.len());
     for stage in &planned.stage_buffers {
         let offset = NSUInteger::try_from(stage.binding_offset()).unwrap_or(NSUInteger::MAX);
         let buffer = stream_buffer(device, &stage.source, stage.binding_offset())?;
@@ -5116,7 +5564,7 @@ fn encode_into_and_readback(
                 offset,
             ),
         }
-        stream_buffers.push(buffer);
+        stage_buffers.push(buffer);
     }
     // The viewport is explicit because the contract carries it, even though
     // the first increment only accepts the attachment-covering default. The
@@ -5302,10 +5750,41 @@ fn encode_into_and_readback(
         }
         _ => None,
     };
+    // The writable stage buffers' bytes, read once the fence has signalled
+    // (`research/docs/23` §3.3, v86/v92). Both source arms are read the way the
+    // bytes already live: an uploaded binding lives in this rail's own shared
+    // `MTLBuffer`, and a no-copy binding's `MTLBuffer` *is* the owner's mapping,
+    // so `contents()` reaches the bytes the device just wrote either way. The
+    // read publishes the *whole* view — `BufferWriteback` carries the view's own
+    // extent — at the offset the binding was placed at, which is the extent the
+    // writeback contract requires for a written view.
+    let mut stage_readbacks = Vec::with_capacity(planned.stage_buffers.len());
+    for (binding, buffer) in planned.stage_buffers.iter().zip(&stage_buffers) {
+        if !binding.access.is_writable() {
+            continue;
+        }
+        let offset = usize::try_from(binding.binding_offset())
+            .map_err(|_| resource_refusal("metal_render_stream_offset_overflow"))?;
+        let length = usize::try_from(binding.length)
+            .map_err(|_| resource_refusal("metal_render_stream_offset_overflow"))?;
+        // SAFETY: the `MTLBuffer` was created (uploaded) or mapped (no-copy)
+        // over at least `offset + length` bytes — the plan resolved the view's
+        // own window — and it is still alive here because `stage_buffers` owns
+        // every handle until the end of this call.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().add(offset), length).to_vec()
+        };
+        stage_readbacks.push(StageBufferReadback {
+            stage: binding.stage,
+            index: binding.index,
+            bytes,
+        });
+    }
     Ok(RenderReadback {
         attachments,
         depth,
         stencil,
+        stage_buffers: stage_readbacks,
     })
 }
 
@@ -6454,6 +6933,739 @@ mod tests {
         assert_eq!(refused.slug, "lease_not_imported");
     }
 
+    // ---------------------------------------------------------------------
+    // The writable stage-buffer half (`research/docs/23` §92, R9k)
+    // ---------------------------------------------------------------------
+
+    /// The writable fixture's view and allocation identities, one pair per
+    /// binding: the strided positions, the readable `source`, the write-only
+    /// `sink` and the read-write `accumulator`.
+    const WRITE_STAGE_BUFFER_POSITIONS_VIEW: ViewId = ViewId::new(71);
+    const WRITE_STAGE_BUFFER_POSITIONS_ALLOCATION: AllocationId = AllocationId::new(73);
+    const WRITE_STAGE_BUFFER_SOURCE_VIEW: ViewId = ViewId::new(74);
+    const WRITE_STAGE_BUFFER_SOURCE_ALLOCATION: AllocationId = AllocationId::new(76);
+    const WRITE_STAGE_BUFFER_SINK_VIEW: ViewId = ViewId::new(77);
+    const WRITE_STAGE_BUFFER_SINK_ALLOCATION: AllocationId = AllocationId::new(79);
+    const WRITE_STAGE_BUFFER_ACCUMULATOR_VIEW: ViewId = ViewId::new(81);
+    const WRITE_STAGE_BUFFER_ACCUMULATOR_ALLOCATION: AllocationId = AllocationId::new(83);
+
+    /// The readable `source` payload: the same `float4` the R9g pair binds, so
+    /// the attachment and the sink carry the texel the R9f write half carries.
+    fn write_stage_buffer_source() -> Vec<u8> {
+        stage_buffer_tint()
+    }
+
+    /// The read-write `accumulator`'s previous bytes: `0.25` in every
+    /// component. The stage adds one to whatever it holds, so a rail that bound
+    /// zeros would publish `1.0` where this publishes `1.25` — the read half of
+    /// the access is what the difference observes.
+    fn write_stage_buffer_accumulator() -> Vec<u8> {
+        [0.25_f32; 4]
+            .iter()
+            .flat_map(|component| component.to_le_bytes())
+            .collect()
+    }
+
+    /// What the accumulator holds after the pass: one added to every component
+    /// of its previous bytes, as the fixture's own `f32` arithmetic states it.
+    fn write_stage_buffer_accumulator_after() -> Vec<u8> {
+        [1.25_f32; 4]
+            .iter()
+            .flat_map(|component| component.to_le_bytes())
+            .collect()
+    }
+
+    /// The writable fixture's declarations (`research/docs/23` §92, R9k): the
+    /// vertex positions as the reflected affine pair of accesses, then the
+    /// fragment stage's read, write and read-write slots, each in canonical
+    /// order (vertex bindings first, ascending inside each stage).
+    fn write_stage_buffer_declarations() -> Vec<StageBufferBinding> {
+        let access = |base_offset| AffineAccess {
+            base_offset,
+            access_size: 4,
+            terms: vec![AffineTerm {
+                axis: 0,
+                stride: STAGE_BUFFER_WRITE_VERTEX_STRIDE,
+            }],
+        };
+        vec![
+            StageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index: STAGE_BUFFER_WRITE_VERTEX_BINDING,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Affine {
+                    accesses: vec![access(0), access(4)],
+                },
+            },
+            StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_SOURCE_BINDING,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
+            },
+            StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_SINK_BINDING,
+                access: BufferAccess::Write,
+                footprint: FootprintProof::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
+            },
+            StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING,
+                access: BufferAccess::ReadWrite,
+                footprint: FootprintProof::Static {
+                    max_bytes: STAGE_BUFFER_WRITE_TEXEL_BYTES,
+                },
+            },
+        ]
+    }
+
+    fn write_stage_buffer_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            stage_buffers: write_stage_buffer_declarations(),
+            vertex_entry: STAGE_BUFFER_WRITE_VERTEX_ENTRY.to_owned(),
+            fragment_entry: STAGE_BUFFER_WRITE_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+        }
+    }
+
+    /// One stage buffer view of the writable fixture, at the access its slot
+    /// declares and with the bytes the case states.
+    fn write_stage_buffer_view(
+        stage: RenderPipelineStage,
+        index: u32,
+        view_id: ViewId,
+        allocation_id: AllocationId,
+        access: BufferAccess,
+        bytes: Vec<u8>,
+    ) -> StageBufferView {
+        StageBufferView {
+            stage,
+            view: BufferView {
+                view_id,
+                metal_binding: index,
+                allocation_id,
+                offset: 0,
+                length: u64::try_from(bytes.len()).expect("fixture length"),
+                access,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(bytes),
+            },
+        }
+    }
+
+    /// The writable fixture's pass: the milestone's 2x2 attachment with the
+    /// four stage buffer views bound, in canonical order.
+    fn write_stage_buffer_pass(load: LoadOp, positions: Vec<u8>) -> RenderPassDescriptor {
+        let mut pass = milestone_pass(load);
+        pass.stage_buffers = vec![
+            write_stage_buffer_view(
+                RenderPipelineStage::Vertex,
+                STAGE_BUFFER_WRITE_VERTEX_BINDING,
+                WRITE_STAGE_BUFFER_POSITIONS_VIEW,
+                WRITE_STAGE_BUFFER_POSITIONS_ALLOCATION,
+                BufferAccess::Read,
+                positions,
+            ),
+            write_stage_buffer_view(
+                RenderPipelineStage::Fragment,
+                STAGE_BUFFER_WRITE_SOURCE_BINDING,
+                WRITE_STAGE_BUFFER_SOURCE_VIEW,
+                WRITE_STAGE_BUFFER_SOURCE_ALLOCATION,
+                BufferAccess::Read,
+                write_stage_buffer_source(),
+            ),
+            write_stage_buffer_view(
+                RenderPipelineStage::Fragment,
+                STAGE_BUFFER_WRITE_SINK_BINDING,
+                WRITE_STAGE_BUFFER_SINK_VIEW,
+                WRITE_STAGE_BUFFER_SINK_ALLOCATION,
+                BufferAccess::Write,
+                // The sink starts as zeros, so a rail that executed the pass
+                // but landed nothing would publish these bytes.
+                vec![0; STAGE_BUFFER_WRITE_TEXEL_BYTES as usize],
+            ),
+            write_stage_buffer_view(
+                RenderPipelineStage::Fragment,
+                STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING,
+                WRITE_STAGE_BUFFER_ACCUMULATOR_VIEW,
+                WRITE_STAGE_BUFFER_ACCUMULATOR_ALLOCATION,
+                BufferAccess::ReadWrite,
+                write_stage_buffer_accumulator(),
+            ),
+        ];
+        pass
+    }
+
+    fn write_stage_buffer_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_STAGE_BUFFER_WRITE_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        }
+    }
+
+    /// One contract access as the evidence line spells it.
+    fn access_name(access: BufferAccess) -> &'static str {
+        match access {
+            BufferAccess::Read => "read",
+            BufferAccess::Write => "write",
+            BufferAccess::ReadWrite => "read_write",
+            BufferAccess::Unused => "unused",
+        }
+    }
+
+    /// One plan's writable binding table, as the evidence line spells it
+    /// (`research/docs/23` §92, R9k): the slot, the offset the encoder binds,
+    /// the bytes the module's own reach covers over this draw, the access, the
+    /// view the binding lands in and which of the three source arms the bytes
+    /// came from.
+    fn write_stage_buffer_table(plan: &RenderPlan<'_>) -> String {
+        plan.stage_buffers
+            .iter()
+            .map(|stage| {
+                let source = match &stage.source {
+                    PlannedInputSource::Declared(bytes) => {
+                        format!("declared({} bytes)", bytes.len())
+                    }
+                    PlannedInputSource::Staged(bytes) => {
+                        format!("staged_lease({} bytes)", bytes.len())
+                    }
+                    PlannedInputSource::NoCopy { lease, window } => format!(
+                        "borrowed_no_copy(lease={} window={} len={})",
+                        lease.get(),
+                        window.offset,
+                        window.len,
+                    ),
+                };
+                format!(
+                    "{} [[buffer({})]] offset={} bytes={} access={} view={}/{} len={} source={}",
+                    stage.stage.name(),
+                    stage.index,
+                    stage.binding_offset(),
+                    stage.bytes,
+                    access_name(stage.access),
+                    stage.view_id.get(),
+                    stage.allocation_id.get(),
+                    stage.length,
+                    source,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The index bytes the affine half's indexed runs draw through:
+    /// `[0, 1, 2]` as little-endian `uint16`, the same triple the core
+    /// contract's own affine unit test states.
+    fn write_stage_buffer_indices() -> Vec<u8> {
+        [0_u16, 1, 2]
+            .iter()
+            .flat_map(|index| index.to_le_bytes())
+            .collect()
+    }
+
+    /// The writable fixture, end to end on the planning half (`research/docs/23`
+    /// §92, R9k): the registration pairs all four declarations with the
+    /// reviewed module's own `[[buffer(N)]]` arguments — the affine vertex slot
+    /// against the reflected access pair, and the fragment stage's read, write
+    /// and read-write slots against their own accesses — and the plan resolves
+    /// every view into a binding table naming its slot, its access and the
+    /// extent the module's reach covers over the draw.
+    #[test]
+    fn the_writable_stage_buffer_pair_is_reviewed_and_plans_its_bindings() {
+        let contract = write_stage_buffer_pipeline();
+        let selected = reviewed_module_for(&contract).expect("the writable pair is reviewed");
+        assert_eq!(selected.source, REVIEWED_STAGE_BUFFER_WRITE_SOURCE);
+        assert_eq!(
+            selected.path,
+            "conformance/shaders/render_stage_buffer_write_2x2.metal"
+        );
+        review_contract(&contract).expect("the registration pairs with the module's arguments");
+
+        let positions = stage_buffer_positions();
+        let pass = write_stage_buffer_pass(LoadOp::Clear(sentinel()), positions.clone());
+        // A non-indexed three-vertex draw: the affine reach's highest access
+        // ends at `4 + 4 + (3 - 1) * 8 = 24` bytes, the payload's own length.
+        let request = write_stage_buffer_request(&pass, &contract);
+        let planned = plan_pass(&request).expect("the reviewed writable pair plans its bindings");
+        let [vertex, source, sink, accumulator] = planned.stage_buffers.as_slice() else {
+            panic!("the reviewed module reads and writes four arguments");
+        };
+        assert_eq!(vertex.stage, RenderPipelineStage::Vertex);
+        assert_eq!(vertex.index, STAGE_BUFFER_WRITE_VERTEX_BINDING);
+        assert_eq!(vertex.access, BufferAccess::Read);
+        assert_eq!(vertex.bytes, 24, "the affine reach over three vertices");
+        assert_eq!(vertex.view_id, WRITE_STAGE_BUFFER_POSITIONS_VIEW);
+        assert_eq!(
+            vertex.allocation_id,
+            WRITE_STAGE_BUFFER_POSITIONS_ALLOCATION
+        );
+        assert_eq!(vertex.length, 24);
+        assert_eq!(vertex.source.proof_bytes(), positions);
+        assert_eq!(source.index, STAGE_BUFFER_WRITE_SOURCE_BINDING);
+        assert_eq!(source.access, BufferAccess::Read);
+        assert_eq!(source.bytes, STAGE_BUFFER_WRITE_TEXEL_BYTES);
+        assert_eq!(sink.index, STAGE_BUFFER_WRITE_SINK_BINDING);
+        assert_eq!(sink.access, BufferAccess::Write);
+        assert_eq!(sink.bytes, STAGE_BUFFER_WRITE_TEXEL_BYTES);
+        assert_eq!(sink.view_id, WRITE_STAGE_BUFFER_SINK_VIEW);
+        assert_eq!(accumulator.index, STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING);
+        assert_eq!(accumulator.access, BufferAccess::ReadWrite);
+        assert_eq!(accumulator.view_id, WRITE_STAGE_BUFFER_ACCUMULATOR_VIEW);
+        eprintln!(
+            "native writable stage-buffer plan bindings: {}",
+            write_stage_buffer_table(&planned)
+        );
+
+        // The indexed run (`[0, 1, 2]` through `base_vertex = 1`) reaches
+        // `base_vertex + highest index + 1 = 4` vertices, so the same affine
+        // access pair asks for `4 + 4 + (4 - 1) * 8 = 32` bytes — the
+        // arithmetic the core contract's own `render_affine_axis_counts` /
+        // `render_affine_required_bytes` state, read from the pass's own index
+        // bytes. A 32-byte view covers it; the 24-byte payload above does not.
+        let mut indexed = write_stage_buffer_pass(LoadOp::Clear(sentinel()), vec![0x11; 32]);
+        indexed.indices = Some(IndexBufferBinding {
+            format: IndexFormat::Uint16,
+            view: BufferView {
+                view_id: ViewId::new(85),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(86),
+                offset: 0,
+                length: 6,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(write_stage_buffer_indices()),
+            },
+        });
+        indexed.base_vertex = 1;
+        let request = write_stage_buffer_request(&indexed, &contract);
+        let planned = plan_pass(&request).expect("the indexed draw's affine reach is covered");
+        assert_eq!(planned.stage_buffers[0].bytes, 32);
+        assert_eq!(
+            planned
+                .indices
+                .as_ref()
+                .expect("the draw is indexed")
+                .base_vertex,
+            1
+        );
+        eprintln!(
+            "native writable stage-buffer indexed plan bindings: {}",
+            write_stage_buffer_table(&planned)
+        );
+
+        let mut short = write_stage_buffer_pass(LoadOp::Clear(sentinel()), positions);
+        short.indices = indexed.indices.clone();
+        short.base_vertex = 1;
+        let request = write_stage_buffer_request(&short, &contract);
+        let refused = plan_pass(&request).expect_err("a 24-byte view under a 32-byte reach");
+        eprintln!("native indexed affine reach refused: {refused:?}");
+        // The pairing gate is what refuses the shape, and its detail carries
+        // the two numbers: the extent the draw's own counts make the
+        // declaration reach, and the view's own length. Core admission maps
+        // this `ContractError` to `render_stage_buffer_footprint_unsupported`
+        // (`contract_error_refusal`), while this rail's own mapping spells the
+        // same fact through its established `trace_contract_invalid` arm with
+        // the message in the detail — the reading R9g pinned for the core
+        // pairing as well.
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+        let detail = refused.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("reads 32 bytes") && detail.contains("declares 24"),
+            "the refusal names the draw-bound reach and the view: {detail}"
+        );
+    }
+
+    /// A writable stage buffer lands through the one writeback channel
+    /// (`research/docs/23` §3.3, v86/v92): the plan publishes one complete
+    /// writeback per writable binding — the pass's own view, at the view's own
+    /// offset, carrying the whole view's bytes — while every read-only binding
+    /// publishes nothing. The bytes are the readback the encoder took after the
+    /// fence, which is what makes "the stage wrote" and "the rail observed it"
+    /// one fact rather than two.
+    #[test]
+    fn the_writable_stage_buffer_landings_are_published_through_the_writeback_channel() {
+        let contract = write_stage_buffer_pipeline();
+        let mut pass = write_stage_buffer_pass(LoadOp::Clear(sentinel()), stage_buffer_positions());
+        // The sink sits four bytes into its allocation, so the offset half of
+        // the writeback contract is observable beside the length half: the
+        // published range is the view's own `4..20`, not the allocation's
+        // `0..16`.
+        pass.stage_buffers[2].view.offset = 4;
+        let request = write_stage_buffer_request(&pass, &contract);
+        let plan = plan_pass(&request).expect("the writable pair plans");
+        let attachment = BufferView {
+            view_id: ViewId::new(7),
+            metal_binding: 0,
+            allocation_id: AllocationId::new(9),
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Write,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(vec![0; 16]),
+        };
+        let planned = TraceRenderPlan {
+            pass: &pass,
+            contract: &contract,
+            landings: vec![Some(&attachment)],
+            depth_landing: None,
+            stencil_landing: None,
+            plan,
+            present: None,
+        };
+        let frame = EXPECTED_TEXEL_BYTES.repeat(4);
+        let sink = write_stage_buffer_source();
+        let accumulator = write_stage_buffer_accumulator_after();
+        let writebacks = planned.writebacks(RenderReadback {
+            attachments: vec![frame.clone()],
+            depth: None,
+            stencil: None,
+            stage_buffers: vec![
+                StageBufferReadback {
+                    stage: RenderPipelineStage::Fragment,
+                    index: STAGE_BUFFER_WRITE_SINK_BINDING,
+                    bytes: sink.clone(),
+                },
+                StageBufferReadback {
+                    stage: RenderPipelineStage::Fragment,
+                    index: STAGE_BUFFER_WRITE_ACCUMULATOR_BINDING,
+                    bytes: accumulator.clone(),
+                },
+            ],
+        });
+        eprintln!("native writable stage-buffer writebacks: {writebacks:?}");
+        let [colour, sink_writeback, accumulator_writeback] = writebacks.as_slice() else {
+            panic!("one attachment and two writable bindings land");
+        };
+        // The attachment keeps its own landing, first, exactly as it did before
+        // this increment.
+        assert_eq!(colour.view_id, ViewId::new(7));
+        assert_eq!(colour.allocation_id, AllocationId::new(9));
+        assert_eq!(colour.bytes, frame);
+        // The write-only sink publishes the bytes the stage wrote over it.
+        assert_eq!(sink_writeback.view_id, WRITE_STAGE_BUFFER_SINK_VIEW);
+        assert_eq!(
+            sink_writeback.allocation_id,
+            WRITE_STAGE_BUFFER_SINK_ALLOCATION
+        );
+        assert_eq!(sink_writeback.offset, 4);
+        assert_eq!(sink_writeback.bytes, sink);
+        assert_ne!(
+            sink_writeback.bytes,
+            vec![0; STAGE_BUFFER_WRITE_TEXEL_BYTES as usize],
+            "the sink starts as zeros, so a rail that landed nothing would publish them"
+        );
+        // The read-write accumulator publishes the previous bytes *plus* one,
+        // which is the arm's read half made observable: a rail that bound zeros
+        // would publish `1.0` here.
+        assert_eq!(
+            accumulator_writeback.view_id,
+            WRITE_STAGE_BUFFER_ACCUMULATOR_VIEW
+        );
+        assert_eq!(accumulator_writeback.bytes, accumulator);
+        assert_ne!(
+            accumulator_writeback.bytes,
+            write_stage_buffer_accumulator(),
+            "the accumulator's previous bytes took part in the write"
+        );
+        // The two read-only bindings publish nothing: a writeback for them
+        // would be a "bytes left the pass" claim no stage made.
+        assert!(writebacks.iter().all(|writeback| {
+            writeback.view_id != WRITE_STAGE_BUFFER_POSITIONS_VIEW
+                && writeback.view_id != WRITE_STAGE_BUFFER_SOURCE_VIEW
+        }));
+    }
+
+    /// Every disagreement between a declaration and the writable module's own
+    /// argument table is refused by name (`research/docs/23` §92, R9k), in the
+    /// vocabulary the Vulkan rail's translated pairing established rather than
+    /// a new slug — and the pass half keeps the contract's own pair rule.
+    #[test]
+    fn the_writable_stage_buffer_face_refuses_what_it_cannot_land() {
+        // One: the declaration says the readable `source` is written while the
+        // module only reads it — the same disagreement from the access side
+        // that the Vulkan rail's write-half refusal states.
+        let mut written_source = write_stage_buffer_pipeline();
+        written_source.stage_buffers[1].access = BufferAccess::Write;
+        let refused = review_contract(&written_source).expect_err("a written source");
+        eprintln!("native writable stage-buffer written source refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("declared_access"),
+            Some(&FieldValue::Text("write".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_access"),
+            Some(&FieldValue::Text("read".to_owned()))
+        );
+
+        // Two: the declaration says the sink is read-write while the module
+        // only writes it. The writeback machinery is access-agnostic, so this
+        // is the *declaration* half that has to be refused: a `ReadWrite` the
+        // stage never reads is not the interface the module states.
+        let mut read_write_sink = write_stage_buffer_pipeline();
+        read_write_sink.stage_buffers[2].access = BufferAccess::ReadWrite;
+        let refused = review_contract(&read_write_sink).expect_err("a read-written sink");
+        eprintln!("native writable stage-buffer read-written sink refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_access"),
+            Some(&FieldValue::Text("read_write".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_access"),
+            Some(&FieldValue::Text("write".to_owned()))
+        );
+
+        // Three: a static declaration for the affine slot — the positions the
+        // draw indexes into are a measurement over the draw's own vertices, and
+        // one byte ceiling cannot state it.
+        let mut static_positions = write_stage_buffer_pipeline();
+        static_positions.stage_buffers[0].footprint = FootprintProof::Static { max_bytes: 24 };
+        let refused = review_contract(&static_positions).expect_err("a static positions reach");
+        eprintln!("native writable stage-buffer static positions refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_bytes"),
+            Some(&FieldValue::Unsigned(24))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_accesses"),
+            Some(&FieldValue::Unsigned(2))
+        );
+
+        // Four: an affine declaration that is not the module's access set —
+        // here the same two sizes with the stride halved, which is a module
+        // nobody wrote rather than a ceiling.
+        let mut half_stride = write_stage_buffer_pipeline();
+        let FootprintProof::Affine { accesses } = &mut half_stride.stage_buffers[0].footprint
+        else {
+            panic!("the fixture declares the affine arm");
+        };
+        for access in accesses.iter_mut() {
+            access.terms[0].stride = STAGE_BUFFER_WRITE_VERTEX_STRIDE / 2;
+        }
+        let refused = review_contract(&half_stride).expect_err("another stride");
+        eprintln!("native writable stage-buffer half stride refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_accesses"),
+            Some(&FieldValue::Unsigned(2))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_accesses"),
+            Some(&FieldValue::Unsigned(2))
+        );
+
+        // Five: a static extent under the write slot's own reach, the pre-R9k
+        // mismatch one level down.
+        let mut short_sink = write_stage_buffer_pipeline();
+        short_sink.stage_buffers[2].footprint = FootprintProof::Static { max_bytes: 8 };
+        let refused = review_contract(&short_sink).expect_err("a sink the stage writes past");
+        eprintln!("native writable stage-buffer short sink refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_bytes"),
+            Some(&FieldValue::Unsigned(8))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_bytes"),
+            Some(&FieldValue::Unsigned(STAGE_BUFFER_WRITE_TEXEL_BYTES))
+        );
+
+        // Six: an unbounded declaration, which the render contract does not
+        // admit for a stage buffer at all.
+        let mut unbounded = write_stage_buffer_pipeline();
+        unbounded.stage_buffers[3].footprint = FootprintProof::Unbounded;
+        let refused = review_contract(&unbounded).expect_err("an unbounded accumulator");
+        eprintln!("native writable stage-buffer unbounded refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+
+        // Seven: the reviewed *read-only* pair keeps its pre-R9k answer — a
+        // writable declaration has no writer behind it, because R9g's module
+        // only reads its slots.
+        let mut read_only = stage_buffer_pipeline();
+        read_only.stage_buffers[1].access = BufferAccess::Write;
+        let refused = review_contract(&read_only).expect_err("a writable read-only module");
+        eprintln!("native writable declaration under the R9g pair refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_access"),
+            Some(&FieldValue::Text("write".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_access"),
+            Some(&FieldValue::Text("read".to_owned()))
+        );
+
+        // Eight: the pass half stays the contract's own rule — a sink view the
+        // pass classifies as read-only beside a `Write` declaration is refused
+        // by core before this rail is asked (`trace_contract_invalid`).
+        let contract = write_stage_buffer_pipeline();
+        let mut pass = write_stage_buffer_pass(LoadOp::Clear(sentinel()), stage_buffer_positions());
+        pass.stage_buffers[2].view.access = BufferAccess::Read;
+        let request = write_stage_buffer_request(&pass, &contract);
+        let refused = plan_pass(&request).expect_err("a read-only sink view");
+        eprintln!("native writable stage-buffer read-only sink refused: {refused:?}");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+
+        // The snapshot keeps the fail-closed default: the bit is off and the
+        // limit is zero, so core admission refuses a stage-buffer trace before
+        // this rail is even asked. Flipping it is the increment after an Apple
+        // device reading, not part of this one.
+        let bits = capability_bits(2048);
+        let capabilities = capabilities(&bits);
+        assert!(!capabilities.supports_render_stage_buffers);
+        assert_eq!(capabilities.max_render_stage_buffers, 0);
+    }
+
+    /// The affine bound over an *indexed draw whose index view is a lease* is
+    /// blocked in core (`research/docs/23` §92, R9k), and the block is one
+    /// missing evaluation rather than a missing resolution: the rail already
+    /// resolves lease index bytes — [`plan_index_stream`] reads the resolved
+    /// window and computes the very span an affine reach is bounded by — while
+    /// the core contract's `render_affine_axis_counts`
+    /// (`crates/metal-api-core/src/provider.rs`) accepts
+    /// `BufferSource::OwnedBytes` alone and refuses the lease arms by name.
+    ///
+    /// Both readings live in one test, because that is the pair a reader has to
+    /// see together: the rail half is measurable here, and the refusal below is
+    /// the exact function `DeviceCapabilities::admit_render_passes` calls
+    /// before any provider runs, which the rail re-runs in `plan_with_leases`.
+    /// Widening the rule therefore needs a core entry point that takes the
+    /// resolved index bytes; this increment stops at the rail's half and
+    /// records the boundary instead of restating the count rule on its own.
+    #[test]
+    fn the_affine_bound_over_a_lease_index_view_is_blocked_in_core() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(51);
+        let index_allocation = AllocationId::new(86);
+        let reservation = lease_registration(lease_id, index_allocation, 6, epoch);
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(reservation, write_stage_buffer_indices())
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: index_allocation,
+                owner_epoch: epoch,
+                size: 6,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the reservation covers its view");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let binding = IndexBufferBinding {
+            format: IndexFormat::Uint16,
+            view: BufferView {
+                view_id: ViewId::new(85),
+                metal_binding: 0,
+                allocation_id: index_allocation,
+                offset: 0,
+                length: 6,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::StagedLease(lease_id),
+            },
+        };
+        // The rail's own half: the staged lease resolves, and the span the
+        // affine reach is bounded by comes out of the provider's copy of the
+        // owner's bytes.
+        let resolved = plan_index_stream(&binding, 3, 1, Some(&leases))
+            .expect("the rail resolves a staged lease's index bytes");
+        assert_eq!(resolved.vertex_span, 3);
+        let slot = REVIEWED_MODULES
+            .iter()
+            .find(|module| module.source == REVIEWED_STAGE_BUFFER_WRITE_SOURCE)
+            .expect("the writable module is in the table")
+            .stage_buffers[0];
+        let counts = [resolved.base_vertex + resolved.vertex_span, 1];
+        eprintln!("native lease-index affine counts: {counts:?}");
+        assert_eq!(
+            slot.reach.required_bytes(counts),
+            Some(32),
+            "base_vertex + highest index + 1 = 4 records, two four-byte accesses eight \
+             bytes apart"
+        );
+
+        // The core half: the same pass, refused by the contract pairing that
+        // runs before any rail resolution exists. The refusal carries the
+        // stage-buffer footprint vocabulary and no fields — `ContractError`
+        // refusals spell their facts into the detail, which is exactly the
+        // boundary this increment records.
+        let contract = write_stage_buffer_pipeline();
+        let mut pass = write_stage_buffer_pass(LoadOp::Clear(sentinel()), vec![0x11; 32]);
+        pass.indices = Some(binding);
+        pass.base_vertex = 1;
+        let error = contract
+            .validate_against(&pass)
+            .expect_err("a lease index view leaves the affine bound unprovable");
+        assert!(
+            matches!(
+                error,
+                ContractError::StageBufferFootprintProofUnsupported {
+                    stage: RenderPipelineStage::Vertex,
+                    index: 0,
+                }
+            ),
+            "the unprovable evaluation names the vertex positions slot: {error:?}"
+        );
+        let refused = contract_refusal(error);
+        // The mapping this rail states for the same error, and the mapping core
+        // admission states for it (`contract_error_refusal`,
+        // `render_stage_buffer_footprint_unsupported` / Capability, which is
+        // the slug a trace sees when `admit_render_passes` refuses it before
+        // any provider runs). Both are one variant; the two callers spell it
+        // in their own established vocabulary.
+        eprintln!("native lease-index affine refused: {refused:?}");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+        assert!(
+            refused.fields.is_empty(),
+            "the core pairing states the refused slot in its detail: {:?}",
+            refused.detail
+        );
+        // The rail's own plan re-runs the same pairing first, so the refusal is
+        // reachable from this side too — one evaluation, two callers.
+        let request = write_stage_buffer_request(&pass, &contract);
+        let refused = plan_pass(&request).expect_err("the rail asks the same contract");
+        eprintln!("native lease-index affine plan refused: {refused:?}");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        let detail = refused.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("does not evaluate"),
+            "the plan names the unprovable proof in the same words: {detail}"
+        );
+        staging
+            .release(lease_id)
+            .expect("the fixture import is released");
+    }
     fn milestone_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
             stage_buffers: Vec::new(),
@@ -9287,6 +10499,7 @@ mod tests {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         let [writeback] = writebacks.as_slice() else {
             panic!("the milestone attachment becomes one writeback");
@@ -9450,6 +10663,7 @@ mod tests {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         let [colour, depth] = writebacks.as_slice() else {
             panic!("the stored depth attachment becomes a second writeback");
@@ -9549,6 +10763,7 @@ mod tests {
             attachments: Vec::new(),
             depth: Some(DEPTH_STORE_TEXEL.repeat(4)),
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         let [depth] = writebacks.as_slice() else {
             panic!("a depth-only pass lands exactly one writeback");
@@ -9582,6 +10797,7 @@ mod tests {
                 attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
                 depth: None,
                 stencil: None,
+                stage_buffers: Vec::new(),
             });
             let [writeback] = writebacks.as_slice() else {
                 panic!("{store:?} lands the colour attachment alone");
@@ -9670,6 +10886,7 @@ mod tests {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
             stencil: Some(vec![STENCIL_STORE_TEXEL; 4]),
+            stage_buffers: Vec::new(),
         });
         let [colour, stencil] = writebacks.as_slice() else {
             panic!("the stored stencil attachment becomes a second writeback");
@@ -9710,6 +10927,7 @@ mod tests {
                 attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
                 depth: None,
                 stencil: None,
+                stage_buffers: Vec::new(),
             });
             let [writeback] = writebacks.as_slice() else {
                 panic!("{store:?} lands the colour attachment alone");
@@ -11898,6 +13116,7 @@ mod tests {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         let [writeback] = writebacks.as_slice() else {
             panic!("the indexed attachment becomes one writeback");
@@ -11949,6 +13168,7 @@ mod tests {
             ],
             depth: None,
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         assert_eq!(writebacks.len(), 2);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
@@ -11988,6 +13208,7 @@ mod tests {
             attachments: vec![EXPECTED_TEXEL_BYTES.repeat(4)],
             depth: None,
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         assert_eq!(writebacks.len(), 1);
         assert_eq!(writebacks[0].view_id, ViewId::new(7));
@@ -12564,6 +13785,7 @@ mod tests {
             attachments: vec![stored_texels.clone()],
             depth: None,
             stencil: None,
+            stage_buffers: Vec::new(),
         });
         let [only] = writebacks.as_slice() else {
             panic!("one publishing attachment becomes one writeback");
@@ -12607,6 +13829,7 @@ mod tests {
                 attachments: Vec::new(),
                 depth: None,
                 stencil: None,
+                stage_buffers: Vec::new(),
             })
             .is_empty());
     }

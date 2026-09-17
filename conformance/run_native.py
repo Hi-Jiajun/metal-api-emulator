@@ -281,6 +281,111 @@ def validate_stage_buffer_selftest(report):
     return " ".join(expected_attachments)
 
 
+def validate_stage_buffer_write_selftest(report):
+    """One writable-stage-buffer self-test report is the reviewed module's
+    observation (`research/docs/23` §92, R9k):
+    `shaders/render_stage_buffer_write_2x2.metal` compiled and run twice against
+    a fresh 2x2 `rgba8_unorm` attachment cleared to the `fefefefe` sentinel.
+
+    Each run binds the vertex stage's own `[[buffer(0)]]` positions, the
+    fragment stage's readable `[[buffer(0)]]` source, its write-only
+    `[[buffer(1)]]` sink and its read-write `[[buffer(2)]]` accumulator with
+    `setVertexBuffer` and `setFragmentBuffer`, and reports five readings. The
+    readings are the claim rather than decoration, one per access arm:
+
+    * `attachment_hex` is the stage's *returned* source texel, so a rail that
+      bound no source reads the clear sentinel everywhere;
+    * `positions_hex` is the geometry the vertex stage read out of its own
+      buffer, so the reviewed triangle covers one texel and the full-screen
+      positions cover all four;
+    * `sink_hex` is the write-only binding's bytes after the pass: the source
+      payload, where a rail that dropped the write would report the zeros the
+      sink started from;
+    * `accumulator_hex` is the read-write binding's bytes after the pass: its
+      previous value plus one, where a rail that bound no previous bytes (or no
+      binding) would report one alone.
+
+    The two runs move the source payload and the geometry independently, so no
+    single constant frame can pass both. The second run's source is
+    `(0, 1, 0, 1)`, which the 8-bit attachment stores as `00ff00ff` while the
+    accumulator stores `1.25` and `2.0` in its components.
+    """
+    if not isinstance(report, dict):
+        raise NativeRunError("stage buffer write selftest: report is not an object")
+    if report.get("id") != "stage_buffer_write_2x2":
+        raise NativeRunError(
+            "stage buffer write selftest: report id " + repr(report.get("id"))
+            + " is not the reviewed writable stage-buffer fixture"
+        )
+    if report.get("completion") != "CompletedVisible":
+        raise NativeRunError(
+            "stage buffer write selftest: completion is not CompletedVisible"
+        )
+    sentinel = "fefefefe"
+    reviewed_frame = "4080c0ff" + sentinel * 3
+    full_frame = "00ff00ff" * 4
+    positions = "000080bf0000803f0000803e0000803f000080bf000080be"
+    full_positions = "000080bf000080bf00004040000080bf000080bf00004040"
+    tint = "8180803e8180003fc1c0403f0000803f"
+    green = "000000000000803f000000000000803f"
+    accumulator_initial = "0000803e" * 4
+    accumulator_reviewed = "0000a03f" * 4
+    accumulator_green = "0000a03f" + "00000040" + "0000a03f" + "00000040"
+    writebacks = report.get("writebacks", [])
+    allocations = report.get("allocations", [])
+    expected_writebacks = [
+        {"allocation": 900, "view": 910, "offset": 0, "bytes_hex": reviewed_frame},
+        {"allocation": 901, "view": 911, "offset": 0, "bytes_hex": tint},
+        {"allocation": 902, "view": 912, "offset": 0, "bytes_hex": accumulator_reviewed},
+    ]
+    expected_allocations = [
+        {"allocation": 900, "bytes_hex": reviewed_frame},
+        {"allocation": 901, "bytes_hex": tint},
+        {"allocation": 902, "bytes_hex": accumulator_reviewed},
+    ]
+    # The shape is part of the claim: the attachment and each writable binding
+    # report exactly one writeback and one allocation, in that order, so a
+    # report that reached the same bytes by another route (a missing sink, a
+    # merged identity) is refused rather than compared as the same observation.
+    if writebacks != expected_writebacks or allocations != expected_allocations:
+        raise NativeRunError(
+            "stage buffer write selftest: observations do not match the reviewed "
+            "run, got " + repr((writebacks, allocations))
+        )
+    observations = report.get("observations", [])
+    if len(observations) != 2:
+        raise NativeRunError(
+            "stage buffer write selftest: expected two runs (reviewed triangle, "
+            "full-screen green), got " + repr(observations)
+        )
+    expected = [
+        (positions, tint, reviewed_frame, tint, accumulator_reviewed),
+        (full_positions, green, full_frame, green, accumulator_green),
+    ]
+    for index, (observation, run) in enumerate(zip(observations, expected)):
+        if not isinstance(observation, dict):
+            raise NativeRunError(
+                "stage buffer write selftest: run " + str(index) + " is not an object"
+            )
+        fields = ("positions_hex", "source_hex", "attachment_hex", "sink_hex",
+                  "accumulator_hex")
+        for field, value in zip(fields, run):
+            if observation.get(field) != value:
+                raise NativeRunError(
+                    "stage buffer write selftest: run " + str(index) + " " + field
+                    + " is " + repr(observation.get(field)) + " instead of " + repr(value)
+                )
+        if observation.get("accumulator_initial_hex") != accumulator_initial:
+            raise NativeRunError(
+                "stage buffer write selftest: run " + str(index)
+                + " does not name the previous bytes it bound, got "
+                + repr(observation.get("accumulator_initial_hex"))
+            )
+    return ("frames=[" + ", ".join(run[2] for run in expected) + "] sinks=["
+            + ", ".join(run[3] for run in expected) + "] accumulators=["
+            + ", ".join(run[4] for run in expected) + "]")
+
+
 def validate_store_dontcare_selftest(report):
     """One store-dontcare self-test report is the reviewed discard fixture's
     observation (`conformance/RENDER-CAPTURE.md` §11): the fixture id, one
