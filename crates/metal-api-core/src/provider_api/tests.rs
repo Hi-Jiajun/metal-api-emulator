@@ -2906,7 +2906,7 @@ fn a_depth_draw_records_the_surface_and_refuses_a_mismatched_extent() {
             None,
         ),
         Err(ContractError::DepthExtentMismatch {
-            viewport: [2, 2],
+            raster: [2, 2],
             depth: [4, 2],
         }
         .into())
@@ -4317,7 +4317,7 @@ fn a_stencil_draw_records_the_surface_and_state_and_needs_an_index_buffer() {
             None,
         ),
         Err(ContractError::StencilExtentMismatch {
-            viewport: [2, 2],
+            raster: [2, 2],
             stencil: [2, 4],
         }
         .into())
@@ -4445,11 +4445,14 @@ fn a_blending_draw_records_the_state_and_needs_an_index_buffer() {
         .unwrap();
     let index_view = index.view(0, 16).unwrap();
     let blend = [contract::BlendAttachment {
+        enabled: true,
         source_rgb: contract::BlendFactor::SourceAlpha,
         destination_rgb: contract::BlendFactor::OneMinusSourceAlpha,
         source_alpha: contract::BlendFactor::SourceAlpha,
         destination_alpha: contract::BlendFactor::OneMinusSourceAlpha,
         operation: contract::BlendOperation::Add,
+        alpha_operation: contract::BlendOperation::Add,
+        write_mask: contract::ColorWriteMask::ALL,
     }];
 
     let command = device.new_command_queue().command_buffer();

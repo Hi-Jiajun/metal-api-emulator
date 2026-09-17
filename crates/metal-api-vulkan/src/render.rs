@@ -34,15 +34,16 @@ use metal2vulkan::reflect::{
 };
 use metal_api_core::provider::{
     AffineAccess, AffineTerm, AttachmentFormat, BlendFactor, BlendOperation, BorrowedLeaseRegistry,
-    BorrowedView, BufferAccess, BufferSource, BufferView, ClearColor, CompareFunction, CullMode,
-    DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest, DeviceEpoch, FieldValue,
-    FootprintProof, IndexFormat, IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp,
-    MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount,
-    SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
-    StoreOp, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
-    VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    BorrowedView, BufferAccess, BufferSource, BufferView, ClearColor, ColorWriteMask,
+    CompareFunction, CullMode, DepthLoadOp, DepthResolveFilter, DepthStoreOp, DepthTest,
+    DeviceEpoch, FieldValue, FootprintProof, IndexFormat, IndirectCommandDescriptor, LeaseId,
+    LeaseRegistry, LoadOp, MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve,
+    ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot,
+    Retryability, SampleCount, SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp,
+    StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
+    TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -763,6 +764,16 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// (`research/docs/23` §3.3, v40), or `None` for "write the fragment
     /// output".
     pub blend: Option<RenderPassBlend>,
+    /// The viewport the pass's draw rasterizes through (`research/docs/23`
+    /// §3.3, v100): `[origin_x, origin_y, width, height]` in framebuffer
+    /// coordinates, recorded with `vkCmdSetViewport` beside the scissor below.
+    ///
+    /// The rect is inside the attachments' own extent — the render area — which
+    /// is the rule the contract states; the texels it does not cover keep the
+    /// load op's bytes. The pre-v100 covering default is what every earlier
+    /// request carried, and it is the same `vk::Viewport` this rail used to
+    /// build from the extent alone.
+    pub viewport: [u32; 4],
     /// The pass-wide multisample raster (`research/docs/23` §3.3, v51/v61), or
     /// `None` for the single-sample raster every pre-v51 pass ran. When
     /// present, every colour attachment is opened as a surface of the raster's
@@ -3513,6 +3524,11 @@ fn prepare_render_request_with_resident<'a>(
         // for this pass (`research/docs/23` §3.3, v39/v40).
         cull: pass.cull,
         blend: pass.blend.clone(),
+        // The declared viewport travels with the request exactly as the trace
+        // stated it (`research/docs/23` §3.3, v100); the rule that it lies
+        // inside the attachments' extent ran in the contract, and `extent`
+        // beside it stays the render area's own size.
+        viewport: pass.viewport,
         extent,
         vertex: OffscreenVertexStage {
             entry: bound_stage_entry(stages, RenderStage::Vertex)?,
@@ -4328,20 +4344,71 @@ fn stage_shader_flags(stage: RenderPipelineStage) -> vk::ShaderStageFlags {
 /// One contract blend factor as the `VkBlendFactor` it names. Closed for the
 /// same reason every other translation here is: a factor that gains no arm is a
 /// compile error rather than a silently different one.
+///
+/// Every arm is total over the contract's list (`research/docs/23` §3.3,
+/// v100): the two families the contract refuses by name — the blend constant
+/// and the second colour output — still have a `VkBlendFactor` of the same
+/// meaning, and mapping them here is what keeps this function a translation of
+/// the vocabulary rather than a second copy of the admission rules. Vulkan
+/// reads neither of them unless the pipeline's blend enable is set, which is
+/// the same condition the contract's refusals state.
 fn vk_blend_factor(factor: BlendFactor) -> vk::BlendFactor {
     match factor {
         BlendFactor::Zero => vk::BlendFactor::ZERO,
         BlendFactor::One => vk::BlendFactor::ONE,
         BlendFactor::SourceAlpha => vk::BlendFactor::SRC_ALPHA,
         BlendFactor::OneMinusSourceAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        BlendFactor::SourceColor => vk::BlendFactor::SRC_COLOR,
+        BlendFactor::OneMinusSourceColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+        BlendFactor::DestinationColor => vk::BlendFactor::DST_COLOR,
+        BlendFactor::OneMinusDestinationColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+        BlendFactor::DestinationAlpha => vk::BlendFactor::DST_ALPHA,
+        BlendFactor::OneMinusDestinationAlpha => vk::BlendFactor::ONE_MINUS_DST_ALPHA,
+        BlendFactor::SourceAlphaSaturated => vk::BlendFactor::SRC_ALPHA_SATURATE,
+        BlendFactor::BlendColor => vk::BlendFactor::CONSTANT_COLOR,
+        BlendFactor::OneMinusBlendColor => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        BlendFactor::BlendAlpha => vk::BlendFactor::CONSTANT_ALPHA,
+        BlendFactor::OneMinusBlendAlpha => vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA,
+        BlendFactor::Source1Color => vk::BlendFactor::SRC1_COLOR,
+        BlendFactor::OneMinusSource1Color => vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+        BlendFactor::Source1Alpha => vk::BlendFactor::SRC1_ALPHA,
+        BlendFactor::OneMinusSource1Alpha => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
     }
 }
 
-/// One contract blend operation as the `VkBlendOp` it names.
+/// One contract blend operation as the `VkBlendOp` it names
+/// (`research/docs/23` §3.3, v100).
 fn vk_blend_operation(operation: BlendOperation) -> vk::BlendOp {
     match operation {
         BlendOperation::Add => vk::BlendOp::ADD,
+        BlendOperation::Subtract => vk::BlendOp::SUBTRACT,
+        BlendOperation::ReverseSubtract => vk::BlendOp::REVERSE_SUBTRACT,
+        BlendOperation::Min => vk::BlendOp::MIN,
+        BlendOperation::Max => vk::BlendOp::MAX,
     }
+}
+
+/// One contract write mask as Vulkan's channel flags (`research/docs/23`
+/// §3.3, v100).
+///
+/// The two spellings do not share a bit order — Metal runs alpha first from
+/// the low end, Vulkan red first — so the translation names each channel
+/// rather than casting the byte across.
+fn vk_color_write_mask(mask: ColorWriteMask) -> vk::ColorComponentFlags {
+    let mut flags = vk::ColorComponentFlags::empty();
+    if mask.writes(ColorWriteMask::RED) {
+        flags |= vk::ColorComponentFlags::R;
+    }
+    if mask.writes(ColorWriteMask::GREEN) {
+        flags |= vk::ColorComponentFlags::G;
+    }
+    if mask.writes(ColorWriteMask::BLUE) {
+        flags |= vk::ColorComponentFlags::B;
+    }
+    if mask.writes(ColorWriteMask::ALPHA) {
+        flags |= vk::ColorComponentFlags::A;
+    }
+    flags
 }
 
 /// The Vulkan index type for one contract index width.
@@ -5935,6 +6002,7 @@ fn execute_offscreen_render_with_retains(
         // copy-out source (`research/docs/23` §3.3, v60).
         request.stencil_resolve.map(|resolve| resolve.filter),
         request.scissor,
+        request.viewport,
         width,
         height,
     )?;
@@ -6628,6 +6696,7 @@ pub(crate) fn execute_present_render<'a>(
         None,
         None,
         None,
+        request.viewport,
         width,
         height,
     )?;
@@ -9475,18 +9544,25 @@ impl<'a> OffscreenObjects<'a> {
             .enumerate()
             .map(|(index, _)| {
                 let state = blend.and_then(|blend| blend.attachments.get(index));
-                let mapped = match state {
+                match state {
                     Some(attachment) => vk::PipelineColorBlendAttachmentState::default()
-                        .blend_enable(true)
+                        .blend_enable(attachment.enabled)
                         .src_color_blend_factor(vk_blend_factor(attachment.source_rgb))
                         .dst_color_blend_factor(vk_blend_factor(attachment.destination_rgb))
                         .color_blend_op(vk_blend_operation(attachment.operation))
                         .src_alpha_blend_factor(vk_blend_factor(attachment.source_alpha))
                         .dst_alpha_blend_factor(vk_blend_factor(attachment.destination_alpha))
-                        .alpha_blend_op(vk_blend_operation(attachment.operation)),
-                    None => vk::PipelineColorBlendAttachmentState::default().blend_enable(false),
-                };
-                mapped.color_write_mask(vk::ColorComponentFlags::RGBA)
+                        .alpha_blend_op(vk_blend_operation(attachment.alpha_operation))
+                        // The mask is written per channel in Vulkan's own bit
+                        // order, applied after blending and read whether or
+                        // not the entry blends (`research/docs/23` §3.3, v100).
+                        .color_write_mask(vk_color_write_mask(attachment.write_mask)),
+                    // A pass that states no blend state at all — every
+                    // pre-v40 trace — keeps the no-blend, all-writes entry.
+                    None => vk::PipelineColorBlendAttachmentState::default()
+                        .blend_enable(false)
+                        .color_write_mask(vk::ColorComponentFlags::RGBA),
+                }
             })
             .collect::<Vec<_>>();
         let blend =
@@ -10299,6 +10375,7 @@ impl<'a> OffscreenObjects<'a> {
         depth_resolve: Option<DepthResolveFilter>,
         stencil_resolve: Option<StencilResolveFilter>,
         scissor: Option<[u32; 4]>,
+        viewport: [u32; 4],
         width: u32,
         height: u32,
     ) -> Result<(), ProviderError> {
@@ -10446,11 +10523,18 @@ impl<'a> OffscreenObjects<'a> {
             .framebuffer(self.framebuffer)
             .render_area(render_area)
             .clear_values(&clear_values);
+        // The viewport is the pass's own rect (`research/docs/23` §3.3, v100):
+        // `vk::Viewport`'s x/y offset and width/height are the same four
+        // numbers the contract carries, and the covering default a pre-v100
+        // pass states is the rect this rail used to build from the extent
+        // alone. The offset is a `f32` in Vulkan, and every extent a snapshot
+        // admits is far below `2^24`, so the conversion is exact.
+        let [viewport_x, viewport_y, viewport_width, viewport_height] = viewport;
         let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: width as f32,
-            height: height as f32,
+            x: viewport_x as f32,
+            y: viewport_y as f32,
+            width: viewport_width as f32,
+            height: viewport_height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         };
@@ -12385,6 +12469,7 @@ mod tests {
                     seed: None,
                     resident: None,
                 }],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -12717,6 +12802,7 @@ mod tests {
                 seed: None,
                 resident: None,
             }],
+            viewport: [0, 0, 2, 2],
             extent: [2, 2],
             vertex: milestone_vertex(),
             translated_fragment: None,
@@ -12792,6 +12878,7 @@ mod tests {
                         seed: None,
                         resident: None,
                     }],
+                    viewport: [0, 0, 2, 2],
                     extent: [2, 2],
                     vertex: single_pixel_vertex(),
                     translated_fragment: None,
@@ -13038,6 +13125,7 @@ mod tests {
                     seed: None,
                     resident: None,
                 }],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: single_pixel_vertex(),
                 translated_fragment: None,
@@ -13094,6 +13182,7 @@ mod tests {
                 seed: None,
                 resident: None,
             }],
+            viewport: [0, 0, 2, 0],
             extent: [2, 0],
             vertex: milestone_vertex(),
             translated_fragment: None,
@@ -13670,6 +13759,7 @@ mod tests {
                         resident: None,
                     },
                 ],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -13747,6 +13837,7 @@ mod tests {
                         resident: None,
                     },
                 ],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -13828,6 +13919,7 @@ mod tests {
                         resident: None,
                     },
                 ],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -13877,6 +13969,7 @@ mod tests {
                 seed: None,
                 resident: None,
             }],
+            viewport: [0, 0, 2, 2],
             extent: [2, 2],
             vertex: milestone_vertex(),
             translated_fragment: None,
@@ -13986,6 +14079,7 @@ mod tests {
                     resident: None,
                 },
             ],
+            viewport: [0, 0, 2, 2],
             extent: [2, 2],
             vertex: milestone_vertex(),
             translated_fragment: None,
@@ -14221,6 +14315,7 @@ mod tests {
                     seed: Some(ClearColor::new(seed_texel)),
                     resident: None,
                 }],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -14359,6 +14454,7 @@ mod tests {
                     seed: None,
                     resident: None,
                 }],
+                viewport: [0, 0, 2, 2],
                 extent: [2, 2],
                 vertex: milestone_vertex(),
                 translated_fragment: None,
@@ -14482,6 +14578,7 @@ mod tests {
                 seed: None,
                 resident: None,
             }],
+            viewport: [0, 0, 2, 2],
             extent: [2, 2],
             vertex: milestone_vertex(),
             translated_fragment: None,
@@ -14576,6 +14673,7 @@ mod tests {
                 seed: None,
                 resident: None,
             }],
+            viewport: [0, 0, 4, 4],
             extent: [4, 4],
             vertex: milestone_vertex(),
             translated_fragment: None,

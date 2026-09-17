@@ -216,6 +216,19 @@ pub enum CodecError {
     ComputeTextureDeclarationsWithRenderHalf {
         declarations: usize,
     },
+    /// A render pass stated blend state its v40 section cannot carry
+    /// (`research/docs/23` §3.3, v100).
+    ///
+    /// The section carries one operation per entry, every channel written and
+    /// blending enabled — the shape v40 published. A pass that states anything
+    /// else (a disabled entry, a second operation for the alpha pair, a write
+    /// mask) has no position in those bytes, so the sender refuses it by name
+    /// instead of framing a state the receiver would read as blending with one
+    /// operation and every channel written.
+    RenderBlendStateUnsupported {
+        location: usize,
+        field: &'static str,
+    },
     /// A wide feature that describes the depth attachment arrived without one.
     /// The store action and the identity are properties *of* the depth
     /// attachment, so either bit without the depth section names a surface the
@@ -380,6 +393,11 @@ impl fmt::Display for CodecError {
                 formatter,
                 "a render pipeline entry carries {declarations} compute texture declarations, \
                  a block the render kinds cannot frame"
+            ),
+            Self::RenderBlendStateUnsupported { location, field } => write!(
+                formatter,
+                "colour attachment {location}'s blend state states {field}, which the v40 blend \
+                 section cannot carry"
             ),
             Self::DepthFeatureWithoutAttachment(features) => write!(
                 formatter,

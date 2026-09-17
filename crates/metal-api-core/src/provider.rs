@@ -2491,26 +2491,82 @@ pub struct DepthTest {
     pub write: bool,
 }
 
-/// The blend factors this increment admits (`research/docs/23` §3.3, v40).
+/// One side of one blend equation (`research/docs/23` §3.3, v40/v100).
 ///
-/// Four values, because they are the ones the reviewed fixture needs and the
-/// ones both rails name identically: Metal's `MTLBlendFactor` and Vulkan's
-/// `VkBlendFactor` agree on all of them. The list stays closed so admitting a
-/// fifth is a deliberate wire-visible change.
+/// Nineteen values: Metal's whole `MTLBlendFactor` list, every entry of which
+/// has a `VkBlendFactor` of the same meaning beside it. The list is the
+/// *vocabulary*, not the admitted set — the two families this increment cannot
+/// execute are refused by name when a blend states them, never spelled as
+/// something else. The four `BlendColor`/`BlendAlpha` values need the blend
+/// constant, which is encoder state neither this pass nor the wire carries
+/// (`MTLRenderCommandEncoder.setBlendColor` / `VkPipelineColorBlendStateCreateInfo
+/// ::blendConstants`); the four `Source1*` values read the fragment shader's
+/// second colour output, which needs a device feature on the Vulkan rail and a
+/// second output slot on both. Everything else executes on both rails.
+///
+/// The codes are this contract's own: `2` and `3` keep the two values the v40
+/// increment published, and every later value takes its Metal ordinal, so a
+/// pre-v100 frame's factor bytes keep exactly the meaning they had.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlendFactor {
     Zero,
     One,
     SourceAlpha,
     OneMinusSourceAlpha,
+    SourceColor,
+    OneMinusSourceColor,
+    DestinationColor,
+    OneMinusDestinationColor,
+    DestinationAlpha,
+    OneMinusDestinationAlpha,
+    SourceAlphaSaturated,
+    BlendColor,
+    OneMinusBlendColor,
+    BlendAlpha,
+    OneMinusBlendAlpha,
+    Source1Color,
+    OneMinusSource1Color,
+    Source1Alpha,
+    OneMinusSource1Alpha,
 }
 
 impl BlendFactor {
-    pub const ADMITTED: [Self; 4] = [
+    /// The factors both rails execute with the state this pass carries: the
+    /// eleven that read nothing but the two texel colours.
+    pub const ADMITTED: [Self; 11] = [
         Self::Zero,
         Self::One,
         Self::SourceAlpha,
         Self::OneMinusSourceAlpha,
+        Self::SourceColor,
+        Self::OneMinusSourceColor,
+        Self::DestinationColor,
+        Self::OneMinusDestinationColor,
+        Self::DestinationAlpha,
+        Self::OneMinusDestinationAlpha,
+        Self::SourceAlphaSaturated,
+    ];
+
+    /// The factors that read the encoder's blend constant
+    /// (`research/docs/23` §3.3, v100). The canonical pass carries no blend
+    /// constant, so a blend that states one is refused by name rather than run
+    /// with a constant the trace never declared.
+    pub const NEEDS_BLEND_CONSTANT: [Self; 4] = [
+        Self::BlendColor,
+        Self::OneMinusBlendColor,
+        Self::BlendAlpha,
+        Self::OneMinusBlendAlpha,
+    ];
+
+    /// The factors that read the fragment shader's second colour output
+    /// (`research/docs/23` §3.3, v100). Dual-source blending needs a second
+    /// output the reviewed stages do not declare and a feature the Vulkan rail
+    /// does not ask for, so the shape is refused by name.
+    pub const DUAL_SOURCE: [Self; 4] = [
+        Self::Source1Color,
+        Self::OneMinusSource1Color,
+        Self::Source1Alpha,
+        Self::OneMinusSource1Alpha,
     ];
 
     pub const fn code(self) -> u8 {
@@ -2519,57 +2575,317 @@ impl BlendFactor {
             Self::One => 1,
             Self::SourceAlpha => 2,
             Self::OneMinusSourceAlpha => 3,
+            Self::SourceColor => 4,
+            Self::OneMinusSourceColor => 5,
+            Self::DestinationColor => 6,
+            Self::OneMinusDestinationColor => 7,
+            Self::DestinationAlpha => 8,
+            Self::OneMinusDestinationAlpha => 9,
+            Self::SourceAlphaSaturated => 10,
+            Self::BlendColor => 11,
+            Self::OneMinusBlendColor => 12,
+            Self::BlendAlpha => 13,
+            Self::OneMinusBlendAlpha => 14,
+            Self::Source1Color => 15,
+            Self::OneMinusSource1Color => 16,
+            Self::Source1Alpha => 17,
+            Self::OneMinusSource1Alpha => 18,
         }
     }
 
     pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Zero),
-            1 => Some(Self::One),
-            2 => Some(Self::SourceAlpha),
-            3 => Some(Self::OneMinusSourceAlpha),
-            _ => None,
-        }
+        Some(match code {
+            0 => Self::Zero,
+            1 => Self::One,
+            2 => Self::SourceAlpha,
+            3 => Self::OneMinusSourceAlpha,
+            4 => Self::SourceColor,
+            5 => Self::OneMinusSourceColor,
+            6 => Self::DestinationColor,
+            7 => Self::OneMinusDestinationColor,
+            8 => Self::DestinationAlpha,
+            9 => Self::OneMinusDestinationAlpha,
+            10 => Self::SourceAlphaSaturated,
+            11 => Self::BlendColor,
+            12 => Self::OneMinusBlendColor,
+            13 => Self::BlendAlpha,
+            14 => Self::OneMinusBlendAlpha,
+            15 => Self::Source1Color,
+            16 => Self::OneMinusSource1Color,
+            17 => Self::Source1Alpha,
+            18 => Self::OneMinusSource1Alpha,
+            _ => return None,
+        })
+    }
+
+    /// Whether this factor reads the blend constant
+    /// (`research/docs/23` §3.3, v100).
+    pub const fn needs_blend_constant(self) -> bool {
+        matches!(
+            self,
+            Self::BlendColor
+                | Self::OneMinusBlendColor
+                | Self::BlendAlpha
+                | Self::OneMinusBlendAlpha
+        )
+    }
+
+    /// Whether this factor reads the fragment shader's second colour output
+    /// (`research/docs/23` §3.3, v100).
+    pub const fn is_dual_source(self) -> bool {
+        matches!(
+            self,
+            Self::Source1Color
+                | Self::OneMinusSource1Color
+                | Self::Source1Alpha
+                | Self::OneMinusSource1Alpha
+        )
     }
 }
 
-/// The blend operation this increment admits. One value: the reviewed fixture
-/// adds, and every other operation needs its own parity evidence.
+/// The blend operation this increment admits (`research/docs/23` §3.3,
+/// v40/v100).
+///
+/// Five values — Metal's whole `MTLBlendOperation` — and every one of them has
+/// a `VkBlendOp` of the same meaning, so this list is also the admitted set.
+/// `Add` keeps the code the v40 increment published; the four after it take
+/// their Metal ordinals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlendOperation {
     Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
 }
 
 impl BlendOperation {
-    pub const ADMITTED: [Self; 1] = [Self::Add];
+    pub const ADMITTED: [Self; 5] = [
+        Self::Add,
+        Self::Subtract,
+        Self::ReverseSubtract,
+        Self::Min,
+        Self::Max,
+    ];
 
     pub const fn code(self) -> u8 {
         match self {
             Self::Add => 0,
+            Self::Subtract => 1,
+            Self::ReverseSubtract => 2,
+            Self::Min => 3,
+            Self::Max => 4,
         }
     }
 
     pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Add),
-            _ => None,
-        }
+        Some(match code {
+            0 => Self::Add,
+            1 => Self::Subtract,
+            2 => Self::ReverseSubtract,
+            3 => Self::Min,
+            4 => Self::Max,
+            _ => return None,
+        })
     }
 }
 
-/// One colour attachment's blend state (`research/docs/23` §3.3, v40).
+/// The colour channels a pass's fragment output writes (`research/docs/23`
+/// §3.3, v100).
 ///
-/// The four factors are stated separately for the colour and alpha channels,
-/// exactly as Metal's `MTLRenderPipelineColorAttachmentDescriptor` and Vulkan's
-/// `VkPipelineColorBlendAttachmentState` do; the operation is shared, because
-/// the increment admits one.
+/// Metal's `MTLColorWriteMask`, whose bit order is *not* Vulkan's: the four
+/// bits run alpha first from the low end here, while `VkColorComponentFlags`
+/// runs red first. The spelling is Metal's because it is the vocabulary the
+/// guest declares, exactly as the blend factors and operations are; the two
+/// rails own the mapping, and neither bit order can be read as the other
+/// because a mask is always taken through one of the named constants or
+/// [`ColorWriteMask::from_bits`].
+///
+/// The mask is not part of the blend in either API: an unblended attachment
+/// with a mask still leaves its unwritten channels alone, which is why the mask
+/// is carried whether or not the entry beside it blends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColorWriteMask(u8);
+
+impl ColorWriteMask {
+    /// No channel is written.
+    pub const NONE: Self = Self(0);
+    /// The alpha channel.
+    pub const ALPHA: Self = Self(1 << 0);
+    /// The blue channel.
+    pub const BLUE: Self = Self(1 << 1);
+    /// The green channel.
+    pub const GREEN: Self = Self(1 << 2);
+    /// The red channel.
+    pub const RED: Self = Self(1 << 3);
+    /// Every channel.
+    pub const ALL: Self = Self(0xf);
+
+    /// The bits a mask can set: Metal's four channel bits and nothing else.
+    pub const BITS: u8 = 0xf;
+
+    /// The mask a wire code states, or `None` for a value no
+    /// `MTLColorWriteMask` holds. A five-bit code is refused rather than
+    /// truncated, because the fifth bit is not a channel either API has.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// The mask's bits, in Metal's alpha-first order.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether `channel` — one of the four single-bit constants — is written.
+    pub const fn writes(self, channel: Self) -> bool {
+        self.0 & channel.0 != 0
+    }
+
+    /// The union of two masks: Metal's own spelling, where the four channel
+    /// bits combine with `|`. A caller that wants red and alpha together states
+    /// `ColorWriteMask::RED.union(ColorWriteMask::ALPHA)` rather than a bare
+    /// byte no reader could check.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// Which of an attachment's four blend-factor slots a refusal is about
+/// (`research/docs/23` §3.3, v100).
+///
+/// The two APIs state the four factors as four parameters, and one of them is
+/// not symmetric: `SourceAlphaSaturated` is a *source* factor only. A refusal
+/// that named just the factor would not say which of the four slots to fix, so
+/// the slot travels with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlendFactorSlot {
+    SourceRgb,
+    DestinationRgb,
+    SourceAlpha,
+    DestinationAlpha,
+}
+
+impl BlendFactorSlot {
+    /// Lowercase spelling used by `Display` output and test failure messages.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SourceRgb => "source rgb",
+            Self::DestinationRgb => "destination rgb",
+            Self::SourceAlpha => "source alpha",
+            Self::DestinationAlpha => "destination alpha",
+        }
+    }
+
+    /// Whether the slot is a destination slot, which is the half of the four
+    /// that does not admit `SourceAlphaSaturated`.
+    pub const fn is_destination(self) -> bool {
+        matches!(self, Self::DestinationRgb | Self::DestinationAlpha)
+    }
+}
+
+/// One colour attachment's blend state and write mask (`research/docs/23`
+/// §3.3, v40/v100).
+///
+/// The fields are Metal's `MTLRenderPipelineColorAttachmentDescriptor` and
+/// Vulkan's `VkPipelineColorBlendAttachmentState` in one description: whether
+/// the attachment blends at all, the four factors with colour and alpha stated
+/// separately, the two operations (Metal's `rgbBlendOperation` and
+/// `alphaBlendOperation`), and the write mask. `operation` keeps its v40 name
+/// and position — it is the colour operation — so a frame that states the v40
+/// shape keeps its meaning byte for byte: alpha follows the colour operation
+/// unless `alpha_operation` says otherwise, and every channel is written
+/// unless `write_mask` says otherwise.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlendAttachment {
+    /// Whether this attachment blends its fragment output at all (Metal's
+    /// `blendingEnabled`). An entry with this clear writes the fragment output
+    /// through `write_mask` and the six fields after it are not read — the
+    /// shape Metal describes, where the factors of a disabled attachment are
+    /// carried but unused, and the reason the factor refusals below apply only
+    /// to an enabled entry: a factor that cannot reach a pixel cannot refuse
+    /// the pass it sits in.
+    pub enabled: bool,
     pub source_rgb: BlendFactor,
     pub destination_rgb: BlendFactor,
     pub source_alpha: BlendFactor,
     pub destination_alpha: BlendFactor,
+    /// The colour operation, Metal's `rgbBlendOperation` — the field's v40
+    /// name, which every pre-v100 frame states.
     pub operation: BlendOperation,
+    /// The alpha operation, Metal's `alphaBlendOperation`. The v40 shape
+    /// states the colour operation here too, which is what that increment's one
+    /// shared operation meant.
+    pub alpha_operation: BlendOperation,
+    /// The channels this attachment writes, applied after blending in both
+    /// APIs.
+    pub write_mask: ColorWriteMask,
+}
+
+impl BlendAttachment {
+    /// Whether this entry is the shape the v40 increment published: blending
+    /// enabled, one operation for both channel pairs, every channel written.
+    ///
+    /// The wire's v40 blend section carries exactly that shape — one operation
+    /// code per entry and no mask — so a codec asks this question before it
+    /// writes an entry and refuses anything else by name, rather than framing a
+    /// different state (`research/docs/23` §3.3, v100).
+    pub const fn is_v40_shape(&self) -> bool {
+        self.enabled
+            && self.alpha_operation.code() == self.operation.code()
+            && self.write_mask.bits() == ColorWriteMask::ALL.bits()
+    }
+
+    /// Structural validation of one attachment's state: the factors and
+    /// channels both rails can execute with the state this pass carries.
+    ///
+    /// `location` is the entry's position, i.e. the colour attachment it
+    /// describes, so a refusal can name the target it is about.
+    pub fn validate(&self, location: usize) -> Result<(), ContractError> {
+        // The write mask needs no rule of its own: [`ColorWriteMask`] can only
+        // hold Metal's four channel bits, and a wire code with a fifth bit is
+        // refused where the code is read rather than here.
+        if !self.enabled {
+            return Ok(());
+        }
+        for (slot, factor) in [
+            (BlendFactorSlot::SourceRgb, self.source_rgb),
+            (BlendFactorSlot::DestinationRgb, self.destination_rgb),
+            (BlendFactorSlot::SourceAlpha, self.source_alpha),
+            (BlendFactorSlot::DestinationAlpha, self.destination_alpha),
+        ] {
+            if factor.needs_blend_constant() {
+                return Err(ContractError::BlendFactorNeedsBlendConstant {
+                    location,
+                    slot,
+                    factor,
+                });
+            }
+            if factor.is_dual_source() {
+                return Err(ContractError::BlendFactorDualSourceUnsupported {
+                    location,
+                    slot,
+                    factor,
+                });
+            }
+            // `SourceAlphaSaturated` reduces the source colour by the source
+            // alpha, which both APIs define for a *source* factor only: as a
+            // destination factor the equations are not the ones either API
+            // names, so the shape is refused instead of being run with
+            // whichever reading a driver picks.
+            if slot.is_destination() && factor == BlendFactor::SourceAlphaSaturated {
+                return Err(ContractError::BlendFactorSlotUnsupported {
+                    location,
+                    slot,
+                    factor,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The blend state a pass's draw runs with (`research/docs/23` §3.3, v40).
@@ -3167,11 +3483,41 @@ pub struct RenderPassDescriptor {
     /// fragment stage's output `i` lands in, up to
     /// [`MAX_COLOR_ATTACHMENTS`].
     pub color_attachments: Vec<RenderAttachment>,
-    /// `[origin_x, origin_y, width, height]`. The first increment accepts only
-    /// the attachment-covering default `(0, 0, width, height)`: the viewport is
-    /// explicit so a trace cannot imply viewport state the execution step does
-    /// not set, and so a later dynamic-viewport extension is a deliberate
-    /// change (`docs/23` §3.1).
+    /// `[origin_x, origin_y, width, height]`, the viewport the pass's draw
+    /// rasterizes through — the rect NDC maps onto, in framebuffer coordinates
+    /// (`research/docs/23` §3.1, v100). The attachment-covering default
+    /// `(0, 0, width, height)` is what every earlier increment published and
+    /// what a trace that never states a viewport keeps byte for byte.
+    ///
+    /// The viewport is a *rect*, not a scale factor: its origin is where NDC's
+    /// `(-1, -1)` lands and its extent is the size NDC's two units span, so a
+    /// smaller or offset rect shrinks or moves the raster and the texels it
+    /// does not cover keep whatever the load op gave them. The rules this
+    /// contract states about it are the four a rail can execute without
+    /// repairing the request:
+    ///
+    /// - the extent is non-empty, because a zero-width or zero-height raster
+    ///   is the "nothing landed" shape the store rules refuse on their own
+    ///   side;
+    /// - every colour attachment shares one extent, and that shared extent —
+    ///   the pass's *raster* — is what the depth and stencil surfaces are held
+    ///   to as well;
+    /// - the rect lies **inside** that raster: an origin or extent that reaches
+    ///   outside is refused by name rather than clipped, because the class
+    ///   proves the transform over an exact raster — every covered pixel is one
+    ///   the readback carries — and a rect that reaches outside would make the
+    ///   two APIs' render-area clipping the thing under test instead;
+    /// - a *negative* origin is not this field's shape at all: the origin is
+    ///   the low half of a `u32` pair, so a rect starting left of or above the
+    ///   framebuffer has no spelling here. The guest vocabulary states the
+    ///   origin as a float and can name one, which is why a mapper refuses that
+    ///   shape by name instead of clamping it to zero.
+    ///
+    /// The scissor beside it is framebuffer state, not viewport state: it is
+    /// held to the attachment's own extent (below), so a scissor may cover
+    /// texels the viewport does not reach — those texels are simply never
+    /// rasterized. A pass that states neither keeps the covering default and
+    /// the whole render area, exactly as before.
     pub viewport: [u32; 4],
     /// The scissor rectangle `[x, y, width, height]` the draw is clipped to, or
     /// `None` for "the whole viewport".
@@ -3668,19 +4014,58 @@ impl RenderPassDescriptor {
                 });
             }
         }
-        if origin_x != 0 || origin_y != 0 {
-            return Err(ContractError::ViewportOriginUnsupported {
-                origin: [origin_x, origin_y],
-            });
+        // The pass's *raster* is its attachments' extent — the framebuffer
+        // both rails open — and the viewport is a rect inside it
+        // (`research/docs/23` §3.1, v100). The colour list defines the raster,
+        // so its entries have to agree first: two colour locations render into
+        // one framebuffer, and a pass whose attachments disagree cannot have
+        // even a single rect that is inside all of them. The MRT shape makes no
+        // exception for location 0, and a single-attachment pass — every
+        // pre-MRT trace — states no rule it did not already satisfy.
+        let mut raster = None;
+        for (index, attachment) in self.color_attachments.iter().enumerate() {
+            match raster {
+                None => raster = Some([attachment.width, attachment.height]),
+                Some(first) if first != [attachment.width, attachment.height] => {
+                    return Err(ContractError::RenderAttachmentExtentMismatch {
+                        attachment: index,
+                        extent: [attachment.width, attachment.height],
+                        first,
+                    });
+                }
+                Some(_) => {}
+            }
         }
-        // Every attachment renders into the same viewport, so each one's
-        // extent has to match it; the MRT shape makes no exception for
-        // location 0.
-        for attachment in &self.color_attachments {
-            if u64::from(width) != attachment.width || u64::from(height) != attachment.height {
-                return Err(ContractError::ViewportExtentMismatch {
-                    viewport: [width, height],
-                    attachment: [attachment.width, attachment.height],
+        // A pass with no colour attachment is the depth-only shape
+        // (`research/docs/23` §3.3, v46), which has no colour list to define
+        // the raster: its own surface is the raster, and the viewport is held
+        // to it exactly as it is held to the colour extent.
+        if raster.is_none() {
+            raster = self.depth.as_ref().map(|depth| [depth.width, depth.height]);
+        }
+        if raster.is_none() {
+            raster = self
+                .stencil
+                .as_ref()
+                .map(|stencil| [stencil.width, stencil.height]);
+        }
+        // The declared viewport lies inside that raster
+        // (`research/docs/23` §3.1, v100): a rect that reaches outside is
+        // refused by name rather than clipped, because the class proves the
+        // transform over an exact raster — every covered pixel is one the
+        // readback carries — and a rect that reaches outside would put the two
+        // APIs' render-area clipping under test instead of the transform.
+        if let Some(attachment) = raster {
+            let covered = u64::from(origin_x)
+                .checked_add(u64::from(width))
+                .is_some_and(|end| end <= attachment[0])
+                && u64::from(origin_y)
+                    .checked_add(u64::from(height))
+                    .is_some_and(|end| end <= attachment[1]);
+            if !covered {
+                return Err(ContractError::ViewportOutsideAttachment {
+                    viewport: self.viewport,
+                    attachment,
                 });
             }
         }
@@ -3698,9 +4083,9 @@ impl RenderPassDescriptor {
             if !DepthFormat::ADMITTED.contains(&depth.format) {
                 return Err(ContractError::UnsupportedDepthFormat(depth.format));
             }
-            if u64::from(width) != depth.width || u64::from(height) != depth.height {
+            if raster.is_some_and(|raster| raster != [depth.width, depth.height]) {
                 return Err(ContractError::DepthExtentMismatch {
-                    viewport: [width, height],
+                    raster: raster.unwrap_or([depth.width, depth.height]),
                     depth: [depth.width, depth.height],
                 });
             }
@@ -3742,6 +4127,14 @@ impl RenderPassDescriptor {
                     attachments: self.color_attachments.len(),
                 });
             }
+            // One entry per colour location, each held to the vocabulary the
+            // two rails execute with the state this pass carries
+            // (`research/docs/23` §3.3, v100): the write mask is read whether
+            // or not the entry blends, so its rule runs for every entry, while
+            // the factors of a disabled entry are carried and unused.
+            for (location, attachment) in blend.attachments.iter().enumerate() {
+                attachment.validate(location)?;
+            }
         }
         // A depth test without a depth attachment has nothing to test against,
         // and one against undefined contents would be the shape the wildcard
@@ -3762,9 +4155,9 @@ impl RenderPassDescriptor {
             if !StencilFormat::ADMITTED.contains(&stencil.format) {
                 return Err(ContractError::UnsupportedStencilFormat(stencil.format));
             }
-            if u64::from(width) != stencil.width || u64::from(height) != stencil.height {
+            if raster.is_some_and(|raster| raster != [stencil.width, stencil.height]) {
                 return Err(ContractError::StencilExtentMismatch {
-                    viewport: [width, height],
+                    raster: raster.unwrap_or([stencil.width, stencil.height]),
                     stencil: [stencil.width, stencil.height],
                 });
             }
@@ -3809,21 +4202,31 @@ impl RenderPassDescriptor {
         if self.stencil_test.is_some() && self.stencil.is_none() {
             return Err(ContractError::StencilTestWithoutAttachment);
         }
-        // The scissor, when present, has to stay inside the viewport and be
-        // non-empty: a zero-area scissor would make "nothing landed" look like
-        // a pass that ran, exactly the shape `StoreOp::DontCare` refuses on the
-        // store side.
+        // The scissor, when present, has to stay inside the pass's raster and
+        // be non-empty: a zero-area scissor would make "nothing landed" look
+        // like a pass that ran, exactly the shape `StoreOp::DontCare` refuses
+        // on the store side.
+        //
+        // The rectangle is framebuffer state rather than viewport state
+        // (`research/docs/23` §3.1, v100): Metal's `setScissorRect` and
+        // Vulkan's `VkRect2D` are both stated in framebuffer coordinates, so
+        // the rect is held to the attachment's own extent and not to the
+        // viewport. The two were the same rectangle until a pass could declare
+        // a viewport of its own; a scissor that covers texels the viewport does
+        // not reach is admitted, because those texels are never rasterized and
+        // the scissor's own rule is about the clip rather than the transform.
         if let Some([x, y, scissor_width, scissor_height]) = self.scissor {
+            let attachment = raster.unwrap_or([u64::from(width), u64::from(height)]);
             let inside = u64::from(x)
                 .checked_add(u64::from(scissor_width))
-                .is_some_and(|end| end <= u64::from(width))
+                .is_some_and(|end| end <= attachment[0])
                 && u64::from(y)
                     .checked_add(u64::from(scissor_height))
-                    .is_some_and(|end| end <= u64::from(height));
+                    .is_some_and(|end| end <= attachment[1]);
             if scissor_width == 0 || scissor_height == 0 || !inside {
                 return Err(ContractError::ScissorOutOfBounds {
                     scissor: [x, y, scissor_width, scissor_height],
-                    viewport: [width, height],
+                    attachment,
                 });
             }
         }
@@ -9211,9 +9614,28 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "attachment_count_unsupported",
         ),
-        E::ViewportOriginUnsupported { .. } => (
+        // The declared viewport's own rule (`research/docs/23` §3.1, v100): a
+        // rect that reaches outside the raster is the first-increment
+        // narrowing, exactly as the attachment bits above are, while a list of
+        // attachments that disagree about the raster is caller-fixable
+        // structure and joins the pair rules below.
+        E::ViewportOutsideAttachment { .. } => (
             ProviderErrorClass::Capability,
-            "viewport_origin_unsupported",
+            "viewport_extent_unsupported",
+        ),
+        // The blend vocabulary's two unexecutable families and the mask rule
+        // (`research/docs/23` §3.3, v100): the blend constant and the second
+        // colour output are state neither rail can supply from this pass, so
+        // those two are capability refusals, while a mask bit outside the four
+        // channels and a destination-slot `SourceAlphaSaturated` are
+        // caller-fixable trace shape.
+        E::BlendFactorNeedsBlendConstant { .. } => (
+            ProviderErrorClass::Capability,
+            "blend_constant_unsupported",
+        ),
+        E::BlendFactorDualSourceUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "blend_dual_source_unsupported",
         ),
         E::DrawVertexCountMismatch { .. } => {
             (ProviderErrorClass::Capability, "draw_shape_unsupported")
@@ -9325,8 +9747,18 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Args,
             "trace_contract_invalid",
         ),
-        E::ViewportExtentMismatch { .. }
-        | E::ScissorOutOfBounds { .. }
+        E::RenderAttachmentExtentMismatch { .. } => (
+            ProviderErrorClass::Args,
+            // The same slug both rails' own extent gate states
+            // (`research/docs/23` §3.1, v100): the contract's rule and the
+            // rails' are one rule, so they answer with one name.
+            "render_attachment_extent_mismatch",
+        ),
+        E::BlendFactorSlotUnsupported { .. } => (
+            ProviderErrorClass::Args,
+            "blend_factor_slot_unsupported",
+        ),
+        E::ScissorOutOfBounds { .. }
         | E::BaseVertexRequiresIndices { .. }
         | E::SingleSampleMultisampleState
         | E::MultisampleWithoutColorAttachment
@@ -10874,13 +11306,40 @@ pub enum ContractError {
     /// the sample is undefined and the filter is refused instead of silently
     /// degrading to sample zero.
     StencilResolveWithoutDepthResolve,
-    ViewportOriginUnsupported {
-        origin: [u32; 2],
+    /// The pass's declared viewport reaches outside the raster its attachments
+    /// open (`research/docs/23` §3.1, v100).
+    ///
+    /// The rect is refused rather than clipped because the class proves the
+    /// NDC-to-framebuffer transform over an exact raster: a rect that reaches
+    /// outside would make the two APIs' render-area clipping the thing under
+    /// test. `viewport` is the declared `[origin_x, origin_y, width, height]`
+    /// and `attachment` the raster extent the rule measured it against (the
+    /// colour extent, or the depth-only pass's own surface).
+    ViewportOutsideAttachment {
+        viewport: [u32; 4],
+        attachment: [u64; 2],
     },
-    /// The pass's scissor rectangle is empty or reaches outside the viewport.
+    /// The pass's colour attachments do not share one extent
+    /// (`research/docs/23` §3.1, v100).
+    ///
+    /// The colour list is what defines the pass's raster, so two locations of
+    /// different extents have no single framebuffer either rail could open —
+    /// and no viewport that is inside both. `attachment` is the position that
+    /// disagreed, `extent` its own extent and `first` the extent location 0
+    /// stated.
+    RenderAttachmentExtentMismatch {
+        attachment: usize,
+        extent: [u64; 2],
+        first: [u64; 2],
+    },
+    /// The pass's scissor rectangle is empty or reaches outside the raster.
+    ///
+    /// The rectangle is framebuffer state (`research/docs/23` §3.1, v100), so
+    /// it is held to the attachment's own extent rather than to the viewport;
+    /// `attachment` carries the extent the rule measured it against.
     ScissorOutOfBounds {
         scissor: [u32; 4],
-        viewport: [u32; 2],
+        attachment: [u64; 2],
     },
     /// The pass declares a base vertex but no index buffer to add it to
     /// (`research/docs/23` §3.3, v34).
@@ -10892,7 +11351,7 @@ pub enum ContractError {
     UnsupportedDepthFormat(DepthFormat),
     /// The pass's depth attachment extent does not match the colour raster.
     DepthExtentMismatch {
-        viewport: [u32; 2],
+        raster: [u64; 2],
         depth: [u64; 2],
     },
     /// The pass declares depth state but carries no depth attachment
@@ -10903,7 +11362,7 @@ pub enum ContractError {
     UnsupportedStencilFormat(StencilFormat),
     /// The pass's stencil attachment extent does not match the colour raster.
     StencilExtentMismatch {
-        viewport: [u32; 2],
+        raster: [u64; 2],
         stencil: [u64; 2],
     },
     /// The pass declares stencil state but carries no stencil attachment
@@ -10933,9 +11392,32 @@ pub enum ContractError {
         blend: usize,
         attachments: usize,
     },
-    ViewportExtentMismatch {
-        viewport: [u32; 2],
-        attachment: [u64; 2],
+    /// A blend factor reads the encoder's blend constant
+    /// (`research/docs/23` §3.3, v100), which this pass does not carry.
+    ///
+    /// `location` is the colour attachment the entry describes and `slot` the
+    /// factor's own parameter, so the refusal names the field to fix rather
+    /// than the factor alone. `factor` is the value that was stated.
+    BlendFactorNeedsBlendConstant {
+        location: usize,
+        slot: BlendFactorSlot,
+        factor: BlendFactor,
+    },
+    /// A blend factor reads the fragment shader's second colour output
+    /// (`research/docs/23` §3.3, v100), which the reviewed stages do not
+    /// declare. `location` is the colour attachment and `slot` the factor's
+    /// parameter.
+    BlendFactorDualSourceUnsupported {
+        location: usize,
+        slot: BlendFactorSlot,
+        factor: BlendFactor,
+    },
+    /// A blend factor is stated in one of the two destination slots, where the
+    /// two APIs do not define it (`research/docs/23` §3.3, v100).
+    BlendFactorSlotUnsupported {
+        location: usize,
+        slot: BlendFactorSlot,
+        factor: BlendFactor,
     },
     DrawVertexCountMismatch {
         expected: u32,
@@ -11676,13 +12158,28 @@ impl fmt::Display for ContractError {
                 "the depthResolvedSample stencil resolve names the sample the depth resolve \
                  selected, so the pass has to state a depth resolve beside it",
             ),
-            Self::ViewportOriginUnsupported { origin } => write!(
+            Self::ViewportOutsideAttachment {
+                viewport,
+                attachment,
+            } => write!(
                 formatter,
-                "viewport origin {origin:?} is outside the first render increment's (0, 0)"
+                "viewport [origin_x, origin_y, width, height] {viewport:?} is not inside the \
+                 pass's attachment extent {attachment:?}"
             ),
-            Self::ScissorOutOfBounds { scissor, viewport } => write!(
+            Self::RenderAttachmentExtentMismatch {
+                attachment,
+                extent,
+                first,
+            } => write!(
                 formatter,
-                "the scissor {scissor:?} is empty or reaches outside the viewport {viewport:?}"
+                "colour attachment {attachment} has extent {extent:?}, and the pass's raster is \
+                 the extent its first colour attachment stated {first:?}: one framebuffer cannot \
+                 carry two extents"
+            ),
+            Self::ScissorOutOfBounds { scissor, attachment } => write!(
+                formatter,
+                "the scissor {scissor:?} is empty or reaches outside the attachment extent \
+                 {attachment:?}"
             ),
             Self::BaseVertexRequiresIndices { base_vertex } => write!(
                 formatter,
@@ -11693,9 +12190,9 @@ impl fmt::Display for ContractError {
                 formatter,
                 "depth format {format:?} is not one this increment admits"
             ),
-            Self::DepthExtentMismatch { viewport, depth } => write!(
+            Self::DepthExtentMismatch { raster, depth } => write!(
                 formatter,
-                "depth attachment extent {depth:?} does not match the colour raster {viewport:?}"
+                "depth attachment extent {depth:?} does not match the pass's raster {raster:?}"
             ),
             Self::DepthTestWithoutAttachment => write!(
                 formatter,
@@ -11712,9 +12209,9 @@ impl fmt::Display for ContractError {
                 formatter,
                 "stencil format {format:?} is not one this increment admits"
             ),
-            Self::StencilExtentMismatch { viewport, stencil } => write!(
+            Self::StencilExtentMismatch { raster, stencil } => write!(
                 formatter,
-                "stencil attachment extent {stencil:?} does not match the colour raster {viewport:?}"
+                "stencil attachment extent {stencil:?} does not match the pass's raster {raster:?}"
             ),
             Self::StencilTestWithoutAttachment => write!(
                 formatter,
@@ -11733,12 +12230,35 @@ impl fmt::Display for ContractError {
                 formatter,
                 "the blend list carries {blend} entries for {attachments} colour attachments"
             ),
-            Self::ViewportExtentMismatch {
-                viewport,
-                attachment,
+            Self::BlendFactorNeedsBlendConstant {
+                location,
+                slot,
+                factor,
             } => write!(
                 formatter,
-                "viewport extent {viewport:?} does not cover attachment extent {attachment:?}"
+                "colour attachment {location}'s {} blend factor {factor:?} reads the blend \
+                 constant, which this pass does not carry",
+                slot.name()
+            ),
+            Self::BlendFactorDualSourceUnsupported {
+                location,
+                slot,
+                factor,
+            } => write!(
+                formatter,
+                "colour attachment {location}'s {} blend factor {factor:?} reads the fragment \
+                 shader's second colour output, which the reviewed stages do not declare",
+                slot.name()
+            ),
+            Self::BlendFactorSlotUnsupported {
+                location,
+                slot,
+                factor,
+            } => write!(
+                formatter,
+                "colour attachment {location}'s {} blend factor {factor:?} is not one the two \
+                 APIs define in a destination slot",
+                slot.name()
             ),
             Self::DrawVertexCountMismatch { expected, actual } => write!(
                 formatter,
@@ -17662,34 +18182,294 @@ mod tests {
     }
 
     #[test]
-    fn render_pass_refuses_a_viewport_that_is_not_the_attachment_extent() {
+    fn render_pass_admits_a_viewport_inside_the_attachment_and_refuses_one_that_reaches_out() {
+        // v100: the viewport is a rect *inside* the raster rather than the
+        // covering default. A smaller rect, and one with an origin, are the
+        // increment's own shape: the texels the rect does not cover keep the
+        // load op's bytes.
         let mut pass = render_pass();
+        pass.viewport = [1, 0, 1, 2];
+        pass.validate()
+            .expect("a rect inside the attachment is the increment's shape");
+        pass.viewport = [1, 1, 1, 1];
+        pass.validate()
+            .expect("an offset rect one texel wide is inside the attachment");
+        pass.viewport = [0, 0, 2, 2];
+        pass.validate()
+            .expect("the covering default stays the shape every earlier pass stated");
+
+        // A rect that reaches outside the raster is refused by name, with the
+        // extent the rule measured it against.
         pass.viewport = [1, 0, 2, 2];
         assert_eq!(
             pass.validate(),
-            Err(ContractError::ViewportOriginUnsupported { origin: [1, 0] })
+            Err(ContractError::ViewportOutsideAttachment {
+                viewport: [1, 0, 2, 2],
+                attachment: [2, 2],
+            })
         );
         pass.viewport = [0, 0, 4, 2];
         assert_eq!(
             pass.validate(),
-            Err(ContractError::ViewportExtentMismatch {
-                viewport: [4, 2],
+            Err(ContractError::ViewportOutsideAttachment {
+                viewport: [0, 0, 4, 2],
                 attachment: [2, 2],
             })
         );
         assert_eq!(
-            contract_error_refusal(ContractError::ViewportOriginUnsupported { origin: [1, 0] })
-                .slug,
-            "viewport_origin_unsupported"
-        );
-        assert_eq!(
-            contract_error_refusal(ContractError::ViewportExtentMismatch {
-                viewport: [4, 2],
+            contract_error_refusal(ContractError::ViewportOutsideAttachment {
+                viewport: [0, 0, 4, 2],
                 attachment: [2, 2],
             })
             .slug,
-            "trace_contract_invalid"
+            "viewport_extent_unsupported"
         );
+    }
+
+    #[test]
+    fn render_pass_holds_the_scissor_to_the_attachment_rather_than_the_viewport() {
+        // v100: the scissor is framebuffer state in both APIs, so a rect that
+        // covers texels the viewport does not reach is admitted — those texels
+        // are never rasterized — while one that reaches outside the attachment
+        // keeps the v29 refusal.
+        let mut pass = render_pass();
+        pass.viewport = [1, 1, 1, 1];
+        pass.scissor = Some([0, 0, 2, 2]);
+        pass.validate()
+            .expect("the scissor is held to the attachment, not to the viewport");
+        pass.scissor = Some([1, 1, 2, 2]);
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::ScissorOutOfBounds {
+                scissor: [1, 1, 2, 2],
+                attachment: [2, 2],
+            })
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_colour_attachments_that_disagree_about_the_raster() {
+        // v100 decoupled the viewport from the attachment extent, so the rule
+        // that the colour list defines one framebuffer is now the contract's
+        // own: two locations of different extents have no rect that is inside
+        // both.
+        let mut pass = render_pass();
+        pass.color_attachments.push(RenderAttachment {
+            view_id: ViewId::new(21),
+            allocation_id: AllocationId::new(31),
+            format: AttachmentFormat::Rgba8Unorm,
+            width: 3,
+            height: 2,
+            load: LoadOp::Clear(ClearColor::new([0xfe; 4])),
+            store: StoreOp::Store,
+        });
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::RenderAttachmentExtentMismatch {
+                attachment: 1,
+                extent: [3, 2],
+                first: [2, 2],
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::RenderAttachmentExtentMismatch {
+                attachment: 1,
+                extent: [3, 2],
+                first: [2, 2],
+            })
+            .slug,
+            "render_attachment_extent_mismatch"
+        );
+    }
+
+    #[test]
+    fn render_pass_refuses_the_blend_families_it_cannot_execute() {
+        let mut pass = render_pass();
+        let entry = |factor: BlendFactor| BlendAttachment {
+            enabled: true,
+            source_rgb: factor,
+            destination_rgb: BlendFactor::One,
+            source_alpha: BlendFactor::One,
+            destination_alpha: BlendFactor::Zero,
+            operation: BlendOperation::Add,
+            alpha_operation: BlendOperation::Add,
+            write_mask: ColorWriteMask::ALL,
+        };
+        // The blend constant is encoder state this pass does not carry.
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![entry(BlendFactor::BlendColor)],
+        });
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::BlendFactorNeedsBlendConstant {
+                location: 0,
+                slot: BlendFactorSlot::SourceRgb,
+                factor: BlendFactor::BlendColor,
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::BlendFactorNeedsBlendConstant {
+                location: 0,
+                slot: BlendFactorSlot::SourceRgb,
+                factor: BlendFactor::BlendColor,
+            })
+            .slug,
+            "blend_constant_unsupported"
+        );
+        // The second colour output is state the reviewed stages do not declare.
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![entry(BlendFactor::Source1Alpha)],
+        });
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::BlendFactorDualSourceUnsupported {
+                location: 0,
+                slot: BlendFactorSlot::SourceRgb,
+                factor: BlendFactor::Source1Alpha,
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::BlendFactorDualSourceUnsupported {
+                location: 0,
+                slot: BlendFactorSlot::SourceRgb,
+                factor: BlendFactor::Source1Alpha,
+            })
+            .slug,
+            "blend_dual_source_unsupported"
+        );
+        // `SourceAlphaSaturated` is a source factor only in both APIs, so the
+        // two destination slots refuse it by name.
+        let mut destination = entry(BlendFactor::One);
+        destination.destination_alpha = BlendFactor::SourceAlphaSaturated;
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![destination],
+        });
+        assert_eq!(
+            pass.validate(),
+            Err(ContractError::BlendFactorSlotUnsupported {
+                location: 0,
+                slot: BlendFactorSlot::DestinationAlpha,
+                factor: BlendFactor::SourceAlphaSaturated,
+            })
+        );
+        assert_eq!(
+            contract_error_refusal(ContractError::BlendFactorSlotUnsupported {
+                location: 0,
+                slot: BlendFactorSlot::DestinationAlpha,
+                factor: BlendFactor::SourceAlphaSaturated,
+            })
+            .slug,
+            "blend_factor_slot_unsupported"
+        );
+        // And the source slot admits it.
+        let mut source = entry(BlendFactor::SourceAlphaSaturated);
+        source.destination_rgb = BlendFactor::OneMinusSourceColor;
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![source],
+        });
+        pass.validate()
+            .expect("sourceAlphaSaturated is a source factor in both APIs");
+    }
+
+    #[test]
+    fn render_pass_carries_a_write_mask_that_is_not_part_of_the_blend() {
+        // The mask is four channel bits and nothing else, in Metal's
+        // alpha-first order: the type holds that shape, so a wire code with a
+        // fifth bit never reaches a pass.
+        assert_eq!(ColorWriteMask::from_bits(0x1f), None);
+        assert_eq!(ColorWriteMask::from_bits(0x0f), Some(ColorWriteMask::ALL));
+        assert_eq!(ColorWriteMask::RED.bits(), 1 << 3);
+        assert_eq!(ColorWriteMask::ALPHA.bits(), 1 << 0);
+        assert!(ColorWriteMask::ALL.writes(ColorWriteMask::GREEN));
+        assert!(!ColorWriteMask::NONE.writes(ColorWriteMask::GREEN));
+
+        let mut pass = render_pass();
+        // A disabled entry still states its mask — the mask is not part of the
+        // blend in either API — and its factors are carried and unused: a
+        // factor that cannot reach a pixel cannot refuse the pass it sits in,
+        // which is Metal's own reading of the flag.
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![BlendAttachment {
+                enabled: false,
+                source_rgb: BlendFactor::BlendColor,
+                destination_rgb: BlendFactor::Source1Color,
+                source_alpha: BlendFactor::One,
+                destination_alpha: BlendFactor::Zero,
+                operation: BlendOperation::Add,
+                alpha_operation: BlendOperation::Add,
+                write_mask: ColorWriteMask::RED,
+            }],
+        });
+        pass.validate()
+            .expect("a masked attachment that does not blend is the shape the mask exists for");
+    }
+
+    #[test]
+    fn render_pass_keeps_the_v40_blend_shape_admitted() {
+        let mut pass = render_pass();
+        pass.blend = Some(RenderPassBlend {
+            attachments: vec![BlendAttachment {
+                enabled: true,
+                source_rgb: BlendFactor::SourceAlpha,
+                destination_rgb: BlendFactor::OneMinusSourceAlpha,
+                source_alpha: BlendFactor::One,
+                destination_alpha: BlendFactor::Zero,
+                operation: BlendOperation::Add,
+                alpha_operation: BlendOperation::Add,
+                write_mask: ColorWriteMask::ALL,
+            }],
+        });
+        pass.validate()
+            .expect("the v40 shape is the increment's own shape, one field wider");
+        assert_eq!(BlendFactor::SourceAlpha.code(), 2);
+        assert_eq!(BlendFactor::from_code(2), Some(BlendFactor::SourceAlpha));
+        assert_eq!(BlendFactor::from_code(4), Some(BlendFactor::SourceColor));
+        assert_eq!(BlendFactor::from_code(19), None);
+        assert_eq!(BlendOperation::Subtract.code(), 1);
+        assert_eq!(BlendOperation::from_code(5), None);
+        assert_eq!(BlendFactor::NEEDS_BLEND_CONSTANT.len(), 4);
+        assert_eq!(BlendFactor::DUAL_SOURCE.len(), 4);
+        assert!(BlendFactor::BlendAlpha.needs_blend_constant());
+        assert!(BlendFactor::OneMinusSource1Alpha.is_dual_source());
+        assert!(BlendFactorSlot::DestinationRgb.is_destination());
+        assert!(!BlendFactorSlot::SourceRgb.is_destination());
+        assert_eq!(
+            BlendFactorSlot::DestinationAlpha.name(),
+            "destination alpha"
+        );
+    }
+
+    #[test]
+    fn render_pass_displays_the_new_viewport_and_blend_refusals() {
+        let outside = ContractError::ViewportOutsideAttachment {
+            viewport: [1, 0, 2, 2],
+            attachment: [2, 2],
+        };
+        assert!(outside.to_string().contains("is not inside"));
+        let mismatch = ContractError::RenderAttachmentExtentMismatch {
+            attachment: 1,
+            extent: [3, 2],
+            first: [2, 2],
+        };
+        assert!(mismatch.to_string().contains("one framebuffer cannot"));
+        let constant = ContractError::BlendFactorNeedsBlendConstant {
+            location: 0,
+            slot: BlendFactorSlot::SourceRgb,
+            factor: BlendFactor::BlendColor,
+        };
+        assert!(constant.to_string().contains("blend constant"));
+        let dual = ContractError::BlendFactorDualSourceUnsupported {
+            location: 0,
+            slot: BlendFactorSlot::SourceRgb,
+            factor: BlendFactor::Source1Alpha,
+        };
+        assert!(dual.to_string().contains("second colour output"));
+        let slot = ContractError::BlendFactorSlotUnsupported {
+            location: 0,
+            slot: BlendFactorSlot::DestinationAlpha,
+            factor: BlendFactor::SourceAlphaSaturated,
+        };
+        assert!(slot.to_string().contains("destination alpha"));
     }
 
     #[test]
