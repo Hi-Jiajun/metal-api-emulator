@@ -7085,6 +7085,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }

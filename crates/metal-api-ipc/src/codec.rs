@@ -154,6 +154,21 @@ pub enum CodecError {
     /// know. The word is 16 bits wide since v43, when the narrow byte ran out
     /// of free bits; the low byte keeps the meanings it always had.
     UnknownRenderFeature(u16),
+    /// A sampled-texture render pass declared more textures than the contract's
+    /// own cap (`research/docs/23` §3.3, v70). The block's count is one byte,
+    /// so this is the protocol's bound; the contract refuses anything above
+    /// [`metal_api_core::provider::MAX_RENDER_TEXTURES`] before a frame is
+    /// written.
+    RenderTextureCount {
+        count: usize,
+        maximum: usize,
+    },
+    /// A capability snapshot declared more render-pass sampling formats than
+    /// the protocol bound (`research/docs/23` §3.3, v70).
+    RenderTextureFormatCount {
+        count: usize,
+        maximum: usize,
+    },
     /// A wide feature that describes the depth attachment arrived without one.
     /// The store action and the identity are properties *of* the depth
     /// attachment, so either bit without the depth section names a surface the
@@ -284,6 +299,14 @@ impl fmt::Display for CodecError {
             Self::UnknownRenderFeature(features) => write!(
                 formatter,
                 "unknown extended render pass feature bits {features:#06x}"
+            ),
+            Self::RenderTextureCount { count, maximum } => write!(
+                formatter,
+                "render pass binds {count} sampled textures, maximum {maximum}"
+            ),
+            Self::RenderTextureFormatCount { count, maximum } => write!(
+                formatter,
+                "capability snapshot names {count} render texture formats, maximum {maximum}"
             ),
             Self::DepthFeatureWithoutAttachment(features) => write!(
                 formatter,

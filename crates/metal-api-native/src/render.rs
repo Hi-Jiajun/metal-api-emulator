@@ -54,7 +54,7 @@ use metal_api_core::provider::{
     IndexFormat, IndirectCommandDescriptor, LoadOp, PipelineId, PresentDescriptor, PresentMode,
     ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
     RenderPassDescriptor, RenderPipelineContract, SampleCount, StencilResolveFilter, StencilTest,
-    StoreOp, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
+    StoreOp, TextureFormat, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
@@ -416,6 +416,15 @@ pub(crate) struct RenderCapabilityBits {
     pub(crate) max_color_attachments: u32,
     pub(crate) max_attachment_dimension: [u64; 2],
     pub(crate) supported_color_formats: Vec<AttachmentFormat>,
+    /// Render-sampler bits, declared next to the render bits for the same
+    /// reason: the snapshot and the rail cannot disagree about what this
+    /// provider samples (`research/docs/23` §3.3, v70). The three fields come
+    /// from [`render_texture_capability_bits`], so their flip condition is one
+    /// observation rather than a second set of inline literals that could
+    /// drift from the comment.
+    pub(crate) supports_render_texture_sampling: bool,
+    pub(crate) max_render_textures: u32,
+    pub(crate) supported_render_texture_formats: Vec<TextureFormat>,
     /// Present bits, declared next to the render bits for the same reason: the
     /// snapshot and the rail cannot disagree about what this provider runs.
     /// The four fields come from [`present_capability_bits`], so their flip
@@ -471,6 +480,15 @@ pub(crate) fn capability_bits() -> RenderCapabilityBits {
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
         max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
+        // The render-sampler bits are ship-fail-closed (`research/docs/23`
+        // §3.3, v70): the contract and the wire carry them, and the encoder
+        // turns them on in the increment that executes the shape. Until then
+        // a texture-bearing pass is refused during admission with
+        // `render_texture_input_unsupported` instead of being executed with a
+        // cleared sampling result the trace did not ask for.
+        supports_render_texture_sampling: false,
+        max_render_textures: 0,
+        supported_render_texture_formats: Vec::new(),
         supports_presentation: present.supports_presentation,
         max_present_targets: present.max_present_targets,
         supported_present_modes: present.supported_present_modes,
@@ -3912,6 +3930,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }
@@ -5173,6 +5192,14 @@ mod tests {
             depth_resolve_modes: 0,
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            // The test snapshot spells the pre-flip shape out for the same
+            // reason the multisample pair above does: a test constructs the
+            // "cannot sample render-side textures" declaration and asserts
+            // core admission refuses the texture-bearing pass
+            // (`research/docs/23` §3.3, v70).
+            supports_render_texture_sampling: false,
+            max_render_textures: 0,
+            supported_render_texture_formats: Vec::new(),
             supports_presentation: bits.supports_presentation,
             max_present_targets: bits.max_present_targets,
             supported_present_modes: bits.supported_present_modes.clone(),
@@ -5316,6 +5343,7 @@ mod tests {
                 format: IndexFormat::Uint16,
             }),
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }

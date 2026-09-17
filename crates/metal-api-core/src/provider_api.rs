@@ -25,8 +25,8 @@ use crate::provider::{
     PresentDescriptor, PresentMode, PresentTarget, ProviderCapabilities, ProviderError,
     ProviderHealth, ProviderSubmission, RenderAttachment, RenderPassDescriptor,
     ResourceTableSnapshot, StorageMode, StoreOp, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
-    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS,
-    PROVIDER_SCHEMA_VERSION,
+    MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_RENDER_TEXTURES, MAX_SERIAL_RESOURCES,
+    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
 };
 use crate::{ApiError, CommandBufferStatus, Size};
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,6 +94,18 @@ pub enum Error {
     /// An index buffer is already bound. One pass draws through one index
     /// buffer, exactly as its descriptor holds one `indices` binding.
     IndexBufferAlreadyBound,
+    /// One texture binding index holds two textures, so the pass's positional
+    /// binding order would name two sampled surfaces for one binding
+    /// (`research/docs/23` §3.3, v70).
+    FragmentTextureAlreadyBound {
+        index: u32,
+    },
+    /// A texture binding index is at or past [`MAX_RENDER_TEXTURES`], which is
+    /// the cap the pass's own descriptor carries.
+    FragmentTextureIndexOutOfRange {
+        index: u32,
+        maximum: usize,
+    },
     /// A vertex-buffer draw has no stream bound. The `vertex_id`-only shape is
     /// [`RenderCommandEncoder::draw_render_pass`], which binds no input at all.
     MissingVertexBuffer,
@@ -101,10 +113,11 @@ pub enum Error {
     /// it selects through.
     MissingIndexBuffer,
     /// An indirect replay supplies its own draw input, but the encoder bound
-    /// streams or an index buffer for a direct draw.
+    /// streams, an index buffer or a sampled texture for a direct draw.
     IndirectReplayInputConflict {
         vertex_buffers: usize,
         index_buffer: bool,
+        fragment_textures: usize,
     },
     /// A multi-attachment draw recorded no colour attachments, so the pass it
     /// would become has no target for any fragment output to land in — and no
@@ -179,6 +192,13 @@ impl fmt::Display for Error {
             Self::IndexBufferAlreadyBound => {
                 f.write_str("an index buffer is already bound on this encoder")
             }
+            Self::FragmentTextureAlreadyBound { index } => {
+                write!(f, "fragment texture binding {index} is bound twice")
+            }
+            Self::FragmentTextureIndexOutOfRange { index, maximum } => write!(
+                f,
+                "fragment texture binding {index} is past the {maximum}-texture limit"
+            ),
             Self::MissingVertexBuffer => f.write_str(
                 "a vertex-buffer draw needs a bound vertex stream; the vertex_id-only shape is \
                  draw_render_pass",
@@ -189,6 +209,7 @@ impl fmt::Display for Error {
             Self::IndirectReplayInputConflict {
                 vertex_buffers,
                 index_buffer,
+                fragment_textures,
             } => {
                 write!(
                     f,
@@ -197,6 +218,9 @@ impl fmt::Display for Error {
                 )?;
                 if *index_buffer {
                     f.write_str(" and an index buffer")?;
+                }
+                if *fragment_textures != 0 {
+                    write!(f, " and {fragment_textures} sampled texture(s)")?;
                 }
                 Ok(())
             }
@@ -620,6 +644,11 @@ struct RenderTarget {
     scissor: Option<[u32; 4]>,
     present: Option<PresentInitial>,
     draw: RenderDraw,
+    /// The sampled textures the pass's fragment stage reads, in binding order
+    /// (`research/docs/23` §3.3, v70). The recording takes the encoder's own
+    /// bindings at record time; the bytes they carry are the snapshot the
+    /// texture declaration took, exactly as a compute binding's are.
+    textures: Vec<contract::TextureView>,
 }
 
 /// One vertex stream a recorded draw reads: the encoder's own view plus the
@@ -1016,6 +1045,11 @@ impl RenderTarget {
             indices,
             base_vertex: self.draw.base_vertex,
             instance_count: self.draw.instance_count,
+            // The fragment stage's sampled textures travel with the recording
+            // (`research/docs/23` §3.3, v70): the encoder's own bindings, in
+            // ascending binding order, each carrying the bytes its declaration
+            // snapshotted.
+            textures: self.textures.clone(),
             present,
         };
         descriptor.validate()?;
@@ -1633,7 +1667,12 @@ enum RecordedPass {
     },
     Render {
         pipeline: RenderPipeline,
-        target: RenderTarget,
+        /// Boxed for the same reason [`ComputeTrace::heap`] is: the recorded
+        /// render pass carries the whole pass contract, and a per-increment
+        /// section ([`RenderTarget::textures`] is v70's) would otherwise grow
+        /// every recorded pass, compute ones included
+        /// (`research/docs/23` §3.3).
+        target: Box<RenderTarget>,
     },
 }
 struct CommandInner {
@@ -1757,6 +1796,7 @@ impl CommandBuffer {
             scissor: None,
             vertex_buffers: BTreeMap::new(),
             index_buffer: None,
+            fragment_textures: BTreeMap::new(),
         })
     }
 
@@ -2403,6 +2443,10 @@ pub struct RenderCommandEncoder {
     /// The one index buffer this encoder draws through, with the width of the
     /// indices it holds.
     index_buffer: Option<(BufferView, IndexFormat)>,
+    /// The sampled textures the fragment stage reads, by binding index
+    /// (`research/docs/23` §3.3, v70). Like the vertex streams, a binding is
+    /// direct-draw state that travels with the pass the draw records.
+    fragment_textures: BTreeMap<u32, Texture>,
     /// The scissor rectangle every pass recorded afterwards clips to, or `None`
     /// for the whole attachment (`research/docs/23` §3.3, v29/v30). Like
     /// Metal's own encoder state it applies to the draws that follow the call.
@@ -2496,6 +2540,43 @@ impl RenderCommandEncoder {
             return Err(Error::IndexBufferAlreadyBound);
         }
         self.index_buffer = Some((buffer.clone(), format));
+        Ok(())
+    }
+
+    /// Bind one sampled texture the fragment stage reads at `index`
+    /// (`research/docs/23` §3.3, v70).
+    ///
+    /// `index` is the binding the pass's descriptor carries positionally, and
+    /// a texture from another device is [`Error::ForeignTexture`]. A repeated
+    /// index is [`Error::FragmentTextureAlreadyBound`] and an index at or past
+    /// [`MAX_RENDER_TEXTURES`] is
+    /// [`Error::FragmentTextureIndexOutOfRange`], exactly as the vertex
+    /// streams' two refusals spell their own binding.
+    ///
+    /// Like a compute binding, the texture's bytes are not copied here: the
+    /// view the pass carries takes them at commit, under the command's own
+    /// reservations, so a host write between recording and commit is refused
+    /// by the same hazard rule every other binding follows. A binding is
+    /// direct-draw state, so it is refused once an indirect replay has been
+    /// recorded, exactly as [`Self::set_vertex_buffer`] is.
+    pub fn set_fragment_texture(&mut self, index: u32, texture: &Texture) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.indirect {
+            return Err(Error::IndirectDirectConflict);
+        }
+        if !Arc::ptr_eq(&self.shared.owner, &texture.inner.owner) {
+            return Err(Error::ForeignTexture);
+        }
+        if self.fragment_textures.contains_key(&index) {
+            return Err(Error::FragmentTextureAlreadyBound { index });
+        }
+        if usize::try_from(index).unwrap_or(usize::MAX) >= MAX_RENDER_TEXTURES {
+            return Err(Error::FragmentTextureIndexOutOfRange {
+                index,
+                maximum: MAX_RENDER_TEXTURES,
+            });
+        }
+        self.fragment_textures.insert(index, texture.clone());
         Ok(())
     }
 
@@ -3782,6 +3863,15 @@ impl RenderCommandEncoder {
             width,
             height,
             scissor: self.scissor,
+            // The encoder's fragment texture bindings travel with the pass it
+            // records (`research/docs/23` §3.3, v70): the map's ascending keys
+            // are the binding order the descriptor makes positional, and each
+            // view carries the bytes the texture declaration snapshotted.
+            textures: self
+                .fragment_textures
+                .iter()
+                .map(|(binding, texture)| texture.view(*binding))
+                .collect(),
             present,
             draw,
         };
@@ -3829,7 +3919,7 @@ impl RenderCommandEncoder {
         }
         inner.passes.push(RecordedPass::Render {
             pipeline: pipeline.clone(),
-            target,
+            target: Box::new(target),
         });
         if let Some(icb) = indirect {
             inner.indirect = Some(icb.clone());
@@ -3929,10 +4019,14 @@ impl RenderCommandEncoder {
                 })
             }
         };
-        if !self.vertex_buffers.is_empty() || self.index_buffer.is_some() {
+        if !self.vertex_buffers.is_empty()
+            || self.index_buffer.is_some()
+            || !self.fragment_textures.is_empty()
+        {
             return Err(Error::IndirectReplayInputConflict {
                 vertex_buffers: self.vertex_buffers.len(),
                 index_buffer: self.index_buffer.is_some(),
+                fragment_textures: self.fragment_textures.len(),
             });
         }
         if self.draw_count > 0 || self.indirect {

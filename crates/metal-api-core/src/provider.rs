@@ -1267,6 +1267,15 @@ pub enum StoreOp {
 /// of those attachments it can execute today (`docs/23` §4.2).
 pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 
+/// The sampled textures a render pass may bind, which is the render-sampler
+/// shape the fragment stage reads (`research/docs/23` §3.3, v70): one texture
+/// per draw, because the reviewed stage samples exactly one 4×4
+/// `rgba8_unorm` surface. A provider's
+/// `ProviderCapabilities::max_render_textures` stays independent of this
+/// value: the core contract admits the shape, while each rail declares how
+/// many of those bindings it can execute today (`docs/23` §4.2).
+pub const MAX_RENDER_TEXTURES: usize = 1;
+
 /// Vertices in the first milestone's single non-indexed draw: the full-screen
 /// triangle generated from `vertex_id` (`research/docs/23` §1.2).
 pub const FULL_SCREEN_TRIANGLE_VERTICES: u32 = 3;
@@ -1580,6 +1589,46 @@ pub fn validate_vertex_buffer_binding(
             kind: RenderInputKind::VertexBuffer,
             binding: view.metal_binding,
             access: view.access,
+        });
+    }
+    Ok(())
+}
+
+/// Validate one sampled texture bound at `index` (`research/docs/23` §3.3,
+/// v70).
+///
+/// The entry's position in [`RenderPassDescriptor::textures`] is the fragment
+/// texture binding both rails use, so the view's own `metal_binding` has to
+/// agree with it — the same rule [`validate_vertex_buffer_binding`] states for
+/// vertex streams. The render-sampler increment reads, and only reads, a
+/// single-sample surface: a writable binding is a `Storage` access the
+/// reviewed fragment stage has no shape for, and a multisampled one is not a
+/// texel the sampling instruction can reduce on either rail.
+pub fn validate_render_texture_binding(
+    index: usize,
+    texture: &TextureView,
+) -> Result<(), ContractError> {
+    texture.validate_shape()?;
+    let expected = u32::try_from(index).map_err(|_| ContractError::RenderTextureLimitExceeded {
+        requested: index,
+        maximum: MAX_RENDER_TEXTURES,
+    })?;
+    if texture.metal_binding != expected {
+        return Err(ContractError::RenderTextureBindingMismatch {
+            index,
+            metal_binding: texture.metal_binding,
+        });
+    }
+    if texture.access != TextureAccess::Sampled {
+        return Err(ContractError::RenderTextureAccessUnsupported {
+            index,
+            access: texture.access,
+        });
+    }
+    if texture.sample_count != 1 {
+        return Err(ContractError::RenderTextureSampleCountUnsupported {
+            index,
+            sample_count: texture.sample_count,
         });
     }
     Ok(())
@@ -2659,6 +2708,20 @@ pub struct RenderPassDescriptor {
     /// offscreen trace leaves the field `None` and keeps the pre-present bytes
     /// exactly (`docs/24` §4.3).
     pub present: Option<PresentDescriptor>,
+    /// Sampled textures the pass's fragment stage reads, in binding order:
+    /// entry `i` is fragment texture binding `i` (`research/docs/23` §3.3,
+    /// v70).
+    ///
+    /// Each entry is a read-only [`TextureView`] that carries its own bytes,
+    /// so the object API can bind a caller's texture into a trace that has no
+    /// compute pass at all — the same rule the vertex and index streams
+    /// follow. The entry's position is the binding index,
+    /// [`validate_render_texture_binding`] holds the view's own `metal_binding`
+    /// to it, and the first increment caps the list at
+    /// [`MAX_RENDER_TEXTURES`]: the reviewed fragment stage samples exactly
+    /// one single-sample 2D surface. A pass that binds none keeps the exact
+    /// pre-v70 bytes.
+    pub textures: Vec<TextureView>,
 }
 
 impl RenderPassDescriptor {
@@ -2823,6 +2886,53 @@ impl RenderPassDescriptor {
                 && self.depth_resolve.is_none()
             {
                 return Err(ContractError::StencilResolveWithoutDepthResolve);
+            }
+        }
+        // Fragment texture bindings (`research/docs/23` §3.3, v70): the
+        // render-sampler shape is a read-only, single-sample 2D texture whose
+        // position is its binding. The count against the contract's own
+        // ceiling and the view's shape are structural; whether the *device*
+        // admits the format or the count at all stays admission's capability
+        // question (`render_texture_format_unsupported` /
+        // `render_texture_limit`), exactly as the colour formats split
+        // between this validator and `admit_render_passes`.
+        if self.textures.len() > MAX_RENDER_TEXTURES {
+            return Err(ContractError::RenderTextureLimitExceeded {
+                requested: self.textures.len(),
+                maximum: MAX_RENDER_TEXTURES,
+            });
+        }
+        let mut sampled_views = BTreeMap::new();
+        for (index, texture) in self.textures.iter().enumerate() {
+            validate_render_texture_binding(index, texture)?;
+            if sampled_views.insert(texture.view_id, ()).is_some() {
+                return Err(ContractError::DuplicateView(texture.view_id));
+            }
+            // An attachment the pass writes and a texture it samples through
+            // the same view would be one draw reading and writing the same
+            // texels. The rails' execution order cannot express that as
+            // anything but a race, so the pass is refused by name instead of
+            // being run with whichever bytes the driver happens to leave.
+            let attachment_views = self
+                .color_attachments
+                .iter()
+                .map(|attachment| attachment.view_id)
+                .chain(
+                    self.depth
+                        .as_ref()
+                        .and_then(|depth| depth.identity)
+                        .map(|identity| identity.view_id),
+                )
+                .chain(
+                    self.stencil
+                        .as_ref()
+                        .and_then(|stencil| stencil.identity)
+                        .map(|identity| identity.view_id),
+                );
+            if attachment_views.clone().any(|view| view == texture.view_id) {
+                return Err(ContractError::RenderTextureAttachmentConflict {
+                    view: texture.view_id,
+                });
             }
         }
         if self.vertex_buffers.len() > MAX_VERTEX_BUFFERS {
@@ -6390,6 +6500,23 @@ pub struct ProviderCapabilities {
     /// snapshot whose bit above is false, so a caller reading the limit
     /// without checking the bit cannot read one as an admission.
     pub max_render_instances: u32,
+    /// Whether this snapshot can sample a texture from a render pass's
+    /// fragment stage (`research/docs/23` §3.3, v70). Defaults to `false`: no
+    /// provider executes the render sampler today, so a pass that binds a
+    /// texture is refused during admission instead of being executed with a
+    /// cleared sampling result the trace did not ask for.
+    pub supports_render_texture_sampling: bool,
+    /// Sampled textures one render pass may bind. `0` means the snapshot
+    /// cannot sample at all; the field stays at that default for a snapshot
+    /// whose bit above is false, so a caller reading the limit without
+    /// checking the bit cannot read one as an admission.
+    pub max_render_textures: u32,
+    /// Texture formats this snapshot admits as render-pass sampling sources.
+    /// Empty means none; the first render-sampler increment admits
+    /// [`TextureFormat::Rgba8Unorm`]. Compared by value rather than by wire
+    /// code so the contract's own enum is the single vocabulary, exactly as
+    /// [`Self::supported_color_formats`] is.
+    pub supported_render_texture_formats: Vec<TextureFormat>,
     /// Whether this snapshot can execute the present action of
     /// `research/docs/24`. Defaults to `false` everywhere: Step 2 publishes the
     /// contract and the refusals, while the Vulkan "readable swapchain
@@ -6465,6 +6592,7 @@ impl ProviderCapabilities {
             || self.declares_multisample_support()
             || self.declares_depth_resolve_support()
             || self.declares_stencil_resolve_support()
+            || self.declares_render_texture_support()
     }
 
     /// Whether any vertex-input bit differs from its default. Part of the
@@ -6514,6 +6642,18 @@ impl ProviderCapabilities {
     /// would be lost on the wire.
     pub fn declares_stencil_resolve_support(&self) -> bool {
         self.supports_render_stencil_resolve || self.stencil_resolve_modes != 0
+    }
+
+    /// Whether any render-sampler bit differs from its default. Part of the
+    /// render bits for the same reason
+    /// [`ProviderCapabilities::declares_depth_resolve_support`] is: a snapshot
+    /// that declared render texture sampling without declaring render would
+    /// otherwise keep sending the legacy capability payload, and the three
+    /// bits would be lost on the wire.
+    pub fn declares_render_texture_support(&self) -> bool {
+        self.supports_render_texture_sampling
+            || self.max_render_textures != 0
+            || !self.supported_render_texture_formats.is_empty()
     }
 
     /// Whether any present bit differs from its default.
@@ -6583,7 +6723,15 @@ impl ProviderCapabilities {
         // compute-only trace never enters the walk (`docs/23` §4.2).
         self.admit_render_passes(trace)?;
 
-        // Present admission is the second gate and sits just as early
+        // Render texture admission is the second render gate and sits in the
+        // same walk (`research/docs/23` §3.3, v70): a pass that binds a
+        // sampled texture is refused here — bit, count, then format — instead
+        // of being executed with a cleared sampling result the trace did not
+        // ask for. The pass's own access/shape rules already ran in
+        // `trace.validate()` above.
+        self.admit_render_texture_inputs(trace)?;
+
+        // Present admission is the next gate and sits just as early
         // (`research/docs/24` §4.2): Step 2 publishes the contract and the
         // refusal, Step 3 owns execution, so a snapshot that cannot present
         // refuses a present-bearing trace before any resource action instead of
@@ -7053,6 +7201,58 @@ impl ProviderCapabilities {
         Ok(())
     }
 
+    /// Render texture admission, the second render gate (`research/docs/23`
+    /// §3.3, v70).
+    ///
+    /// The order repeats [`Self::admit_render_passes`]'s deliberate choice:
+    /// the bit a snapshot answers on its own comes first, then the count, then
+    /// the per-texture format. A trace whose render passes bind no sampled
+    /// texture never enters the walk, so every pre-v70 trace keeps the
+    /// admission path it had.
+    ///
+    /// The pass's own shape rules — the binding label, the read-only access
+    /// and the single-sample requirement — already ran in `trace.validate()`,
+    /// which is why this gate only answers what the snapshot knows: whether it
+    /// samples render-side textures at all, how many it admits, and in which
+    /// formats.
+    fn admit_render_texture_inputs(&self, trace: &ComputeTrace) -> Result<(), ProviderError> {
+        for (pass_index, entry) in trace.passes.iter().enumerate() {
+            let Some(pass) = entry.as_render() else {
+                continue;
+            };
+            if pass.textures.is_empty() {
+                continue;
+            }
+            if !self.supports_render_texture_sampling {
+                return Err(capability_error("render_texture_input_unsupported")
+                    .with_field("pass", FieldValue::Unsigned(pass_index as u64))
+                    .with_field("textures", FieldValue::Unsigned(pass.textures.len() as u64)));
+            }
+            if pass.textures.len() > self.max_render_textures as usize {
+                return Err(capability_error("render_texture_limit")
+                    .with_field(
+                        "requested",
+                        FieldValue::Unsigned(pass.textures.len() as u64),
+                    )
+                    .with_field(
+                        "maximum",
+                        FieldValue::Unsigned(self.max_render_textures as u64),
+                    ));
+            }
+            for texture in &pass.textures {
+                if !self
+                    .supported_render_texture_formats
+                    .contains(&texture.format)
+                {
+                    return Err(capability_error("render_texture_format_unsupported")
+                        .with_field("view", FieldValue::Unsigned(texture.view_id.get()))
+                        .with_field("format", FieldValue::Text(format!("{:?}", texture.format))));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Present admission, the second capability gate (`research/docs/24` §4.2).
     ///
     /// The order repeats the render gate's deliberate choice: the bits a
@@ -7357,6 +7557,22 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
             ProviderErrorClass::Capability,
             "render_input_access_unsupported",
         ),
+        // Render sampler contract (`research/docs/23` §3.3, v70). The access
+        // and the contract ceiling are the same first-increment narrowings the
+        // vertex-input bits above are, so they keep their own capability
+        // slugs; the binding label and the read/write conflict are
+        // caller-fixable trace shape.
+        E::RenderTextureAccessUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_access_unsupported",
+        ),
+        E::RenderTextureLimitExceeded { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_limit",
+        ),
+        E::RenderTextureSampleCountUnsupported { .. } => {
+            (ProviderErrorClass::Args, "texture_shape_mismatch")
+        },
         E::EmptyVertexLayout
         | E::ZeroVertexStride { .. }
         | E::EmptyVertexBufferLayout { .. }
@@ -7366,6 +7582,8 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         | E::VertexLayoutBindingMismatch { .. }
         | E::VertexBufferBindingMismatch { .. }
         | E::IndexBufferBindingMismatch { .. }
+        | E::RenderTextureBindingMismatch { .. }
+        | E::RenderTextureAttachmentConflict { .. }
         | E::RenderInputComputeConflict { .. } => (
             ProviderErrorClass::Args,
             "trace_contract_invalid",
@@ -9154,6 +9372,39 @@ pub enum ContractError {
         binding: u32,
         access: BufferAccess,
     },
+    // Render sampler contract (`research/docs/23` §3.3, v70). The count and
+    // the binding label are caller-fixable structure; the access and the
+    // sample count are the shapes the render-sampler increment cannot execute,
+    // so they name the field that disagreed rather than a device fact.
+    /// A render pass declares more sampled textures than
+    /// [`MAX_RENDER_TEXTURES`].
+    RenderTextureLimitExceeded {
+        requested: usize,
+        maximum: usize,
+    },
+    /// A sampled texture's own binding label does not match its position in
+    /// the pass's texture list.
+    RenderTextureBindingMismatch {
+        index: usize,
+        metal_binding: u32,
+    },
+    /// A render texture binding is not the read-only sampling this increment
+    /// executes.
+    RenderTextureAccessUnsupported {
+        index: usize,
+        access: TextureAccess,
+    },
+    /// A render texture binding is multisampled, which the sampling
+    /// instruction both rails use does not read.
+    RenderTextureSampleCountUnsupported {
+        index: usize,
+        sample_count: u64,
+    },
+    /// A render pass samples a view it also writes as an attachment, so the
+    /// draw would read and write the same texels.
+    RenderTextureAttachmentConflict {
+        view: ViewId,
+    },
     /// A compute binding writes bytes the draw reads, so the draw would observe
     /// a value the trace's order does not define.
     RenderInputComputeConflict {
@@ -9772,6 +10023,32 @@ impl fmt::Display for ContractError {
                 formatter,
                 "render {} {binding} is declared {access:?}, but a draw only reads its inputs",
                 kind.name()
+            ),
+            Self::RenderTextureLimitExceeded {
+                requested,
+                maximum,
+            } => write!(
+                formatter,
+                "render pass binds {requested} sampled textures, above the contract maximum {maximum}"
+            ),
+            Self::RenderTextureBindingMismatch {
+                index,
+                metal_binding,
+            } => write!(
+                formatter,
+                "render texture {index} carries binding label {metal_binding}, but its position is its binding"
+            ),
+            Self::RenderTextureAccessUnsupported { index, access } => write!(
+                formatter,
+                "render texture {index} is declared {access:?}, but the fragment stage only samples its textures"
+            ),
+            Self::RenderTextureSampleCountUnsupported { index, sample_count } => write!(
+                formatter,
+                "render texture {index} carries {sample_count} samples, but the fragment stage samples single-sample texels"
+            ),
+            Self::RenderTextureAttachmentConflict { view } => write!(
+                formatter,
+                "render pass samples view {view:?} through a texture binding while writing it as an attachment"
             ),
             Self::RenderInputComputeConflict {
                 pass_index,
@@ -10857,6 +11134,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         })
     }
@@ -11103,6 +11381,9 @@ mod tests {
             depth_resolve_modes: 0,
             supports_render_stencil_resolve: false,
             stencil_resolve_modes: 0,
+            supports_render_texture_sampling: false,
+            max_render_textures: 0,
+            supported_render_texture_formats: Vec::new(),
             supports_presentation: false,
             max_present_targets: 0,
             supported_present_modes: Vec::new(),
@@ -14106,6 +14387,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         }
     }
@@ -15367,6 +15649,7 @@ mod tests {
             vertex_buffers: Vec::new(),
             indices: None,
             instance_count: 1,
+            textures: Vec::new(),
             present: None,
         })
     }
@@ -15766,6 +16049,188 @@ mod tests {
         pool
     }
 
+    /// The one sampled texture a v70 render pass binds (`research/docs/23`
+    /// §3.3, v70): a 4x4 `rgba8_unorm` surface whose sixteen texels are
+    /// pairwise distinct, so a capture that landed one texel twice cannot
+    /// pass the fixture's own comparison.
+    fn sampled_texture_view(binding: u32) -> TextureView {
+        let mut bytes = Vec::with_capacity(64);
+        for y in 0..4u8 {
+            for x in 0..4u8 {
+                bytes.extend_from_slice(&[x, y, x.wrapping_add(y), 0xff]);
+            }
+        }
+        TextureView {
+            view_id: ViewId::new(83),
+            metal_binding: binding,
+            allocation_id: AllocationId::new(53),
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            width: 4,
+            height: 4,
+            depth: 1,
+            array_length: 1,
+            sample_count: 1,
+            access: TextureAccess::Sampled,
+            source: TextureSource::OwnedBytes(bytes),
+        }
+    }
+
+    /// The attachment fixture extended with one sampled texture
+    /// (`research/docs/23` §3.3, v70).
+    fn render_texture_trace() -> ComputeTrace {
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render_entry(&mut value).textures = vec![sampled_texture_view(0)];
+        value
+    }
+
+    /// The render snapshot extended with the three render-sampler bits.
+    fn render_texture_capabilities() -> ProviderCapabilities {
+        let mut provider = render_capabilities();
+        provider.supports_render_texture_sampling = true;
+        provider.max_render_textures = MAX_RENDER_TEXTURES as u32;
+        provider.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        provider
+    }
+
+    #[test]
+    fn render_texture_bits_gate_the_pass_the_count_and_the_format() {
+        let value = render_texture_trace();
+        value.validate().expect("the fixture is structurally valid");
+        assert!(render_texture_capabilities().declares_render_texture_support());
+        // The three bits are part of the render question on purpose: a
+        // snapshot that declared them without declaring render would lose them
+        // on the wire, the failure `declares_render_support` documents.
+        let mut only_render_texture = capabilities();
+        only_render_texture.supports_render_texture_sampling = true;
+        only_render_texture.max_render_textures = 1;
+        assert!(only_render_texture.declares_render_texture_support());
+        assert!(only_render_texture.declares_render_support());
+        assert!(!render_capabilities().declares_render_texture_support());
+
+        render_texture_capabilities()
+            .admit(&value, &landing_resources())
+            .expect("a snapshot that declares the render-sampler bits admits the pass");
+
+        // The bit comes first: a snapshot that samples nothing render-side
+        // refuses the whole pass instead of reading the texture as an image it
+        // never had.
+        let refusal = render_capabilities()
+            .admit(&value, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_input_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+        // Then the declared ceiling, then the per-texture format: each refusal
+        // names the field the snapshot disagreed on.
+        let mut narrow = render_texture_capabilities();
+        narrow.max_render_textures = 0;
+        let refusal = narrow.admit(&value, &landing_resources()).unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_limit");
+        assert_eq!(
+            refusal.fields.get("maximum"),
+            Some(&FieldValue::Unsigned(0))
+        );
+        let mut foreign_format = render_texture_capabilities();
+        foreign_format.supported_render_texture_formats = vec![TextureFormat::Bgra8Unorm];
+        let refusal = foreign_format
+            .admit(&value, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("Rgba8Unorm".to_owned()))
+        );
+
+        // A pass that binds no texture never enters the walk, so every pre-v70
+        // trace keeps the admission path it had.
+        let plain = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render_capabilities()
+            .admit(&plain, &landing_resources())
+            .expect("the pre-v70 pass keeps admitting without the bits");
+    }
+
+    #[test]
+    fn render_texture_bindings_are_positional_read_only_and_single_sample() {
+        // The entry's position is the binding, exactly as a vertex stream's:
+        // a view that carries another label would name a binding the pass does
+        // not have.
+        let mut value = render_texture_trace();
+        render_entry(&mut value).textures = vec![sampled_texture_view(1)];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderTextureBindingMismatch {
+                index: 0,
+                metal_binding: 1,
+            })
+        );
+
+        // A storage binding is the writeback the reviewed fragment stage has
+        // no shape for; the refusal is the same capability class the vertex
+        // and index inputs' read-only rule uses.
+        let mut storage = sampled_texture_view(0);
+        storage.access = TextureAccess::Storage;
+        let mut value = render_texture_trace();
+        render_entry(&mut value).textures = vec![storage];
+        let refusal = value.validate().unwrap_err();
+        let refusal = contract_error_refusal(refusal);
+        assert_eq!(refusal.slug, "render_texture_access_unsupported");
+        assert_eq!(refusal.class, ProviderErrorClass::Capability);
+
+        // A multisampled surface is not a texel the sampling instruction
+        // reduces; the pass states it as such and is refused by shape.
+        let mut multisampled = sampled_texture_view(0);
+        multisampled.texture_type = TextureType::D2Multisample;
+        multisampled.sample_count = 4;
+        // A multisampled view's own byte extent is four times the single
+        // sample's, so the source has to cover it before the shape rule this
+        // case observes is the one that fires.
+        multisampled.source = TextureSource::OwnedBytes(vec![0; 4 * 64]);
+        let mut value = render_texture_trace();
+        render_entry(&mut value).textures = vec![multisampled];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderTextureSampleCountUnsupported {
+                index: 0,
+                sample_count: 4,
+            })
+        );
+
+        // The contract's own ceiling is one texture per pass: the second entry
+        // is refused before either texture's shape is read.
+        let mut value = render_texture_trace();
+        render_entry(&mut value).textures = vec![sampled_texture_view(0), sampled_texture_view(1)];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderTextureLimitExceeded {
+                requested: 2,
+                maximum: MAX_RENDER_TEXTURES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_render_pass_refuses_to_sample_the_view_it_writes() {
+        // The attachment's own view is the one identity a pass cannot sample:
+        // the draw would read and write the same texels, which neither rail's
+        // execution order describes.
+        let mut texture = sampled_texture_view(0);
+        texture.view_id = ViewId::new(7);
+        let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
+        render_entry(&mut value).textures = vec![texture];
+        assert_eq!(
+            value.validate(),
+            Err(ContractError::RenderTextureAttachmentConflict {
+                view: ViewId::new(7),
+            })
+        );
+
+        // The same identity sampled by a pass that does *not* write it is the
+        // legal v70 shape: the rule is about one draw reading and writing one
+        // surface, not about an identity being reused across passes.
+        render_texture_trace()
+            .validate()
+            .expect("sampling a view the pass does not write stays well formed");
+    }
     #[test]
     fn multisample_bits_gate_the_pass() {
         let value = multisample_trace();

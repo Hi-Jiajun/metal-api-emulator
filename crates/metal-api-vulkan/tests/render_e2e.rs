@@ -182,6 +182,7 @@ fn render_pass(
         vertex_buffers: Vec::new(),
         indices: None,
         instance_count: 1,
+        textures: Vec::new(),
         present: None,
     }
 }
@@ -608,6 +609,7 @@ fn dual_attachments_land_both_locations_through_writeback() {
                 vertex_buffers: Vec::new(),
                 indices: None,
                 instance_count: 1,
+                textures: Vec::new(),
                 present: None,
             }),
         ],
@@ -802,6 +804,7 @@ fn a_discarded_attachment_lands_no_writeback_but_the_stored_one_does() {
                 vertex_buffers: Vec::new(),
                 indices: None,
                 instance_count: 1,
+                textures: Vec::new(),
                 present: None,
             }),
         ],

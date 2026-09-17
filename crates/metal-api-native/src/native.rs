@@ -354,6 +354,16 @@ impl NativeMetalProvider {
                 supports_render_stencil_resolve: stencil_resolve_bits
                     .supports_render_stencil_resolve,
                 stencil_resolve_modes: stencil_resolve_bits.stencil_resolve_modes,
+                // The render-sampler bits stay closed until the rail executes
+                // the shape (`research/docs/23` §3.3, v70): the contract and
+                // the wire ship them fail-closed, so a texture-bearing pass is
+                // refused during admission instead of being executed with a
+                // cleared sampling result the trace did not ask for.
+                supports_render_texture_sampling: render_bits.supports_render_texture_sampling,
+                max_render_textures: render_bits.max_render_textures,
+                supported_render_texture_formats: render_bits
+                    .supported_render_texture_formats
+                    .clone(),
                 // The present bits come from the same rail value as the render
                 // bits, so this snapshot cannot claim a present action the rail
                 // does not run (`research/docs/24` §4.2, §6 Step 3).

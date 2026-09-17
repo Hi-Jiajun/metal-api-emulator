@@ -137,6 +137,15 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // (`research/docs/23` §3.3, v60).
         supports_render_stencil_resolve: false,
         stencil_resolve_modes: 0,
+        // The render sampler is ship-fail-closed (`research/docs/23` §3.3,
+        // v70): the contract and the wire carry the three bits, and the rail
+        // turns them on in the increment that executes the shape. Until then
+        // a texture-bearing pass is refused during admission with
+        // `render_texture_input_unsupported` instead of being executed with a
+        // cleared sampling result the trace did not ask for.
+        supports_render_texture_sampling: false,
+        max_render_textures: 0,
+        supported_render_texture_formats: Vec::new(),
         // Presentation is declared: `render.rs` executes the "readable
         // swapchain equivalent" end to end (`research/docs/24` §6 Step 3) — one
         // target, one `Fifo` present, single buffering. Evidence:

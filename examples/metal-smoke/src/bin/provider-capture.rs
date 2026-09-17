@@ -7506,6 +7506,10 @@ fn run_render_case(
         // (`research/docs/23` §3.3, v39).
         cull,
         blend,
+        // The reviewed render-sampler case binds its fragment texture here;
+        // every other case leaves the list empty, which the rails execute as
+        // "the fragment stage samples nothing" (`research/docs/23` §3.3, v70).
+        textures: Vec::new(),
         present,
     }));
 
