@@ -1433,12 +1433,13 @@ mod tests {
         RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
         RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment,
         RenderStencilIdentity, ResourceTableSnapshot, Retryability, SampleCount, SemanticDigest,
-        ShaderSource, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
-        StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, SubmissionId,
-        TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
-        ValidatedComputeTrace, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-        ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES, MAX_COLOR_ATTACHMENTS,
-        MAX_PRESENT_IMAGE_COUNT, MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+        ShaderSource, StageBufferBinding, StageBufferView, StagedLease, StencilCompare,
+        StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StorageMode,
+        StoreOp, SubmissionId, TextureAccess, TextureFormat, TextureSource, TextureType,
+        TextureView, TracePass, ValidatedComputeTrace, VertexAttribute, VertexBufferLayout,
+        VertexFormat, VertexLayout, ViewId, Winding, FULL_SCREEN_TRIANGLE_VERTICES,
+        MAX_COLOR_ATTACHMENTS, MAX_PRESENT_IMAGE_COUNT, MAX_RENDER_STAGE_BUFFERS,
+        MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2119,15 +2120,127 @@ mod tests {
         ));
     }
 
+    /// The declaration block the v83 fixture writes: one count, one stage
+    /// (`fragment` = 1), one `u32` index, one access (`Read` = 0) and one
+    /// static footprint tag with its `u64` extent
+    /// (`research/docs/23` §3.3, v83).
+    const STAGE_BUFFER_DECLARATION_BLOCK: [u8; 16] = [
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10,
+    ];
+
     #[test]
-    fn pipeline_entries_refuse_an_unknown_tag_next_to_the_mrt_tag() {
+    fn a_render_contract_with_stage_declarations_takes_its_own_pipeline_kind() {
+        // The contract's declaration half travels under
+        // `PIPELINE_KIND_RENDER_STAGE_BUFFERS` (`research/docs/23` §3.3, v83):
+        // the entry writes its colour formats the MRT way and appends the
+        // declaration block after the vertex layout.
+        let plain = CommandCodec::encode_request(&render_submit_with_formats(vec![
+            AttachmentFormat::Rgba8Unorm,
+        ]))
+        .unwrap();
+        // The declaration half alone: the pass keeps the empty list, so the
+        // frame differs from the plain one in the pipeline entry only.
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(stage_buffer_render_contract());
+        let request = CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the declaration frame re-encodes byte for byte"
+        );
+        assert_eq!(plain[pipeline_entry_kind_offset()], 0x01, "plain entry tag");
+        assert_eq!(
+            frame[pipeline_entry_kind_offset()],
+            0x03,
+            "declaration entry tag"
+        );
+        // The format field is the MRT-style list even for one format, because
+        // the tag itself is the new shape.
+        let list_offset = render_entry_format_offset(&frame);
+        assert_eq!(
+            &frame[list_offset..list_offset + 8],
+            1_u64.to_be_bytes(),
+            "the list carries its own length"
+        );
+        assert_eq!(frame[list_offset + 8], 0x02, "Rgba8Unorm follows the list");
+        let at = frame
+            .windows(STAGE_BUFFER_DECLARATION_BLOCK.len())
+            .position(|window| window == STAGE_BUFFER_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+        // The block is the whole difference plus the list's length prefix:
+        // eight bytes of list length and sixteen bytes of declarations.
+        assert_eq!(
+            frame.len(),
+            plain.len() + 8 + STAGE_BUFFER_DECLARATION_BLOCK.len()
+        );
+        eprintln!(
+            "pipeline declaration frame: len={} plain={} kind={:#04x} block_at={at}",
+            frame.len(),
+            plain.len(),
+            frame[pipeline_entry_kind_offset()]
+        );
+    }
+
+    #[test]
+    fn a_pipeline_stage_buffer_declaration_refuses_a_count_above_the_contract_cap() {
+        // The encoder refuses the count before a single tuple is written.
+        let mut contract = stage_buffer_render_contract();
+        contract.stage_buffers = (0..=MAX_RENDER_STAGE_BUFFERS as u32)
+            .map(|index| StageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 4 },
+            })
+            .collect();
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(contract);
+        let refused = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace,
+            resources: resources(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::RenderStageBufferCount { count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
+        ));
+        // The decoder refuses the same count by name instead of reading five
+        // tuples from four.
+        let request = CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        let at = frame
+            .windows(STAGE_BUFFER_DECLARATION_BLOCK.len())
+            .position(|window| window == STAGE_BUFFER_DECLARATION_BLOCK)
+            .expect("the declaration block is on the wire");
+        let mut patched = frame.clone();
+        patched[at] = 0x05;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched).unwrap_err(),
+            CodecError::RenderStageBufferCount { count: 5, maximum }
+                if maximum == MAX_RENDER_STAGE_BUFFERS
+        ));
+        eprintln!("pipeline declaration count refused: {refused}");
+    }
+
+    #[test]
+    fn pipeline_entries_refuse_an_unknown_tag_next_to_the_stage_buffer_tag() {
         let request = render_submit_with_formats(vec![AttachmentFormat::Rgba8Unorm]);
         let frame = CommandCodec::encode_request(&request).unwrap();
         let mut unknown = frame.clone();
-        unknown[pipeline_entry_kind_offset()] = 0x03;
+        unknown[pipeline_entry_kind_offset()] = 0x04;
         assert!(matches!(
             CommandCodec::decode_request(&unknown).unwrap_err(),
-            CodecError::UnknownPipelineTag(0x03)
+            CodecError::UnknownPipelineTag(0x04)
         ));
     }
 
@@ -2280,31 +2393,389 @@ mod tests {
         trace
     }
 
-    #[test]
-    fn a_stage_buffer_pass_is_refused_by_the_frame_encoder() {
-        // The face has no section in this frame layout yet
-        // (`research/docs/23` §3.3, v83): the encoder refuses the frame
-        // instead of writing bytes that would be read as the next pass, and
-        // the decoder's own pass keeps the empty list every pre-v83 frame
-        // states.
-        let mut trace = vertex_input_trace();
+    /// One stage buffer entry for the v83 fixture: a fragment
+    /// `[[buffer(0)]]` read of sixteen caller-held bytes
+    /// (`research/docs/23` §3.3, v83).
+    fn stage_buffer_view() -> StageBufferView {
+        StageBufferView {
+            stage: RenderPipelineStage::Fragment,
+            view: BufferView {
+                view_id: ViewId::new(49),
+                metal_binding: 0,
+                allocation_id: AllocationId::new(51),
+                offset: 0,
+                length: 16,
+                access: BufferAccess::Read,
+                attribute_stride: None,
+                source: BufferSource::OwnedBytes(vec![
+                    0x40, 0x80, 0xc0, 0xff, 0x40, 0x80, 0xc0, 0xff, 0x40, 0x80, 0xc0, 0xff, 0x40,
+                    0x80, 0xc0, 0xff,
+                ]),
+            },
+        }
+    }
+
+    /// The stage buffer entry's payload, spelled once so the tests assert on
+    /// the same bytes the fixture carries.
+    fn stage_buffer_payload() -> Vec<u8> {
+        [0x40, 0x80, 0xc0, 0xff].repeat(4)
+    }
+
+    /// The fixture's render contract extended with the declaration that pairs
+    /// with [`stage_buffer_view`] (`research/docs/23` §3.3, v83).
+    fn stage_buffer_render_contract() -> RenderPipelineContract {
+        RenderPipelineContract {
+            stage_buffers: vec![StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            }],
+            ..render_contract()
+        }
+    }
+
+    /// A render trace whose contract declares one stage buffer binding and
+    /// whose pass fills it (`research/docs/23` §3.3, v83).
+    fn stage_buffer_trace() -> ComputeTrace {
+        let mut trace = render_only_trace();
+        trace.pipelines[0].render = Some(stage_buffer_render_contract());
         let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
             panic!("the fixture is a render pass");
         };
-        pass.stage_buffers = vec![StageBufferView {
-            stage: RenderPipelineStage::Fragment,
-            view: vertex_stream_view(),
-        }];
+        pass.stage_buffers = vec![stage_buffer_view()];
+        trace
+    }
+
+    /// The multisample fixture plus one stage buffer entry, so the frame
+    /// carries a wide feature word *and* the v83 block
+    /// (`research/docs/23` §3.3). The contract keeps the plain shape so the
+    /// frame differs from [`multisample_trace`] in the pass alone.
+    fn multisample_stage_buffer_trace() -> ComputeTrace {
+        let mut trace = multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stage_buffers = vec![stage_buffer_view()];
+        trace
+    }
+
+    /// A render trace that both samples one texture and reads one stage
+    /// buffer, so the v70 and v83 blocks travel in one frame
+    /// (`research/docs/23` §3.3). The contract keeps the plain shape so the
+    /// frame differs from [`sampled_multisample_trace`] in the pass alone.
+    fn sampled_stage_buffer_trace() -> ComputeTrace {
+        let mut trace = sampled_multisample_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stage_buffers = vec![stage_buffer_view()];
+        trace
+    }
+
+    /// The five bytes that spell a v83 stage-buffer pass's fixed head: the
+    /// tag, the wide feature word — here all zero, because the fixture's pass
+    /// states no optional section — and the block's count and the entry's
+    /// stage code (`fragment` = 1) (`research/docs/23` §3.3, v83).
+    const STAGE_BUFFER_HEAD: [u8; 5] = [0x13, 0x00, 0x00, 0x01, 0x01];
+
+    /// Where [`STAGE_BUFFER_HEAD`] sits in a frame, by position.
+    fn stage_buffer_head_at(frame: &[u8]) -> usize {
+        frame
+            .windows(STAGE_BUFFER_HEAD.len())
+            .position(|window| window == STAGE_BUFFER_HEAD)
+            .expect("the frame carries the stage-buffer head")
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_takes_its_own_tag_and_round_trips() {
+        let request = CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        // The round trip is byte exact in both directions: the decoded value
+        // re-encodes to the same frame, so a relay that decodes and forwards
+        // cannot perturb the shape.
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame
+        );
+        // The stage-buffer tag is followed by the same wide feature word the
+        // wide tag carries and then by the block the word had no bit for: a
+        // `u8` count, the entry's stage code and one full `BufferView`
+        // (`research/docs/23` §3.3, v83).
+        let position = stage_buffer_head_at(&frame);
+        assert_eq!(
+            &frame[position..position + STAGE_BUFFER_HEAD.len()],
+            &STAGE_BUFFER_HEAD
+        );
+        eprintln!(
+            "stage-buffer frame: len={} head={:02x?} at={position}",
+            frame.len(),
+            &frame[position..position + 5]
+        );
+        // The bytes the stage reads travel with the frame, so a provider can
+        // fill the slot without a second declaration.
+        let payload = stage_buffer_payload();
+        let payload_at = frame
+            .windows(payload.len())
+            .position(|window| window == payload)
+            .expect("the stage buffer's own bytes travel in the frame");
+        eprintln!(
+            "stage-buffer payload at={payload_at} bytes={:02x?}",
+            &frame[payload_at..payload_at + payload.len()]
+        );
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_is_the_pre_v83_frame_with_one_tag_and_one_block_more() {
+        // The only difference between a pre-v83 wide frame and a v83
+        // stage-buffer frame has to be the tag byte and the inserted block:
+        // the wide word keeps its meanings, and every section after the block
+        // is byte identical. This is the "old frames keep their bytes" rule
+        // stated as a comparison instead of a golden vector.
+        let plain_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let staged_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: multisample_stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        // The nine-byte frame header carries the payload length, which the
+        // block deliberately changes; every byte after it is what this test
+        // compares.
+        let plain = &plain_frame[9..];
+        let staged = &staged_frame[9..];
+        let position = plain
+            .windows(3)
+            .position(|window| window == [0x11, 0x20, 0x01])
+            .expect("the plain fixture takes the wide tag");
+        assert_eq!(&staged[..position], &plain[..position]);
+        assert_eq!(staged[position], 0x13);
+        assert_eq!(
+            &staged[position + 1..position + 3],
+            &plain[position + 1..position + 3],
+            "the stage-buffer tag carries the same wide word"
+        );
+        assert_eq!(staged[position + 3], 0x01, "one stage buffer");
+        let block_length = staged.len() - plain.len() - 1;
+        assert_eq!(
+            &staged[position + 4 + block_length..],
+            &plain[position + 3..],
+            "every section after the block is byte identical"
+        );
+        eprintln!(
+            "pre-v83 len={} staged len={} block={} bytes tag_at={position}",
+            plain_frame.len(),
+            staged_frame.len(),
+            block_length + 1
+        );
+    }
+
+    #[test]
+    fn a_sampled_stage_buffer_pass_carries_both_blocks() {
+        let request = CommandRequest::Submit {
+            trace: sampled_stage_buffer_trace(),
+            resources: resources(),
+        };
+        let frame = CommandCodec::encode_request(&request).unwrap();
+        assert_eq!(CommandCodec::decode_request(&frame).unwrap(), request);
+        assert_eq!(
+            CommandCodec::encode_request(&CommandCodec::decode_request(&frame).unwrap()).unwrap(),
+            frame,
+            "the combined frame re-encodes byte for byte"
+        );
+        // The combined tag writes the sampled tag's payload first — the wide
+        // word and the texture count — and appends the stage buffer block
+        // after the texture block (`research/docs/23` §3.3, v83).
+        assert!(
+            frame
+                .windows(4)
+                .any(|window| window == [0x14, 0x20, 0x01, 0x01]),
+            "the combined pass carries its own tag, the wide word and the texture count"
+        );
+        let texels: Vec<u8> = (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect();
+        let texture_at = frame
+            .windows(texels.len())
+            .position(|window| window == texels)
+            .expect("the sampled texture's bytes travel in the frame");
+        let payload = stage_buffer_payload();
+        let payload_at = frame
+            .windows(payload.len())
+            .position(|window| window == payload)
+            .expect("the stage buffer's bytes travel in the frame");
+        assert!(
+            texture_at < payload_at,
+            "the texture block precedes the stage buffer block"
+        );
+        // The combined frame shares the sampled frame's head — tag aside — and
+        // every section after the stage block is byte identical, because both
+        // tags walk the same wide word through the same section walker.
+        let sampled_frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: sampled_multisample_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let sampled = &sampled_frame[9..];
+        let combined = &frame[9..];
+        let position = sampled
+            .windows(3)
+            .position(|window| window == [0x12, 0x20, 0x01])
+            .expect("the sampled fixture takes the sampled tag");
+        assert_eq!(&combined[..position], &sampled[..position]);
+        assert_eq!(combined[position], 0x14);
+        assert_eq!(
+            &combined[position + 1..position + 3],
+            &sampled[position + 1..position + 3]
+        );
+        assert_eq!(combined[position + 3], 0x01, "one sampled texture");
+        // The stage block's payload is the last variable-length field before
+        // the pass's own sections, so both frames' sections start where their
+        // payloads end, and they are byte identical.
+        let combined_sections = payload_at + payload.len() - 9;
+        let sampled_sections = texture_at + texels.len() - 9;
+        assert_eq!(
+            &combined[combined_sections..],
+            &sampled[sampled_sections..],
+            "every section after the stage block is byte identical"
+        );
+        eprintln!(
+            "combined len={} sampled len={} texels_at={texture_at} payload_at={payload_at}",
+            frame.len(),
+            sampled_frame.len()
+        );
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_refuses_a_count_above_the_contract_cap() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let position = stage_buffer_head_at(&frame);
+        let mut patched = frame.clone();
+        patched[position + 3] = 0x05;
+        assert!(matches!(
+            CommandCodec::decode_request(&patched).unwrap_err(),
+            CodecError::RenderStageBufferCount { count: 5, maximum }
+                if maximum == MAX_RENDER_STAGE_BUFFERS
+        ));
+        // The encoder refuses the same protocol bound instead of writing a
+        // frame the decoder would reject.
+        let mut trace = stage_buffer_trace();
+        let Some(TracePass::Render(pass)) = trace.passes.first_mut() else {
+            panic!("the fixture is a render pass");
+        };
+        pass.stage_buffers = (0..=MAX_RENDER_STAGE_BUFFERS as u32)
+            .map(|index| StageBufferView {
+                stage: RenderPipelineStage::Fragment,
+                view: BufferView {
+                    view_id: ViewId::new(49 + u64::from(index)),
+                    metal_binding: index,
+                    ..stage_buffer_view().view
+                },
+            })
+            .collect();
         let refused = CommandCodec::encode_request(&CommandRequest::Submit {
             trace,
             resources: resources(),
         })
-        .expect_err("a stage-buffer pass has no section in this frame");
+        .unwrap_err();
         assert!(matches!(
             refused,
-            CodecError::StageBufferUnsupported { bindings: 1 }
+            CodecError::RenderStageBufferCount { count, maximum }
+                if count == MAX_RENDER_STAGE_BUFFERS + 1 && maximum == MAX_RENDER_STAGE_BUFFERS
         ));
-        eprintln!("stage-buffer frame refused: {refused}");
+        eprintln!("stage buffer count refusals: {refused}");
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_refuses_an_unknown_stage_code() {
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let position = stage_buffer_head_at(&frame);
+        let mut patched = frame.clone();
+        // The stage byte follows the block's count: `0` is vertex, `1` is
+        // fragment, and any other byte names no stage.
+        patched[position + 4] = 0x02;
+        let refused = CommandCodec::decode_request(&patched).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::UnknownEnumValue {
+                field: "render pipeline stage",
+                value: 2,
+            }
+        ));
+        eprintln!("unknown stage code refused: {refused}");
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_refuses_a_corrupt_view_by_name() {
+        // The view keeps its own named refusals inside the block: a source tag
+        // this version does not know is refused as `buffer source` instead of
+        // being read as one of the three arms, exactly as a compute binding's
+        // view is.
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let payload = stage_buffer_payload();
+        let payload_at = frame
+            .windows(payload.len())
+            .position(|window| window == payload)
+            .expect("the stage buffer's own bytes travel in the frame");
+        let mut patched = frame.clone();
+        // The blob's eight-byte length precedes the payload, and the source
+        // tag precedes that length.
+        patched[payload_at - 9] = 0x03;
+        let refused = CommandCodec::decode_request(&patched).unwrap_err();
+        assert!(matches!(
+            refused,
+            CodecError::UnknownEnumValue {
+                field: "buffer source",
+                value: 3,
+            }
+        ));
+        eprintln!("corrupt stage buffer view refused: {refused}");
+    }
+
+    #[test]
+    fn a_stage_buffer_pass_refuses_a_second_entry_that_is_not_there() {
+        // The count is one byte, so a frame can claim more entries than it
+        // wrote. The decoder reads the claimed entries and then the pass's own
+        // fields from the wrong bytes, so the frame is refused inside the
+        // payload instead of decoding a pass nobody wrote.
+        let frame = CommandCodec::encode_request(&CommandRequest::Submit {
+            trace: stage_buffer_trace(),
+            resources: resources(),
+        })
+        .unwrap();
+        let position = stage_buffer_head_at(&frame);
+        let mut patched = frame.clone();
+        patched[position + 3] = 0x02;
+        let refused = CommandCodec::decode_request(&patched).unwrap_err();
+        eprintln!("over-claimed stage buffer count refused: {refused}");
+        assert!(
+            matches!(
+                refused,
+                CodecError::TruncatedPayload { .. }
+                    | CodecError::UnknownEnumValue { .. }
+                    | CodecError::TrailingPayload { .. }
+            ),
+            "a count above the written entries is refused inside the payload"
+        );
     }
 
     #[test]
@@ -3761,11 +4232,126 @@ mod tests {
             .windows(block.len())
             .position(|window| window == block)
             .expect("the render-sampler tail carries its presence tag");
-        patched[tag] = 0x40;
+        patched[tag] = 0x80;
         assert!(matches!(
             CommandCodec::decode_response(&patched),
-            Err(CodecError::UnknownCapabilityTail(0x40))
+            Err(CodecError::UnknownCapabilityTail(0x80))
         ));
+    }
+
+    #[test]
+    fn stage_buffer_capability_bits_round_trip_and_extend_the_render_texture_frame() {
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_passes = true;
+        capabilities.max_color_attachments = 1;
+        capabilities.max_attachment_dimension = [2, 2];
+        capabilities.supported_color_formats = vec![AttachmentFormat::Rgba8Unorm];
+        capabilities.supports_render_texture_sampling = true;
+        capabilities.max_render_textures = 1;
+        capabilities.supported_render_texture_formats = vec![TextureFormat::Rgba8Unorm];
+        let plain = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: capabilities.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            CommandCodec::decode_response(&plain).unwrap(),
+            CommandResponse::Capabilities {
+                epoch: DeviceEpoch::new(1),
+                capabilities: capabilities.clone(),
+            }
+        );
+
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the capability frame re-encodes byte for byte"
+        );
+        // The stage-buffer block is the extended payload's newest optional
+        // section: one presence tag, one bool and one `u32` binding cap
+        // (`research/docs/23` §3.3, v83).
+        let block = [0x40, 0x01, 0x00, 0x00, 0x00, 0x04];
+        assert!(
+            frame.windows(block.len()).any(|window| window == block),
+            "the stage-buffer tail carries its tag, its bool and its cap"
+        );
+        assert_eq!(frame.len(), plain.len() + block.len());
+        // A decoder that predates the section refuses a tag this version does
+        // not know rather than reading it as another section's bytes.
+        let mut patched = frame.clone();
+        let tag = frame
+            .windows(block.len())
+            .position(|window| window == block)
+            .expect("the stage-buffer tail carries its presence tag");
+        patched[tag] = 0x80;
+        assert!(matches!(
+            CommandCodec::decode_response(&patched).unwrap_err(),
+            CodecError::UnknownCapabilityTail(0x80)
+        ));
+        eprintln!(
+            "stage-buffer capability frame: len={} plain={} block={:02x?}",
+            frame.len(),
+            plain.len(),
+            block
+        );
+    }
+
+    #[test]
+    fn an_only_stage_buffer_declaration_still_writes_the_extended_payload() {
+        // The two stage buffer bits are part of the extended payload's own
+        // question: a snapshot that declares one of them without any earlier
+        // render bit still writes the extended frame, so the declaration
+        // cannot be dropped on the wire (`research/docs/23` §3.3, v83).
+        let mut capabilities = fake_capabilities();
+        capabilities.supports_render_stage_buffers = true;
+        capabilities.max_render_stage_buffers = MAX_RENDER_STAGE_BUFFERS as u32;
+        assert!(!capabilities.declares_render_support());
+        let response = CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities,
+        };
+        let frame = CommandCodec::encode_response(&response).unwrap();
+        assert_eq!(frame[9], 0x0a, "the extended capability tag");
+        assert_eq!(CommandCodec::decode_response(&frame).unwrap(), response);
+        assert_eq!(
+            CommandCodec::encode_response(&CommandCodec::decode_response(&frame).unwrap()).unwrap(),
+            frame,
+            "the only-stage-buffer capability frame re-encodes byte for byte"
+        );
+        let block = [0x40, 0x01, 0x00, 0x00, 0x00, 0x04];
+        assert!(
+            frame.windows(block.len()).any(|window| window == block),
+            "the stage-buffer tail carries its tag, its bool and its cap"
+        );
+        // A snapshot with both bits at their defaults keeps the legacy frame,
+        // and the decoder reads the missing block as the two "cannot bind a
+        // stage buffer" defaults provider admission refuses the shape with.
+        let legacy = CommandCodec::encode_response(&CommandResponse::Capabilities {
+            epoch: DeviceEpoch::new(1),
+            capabilities: fake_capabilities(),
+        })
+        .unwrap();
+        assert_eq!(legacy[9], 0x01, "the legacy capability tag");
+        let decoded = match CommandCodec::decode_response(&legacy).unwrap() {
+            CommandResponse::Capabilities { capabilities, .. } => capabilities,
+            other => panic!("the legacy frame decodes to capabilities, got {other:?}"),
+        };
+        assert!(!decoded.supports_render_stage_buffers);
+        assert_eq!(decoded.max_render_stage_buffers, 0);
+        eprintln!(
+            "only stage buffer bits: extended len={} legacy len={} flags={}",
+            frame.len(),
+            legacy.len(),
+            decoded.max_render_stage_buffers
+        );
     }
 
     #[test]
