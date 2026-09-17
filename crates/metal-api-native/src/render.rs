@@ -65,8 +65,8 @@ use metal_api_core::provider::{
     LeaseId, LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, ResourceTableSnapshot, SampleCount, StencilResolveFilter, StencilTest,
-    StoreOp, TextureFormat, TextureSource, TextureType, TracePass, VertexFormat, VertexLayout,
-    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    StoreOp, TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexFormat,
+    VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1557,12 +1557,12 @@ fn plan_index_stream<'a>(
 /// channel existed.
 fn render_input_refusal(
     role: RenderInputRole,
-    view: &BufferView,
+    view: ViewId,
     storage_mode: &'static str,
     detail: &'static str,
 ) -> ProviderError {
     capability_refusal(role.slug())
-        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field("view", FieldValue::Unsigned(view.get()))
         .with_field("storage_mode", FieldValue::Text(storage_mode.to_owned()))
         .with_detail(detail)
 }
@@ -1577,6 +1577,9 @@ enum RenderInputRole {
     /// The previous contents a `LoadOp::Load` attachment uploads
     /// (`research/docs/23` §74, R5b).
     Attachment,
+    /// A sampled texture the pass's fragment stage reads
+    /// (`research/docs/23` §75, R5c).
+    Texture,
 }
 
 impl RenderInputRole {
@@ -1584,12 +1587,15 @@ impl RenderInputRole {
     /// two stream names are the ones this rail published before the lease
     /// channel existed, so a capture that could not read a stream keeps its
     /// slug; the attachment name is the one the Vulkan rail publishes for the
-    /// same source arm, so both rails answer a capture with one name.
+    /// same source arm, and the texture role keeps the sampler's own source
+    /// name, so both rails answer a capture with one name
+    /// (`research/docs/23` §75, R5c).
     const fn slug(self) -> &'static str {
         match self {
             Self::Vertex => VERTEX_SLUG,
             Self::Index => INDEX_SLUG,
             Self::Attachment => ATTACHMENT_LOAD_SLUG,
+            Self::Texture => TEXTURE_SLUG,
         }
     }
 }
@@ -1717,7 +1723,7 @@ fn resolve_render_input<'a>(
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
                     role,
-                    view,
+                    view.view_id,
                     "staged_lease",
                     "the render submission carries no lease channel, so a lease-backed render \
                      input cannot be read",
@@ -1735,7 +1741,7 @@ fn resolve_render_input<'a>(
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
                     role,
-                    view,
+                    view.view_id,
                     "borrowed_no_copy",
                     "the render submission carries no lease channel, so a lease-backed render \
                      input cannot be read",
@@ -1759,43 +1765,146 @@ fn resolve_render_input<'a>(
                 leases.device_epoch,
                 leases.resources,
             )?;
-            // `newBufferWithBytesNoCopy:` maps whole pages: the reservation's
-            // base address and length have to sit on the device's import
-            // alignment, and the view inside it on the 4-byte rule the compute
-            // rail states for the same mapping. The first two are also what
-            // `import_borrowed_lease` checked for this provider; re-asking them
-            // here keeps the refusal beside the window that would be mapped, and
-            // the checks are the ones the encoder body depends on.
-            if !u64::try_from(window.base_len)
-                .unwrap_or(u64::MAX)
-                .is_multiple_of(leases.host_import_alignment)
-            {
-                return Err(crate::lease_length_refusal(
-                    *lease_id,
-                    u64::try_from(window.base_len).unwrap_or(u64::MAX),
-                    leases.host_import_alignment,
-                ));
-            }
-            let alignment = usize::try_from(leases.host_import_alignment).unwrap_or(usize::MAX);
-            if !window.base_pointer.is_multiple_of(alignment) {
-                return Err(crate::lease_alignment_refusal(
-                    *lease_id,
-                    window.base_pointer,
-                    leases.host_import_alignment,
-                ));
-            }
-            if !window.offset.is_multiple_of(4) {
-                return Err(crate::lease_offset_refusal(
-                    *lease_id,
-                    u64::try_from(window.offset).unwrap_or(u64::MAX),
-                ));
-            }
+            check_no_copy_window(*lease_id, window, leases.host_import_alignment)?;
             Ok(PlannedInputSource::NoCopy {
                 lease: *lease_id,
                 window,
             })
         }
     }
+}
+
+/// Resolve one sampled texture's bytes into the source the encoder uploads
+/// (`research/docs/23` §75, R5c).
+///
+/// The render sampler's third declaration of the same three arms: a texture
+/// carries its whole byte extent (no offset and length, unlike a buffer view),
+/// so the lease window is the texture's own tightly packed extent at the
+/// reservation's start — the window rule core's registries state for
+/// `TextureSource`. `OwnedBytes` behaves byte for byte as before, a
+/// `StagedLease` uploads the provider's own copy of the owner's window, and a
+/// `BorrowedNoCopy` uploads the owner's own pages, so a rewrite after the
+/// import reaches the sampled texels instead of leaving the import's first copy
+/// behind.
+fn resolve_render_texture_source<'a>(
+    view: &'a TextureView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    binding: usize,
+) -> Result<PlannedInputSource<'a>, ProviderError> {
+    match &view.source {
+        TextureSource::OwnedBytes(bytes) => Ok(PlannedInputSource::Declared(bytes)),
+        TextureSource::StagedLease(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                texture_source_refusal(
+                    binding,
+                    view.view_id,
+                    "staged_lease",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     texture cannot be read",
+                )
+            })?;
+            let bytes = leases.staging.texture_bytes(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            Ok(PlannedInputSource::Staged(bytes))
+        }
+        TextureSource::BorrowedNoCopy(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                texture_source_refusal(
+                    binding,
+                    view.view_id,
+                    "borrowed_no_copy",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     texture cannot be read",
+                )
+            })?;
+            if leases.host_import_alignment == 0 {
+                return Err(capability_refusal("storage_mode_unsupported")
+                    .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+                    .with_field(
+                        "storage_mode",
+                        FieldValue::Text("borrowed_no_copy".to_owned()),
+                    )
+                    .with_detail(
+                        "this device cannot read an owner window, so a no-copy render texture \
+                         has no path through this rail",
+                    ));
+            }
+            let window = leases.borrowed.texture_pointer(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            check_no_copy_window(*lease_id, window, leases.host_import_alignment)?;
+            Ok(PlannedInputSource::NoCopy {
+                lease: *lease_id,
+                window,
+            })
+        }
+    }
+}
+
+/// One sampled texture's source refusal (`research/docs/23` §75, R5c).
+///
+/// The fields are the sampler's own — the binding index the view's own label
+/// holds it to, the view's identity and the storage mode it arrived under — so
+/// a capture reads the same two names the Vulkan rail publishes.
+fn texture_source_refusal(
+    binding: usize,
+    view: ViewId,
+    storage_mode: &'static str,
+    detail: &'static str,
+) -> ProviderError {
+    capability_refusal(TEXTURE_SLUG)
+        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field("view", FieldValue::Unsigned(view.get()))
+        .with_field("storage_mode", FieldValue::Text(storage_mode.to_owned()))
+        .with_detail(detail)
+}
+
+/// The whole-page rules every no-copy window has to meet
+/// (`research/docs/23` §72/§75).
+///
+/// `newBufferWithBytesNoCopy:` maps whole pages: the reservation's base address
+/// and length have to sit on the device's import alignment, and the view inside
+/// it on the 4-byte rule the compute rail states for the same mapping. The
+/// first two are also what `import_borrowed_lease` checked for this provider;
+/// re-asking them here keeps the refusal beside the window that would be
+/// mapped, and the checks are the ones the encoder body depends on.
+fn check_no_copy_window(
+    lease_id: LeaseId,
+    window: BorrowedView,
+    host_import_alignment: u64,
+) -> Result<(), ProviderError> {
+    if !u64::try_from(window.base_len)
+        .unwrap_or(u64::MAX)
+        .is_multiple_of(host_import_alignment)
+    {
+        return Err(crate::lease_length_refusal(
+            lease_id,
+            u64::try_from(window.base_len).unwrap_or(u64::MAX),
+            host_import_alignment,
+        ));
+    }
+    let alignment = usize::try_from(host_import_alignment).unwrap_or(usize::MAX);
+    if !window.base_pointer.is_multiple_of(alignment) {
+        return Err(crate::lease_alignment_refusal(
+            lease_id,
+            window.base_pointer,
+            host_import_alignment,
+        ));
+    }
+    if !window.offset.is_multiple_of(4) {
+        return Err(crate::lease_offset_refusal(
+            lease_id,
+            u64::try_from(window.offset).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(())
 }
 
 /// The storage modes a stream view can carry, as the refusal spells them.
@@ -1874,6 +1983,16 @@ const INDEX_SLUG: &str = "render_index_buffer_unsupported";
 /// declaration at all).
 const ATTACHMENT_LOAD_SLUG: &str = "render_attachment_load_source_unsupported";
 
+/// Slug of a sampled texture this rail cannot read (`research/docs/23` §75,
+/// R5c).
+///
+/// The render sampler's source arm is the name the Vulkan rail published for
+/// the same fact before the lease channel reached textures, so the two rails
+/// keep answering a capture with one name: a texture whose bytes could not be
+/// resolved is refused under it, exactly as the attachment's previous contents
+/// are refused under their own.
+const TEXTURE_SLUG: &str = "render_texture_source_unsupported";
+
 /// One offscreen render pass to execute.
 ///
 /// The pass and the pipeline are the core values themselves, so this rail cannot
@@ -1901,11 +2020,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
 }
 
 /// One sampled texture a render pass binds (`research/docs/23` §3.3, v70): the
-/// trace's own tightly packed texel bytes plus the extent the pass's render
-/// area shares with it.
+/// source of its tightly packed texel bytes plus the extent the pass's render
+/// area shares with it. The source's three arms are the three
+/// [`TextureSource`] arms, resolved before any Metal object exists
+/// (`research/docs/23` §75, R5c).
 #[derive(Debug)]
 pub(crate) struct PlannedTexture<'a> {
-    pub(crate) bytes: &'a [u8],
+    pub(crate) source: PlannedInputSource<'a>,
     pub(crate) extent: [u32; 2],
 }
 
@@ -1994,7 +2115,10 @@ impl RenderPlan<'_> {
     /// two streams appears twice, which is the retain count the registry needs:
     /// both bindings read the same mapping. A loading attachment's previous
     /// contents are the third input that can name one: the encoder uploads them
-    /// out of the owner's mapping, so the hold covers that window too.
+    /// out of the owner's mapping, and a sampled texture's bytes are the fourth
+    /// (`research/docs/23` §75, R5c): the encoder uploads them the same way, one
+    /// hold per window, so a pass that binds several textures retains each lease
+    /// once per window it appears in.
     pub(crate) fn borrowed_leases(&self) -> Vec<LeaseId> {
         let mut leases = Vec::new();
         for stream in &self.vertex_streams {
@@ -2012,6 +2136,11 @@ impl RenderPlan<'_> {
                 if let Some(lease) = source.borrowed_lease() {
                     leases.push(lease);
                 }
+            }
+        }
+        for texture in &self.textures {
+            if let Some(lease) = texture.source.borrowed_lease() {
+                leases.push(lease);
             }
         }
         leases
@@ -2353,7 +2482,7 @@ pub(crate) fn plan_with_leases<'a>(
                  sampling module",
             ));
             }
-            resolve_render_textures(request.pass, extent)?
+            resolve_render_textures(request.pass, extent, leases)?
         };
     // Every admitted colour format and `depth32float` alike store four bytes per
     // texel, so one texel-byte count serves the colour attachments and the
@@ -2748,15 +2877,22 @@ pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), P
 /// (`research/docs/23` §3.3, v70).
 ///
 /// The Vulkan rail's window, restated for a directly-constructed pass: exactly
-/// one `rgba8_unorm` 2D single-sample surface, trace-owned bytes, whose extent
-/// equals the render area. The extent rule is what makes the fixture's
-/// expectation driver-independent — the interpolated varying stands on a texel
-/// centre only when the texture and the render area share their extent — so a
-/// texture of another size is refused by name instead of sampled as a filtered
-/// read the review never covered.
+/// one `rgba8_unorm` 2D single-sample surface whose extent equals the render
+/// area. The extent rule is what makes the fixture's expectation
+/// driver-independent — the interpolated varying stands on a texel centre only
+/// when the texture and the render area share their extent — so a texture of
+/// another size is refused by name instead of sampled as a filtered read the
+/// review never covered.
+///
+/// The texture's bytes are resolved through the same three-arm channel the
+/// streams and the loading attachments use (`research/docs/23` §75, R5c): the
+/// trace's own bytes, the provider's staged copy of an owner lease, or the
+/// owner's own mapping, whose pages the encoder uploads as they stand. The
+/// resolution runs before the first Metal object exists.
 fn resolve_render_textures<'a>(
     pass: &'a RenderPassDescriptor,
     extent: [u32; 2],
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<PlannedTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES as usize {
         return Err(capability_refusal("render_texture_limit")
@@ -2791,11 +2927,7 @@ fn resolve_render_textures<'a>(
                 .with_field("sample_count", FieldValue::Unsigned(view.sample_count))
                 .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
         }
-        let TextureSource::OwnedBytes(bytes) = &view.source else {
-            return Err(capability_refusal("render_texture_source_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
-                .with_detail("the first render-sampler increment uploads trace-owned bytes only"));
-        };
+        let source = resolve_render_texture_source(view, leases, index)?;
         let width = u32::try_from(view.width).unwrap_or(u32::MAX);
         let height = u32::try_from(view.height).unwrap_or(u32::MAX);
         if width == 0 || height == 0 {
@@ -2820,7 +2952,7 @@ fn resolve_render_textures<'a>(
             .checked_mul(u64::from(height))
             .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
             .ok_or_else(|| contract_refusal(ContractError::ArithmeticOverflow("render texture")))?;
-        let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let actual = u64::try_from(source.len()).unwrap_or(u64::MAX);
         if actual != expected {
             return Err(contract_refusal(ContractError::SourceLengthMismatch {
                 view: view.view_id,
@@ -2829,7 +2961,7 @@ fn resolve_render_textures<'a>(
             }));
         }
         textures.push(PlannedTexture {
-            bytes,
+            source,
             extent: [width, height],
         });
     }
@@ -4671,7 +4803,10 @@ fn read_stencil_texels(
 /// Each texture is created with `ShaderRead` usage — the sampling stage is the
 /// only reader — and filled with the plan's own bytes through
 /// `replaceRegion`, one tightly packed `width * 4`-byte row per texel row, which
-/// is the same upload shape the rail's attachment presets use.
+/// is the same upload shape the rail's attachment presets use. A no-copy
+/// texture's upload reads the owner's own mapping, so an owner that rewrites
+/// its pages after the import changes the texels the pass samples
+/// (`research/docs/23` §75, R5c).
 #[cfg(target_os = "macos")]
 fn sampled_textures(
     device: &Device,
@@ -4704,7 +4839,7 @@ fn sampled_textures(
                 },
             },
             0,
-            sampled.bytes.as_ptr().cast(),
+            sampled.source.proof_bytes().as_ptr().cast(),
             NSUInteger::try_from(u64::from(width) * 4).unwrap_or(NSUInteger::MAX),
         );
         textures.push(texture);
@@ -4957,7 +5092,7 @@ mod tests {
         .expect("the reviewed sampling shape is planned");
         assert_eq!(plan.textures.len(), 1);
         assert_eq!(plan.textures[0].extent, [4, 4]);
-        assert_eq!(plan.textures[0].bytes.len(), 64);
+        assert_eq!(plan.textures[0].source.len(), 64);
         assert_eq!(plan.vertex_entry, SAMPLED_VERTEX_ENTRY);
         assert_eq!(plan.fragment_entry, SAMPLED_FRAGMENT_ENTRY);
 
@@ -8750,6 +8885,328 @@ mod tests {
         );
     }
 
+    /// The sixteen texels the reviewed sampling fixture uploads
+    /// (`research/docs/23` §3.3, v70): one distinct texel per position.
+    fn sampled_texels() -> Vec<u8> {
+        (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x, y, x.wrapping_add(y), 0xff]))
+            .collect()
+    }
+
+    /// The sixteen texels the owner's rewritten window holds
+    /// (`research/docs/23` §75, R5c): four distinct channels per texel, none of
+    /// them equal to the fixture's own, so "the pass read the owner's pages
+    /// after the rewrite" is falsifiable per texel.
+    fn rewritten_sampled_texels() -> Vec<u8> {
+        (0..4u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [0x80 | x, 0x40 | y, x ^ y, 0xff]))
+            .collect()
+    }
+
+    /// The reviewed sampled pass with its texture bound to `source`
+    /// (`research/docs/23` §75, R5c).
+    fn leased_sampled_pass(source: TextureSource) -> RenderPassDescriptor {
+        let mut pass = sampled_pass(4);
+        pass.textures[0].source = source;
+        pass
+    }
+
+    /// The sampled pass's request, as the device-level helper's shape builds
+    /// it.
+    fn sampled_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+        }
+    }
+
+    /// A snapshot carrying the sampled texture's allocation at whole-page size,
+    /// plus the reservation drawn from its first bytes
+    /// (`research/docs/23` §75, R5c).
+    ///
+    /// The owner's reservation is page-sized exactly as the production rail's
+    /// is — the import rules make owners align their windows — while the
+    /// texture is only its first sixty-four bytes.
+    fn owner_texture_resources(
+        epoch: DeviceEpoch,
+        reservation: LeaseReservation,
+        alignment: u64,
+    ) -> ResourceTableSnapshot {
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(53),
+                owner_epoch: epoch,
+                size: alignment,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the texture reservation covers its view");
+        resources
+    }
+
+    /// A staged lease resolves a sampled texture's texels into the provider's
+    /// own copy (`research/docs/23` §75, R5c).
+    ///
+    /// The plan carries the staged bytes exactly as it carries the texture's
+    /// own, names no lease to retain, and refuses the same declaration under the
+    /// registry's own name once the copy is released. The window is the
+    /// texture's own extent at the reservation's start, so the page-aligned
+    /// padding behind it stays unread.
+    #[test]
+    fn plan_resolves_a_staged_lease_render_texture_into_the_providers_copy() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(71);
+        let reservation =
+            lease_registration(lease_id, AllocationId::new(53), OWNER_ALIGNMENT, epoch);
+        let texels = sampled_texels();
+        let mut staged_bytes = vec![0x5a_u8; OWNER_ALIGNMENT as usize];
+        staged_bytes[..texels.len()].copy_from_slice(&texels);
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(reservation, staged_bytes)
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = owner_texture_resources(epoch, reservation, OWNER_ALIGNMENT);
+        // The staged arm is the provider's own copy, so the device's mapping
+        // ability plays no part in it.
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: 0,
+        };
+
+        let pipeline = sampled_pipeline();
+        let pass = leased_sampled_pass(TextureSource::StagedLease(lease_id));
+        let request = sampled_request(&pass, &pipeline);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the staged copy carries the texture's texels");
+        assert!(
+            matches!(plan.textures[0].source, PlannedInputSource::Staged(_)),
+            "a staged lease resolves into the provider's own copy: {:?}",
+            plan.textures[0].source
+        );
+        assert_eq!(
+            plan.textures[0].source.proof_bytes(),
+            texels.as_slice(),
+            "the window is the texture's own extent at the reservation's start"
+        );
+        assert!(
+            plan.borrowed_leases().is_empty(),
+            "a staged arm has no owner mapping to retain"
+        );
+
+        staging
+            .release(lease_id)
+            .expect("the fixture import is released");
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released staged lease cannot be read");
+        eprintln!("released staged texture lease refused: {error:?}");
+        assert_eq!(error.slug, "lease_not_imported");
+        assert_eq!(
+            error.fields.get("lease"),
+            Some(&FieldValue::Unsigned(lease_id.get()))
+        );
+    }
+
+    /// A no-copy lease resolves a sampled texture's texels into the owner's own
+    /// pages (`research/docs/23` §75, R5c).
+    ///
+    /// The proof and the encoder's upload read the same mapping: an owner that
+    /// rewrites its pages after the import changes both, which a snapshot-style
+    /// import could not, and the plan names the lease its submission has to
+    /// retain.
+    #[test]
+    fn plan_resolves_a_borrowed_lease_render_texture_into_the_owners_pages() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(72);
+        let reservation =
+            lease_registration(lease_id, AllocationId::new(53), OWNER_ALIGNMENT, epoch);
+        let texels = sampled_texels();
+        let mut owner_texture = OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_texture.write(&texels);
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, owner_texture.as_ptr())
+                    .expect("the owner's texture window is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let resources = owner_texture_resources(epoch, reservation, OWNER_ALIGNMENT);
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+
+        let pipeline = sampled_pipeline();
+        let pass = leased_sampled_pass(TextureSource::BorrowedNoCopy(lease_id));
+        let request = sampled_request(&pass, &pipeline);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the texture's texels");
+        let PlannedInputSource::NoCopy { lease, window } = &plan.textures[0].source else {
+            panic!(
+                "a no-copy lease resolves into the owner's mapping: {:?}",
+                plan.textures[0].source
+            );
+        };
+        assert_eq!(*lease, lease_id);
+        assert_eq!(
+            window.offset, 0,
+            "the texture starts at the reservation's base"
+        );
+        assert_eq!(
+            window.len,
+            texels.len(),
+            "the window is the texture's own extent, not the page-aligned reservation"
+        );
+        assert_eq!(window.base_len, OWNER_ALIGNMENT as usize);
+        assert_eq!(plan.textures[0].source.proof_bytes(), texels.as_slice());
+        assert_eq!(
+            plan.borrowed_leases(),
+            vec![lease_id],
+            "the plan names one hold for the texture's window"
+        );
+
+        // The probe: the owner rewrites its own page after the import, and the
+        // upload reads those bytes instead of a copy taken at import time — the
+        // same falsification the Vulkan rail's e2e states with a device.
+        let rewritten = rewritten_sampled_texels();
+        owner_texture.write(&rewritten);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the rewritten owner window still holds a 4x4 surface");
+        assert_eq!(
+            plan.textures[0].source.proof_bytes(),
+            rewritten.as_slice(),
+            "the upload follows the owner's rewritten pages"
+        );
+
+        // One hold while the pass is in flight, none once Metal retired it —
+        // both spellings, exactly as the attachment half measures them.
+        let mut retains = RenderInputRetains::retain(&borrowed, &plan).expect("the hold is taken");
+        assert_eq!(borrowed.outstanding(lease_id), Some(1));
+        retains.retire();
+        assert_eq!(borrowed.outstanding(lease_id), Some(0));
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("the hold is taken");
+        drop(retains);
+        assert_eq!(borrowed.outstanding(lease_id), Some(0));
+
+        // A released import is the registry's own refusal.
+        borrowed
+            .release(lease_id)
+            .expect("the owner's texture window is released");
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released no-copy import cannot be resolved");
+        assert_eq!(error.slug, "lease_not_imported");
+    }
+
+    /// A lease-backed sampled texture with no channel is refused under the
+    /// sampler's source name with the storage mode it arrived under, and a
+    /// device that cannot read an owner window is refused under the storage
+    /// mode's own name (`research/docs/23` §75, R5c).
+    #[test]
+    fn a_lease_backed_render_texture_is_refused_without_a_channel_or_a_mapping() {
+        let pipeline = sampled_pipeline();
+        let pass = leased_sampled_pass(TextureSource::BorrowedNoCopy(LeaseId::new(73)));
+        let request = sampled_request(&pass, &pipeline);
+        let error = plan_pass(&request).expect_err("a lease needs the channel that imported it");
+        eprintln!("no channel: {error:?}");
+        assert_eq!(error.slug, "render_texture_source_unsupported");
+        assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(error.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(error.fields.get("binding"), Some(&FieldValue::Unsigned(0)));
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(ViewId::new(83).get()))
+        );
+
+        // A device that cannot read an owner window refuses the borrowed arm
+        // under the storage mode's published name, with the window's identity,
+        // exactly as the stream and attachment roles do.
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = ResourceTableSnapshot::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: DeviceEpoch::new(3),
+            host_import_alignment: 0,
+        };
+        let error =
+            plan_with_leases(&request, Some(&leases), 0, 0).expect_err("no owner mapping path");
+        eprintln!("no owner mapping refused: {error:?}");
+        assert_eq!(error.slug, "storage_mode_unsupported");
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(ViewId::new(83).get()))
+        );
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+
+        // The whole-page rule is the one every no-copy window meets, the
+        // texture's own window included: a reservation that covers the texture
+        // but misses the device's import alignment is refused by name instead
+        // of mapped.
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(74);
+        let short = lease_registration(lease_id, AllocationId::new(53), 128, epoch);
+        let mut owner_texture = OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_texture.write(&sampled_texels());
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(short, owner_texture.as_ptr())
+                    .expect("a 128-byte reservation is a valid lease window"),
+            )
+            .expect("the fixture import is accepted");
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(53),
+                owner_epoch: epoch,
+                size: OWNER_ALIGNMENT,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(short)
+            .expect("the short reservation is admitted");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+        let pass = leased_sampled_pass(TextureSource::BorrowedNoCopy(lease_id));
+        let request = sampled_request(&pass, &pipeline);
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a 128-byte reservation cannot map as a whole page");
+        eprintln!("short reservation refused: {error:?}");
+        assert_eq!(error.slug, "lease_length_unsupported");
+        assert_eq!(error.fields.get("lease"), Some(&FieldValue::Unsigned(74)));
+    }
+
     /// The reviewed stream collapsed onto one corner.
     ///
     /// Every fragment is degenerate, so the draw covers no texel and the
@@ -9130,6 +9587,127 @@ mod tests {
             .release(lease_id)
             .expect("the owner's attachment window is released");
         let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect_err("a released no-copy import cannot be resolved");
+        assert_eq!(error.slug, "lease_not_imported");
+    }
+
+    /// The no-copy sampled texture on a real Metal device (`research/docs/23`
+    /// §75, R5c).
+    ///
+    /// Device-only, so the macOS CI job's `cargo test -p metal-api-native` is
+    /// the observation: three facts the host-side tests cannot reach — the
+    /// encoder uploads the owner's pages into the sampled texture, the fragment
+    /// stage samples those texels into the attachment (byte for byte the value
+    /// the declared-bytes fixture lands), and an owner rewrite afterwards
+    /// changes the landing instead of leaving the import's first copy behind.
+    /// The retain guard is measured with the registry as well.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_borrowed_lease_texture_samples_the_owners_pages_on_a_device() {
+        let Some(device) = eligible_apple_device() else {
+            eprintln!("skipping native render-lease test: no eligible Metal device");
+            return;
+        };
+        let queue = device.new_command_queue();
+        // The mapping's own alignment is the device's page size, which is what
+        // `no_copy_alignment` publishes and `import_borrowed_lease` checks; the
+        // host-side tests use 4 KiB because they never map anything.
+        let alignment = crate::native::page_size();
+        if alignment == 0 {
+            eprintln!("skipping native render-lease test: the device reports no page size");
+            return;
+        }
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(82);
+        let reservation = lease_registration(lease_id, AllocationId::new(53), alignment, epoch);
+        let texels = sampled_texels();
+        let mut owner_texture = OwnerPages::new(alignment as usize, alignment as usize);
+        owner_texture.write(&texels);
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, owner_texture.as_ptr())
+                    .expect("the owner's texture window is a valid reservation"),
+            )
+            .expect("the owner's texture window is imported");
+        let resources = owner_texture_resources(epoch, reservation, alignment);
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: alignment,
+        };
+        let pipeline = sampled_pipeline();
+        let pass = leased_sampled_pass(TextureSource::BorrowedNoCopy(lease_id));
+        let request = sampled_request(&pass, &pipeline);
+        let plan = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the texture's texels");
+        assert_eq!(
+            plan.borrowed_leases(),
+            vec![lease_id],
+            "the texture's own window is the one hold this pass takes"
+        );
+
+        // The pass is synchronous, so dropping the guard after the encoder
+        // returns is the retirement point the provider's own
+        // `execute_render_passes` takes.
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("the hold is taken");
+        assert_eq!(borrowed.outstanding(lease_id), Some(1));
+        let readback = encode_offscreen_render(&device, &queue, &plan)
+            .expect("the owner's texels sample into the attachment");
+        drop(retains);
+        let attachment = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!("borrowed lease texture readback: {}", hex(&attachment));
+        assert_eq!(
+            attachment,
+            texels,
+            "the fragment stage samples the owner's pages through the mapping: {}",
+            hex(&attachment)
+        );
+        assert_eq!(
+            borrowed.outstanding(lease_id),
+            Some(0),
+            "the texture hold is retired once the pass is terminal"
+        );
+
+        // A rail that had snapshotted the owner's window at import time — or
+        // that had uploaded it into its own texture while building the pass —
+        // would keep sampling the first texels; the rewrite reaches every texel
+        // the draw reads instead.
+        let rewritten = rewritten_sampled_texels();
+        owner_texture.write(&rewritten);
+        let retains = RenderInputRetains::retain(&borrowed, &plan).expect("the hold is taken");
+        let readback = encode_offscreen_render(&device, &queue, &plan)
+            .expect("the rewritten owner window still samples");
+        drop(retains);
+        let rewritten_attachment = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!(
+            "owner-rewritten texture window readback: {}",
+            hex(&rewritten_attachment)
+        );
+        assert_eq!(
+            rewritten_attachment,
+            rewritten,
+            "the sampled texels follow the owner's rewritten pages: {}",
+            hex(&rewritten_attachment)
+        );
+
+        // A released import is the registry's own refusal, the same name the
+        // host-side tests assert without a device.
+        borrowed
+            .release(lease_id)
+            .expect("the owner's texture window is released");
+        let error = plan_with_leases(&request, Some(&leases), 0, 0)
             .expect_err("a released no-copy import cannot be resolved");
         assert_eq!(error.slug, "lease_not_imported");
     }

@@ -39,7 +39,8 @@ use metal_api_core::provider::{
     RenderPassBlend, RenderPassCull, RenderPassDescriptor, RenderPipelineContract,
     ResourceTableSnapshot, Retryability, SampleCount, StencilCompare, StencilLoadOp, StencilOp,
     StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
-    VertexBufferLayout, VertexFormat, VertexStep, Winding, MAX_RENDER_TEXTURES,
+    TextureView, VertexBufferLayout, VertexFormat, VertexStep, ViewId, Winding,
+    MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -566,19 +567,23 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     pub textures: Vec<OffscreenRenderTexture<'a>>,
 }
 
-/// One sampled texture a render pass binds: the trace's own texel bytes plus
+/// One sampled texture a render pass binds: the source of its texel bytes plus
 /// the shape the rail executes them with (`research/docs/23` §3.3, v70).
 ///
 /// The entry's position in [`OffscreenRenderRequest::textures`] is the binding
 /// index — the contract already held the view's own label to it — and the rail
 /// uploads these bytes into an image of its own, exactly as the compute rail
-/// uploads a pass's texture bindings. The first increment executes one
-/// `rgba8_unorm` 2D surface whose extent matches the render area, so every
-/// fragment stands on a texel centre and the nearest sample is an identity
-/// copy rather than a filtered or boundary-dependent read.
+/// uploads a pass's texture bindings; the no-copy arm imports the owner's own
+/// pages as the copy's transfer source instead (`research/docs/23` §75, R5c).
+/// The first increment executes one `rgba8_unorm` 2D surface whose extent
+/// matches the render area, so every fragment stands on a texel centre and the
+/// nearest sample is an identity copy rather than a filtered or
+/// boundary-dependent read.
 pub(crate) struct OffscreenRenderTexture<'a> {
-    /// The texture's tightly packed, row-major texel bytes.
-    pub bytes: &'a [u8],
+    /// Where the texture's tightly packed, row-major texel bytes come from.
+    /// The three arms are the three [`TextureSource`] arms, resolved before any
+    /// device object exists.
+    pub source: RenderInputSource<'a>,
     /// Extent in texels, which the pass requires to equal the render area
     /// (`prepare_render_request` refuses the pass otherwise).
     pub extent: [u32; 2],
@@ -2024,7 +2029,7 @@ fn prepare_render_request<'a>(
     // one `rgba8_unorm` surface whose extent matches the render area, so a
     // fragment standing on a texel centre reads that texel's own bytes rather
     // than a filtered or boundary-rule-dependent neighbour.
-    let textures = resolve_render_textures(pass, extent)?;
+    let textures = resolve_render_textures(pass, extent, leases)?;
     let streams = resolve_vertex_streams(stages, pass, leases)?;
     // A per-instance stream's record count is the draw's instance count, so its
     // footprint is proved against that count instead of the vertex span
@@ -2224,14 +2229,23 @@ fn prepare_render_request<'a>(
 /// single-sample requirement (`RenderPassDescriptor::validate`); this is the
 /// rail's own window, restated for a directly-constructed pass and narrowed to
 /// what the reviewed sampling module covers: one `rgba8_unorm` 2D surface,
-/// trace-owned bytes, whose extent equals the render area. The extent rule is
-/// what keeps the fixture's expectation driver-independent — a texture of
-/// another size puts some fragment's `(column + 0.5) / width` sample either on
-/// a texel boundary or inside a neighbour, which is a filtered read the review
-/// never covered, so the pass is refused by name instead of sampled.
+/// whose extent equals the render area. The extent rule is what keeps the
+/// fixture's expectation driver-independent — a texture of another size puts
+/// some fragment's `(column + 0.5) / width` sample either on a texel boundary
+/// or inside a neighbour, which is a filtered read the review never covered, so
+/// the pass is refused by name instead of sampled.
+///
+/// The texture's bytes are resolved through the same three-arm channel the
+/// streams and the loading attachments use (`research/docs/23` §75, R5c): the
+/// trace's own bytes, the provider's staged copy of an owner lease, or the
+/// owner's own mapping. The resolution runs before the first device object
+/// exists, and the window a lease resolves to has to be the texture's own
+/// tightly packed extent — the shape the trace-owned arm's `validate_shape`
+/// already holds.
 fn resolve_render_textures<'a>(
     pass: &'a RenderPassDescriptor,
     extent: [u32; 2],
+    leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
@@ -2265,11 +2279,7 @@ fn resolve_render_textures<'a>(
                 .with_field("array_length", FieldValue::Unsigned(view.array_length))
                 .with_detail("the reviewed sampling module reads a single-sample 2D surface"));
         }
-        let TextureSource::OwnedBytes(bytes) = &view.source else {
-            return Err(capability_refusal("render_texture_source_unsupported")
-                .with_field("binding", FieldValue::Unsigned(index as u64))
-                .with_detail("the first render-sampler increment uploads trace-owned bytes only"));
-        };
+        let source = resolve_render_texture_source(view, leases, index)?;
         let width = narrow_dimension(view.width)?;
         let height = narrow_dimension(view.height)?;
         if width == 0 || height == 0 {
@@ -2291,14 +2301,14 @@ fn resolve_render_textures<'a>(
             .checked_mul(u64::from(height))
             .and_then(|texels| texels.checked_mul(view.format.bytes_per_texel()))
             .ok_or_else(|| contract_refusal("render texture bytes overflow u64"))?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected {
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) != expected {
             return Err(contract_refusal(&format!(
-                "render texture {index} carries {} bytes for a {width}x{height} surface",
-                bytes.len()
+                "render texture {index} resolves {} bytes for a {width}x{height} surface",
+                source.len()
             )));
         }
         textures.push(OffscreenRenderTexture {
-            bytes,
+            source,
             extent: [width, height],
         });
     }
@@ -2333,6 +2343,9 @@ enum RenderInputRole {
     /// The previous contents a `LoadOp::Load` attachment uploads
     /// (`research/docs/23` §74, R5b).
     Attachment,
+    /// A sampled texture the pass's fragment stage reads
+    /// (`research/docs/23` §75, R5c).
+    Texture,
 }
 
 impl RenderInputRole {
@@ -2342,21 +2355,24 @@ impl RenderInputRole {
     /// slug; the attachment name is the source-arm sibling the sampler
     /// publishes (`render_texture_source_unsupported`), because what could not
     /// be read is the attachment's own prior contents rather than a load
-    /// operation the contract refuses.
+    /// operation the contract refuses, and the texture role keeps that sampler
+    /// name itself (`research/docs/23` §75, R5c).
     const fn slug(self) -> &'static str {
         match self {
             Self::Vertex => "render_vertex_buffer_unsupported",
             Self::Index => "render_index_buffer_unsupported",
             Self::Attachment => "render_attachment_load_source_unsupported",
+            Self::Texture => "render_texture_source_unsupported",
         }
     }
 
     /// The field this role's own slot is reported under: a stream or an index
-    /// buffer is a *binding* of the pipeline's layout, while an attachment's
-    /// previous contents are named by their location.
+    /// buffer is a *binding* of the pipeline's layout, a texture is the
+    /// *binding* its view's own label holds it to (`docs/23` §3.3, v70), while
+    /// an attachment's previous contents are named by their location.
     const fn slot_field(self) -> &'static str {
         match self {
-            Self::Vertex | Self::Index => "binding",
+            Self::Vertex | Self::Index | Self::Texture => "binding",
             Self::Attachment => "attachment",
         }
     }
@@ -2481,7 +2497,7 @@ fn resolve_render_input<'a>(
                 )
             })?;
             if leases.host_import_alignment == 0 {
-                return Err(host_import_refusal(role, slot, view));
+                return Err(host_import_refusal(role, slot, view.view_id));
             }
             let window = leases.borrowed.view_pointer(
                 *lease_id,
@@ -2541,7 +2557,85 @@ fn resolve_attachment_load<'a>(
     Ok(source)
 }
 
-/// One render input whose source this rail cannot read (`docs/23` §71/§74).
+/// Resolve one sampled texture's bytes into the source the rail uploads or
+/// imports (`research/docs/23` §75, R5c).
+///
+/// The render sampler's third declaration of the same three arms: a texture
+/// carries its whole byte extent (no offset and length, unlike a buffer view),
+/// so the lease window is the texture's own tightly packed extent at the
+/// reservation's start — the window rule core's registries state for
+/// `TextureSource`. `OwnedBytes` behaves byte for byte as before, a
+/// `StagedLease` uploads the provider's own copy of the owner's window, and a
+/// `BorrowedNoCopy` imports the owner's pages, so `vkCmdCopyBufferToImage`
+/// reads what the owner wrote rather than a snapshot of it.
+fn resolve_render_texture_source<'a>(
+    view: &'a TextureView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    binding: usize,
+) -> Result<RenderInputSource<'a>, ProviderError> {
+    match &view.source {
+        TextureSource::OwnedBytes(bytes) => Ok(RenderInputSource::TraceBytes(bytes)),
+        TextureSource::StagedLease(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    RenderInputRole::Texture,
+                    binding,
+                    "staged_lease",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     texture cannot be read",
+                )
+            })?;
+            let bytes = leases.staging.texture_bytes(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            Ok(RenderInputSource::StagedBytes(bytes))
+        }
+        TextureSource::BorrowedNoCopy(lease_id) => {
+            let leases = leases.ok_or_else(|| {
+                render_input_refusal(
+                    RenderInputRole::Texture,
+                    binding,
+                    "borrowed_no_copy",
+                    "the render submission carries no lease channel, so a lease-backed render \
+                     texture cannot be read",
+                )
+            })?;
+            if leases.host_import_alignment == 0 {
+                return Err(host_import_refusal(
+                    RenderInputRole::Texture,
+                    binding,
+                    view.view_id,
+                ));
+            }
+            let window = leases.borrowed.texture_pointer(
+                *lease_id,
+                view,
+                leases.device_epoch,
+                leases.resources,
+            )?;
+            let alignment = usize::try_from(leases.host_import_alignment).unwrap_or(usize::MAX);
+            if !window.pointer.is_multiple_of(alignment) {
+                return Err(lease_alignment_refusal(
+                    *lease_id,
+                    window.pointer,
+                    leases.host_import_alignment,
+                    RenderInputRole::Texture,
+                    binding,
+                ));
+            }
+            Ok(RenderInputSource::Borrowed {
+                lease: *lease_id,
+                window,
+            })
+        }
+    }
+}
+
+/// One render input whose source this rail cannot read
+/// (`docs/23` §71/§74/§75).
 fn render_input_refusal(
     role: RenderInputRole,
     slot: usize,
@@ -2559,10 +2653,10 @@ fn render_input_refusal(
 /// The slug is the same one core admission and the compute rail publish for an
 /// unsupported storage mode, so a capture reads one name for one fact: this
 /// device cannot bind owner memory without copying it.
-fn host_import_refusal(role: RenderInputRole, slot: usize, view: &BufferView) -> ProviderError {
+fn host_import_refusal(role: RenderInputRole, slot: usize, view: ViewId) -> ProviderError {
     capability_refusal("storage_mode_unsupported")
         .with_field(role.slot_field(), FieldValue::Unsigned(slot as u64))
-        .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+        .with_field("view", FieldValue::Unsigned(view.get()))
         .with_field(
             "storage_mode",
             FieldValue::Text("borrowed_no_copy".to_owned()),
@@ -3196,6 +3290,16 @@ impl RenderInputRetains {
                 if let Some(lease) = source.borrowed_lease() {
                     lease_ids.push(lease);
                 }
+            }
+        }
+        // A sampled texture whose bytes come from an owner's mapping is the
+        // fourth (`research/docs/23` §75, R5c), one hold per window: the
+        // imported transfer source reads those pages until the pass's fence
+        // signals, so a pass that binds several textures retains each lease
+        // once per window it appears in.
+        for texture in &request.textures {
+            if let Some(lease) = texture.source.borrowed_lease() {
+                lease_ids.push(lease);
             }
         }
         if lease_ids.is_empty() {
@@ -4690,11 +4794,23 @@ struct OffscreenObjects<'a> {
 /// provider-synthesised nearest/clamp sampler the descriptor binds. The bytes
 /// are written once, when the pass's objects are created, and the `record`
 /// step's barrier is what makes them visible to the fragment stage.
+///
+/// A no-copy texture's image is device-local instead (`research/docs/23` §75,
+/// R5c), and `copy_source` carries the owner's imported window the `record`
+/// step's `vkCmdCopyBufferToImage` reads it from. The buffer and its memory are
+/// the pass's own, like the image beside them.
 struct SampledTextureObjects {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     sampler: vk::Sampler,
+    /// The extent the image was created with, which is also the region the
+    /// no-copy arm's `vkCmdCopyBufferToImage` covers (`research/docs/23` §75,
+    /// R5c).
+    extent: [u32; 2],
+    /// The owner-window buffer a no-copy texture is copied out of, or `None`
+    /// for the two uploaded arms.
+    copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 /// The Vulkan objects the rail-owned depth attachment owns
@@ -6156,17 +6272,117 @@ impl<'a> OffscreenObjects<'a> {
         Ok(())
     }
 
+    /// Write tightly packed texel rows into one host-visible `LINEAR` image.
+    ///
+    /// The two uploaded arms' half of [`Self::create_render_textures`],
+    /// unchanged from the pre-lease increments: the source bytes are tightly
+    /// packed `width * 4`-byte rows, while the driver's `row_pitch` is where
+    /// each row actually starts. Writing row `r` at `r * width * 4` would land
+    /// every row after the first in bytes the driver never reads, the same trap
+    /// the compute rail's upload documents. A failure disposes the image and
+    /// its memory, because nothing else owns them yet.
+    fn upload_render_texture(
+        &self,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        requirements: &vk::MemoryRequirements,
+        width: u32,
+        height: u32,
+        texels: &[u8],
+    ) -> Result<(), ProviderError> {
+        let mapped = match unsafe {
+            self.context.device.map_memory(
+                memory,
+                0,
+                requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                unsafe {
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(execution_refusal(
+                    "map render texture memory",
+                    &error.to_string(),
+                ));
+            }
+        };
+        let tight_row_bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| {
+                unsafe {
+                    self.context.device.unmap_memory(memory);
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                contract_refusal("render texture row pitch overflows usize")
+            })?;
+        let (base_offset, row_pitch) = if height == 1 {
+            (0, tight_row_bytes)
+        } else {
+            let layout = unsafe {
+                self.context.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            (
+                usize::try_from(layout.offset)
+                    .map_err(|_| contract_refusal("render texture row offset overflows"))?,
+                usize::try_from(layout.row_pitch)
+                    .map_err(|_| contract_refusal("render texture row pitch overflows"))?,
+            )
+        };
+        for (row, chunk) in texels.chunks(tight_row_bytes).enumerate() {
+            let destination = base_offset + row * row_pitch;
+            if destination + chunk.len() > usize::try_from(requirements.size).unwrap_or(0) {
+                unsafe {
+                    self.context.device.unmap_memory(memory);
+                    self.context.device.destroy_image(image, None);
+                    self.context.device.free_memory(memory, None);
+                }
+                return Err(contract_refusal(
+                    "render texture rows reach past the image's own allocation",
+                ));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    (mapped.cast::<u8>()).add(destination),
+                    chunk.len(),
+                );
+            }
+        }
+        unsafe { self.context.device.unmap_memory(memory) };
+        Ok(())
+    }
+
     /// Upload one pass's sampled textures and build the descriptor the fragment
     /// stage reads them through (`research/docs/23` §3.3, v70).
     ///
-    /// The rail mirrors the compute track's texture handling: a host-visible
-    /// `LINEAR` image per binding, written through the driver's own
-    /// `VkSubresourceLayout.row_pitch` (a linear image's rows are only *at
-    /// least* the tightly packed width apart), and a provider-synthesised
-    /// nearest/clamp sampler. The image stays in `PREINITIALIZED` until
-    /// [`Self::record`] transitions it, which is where the host writes become
-    /// visible to the fragment stage — the same two-step shape the compute
-    /// rail's own upload uses.
+    /// The rail mirrors the compute track's texture handling for the two
+    /// uploaded arms: a host-visible `LINEAR` image per binding, written
+    /// through the driver's own `VkSubresourceLayout.row_pitch` (a linear
+    /// image's rows are only *at least* the tightly packed width apart), and a
+    /// provider-synthesised nearest/clamp sampler. The image stays in
+    /// `PREINITIALIZED` until [`Self::record`] transitions it, which is where
+    /// the host writes become visible to the fragment stage — the same two-step
+    /// shape the compute rail's own upload uses.
+    ///
+    /// The no-copy arm cannot upload host bytes at all: writing the owner's
+    /// mapping into the rail's own image here would freeze the pages at the
+    /// moment the pass was built, which is exactly the snapshot R5c's
+    /// falsification refuses (`research/docs/23` §75). It imports the owner's
+    /// window as a `TRANSFER_SRC` buffer instead, and [`Self::record`] issues
+    /// the `vkCmdCopyBufferToImage` that reads those pages at execution time.
     fn create_render_textures(
         &mut self,
         textures: &[OffscreenRenderTexture<'_>],
@@ -6177,6 +6393,10 @@ impl<'a> OffscreenObjects<'a> {
         let format = vk::Format::R8G8B8A8_UNORM;
         for texture in textures {
             let [width, height] = texture.extent;
+            // The no-copy arm's image is a transfer destination, never a host
+            // write: the device copy lands in it, so it lives in device-local
+            // `OPTIMAL` memory and starts undefined.
+            let borrowing = matches!(texture.source, RenderInputSource::Borrowed { .. });
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
@@ -6188,86 +6408,72 @@ impl<'a> OffscreenObjects<'a> {
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::LINEAR)
-                .usage(vk::ImageUsageFlags::SAMPLED)
+                .tiling(if borrowing {
+                    vk::ImageTiling::OPTIMAL
+                } else {
+                    vk::ImageTiling::LINEAR
+                })
+                .usage(
+                    vk::ImageUsageFlags::SAMPLED
+                        | if borrowing {
+                            vk::ImageUsageFlags::TRANSFER_DST
+                        } else {
+                            vk::ImageUsageFlags::empty()
+                        },
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::PREINITIALIZED);
+                .initial_layout(if borrowing {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::PREINITIALIZED
+                });
             let (image, memory, requirements) = crate::allocate_image_backing(
                 self.context,
                 &info,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                if borrowing {
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                } else {
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+                },
                 "render texture",
             )
             .map_err(|error| execution_refusal("create render texture image", &error.detail))?;
-            let mapped = unsafe {
-                self.context.device.map_memory(
-                    memory,
-                    0,
-                    requirements.size,
-                    vk::MemoryMapFlags::empty(),
-                )
-            }
-            .map_err(|error| {
-                unsafe {
-                    self.context.device.destroy_image(image, None);
-                    self.context.device.free_memory(memory, None);
-                }
-                execution_refusal("map render texture memory", &error.to_string())
-            })?;
-            // The owned bytes are tightly packed `width * 4` byte rows; the
-            // driver's `row_pitch` is where each row actually starts. Writing
-            // row `r` at `r * width * 4` would land every row after the first
-            // in bytes the driver never reads, the same trap the compute
-            // rail's upload documents.
-            let tight_row_bytes = usize::try_from(width)
-                .ok()
-                .and_then(|width| width.checked_mul(4))
-                .ok_or_else(|| contract_refusal("render texture row pitch overflows usize"))?;
-            let (base_offset, row_pitch) = if height == 1 {
-                (0, tight_row_bytes)
-            } else {
-                let layout = unsafe {
-                    self.context.device.get_image_subresource_layout(
-                        image,
-                        vk::ImageSubresource {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            array_layer: 0,
-                        },
-                    )
-                };
-                (
-                    usize::try_from(layout.offset)
-                        .map_err(|_| contract_refusal("render texture row offset overflows"))?,
-                    usize::try_from(layout.row_pitch)
-                        .map_err(|_| contract_refusal("render texture row pitch overflows"))?,
-                )
-            };
-            for (row, chunk) in texture.bytes.chunks(tight_row_bytes).enumerate() {
-                let destination = base_offset + row * row_pitch;
-                if destination + chunk.len() > usize::try_from(requirements.size).unwrap_or(0) {
-                    unsafe {
-                        self.context.device.unmap_memory(memory);
-                        self.context.device.destroy_image(image, None);
-                        self.context.device.free_memory(memory, None);
+            // The imported buffer's lifetime is the pass's: the copy reads it
+            // until the fence signals, so it is destroyed with the image.
+            let copy_source = match &texture.source {
+                RenderInputSource::Borrowed { window, .. } => {
+                    match self.import_host_pointer_buffer(
+                        window,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        "render texture",
+                    ) {
+                        Ok(source) => Some(source),
+                        Err(error) => {
+                            unsafe {
+                                self.context.device.destroy_image(image, None);
+                                self.context.device.free_memory(memory, None);
+                            }
+                            return Err(error);
+                        }
                     }
-                    return Err(contract_refusal(
-                        "render texture rows reach past the image's own allocation",
-                    ));
                 }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        chunk.as_ptr(),
-                        (mapped.cast::<u8>()).add(destination),
-                        chunk.len(),
-                    );
+                RenderInputSource::TraceBytes(bytes) => {
+                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    None
                 }
-            }
-            unsafe { self.context.device.unmap_memory(memory) };
+                RenderInputSource::StagedBytes(bytes) => {
+                    self.upload_render_texture(image, memory, &requirements, width, height, bytes)?;
+                    None
+                }
+            };
             let view =
                 crate::create_color_image_view(self.context, image, format, "render texture")
                     .map_err(|error| {
                         unsafe {
+                            if let Some((buffer, buffer_memory)) = copy_source {
+                                self.context.device.destroy_buffer(buffer, None);
+                                self.context.device.free_memory(buffer_memory, None);
+                            }
                             self.context.device.destroy_image(image, None);
                             self.context.device.free_memory(memory, None);
                         }
@@ -6283,19 +6489,28 @@ impl<'a> OffscreenObjects<'a> {
             let sampler = unsafe { self.context.device.create_sampler(&sampler_info, None) }
                 .map_err(|error| {
                     unsafe {
+                        if let Some((buffer, buffer_memory)) = copy_source {
+                            self.context.device.destroy_buffer(buffer, None);
+                            self.context.device.free_memory(buffer_memory, None);
+                        }
                         self.context.device.destroy_image_view(view, None);
                         self.context.device.destroy_image(image, None);
                         self.context.device.free_memory(memory, None);
                     }
                     execution_refusal("create render texture sampler", &error.to_string())
                 })?;
-            self.context.record_buffer_upload();
-            self.context.record_buffer_upload_bytes(texture.bytes.len());
+            if copy_source.is_none() {
+                self.context.record_buffer_upload();
+                self.context
+                    .record_buffer_upload_bytes(texture.source.len());
+            }
             self.textures.push(SampledTextureObjects {
                 image,
                 memory,
                 view,
                 sampler,
+                extent: [width, height],
+                copy_source,
             });
         }
         // The descriptor set layout is the sampled pipeline's own: one
@@ -7467,20 +7682,89 @@ impl<'a> OffscreenObjects<'a> {
         // transition needs only the new layout, not an access scope — the same
         // two-step shape the compute rail's own texture upload records
         // (`research/docs/23` §3.3, v70).
+        //
+        // A no-copy texture is entered by the device copy instead
+        // (`research/docs/23` §75, R5c): the image starts `UNDEFINED`, the
+        // first barrier hands the transfer stage a `TRANSFER_DST_OPTIMAL`
+        // destination, `vkCmdCopyBufferToImage` reads the owner's own pages the
+        // pass imported, and the second barrier publishes those texels to the
+        // fragment stage that samples them.
         for texture in &self.textures {
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            if let Some((buffer, _)) = texture.copy_source {
+                let [width, height] = texture.extent;
+                unsafe {
+                    self.context.device.cmd_pipeline_barrier(
+                        self.command,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(texture.image)
+                            .subresource_range(subresource)],
+                    );
+                    let copy = vk::BufferImageCopy::default()
+                        .buffer_offset(0)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        });
+                    self.context.device.cmd_copy_buffer_to_image(
+                        self.command,
+                        buffer,
+                        texture.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        std::slice::from_ref(&copy),
+                    );
+                    self.context.device.cmd_pipeline_barrier(
+                        self.command,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(texture.image)
+                            .subresource_range(subresource)
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+                    );
+                }
+                continue;
+            }
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::PREINITIALIZED)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(texture.image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
+                .subresource_range(subresource);
             unsafe {
                 self.context.device.cmd_pipeline_barrier(
                     self.command,
@@ -7884,6 +8168,17 @@ impl<'a> Drop for OffscreenObjects<'a> {
                 }
                 if texture.memory != vk::DeviceMemory::null() {
                     self.context.device.free_memory(texture.memory, None);
+                }
+                // The no-copy arm's imported window is the pass's own too
+                // (`research/docs/23` §75, R5c): the object is destroyed once
+                // the pass is terminal, exactly like the image it fed.
+                if let Some((buffer, memory)) = texture.copy_source {
+                    if buffer != vk::Buffer::null() {
+                        self.context.device.destroy_buffer(buffer, None);
+                    }
+                    if memory != vk::DeviceMemory::null() {
+                        self.context.device.free_memory(memory, None);
+                    }
                 }
             }
             if self.descriptor_pool != vk::DescriptorPool::null() {
@@ -8442,7 +8737,7 @@ mod tests {
             .expect("the reviewed sampling shape is admitted");
         assert_eq!(request.textures.len(), 1);
         assert_eq!(request.textures[0].extent, [4, 4]);
-        assert_eq!(request.textures[0].bytes.len(), 64);
+        assert_eq!(request.textures[0].source.len(), 64);
 
         // Another extent puts some fragment's sample on a texel boundary or
         // inside a neighbour, which is a filtered read the review never
@@ -11000,5 +11295,350 @@ mod tests {
             refused.fields.get("resolved_bytes"),
             Some(&FieldValue::Unsigned(32))
         );
+    }
+
+    /// The sampled texture a lease resolves, as the resolution fixtures build
+    /// it: the reviewed 4x4 `rgba8_unorm` surface with a lease source over
+    /// `allocation` (`docs/23` §75, R5c).
+    fn leased_sampled_texture_view(source: TextureSource, allocation: AllocationId) -> TextureView {
+        let mut view = sampled_texture_view(4, 4);
+        view.allocation_id = allocation;
+        view.source = source;
+        view
+    }
+
+    /// A sampled texture's bytes resolve through the same three arms a stream's
+    /// do (`docs/23` §75, R5c).
+    ///
+    /// The staged arm is the resolution the ownership states: the texture names
+    /// an imported lease and the rail reads the provider's own copy of it,
+    /// while the window itself is the texture's own extent at the reservation's
+    /// start — a page-aligned reservation larger than the texture is padding,
+    /// not a second declaration.
+    #[test]
+    fn a_staged_lease_render_texture_resolves_into_the_providers_copy() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(31);
+        let allocation = AllocationId::new(47);
+        // Four kilobytes, as the import rules make owners reserve: only the
+        // first sixty-four bytes are the texture.
+        let reservation = lease_registration(lease_id, allocation, 4096, epoch);
+        let mut texels = vec![0x2b; 4096];
+        for (index, byte) in texels.iter_mut().enumerate().take(64) {
+            *byte = index as u8;
+        }
+        let staged = LeaseRegistry::new();
+        staged
+            .import(
+                StagedLease::new(reservation, texels.clone())
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 4096,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers the texture");
+        let leases = attachment_lease_context(&staged, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::StagedLease(lease_id),
+            allocation,
+        )];
+        let request = prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0)
+            .expect("the staged copy carries the texture's texels");
+        let [texture] = request.textures.as_slice() else {
+            panic!("the sampled pass carries one texture");
+        };
+        let RenderInputSource::StagedBytes(bytes) = &texture.source else {
+            panic!(
+                "a staged lease resolves into the provider's own copy: {:?}",
+                texture.source
+            );
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            &texels[..64],
+            "the window is the texture's own extent at the reservation's start"
+        );
+        assert!(
+            RenderInputRetains::retain(Some(&leases), &request)
+                .expect("a staged arm takes no hold")
+                .is_none(),
+            "a staged copy has no owner mapping to retain"
+        );
+
+        // The staged copy is the provider's, so releasing it is what makes the
+        // same declaration unreadable, under the registry's own name.
+        staged
+            .release(lease_id)
+            .expect("the staged copy is released");
+        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a released staged lease cannot be read"),
+        };
+        eprintln!("released staged texture lease refused: {refused:?}");
+        assert_eq!(refused.slug, "lease_not_imported");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+    }
+
+    /// A sampled texture whose declaration names a lease the rail cannot
+    /// resolve is refused under the sampler's own source name, the same one the
+    /// loading attachment's source arm publishes (`docs/23` §75, R5c).
+    #[test]
+    fn a_render_texture_is_refused_without_a_lease_channel() {
+        let allocation = AllocationId::new(47);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::BorrowedNoCopy(LeaseId::new(32)),
+            allocation,
+        )];
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a lease cannot be read without the registry that imported it"),
+        };
+        eprintln!("no channel: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_source_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+
+        // The staged arm keeps the same name and states its own storage mode:
+        // one fact, one slug, whichever lease form arrived.
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::StagedLease(LeaseId::new(33)),
+            allocation,
+        )];
+        let refused = match prepare_render_request(&stages, &pass, &[None], None, 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a staged lease cannot be read without its registry"),
+        };
+        eprintln!("no channel: {refused:?}");
+        assert_eq!(refused.slug, "render_texture_source_unsupported");
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
+    }
+
+    /// A borrowed texture on a device that does not import host memory is
+    /// refused under the storage mode's published name, with the role that
+    /// could not be bound (`docs/23` §75, R5c).
+    #[test]
+    fn a_borrowed_render_texture_is_refused_without_host_import() {
+        let epoch = DeviceEpoch::new(3);
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = ResourceTableSnapshot::new();
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 0);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::BorrowedNoCopy(LeaseId::new(34)),
+            AllocationId::new(47),
+        )];
+        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a device without host import cannot read the owner's window"),
+        };
+        eprintln!("no host import: {refused:?}");
+        assert_eq!(refused.slug, "storage_mode_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("role"),
+            Some(&FieldValue::Text(
+                "render_texture_source_unsupported".to_owned()
+            ))
+        );
+        // The texture's own view identity travels with the refusal, exactly as
+        // a stream's does.
+        assert_eq!(refused.fields.get("view"), Some(&FieldValue::Unsigned(83)));
+    }
+
+    /// An owner window whose address misses the device's host-import alignment
+    /// is refused by name before any Vulkan import exists (`docs/23` §75).
+    #[test]
+    fn a_borrowed_render_texture_is_refused_when_its_pointer_misses_the_alignment() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(35);
+        let allocation = AllocationId::new(47);
+        let reservation = lease_registration(lease_id, allocation, 4096, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 4096,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers the texture");
+        let borrowed = BorrowedLeaseRegistry::new();
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000 + 1)
+                    .expect("a non-null owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(borrowed);
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::BorrowedNoCopy(lease_id),
+            allocation,
+        )];
+        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a pointer one byte past the alignment cannot be imported"),
+        };
+        eprintln!("misaligned texture window: {refused:?}");
+        assert_eq!(refused.slug, "lease_alignment_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(35)));
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// The borrowed arm's window is the texture's own extent at the owner
+    /// reservation's start, and the pass holds that lease exactly once
+    /// (`docs/23` §75, R5c).
+    ///
+    /// Host side: no device exists, so the window is the registry's answer and
+    /// the hold is the registry's own count. The e2e fixture is what shows the
+    /// device reading those pages.
+    #[test]
+    fn a_borrowed_render_texture_resolves_into_the_owners_window() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(36);
+        let allocation = AllocationId::new(47);
+        let reservation = lease_registration(lease_id, allocation, 4096, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 4096,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers the texture");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000)
+                    .expect("an aligned non-null owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staging = LeaseRegistry::new();
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::BorrowedNoCopy(lease_id),
+            allocation,
+        )];
+        let request = prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0)
+            .expect("the owner's window resolves");
+        let [texture] = request.textures.as_slice() else {
+            panic!("the sampled pass carries one texture");
+        };
+        let RenderInputSource::Borrowed { lease, window } = &texture.source else {
+            panic!(
+                "a no-copy texture resolves into the owner's window: {:?}",
+                texture.source
+            );
+        };
+        assert_eq!(*lease, lease_id);
+        assert_eq!(window.pointer, 0x2000);
+        assert_eq!(
+            window.len, 64,
+            "the window is the texture's own extent, not the page-aligned reservation"
+        );
+        assert_eq!(
+            borrowed.outstanding(lease_id),
+            Some(0),
+            "resolution alone takes no hold"
+        );
+
+        // One hold per no-copy window, taken before the first import and given
+        // back at the fence: dropping the guard is this rail's retirement
+        // point, exactly as the provider drops it after the pass is terminal.
+        let retains = RenderInputRetains::retain(Some(&leases), &request)
+            .expect("the no-copy window is retained")
+            .expect("a no-copy texture takes a hold");
+        assert_eq!(borrowed.outstanding(lease_id), Some(1));
+        drop(retains);
+        assert_eq!(borrowed.outstanding(lease_id), Some(0));
+    }
+
+    /// A reservation that does not cover the texture's own extent is refused
+    /// under the registry's own range name instead of being read past its end
+    /// (`docs/23` §75, R5c).
+    #[test]
+    fn a_render_texture_refuses_a_reservation_that_misses_its_extent() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(37);
+        let allocation = AllocationId::new(47);
+        let reservation = lease_registration(lease_id, allocation, 32, epoch);
+        let staged = LeaseRegistry::new();
+        staged
+            .import(
+                StagedLease::new(reservation, vec![0x3c; 32])
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 32,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers the texture");
+        let leases = attachment_lease_context(&staged, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_sampled_stages();
+        let mut pass = sampled_pass(4);
+        pass.textures = vec![leased_sampled_texture_view(
+            TextureSource::StagedLease(lease_id),
+            allocation,
+        )];
+        let refused = match prepare_render_request(&stages, &pass, &[None], Some(&leases), 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a 4x4 texture reads sixty-four bytes, not thirty-two"),
+        };
+        eprintln!("short reservation refused: {refused:?}");
+        assert_eq!(refused.slug, "lease_range_out_of_bounds");
+        assert_eq!(refused.class, ProviderErrorClass::Resource);
+        assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(37)));
     }
 }
