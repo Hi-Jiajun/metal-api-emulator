@@ -2493,6 +2493,213 @@ fn a_borrowed_lease_vertex_stream_reads_the_owners_pages() {
     assert_eq!(refused.slug, "lease_not_imported");
 }
 
+/// The staged half of the attachment-load lease channel (`research/docs/23`
+/// §74, R5b): the previous contents a `LoadOp::Load` attachment uploads arrive
+/// as a staged lease instead of trace-owned bytes, and the pass lands
+/// byte-for-byte the attachment the owned fixture lands.
+#[test]
+fn a_staged_lease_attachment_load_renders_the_same_bytes_as_owned_bytes() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture_with_load(left_column_vertex_bytes(), quad_index_bytes(), true)
+    else {
+        return;
+    };
+    let owned = readback(
+        &submit_vertex_input(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+
+    let epoch = provider.device_epoch();
+    let lease = LeaseId::new(51);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: lease,
+            allocation_id: ATTACHMENT_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 16,
+    };
+    provider
+        .import_staged_lease(
+            StagedLease::new(reservation, ATTACHMENT_WORD.repeat(4))
+                .expect("the staged window carries one byte per declared byte"),
+        )
+        .expect("the provider stages the owner's previous bytes");
+
+    // The attachment's previous contents are the declaring view's own bytes, so
+    // the lease is named by the binding that declares that view — the compute
+    // pass's read — rather than by the render pass, which restates only the
+    // attachment's identity (`research/docs/23` §3.3).
+    let mut leased = trace.clone();
+    if let Some(TracePass::Compute(pass)) = leased.passes.first_mut() {
+        pass.buffers[0].source = BufferSource::StagedLease(lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_lease(reservation)
+        .expect("the attachment reservation covers its view");
+    let attachment = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!("staged attachment load: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the staged lease channel uploads the previous contents the owned fixture carries"
+    );
+
+    // The staged bytes are the provider's copy: releasing them is what the
+    // owner's ledger drives, and a submission after the release is refused by
+    // name instead of silently uploading the last copy it saw.
+    provider
+        .release_staged_lease(lease)
+        .expect("the staged attachment lease is released");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released staged lease cannot be read");
+    eprintln!("released staged attachment lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+    assert_eq!(refused.class, ProviderErrorClass::Args);
+}
+
+/// The no-copy half of the attachment-load lease channel (`research/docs/23`
+/// §74, R5b): the previous contents stay in the owner's own mapping, the
+/// device reads that mapping as the copy's transfer source, and the registry's
+/// hold is retired once the pass's fence has signalled.
+///
+/// The falsifications are the point: a rail that snapshotted the owner's window
+/// when the view was declared would keep uploading the first word after the
+/// owner rewrites the pages, and a rail whose upload read stale bytes could not
+/// show the owner's new word where the draw leaves a texel alone.
+#[test]
+fn a_borrowed_lease_attachment_load_reads_the_owners_pages() {
+    let Some((provider, trace, resources)) =
+        vertex_input_fixture_with_load(left_column_vertex_bytes(), quad_index_bytes(), true)
+    else {
+        return;
+    };
+    let alignment = provider.no_copy_alignment();
+    if alignment == 0 {
+        eprintln!("SKIP: the device does not import host memory");
+        return;
+    }
+    let owned = readback(
+        &submit_vertex_input(&provider, &trace, &resources),
+        ATTACHMENT_VIEW,
+    );
+
+    let mut owner_attachment = AlignedBuffer::new(16, alignment as usize);
+    owner_attachment
+        .as_mut_slice()
+        .copy_from_slice(&ATTACHMENT_WORD.repeat(4));
+
+    let epoch = provider.device_epoch();
+    let lease = LeaseId::new(52);
+    let reservation = LeaseReservation {
+        lease: BufferLease {
+            lease_id: lease,
+            allocation_id: ATTACHMENT_ALLOCATION,
+            owner_epoch: epoch,
+        },
+        offset: 0,
+        length: 16,
+    };
+    // SAFETY: the owner allocation outlives every submission below and the
+    // provider's release of the import.
+    unsafe {
+        provider
+            .import_borrowed_lease(
+                BorrowedLease::new(reservation, owner_attachment.as_ptr() as usize)
+                    .expect("the owner's attachment window is a valid reservation"),
+            )
+            .expect("the provider imports the owner's attachment window");
+    }
+
+    let mut leased = trace.clone();
+    if let Some(TracePass::Compute(pass)) = leased.passes.first_mut() {
+        pass.buffers[0].source = BufferSource::BorrowedNoCopy(lease);
+    }
+    let mut leased_resources = resources.clone();
+    leased_resources
+        .insert_lease(reservation)
+        .expect("the attachment reservation covers its view");
+    let attachment = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!("borrowed attachment load: {}", hex(&attachment));
+    assert_eq!(
+        attachment, owned,
+        "the no-copy channel uploads the owner's window and lands the owned fixture's bytes"
+    );
+
+    // The pass is synchronous, so its fence is the retirement evidence: the
+    // hold the attachment's own window took is back to zero.
+    let registry = provider.borrowed_registry();
+    assert_eq!(
+        registry.outstanding(lease),
+        Some(0),
+        "the attachment hold is retired once the fence signals"
+    );
+
+    // A device that had snapshotted the owner's pages at import would keep
+    // uploading the first word; the owner's rewrite reaches the two texels the
+    // draw leaves alone instead.
+    let rewritten_word = [0x55_u8, 0x66, 0x77, 0x88];
+    owner_attachment
+        .as_mut_slice()
+        .copy_from_slice(&rewritten_word.repeat(4));
+    let rewritten = readback(
+        &submit_vertex_input(&provider, &leased, &leased_resources),
+        ATTACHMENT_VIEW,
+    );
+    eprintln!(
+        "owner-rewritten attachment window readback: {}",
+        hex(&rewritten)
+    );
+    let covered = rewritten
+        .chunks_exact(4)
+        .filter(|texel| *texel == QUAD_TEXEL)
+        .count();
+    let loaded = rewritten
+        .chunks_exact(4)
+        .filter(|texel| *texel == rewritten_word)
+        .count();
+    assert_eq!(
+        (covered, loaded),
+        (2, 2),
+        "the owner's rewritten window is what the uncovered texels upload: {}",
+        hex(&rewritten)
+    );
+    assert!(
+        !rewritten
+            .chunks_exact(4)
+            .any(|texel| texel == ATTACHMENT_WORD),
+        "no texel keeps the pre-rewrite word a snapshot would have pinned: {}",
+        hex(&rewritten)
+    );
+
+    // Once the owner releases the import, the same declaration is refused by
+    // name instead of being read through a mapping the provider no longer owns.
+    registry
+        .release(lease)
+        .expect("no retain is outstanding after the fence");
+    let admitted = provider
+        .capabilities()
+        .validate_trace(leased.clone(), leased_resources)
+        .expect("the declaration stays well formed after the release");
+    let refused = provider
+        .submit(admitted)
+        .expect_err("a released no-copy lease cannot be read");
+    eprintln!("released borrowed attachment lease refused: {refused:?}");
+    assert_eq!(refused.slug, "lease_not_imported");
+}
+
 /// The reviewed sampling pair (`research/docs/23` §3.3, v70): the full-screen
 /// geometry with its `Location 0` uv varying, and the fragment stage that
 /// samples `DescriptorSet 0 / Binding 0` with it.

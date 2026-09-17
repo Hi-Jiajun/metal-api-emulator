@@ -1567,23 +1567,29 @@ fn render_input_refusal(
         .with_detail(detail)
 }
 
-/// Which of a pass's two render inputs a refusal is about.
+/// Which of a pass's render inputs a refusal is about.
 #[derive(Clone, Copy)]
 enum RenderInputRole {
     /// A vertex stream of the pass's layout.
     Vertex,
     /// The pass's index buffer.
     Index,
+    /// The previous contents a `LoadOp::Load` attachment uploads
+    /// (`research/docs/23` §74, R5b).
+    Attachment,
 }
 
 impl RenderInputRole {
     /// The capability slug this role's unreadable source is refused with. The
-    /// two names are the ones this rail published before the lease channel
-    /// existed, so a capture that could not read a stream keeps its slug.
+    /// two stream names are the ones this rail published before the lease
+    /// channel existed, so a capture that could not read a stream keeps its
+    /// slug; the attachment name is the one the Vulkan rail publishes for the
+    /// same source arm, so both rails answer a capture with one name.
     const fn slug(self) -> &'static str {
         match self {
             Self::Vertex => VERTEX_SLUG,
             Self::Index => INDEX_SLUG,
+            Self::Attachment => ATTACHMENT_LOAD_SLUG,
         }
     }
 }
@@ -1608,7 +1614,7 @@ pub(crate) struct RenderLeaseContext<'a> {
 }
 
 /// Where one render input's bytes come from (`research/docs/23` §72, R3d).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum PlannedInputSource<'a> {
     /// The bytes the view itself declares (`BufferSource::OwnedBytes`),
     /// unchanged from the pre-lease increments. The encoder uploads them into a
@@ -1857,6 +1863,17 @@ const VERTEX_SLUG: &str = "render_vertex_buffer_unsupported";
 /// Slug of an index stream this rail cannot read.
 const INDEX_SLUG: &str = "render_index_buffer_unsupported";
 
+/// Slug of a loading attachment's previous contents this rail cannot read
+/// (`research/docs/23` §74, R5b).
+///
+/// The two stream slugs above are the names this rail published before the
+/// lease channel existed; an attachment's previous contents are a third
+/// declaration the rail resolves through the same channel, so they get their
+/// own name rather than sharing the load operation's
+/// (`attachment_load_op_unsupported`, which still refuses a `Load` with no
+/// declaration at all).
+const ATTACHMENT_LOAD_SLUG: &str = "render_attachment_load_source_unsupported";
+
 /// One offscreen render pass to execute.
 ///
 /// The pass and the pipeline are the core values themselves, so this rail cannot
@@ -1874,10 +1891,13 @@ pub(crate) struct OffscreenRenderRequest<'a> {
     /// `[[stage_in]]` module ([`REVIEWED_DUAL_SOURCE`]) — so a caller cannot
     /// pair one shape's descriptor with another shape's module.
     pub(crate) source: &'a str,
-    /// One entry per colour attachment, in location order: the tightly packed
-    /// texels that attachment already holds, for [`LoadOp::Load`]. Required
-    /// exactly then, refused for a clear.
-    pub(crate) initial: Vec<Option<&'a [u8]>>,
+    /// One entry per colour attachment, in location order: where the tightly
+    /// packed texels that attachment already holds come from, for
+    /// [`LoadOp::Load`]. Required exactly then, refused for a clear. The source
+    /// is resolved by the caller ([`resolve_render_input`] through the lease
+    /// channel) or, on the trace path, by [`plan_trace_with_leases`] from the
+    /// attachment's declaring view (`research/docs/23` §74, R5b).
+    pub(crate) initial: Vec<Option<PlannedInputSource<'a>>>,
 }
 
 /// One sampled texture a render pass binds (`research/docs/23` §3.3, v70): the
@@ -1967,12 +1987,14 @@ pub(crate) struct RenderPlan<'a> {
 
 impl RenderPlan<'_> {
     /// The no-copy leases this pass's inputs read, in binding order
-    /// (`research/docs/23` §72, R3d).
+    /// (`research/docs/23` §72/§74, R3d/R5b).
     ///
     /// The list a submission retains before it maps a single owner window and
     /// retires once the pass's command buffer is terminal. One lease named by
     /// two streams appears twice, which is the retain count the registry needs:
-    /// both bindings read the same mapping.
+    /// both bindings read the same mapping. A loading attachment's previous
+    /// contents are the third input that can name one: the encoder uploads them
+    /// out of the owner's mapping, so the hold covers that window too.
     pub(crate) fn borrowed_leases(&self) -> Vec<LeaseId> {
         let mut leases = Vec::new();
         for stream in &self.vertex_streams {
@@ -1983,6 +2005,13 @@ impl RenderPlan<'_> {
         if let Some(index) = &self.indices {
             if let Some(lease) = index.source.borrowed_lease() {
                 leases.push(lease);
+            }
+        }
+        for attachment in &self.attachments {
+            if let Some(source) = &attachment.initial {
+                if let Some(lease) = source.borrowed_lease() {
+                    leases.push(lease);
+                }
             }
         }
         leases
@@ -2070,8 +2099,20 @@ pub(crate) struct PlannedAttachment<'a> {
     /// `DontCare` discards the attachment and yields no readback.
     pub(crate) store: RenderStoreAction,
     /// The tightly packed texels a [`LoadOp::Load`] uploads before the pass
-    /// opens; `None` for a clear.
-    pub(crate) initial: Option<&'a [u8]>,
+    /// opens, resolved to the window they come from (`research/docs/23` §74,
+    /// R5b); `None` for a clear. A no-copy source keeps the owner's own
+    /// mapping, so the upload reads the pages the footprint proof read and the
+    /// plan names the lease its submission has to retain.
+    pub(crate) initial: Option<PlannedInputSource<'a>>,
+}
+
+impl PlannedAttachment<'_> {
+    /// The bytes the encoder uploads for a loading attachment: the resolved
+    /// window itself, which for a no-copy source is the owner's own mapping
+    /// (`research/docs/23` §74, R5b).
+    pub(crate) fn initial_bytes(&self) -> Option<&[u8]> {
+        self.initial.as_ref().map(|source| source.proof_bytes())
+    }
 }
 
 /// Validate a render request against the contract and the rail's own allowlist.
@@ -2345,19 +2386,21 @@ pub(crate) fn plan_with_leases<'a>(
         );
     }
     let mut planned_attachments = Vec::with_capacity(attachments.len());
-    for (attachment, previous) in attachments.iter().zip(request.initial.iter().copied()) {
+    for (attachment, previous) in attachments.iter().zip(request.initial.iter().cloned()) {
         let format = pixel_format(attachment.format)?;
         let load = load_action(attachment.load, format)?;
         let store = store_action(attachment.store)?;
         let initial = match (load, previous, present) {
             (RenderLoadAction::Clear(_), None, _) => None,
             (RenderLoadAction::DontCare, None, _) => None,
-            (RenderLoadAction::Load, Some(bytes), _) if bytes.len() == texel_bytes => Some(bytes),
-            (RenderLoadAction::Load, Some(bytes), _) => {
+            (RenderLoadAction::Load, Some(source), _) if source.len() == texel_bytes => {
+                Some(source)
+            }
+            (RenderLoadAction::Load, Some(source), _) => {
                 return Err(
                     args_refusal("render_attachment_initial_mismatch").with_detail(format!(
                         "LoadOp::Load needs {texel_bytes} tightly packed bytes, got {}",
-                        bytes.len()
+                        source.len()
                     )),
                 );
             }
@@ -2793,36 +2836,39 @@ fn resolve_render_textures<'a>(
     Ok(textures)
 }
 
-/// The previous bytes an offscreen `LoadOp::Load` pass uploads before it opens.
+/// Where the previous contents an offscreen `LoadOp::Load` pass uploads before
+/// it opens come from (`research/docs/23` §74, R5b).
 ///
 /// The declaring case's view is the only channel that carries an attachment's
 /// previous contents: [`metal_api_core::provider::RenderAttachment`] restates
 /// the view's identity and shape and names no bytes, so a `Load` resolves them
-/// from what the declaration itself owns ([`BufferSource::OwnedBytes`])
-/// (`research/docs/23` §3.3). A lease-backed declaration carries bytes this rail
-/// does not hold, and the refusal reuses the slug, class and phase this rail and
-/// the Vulkan rail give an unexecutable load op
-/// (`crates/metal-api-vulkan/src/compute_provider.rs`, the `loading` branch).
+/// from the declaration itself — the bytes it owns
+/// ([`BufferSource::OwnedBytes`]), the provider's staged copy of an owner lease,
+/// or the owner's own mapping, which is the same three-arm resolution a render
+/// stream goes through ([`resolve_render_input`]). The no-copy arm keeps the
+/// owner's mapping, so the bytes the encoder uploads are the pages the owner
+/// wrote last — a snapshot-style import cannot pass that, and the plan names the
+/// lease its submission has to retain.
+///
 /// `Clear` and `DontCare` resolve no bytes: a clear writes every texel and a
 /// `DontCare` attachment declares its pre-pass contents undefined, so neither
 /// shape presets the attachment (`research/docs/23` §3.1, v20).
-pub(crate) fn previous_bytes(
+pub(crate) fn previous_source<'a>(
     load: LoadOp,
-    view: &BufferView,
-) -> Result<Option<&[u8]>, ProviderError> {
-    match (load, &view.source) {
-        (LoadOp::Load, BufferSource::OwnedBytes(bytes)) => Ok(Some(bytes.as_slice())),
-        (LoadOp::Load, other) => Err(capability_refusal("attachment_load_op_unsupported")
-            .with_field("load_op", FieldValue::Text("load".to_owned()))
-            .with_field(
-                "storage_mode",
-                FieldValue::Text(storage_mode_name(other).to_owned()),
-            )
-            .with_detail(
-                "the first `LoadOp::Load` increment uploads the bytes the declaring view \
-                 owns; a leased declaration has no path through this rail",
-            )),
-        (LoadOp::Clear(_) | LoadOp::DontCare, _) => Ok(None),
+    view: &'a BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    attachment: usize,
+) -> Result<Option<PlannedInputSource<'a>>, ProviderError> {
+    match load {
+        // The refusal carries the location it could not read, so a capture can
+        // tell which attachment of a multi-attachment pass the source arm
+        // belongs to.
+        LoadOp::Load => resolve_render_input(view, leases, RenderInputRole::Attachment)
+            .map(Some)
+            .map_err(|error| {
+                error.with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            }),
+        LoadOp::Clear(_) | LoadOp::DontCare => Ok(None),
     }
 }
 
@@ -3189,7 +3235,7 @@ pub(crate) fn plan_trace_with_leases<'a>(
         // declaration (`research/docs/23` §3.3).
         let mut landings = Vec::with_capacity(pass.color_attachments.len());
         let mut previous = Vec::with_capacity(pass.color_attachments.len());
-        for attachment in &pass.color_attachments {
+        for (index, attachment) in pass.color_attachments.iter().enumerate() {
             let landing = pool
                 .iter()
                 .find(|view| {
@@ -3208,17 +3254,19 @@ pub(crate) fn plan_trace_with_leases<'a>(
                          and this trace declares no buffer view covering the attachment",
                         )
                 })?;
-            // An offscreen `Load` uploads the bytes the declaring view owns
-            // before the pass opens. A present pass's `Load` keeps the target's
-            // own initial state, which the present path supplies, so it
-            // resolves no bytes (`research/docs/24` §3.1).
-            let bytes = if pass.present.is_none() {
-                previous_bytes(attachment.load, landing)?
+            // An offscreen `Load` uploads the contents the declaring view
+            // carries before the pass opens — its own bytes, a staged lease's
+            // copy, or the owner's mapping (`research/docs/23` §74, R5b). A
+            // present pass's `Load` keeps the target's own initial state, which
+            // the present path supplies, so it resolves no bytes
+            // (`research/docs/24` §3.1).
+            let source = if pass.present.is_none() {
+                previous_source(attachment.load, landing, leases, index)?
             } else {
                 None
             };
             landings.push(landing);
-            previous.push(bytes);
+            previous.push(source);
         }
         // The stored depth attachment's landing view, resolved before the pass
         // runs for the same reason the colour ones are: the texels it receives
@@ -4064,8 +4112,12 @@ fn attachment_textures(
     let mut textures = Vec::with_capacity(planned.attachments.len());
     for attachment in &planned.attachments {
         let texture = present_target_texture(device, attachment.format, planned.extent)?;
-        if let Some(bytes) = attachment.initial {
-            upload_texels(&texture, planned, bytes);
+        // The upload reads the resolved window, which for a no-copy source is
+        // the owner's own mapping: an owner that rewrites its pages after the
+        // import changes what the preset uploads, exactly as it changes what a
+        // bound stream reads (`research/docs/23` §74, R5b).
+        if let Some(source) = &attachment.initial {
+            upload_texels(&texture, planned, source.proof_bytes());
         }
         textures.push(texture);
     }
@@ -4842,7 +4894,7 @@ mod tests {
             pass,
             pipeline,
             source: REVIEWED_SOURCE,
-            initial: vec![initial],
+            initial: vec![initial.map(PlannedInputSource::Declared)],
         }
     }
 
@@ -5045,7 +5097,7 @@ mod tests {
         // 2x2 texels of a 4-byte format: 16 bytes, two rows of 8.
         assert_eq!(planned.texel_bytes, 16);
         assert_eq!(planned.row_pitch, 8);
-        assert_eq!(attachment.initial, None);
+        assert_eq!(attachment.initial_bytes(), None);
         let RenderLoadAction::Clear(components) = attachment.load else {
             panic!("the milestone clears its attachment");
         };
@@ -5337,8 +5389,8 @@ mod tests {
         assert!(matches!(second.load, RenderLoadAction::Clear(_)));
         assert_eq!(first.store, RenderStoreAction::Store);
         assert_eq!(second.store, RenderStoreAction::Store);
-        assert_eq!(first.initial, None);
-        assert_eq!(second.initial, None);
+        assert_eq!(first.initial_bytes(), None);
+        assert_eq!(second.initial_bytes(), None);
         assert_eq!(planned.texel_bytes, 16);
         assert_eq!(planned.row_pitch, 8);
     }
@@ -5763,7 +5815,8 @@ mod tests {
         assert_eq!(planned.attachments.len(), 1);
         assert_eq!(planned.attachments[0].load, RenderLoadAction::DontCare);
         assert_eq!(
-            planned.attachments[0].initial, None,
+            planned.attachments[0].initial_bytes(),
+            None,
             "a DontCare attachment carries no pre-pass bytes"
         );
     }
@@ -6009,7 +6062,7 @@ mod tests {
             panic!("the milestone renders one attachment");
         };
         assert_eq!(attachment.load, RenderLoadAction::Load);
-        assert_eq!(attachment.initial, Some(previous.as_slice()));
+        assert_eq!(attachment.initial_bytes(), Some(previous.as_slice()));
 
         let short = [0x11_u8; 15];
         let error = plan_pass(&milestone_request(&pass, &pipeline, Some(&short))).unwrap_err();
@@ -7464,7 +7517,7 @@ mod tests {
             RenderPixelFormat::Rgba8Unorm
         );
         assert_eq!(planned.plan.vertices, 3);
-        assert_eq!(planned.plan.attachments[0].initial, None);
+        assert_eq!(planned.plan.attachments[0].initial_bytes(), None);
         // The landing view is the declaration's own identity and range, so the
         // writeback is the one the trace asked for and no second channel is
         // invented.
@@ -7512,7 +7565,7 @@ mod tests {
         // The declaration's 16-byte range is the tightly packed 2x2 rgba8
         // texels, so the plan carries exactly those bytes.
         assert_eq!(
-            planned.plan.attachments[0].initial,
+            planned.plan.attachments[0].initial_bytes(),
             Some([0xfe; 16].as_slice())
         );
     }
@@ -7533,15 +7586,18 @@ mod tests {
         };
         assert_eq!(planned.plan.attachments[0].load, RenderLoadAction::DontCare);
         assert_eq!(
-            planned.plan.attachments[0].initial, None,
+            planned.plan.attachments[0].initial_bytes(),
+            None,
             "a DontCare attachment presets nothing"
         );
     }
 
-    /// A lease-backed declaration carries bytes this rail does not hold, so a
-    /// loading pass is refused by name rather than executed as a clear.
+    /// A lease-backed declaration is resolved through the lease channel
+    /// (`research/docs/23` §74, R5b); with no channel to resolve it in — the
+    /// `plan_trace` shape, which is the device-level caller — the loading pass
+    /// is refused under the source's own name rather than executed as a clear.
     #[test]
-    fn plan_trace_refuses_a_leased_attachment_load() {
+    fn plan_trace_refuses_a_leased_attachment_load_without_a_channel() {
         let (trace, _) = milestone_trace(LoadOp::Load);
         let mut pool = trace.serial_resources().expect("admitted serial pool");
         let view = pool
@@ -7552,16 +7608,20 @@ mod tests {
             .expect("the milestone trace declares the attachment view");
         view.source = BufferSource::StagedLease(LeaseId::new(5));
         let error = plan_trace(&trace, &pool, &milestone_contracts(), 0, 0).unwrap_err();
-        assert_eq!(error.slug, "attachment_load_op_unsupported");
+        assert_eq!(error.slug, "render_attachment_load_source_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
         assert_eq!(
-            error.fields.get("load_op"),
-            Some(&FieldValue::Text("load".to_owned()))
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(ViewId::new(7).get()))
         );
         assert_eq!(
             error.fields.get("storage_mode"),
             Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
         );
     }
 
@@ -8454,6 +8514,242 @@ mod tests {
         assert_eq!(error.slug, "lease_not_imported");
     }
 
+    /// The milestone trace with its one declaring view naming `source`
+    /// (`research/docs/23` §74, R5b).
+    ///
+    /// The attachment's previous contents are the declaring view's own bytes, so
+    /// a lease-backed loading pass names the lease in the compute declaration —
+    /// the render pass restates only the attachment's identity and shape
+    /// (`research/docs/23` §3.3).
+    fn lease_the_milestone_attachment(trace: &mut ComputeTrace, source: BufferSource) {
+        for pass in &mut trace.passes {
+            if let TracePass::Compute(pass) = pass {
+                for view in &mut pass.buffers {
+                    if view.view_id == ViewId::new(7) {
+                        view.source = source.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// A snapshot carrying the milestone attachment's allocation at whole-page
+    /// size, plus the reservation drawn from its first bytes.
+    ///
+    /// The no-copy arm maps the reservation, not the view, so the fixture's
+    /// reservation is page-sized exactly as the production rail's is — at the
+    /// alignment the mapping itself needs, which a device test reads from the
+    /// device.
+    fn owner_attachment_resources(
+        epoch: DeviceEpoch,
+        reservation: LeaseReservation,
+        alignment: u64,
+    ) -> ResourceTableSnapshot {
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(9),
+                owner_epoch: epoch,
+                size: alignment,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the attachment reservation covers its view");
+        resources
+    }
+
+    /// A staged lease resolves a loading attachment's previous contents into
+    /// the provider's own copy (`research/docs/23` §74, R5b).
+    ///
+    /// The plan carries the staged bytes exactly as it carries the declaring
+    /// view's own, names no lease to retain, and refuses the same declaration
+    /// under the registry's own name once the copy is released.
+    #[test]
+    fn plan_trace_resolves_a_staged_lease_attachment_load_into_the_providers_copy() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(61);
+        let reservation = lease_registration(lease_id, AllocationId::new(9), 16, epoch);
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(reservation, vec![0xfe; 16])
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = owner_attachment_resources(epoch, reservation, OWNER_ALIGNMENT);
+        // The staged arm is the provider's own copy, so the device's mapping
+        // ability plays no part in it.
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: 0,
+        };
+
+        let (mut trace, _) = milestone_trace(LoadOp::Load);
+        lease_the_milestone_attachment(&mut trace, BufferSource::StagedLease(lease_id));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect("the staged copy carries the attachment's previous contents");
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        let [attachment] = planned.plan.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        assert!(
+            matches!(attachment.initial, Some(PlannedInputSource::Staged(_))),
+            "a staged lease resolves into the provider's own copy: {:?}",
+            attachment.initial
+        );
+        assert_eq!(
+            attachment.initial_bytes(),
+            Some([0xfe; 16].as_slice()),
+            "the staged window is what the preset uploads"
+        );
+        assert!(
+            planned.plan.borrowed_leases().is_empty(),
+            "a staged arm has no owner mapping to retain"
+        );
+
+        staging
+            .release(lease_id)
+            .expect("the fixture import is released");
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect_err("a released staged lease cannot be read");
+        eprintln!("released staged attachment lease refused: {error:?}");
+        assert_eq!(error.slug, "lease_not_imported");
+        assert_eq!(
+            error.fields.get("lease"),
+            Some(&FieldValue::Unsigned(lease_id.get()))
+        );
+        // The location the rail could not read is part of the refusal, so a
+        // multi-attachment capture can tell which one it was.
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// A no-copy lease resolves a loading attachment's previous contents into
+    /// the owner's own pages (`research/docs/23` §74, R5b).
+    ///
+    /// The proof and the preset read the same mapping: an owner that rewrites
+    /// its pages after the import changes both, which a snapshot-style import
+    /// could not, and the plan names the lease its submission has to retain.
+    #[test]
+    fn plan_resolves_a_borrowed_lease_attachment_load_into_the_owners_pages() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(62);
+        let reservation =
+            lease_registration(lease_id, AllocationId::new(9), OWNER_ALIGNMENT, epoch);
+        let mut owner_attachment =
+            OwnerPages::new(OWNER_ALIGNMENT as usize, OWNER_ALIGNMENT as usize);
+        owner_attachment.write(&[0xfe; 16]);
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, owner_attachment.as_ptr())
+                    .expect("the owner's attachment window is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let resources = owner_attachment_resources(epoch, reservation, OWNER_ALIGNMENT);
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+
+        let (mut trace, _) = milestone_trace(LoadOp::Load);
+        lease_the_milestone_attachment(&mut trace, BufferSource::BorrowedNoCopy(lease_id));
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = milestone_contracts();
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the attachment's previous contents");
+        let [planned] = planned.as_slice() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        let [attachment] = planned.plan.attachments.as_slice() else {
+            panic!("the milestone renders one attachment");
+        };
+        let Some(PlannedInputSource::NoCopy { lease, window }) = &attachment.initial else {
+            panic!(
+                "a no-copy lease resolves into the owner's mapping: {:?}",
+                attachment.initial
+            );
+        };
+        assert_eq!(*lease, lease_id);
+        assert_eq!(
+            window.offset, 0,
+            "the view starts at the reservation's base"
+        );
+        assert_eq!(window.len, 16);
+        assert_eq!(window.base_len, OWNER_ALIGNMENT as usize);
+        assert_eq!(attachment.initial_bytes(), Some([0xfe; 16].as_slice()));
+        assert_eq!(
+            planned.plan.borrowed_leases(),
+            vec![lease_id],
+            "the plan names one hold for the loading attachment's window"
+        );
+
+        // The probe: the owner rewrites its own page after the import, and the
+        // preset reads those bytes instead of a copy taken at import time — the
+        // same falsification the Vulkan rail's e2e states with a device.
+        owner_attachment.write(&[0x37; 16]);
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect("the rewritten owner window still holds sixteen bytes");
+        assert_eq!(
+            planned[0].plan.attachments[0].initial_bytes(),
+            Some([0x37; 16].as_slice()),
+            "the preset follows the owner's rewritten pages"
+        );
+
+        // One hold while the pass is in flight, none once Metal retired it —
+        // both spellings, exactly as the stream half measures them.
+        let mut retains =
+            RenderInputRetains::retain(&borrowed, &planned[0].plan).expect("the hold is taken");
+        assert_eq!(borrowed.outstanding(lease_id), Some(1));
+        retains.retire();
+        assert_eq!(borrowed.outstanding(lease_id), Some(0));
+        let retains =
+            RenderInputRetains::retain(&borrowed, &planned[0].plan).expect("the hold is taken");
+        drop(retains);
+        assert_eq!(borrowed.outstanding(lease_id), Some(0));
+
+        // A device that cannot map an owner window refuses the same declaration
+        // by the storage mode's own name rather than copying it.
+        let unmappable = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: 0,
+        };
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&unmappable), 0, 0)
+            .expect_err("a device with no owner mapping cannot read the window");
+        eprintln!("no owner mapping refused: {error:?}");
+        assert_eq!(error.slug, "storage_mode_unsupported");
+        assert_eq!(
+            error.fields.get("view"),
+            Some(&FieldValue::Unsigned(ViewId::new(7).get()))
+        );
+        assert_eq!(
+            error.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
     /// The reviewed stream collapsed onto one corner.
     ///
     /// Every fragment is degenerate, so the draw covers no texel and the
@@ -8468,6 +8764,57 @@ mod tests {
         }
         bytes
     }
+
+    /// The reviewed stream's four vertices moved into the left column:
+    /// `(-1,-1) (0,-1) (-1,1) (0,1)`. With the six reviewed indices the two
+    /// triangles cover exactly two of the four texels, which leaves the other
+    /// two for a loading attachment's previous contents to show through.
+    ///
+    /// The band is chosen to be symmetric under the NDC y flip the two rails
+    /// disagree about — Vulkan's y points down, Metal's points up — so both
+    /// rails cover the same texel column and the byte expectation stays
+    /// identical (`crates/metal-api-vulkan/tests/render_e2e.rs`).
+    #[cfg(target_os = "macos")]
+    fn left_column_quad_vertex_bytes() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32);
+        for (x, y) in [(-1.0_f32, -1.0_f32), (0.0, -1.0), (-1.0, 1.0), (0.0, 1.0)] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Name one source for the quad's vertex stream in the declaration pass and
+    /// the render pass alike, which is what a serial trace asks of two
+    /// declarations of one view (`SerialBufferRebinding`).
+    #[cfg(target_os = "macos")]
+    fn re_source_quad_vertices(trace: &mut ComputeTrace, source: BufferSource) {
+        for pass in &mut trace.passes {
+            match pass {
+                TracePass::Compute(pass) => {
+                    for view in &mut pass.buffers {
+                        if view.view_id == QUAD_VERTEX_VIEW {
+                            view.source = source.clone();
+                        }
+                    }
+                }
+                TracePass::Render(pass) => {
+                    for view in &mut pass.vertex_buffers {
+                        if view.view_id == QUAD_VERTEX_VIEW {
+                            view.source = source.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The word the owner's page holds as the attachment's previous contents
+    /// (`research/docs/23` §74, R5b): four bytes no reviewed module produces and
+    /// no clear sentinel spells, so "the preset came from the owner" is
+    /// falsifiable per texel.
+    #[cfg(target_os = "macos")]
+    const OWNER_ATTACHMENT_WORD: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 
     /// A byte string as the evidence logs spell it.
     #[cfg(target_os = "macos")]
@@ -8625,6 +8972,164 @@ mod tests {
             .release(index_lease)
             .expect("the owner's index window is released");
         let error = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released no-copy import cannot be resolved");
+        assert_eq!(error.slug, "lease_not_imported");
+    }
+
+    /// The no-copy attachment preset on a real Metal device (`research/docs/23`
+    /// §74, R5b).
+    ///
+    /// Device-only, so the macOS CI job's `cargo test -p metal-api-native` is
+    /// the observation: three facts the host-side tests cannot reach — the
+    /// encoder uploads the owner's pages into the attachment before the pass
+    /// opens, the draw leaves the owner's bytes in the texels it does not
+    /// cover, and an owner rewrite afterwards changes those texels instead of
+    /// leaving the import's first copy behind. The retain guard is measured
+    /// with the registry as well.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_borrowed_lease_attachment_preset_reads_the_owners_pages_on_a_device() {
+        let Some(device) = eligible_apple_device() else {
+            eprintln!("skipping native render-lease test: no eligible Metal device");
+            return;
+        };
+        let queue = device.new_command_queue();
+        let alignment = crate::native::page_size();
+        if alignment == 0 {
+            eprintln!("skipping native render-lease test: the device reports no page size");
+            return;
+        }
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(81);
+        let reservation = lease_registration(lease_id, AllocationId::new(9), alignment, epoch);
+        let mut owner_attachment = OwnerPages::new(alignment as usize, alignment as usize);
+        owner_attachment.write(&OWNER_ATTACHMENT_WORD.repeat(4));
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, owner_attachment.as_ptr())
+                    .expect("the owner's attachment window is a valid reservation"),
+            )
+            .expect("the owner's attachment window is imported");
+        let resources = owner_attachment_resources(epoch, reservation, alignment);
+        let staging = LeaseRegistry::new();
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: alignment,
+        };
+
+        // The reviewed quad trace with two changes: its attachment opens with
+        // `LoadOp::Load` over the owner's window, and its stream covers only the
+        // left column, so two texels keep whatever the preset uploaded.
+        let (mut trace, _) = quad_trace();
+        lease_the_milestone_attachment(&mut trace, BufferSource::BorrowedNoCopy(lease_id));
+        re_source_quad_vertices(
+            &mut trace,
+            BufferSource::OwnedBytes(left_column_quad_vertex_bytes()),
+        );
+        for pass in &mut trace.passes {
+            if let TracePass::Render(pass) = pass {
+                pass.color_attachments[0].load = LoadOp::Load;
+            }
+        }
+        let pool = trace.serial_resources().expect("admitted serial pool");
+        let contracts = quad_contracts();
+        let planned = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
+            .expect("the owner's pages hold the attachment's previous contents");
+        let [planned] = planned.as_slice() else {
+            panic!("the quad trace carries one render pass");
+        };
+        assert_eq!(
+            planned.plan.borrowed_leases(),
+            vec![lease_id],
+            "the loading attachment's own window is the one hold this pass takes"
+        );
+
+        // The pass is synchronous, so dropping the guard after the encoder
+        // returns is the retirement point the provider's own
+        // `execute_render_passes` takes.
+        let retains =
+            RenderInputRetains::retain(&borrowed, &planned.plan).expect("the hold is taken");
+        assert_eq!(borrowed.outstanding(lease_id), Some(1));
+        let readback = encode_offscreen_render(&device, &queue, &planned.plan)
+            .expect("the owner's window presets the attachment");
+        drop(retains);
+        let attachment = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!("loading attachment readback: {}", hex(&attachment));
+        let covered = attachment
+            .chunks_exact(4)
+            .filter(|texel| *texel == EXPECTED_TEXEL_BYTES)
+            .count();
+        let loaded = attachment
+            .chunks_exact(4)
+            .filter(|texel| *texel == OWNER_ATTACHMENT_WORD)
+            .count();
+        assert_eq!(
+            (covered, loaded),
+            (2, 2),
+            "the left column is drawn and the rest keeps the owner's bytes: {}",
+            hex(&attachment)
+        );
+        assert_eq!(
+            borrowed.outstanding(lease_id),
+            Some(0),
+            "the attachment hold is retired once the pass is terminal"
+        );
+
+        // A rail that had snapshotted the owner's page at import time would
+        // keep presetting the first word; the rewrite reaches the texels the
+        // draw leaves alone instead.
+        let rewritten_word = [0x55_u8, 0x66, 0x77, 0x88];
+        owner_attachment.write(&rewritten_word.repeat(4));
+        let retains =
+            RenderInputRetains::retain(&borrowed, &planned.plan).expect("the hold is taken");
+        let readback = encode_offscreen_render(&device, &queue, &planned.plan)
+            .expect("the rewritten owner window still presets the attachment");
+        drop(retains);
+        let rewritten = readback
+            .attachments
+            .into_iter()
+            .next()
+            .expect("the pass stores its one attachment");
+        eprintln!(
+            "owner-rewritten attachment window readback: {}",
+            hex(&rewritten)
+        );
+        let covered = rewritten
+            .chunks_exact(4)
+            .filter(|texel| *texel == EXPECTED_TEXEL_BYTES)
+            .count();
+        let loaded = rewritten
+            .chunks_exact(4)
+            .filter(|texel| *texel == rewritten_word)
+            .count();
+        assert_eq!(
+            (covered, loaded),
+            (2, 2),
+            "the preset follows the owner's rewritten pages: {}",
+            hex(&rewritten)
+        );
+        assert!(
+            !rewritten
+                .chunks_exact(4)
+                .any(|texel| texel == OWNER_ATTACHMENT_WORD),
+            "no texel keeps the pre-rewrite word a snapshot would have pinned: {}",
+            hex(&rewritten)
+        );
+
+        // A released import is the registry's own refusal, the same name the
+        // host-side tests assert without a device.
+        borrowed
+            .release(lease_id)
+            .expect("the owner's attachment window is released");
+        let error = plan_trace_with_leases(&trace, &pool, &contracts, Some(&leases), 0, 0)
             .expect_err("a released no-copy import cannot be resolved");
         assert_eq!(error.slug, "lease_not_imported");
     }
@@ -9072,22 +9577,22 @@ mod tests {
         };
         assert_eq!(planned.plan.attachments[0].load, RenderLoadAction::Load);
         assert_eq!(
-            planned.plan.attachments[0].initial,
+            planned.plan.attachments[0].initial_bytes(),
             Some([0xfe; 16].as_slice())
         );
         assert_eq!(planned.plan.attachments[1].load, RenderLoadAction::Load);
         assert_eq!(
-            planned.plan.attachments[1].initial,
+            planned.plan.attachments[1].initial_bytes(),
             Some([0xfd; 16].as_slice())
         );
     }
 
-    /// The lease refusal reuses `previous_bytes` per location: a lease-backed
-    /// second declaration is refused with the same slug, class and phase a
-    /// single attachment gets, naming the storage mode rather than executing
-    /// location 1 as a clear.
+    /// The source refusal is per location: a lease-backed second declaration
+    /// with no channel to resolve it is refused with the same slug, class and
+    /// phase a single attachment gets, naming storage mode and location rather
+    /// than executing location 1 as a clear.
     #[test]
-    fn plan_trace_refuses_a_leased_second_attachment_load() {
+    fn plan_trace_refuses_a_leased_second_attachment_load_without_a_channel() {
         let (trace, _) = dual_trace(LoadOp::Load);
         let mut pool = trace.serial_resources().expect("admitted serial pool");
         let view = pool
@@ -9099,12 +9604,16 @@ mod tests {
         view.source = BufferSource::StagedLease(LeaseId::new(5));
         let contracts = dual_contracts();
         let error = plan_trace(&trace, &pool, &contracts, 0, 0).unwrap_err();
-        assert_eq!(error.slug, "attachment_load_op_unsupported");
+        assert_eq!(error.slug, "render_attachment_load_source_unsupported");
         assert_eq!(error.class, ProviderErrorClass::Capability);
         assert_eq!(error.phase, ProviderPhase::Resolve);
         assert_eq!(
             error.fields.get("storage_mode"),
             Some(&FieldValue::Text("staged_lease".to_owned()))
+        );
+        assert_eq!(
+            error.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(1))
         );
     }
 

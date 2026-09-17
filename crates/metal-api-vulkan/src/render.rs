@@ -671,11 +671,15 @@ pub(crate) struct OffscreenColorAttachment<'a> {
     /// before the pass opens, and `DontCare` discards the pre-pass contents
     /// without reading or uploading them (`docs/23` §3.1, v20).
     pub load: LoadOp,
-    /// The attachment's previous bytes for a `LoadOp::Load` pass
-    /// (`research/docs/23` §3.3). `Some` means the rail uploads them into the
-    /// image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
-    /// `Clear`/`DontCare` shape.
-    pub previous: Option<&'a [u8]>,
+    /// The attachment's previous contents for a `LoadOp::Load` pass
+    /// (`research/docs/23` §3.3/§74). `Some` means the rail uploads them into
+    /// the image and opens the render pass with `LOAD_OP_LOAD`; `None` is the
+    /// `Clear`/`DontCare` shape. The source was resolved from the declaring
+    /// view before any device object exists, so a `Load` cannot be executed as
+    /// a clear and a lease-backed declaration cannot be read as stale bytes: an
+    /// owner window is imported as the copy's own source, and the retain the
+    /// pass took keeps it alive until the fence signals (R5b).
+    pub previous: Option<RenderInputSource<'a>>,
 }
 
 /// One caller-held vertex stream: the layout the pipeline is built from plus
@@ -1596,19 +1600,24 @@ fn fragment_stage_mismatch_refusal(formats: &[AttachmentFormat], entry: &str) ->
 /// This is the trace-side entry point of the rail: the pass's shape rules were
 /// already checked by core admission, so what is left here is the agreement
 /// between the pass and the registered pipeline it names
-/// ([`RenderPipelineContract::validate_against`]) and the two shapes the first
-/// increment cannot execute — a `Load` that would have to carry the
-/// attachment's previous bytes into the image, and a pass whose attachment
-/// list or format combination is outside the reviewed set. All of them are
-/// refused as capability facts before any Vulkan object exists, never
-/// downgraded to a clear. The registered fragment stage is re-checked against
-/// the pipeline's declared format list in the same place, for the same reason:
-/// the pass is about to be executed with it.
-pub(crate) fn execute_render_pass(
+/// ([`RenderPipelineContract::validate_against`]) and the shapes this increment
+/// cannot execute — a pass whose attachment list or format combination is
+/// outside the reviewed set, and a `Load` whose declaring view carries no
+/// readable contents. All of them are refused as capability facts before any
+/// Vulkan object exists, never downgraded to a clear. The registered fragment
+/// stage is re-checked against the pipeline's declared format list in the same
+/// place, for the same reason: the pass is about to be executed with it.
+///
+/// `previous` carries one entry per colour attachment, in location order: the
+/// view the trace declares for that attachment when the pass opens it with
+/// `LoadOp::Load`, and `None` for every other load operation. The rail resolves
+/// that declaration into the bytes it uploads (`research/docs/23` §74, R5b), so
+/// the caller hands over the declaration rather than a snapshot of it.
+pub(crate) fn execute_render_pass<'a>(
     context: &VulkanContext,
-    stages: &RenderStages,
-    pass: &RenderPassDescriptor,
-    previous: &[Option<&[u8]>],
+    stages: &'a RenderStages,
+    pass: &'a RenderPassDescriptor,
+    previous: &'a [Option<&'a BufferView>],
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     refuse_attachment_extent(context, pass)?;
@@ -1635,7 +1644,7 @@ pub(crate) fn execute_render_pass(
 fn prepare_render_request<'a>(
     stages: &'a RenderStages,
     pass: &'a RenderPassDescriptor,
-    previous: &'a [Option<&'a [u8]>],
+    previous: &'a [Option<&'a BufferView>],
     leases: Option<&RenderLeaseContext<'_>>,
     depth_resolve_modes: u32,
     stencil_resolve_modes: u32,
@@ -1654,7 +1663,7 @@ fn prepare_render_request<'a>(
     }
     if previous.len() != pass.color_attachments.len() {
         return Err(contract_refusal(
-            "the previous-byte list must carry one entry per colour attachment",
+            "the previous-contents list must carry one entry per colour attachment",
         ));
     }
     // The registration gate is re-asked of the value the rail was handed, so a
@@ -1905,14 +1914,31 @@ fn prepare_render_request<'a>(
     }
     let mut attachments = Vec::with_capacity(pass.color_attachments.len());
     let mut extent: Option<[u32; 2]> = None;
-    for (index, (attachment, previous)) in pass.color_attachments.iter().zip(previous).enumerate() {
+    for (index, (attachment, declared)) in pass.color_attachments.iter().zip(previous).enumerate() {
+        // The attachment's previous contents come from the view the trace
+        // declares for it, exactly as a stream's bytes come from their own
+        // declaration: the source is resolved here, before any device object
+        // exists, and a `Load` whose declaration cannot be read is refused
+        // rather than silently executed as a clear (`research/docs/23`
+        // §3.3/§74, R5b).
+        let previous = match (attachment.load, declared) {
+            (LoadOp::Load, Some(view)) => Some(resolve_attachment_load(
+                view,
+                leases,
+                index,
+                attachment
+                    .expected_bytes()
+                    .map_err(|error| contract_refusal(&error.to_string()))?,
+            )?),
+            _ => None,
+        };
         match attachment.load {
             LoadOp::Clear(_) => {}
             LoadOp::Load => {
                 // The rail uploads the attachment's previous bytes before
                 // opening the render pass (`research/docs/23` §3.3). The caller
                 // resolves them from the trace's own declaration, so a `Load`
-                // that carries no bytes is refused rather than silently
+                // that carries no declaration is refused rather than silently
                 // executed as a clear.
                 if previous.is_none() {
                     return Err(capability_refusal("attachment_load_op_unsupported")
@@ -1929,7 +1955,7 @@ fn prepare_render_request<'a>(
                 // rail neither reads nor uploads declaring bytes. A caller
                 // that resolves bytes anyway is refused rather than silently
                 // ignored (`docs/23` §3.1, v20).
-                if previous.is_some() {
+                if declared.is_some() {
                     return Err(capability_refusal("attachment_load_op_unsupported")
                         .with_field("attachment", FieldValue::Unsigned(index as u64))
                         .with_field("load_op", FieldValue::Text("dont_care".to_owned()))
@@ -1967,7 +1993,7 @@ fn prepare_render_request<'a>(
             format: attachment.format,
             store: attachment.store,
             load: attachment.load,
-            previous: *previous,
+            previous,
         });
     }
     // A pass with no colour attachment takes its extent from the depth
@@ -2297,26 +2323,52 @@ pub(crate) struct RenderLeaseContext<'a> {
     pub(crate) host_import_alignment: u64,
 }
 
-/// Which of a pass's two render inputs a refusal is about.
+/// Which of a pass's render inputs a refusal is about.
 #[derive(Clone, Copy)]
 enum RenderInputRole {
+    /// A vertex stream of the pass's layout.
     Vertex,
+    /// The pass's index buffer.
     Index,
+    /// The previous contents a `LoadOp::Load` attachment uploads
+    /// (`research/docs/23` §74, R5b).
+    Attachment,
 }
 
 impl RenderInputRole {
     /// The capability slug this role's unreadable source is refused with. The
-    /// two names are the ones this rail published before the lease channel
-    /// existed, so a capture that could not read a stream keeps its slug.
+    /// two stream names are the ones this rail published before the lease
+    /// channel existed, so a capture that could not read a stream keeps its
+    /// slug; the attachment name is the source-arm sibling the sampler
+    /// publishes (`render_texture_source_unsupported`), because what could not
+    /// be read is the attachment's own prior contents rather than a load
+    /// operation the contract refuses.
     const fn slug(self) -> &'static str {
         match self {
             Self::Vertex => "render_vertex_buffer_unsupported",
             Self::Index => "render_index_buffer_unsupported",
+            Self::Attachment => "render_attachment_load_source_unsupported",
+        }
+    }
+
+    /// The field this role's own slot is reported under: a stream or an index
+    /// buffer is a *binding* of the pipeline's layout, while an attachment's
+    /// previous contents are named by their location.
+    const fn slot_field(self) -> &'static str {
+        match self {
+            Self::Vertex | Self::Index => "binding",
+            Self::Attachment => "attachment",
         }
     }
 }
 
-/// Where one render input's bytes come from (`research/docs/23` §71, R3c).
+/// Where one render input's bytes come from (`research/docs/23` §71/§74,
+/// R3c/R5b).
+///
+/// One type serves every render input the rail reads from a declaration: the
+/// bytes a vertex stream or index buffer carries, and the previous contents a
+/// `LoadOp::Load` attachment uploads. The three arms are the three
+/// [`BufferSource`] arms, resolved before any device object exists.
 #[derive(Debug)]
 pub(crate) enum RenderInputSource<'a> {
     /// The trace's own bytes (`BufferSource::OwnedBytes`), unchanged from the
@@ -2335,6 +2387,19 @@ pub(crate) enum RenderInputSource<'a> {
 }
 
 impl RenderInputSource<'_> {
+    /// The bytes the rail reads out of this source.
+    ///
+    /// A borrowed window is measured at the owner's mapping — the same window
+    /// the import binds, so a length the attachment's extent disagrees with is
+    /// refused rather than copied from out of range.
+    fn len(&self) -> usize {
+        match self {
+            Self::TraceBytes(bytes) => bytes.len(),
+            Self::StagedBytes(bytes) => bytes.len(),
+            Self::Borrowed { window, .. } => window.len,
+        }
+    }
+
     /// The bytes the rail's footprint proof reads.
     ///
     /// A borrowed window is read through the owner's mapping, because that is
@@ -2365,8 +2430,8 @@ impl RenderInputSource<'_> {
     }
 }
 
-/// Resolve one render input's source into the window the rail binds
-/// (`research/docs/23` §71, R3c).
+/// Resolve one render input's source into the window the rail reads
+/// (`research/docs/23` §71/§74, R3c/R5b).
 ///
 /// `OwnedBytes` resolves to the trace's own bytes exactly as before. A
 /// `StagedLease` resolves through the provider's staged registry, which holds
@@ -2375,12 +2440,15 @@ impl RenderInputSource<'_> {
 /// back the owner's address and never copies. Every unresolvable arm is refused
 /// by name before any device object exists: a lease that was never imported or
 /// admitted, a reservation that does not cover the view, a device that cannot
-/// import host memory, and a pointer that misses the import alignment.
+/// import host memory, and a pointer that misses the import alignment. `role`
+/// decides which of the three inputs the refusal names — a vertex stream, the
+/// index buffer, or a loading attachment's own prior contents — and `slot` is
+/// that input's own binding or attachment location.
 fn resolve_render_input<'a>(
     view: &'a BufferView,
     leases: Option<&RenderLeaseContext<'_>>,
     role: RenderInputRole,
-    binding: usize,
+    slot: usize,
 ) -> Result<RenderInputSource<'a>, ProviderError> {
     match &view.source {
         BufferSource::OwnedBytes(bytes) => Ok(RenderInputSource::TraceBytes(bytes)),
@@ -2388,7 +2456,7 @@ fn resolve_render_input<'a>(
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
                     role,
-                    binding,
+                    slot,
                     "staged_lease",
                     "the render submission carries no lease channel, so a lease-backed render \
                      input cannot be read",
@@ -2406,14 +2474,14 @@ fn resolve_render_input<'a>(
             let leases = leases.ok_or_else(|| {
                 render_input_refusal(
                     role,
-                    binding,
+                    slot,
                     "borrowed_no_copy",
                     "the render submission carries no lease channel, so a lease-backed render \
                      input cannot be read",
                 )
             })?;
             if leases.host_import_alignment == 0 {
-                return Err(host_import_refusal(role, binding, view));
+                return Err(host_import_refusal(role, slot, view));
             }
             let window = leases.borrowed.view_pointer(
                 *lease_id,
@@ -2427,7 +2495,8 @@ fn resolve_render_input<'a>(
                     *lease_id,
                     window.pointer,
                     leases.host_import_alignment,
-                    binding,
+                    role,
+                    slot,
                 ));
             }
             Ok(RenderInputSource::Borrowed {
@@ -2438,15 +2507,49 @@ fn resolve_render_input<'a>(
     }
 }
 
-/// One render input whose source this rail cannot read (`docs/23` §71).
+/// Resolve one loading attachment's previous contents into the window the rail
+/// uploads into the image (`research/docs/23` §74, R5b).
+///
+/// The declaring view is the only channel that carries an attachment's previous
+/// bytes — the attachment restates the view's identity and shape and names no
+/// contents (`docs/23` §3.3) — so the three arms are exactly the ones
+/// [`resolve_render_input`] decides for a stream, one role wider: the
+/// trace-owned bytes, the provider's staged copy of an owner lease, or the
+/// owner's own mapping. The window a `Load` uploads has to be the attachment's
+/// own tightly packed extent, which is the length `BufferView::validate_shape`
+/// already holds a trace-owned declaration to; a lease that resolves to a
+/// different length is refused by name instead of being read past its end.
+fn resolve_attachment_load<'a>(
+    view: &'a BufferView,
+    leases: Option<&RenderLeaseContext<'_>>,
+    attachment: usize,
+    expected_bytes: u64,
+) -> Result<RenderInputSource<'a>, ProviderError> {
+    let source = resolve_render_input(view, leases, RenderInputRole::Attachment, attachment)?;
+    let resolved = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    if resolved != expected_bytes {
+        return Err(args_refusal("render_attachment_initial_mismatch")
+            .with_field("attachment", FieldValue::Unsigned(attachment as u64))
+            .with_field("view", FieldValue::Unsigned(view.view_id.get()))
+            .with_field("expected_bytes", FieldValue::Unsigned(expected_bytes))
+            .with_field("resolved_bytes", FieldValue::Unsigned(resolved))
+            .with_detail(
+                "the window a loading attachment reads has to be the attachment's own tightly \
+                 packed byte extent",
+            ));
+    }
+    Ok(source)
+}
+
+/// One render input whose source this rail cannot read (`docs/23` §71/§74).
 fn render_input_refusal(
     role: RenderInputRole,
-    binding: usize,
+    slot: usize,
     storage_mode: &'static str,
     detail: &'static str,
 ) -> ProviderError {
     capability_refusal(role.slug())
-        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field(role.slot_field(), FieldValue::Unsigned(slot as u64))
         .with_field("storage_mode", FieldValue::Text(storage_mode.to_owned()))
         .with_detail(detail)
 }
@@ -2456,9 +2559,9 @@ fn render_input_refusal(
 /// The slug is the same one core admission and the compute rail publish for an
 /// unsupported storage mode, so a capture reads one name for one fact: this
 /// device cannot bind owner memory without copying it.
-fn host_import_refusal(role: RenderInputRole, binding: usize, view: &BufferView) -> ProviderError {
+fn host_import_refusal(role: RenderInputRole, slot: usize, view: &BufferView) -> ProviderError {
     capability_refusal("storage_mode_unsupported")
-        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field(role.slot_field(), FieldValue::Unsigned(slot as u64))
         .with_field("view", FieldValue::Unsigned(view.view_id.get()))
         .with_field(
             "storage_mode",
@@ -2478,13 +2581,14 @@ fn lease_alignment_refusal(
     lease_id: LeaseId,
     pointer: usize,
     alignment: u64,
-    binding: usize,
+    role: RenderInputRole,
+    slot: usize,
 ) -> ProviderError {
     capability_refusal("lease_alignment_unsupported")
         .with_field("lease", FieldValue::Unsigned(lease_id.get()))
         .with_field("pointer", FieldValue::Unsigned(pointer as u64))
         .with_field("alignment", FieldValue::Unsigned(alignment))
-        .with_field("binding", FieldValue::Unsigned(binding as u64))
+        .with_field(role.slot_field(), FieldValue::Unsigned(slot as u64))
         .with_detail("a no-copy render input has to meet the device's host import alignment")
 }
 
@@ -2624,12 +2728,12 @@ fn color_subresource() -> vk::ImageSubresourceRange {
 /// is not admitted as a render pass cannot reach it. Compute dispatches and the
 /// un-reviewed indexed shapes are outside the first indirect increment and are
 /// refused with the capability slug the contract publishes for them.
-pub(crate) fn execute_indirect_render_pass(
+pub(crate) fn execute_indirect_render_pass<'a>(
     context: &VulkanContext,
-    stages: &RenderStages,
-    pass: &RenderPassDescriptor,
+    stages: &'a RenderStages,
+    pass: &'a RenderPassDescriptor,
     command: &IndirectCommandDescriptor,
-    previous: &[Option<&[u8]>],
+    previous: &'a [Option<&'a BufferView>],
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<OffscreenReadback, ProviderError> {
     let replay = match command {
@@ -3081,6 +3185,17 @@ impl RenderInputRetains {
         if let Some(index) = &request.index_stream {
             if let Some(lease) = index.source.borrowed_lease() {
                 lease_ids.push(lease);
+            }
+        }
+        // A loading attachment whose previous contents come from an owner's
+        // mapping is the third input of the same shape (`research/docs/23`
+        // §74, R5b): the imported transfer source reads the owner's pages, so
+        // the hold covers it exactly like a stream's.
+        for attachment in &request.attachments {
+            if let Some(source) = &attachment.previous {
+                if let Some(lease) = source.borrowed_lease() {
+                    lease_ids.push(lease);
+                }
             }
         }
         if lease_ids.is_empty() {
@@ -3760,7 +3875,7 @@ fn execute_offscreen_render_with_retains(
     objects.instance_count = request.instance_count;
     objects.base_vertex = request.base_vertex;
     for (index, attachment) in request.attachments.iter().enumerate() {
-        if let Some(previous) = attachment.previous {
+        if let Some(previous) = &attachment.previous {
             objects.create_previous_bytes(index, previous)?;
         }
     }
@@ -4201,12 +4316,12 @@ fn present_transition_barrier(image: vk::Image) -> vk::ImageMemoryBarrier<'stati
 /// command buffer. The one acquire and one present are counted around the pass
 /// (`docs/24` §5.3). The target image itself is not destroyed here: it is the
 /// provider's, so it stays readable after `wait` (`docs/24` §3.3 rule 2).
-pub(crate) fn execute_present_render(
+pub(crate) fn execute_present_render<'a>(
     context: &VulkanContext,
-    stages: &RenderStages,
-    pass: &RenderPassDescriptor,
+    stages: &'a RenderStages,
+    pass: &'a RenderPassDescriptor,
     target: &PresentTargetImage,
-    previous: Option<&[u8]>,
+    previous: Option<&'a BufferView>,
     leases: Option<&RenderLeaseContext<'_>>,
 ) -> Result<Vec<u8>, ProviderError> {
     // The present path stays single-attachment: it renders into one
@@ -6554,7 +6669,9 @@ impl<'a> OffscreenObjects<'a> {
     ///
     /// The two uploaded arms land in a host-visible buffer of the rail's own;
     /// the borrowed arm imports the owner's mapping instead, which is the only
-    /// shape that reads the owner's pages directly (`research/docs/23` §71).
+    /// shape that reads the owner's pages directly (`research/docs/23`
+    /// §71/§74). The three roles that arrive here are a vertex stream, the
+    /// index buffer, and a loading attachment's transfer source.
     fn bind_render_input(
         &self,
         source: &RenderInputSource<'_>,
@@ -6687,14 +6804,24 @@ impl<'a> OffscreenObjects<'a> {
         Ok((buffer, memory))
     }
 
-    /// Upload an attachment's previous bytes into a host-visible staging buffer
-    /// for the `vkCmdCopyBufferToImage` a `LoadOp::Load` pass issues
-    /// (`research/docs/23` §3.3).
-    fn create_previous_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), ProviderError> {
-        let (buffer, memory) = self.create_host_visible_buffer(
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    /// Provide the transfer source an attachment's previous contents leave for
+    /// the `vkCmdCopyBufferToImage` a `LoadOp::Load` pass issues
+    /// (`research/docs/23` §3.3/§74).
+    ///
+    /// The bytes the trace owns and the provider's staged copy are uploaded
+    /// into a host-visible staging buffer, exactly as before. An owner's own
+    /// mapping is imported at the owner's address instead — the same
+    /// [`Self::bind_render_input`] arm a no-copy stream takes — so the device
+    /// reads the pages the footprint and the upload both name rather than a
+    /// snapshot of them (R5b).
+    fn create_previous_bytes(
+        &mut self,
+        index: usize,
+        source: &RenderInputSource<'_>,
+    ) -> Result<(), ProviderError> {
+        let (buffer, memory) = self.bind_render_input(
+            source,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            bytes,
             "attachment previous bytes",
         )?;
         self.attachments[index].previous_buffer = buffer;
@@ -8030,6 +8157,20 @@ fn contract_refusal(detail: &str) -> ProviderError {
     error.with_detail(detail.to_owned())
 }
 
+/// A structurally wrong value a caller handed the rail, under a slug that names
+/// the field instead of the generic contract refusal.
+///
+/// The class and phase are the ones core admission uses for the same fact
+/// (`Args`, `Resolve`), which is also the pair the native rail refuses a
+/// loading attachment's mismatched previous bytes with
+/// (`render_attachment_initial_mismatch`), so the two rails report one name.
+fn args_refusal(slug: &'static str) -> ProviderError {
+    let mut error = ProviderError::new(ProviderPhase::Resolve, ProviderErrorClass::Args, slug)
+        .expect("static provider refusal slug");
+    error.retryability = Retryability::Never;
+    error
+}
+
 fn spirv_refusal(detail: &str) -> ProviderError {
     let mut error = ProviderError::new(
         ProviderPhase::Resolve,
@@ -8114,7 +8255,7 @@ mod tests {
         AcquirePolicy, AllocationId, AllocationRecord, BorrowedLease, BufferAccess, BufferLease,
         DepthFormat, DepthLoadOp, InitialState, LeaseReservation, PipelineId, PresentDescriptor,
         PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment, RenderDepthIdentity,
-        RenderStencilAttachment, RenderStencilIdentity, StencilFormat, StencilLoadOp,
+        RenderStencilAttachment, RenderStencilIdentity, StagedLease, StencilFormat, StencilLoadOp,
         TextureAccess, TextureFormat, TextureSource, TextureType, TextureView, VertexLayout,
         ViewId,
     };
@@ -9623,7 +9764,7 @@ mod tests {
                         format: AttachmentFormat::Rgba8Unorm,
                         store: StoreOp::DontCare,
                         load: LoadOp::Load,
-                        previous: Some(&previous),
+                        previous: Some(RenderInputSource::TraceBytes(&previous)),
                     },
                 ],
                 extent: [2, 2],
@@ -10030,8 +10171,11 @@ mod tests {
         // Without bytes the shape plans; with bytes it is refused by name.
         prepare_render_request(&stages, &pass, &[None], None, 0, 0)
             .expect("a DontCare attachment with no previous bytes plans");
-        let previous: [u8; 16] = [0x11; 16];
-        let refused = match prepare_render_request(&stages, &pass, &[Some(&previous)], None, 0, 0) {
+        let declared = attachment_previous_view(
+            BufferSource::OwnedBytes(vec![0x11; 16]),
+            AllocationId::new(9),
+        );
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&declared)], None, 0, 0) {
             Err(error) => error,
             Ok(_) => panic!("bytes carried for a DontCare attachment are refused"),
         };
@@ -10443,6 +10587,22 @@ mod tests {
         }
     }
 
+    /// One pool view declaring a `LoadOp::Load` attachment's previous contents
+    /// (`docs/23` §3.3/§74): the reviewed 2x2 `rgba8_unorm` attachment's own
+    /// 16 tightly packed bytes.
+    fn attachment_previous_view(source: BufferSource, allocation: AllocationId) -> BufferView {
+        BufferView {
+            view_id: ViewId::new(61),
+            metal_binding: 0,
+            allocation_id: allocation,
+            offset: 0,
+            length: 16,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source,
+        }
+    }
+
     /// One lease registration over `allocation`'s first `length` bytes.
     fn lease_registration(
         lease_id: LeaseId,
@@ -10572,5 +10732,273 @@ mod tests {
             Some(&FieldValue::Unsigned(4096))
         );
         assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(11)));
+    }
+
+    /// The reviewed loading pass: the milestone's 2x2 attachment opened with
+    /// `LoadOp::Load`, so its previous contents have to resolve before the rail
+    /// reads a device (`docs/23` §74, R5b).
+    fn loading_pass() -> RenderPassDescriptor {
+        let mut pass = milestone_pass(AttachmentFormat::Rgba8Unorm);
+        pass.color_attachments[0].load = LoadOp::Load;
+        pass
+    }
+
+    /// One lease context over `resources` with the given host-import
+    /// alignment, exactly as the provider builds it per submission
+    /// (`docs/23` §74).
+    fn attachment_lease_context<'a>(
+        staging: &'a LeaseRegistry,
+        borrowed: &'a Arc<BorrowedLeaseRegistry>,
+        resources: &'a ResourceTableSnapshot,
+        epoch: DeviceEpoch,
+        host_import_alignment: u64,
+    ) -> RenderLeaseContext<'a> {
+        RenderLeaseContext {
+            staging,
+            borrowed,
+            resources,
+            device_epoch: epoch,
+            host_import_alignment,
+        }
+    }
+
+    /// A loading attachment's previous contents resolve through the same three
+    /// arms a stream's bytes do (`docs/23` §74, R5b).
+    ///
+    /// The staged arm is the resolution the ownership states: the declaring
+    /// view names an imported lease and the rail reads the provider's own copy
+    /// of it, exactly as the trace-owned arm reads the view's own bytes.
+    #[test]
+    fn a_staged_lease_attachment_load_resolves_into_the_providers_copy() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(21);
+        let allocation = AllocationId::new(45);
+        let reservation = lease_registration(lease_id, allocation, 16, epoch);
+        let staged = LeaseRegistry::new();
+        staged
+            .import(
+                StagedLease::new(reservation, vec![0x2a; 16])
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 16,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers its view");
+        let leases = attachment_lease_context(&staged, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let view = attachment_previous_view(BufferSource::StagedLease(lease_id), allocation);
+        let declared = [Some(&view)];
+        let request = prepare_render_request(&stages, &pass, &declared, Some(&leases), 0, 0)
+            .expect("the staged copy carries the attachment's previous contents");
+        let [attachment] = request.attachments.as_slice() else {
+            panic!("the milestone pass carries one colour attachment");
+        };
+        let Some(RenderInputSource::StagedBytes(bytes)) = &attachment.previous else {
+            panic!(
+                "a staged lease resolves into the provider's own copy: {:?}",
+                attachment.previous
+            );
+        };
+        assert_eq!(bytes.as_slice(), [0x2a; 16]);
+        assert!(
+            RenderInputRetains::retain(Some(&leases), &request)
+                .expect("a staged arm takes no hold")
+                .is_none(),
+            "a staged copy has no owner mapping to retain"
+        );
+
+        // The staged copy is the provider's, so releasing it is what makes the
+        // same declaration unreadable, under the registry's own name.
+        staged
+            .release(lease_id)
+            .expect("the staged copy is released");
+        let refused =
+            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
+                Err(error) => error,
+                Ok(_) => panic!("a released staged lease cannot be read"),
+            };
+        eprintln!("released staged lease refused: {refused:?}");
+        assert_eq!(refused.slug, "lease_not_imported");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+    }
+
+    /// A loading attachment whose declaring view names a lease the rail cannot
+    /// resolve is refused under the source's own name, not under the load
+    /// operation's (`docs/23` §74, R5b).
+    #[test]
+    fn an_attachment_load_is_refused_without_a_lease_channel() {
+        let allocation = AllocationId::new(45);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let view =
+            attachment_previous_view(BufferSource::BorrowedNoCopy(LeaseId::new(22)), allocation);
+        let refused = match prepare_render_request(&stages, &pass, &[Some(&view)], None, 0, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a lease cannot be read without the registry that imported it"),
+        };
+        eprintln!("no channel: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_load_source_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.phase, ProviderPhase::Resolve);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// A borrowed attachment load on a device that does not import host memory
+    /// is refused under the storage mode's published name, with the role that
+    /// could not be bound (`docs/23` §74, R5b).
+    #[test]
+    fn a_borrowed_attachment_load_is_refused_without_host_import() {
+        let epoch = DeviceEpoch::new(3);
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let resources = ResourceTableSnapshot::new();
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 0);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let view = attachment_previous_view(
+            BufferSource::BorrowedNoCopy(LeaseId::new(23)),
+            AllocationId::new(45),
+        );
+        let refused =
+            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
+                Err(error) => error,
+                Ok(_) => panic!("a device without host import cannot read the owner's window"),
+            };
+        eprintln!("no host import: {refused:?}");
+        assert_eq!(refused.slug, "storage_mode_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("storage_mode"),
+            Some(&FieldValue::Text("borrowed_no_copy".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("role"),
+            Some(&FieldValue::Text(
+                "render_attachment_load_source_unsupported".to_owned()
+            ))
+        );
+    }
+
+    /// An owner window whose address misses the device's host-import alignment
+    /// is refused by name before any Vulkan import exists (`docs/23` §74).
+    #[test]
+    fn a_borrowed_attachment_load_is_refused_when_its_pointer_misses_the_alignment() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(24);
+        let allocation = AllocationId::new(45);
+        let reservation = lease_registration(lease_id, allocation, 16, epoch);
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 32,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers its view");
+        let borrowed = BorrowedLeaseRegistry::new();
+        borrowed
+            .import(
+                BorrowedLease::new(reservation, 0x2000 + 1)
+                    .expect("a non-null owner pointer is a valid reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let staging = LeaseRegistry::new();
+        let borrowed = Arc::new(borrowed);
+        let leases = attachment_lease_context(&staging, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let view = attachment_previous_view(BufferSource::BorrowedNoCopy(lease_id), allocation);
+        let refused =
+            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
+                Err(error) => error,
+                Ok(_) => panic!("a pointer one byte past the alignment cannot be imported"),
+            };
+        eprintln!("misaligned attachment window: {refused:?}");
+        assert_eq!(refused.slug, "lease_alignment_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("lease"), Some(&FieldValue::Unsigned(24)));
+        assert_eq!(
+            refused.fields.get("attachment"),
+            Some(&FieldValue::Unsigned(0))
+        );
+    }
+
+    /// A declaring view whose window is not the attachment's own extent is
+    /// refused by name, under the slug the native rail publishes for the same
+    /// fact (`docs/23` §74, R5b).
+    #[test]
+    fn an_attachment_load_refuses_a_window_that_is_not_its_extent() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(25);
+        let allocation = AllocationId::new(46);
+        let reservation = lease_registration(lease_id, allocation, 32, epoch);
+        let staged = LeaseRegistry::new();
+        staged
+            .import(
+                StagedLease::new(reservation, vec![0x3b; 32])
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: allocation,
+                owner_epoch: epoch,
+                size: 32,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the fixture lease covers its view");
+        let leases = attachment_lease_context(&staged, &borrowed, &resources, epoch, 4096);
+        let stages = reviewed_stages(AttachmentFormat::Rgba8Unorm);
+        let pass = loading_pass();
+        let view = BufferView {
+            view_id: ViewId::new(62),
+            metal_binding: 0,
+            allocation_id: allocation,
+            offset: 0,
+            length: 32,
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::StagedLease(lease_id),
+        };
+        let refused =
+            match prepare_render_request(&stages, &pass, &[Some(&view)], Some(&leases), 0, 0) {
+                Err(error) => error,
+                Ok(_) => panic!("a 2x2 attachment reads sixteen bytes, not thirty-two"),
+            };
+        eprintln!("over-wide window refused: {refused:?}");
+        assert_eq!(refused.slug, "render_attachment_initial_mismatch");
+        assert_eq!(refused.class, ProviderErrorClass::Args);
+        assert_eq!(
+            refused.fields.get("expected_bytes"),
+            Some(&FieldValue::Unsigned(16))
+        );
+        assert_eq!(
+            refused.fields.get("resolved_bytes"),
+            Some(&FieldValue::Unsigned(32))
+        );
     }
 }
