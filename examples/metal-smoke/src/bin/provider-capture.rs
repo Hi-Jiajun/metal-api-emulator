@@ -19,12 +19,13 @@ use metal_api_core::provider::{
     QueuePriority, QueueSchedulingPolicy, RenderAttachment, RenderDepthAttachment,
     RenderDepthIdentity, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, RenderStencilAttachment, RenderStencilIdentity,
-    ResourceTableSnapshot, SampleCount, SemanticDigest, ShaderSource, StageBufferBinding,
-    StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-    StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess, TextureFormat,
-    TextureSource, TextureType, TextureView, TracePass, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexLayout, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS,
-    MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION, RENDER_AFFINE_AXES,
+    ResourceTableSnapshot, SampleCount, SamplerPolicy, SemanticDigest, ShaderSource,
+    StageBufferBinding, StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp,
+    StencilOp, StencilResolveFilter, StencilTest, StorageMode, StoreOp, TextureAccess,
+    TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView, TracePass,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId, Winding,
+    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_STAGE_BUFFER_INDEX, PROVIDER_SCHEMA_VERSION,
+    RENDER_AFFINE_AXES,
 };
 use metal_api_core::{provider_api as objects, Size};
 #[cfg(unix)]
@@ -1517,6 +1518,18 @@ fn register_render_pipeline(
             VertexLayout::None,
         ),
     };
+    // The sampled case's declaration (`research/docs/23` §3.3, v100): the
+    // fragment stage reads the pass's one texture at binding 0, and the state
+    // is the one the reviewed pair's own MSL sibling carries — the state both
+    // rails execute, and the one a declaration has to repeat.
+    let textures = match geometry {
+        RenderGeometry::SampledTexture => vec![TextureBindingContract::sampled(
+            0,
+            TextureFormat::Rgba8Unorm,
+            SamplerPolicy::reviewed_render_sampler(),
+        )],
+        _ => Vec::new(),
+    };
     let registered = match registrar {
         RenderRegistrar::Vulkan(vulkan) => vulkan.register_render_pipeline(RenderPipelineRequest {
             contract: RenderPipelineContract {
@@ -1525,6 +1538,7 @@ fn register_render_pipeline(
                 fragment_entry: vulkan_entries.1.to_owned(),
                 color_formats: formats.to_vec(),
                 vertex_layout: layout.clone(),
+                textures: textures.clone(),
             },
             vertex_spirv: vulkan_stages.0.to_vec(),
             fragment_spirv: vulkan_stages.1.to_vec(),
@@ -1544,6 +1558,7 @@ fn register_render_pipeline(
                     fragment_entry: msl_entries.1.to_owned(),
                     color_formats: formats.to_vec(),
                     vertex_layout: layout.clone(),
+                    textures: textures.clone(),
                 },
                 logical_digest,
             })
@@ -1667,6 +1682,7 @@ fn register_translated_stage_buffer_pipeline(
         color_formats: formats.to_vec(),
         vertex_layout: VertexLayout::None,
         stage_buffers: stage_buffer_declarations(case)?,
+        textures: Vec::new(),
     };
     let logical_digest = SemanticDigest::new(
         "suite-sha256-entry-v1",

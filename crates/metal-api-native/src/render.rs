@@ -65,7 +65,7 @@ use metal_api_core::provider::{
     FootprintProof, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor, LeaseId,
     LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount,
+    RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, SampleCount, SamplerPolicy,
     StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource, TextureType,
     TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
     FULL_SCREEN_TRIANGLE_VERTICES,
@@ -3526,6 +3526,40 @@ pub(crate) fn plan_with_leases<'a>(
     }
     // Bounded by the check above, so these conversions cannot lose a bit.
     let extent = [raster[0] as u32, raster[1] as u32];
+    // The declaration states the sampler state the pass's samples were lowered
+    // against (`research/docs/23` §3.3, v100), and this rail's reviewed MSL
+    // module *carries* that state in its own `constexpr sampler`: the one it
+    // spells is the one it executes. A declaration naming another filtering or
+    // addressing mode describes a sampler no module behind it carries, so it is
+    // refused by name with both halves rather than executed as the reviewed
+    // state and reported under another. A second reviewed module per state is
+    // what would lift this, not a silently substituted sampler.
+    for declared in &request.pipeline.textures {
+        if declared.sampler == Some(SamplerPolicy::reviewed_render_sampler()) {
+            continue;
+        }
+        let half = |policy: Option<SamplerPolicy>| match policy {
+            Some(policy) => (
+                FieldValue::Text(format!("{:?}", policy.filter)),
+                FieldValue::Text(format!("{:?}", policy.address)),
+            ),
+            None => (
+                FieldValue::Text("None".to_owned()),
+                FieldValue::Text("None".to_owned()),
+            ),
+        };
+        let (filter, address) = half(declared.sampler);
+        let (module_filter, module_address) = half(Some(SamplerPolicy::reviewed_render_sampler()));
+        return Err(capability_refusal("render_texture_sampler_unsupported")
+            .with_field(
+                "binding",
+                FieldValue::Unsigned(u64::from(declared.metal_binding)),
+            )
+            .with_field("filter", filter)
+            .with_field("address", address)
+            .with_field("module_filter", module_filter)
+            .with_field("module_address", module_address));
+    }
     // The render sampler (`research/docs/23` §3.3, v70) is one decision in two
     // halves, so both are answered together: the reviewed sampling module
     // samples the pass's own texture binding, and a pass that binds a texture
@@ -6667,10 +6701,11 @@ mod tests {
         MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, OperationId,
         PipelineContract, PresentTarget, ProviderCapabilities, RenderAttachment,
         RenderDepthAttachment, RenderDepthIdentity, RenderPipelineStage, RenderStencilAttachment,
-        RenderStencilIdentity, ResourceTableSnapshot, SemanticDigest, StageBufferBinding,
-        StageBufferView, StagedLease, StencilCompare, StencilFormat, StencilLoadOp, StencilOp,
-        StencilResolveFilter, StencilTest, StorageMode, TextureAccess, VertexAttribute,
-        VertexBufferLayout, VertexLayout, ViewId, PROVIDER_SCHEMA_VERSION,
+        RenderStencilIdentity, ResourceTableSnapshot, SamplerAddressMode, SamplerFilter,
+        SamplerPolicy, SemanticDigest, StageBufferBinding, StageBufferView, StagedLease,
+        StencilCompare, StencilFormat, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
+        StorageMode, TextureAccess, VertexAttribute, VertexBufferLayout, VertexLayout, ViewId,
+        PROVIDER_SCHEMA_VERSION,
     };
 
     /// The texels the reviewed fragment writes, as `MTLClearColor` components.
@@ -6766,6 +6801,7 @@ mod tests {
             fragment_entry: STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }
     }
 
@@ -7008,6 +7044,7 @@ mod tests {
                 access: BufferAccess::Read,
                 footprint: FootprintProof::Static { max_bytes: 16 },
             }],
+            textures: Vec::new(),
             ..milestone_pipeline()
         };
         let refused =
@@ -7222,6 +7259,7 @@ mod tests {
             fragment_entry: STAGE_BUFFER_WRITE_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }
     }
 
@@ -7906,6 +7944,7 @@ mod tests {
             fragment_entry: FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }
     }
 
@@ -7917,7 +7956,7 @@ mod tests {
     }
 
     /// The reviewed render-sampler fixture's contract and its 4×4 pass
-    /// (`research/docs/23` §3.3, v70).
+    /// (`research/docs/23` §3.3, v70/v100).
     fn sampled_pipeline() -> RenderPipelineContract {
         RenderPipelineContract {
             stage_buffers: Vec::new(),
@@ -7925,6 +7964,16 @@ mod tests {
             fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            // The declaration the pass's binding pairs with (`research/docs/23`
+            // §3.3, v100): the reviewed MSL module samples one `rgba8_unorm`
+            // surface through its own `constexpr sampler`, which is nearest
+            // filtering with clamped addressing — the one state this rail
+            // executes, and the state a declaration has to repeat.
+            textures: vec![metal_api_core::provider::TextureBindingContract::sampled(
+                0,
+                metal_api_core::provider::TextureFormat::Rgba8Unorm,
+                metal_api_core::provider::SamplerPolicy::reviewed_render_sampler(),
+            )],
         }
     }
 
@@ -8013,6 +8062,7 @@ mod tests {
             stage_buffers: Vec::new(),
             vertex_entry: VERTEX_ENTRY.to_owned(),
             fragment_entry: SAMPLED_FRAGMENT_ENTRY.to_owned(),
+            textures: Vec::new(),
             ..sampled_pipeline()
         };
         assert!(reviewed_module_for(&crossed).is_none());
@@ -8053,7 +8103,14 @@ mod tests {
         })
         .unwrap_err();
         eprintln!("unbound refused: {error:?}");
-        assert_eq!(error.slug, "render_texture_binding_required");
+        // Since v100 the pair rules answer first (`research/docs/23` §3.3,
+        // v100): the registration declared a texture this pass does not bind,
+        // so no rail ever reaches an unbound descriptor.
+        assert_eq!(error.slug, "trace_contract_invalid");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("declares texture binding 0")));
         let error = plan_pass(&OffscreenRenderRequest {
             pass: &pass,
             pipeline: &milestone,
@@ -8063,7 +8120,14 @@ mod tests {
         })
         .unwrap_err();
         eprintln!("uncoupled refused: {error:?}");
-        assert_eq!(error.slug, "render_texture_stage_unsupported");
+        // The other direction of the same pair (`research/docs/23` §3.3,
+        // v100): a pass that binds a texture its registration never declared is
+        // refused by the contract before the rail asks which module runs.
+        assert_eq!(error.slug, "trace_contract_invalid");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("declares no texture there")));
 
         // Another extent puts some fragment's sample on a texel boundary or
         // inside a neighbour, which is a filtered read the review never covered.
@@ -8092,9 +8156,14 @@ mod tests {
             pass.textures = vec![view];
             pass
         };
+        // The declaration states the same format the pass binds, so the pair
+        // rules admit the trace and the rail's own format window is what
+        // refuses (`research/docs/23` §3.3, v100).
+        let mut bgra_pipeline = sampled_pipeline();
+        bgra_pipeline.textures[0].format = TextureFormat::Bgra8Unorm;
         let error = plan_pass(&OffscreenRenderRequest {
             pass: &other_format,
-            pipeline: &sampled,
+            pipeline: &bgra_pipeline,
             source: REVIEWED_SAMPLED_SOURCE,
             initial: vec![None],
             resident: Vec::new(),
@@ -8117,6 +8186,64 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.slug, "render_texture_source_unsupported");
+    }
+
+    /// The declaration repeats the state the reviewed module's own `constexpr
+    /// sampler` carries (`research/docs/23` §3.3, v100).
+    ///
+    /// This rail executes the reviewed MSL module, whose sampler state lives in
+    /// the module itself: the rail cannot create another one without another
+    /// reviewed module, so a declaration naming another filtering or addressing
+    /// mode is refused with both halves rather than executed as the reviewed
+    /// state under a name that says otherwise.
+    #[test]
+    fn a_render_sampler_declaration_must_repeat_the_reviewed_module() {
+        let pass = sampled_pass(4);
+        for (filter, address) in [
+            (SamplerFilter::Linear, SamplerAddressMode::ClampToEdge),
+            (SamplerFilter::Nearest, SamplerAddressMode::Repeat),
+        ] {
+            let mut declaring = sampled_pipeline();
+            declaring.textures[0].sampler = Some(SamplerPolicy { filter, address });
+            let error = plan_pass(&OffscreenRenderRequest {
+                pass: &pass,
+                pipeline: &declaring,
+                source: REVIEWED_SAMPLED_SOURCE,
+                initial: vec![None],
+                resident: Vec::new(),
+            })
+            .unwrap_err();
+            eprintln!("{filter:?}/{address:?} refused: {error:?}");
+            assert_eq!(error.slug, "render_texture_sampler_unsupported");
+            assert_eq!(error.class, ProviderErrorClass::Capability);
+            assert_eq!(error.fields.get("binding"), Some(&FieldValue::Unsigned(0)));
+            assert_eq!(
+                error.fields.get("filter"),
+                Some(&FieldValue::Text(format!("{filter:?}")))
+            );
+            assert_eq!(
+                error.fields.get("address"),
+                Some(&FieldValue::Text(format!("{address:?}")))
+            );
+            assert_eq!(
+                error.fields.get("module_filter"),
+                Some(&FieldValue::Text("Nearest".to_owned()))
+            );
+            assert_eq!(
+                error.fields.get("module_address"),
+                Some(&FieldValue::Text("ClampToEdge".to_owned()))
+            );
+        }
+        // Control: the state the reviewed module carries admits the very same
+        // pass, so the refusal above is about the state rather than the shape.
+        plan_pass(&OffscreenRenderRequest {
+            pass: &pass,
+            pipeline: &sampled_pipeline(),
+            source: REVIEWED_SAMPLED_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        })
+        .expect("the reviewed state admits the reviewed pass");
     }
 
     /// The render bits the provider declares now carry the sampler
@@ -8152,6 +8279,7 @@ mod tests {
             fragment_entry: fragment.to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         };
         let request = OffscreenRenderRequest {
             pass: &pass,
@@ -8656,6 +8784,7 @@ mod tests {
                     },
                 ],
             }]),
+            textures: Vec::new(),
         };
         let request = OffscreenRenderRequest {
             pass: &pass,
@@ -9355,6 +9484,7 @@ mod tests {
                 fragment_entry: FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             }),
         }
     }
@@ -9701,6 +9831,7 @@ mod tests {
                     format: VertexFormat::Float32x2,
                 }],
             }]),
+            textures: Vec::new(),
         }
     }
 
@@ -10155,6 +10286,7 @@ mod tests {
                     },
                 ],
             }]),
+            textures: Vec::new(),
         }
     }
 
@@ -10301,6 +10433,7 @@ mod tests {
                     format: VertexFormat::Float32x2,
                 }],
             }]),
+            textures: Vec::new(),
         }
     }
 

@@ -2852,7 +2852,11 @@ pub(crate) fn static_sampler_policy(
 }
 
 /// The Vulkan create-info for one contract sampler policy.
-fn sampler_create_info(
+///
+/// Shared by both rails that create a `VkSampler` from a contract policy: the
+/// compute narrow class's AIR-embedded state and the render sampler's
+/// declaration (`research/docs/23` §3.3, v100).
+pub(crate) fn sampler_create_info(
     policy: metal_api_core::provider::SamplerPolicy,
 ) -> vk::SamplerCreateInfo<'static> {
     use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
@@ -6553,6 +6557,7 @@ mod tests {
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: VertexLayout::None,
+                    textures: Vec::new(),
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
                 fragment_spirv: crate::render::solid_fragment_spirv(&[
@@ -6678,6 +6683,7 @@ mod tests {
                     fragment_entry: crate::render::SOLID_FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba8Unorm],
                     vertex_layout: VertexLayout::None,
+                    textures: Vec::new(),
                 },
                 vertex_spirv: include_bytes!("render_spv/fullscreen_triangle.vert.spv").to_vec(),
                 fragment_spirv: crate::render::solid_fragment_spirv(&[

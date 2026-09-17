@@ -716,6 +716,28 @@ impl SamplerPolicy {
             address: SamplerAddressMode::ClampToEdge,
         }
     }
+
+    /// The state the reviewed render-sampling pair carries
+    /// (`research/docs/23` §3.3, v100).
+    ///
+    /// Both rails that execute the reviewed pair state this one: the native
+    /// rail's reviewed MSL module spells it as a `constexpr sampler`
+    /// (`conformance/shaders/render_sampled_4x4.metal`), and the Vulkan rail
+    /// creates its descriptor's sampler from the state the trace's declaration
+    /// names — so the state is stated once here instead of drifting between the
+    /// rails' hand-written literals and the fixtures that register them.
+    ///
+    /// Nearest filtering with clamped addressing is also what the reviewed
+    /// *identity* sample needs: the reviewed pair samples a texture of the
+    /// render area's own extent at texel centres, so a filtering that blended or
+    /// an addressing mode that wrapped would read texels the v70 review never
+    /// covered.
+    pub const fn reviewed_render_sampler() -> Self {
+        Self {
+            filter: SamplerFilter::Nearest,
+            address: SamplerAddressMode::ClampToEdge,
+        }
+    }
 }
 
 /// How far a shader reaches into one texture binding, or — for a storage
@@ -4013,6 +4035,35 @@ pub struct RenderPipelineContract {
     /// passes bind none either, because
     /// [`Self::validate_against`] holds the two lists to each other.
     pub stage_buffers: Vec<StageBufferBinding>,
+    /// Sampled textures the fragment stage reads, in canonical order
+    /// (`research/docs/23` §3.3, v100).
+    ///
+    /// This is the pipeline-level half of the pass's
+    /// [`RenderPassDescriptor::textures`], and it reuses the compute face's
+    /// declaration type on purpose: the two faces state the same five facts
+    /// about a sampled binding — the Metal index, the read-only access, the
+    /// dimensionality, the texel format and the sampler state the module's
+    /// sampling operations were lowered against — and only their *namespaces*
+    /// differ. A compute pass pairs a declaration with its bound views by
+    /// `metal_binding`; a render pass's texture list *is* its binding space
+    /// (`RenderPassDescriptor::validate` requires `metal_binding` to equal the
+    /// position), so entry `i` here is the fragment stage's `[[texture(i)]]`
+    /// and pairs with `pass.textures[i]`.
+    ///
+    /// The sampler state is the render-side sibling of the compute narrow
+    /// class's C1b rule (`research/docs/26` §21.3): it is a *declaration*, not
+    /// a request knob, because the fragment stage's sampling operations were
+    /// lowered against one state and a rail that creates another one silently
+    /// changes which texels a read returns. Entry order, the position-equals-
+    /// binding rule, the sampler-presence rule and the bounded-read rule are
+    /// [`Self::validate`]'s; the agreement with the pass is
+    /// [`Self::validate_against`]'s; whether the *module* the registration
+    /// names carries that same state is the execution rail's, exactly as it is
+    /// for compute.
+    ///
+    /// A pipeline that declares none — every pre-v100 registration — keeps the
+    /// exact bytes it had, and its passes bind none either.
+    pub textures: Vec<TextureBindingContract>,
 }
 
 impl RenderPipelineContract {
@@ -4054,6 +4105,7 @@ impl RenderPipelineContract {
         if let VertexLayout::Buffers(buffers) = &self.vertex_layout {
             validate_vertex_layout(buffers)?;
         }
+        validate_render_texture_declarations(&self.textures)?;
         validate_stage_buffer_bindings(&self.stage_buffers, &self.vertex_layout)?;
         Ok(())
     }
@@ -4189,6 +4241,59 @@ impl RenderPipelineContract {
                 });
             }
         }
+        // The sampled textures pair by position (`research/docs/23` §3.3,
+        // v100): the pass's texture list *is* the fragment stage's
+        // `[[texture(n)]]` space, so declaration `i` and `pass.textures[i]`
+        // describe one binding, and the two sides have to agree about its
+        // access, dimensionality and format. The list length is compared
+        // implicitly, in both directions: a declaration without a bound view
+        // would leave a descriptor the fragment stage reads undefined, and a
+        // bound view without a declaration would fill a slot the pipeline
+        // never said how to read. What the declaration adds beyond the view's
+        // own shape is the sampler state the module's samples were lowered
+        // against and the read's own bounded reach, which is why a binding has
+        // to be declared at all.
+        for (index, declared) in self.textures.iter().enumerate() {
+            let Some(bound) = pass.textures.get(index) else {
+                return Err(ContractError::MissingTextureBinding {
+                    binding: declared.metal_binding,
+                });
+            };
+            if bound.access != declared.access {
+                return Err(ContractError::TextureAccessMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.access,
+                    actual: bound.access,
+                });
+            }
+            if bound.texture_type != declared.texture_type {
+                return Err(ContractError::TextureTypeMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.texture_type,
+                    actual: bound.texture_type,
+                });
+            }
+            if bound.format != declared.format {
+                return Err(ContractError::TextureFormatMismatch {
+                    binding: declared.metal_binding,
+                    expected: declared.format,
+                    actual: bound.format,
+                });
+            }
+            if declared.footprint == TextureFootprintProof::Unbounded {
+                return Err(ContractError::RenderTextureFootprintProofUnsupported {
+                    index: declared.metal_binding,
+                    proof: declared.footprint,
+                });
+            }
+        }
+        for (index, bound) in pass.textures.iter().enumerate() {
+            if self.textures.get(index).is_none() {
+                return Err(ContractError::UndeclaredTextureBinding {
+                    binding: bound.metal_binding,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -4219,6 +4324,65 @@ impl RenderPipelineContract {
     ) -> Result<[u64; 2], ContractError> {
         render_affine_axis_counts(pass, stage, index, resolved_index_bytes)
     }
+}
+
+/// Structural validation of a [`RenderPipelineContract`]'s render texture
+/// declarations, shared by the contract and its tests
+/// (`research/docs/23` §3.3, v100).
+///
+/// Every rule is a fact the declaration list alone can answer: the count stays
+/// inside the first increment's cap, the list is canonical and *positional*
+/// (entry `i` is the fragment stage's `[[texture(i)]]`, so it pairs with
+/// `pass.textures[i]`), a declaration states a sampler exactly when its access
+/// is the sampled one — the same half-statement rule C1b's storage-image
+/// sibling states — and the reach is the bounded one: the render sampler reads
+/// a whole, tightly packed view, which is the unit the pass's own extent rule
+/// and the lease channel are stated in.
+fn validate_render_texture_declarations(
+    bindings: &[TextureBindingContract],
+) -> Result<(), ContractError> {
+    if bindings.len() > MAX_RENDER_TEXTURES {
+        return Err(ContractError::RenderTextureLimitExceeded {
+            requested: bindings.len(),
+            maximum: MAX_RENDER_TEXTURES,
+        });
+    }
+    let mut previous: Option<u32> = None;
+    for (index, binding) in bindings.iter().enumerate() {
+        if previous.is_some_and(|previous| previous >= binding.metal_binding) {
+            if previous == Some(binding.metal_binding) {
+                return Err(ContractError::DuplicateBinding(binding.metal_binding));
+            }
+            return Err(ContractError::NonCanonicalBindingOrder(
+                "render texture declarations",
+            ));
+        }
+        previous = Some(binding.metal_binding);
+        let expected =
+            u32::try_from(index).map_err(|_| ContractError::RenderTextureLimitExceeded {
+                requested: index,
+                maximum: MAX_RENDER_TEXTURES,
+            })?;
+        if binding.metal_binding != expected {
+            return Err(ContractError::RenderTextureBindingMismatch {
+                index,
+                metal_binding: binding.metal_binding,
+            });
+        }
+        if binding.sampler.is_some() != (binding.access == TextureAccess::Sampled) {
+            return Err(ContractError::TextureSamplerDeclarationMismatch {
+                binding: binding.metal_binding,
+                access: binding.access,
+            });
+        }
+        if binding.footprint == TextureFootprintProof::Unbounded {
+            return Err(ContractError::RenderTextureFootprintProofUnsupported {
+                index: binding.metal_binding,
+                proof: binding.footprint,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Structural validation of a [`RenderPipelineContract`]'s stage buffer
@@ -9089,6 +9253,15 @@ fn contract_error_refusal(error: ContractError) -> ProviderError {
         E::RenderTextureSampleCountUnsupported { .. } => {
             (ProviderErrorClass::Args, "texture_shape_mismatch")
         },
+        // A render texture declaration's reach is the render sampler's own
+        // first-increment narrowing (`research/docs/23` §3.3, v100), so it
+        // keeps a capability slug beside the access and count bits; the rest
+        // of the declaration's pair rules are caller-fixable trace structure
+        // and join the contract arm below.
+        E::RenderTextureFootprintProofUnsupported { .. } => (
+            ProviderErrorClass::Capability,
+            "render_texture_footprint_unsupported",
+        ),
         // Stage buffer contract (`research/docs/23` §3.3, v83). The cap, the
         // index bound and the admitted proof are first-increment narrowings on
         // a well-formed request, so they keep the same class and shape the
@@ -10987,6 +11160,19 @@ pub enum ContractError {
     RenderTextureAttachmentConflict {
         view: ViewId,
     },
+    /// A render texture declaration reaches an unbounded region of its view
+    /// (`research/docs/23` §3.3, v100).
+    ///
+    /// The render sampler reads a whole, tightly packed view — the unit the
+    /// pass's own extent rule, the lease channel and the readback are stated
+    /// in — so a declaration whose reach cannot be bounded is refused by name
+    /// instead of executed against texels nobody sized. The index is the
+    /// declaration's own position, which is the fragment stage's
+    /// `[[texture(n)]]` and the pass's `textures[n]`.
+    RenderTextureFootprintProofUnsupported {
+        index: u32,
+        proof: TextureFootprintProof,
+    },
     // Compute texture contract (`research/docs/26` §21.3). The pair rules are
     // caller-fixable structure, so they keep the trace-contract slug; the
     // reach proof is the first-increment narrowing and keeps its own
@@ -11782,6 +11968,10 @@ impl fmt::Display for ContractError {
             Self::RenderTextureAttachmentConflict { view } => write!(
                 formatter,
                 "render pass samples view {view:?} through a texture binding while writing it as an attachment"
+            ),
+            Self::RenderTextureFootprintProofUnsupported { index, proof } => write!(
+                formatter,
+                "render texture declaration {index} states a {proof:?} footprint, but the render sampler reads a whole tightly packed view"
             ),
             Self::MissingTextureBinding { binding } => write!(
                 formatter,
@@ -17579,6 +17769,7 @@ mod tests {
         let contract = RenderPipelineContract {
             stage_buffers: Vec::new(),
             vertex_layout: layout.clone(),
+            textures: Vec::new(),
             ..render_pipeline_contract()
         };
         contract
@@ -17614,6 +17805,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: zero_stride,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17629,6 +17821,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: empty_attributes,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17644,6 +17837,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: no_streams,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17661,6 +17855,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: out_of_range,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17688,6 +17883,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: duplicate,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17709,6 +17905,7 @@ mod tests {
             RenderPipelineContract {
                 stage_buffers: Vec::new(),
                 vertex_layout: too_many,
+                textures: Vec::new(),
                 ..render_pipeline_contract()
             }
             .validate(),
@@ -17728,6 +17925,7 @@ mod tests {
         let contract = RenderPipelineContract {
             stage_buffers: Vec::new(),
             vertex_layout: quad_layout(),
+            textures: Vec::new(),
             ..render_pipeline_contract()
         };
         contract
@@ -18640,6 +18838,7 @@ mod tests {
             fragment_entry: "solid_color_fragment".to_owned(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }
     }
 
@@ -19162,6 +19361,20 @@ mod tests {
     fn render_texture_trace() -> ComputeTrace {
         let mut value = attachment_trace(landing_view(7, 9), attachment_into(7, 9));
         render_entry(&mut value).textures = vec![sampled_texture_view(0)];
+        // The pass's binding and the pipeline's declaration are one pair
+        // (`research/docs/23` §3.3, v100): the sampled pass the v70 gate admits
+        // is the pass whose registration stated the texture it reads, with the
+        // state the reviewed pair's own MSL sibling carries.
+        if let Some(render) = value.pipelines[0].render.as_mut() {
+            render.textures = vec![TextureBindingContract::sampled(
+                0,
+                TextureFormat::Rgba8Unorm,
+                SamplerPolicy {
+                    filter: SamplerFilter::Nearest,
+                    address: SamplerAddressMode::ClampToEdge,
+                },
+            )];
+        }
         value
     }
 

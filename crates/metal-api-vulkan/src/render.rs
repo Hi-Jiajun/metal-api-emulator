@@ -40,9 +40,9 @@ use metal_api_core::provider::{
     MultisampleDepthResolve, MultisampleState, MultisampleStencilResolve, ProviderError,
     ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot, Retryability, SampleCount,
-    StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest, StoreOp,
-    TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout, VertexFormat,
-    VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
+    SamplerPolicy, StencilCompare, StencilLoadOp, StencilOp, StencilResolveFilter, StencilTest,
+    StoreOp, TextureFormat, TextureSource, TextureType, TextureView, VertexBufferLayout,
+    VertexFormat, VertexStep, ViewId, Winding, MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -291,6 +291,93 @@ const SAMPLED_UNORM8_FRAG_SPV: &[u8] = include_bytes!("render_spv/solid_unorm8_s
 /// The sampled pass's single texture binding: the fragment stage's
 /// `DescriptorSet 0 / Binding 0`.
 const SAMPLED_TEXTURE_BINDING: u32 = 0;
+
+/// The sampler state the reviewed sampling pair is executed with
+/// (`research/docs/23` §3.3, v100).
+///
+/// The pair's MSL sibling (`conformance/shaders/render_sampled_4x4.metal`)
+/// spells a `constexpr sampler` with nearest filtering and clamped addressing;
+/// its Vulkan SPIR-V sibling samples through the descriptor the rail builds, so
+/// the *declaration* is what states the state on this arm. The review covers
+/// exactly this one, which is why a registration declaring another one is
+/// refused by name ([`RenderStages::validate_reviewed_texture_sampler`]) rather
+/// than executed with a filtering no review covered. A translated fragment
+/// stage is the opposite arm: its AIR carries the state, and the rail holds the
+/// declaration to it ([`translated_texture_slots`]).
+const REVIEWED_SAMPLER_POLICY: SamplerPolicy = SamplerPolicy::reviewed_render_sampler();
+
+/// One sampled texture's execution slot (`research/docs/23` §3.3, v100).
+///
+/// Two rails states the pair. The reviewed sampling pair reads
+/// `DescriptorSet 0 / Binding i` for the pass's entry `i`, and the one state
+/// the review names; a translated fragment stage reads the slot its own
+/// reflection names, with the state its AIR was lowered against. Both end up
+/// here, so `create_render_textures` builds one layout and one sampler from the
+/// pair and holds no branch of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenderTextureSlot {
+    /// The reviewed pair's own layout: `DescriptorSet 0 / Binding i` carries
+    /// one combined image sampler, and the reviewed module samples it directly.
+    Combined {
+        set: u32,
+        binding: u32,
+        sampler: SamplerPolicy,
+    },
+    /// A translated fragment stage's layout: the translator emits the sampled
+    /// texture and the AIR static sampler as two descriptors (`OpTypeImage` and
+    /// `OpTypeSampler`, combined by the module's own `OpSampledImage`), so the
+    /// rail binds a `SAMPLED_IMAGE` at the image's slot and a `SAMPLER` at the
+    /// sampler's.
+    Split {
+        set: u32,
+        image: u32,
+        sampler_binding: u32,
+        sampler: SamplerPolicy,
+    },
+}
+
+impl RenderTextureSlot {
+    /// The sampler state this slot's samples are executed with.
+    pub(crate) const fn sampler(&self) -> SamplerPolicy {
+        match self {
+            Self::Combined { sampler, .. } | Self::Split { sampler, .. } => *sampler,
+        }
+    }
+}
+
+/// The refusal a declaration gets when the sampler state it names is not the
+/// state the module it was registered against carries
+/// (`research/docs/23` §3.3, v100).
+///
+/// Both rails publish it with the same fields the compute sibling's
+/// `compute_texture_sampler_unsupported` carries: the binding, the declared
+/// filtering and addressing, and the module's own two halves — so a caller can
+/// fix the declaration without a second lookup, and a state that was silently
+/// substituted is impossible to mistake for one that agreed.
+fn texture_sampler_refusal(
+    binding: u32,
+    declared: Option<SamplerPolicy>,
+    module: Option<SamplerPolicy>,
+) -> ProviderError {
+    let halves = |policy: Option<SamplerPolicy>| match policy {
+        Some(policy) => (
+            FieldValue::Text(format!("{:?}", policy.filter)),
+            FieldValue::Text(format!("{:?}", policy.address)),
+        ),
+        None => (
+            FieldValue::Text("None".to_owned()),
+            FieldValue::Text("None".to_owned()),
+        ),
+    };
+    let (filter, address) = halves(declared);
+    let (module_filter, module_address) = halves(module);
+    capability_refusal("render_texture_sampler_unsupported")
+        .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
+        .with_field("filter", filter)
+        .with_field("address", address)
+        .with_field("module_filter", module_filter)
+        .with_field("module_address", module_address)
+}
 
 /// The fragment stage this rail owns for the reviewed sampling pair
 /// (`research/docs/23` §3.3, v70).
@@ -834,6 +921,13 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// Extent in texels, which the pass requires to equal the render area
     /// (`prepare_render_request` refuses the pass otherwise).
     pub extent: [u32; 2],
+    /// The descriptor slot the fragment stage reads this texture from, and the
+    /// sampler state it samples it with (`research/docs/23` §3.3, v100). The
+    /// slot is the reviewed pair's own binding order or the one a translated
+    /// module's reflection names; the state is the reviewed pair's one state or
+    /// the module's AIR state, which the registration gate has already held the
+    /// contract's declaration to.
+    pub slot: RenderTextureSlot,
 }
 
 /// The depth attachment one offscreen pass opens (`research/docs/23` §3.3,
@@ -1139,11 +1233,43 @@ impl RenderStages {
     pub(crate) fn validate_stage_pair(&self) -> Result<(), ProviderError> {
         self.validate_vertex_half()?;
         self.validate_fragment_half()?;
+        self.validate_reviewed_texture_sampler()?;
         self.validate_reviewed_stage_buffer_access()?;
         if let (Some(vertex), Some(fragment)) =
             (&self.vertex_translation, &self.fragment_translation)
         {
             validate_varying_linkage(vertex, fragment, &self.contract.fragment_entry)?;
+        }
+        Ok(())
+    }
+
+    /// A reviewed sampling pair is executed with the one state the review
+    /// covers (`research/docs/23` §3.3, v100).
+    ///
+    /// The reviewed fragment module's Vulkan SPIR-V samples through the
+    /// descriptor set the rail builds, so the contract's declaration is the
+    /// only statement of state on this arm — and the review covers exactly one
+    /// state, the one the pair's MSL sibling spells. A registration that
+    /// declares another state is refused by name, with both halves, instead of
+    /// creating a sampler the review never covered. The translated arm answers
+    /// the same question the other way round: there the *module's* AIR carries
+    /// the state, and [`validate_translated_stage_textures`] holds the
+    /// declaration to it.
+    fn validate_reviewed_texture_sampler(&self) -> Result<(), ProviderError> {
+        if self.fragment_translation.is_some() {
+            // The translated fragment stage states its own state; its pairing
+            // is the module's reflection's business.
+            return Ok(());
+        }
+        for declared in &self.contract.textures {
+            if declared.sampler == Some(REVIEWED_SAMPLER_POLICY) {
+                continue;
+            }
+            return Err(texture_sampler_refusal(
+                declared.metal_binding,
+                declared.sampler,
+                Some(REVIEWED_SAMPLER_POLICY),
+            ));
         }
         Ok(())
     }
@@ -1381,6 +1507,7 @@ fn validate_translated_stage(
         return Err(unsupported_interface_refusal(stage, entry, field));
     }
     validate_translated_stage_buffers(stages, stage, entry, reflection)?;
+    validate_translated_stage_textures(stages, stage, entry, reflection)?;
     match stage {
         RenderStage::Vertex => validate_translated_vertex(stages, entry, reflection),
         RenderStage::Fragment => validate_translated_fragment(stages, entry, reflection),
@@ -1757,6 +1884,279 @@ fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static
     .find_map(|(present, field)| present.then_some(field))
 }
 
+/// Pair one translated fragment stage's reflected sampled textures with the
+/// contract's declarations (`research/docs/23` §3.3, v100).
+///
+/// This is the image half of [`validate_translated_stage_buffers`], and it asks
+/// the same question of the other Metal resource family: the module's
+/// reflection names the `[[texture(n)]]` argument it reads and the AIR static
+/// sampler its samples were lowered against, and the contract declares what the
+/// pass's binding states there. The rail executes the pair only when the two
+/// halves agree field by field:
+///
+/// * a reflected texture the contract does not declare is the registration's
+///   own mismatch (`render_stage_reflection_mismatch`), because the pass would
+///   bind bytes under a declaration nobody stated;
+/// * a declaration the reflection never reads is the other direction of the
+///   same pairing;
+/// * a reflected shape outside the one this rail uploads and samples — a
+///   non-`D2`, arrayed, multisampled, writable or non-`float` texture — is
+///   refused by name with the shape in hand (`render_texture_shape_unsupported`
+///   / `render_texture_format_unsupported`), because the pass's own extent and
+///   format rules are stated for a single-sample `rgba8_unorm` surface;
+/// * a reflected descriptor slot outside set 0, or an arrayed binding, has no
+///   layout this rail builds (`render_texture_layout_unsupported`);
+/// * and the *sampler state* the module's AIR carries is compared with the
+///   declaration: the state the module was lowered against is the state the
+///   pass executes with, so a declaration naming another filtering or address
+///   mode is refused with both halves (`render_texture_sampler_unsupported`)
+///   instead of being executed with a silently substituted sampler.
+///
+/// The vertex stage has no image half — the render sampler is the fragment
+/// stage's own — so a vertex reflection that names one keeps the
+/// `bindings`-field refusal [`validate_translated_stage_buffers`] states.
+fn validate_translated_stage_textures(
+    stages: &RenderStages,
+    stage: RenderStage,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<(), ProviderError> {
+    translated_texture_slots(stages, stage, entry, reflection).map(|_| ())
+}
+
+/// The slots and sampler states one translated fragment stage's sampled
+/// textures are executed with (`research/docs/23` §3.3, v100).
+///
+/// [`validate_translated_stage_textures`] is this walk's answer as a gate, and
+/// [`render_texture_slots`] asks it again where the pass's own bindings are in
+/// hand, so a directly-constructed [`RenderStages`] cannot skip the pairing.
+fn translated_texture_slots(
+    stages: &RenderStages,
+    stage: RenderStage,
+    entry: &str,
+    reflection: &ShaderReflection,
+) -> Result<Vec<RenderTextureSlot>, ProviderError> {
+    use metal2vulkan::meta::{TextureComponent, TextureDimension};
+
+    if stage != RenderStage::Fragment {
+        return Ok(Vec::new());
+    }
+    // The AIR-embedded constexpr samplers first: one sampled texture is read
+    // through one of them, exactly as the compute face's narrow class states
+    // it, so the two lists pair by position below.
+    let mut samplers = Vec::new();
+    let mut sampler_slots = Vec::new();
+    for binding in &reflection.bindings {
+        if binding.kind != ResourceKind::StaticSampler {
+            continue;
+        }
+        let unsupported = |detail: String| {
+            unsupported_interface_refusal(stage, entry, "textures")
+                .with_field(
+                    "index",
+                    FieldValue::Unsigned(u64::from(binding.metal_index)),
+                )
+                .with_detail(detail)
+        };
+        let Some(sampler_descriptor) = binding.descriptor else {
+            return Err(unsupported(
+                "the reflected AIR static sampler consumes no Vulkan descriptor".to_owned(),
+            ));
+        };
+        if sampler_descriptor.count != 1 || sampler_descriptor.set != 0 {
+            return Err(capability_refusal("render_texture_layout_unsupported")
+                .with_field(
+                    "index",
+                    FieldValue::Unsigned(u64::from(binding.metal_index)),
+                )
+                .with_field(
+                    "set",
+                    FieldValue::Unsigned(u64::from(sampler_descriptor.set)),
+                )
+                .with_field(
+                    "count",
+                    FieldValue::Unsigned(u64::from(sampler_descriptor.count)),
+                )
+                .with_detail(
+                    "the AIR static sampler is one descriptor in set 0, where the render \
+                     pipeline layout carries the sampled textures' slots",
+                ));
+        }
+        sampler_slots.push(sampler_descriptor.binding);
+        let Some(state) = binding.static_sampler.as_ref() else {
+            return Err(unsupported(
+                "the AIR static sampler carries no decoded state".to_owned(),
+            ));
+        };
+        samplers.push(crate::static_sampler_policy(state).map_err(|error| {
+            unsupported(format!(
+                "the module's AIR sampler is outside the state family this rail creates: {error}"
+            ))
+        })?);
+    }
+    let mut slots = Vec::new();
+    for binding in &reflection.bindings {
+        if binding.kind != ResourceKind::Texture {
+            continue;
+        }
+        let index = FieldValue::Unsigned(u64::from(binding.metal_index));
+        let mismatch = |detail: &str| {
+            reflection_mismatch_refusal(stage, entry)
+                .with_field("field", FieldValue::Text("textures".to_owned()))
+                .with_field("index", index.clone())
+                .with_detail(detail.to_owned())
+        };
+        let Some(shape) = binding.texture_shape.as_ref() else {
+            return Err(mismatch("the reflection names no shape for this texture"));
+        };
+        if shape.dimension != TextureDimension::D2
+            || shape.arrayed
+            || shape.multisampled
+            || shape.array_ref
+            || shape.writable
+        {
+            return Err(capability_refusal("render_texture_shape_unsupported")
+                .with_field("binding", index)
+                .with_field(
+                    "dimension",
+                    FieldValue::Text(format!("{:?}", shape.dimension)),
+                )
+                .with_field("arrayed", FieldValue::Bool(shape.arrayed))
+                .with_field("multisampled", FieldValue::Bool(shape.multisampled))
+                .with_field("writable", FieldValue::Bool(shape.writable))
+                .with_detail("the render sampler reads a single-sample non-arrayed 2D surface"));
+        }
+        if shape.component != TextureComponent::Float {
+            return Err(capability_refusal("render_texture_format_unsupported")
+                .with_field("binding", index)
+                .with_field("component", FieldValue::Text(format!("{:?}", shape.component)))
+                .with_detail("the render sampler reads an rgba8_unorm surface through normalized float sampling"));
+        }
+        let Some(descriptor) = binding.descriptor else {
+            return Err(capability_refusal("render_texture_layout_unsupported")
+                .with_field("binding", index)
+                .with_detail("the reflected texture consumes no Vulkan descriptor"));
+        };
+        if descriptor.count != 1 {
+            return Err(capability_refusal("render_texture_layout_unsupported")
+                .with_field("binding", index)
+                .with_field("count", FieldValue::Unsigned(u64::from(descriptor.count)))
+                .with_detail("one sampled texture is one descriptor"));
+        }
+        if descriptor.set != 0 {
+            return Err(capability_refusal("render_texture_layout_unsupported")
+                .with_field("binding", index)
+                .with_field("set", FieldValue::Unsigned(u64::from(descriptor.set)))
+                .with_detail("the render pipeline layout carries the sampler in set 0"));
+        }
+        let declared = stages
+            .contract
+            .textures
+            .iter()
+            .find(|declared| declared.metal_binding == binding.metal_index);
+        let Some(declared) = declared else {
+            return Err(mismatch(
+                "the module reads a sampled texture the contract does not declare",
+            ));
+        };
+        let Some(module_sampler) = samplers.get(slots.len()).copied() else {
+            return Err(mismatch(
+                "the module samples a texture without an AIR static sampler",
+            ));
+        };
+        if declared.sampler != Some(module_sampler) {
+            return Err(texture_sampler_refusal(
+                declared.metal_binding,
+                declared.sampler,
+                Some(module_sampler),
+            ));
+        }
+        if declared.format != TextureFormat::Rgba8Unorm {
+            return Err(capability_refusal("render_texture_format_unsupported")
+                .with_field("binding", index)
+                .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
+                .with_detail("the render sampler uploads and reads one rgba8_unorm surface"));
+        }
+        let Some(sampler_binding) = sampler_slots.get(slots.len()).copied() else {
+            return Err(mismatch(
+                "the module samples a texture without a sampler descriptor",
+            ));
+        };
+        slots.push(RenderTextureSlot::Split {
+            set: descriptor.set,
+            image: descriptor.binding,
+            sampler_binding,
+            sampler: module_sampler,
+        });
+    }
+    for declared in &stages.contract.textures {
+        let read = reflection.bindings.iter().any(|binding| {
+            binding.kind == ResourceKind::Texture && binding.metal_index == declared.metal_binding
+        });
+        if !read {
+            return Err(reflection_mismatch_refusal(stage, entry)
+                .with_field("field", FieldValue::Text("textures".to_owned()))
+                .with_field(
+                    "index",
+                    FieldValue::Unsigned(u64::from(declared.metal_binding)),
+                )
+                .with_detail(
+                    "the contract declares a sampled texture the reflection never reads",
+                ));
+        }
+    }
+    if samplers.len() != slots.len() {
+        return Err(reflection_mismatch_refusal(stage, entry)
+            .with_field("field", FieldValue::Text("textures".to_owned()))
+            .with_field("samplers", FieldValue::Unsigned(samplers.len() as u64))
+            .with_field("textures", FieldValue::Unsigned(slots.len() as u64))
+            .with_detail("this rail pairs one AIR static sampler with one sampled texture"));
+    }
+    Ok(slots)
+}
+
+/// The slots and states the pass's sampled textures are executed with
+/// (`research/docs/23` §3.3, v100).
+///
+/// The reviewed sampling pair reads `DescriptorSet 0 / Binding i` for the
+/// pass's entry `i` — the layout `create_render_textures` builds — and is
+/// executed with the one state the review covers; a translated fragment stage
+/// answers with the slots its own reflection names, which
+/// [`validate_translated_stage_textures`] has already held the contract's
+/// declarations to. The count is compared here rather than in the pair walk
+/// because this is where the pass's own binding list is in hand: a translated
+/// stage that samples no texture, under a pass that binds one, has no slot to
+/// bind it into and is refused by name instead.
+fn render_texture_slots(
+    stages: &RenderStages,
+    count: usize,
+) -> Result<Vec<RenderTextureSlot>, ProviderError> {
+    let slots = match &stages.fragment_translation {
+        None => (0..count)
+            .map(|index| RenderTextureSlot::Combined {
+                set: 0,
+                binding: u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING),
+                sampler: REVIEWED_SAMPLER_POLICY,
+            })
+            .collect(),
+        Some(reflection) => translated_texture_slots(
+            stages,
+            RenderStage::Fragment,
+            &stages.contract.fragment_entry,
+            reflection,
+        )?,
+    };
+    if slots.len() != count {
+        return Err(capability_refusal("render_texture_stage_unsupported")
+            .with_field("textures", FieldValue::Unsigned(count as u64))
+            .with_field("bindings", FieldValue::Unsigned(slots.len() as u64))
+            .with_detail(
+                "the fragment stage names another number of sampled textures than the pass binds",
+            ));
+    }
+    Ok(slots)
+}
+
 /// Pair one translated stage's reflected buffer bindings with the contract's
 /// stage-buffer declarations (`research/docs/23` §3.3, v84).
 ///
@@ -1818,6 +2218,21 @@ fn validate_translated_stage_buffers(
     };
     for binding in &reflection.bindings {
         let index = binding.metal_index;
+        // The image half of the same interface is paired by
+        // [`validate_translated_stage_textures`], which runs beside this walk
+        // (`research/docs/23` §3.3, v100): a sampled texture and the AIR static
+        // sampler it is read through are one binding pair, so neither is a
+        // stage buffer and neither is this function's to refuse. The vertex
+        // stage has no image half — the render sampler is the fragment stage's
+        // own — so its non-buffer kinds stay refused here.
+        if stage == RenderStage::Fragment
+            && matches!(
+                binding.kind,
+                ResourceKind::Texture | ResourceKind::StaticSampler
+            )
+        {
+            continue;
+        }
         if binding.kind != ResourceKind::Buffer {
             return Err(unsupported(
                 index,
@@ -2906,7 +3321,14 @@ fn prepare_render_request_with_resident<'a>(
     // one `rgba8_unorm` surface whose extent matches the render area, so a
     // fragment standing on a texel centre reads that texel's own bytes rather
     // than a filtered or boundary-rule-dependent neighbour.
-    let textures = resolve_render_textures(pass, extent, leases)?;
+    // The sampled textures' descriptor slots and sampler states come from the
+    // stage the pass renders with (`research/docs/23` §3.3, v100), so they are
+    // settled before the views are resolved: the reviewed pair reads its own
+    // binding order with the one state the review covers, and a translated
+    // fragment stage reads the slots its reflection names with the state its
+    // AIR carries.
+    let texture_slots = render_texture_slots(stages, pass.textures.len())?;
+    let textures = resolve_render_textures(pass, extent, leases, &texture_slots)?;
     // Stage buffers (`research/docs/23` §3.3, v83) resolve right beside them:
     // the same three-arm channel, one list carrying both stages' index spaces,
     // and every binding the pipeline declared already paired with the pass in
@@ -3135,6 +3557,7 @@ fn resolve_render_textures<'a>(
     pass: &'a RenderPassDescriptor,
     extent: [u32; 2],
     leases: Option<&RenderLeaseContext<'_>>,
+    slots: &[RenderTextureSlot],
 ) -> Result<Vec<OffscreenRenderTexture<'a>>, ProviderError> {
     if pass.textures.len() > MAX_RENDER_TEXTURES {
         return Err(capability_refusal("render_texture_limit")
@@ -3199,6 +3622,7 @@ fn resolve_render_textures<'a>(
         textures.push(OffscreenRenderTexture {
             source,
             extent: [width, height],
+            slot: slots[index],
         });
     }
     Ok(textures)
@@ -4765,19 +5189,15 @@ fn execute_offscreen_render_with_retains(
     // vertex stage keeps the format list's solid module.
     let (fragment_spirv, fragment_entry_name) = match &request.translated_fragment {
         Some(fragment) => {
-            // A translated fragment stage describes the interface the
-            // translation produced, and the reviewed sampling module's
-            // descriptor binding is not part of that description yet: the two
-            // shapes are refused together instead of binding a descriptor the
-            // reflection never mentioned (`research/docs/23` §3.3, v70).
-            if !request.textures.is_empty() {
-                return Err(
-                    capability_refusal("render_texture_stage_unsupported").with_detail(
-                        "render texture sampling is executed by the reviewed sampling pair; a \
-                         translated fragment stage carries no image binding",
-                    ),
-                );
-            }
+            // A translated fragment stage's image bindings are part of the
+            // interface the translation produced (`research/docs/23` §3.3,
+            // v100): the registration gate paired every reflected sampled
+            // texture with the contract's declaration, slot and state alike,
+            // and the execution path binds the pass's texture into the slot the
+            // reflection names. A translation that names no texture, under a
+            // pass that binds one, is refused there ("the fragment stage names
+            // another number of sampled textures than the pass binds") rather
+            // than executed with the binding dropped.
             (fragment.spirv, fragment.entry.as_str())
         }
         None => {
@@ -4816,22 +5236,29 @@ fn execute_offscreen_render_with_retains(
     // texture would sample an unbound descriptor, and a pass that binds a
     // texture with another fragment stage would ignore it. Both are refused by
     // name instead of executed as the other shape.
-    if vertex_stage_is_sampled(&request.vertex.entry, request.vertex.spirv) {
-        if request.textures.is_empty() {
+    // The reviewed pair and the pass's bindings are one decision. A translated
+    // fragment stage answers the same question itself (`research/docs/23` §3.3,
+    // v100): its reflection names the textures it reads and the registration
+    // gate paired them with the contract's declarations, so the reviewed
+    // module's own binding order is not the statement to hold it to.
+    if request.translated_fragment.is_none() {
+        if vertex_stage_is_sampled(&request.vertex.entry, request.vertex.spirv) {
+            if request.textures.is_empty() {
+                return Err(
+                    capability_refusal("render_texture_binding_required").with_detail(
+                        "the reviewed sampling pair samples the pass's own texture binding; this \
+                         pass binds none",
+                    ),
+                );
+            }
+        } else if !request.textures.is_empty() {
             return Err(
-                capability_refusal("render_texture_binding_required").with_detail(
-                    "the reviewed sampling pair samples the pass's own texture binding; this \
-                     pass binds none",
+                capability_refusal("render_texture_stage_unsupported").with_detail(
+                    "the pass binds a render texture but its fragment stage is not the reviewed \
+                     sampling module",
                 ),
             );
         }
-    } else if !request.textures.is_empty() {
-        return Err(
-            capability_refusal("render_texture_stage_unsupported").with_detail(
-                "the pass binds a render texture but its fragment stage is not the reviewed \
-                 sampling module",
-            ),
-        );
     }
     // The stage buffers and the pass's bindings are one decision
     // (`research/docs/23` §3.3, v83/v84); the present rail asks the same
@@ -6439,6 +6866,9 @@ struct SampledTextureObjects {
     /// The owner-window buffer a no-copy texture is copied out of, or `None`
     /// for the two uploaded arms.
     copy_source: Option<(vk::Buffer, vk::DeviceMemory)>,
+    /// The descriptor slot (or pair of slots) this texture is bound to
+    /// (`research/docs/23` §3.3, v100).
+    slot: RenderTextureSlot,
 }
 
 /// The Vulkan objects the rail-owned depth attachment owns
@@ -8428,13 +8858,13 @@ impl<'a> OffscreenObjects<'a> {
                         }
                         execution_refusal("create render texture view", &error.detail)
                     })?;
-            let sampler_info = vk::SamplerCreateInfo::default()
-                .mag_filter(vk::Filter::NEAREST)
-                .min_filter(vk::Filter::NEAREST)
-                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            // The state the sampler is created with is the *declaration's*
+            // (`research/docs/23` §3.3, v100): on this rail the fragment
+            // module's samples take their filtering and addressing from the
+            // descriptor the rail binds, so the contract is the statement the
+            // bytes are read under — and the registration gate has already held
+            // it to the module or to the reviewed pair.
+            let sampler_info = crate::sampler_create_info(texture.slot.sampler());
             let sampler = unsafe { self.context.device.create_sampler(&sampler_info, None) }
                 .map_err(|error| {
                     unsafe {
@@ -8460,23 +8890,58 @@ impl<'a> OffscreenObjects<'a> {
                 sampler,
                 extent: [width, height],
                 copy_source,
+                slot: texture.slot,
             });
         }
         // The descriptor set layout is the sampled pipeline's own: one
         // fragment-stage combined image sampler per binding, in binding order
         // (`research/docs/23` §3.3, v70).
-        let bindings = self
-            .textures
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING))
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            })
-            .collect::<Vec<_>>();
+        // The descriptor shapes are the *module's* (`research/docs/23` §3.3,
+        // v100): the reviewed pair samples through one combined image sampler
+        // per binding, while the translator emits a translated stage's texture
+        // and its AIR static sampler as two descriptors — an `OpTypeImage` and
+        // an `OpTypeSampler` the module combines itself — so that arm binds a
+        // `SAMPLED_IMAGE` and a `SAMPLER` at the slots the reflection names.
+        let mut bindings = Vec::with_capacity(self.textures.len());
+        let mut combined_count = 0_u32;
+        let mut sampled_image_count = 0_u32;
+        let mut sampler_count = 0_u32;
+        for texture in &self.textures {
+            match texture.slot {
+                RenderTextureSlot::Combined { binding, .. } => {
+                    combined_count += 1;
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(binding)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    );
+                }
+                RenderTextureSlot::Split {
+                    image,
+                    sampler_binding,
+                    ..
+                } => {
+                    sampled_image_count += 1;
+                    sampler_count += 1;
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(image)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    );
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(sampler_binding)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    );
+                }
+            }
+        }
         self.descriptor_set_layout = unsafe {
             self.context.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -8484,9 +8949,23 @@ impl<'a> OffscreenObjects<'a> {
             )
         }
         .map_err(|error| execution_refusal("create descriptor set layout", &error.to_string()))?;
-        let pool_sizes = [vk::DescriptorPoolSize::default()
+        let mut pool_sizes = vec![vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(bindings.len() as u32)];
+            .descriptor_count(combined_count)];
+        if sampled_image_count > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(sampled_image_count),
+            );
+        }
+        if sampler_count > 0 {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(sampler_count),
+            );
+        }
         self.descriptor_pool = unsafe {
             self.context.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -8508,29 +8987,80 @@ impl<'a> OffscreenObjects<'a> {
         self.descriptor_set = sets.into_iter().next().ok_or_else(|| {
             execution_refusal("allocate descriptor set", "driver returned no set")
         })?;
-        let image_infos = self
-            .textures
-            .iter()
-            .map(|texture| {
+        // The infos have to outlive the writes that borrow them, so they are
+        // collected first and the writes attached once every push is done —
+        // the same order the compute rail's own descriptor write uses.
+        enum Written {
+            Combined(usize),
+            Image(usize),
+            Sampler(usize),
+        }
+        let mut combined_infos = Vec::new();
+        let mut image_infos = Vec::new();
+        let mut sampler_infos = Vec::new();
+        let mut planned = Vec::new();
+        for texture in &self.textures {
+            // The upload lands the image in `GENERAL` before the draw
+            // (`Self::record`), the same layout the compute rail binds its
+            // sampled textures in.
+            let info = |texture: &SampledTextureObjects| {
                 vk::DescriptorImageInfo::default()
                     .sampler(texture.sampler)
                     .image_view(texture.view)
-                    // The upload lands the image in `GENERAL` before the draw
-                    // (`Self::record`), the same layout the compute rail binds
-                    // its sampled textures in.
                     .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect::<Vec<_>>();
-        let writes = image_infos
-            .iter()
-            .enumerate()
-            .map(|(index, info)| {
+            };
+            let write = |binding: u32, ty: vk::DescriptorType| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(self.descriptor_set)
-                    .dst_binding(u32::try_from(index).unwrap_or(SAMPLED_TEXTURE_BINDING))
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .dst_binding(binding)
+                    .descriptor_type(ty)
                     .descriptor_count(1)
-                    .image_info(std::slice::from_ref(info))
+            };
+            match texture.slot {
+                RenderTextureSlot::Combined { binding, .. } => {
+                    let index = combined_infos.len();
+                    combined_infos.push(info(texture));
+                    planned.push((
+                        write(binding, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+                        Written::Combined(index),
+                    ));
+                }
+                RenderTextureSlot::Split {
+                    image,
+                    sampler_binding,
+                    ..
+                } => {
+                    let image_index = image_infos.len();
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(texture.view)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    );
+                    planned.push((
+                        write(image, vk::DescriptorType::SAMPLED_IMAGE),
+                        Written::Image(image_index),
+                    ));
+                    let sampler_index = sampler_infos.len();
+                    sampler_infos.push(vk::DescriptorImageInfo::default().sampler(texture.sampler));
+                    planned.push((
+                        write(sampler_binding, vk::DescriptorType::SAMPLER),
+                        Written::Sampler(sampler_index),
+                    ));
+                }
+            }
+        }
+        let writes = planned
+            .into_iter()
+            .map(|(write, source)| match source {
+                Written::Combined(index) => {
+                    write.image_info(std::slice::from_ref(&combined_infos[index]))
+                }
+                Written::Image(index) => {
+                    write.image_info(std::slice::from_ref(&image_infos[index]))
+                }
+                Written::Sampler(index) => {
+                    write.image_info(std::slice::from_ref(&sampler_infos[index]))
+                }
             })
             .collect::<Vec<_>>();
         unsafe {
@@ -8973,15 +9503,28 @@ impl<'a> OffscreenObjects<'a> {
         // that binds no stage buffer keeps exactly the one-set layout every
         // earlier increment built. Nothing can shift an existing pass's
         // numbering because the positional list starts at set 0.
-        let descriptor_set_layouts = if self.stage_buffer_layout_slots.is_empty() {
-            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
-                vec![self.descriptor_set_layout]
-            } else {
-                Vec::new()
+        // Set 0 carries the sampled textures' combined image samplers whenever
+        // the pass binds any (`research/docs/23` §3.3, v70/v100). A pass whose
+        // stages also read stage buffers laid that list out positionally, so
+        // the textures' layout takes slot 0 when nothing else claimed it — and
+        // a translated module that reads a stage buffer in set 0 conflicts with
+        // the image layout, which is refused by name rather than built with one
+        // of the two dropped.
+        let mut descriptor_set_layouts = self.stage_buffer_layout_slots.clone();
+        if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+            match descriptor_set_layouts.first().copied() {
+                Some(layout) if layout != vk::DescriptorSetLayout::null() => {
+                    return Err(capability_refusal("render_texture_layout_unsupported")
+                        .with_detail(
+                            "a stage buffer occupies descriptor set 0, which is where this \
+                             pipeline's combined image samplers live; the two faces need \
+                             different slots for one layout to hold both",
+                        ));
+                }
+                Some(_) => descriptor_set_layouts[0] = self.descriptor_set_layout,
+                None => descriptor_set_layouts.push(self.descriptor_set_layout),
             }
-        } else {
-            self.stage_buffer_layout_slots.clone()
-        };
+        }
         let pipeline_layout_info =
             vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
         self.pipeline_layout = unsafe {
@@ -10971,8 +11514,9 @@ mod tests {
         DepthFormat, DepthLoadOp, IndexBufferBinding, InitialState, LeaseReservation, PipelineId,
         PresentDescriptor, PresentMode, PresentTarget, RenderAttachment, RenderDepthAttachment,
         RenderDepthIdentity, RenderStencilAttachment, RenderStencilIdentity, StageBufferBinding,
-        StageBufferView, StagedLease, StencilFormat, StencilLoadOp, TextureAccess, TextureFormat,
-        TextureSource, TextureType, TextureView, VertexLayout, ViewId,
+        StageBufferView, StagedLease, StencilFormat, StencilLoadOp, TextureAccess,
+        TextureBindingContract, TextureFormat, TextureSource, TextureType, TextureView,
+        VertexLayout, ViewId,
     };
 
     /// Vertex stage: positions from `gl_VertexIndex`, no vertex buffers, no
@@ -11074,6 +11618,7 @@ mod tests {
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![format],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
             fragment_spirv: solid_fragment_spirv(&[format])
@@ -11144,6 +11689,7 @@ mod tests {
                 // the layout binds no stream and the indexed draw reads only the
                 // index window (E-L1).
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv: STAGE_BUFFER_POSITIONS_VERT_SPV.to_vec(),
             fragment_spirv: STAGE_BUFFER_TINT_FRAG_SPV.to_vec(),
@@ -11320,6 +11866,7 @@ mod tests {
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm, AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv: FULL_SCREEN_TRIANGLE_VERT_SPV.to_vec(),
             fragment_spirv: solid_fragment_spirv(&[
@@ -11344,6 +11891,15 @@ mod tests {
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                // The reviewed pair's own declaration (`research/docs/23`
+                // §3.3, v100): the sampling module reads the pass's texture at
+                // binding 0, and its MSL sibling's `constexpr sampler` is the
+                // one state the review covers.
+                textures: vec![TextureBindingContract::sampled(
+                    0,
+                    TextureFormat::Rgba8Unorm,
+                    REVIEWED_SAMPLER_POLICY,
+                )],
             },
             vertex_spirv: SAMPLED_QUAD_VERT_SPV.to_vec(),
             fragment_spirv: SAMPLED_UNORM8_FRAG_SPV.to_vec(),
@@ -11432,13 +11988,20 @@ mod tests {
         assert_eq!(refused.slug, "render_texture_extent_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
 
-        // The reviewed stage reads one `rgba8_unorm` surface.
+        // The reviewed stage reads one `rgba8_unorm` surface. The declaration
+        // and the binding agree on `bgra8_unorm` here, so the pair rules admit
+        // the trace and this rail's own format gate is what refuses — the two
+        // gates answer the two questions: agreement is core's, the one format
+        // this rail uploads and the reviewed module reads is the rail's
+        // (`research/docs/23` §3.3, v70/v100).
         let mut other_format = sampled_pass(4);
         let mut view = sampled_texture_view(4, 4);
         view.format = TextureFormat::Bgra8Unorm;
         other_format.textures = vec![view];
+        let mut bgra_stages = reviewed_sampled_stages();
+        bgra_stages.contract.textures[0].format = TextureFormat::Bgra8Unorm;
         let refused = match prepare_render_request(
-            &stages,
+            &bgra_stages,
             &other_format,
             &previous,
             None,
@@ -11467,10 +12030,13 @@ mod tests {
         // The command buffer is where the pair and the binding meet, so the
         // rail re-asks that question there too: a pass that names the pair
         // without a texture is refused instead of sampling an unbound
-        // descriptor.
+        // descriptor. Since v100 the refusal is the *contract's* own pair rule
+        // (`research/docs/23` §3.3, v100) — the registration declared a texture
+        // the pass does not bind — and it arrives before any rail-side shape
+        // question, on every registration and every rail alike.
         let mut unbound = sampled_pass(4);
         unbound.textures = Vec::new();
-        let request = prepare_render_request(
+        let refused = match prepare_render_request(
             &stages,
             &unbound,
             &previous,
@@ -11478,9 +12044,16 @@ mod tests {
             0,
             0,
             SpirvFeaturePolicy::PHASE1,
-        )
-        .expect("the shape is admitted; the binding question is the execution's");
-        assert!(request.textures.is_empty());
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the contract declares a texture this pass never binds"),
+        };
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "trace_contract_invalid");
+        assert!(refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("declares texture binding 0")));
     }
 
     /// R9f (`research/docs/23` §3.3, v86): the stage-buffer pairing is re-asked
@@ -12548,6 +13121,7 @@ mod tests {
                 fragment_entry: SOLID_FRAGMENT_ENTRY.to_owned(),
                 color_formats: vec![AttachmentFormat::Rgba8Unorm],
                 vertex_layout: VertexLayout::None,
+                textures: Vec::new(),
             },
             vertex_spirv,
             fragment_spirv: SOLID_UNORM8_FRAG_SPV.to_vec(),

@@ -1597,8 +1597,32 @@ fn render_metadata(provider: &FakeProvider) -> CompiledComputePipeline {
             fragment_entry: "fragment_main".into(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }),
     }
+}
+
+/// [`render_metadata`] with the one fragment texture its pass binds declared
+/// (`research/docs/23` §3.3, v100).
+///
+/// The declaration is what the registration states about the module the
+/// fragment stage came from, so a recording that binds the texture has to name
+/// a pipeline whose contract states it — the sampled object fixture is the
+/// reviewed pair, whose own MSL sibling carries a nearest/clamp-to-edge
+/// sampler.
+fn render_metadata_with_fragment_texture(provider: &FakeProvider) -> CompiledComputePipeline {
+    let mut metadata = render_metadata(provider);
+    if let Some(render) = metadata.render.as_mut() {
+        render.textures = vec![TextureBindingContract::sampled(
+            0,
+            TextureFormat::Rgba8Unorm,
+            crate::provider::SamplerPolicy {
+                filter: crate::provider::SamplerFilter::Nearest,
+                address: crate::provider::SamplerAddressMode::ClampToEdge,
+            },
+        )];
+    }
+    metadata
 }
 
 #[test]
@@ -1691,7 +1715,7 @@ fn a_recording_binds_one_fragment_texture_in_binding_order() {
     let provider = Arc::new(FakeProvider::new().with_render().with_fragment_texture());
     let device = Device::new(provider.clone());
     let declaring = device.compile_pipeline(request("declare")).unwrap();
-    let render_metadata = render_metadata(&provider);
+    let render_metadata = render_metadata_with_fragment_texture(&provider);
     provider
         .pipelines
         .lock()
@@ -5024,6 +5048,7 @@ fn render_metadata_with_layout(
         fragment_entry: "fragment_main".into(),
         color_formats: vec![AttachmentFormat::Rgba8Unorm],
         vertex_layout: layout,
+        textures: Vec::new(),
     });
     metadata
 }
@@ -5043,6 +5068,7 @@ fn render_metadata_multi(
         fragment_entry: "fragment_main".into(),
         color_formats: formats,
         vertex_layout: VertexLayout::Buffers(vec![stream_layout(0)]),
+        textures: Vec::new(),
     });
     metadata
 }

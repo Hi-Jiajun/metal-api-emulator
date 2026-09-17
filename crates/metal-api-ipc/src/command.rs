@@ -1584,6 +1584,7 @@ mod tests {
             fragment_entry: "solid_color_fragment".into(),
             color_formats: vec![AttachmentFormat::Rgba8Unorm],
             vertex_layout: VertexLayout::None,
+            textures: Vec::new(),
         }
     }
 
@@ -1711,6 +1712,7 @@ mod tests {
         compiled.render = Some(RenderPipelineContract {
             stage_buffers: Vec::new(),
             color_formats: vec![AttachmentFormat::Rgba16Float],
+            textures: Vec::new(),
             ..render_contract()
         });
         let mut attachment = render_attachment(2, 2);
@@ -2375,6 +2377,7 @@ mod tests {
                     format: VertexFormat::Float32x2,
                 }],
             }]),
+            textures: Vec::new(),
             ..render_contract()
         }
     }
@@ -2434,6 +2437,7 @@ mod tests {
                 access: BufferAccess::Read,
                 footprint: FootprintProof::Static { max_bytes: 16 },
             }],
+            textures: Vec::new(),
             ..render_contract()
         }
     }
@@ -2852,6 +2856,7 @@ mod tests {
                     }],
                 },
             ]),
+            textures: Vec::new(),
             ..render_contract()
         }
     }

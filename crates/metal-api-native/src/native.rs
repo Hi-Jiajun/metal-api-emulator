@@ -2871,6 +2871,7 @@ mod tests {
                             format: VertexFormat::Float32x2,
                         }],
                     }]),
+                    textures: Vec::new(),
                 },
                 logical_digest: digest(b"native_resident_quad_pipeline"),
             })
@@ -3421,6 +3422,7 @@ mod tests {
                     fragment_entry: render::FRAGMENT_ENTRY.to_owned(),
                     color_formats: vec![AttachmentFormat::Rgba16Float],
                     vertex_layout: VertexLayout::None,
+                    textures: Vec::new(),
                 },
                 logical_digest: digest(b"native_resident_wide_pipeline"),
             })

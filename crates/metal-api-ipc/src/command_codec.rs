@@ -2056,6 +2056,7 @@ fn get_render_pipeline_contract(
         fragment_entry,
         color_formats,
         vertex_layout,
+        textures: Vec::new(),
     })
 }
 
