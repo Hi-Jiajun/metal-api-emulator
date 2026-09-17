@@ -22,13 +22,16 @@ use metal_api_core::ExecutorError;
 /// The milestone's window was 4×4 (`research/docs/23` §1.3): every texel had to
 /// be distinguishable from a single stored one, and the capability value kept a
 /// larger attachment out of the rail instead of letting the driver answer a
-/// size no fixture proved. R1b (`research/docs/23` §70) widens that window to
-/// the first family a real frame needs — the reviewed fixtures pin 16×16 and
-/// the 64×64 boundary — so the declared window is this ceiling clamped by the
-/// selected device's own framebuffer limits
-/// ([`attachment_dimension_window`]). Widening the ceiling further is a
-/// deliberate change that owes a boundary fixture at the new value.
-pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [64, 64];
+/// size no fixture proved. R1b (`research/docs/23` §70) widened it to the first
+/// family a real frame needs (16×16 and the 64×64 boundary); R5a
+/// (`research/docs/23` §73) widened it once more to the desktop sizes the guest
+/// profile measured — the 2048×2048 boundary, inside every conformant device's
+/// own window (Vulkan's minimum `maxFramebuffer{Width,Height}` is 4096) — so
+/// the declared window is this ceiling clamped by the selected device's own
+/// framebuffer limits ([`attachment_dimension_window`]). Widening the ceiling
+/// further is a deliberate change that owes a boundary fixture at the new
+/// value, in all three review surfaces.
+pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [2048, 2048];
 
 /// The attachment window a device with these limits declares.
 ///
@@ -558,7 +561,7 @@ mod tests {
         // The render bits are the rail's own window in every format the render
         // contract admits, and the attachment window is the reviewed ceiling
         // clamped by this device's own framebuffer limits (R1b,
-        // `research/docs/23` §70): 32×8 rather than 64×64 here.
+        // `research/docs/23` §70; R5a, §73): 32×8 rather than 2048×2048 here.
         assert!(capabilities.supports_render_passes);
         assert_eq!(
             capabilities.max_color_attachments,
