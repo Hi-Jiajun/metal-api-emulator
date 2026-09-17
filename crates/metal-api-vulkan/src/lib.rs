@@ -1066,6 +1066,17 @@ impl VulkanContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The selected device's own limits, for the render rail's attachment
+    /// window (R1b, `research/docs/23` §70).
+    ///
+    /// The declared window is this device's `maxFramebuffer{Width,Height}`
+    /// clamped by the reviewed ceiling, and the rail re-asks both halves at
+    /// execution; reading the same `VkPhysicalDeviceLimits` is what keeps the
+    /// snapshot and the rail's answer from drifting apart.
+    pub(crate) fn physical_device_limits(&self) -> &vk::PhysicalDeviceLimits {
+        &self.properties.limits
+    }
+
     /// The contract's admitted depth-resolve filter mask for this device
     /// (`research/docs/23` §3.3, v57). The render rail's admission reads the
     /// same mask the capability snapshot published, so a directly-constructed

@@ -17,14 +17,36 @@ use metal_api_core::provider::{
 };
 use metal_api_core::ExecutorError;
 
-/// The largest attachment extent the first render increment executes.
+/// The largest attachment extent this rail's review covers, per axis.
 ///
-/// The milestone is 2×2 (`research/docs/23` §1.3): every texel has to be
-/// distinguishable from a single stored one, and the capability bit is what
-/// keeps a larger attachment out of the rail instead of letting the driver
-/// answer a size the fixture never proved. Widening it is a deliberate change
-/// to the rail's window and to the conformance case that measures it.
-const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
+/// The milestone's window was 4×4 (`research/docs/23` §1.3): every texel had to
+/// be distinguishable from a single stored one, and the capability value kept a
+/// larger attachment out of the rail instead of letting the driver answer a
+/// size no fixture proved. R1b (`research/docs/23` §70) widens that window to
+/// the first family a real frame needs — the reviewed fixtures pin 16×16 and
+/// the 64×64 boundary — so the declared window is this ceiling clamped by the
+/// selected device's own framebuffer limits
+/// ([`attachment_dimension_window`]). Widening the ceiling further is a
+/// deliberate change that owes a boundary fixture at the new value.
+pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [64, 64];
+
+/// The attachment window a device with these limits declares.
+///
+/// R1b (`research/docs/23` §70): per axis, the smaller of the reviewed ceiling
+/// above and the device's own `maxFramebuffer{Width,Height}`. The capability
+/// snapshot publishes this value and core admission refuses a wider attachment
+/// by name (`attachment_dimension_limit`, carrying the maximum it crossed), so
+/// the declared window is a device fact rather than a fixture-shaped constant.
+/// The rail's own execution path asks the same two halves in the other order —
+/// the device's answer first (`attachment_extent_device_limit`), the ceiling
+/// second — so a directly-constructed request cannot jump either gate
+/// (`render.rs`, `refuse_attachment_extent`).
+pub(crate) fn attachment_dimension_window(limits: &vk::PhysicalDeviceLimits) -> [u64; 2] {
+    [
+        u64::from(limits.max_framebuffer_width).min(REVIEWED_ATTACHMENT_CEILING[0]),
+        u64::from(limits.max_framebuffer_height).min(REVIEWED_ATTACHMENT_CEILING[1]),
+    ]
+}
 
 /// The largest instance count the instancing increment executes
 /// (`research/docs/23` §3.3, v31).
@@ -68,11 +90,11 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         submit_only: false,
         // The offscreen render rail is admitted: `render.rs` executes one to
         // four colour attachments end to end, so the capability bits name
-        // exactly what that rail covers — up to four 2×2 attachments, with a
-        // reviewed output module per attachment count and per format (the
-        // single-output, dual, triple and quad 8-bit modules, the
-        // single-channel float module, and the depth-only stage beside an empty
-        // colour list).
+        // exactly what that rail covers — up to four attachments of the
+        // declared window below, with a reviewed output module per attachment
+        // count and per format (the single-output, dual, triple and quad 8-bit
+        // modules, the single-channel float module, and the depth-only stage
+        // beside an empty colour list).
         // Formats the device itself refuses are still refused before
         // `vkCreateImage` by the rail's `COLOR_ATTACHMENT` probe; the
         // capability snapshot answers which shapes the provider can express,
@@ -83,7 +105,7 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // pass beyond it (`render_mrt_attachment_count_unsupported`) instead of
         // silently rendering a subset of the locations.
         max_color_attachments: MAX_COLOR_ATTACHMENTS as u32,
-        max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
+        max_attachment_dimension: attachment_dimension_window(limits),
         supported_color_formats: AttachmentFormat::ADMITTED.to_vec(),
         // Vertex input is executed (`render.rs` uploads each bound pool view,
         // builds the pipeline's vertex input state from the contract layout and
@@ -519,6 +541,8 @@ mod tests {
             max_per_stage_resources: 14,
             max_storage_buffer_range: 4096,
             max_push_constants_size: 128,
+            max_framebuffer_width: 32,
+            max_framebuffer_height: 8,
             ..Default::default()
         };
         let capabilities = capabilities_from_limits(&limits);
@@ -531,14 +555,16 @@ mod tests {
         assert_eq!(capabilities.storage_modes, vec![StorageMode::OwnedBytes]);
         assert!(!capabilities.supports_threadgroups);
         assert!(!capabilities.submit_only);
-        // The render bits are the rail's own window, not a device limit: up to
-        // two 2×2 attachments in every format the render contract admits.
+        // The render bits are the rail's own window in every format the render
+        // contract admits, and the attachment window is the reviewed ceiling
+        // clamped by this device's own framebuffer limits (R1b,
+        // `research/docs/23` §70): 32×8 rather than 64×64 here.
         assert!(capabilities.supports_render_passes);
         assert_eq!(
             capabilities.max_color_attachments,
             MAX_COLOR_ATTACHMENTS as u32
         );
-        assert_eq!(capabilities.max_attachment_dimension, [4, 4]);
+        assert_eq!(capabilities.max_attachment_dimension, [32, 8]);
         assert_eq!(
             capabilities.supported_color_formats,
             AttachmentFormat::ADMITTED.to_vec()
@@ -558,6 +584,42 @@ mod tests {
             MAX_PRESENT_IMAGE_COUNT
         );
         assert!(capabilities.declares_presentation_support());
+    }
+
+    #[test]
+    fn attachment_window_is_the_ceiling_clamped_by_the_device_limits() {
+        // R1b (`research/docs/23` §70): the declared window is per axis the
+        // reviewed ceiling or the device's own framebuffer limit, whichever is
+        // smaller, so a device narrower than the review declares its own
+        // number instead of the ceiling.
+        let wide = vk::PhysicalDeviceLimits {
+            max_framebuffer_width: 16384,
+            max_framebuffer_height: 16384,
+            ..Default::default()
+        };
+        assert_eq!(
+            attachment_dimension_window(&wide),
+            REVIEWED_ATTACHMENT_CEILING
+        );
+
+        let narrow = vk::PhysicalDeviceLimits {
+            max_framebuffer_width: 32,
+            max_framebuffer_height: 8,
+            ..Default::default()
+        };
+        assert_eq!(attachment_dimension_window(&narrow), [32, 8]);
+
+        // One axis at the device's limit and the other at the ceiling: the
+        // clamp is per axis, not a single "fits or not" answer.
+        let mixed = vk::PhysicalDeviceLimits {
+            max_framebuffer_width: 4,
+            max_framebuffer_height: 4096,
+            ..Default::default()
+        };
+        assert_eq!(
+            attachment_dimension_window(&mixed),
+            [4, REVIEWED_ATTACHMENT_CEILING[1]]
+        );
     }
 
     #[test]

@@ -64,15 +64,17 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use foreign_types::ForeignType;
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // `MTLFeatureSet` is the binding's only 2D-texture-size table.
 use metal::{
     Buffer, CommandQueue, CompileOptions, DepthStencilDescriptor, Device,
     IndirectCommandBufferDescriptor, MTLBlendFactor, MTLBlendOperation, MTLClearColor,
-    MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLIndexType, MTLIndirectCommandType,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
-    MTLSize, MTLStencilOperation, MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage,
-    MTLVertexFormat, MTLVertexStepFunction, MTLViewport, MTLWinding, NSInteger, NSRange,
-    NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor, RenderPipelineDescriptor,
-    RenderPipelineState, StencilDescriptor, Texture, TextureDescriptor, VertexDescriptor,
+    MTLCommandBufferStatus, MTLCompareFunction, MTLCullMode, MTLFeatureSet, MTLIndexType,
+    MTLIndirectCommandType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
+    MTLResourceOptions, MTLSize, MTLStencilOperation, MTLStorageMode, MTLStoreAction,
+    MTLTextureType, MTLTextureUsage, MTLVertexFormat, MTLVertexStepFunction, MTLViewport,
+    MTLWinding, NSInteger, NSRange, NSUInteger, RenderPassDescriptor as MetalRenderPassDescriptor,
+    RenderPipelineDescriptor, RenderPipelineState, StencilDescriptor, Texture, TextureDescriptor,
+    VertexDescriptor,
 };
 #[cfg(target_os = "macos")]
 use metal_api_core::provider::{
@@ -454,9 +456,42 @@ pub(crate) const MAX_COLOR_ATTACHMENTS: u32 = 4;
 /// provider that declares it (`research/docs/23` §3.3, §4.2).
 pub(crate) const MAX_VERTEX_BUFFERS: u32 = metal_api_core::provider::MAX_VERTEX_BUFFERS as u32;
 
-/// Largest attachment the first milestone renders into: 2x2, so full coverage
-/// stays distinguishable from "one texel was written" (`research/docs/23` §1.3).
-pub(crate) const MAX_ATTACHMENT_DIMENSION: [u64; 2] = [4, 4];
+/// The largest attachment extent this rail's review covers, per axis.
+///
+/// The milestone's window was 4×4 (`research/docs/23` §1.3): a size the
+/// reviewed modules execute and a conformance case measured. R1b
+/// (`research/docs/23` §70) widens it to the first family a real frame needs —
+/// the reviewed fixtures pin 16×16 and the 64×64 boundary — and the declared
+/// window is this ceiling clamped by the device's own 2D texture limit
+/// ([`attachment_dimension_window`], [`device_attachment_dimension_limit`]).
+/// Widening the ceiling further is a deliberate change that owes a boundary
+/// fixture at the new value.
+pub(crate) const REVIEWED_ATTACHMENT_CEILING: [u64; 2] = [64, 64];
+
+/// The attachment window a device with this 2D texture limit declares.
+///
+/// R1b (`research/docs/23` §70): per axis, the smaller of the reviewed ceiling
+/// above and the device's own limit. The capability snapshot publishes this
+/// value, so core admission refuses a wider attachment by name
+/// (`attachment_dimension_limit`, carrying the maximum it crossed) instead of
+/// letting the rail plan a texture the device cannot open. Pure so the clamp is
+/// testable on a host without Metal, exactly as the Vulkan rail's
+/// `attachment_dimension_window` is.
+pub(crate) fn attachment_dimension_window(device_2d_texture_limit: u64) -> [u64; 2] {
+    [
+        device_2d_texture_limit.min(REVIEWED_ATTACHMENT_CEILING[0]),
+        device_2d_texture_limit.min(REVIEWED_ATTACHMENT_CEILING[1]),
+    ]
+}
+
+/// The 2D texture ceiling every admissible Apple GPU family states.
+///
+/// `metal::MTLFeatureSet::max_2d_texture_size` answers 16384 for every macOS
+/// GPU family, and this rail admits Apple4+ devices only; the fallback in
+/// [`device_attachment_dimension_limit`] uses this value so a device that
+/// answers no legacy macOS feature set still declares the documented ceiling
+/// rather than 0.
+pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
 
 /// Colour formats this rail can build an `MTLTexture` and a pipeline state from
 /// — the core contract's admitted set, without `R32Uint` ([`pixel_format`]
@@ -524,7 +559,8 @@ pub(crate) const MAX_PRESENT_IMAGE_COUNT: u32 = metal_api_core::provider::MAX_PR
 /// reviewed fixture draws two instances and the declared window is four.
 pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
 
-/// The render bits this provider declares as of the Step 7 flip.
+/// The render bits this provider declares as of the Step 7 flip, with the
+/// attachment window R1b made device-gated.
 ///
 /// Flip evidence (`research/docs/23` §4.2, §6 Steps 6-7;
 /// `conformance/RENDER-CAPTURE.md` §5): CI run `34774478149` — job
@@ -533,13 +569,19 @@ pub(crate) const MAX_RENDER_INSTANCES: u32 = 4;
 /// `4080c0ff` four times and ended with `render_selftest: PASS`. A green run
 /// whose log said `SKIP` would not be that evidence, because it reports a runner
 /// without an eligible device rather than an executed reviewed path.
-pub(crate) fn capability_bits() -> RenderCapabilityBits {
+///
+/// The attachment window is the reviewed ceiling clamped by the device's own
+/// 2D texture limit (`research/docs/23` §70): the snapshot and the rail's
+/// device-half refusal read the same number
+/// ([`device_attachment_dimension_limit`] through the provider), so a device
+/// narrower than the review declares its own limit instead of the ceiling.
+pub(crate) fn capability_bits(device_2d_texture_limit: u64) -> RenderCapabilityBits {
     let present = present_capability_bits();
     let render_texture = render_texture_capability_bits();
     RenderCapabilityBits {
         supports_render_passes: true,
         max_color_attachments: MAX_COLOR_ATTACHMENTS,
-        max_attachment_dimension: MAX_ATTACHMENT_DIMENSION,
+        max_attachment_dimension: attachment_dimension_window(device_2d_texture_limit),
         supported_color_formats: SUPPORTED_COLOR_FORMATS.to_vec(),
         supports_render_texture_sampling: render_texture.supports_render_texture_sampling,
         max_render_textures: render_texture.max_render_textures,
@@ -702,6 +744,88 @@ pub(crate) struct MultisampleCapabilityBits {
     /// the ceiling alone cannot say which of the counts a device lacks
     /// (`research/docs/23` §3.3, v61).
     pub(crate) render_sample_counts: u32,
+}
+
+/// The selected device's own 2D texture limit, in texels per axis (R1b,
+/// `research/docs/23` §70).
+///
+/// metal-rs carries the limit as a table on `MTLFeatureSet` rather than as a
+/// `Device` property, so the device's answer is the largest 2D texture size
+/// among the macOS GPU feature sets the device itself reports — the same shape
+/// [`device_multisample_capability_bits`] uses for the sample counts. Every
+/// macOS GPU family states a 16384 ceiling, and this rail only admits Apple4+
+/// devices (`native.rs`: a named device with unified memory), so a device that
+/// answers no macOS feature set at all keeps that documented Apple-family
+/// ceiling instead of declaring 0, which would refuse every render pass.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // `MTLFeatureSet` is the binding's only 2D-size table; see above.
+pub(crate) fn device_attachment_dimension_limit(device: &Device) -> u64 {
+    const MACOS_GPU_FEATURE_SETS: [MTLFeatureSet; 5] = [
+        MTLFeatureSet::macOS_GPUFamily1_v1,
+        MTLFeatureSet::macOS_GPUFamily1_v2,
+        MTLFeatureSet::macOS_GPUFamily1_v3,
+        MTLFeatureSet::macOS_GPUFamily1_v4,
+        MTLFeatureSet::macOS_GPUFamily2_v1,
+    ];
+    let limit = MACOS_GPU_FEATURE_SETS
+        .iter()
+        .filter(|feature_set| device.supports_feature_set(**feature_set))
+        .map(|feature_set| feature_set.max_2d_texture_size())
+        .max()
+        .unwrap_or(0);
+    if limit == 0 {
+        APPLE_2D_TEXTURE_CEILING
+    } else {
+        u64::from(limit)
+    }
+}
+
+/// Refuse a render attachment the device's own 2D texture limit cannot carry.
+///
+/// R1b (`research/docs/23` §70): the device half of the declared window,
+/// answered from the trace's own attachment extents before any Metal object
+/// exists. The snapshot already declares the device-gated window, so admission
+/// refuses a wider attachment as `attachment_dimension_limit`; this refusal is
+/// the rail's own second line for a trace that skipped admission, and the
+/// provider runs it before [`plan_trace`]'s reviewed-ceiling check so the
+/// device's answer is the one a caller sees when both halves are exceeded. The
+/// requested extent and the limit it crossed are both reported; nothing is
+/// narrowed.
+pub(crate) fn refuse_attachment_extent_over_device_limit(
+    trace: &ComputeTrace,
+    device_2d_texture_limit: u64,
+) -> Result<(), ProviderError> {
+    let refusal = |width: u64, height: u64| {
+        capability_refusal("attachment_extent_device_limit")
+            .with_field("width", FieldValue::Unsigned(width))
+            .with_field("height", FieldValue::Unsigned(height))
+            .with_field(
+                "maximum_width",
+                FieldValue::Unsigned(device_2d_texture_limit),
+            )
+            .with_field(
+                "maximum_height",
+                FieldValue::Unsigned(device_2d_texture_limit),
+            )
+    };
+    for pass in trace.render_passes() {
+        let extents = pass
+            .color_attachments
+            .iter()
+            .map(|attachment| (attachment.width, attachment.height))
+            .chain(pass.depth.iter().map(|depth| (depth.width, depth.height)))
+            .chain(
+                pass.stencil
+                    .iter()
+                    .map(|stencil| (stencil.width, stencil.height)),
+            );
+        for (width, height) in extents {
+            if width > device_2d_texture_limit || height > device_2d_texture_limit {
+                return Err(refusal(width, height));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The multisample bits this provider declares, from the device's own answer
@@ -1835,19 +1959,23 @@ pub(crate) fn plan<'a>(
             );
         }
     }
-    if raster[0] > MAX_ATTACHMENT_DIMENSION[0] || raster[1] > MAX_ATTACHMENT_DIMENSION[1] {
+    if raster[0] > REVIEWED_ATTACHMENT_CEILING[0] || raster[1] > REVIEWED_ATTACHMENT_CEILING[1] {
         // The slug and fields capability admission uses for this fact
         // (`metal_api_core::provider::ProviderCapabilities::admit_render_passes`).
+        // R1b (`research/docs/23` §70): this is the reviewed-ceiling half of the
+        // declared window; the device half is answered by the provider before
+        // planning (`native.rs`, `refuse_attachment_extent_over_device_limit`),
+        // so the two halves cannot disagree about which limit was crossed.
         return Err(capability_refusal("attachment_dimension_limit")
             .with_field("width", FieldValue::Unsigned(raster[0]))
             .with_field("height", FieldValue::Unsigned(raster[1]))
             .with_field(
                 "maximum_width",
-                FieldValue::Unsigned(MAX_ATTACHMENT_DIMENSION[0]),
+                FieldValue::Unsigned(REVIEWED_ATTACHMENT_CEILING[0]),
             )
             .with_field(
                 "maximum_height",
-                FieldValue::Unsigned(MAX_ATTACHMENT_DIMENSION[1]),
+                FieldValue::Unsigned(REVIEWED_ATTACHMENT_CEILING[1]),
             ));
     }
     // Bounded by the check above, so these conversions cannot lose a bit.
@@ -4443,7 +4571,7 @@ mod tests {
             bits.supported_render_texture_formats,
             vec![TextureFormat::Rgba8Unorm]
         );
-        let declared = capability_bits();
+        let declared = capability_bits(APPLE_2D_TEXTURE_CEILING);
         assert_eq!(
             declared.supports_render_texture_sampling,
             bits.supports_render_texture_sampling
@@ -4627,18 +4755,24 @@ mod tests {
 
     #[test]
     fn plan_refuses_an_attachment_beyond_the_declared_extent() {
-        // The rail executes extents up to `MAX_ATTACHMENT_DIMENSION` (four
-        // texels per axis from v27); one axis beyond that is refused rather
-        // than silently clamped.
+        // The rail's reviewed ceiling is `REVIEWED_ATTACHMENT_CEILING` (R1b,
+        // `research/docs/23` §70); one texel beyond it is refused rather than
+        // silently clamped, with the maximum the plan measured against.
+        let over = REVIEWED_ATTACHMENT_CEILING[0] + 1;
+        let over_u32 = u32::try_from(over).expect("the ceiling fits the viewport");
         let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
-        pass.viewport = [0, 0, 5, 5];
+        pass.viewport = [0, 0, over_u32, over_u32];
         let attachment = &mut pass.color_attachments[0];
-        attachment.width = 5;
-        attachment.height = 5;
+        attachment.width = over;
+        attachment.height = over;
         let pipeline = milestone_pipeline();
         let error = plan_pass(&milestone_request(&pass, &pipeline, None)).unwrap_err();
         assert_eq!(error.slug, "attachment_dimension_limit");
         assert_eq!(error.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            error.fields.get("maximum_width"),
+            Some(&FieldValue::Unsigned(REVIEWED_ATTACHMENT_CEILING[0]))
+        );
     }
 
     #[test]
@@ -4655,6 +4789,81 @@ mod tests {
             .expect("a four-by-four attachment is within the declared extent");
         assert_eq!(plan.extent, [4, 4]);
         assert_eq!(plan.texel_bytes, 64);
+    }
+
+    #[test]
+    fn plan_accepts_the_reviewed_window_boundary() {
+        // R1b (`research/docs/23` §70): the boundary extent the new fixture
+        // pins plans with the whole texel count, so the declared window is
+        // executable on the host before any Metal object exists.
+        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
+        pass.viewport = [
+            0,
+            0,
+            REVIEWED_ATTACHMENT_CEILING[0] as u32,
+            REVIEWED_ATTACHMENT_CEILING[1] as u32,
+        ];
+        let attachment = &mut pass.color_attachments[0];
+        attachment.width = REVIEWED_ATTACHMENT_CEILING[0];
+        attachment.height = REVIEWED_ATTACHMENT_CEILING[1];
+        let pipeline = milestone_pipeline();
+        let plan = plan_pass(&milestone_request(&pass, &pipeline, None))
+            .expect("the reviewed boundary extent is within the declared window");
+        assert_eq!(plan.extent, [64, 64]);
+        assert_eq!(plan.texel_bytes, 64 * 64 * 4);
+    }
+
+    #[test]
+    fn the_device_half_refuses_an_extent_beyond_the_devices_own_limit() {
+        // R1b (`research/docs/23` §70): the declared window's device half is
+        // the provider's own refusal, asked before the reviewed-ceiling check,
+        // so a trace that skipped admission is refused with the device's answer
+        // instead of an extent the device could never open. The check is a
+        // value-level one, so it runs on a host without Metal.
+        let mut refused_trace = milestone_trace(LoadOp::Clear(sentinel())).0;
+        let pass = render_pass_mut(&mut refused_trace);
+        pass.color_attachments[0].width = 8;
+        pass.color_attachments[0].height = 8;
+        pass.viewport = [0, 0, 8, 8];
+
+        let refused = refuse_attachment_extent_over_device_limit(&refused_trace, 4)
+            .expect_err("an extent beyond the device's own limit is a refusal");
+        eprintln!("refused: {refused:?}");
+        assert_eq!(refused.slug, "attachment_extent_device_limit");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(refused.fields.get("width"), Some(&FieldValue::Unsigned(8)));
+        assert_eq!(
+            refused.fields.get("maximum_width"),
+            Some(&FieldValue::Unsigned(4))
+        );
+        assert_eq!(
+            refused.fields.get("maximum_height"),
+            Some(&FieldValue::Unsigned(4))
+        );
+        // The same trace on a device at least as wide as the review passes the
+        // device half; the reviewed ceiling is what bounds it then.
+        refuse_attachment_extent_over_device_limit(&refused_trace, APPLE_2D_TEXTURE_CEILING)
+            .expect("an eight-texel extent is inside every reviewed device's limit");
+
+        // The boundary extent itself: inside a device at the Apple ceiling,
+        // refused by a device one texel narrower.
+        let mut boundary_trace = milestone_trace(LoadOp::Clear(sentinel())).0;
+        let pass = render_pass_mut(&mut boundary_trace);
+        pass.color_attachments[0].width = REVIEWED_ATTACHMENT_CEILING[0];
+        pass.color_attachments[0].height = REVIEWED_ATTACHMENT_CEILING[1];
+        pass.viewport = [0, 0, 64, 64];
+        refuse_attachment_extent_over_device_limit(&boundary_trace, APPLE_2D_TEXTURE_CEILING)
+            .expect("the reviewed boundary is inside the device's own limit");
+        let refused = refuse_attachment_extent_over_device_limit(
+            &boundary_trace,
+            REVIEWED_ATTACHMENT_CEILING[0] - 1,
+        )
+        .expect_err("a narrower device refuses the reviewed boundary");
+        assert_eq!(refused.slug, "attachment_extent_device_limit");
+        assert_eq!(
+            refused.fields.get("maximum_width"),
+            Some(&FieldValue::Unsigned(REVIEWED_ATTACHMENT_CEILING[0] - 1))
+        );
     }
 
     #[test]
@@ -5504,6 +5713,14 @@ mod tests {
             })
             .unwrap();
         (trace, resources)
+    }
+
+    /// The milestone trace's render pass, for the value-level window checks.
+    fn render_pass_mut(trace: &mut ComputeTrace) -> &mut RenderPassDescriptor {
+        let Some(TracePass::Render(pass)) = trace.passes.last_mut() else {
+            panic!("the milestone trace carries one render pass");
+        };
+        pass
     }
 
     /// The milestone's present pass: the same 2x2 attachment, but with a
@@ -6480,10 +6697,23 @@ mod tests {
     /// admits have to be the same set, or one of the two is lying.
     #[test]
     fn declared_render_capabilities_admit_what_the_rail_plans() {
-        let bits = capability_bits();
+        let bits = capability_bits(APPLE_2D_TEXTURE_CEILING);
         assert!(bits.supports_render_passes);
         assert_eq!(bits.max_color_attachments, MAX_COLOR_ATTACHMENTS);
-        assert_eq!(bits.max_attachment_dimension, MAX_ATTACHMENT_DIMENSION);
+        // R1b (`research/docs/23` §70): the declared window is the reviewed
+        // ceiling on a device as wide as the review, and the device's own
+        // limit on a narrower one.
+        assert_eq!(bits.max_attachment_dimension, REVIEWED_ATTACHMENT_CEILING);
+        assert_eq!(
+            capability_bits(32).max_attachment_dimension,
+            [32, 32],
+            "a device narrower than the review declares its own 2D texture limit"
+        );
+        assert_eq!(
+            capability_bits(4).max_attachment_dimension,
+            [4, 4],
+            "the milestone's 4x4 window is the floor the clamp can report"
+        );
         assert_eq!(
             bits.supported_color_formats,
             SUPPORTED_COLOR_FORMATS.to_vec()
@@ -6525,7 +6755,7 @@ mod tests {
     /// [`present_capability_bits`].
     #[test]
     fn declared_present_capabilities_admit_what_the_rail_plans() {
-        let bits = capability_bits();
+        let bits = capability_bits(APPLE_2D_TEXTURE_CEILING);
         assert!(bits.supports_presentation);
         assert_eq!(bits.max_present_targets, MAX_PRESENT_TARGETS);
         assert_eq!(bits.supported_present_modes, PresentMode::ADMITTED.to_vec());
@@ -6555,7 +6785,7 @@ mod tests {
     /// gate, only the declaration differs.
     #[test]
     fn the_pre_flip_snapshot_refuses_a_present_bearing_trace() {
-        let mut bits = capability_bits();
+        let mut bits = capability_bits(APPLE_2D_TEXTURE_CEILING);
         bits.supports_presentation = false;
         bits.max_present_targets = 0;
         bits.supported_present_modes = Vec::new();
@@ -7226,7 +7456,7 @@ mod tests {
         );
 
         let (trace, resources) = quad_trace();
-        capabilities(&capability_bits())
+        capabilities(&capability_bits(APPLE_2D_TEXTURE_CEILING))
             .admit(&trace, &resources)
             .expect("the declared bits admit the vertex-input trace");
 
@@ -7234,7 +7464,7 @@ mod tests {
         // are read, which is the order capability admission documents.
         let mut closed = vertex_input_capability_bits();
         closed.max_vertex_buffers = 0;
-        let refused = capabilities_with(&capability_bits(), &closed)
+        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &closed)
             .admit(&trace, &resources)
             .unwrap_err();
         assert_eq!(refused.slug, "vertex_buffer_limit");
@@ -7248,7 +7478,7 @@ mod tests {
         // Closed index widths: the same trace, refused one gate later.
         let mut no_indices = vertex_input_capability_bits();
         no_indices.supported_index_formats = Vec::new();
-        let refused = capabilities_with(&capability_bits(), &no_indices)
+        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &no_indices)
             .admit(&trace, &resources)
             .unwrap_err();
         assert_eq!(refused.slug, "index_format_unsupported");
@@ -7258,7 +7488,7 @@ mod tests {
         // gate reads, after the pass and the layout already agreed.
         let mut no_formats = vertex_input_capability_bits();
         no_formats.supported_vertex_formats = Vec::new();
-        let refused = capabilities_with(&capability_bits(), &no_formats)
+        let refused = capabilities_with(&capability_bits(APPLE_2D_TEXTURE_CEILING), &no_formats)
             .admit(&trace, &resources)
             .unwrap_err();
         assert_eq!(refused.slug, "vertex_format_unsupported");

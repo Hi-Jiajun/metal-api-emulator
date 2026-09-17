@@ -47,6 +47,13 @@ use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const MAX_BYTES: usize = 1024 * 1024;
+/// The reviewed attachment ceiling per axis (R1b, `research/docs/23` §70): the
+/// window every render rail's fixture is checked against. The rails declare the
+/// smaller of this ceiling and their device's own framebuffer limit, so a
+/// fixture at the ceiling is inside every conformant device's window (Vulkan's
+/// minimum `maxFramebufferWidth` is 4096). Widening it is a deliberate change
+/// that owes a boundary fixture at the new value, in all three review surfaces.
+const REVIEWED_ATTACHMENT_CEILING: u64 = 64;
 
 /// The Vulkan rail's half of the reviewed render fixture
 /// (`research/docs/23` §1.2). A render case pins the MSL module the canonical
@@ -2771,6 +2778,8 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "render_declaring_depth_resolve",
             "render_declaring_stencil_store",
             "render_declaring_stencil_resolve",
+            "render_declaring_attachment_16x16",
+            "render_declaring_attachment_64x64",
         ],
         _ => return Err("unsupported suite identity/version".into()),
     };
@@ -5247,12 +5256,14 @@ fn validate_render_case(suite: &Suite, case: &RenderCase) -> Result<()> {
         }
         if attachment.width == 0
             || attachment.height == 0
-            || attachment.width > 4
-            || attachment.height > 4
+            || attachment.width > REVIEWED_ATTACHMENT_CEILING
+            || attachment.height > REVIEWED_ATTACHMENT_CEILING
         {
-            return Err(
-                format!("{where_}: the attachment extent is one to four texels per axis").into(),
-            );
+            return Err(format!(
+                "{where_}: the attachment extent is one to {REVIEWED_ATTACHMENT_CEILING} \
+                     texels per axis"
+            )
+            .into());
         }
         if attachment.allocation == 0 || attachment.view == 0 {
             return Err(format!("{where_}: zero attachment identity").into());
@@ -6325,6 +6336,22 @@ fn case_shape(id: &str) -> Result<CaseShape> {
             [1, 1, 1],
             [1, 1, 1],
             &[(0, "read", 64), (1, "write", 4)][..],
+        ),
+        // R1b: the same copy_word shape over the wider attachment views — the
+        // 16x16 case's 1024 bytes and the 64x64 boundary's 16384 bytes — so one
+        // submission declares the view each render pass stores into
+        // (`research/docs/23` §70).
+        "render_declaring_attachment_16x16" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 1024), (1, "write", 4)][..],
+        ),
+        "render_declaring_attachment_64x64" => (
+            "copy_word",
+            [1, 1, 1],
+            [1, 1, 1],
+            &[(0, "read", 16384), (1, "write", 4)][..],
         ),
         // v43: the same 4x4 attachment view, plus the depth attachment's own
         // view as a second read, and the 4-byte output view the reviewed
