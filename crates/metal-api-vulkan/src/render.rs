@@ -1022,10 +1022,11 @@ impl StageBufferSlot {
 /// rail uploads these bytes into an image of its own, exactly as the compute
 /// rail uploads a pass's texture bindings; the no-copy arm imports the owner's
 /// own pages as the copy's transfer source instead (`research/docs/23` §75,
-/// R5c). The first increment executes one `rgba8_unorm` 2D surface whose extent
-/// matches the render area, so every fragment stands on a texel centre and the
-/// nearest sample is an identity copy rather than a filtered or
-/// boundary-dependent read.
+/// R5c). The render sampler executes one 8-bit four-component UNORM 2D surface
+/// — `rgba8_unorm` or `bgra8_unorm`, whichever the view itself names
+/// (`research/docs/23` §107) — whose extent matches the render area, so every
+/// fragment stands on a texel centre and the nearest sample is an identity copy
+/// rather than a filtered or boundary-dependent read.
 pub(crate) struct OffscreenRenderTexture<'a> {
     /// Where the texture's tightly packed, row-major texel bytes come from.
     /// The three arms are the three [`TextureSource`] arms, resolved before any
@@ -1034,6 +1035,14 @@ pub(crate) struct OffscreenRenderTexture<'a> {
     /// Extent in texels, which the pass requires to equal the render area
     /// (`prepare_render_request` refuses the pass otherwise).
     pub extent: [u32; 2],
+    /// The `VkFormat` the view's own `TextureFormat` names (`research/docs/23`
+    /// §3.3, §107): the image this rail uploads the bytes into and the view the
+    /// descriptor reads. Which byte holds which channel is decided here and
+    /// nowhere else — a `bgra8_unorm` view is a `VK_FORMAT_B8G8R8A8_UNORM`
+    /// image, not an `R8G8B8A8` one read through a component mapping, so the
+    /// descriptor's channel mapping stays Vulkan's identity default and the
+    /// guest's own channel order is what the fragment stage reads.
+    pub format: vk::Format,
     /// The descriptor slot the fragment stage reads this texture from, and the
     /// sampler state it samples it with (`research/docs/23` §3.3, v100). The
     /// slot is the reviewed pair's own binding order or the one a translated
@@ -2071,7 +2080,8 @@ fn unsupported_interface_field(reflection: &ShaderReflection) -> Option<&'static
 ///   non-`D2`, arrayed, multisampled, writable or non-`float` texture — is
 ///   refused by name with the shape in hand (`render_texture_shape_unsupported`
 ///   / `render_texture_format_unsupported`), because the pass's own extent and
-///   format rules are stated for a single-sample `rgba8_unorm` surface;
+///   format rules are stated for a single-sample 8-bit four-component UNORM
+///   surface (`rgba8_unorm`/`bgra8_unorm`, `research/docs/23` §107);
 /// * a reflected descriptor slot outside set 0, or an arrayed binding, has no
 ///   layout this rail builds (`render_texture_layout_unsupported`);
 /// * and the *sampler state* the module's AIR carries is compared with the
@@ -2316,8 +2326,14 @@ fn translated_texture_pairs(
         if shape.component != TextureComponent::Float {
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", index)
-                .with_field("component", FieldValue::Text(format!("{:?}", shape.component)))
-                .with_detail("the render sampler reads an rgba8_unorm surface through normalized float sampling"));
+                .with_field(
+                    "component",
+                    FieldValue::Text(format!("{:?}", shape.component)),
+                )
+                .with_detail(
+                    "the render sampler reads an 8-bit four-component unorm surface through \
+                     normalized float sampling",
+                ));
         }
         let Some(descriptor) = binding.descriptor else {
             return Err(capability_refusal("render_texture_layout_unsupported")
@@ -2346,11 +2362,14 @@ fn translated_texture_pairs(
                 "the module reads a sampled texture the contract does not declare",
             ));
         };
-        if declared.format != TextureFormat::Rgba8Unorm {
+        if !TextureFormat::RENDER_SAMPLED.contains(&declared.format) {
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", index)
                 .with_field("format", FieldValue::Text(format!("{:?}", declared.format)))
-                .with_detail("the render sampler uploads and reads one rgba8_unorm surface"));
+                .with_detail(
+                    "the render sampler uploads and reads one 8-bit four-component unorm \
+                     surface, in either byte order (`rgba8_unorm`/`bgra8_unorm`)",
+                ));
         }
         // Whether the module samples this texture or texel-fetches it is the
         // module's *own* statement (`research/docs/23` §3.3, v105): the
@@ -4070,9 +4089,10 @@ fn prepare_render_request_with_resident<'a>(
     // anything the reviewed shape does not cover.
     // The render sampler (`research/docs/23` §3.3, v70) is the same kind of
     // question one dimension up: the reviewed fragment stage samples exactly
-    // one `rgba8_unorm` surface whose extent matches the render area, so a
-    // fragment standing on a texel centre reads that texel's own bytes rather
-    // than a filtered or boundary-rule-dependent neighbour.
+    // one 8-bit four-component UNORM surface — `rgba8_unorm` or `bgra8_unorm`,
+    // the view's own name (`research/docs/23` §107) — whose extent matches the
+    // render area, so a fragment standing on a texel centre reads that texel's
+    // own bytes rather than a filtered or boundary-rule-dependent neighbour.
     // The sampled textures' descriptor slots and sampler states come from the
     // stage the pass renders with (`research/docs/23` §3.3, v100), so they are
     // settled before the views are resolved: the reviewed pair reads its own
@@ -4297,8 +4317,9 @@ fn prepare_render_request_with_resident<'a>(
 /// single-sample requirement, and the pass's list the canonical order and the
 /// index bound (`RenderPassDescriptor::validate`); this is the rail's own
 /// window, restated for a directly-constructed pass and narrowed to what the
-/// reviewed sampling module covers: one `rgba8_unorm` 2D surface, whose extent
-/// equals the render area. The extent rule is what keeps the fixture's
+/// reviewed sampling module covers: one 8-bit four-component UNORM 2D surface
+/// (`rgba8_unorm`/`bgra8_unorm`, `research/docs/23` §107), whose extent equals
+/// the render area. The extent rule is what keeps the fixture's
 /// expectation driver-independent — a texture of another size puts some
 /// fragment's `(column + 0.5) / width` sample either on a texel boundary or
 /// inside a neighbour, which is a filtered read the review never covered, so
@@ -4335,11 +4356,15 @@ fn resolve_render_textures<'a>(
         // list happens to be dense from zero, which is exactly the assumption
         // the sparse `[[texture(3)]]` shape retires.
         let binding = view.metal_binding;
-        if view.format != TextureFormat::Rgba8Unorm {
+        if !TextureFormat::RENDER_SAMPLED.contains(&view.format) {
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
-                .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
+                .with_detail(
+                    "the reviewed sampling module reads one 8-bit four-component unorm \
+                     surface, in either byte order (`rgba8_unorm`/`bgra8_unorm`); which byte \
+                     holds which channel is the view's own format fact",
+                ));
         }
         if view.texture_type != TextureType::D2
             || view.sample_count != 1
@@ -4392,6 +4417,7 @@ fn resolve_render_textures<'a>(
         textures.push(OffscreenRenderTexture {
             source,
             extent: [width, height],
+            format: render_texture_vk_format(view.format)?,
             slot: slots[position],
         });
     }
@@ -5441,6 +5467,38 @@ pub(crate) fn attachment_vk_format(format: AttachmentFormat) -> Result<vk::Forma
         // Refused above; the arm keeps the match exhaustive so adding a
         // contract format forces a decision here.
         AttachmentFormat::R32Uint => vk::Format::R32_UINT,
+    })
+}
+
+/// The `VkFormat` a sampled render texture's own `TextureFormat` names
+/// (`research/docs/23` §3.3, §107).
+///
+/// The two admitted formats are the same four-byte 8-bit UNORM texel in two
+/// byte orders, which is what the census's BGRA8 binds state
+/// (`evidence/gate3-census-v13-2026-09-17/`): the guest view's
+/// `B8G8R8A8_UNORM` texels are uploaded into the image the *name* selects, so
+/// the fragment stage reads the channels the guest's own view states and no
+/// component mapping is needed — [`crate::create_color_image_view`] leaves the
+/// descriptor's mapping at Vulkan's identity default. A format outside the
+/// window is refused with the view's own name rather than uploaded under
+/// another.
+pub(crate) fn render_texture_vk_format(format: TextureFormat) -> Result<vk::Format, ProviderError> {
+    if !TextureFormat::RENDER_SAMPLED.contains(&format) {
+        return Err(capability_refusal("render_texture_format_unsupported")
+            .with_field("format", FieldValue::Text(format!("{format:?}")))
+            .with_detail(
+                "the render sampler uploads and reads one 8-bit four-component unorm surface, \
+                 in either byte order (`rgba8_unorm`/`bgra8_unorm`)",
+            ));
+    }
+    Ok(match format {
+        TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        // Refused above; the arm keeps the match exhaustive so a widened
+        // contract format forces a decision here.
+        TextureFormat::R32Uint | TextureFormat::R32Float | TextureFormat::Rgba16Float => {
+            vk::Format::UNDEFINED
+        }
     })
 }
 
@@ -9597,6 +9655,12 @@ impl<'a> OffscreenObjects<'a> {
     /// the host writes become visible to the fragment stage — the same two-step
     /// shape the compute rail's own upload uses.
     ///
+    /// The image's format is the *view's* own (`research/docs/23` §3.3, §107):
+    /// the bytes the source carries are already in the view's byte order, so
+    /// the rail names the view's `VkFormat` and lets the driver's own channel
+    /// order turn them into the `vec4` the module samples, instead of
+    /// re-ordering bytes in software.
+    ///
     /// The no-copy arm cannot upload host bytes at all: writing the owner's
     /// mapping into the rail's own image here would freeze the pages at the
     /// moment the pass was built, which is exactly the snapshot R5c's
@@ -9610,9 +9674,9 @@ impl<'a> OffscreenObjects<'a> {
         if textures.is_empty() {
             return Ok(());
         }
-        let format = vk::Format::R8G8B8A8_UNORM;
         for texture in textures {
             let [width, height] = texture.extent;
+            let format = texture.format;
             // The no-copy arm's image is a transfer destination, never a host
             // write: the device copy lands in it, so it lives in device-local
             // `OPTIMAL` memory and starts undefined.
@@ -12859,10 +12923,12 @@ mod tests {
     }
 
     /// The rail's own window for the sampling shape (`research/docs/23` §3.3,
-    /// v70): the reviewed pair is admitted only for one `rgba8_unorm` texture
-    /// of the render area's own extent, and a pass that names the pair without
-    /// binding that texture is refused by name rather than sampled through an
-    /// unbound descriptor. Host-side: `prepare_render_request` reads no device.
+    /// v70/§107): the reviewed pair is admitted only for one 8-bit
+    /// four-component UNORM texture (`rgba8_unorm`/`bgra8_unorm`, the view's
+    /// own name) of the render area's own extent, and a pass that names the
+    /// pair without binding that texture is refused by name rather than sampled
+    /// through an unbound descriptor. Host-side: `prepare_render_request` reads
+    /// no device.
     #[test]
     fn prepare_render_request_admits_the_reviewed_sampling_shape_only() {
         let stages = reviewed_sampled_stages();
@@ -12906,20 +12972,44 @@ mod tests {
         assert_eq!(refused.slug, "render_texture_extent_unsupported");
         assert_eq!(refused.class, ProviderErrorClass::Capability);
 
-        // The reviewed stage reads one `rgba8_unorm` surface. The declaration
-        // and the binding agree on `bgra8_unorm` here, so the pair rules admit
-        // the trace and this rail's own format gate is what refuses — the two
-        // gates answer the two questions: agreement is core's, the one format
-        // this rail uploads and the reviewed module reads is the rail's
-        // (`research/docs/23` §3.3, v70/v100).
-        let mut other_format = sampled_pass(4);
-        let mut view = sampled_texture_view(4, 4);
-        view.format = TextureFormat::Bgra8Unorm;
-        other_format.textures = vec![view];
+        // The widened window (`research/docs/23` §107): the declaration and the
+        // binding agree on `bgra8_unorm` — the census's BGRA8 binds — and this
+        // rail's own format gate admits it, naming the view's own `VkFormat`
+        // rather than uploading the bytes under another. The pair rules answer
+        // agreement (core's), the format gate answers which names this rail
+        // uploads (its own).
+        let mut bgra = sampled_pass(4);
+        bgra.textures[0].format = TextureFormat::Bgra8Unorm;
         let mut bgra_stages = reviewed_sampled_stages();
         bgra_stages.contract.textures[0].format = TextureFormat::Bgra8Unorm;
-        let refused = match prepare_render_request(
+        let request = prepare_render_request(
             &bgra_stages,
+            &bgra,
+            &previous,
+            None,
+            0,
+            0,
+            SpirvFeaturePolicy::PHASE1,
+        )
+        .expect("the BGRA8 view is the same texel in the other byte order");
+        assert_eq!(request.textures.len(), 1);
+        assert_eq!(
+            request.textures[0].format.as_raw(),
+            vk::Format::B8G8R8A8_UNORM.as_raw()
+        );
+
+        // A format outside the window — here the eight-byte `rgba16_float` texel
+        // the contract states for the attachment bridge — is refused by name,
+        // with the declaration's own format in the fields.
+        let mut other_format = sampled_pass(4);
+        let mut view = sampled_texture_view(4, 4);
+        view.format = TextureFormat::Rgba16Float;
+        view.source = TextureSource::OwnedBytes(vec![0x5a; 4 * 4 * 8]);
+        other_format.textures = vec![view];
+        let mut wide_stages = reviewed_sampled_stages();
+        wide_stages.contract.textures[0].format = TextureFormat::Rgba16Float;
+        let refused = match prepare_render_request(
+            &wide_stages,
             &other_format,
             &previous,
             None,

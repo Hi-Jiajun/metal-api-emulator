@@ -574,14 +574,30 @@ pub enum TextureFormat {
     /// (`research/docs/23` §78): the format table states it so
     /// [`AttachmentFormat::as_texture_format`] stays total and a
     /// `rgba16_float` attachment can be declared as its own texture view, not
-    /// so the reviewed sampling rail samples it. That rail's own capability
-    /// list (`supported_render_texture_formats`) still names exactly the
-    /// reviewed `rgba8_unorm` sample, so an unsampled `rgba16_float` binding is
-    /// refused by name rather than sampled with a module no review covered.
+    /// so the reviewed sampling rail samples it. The render sampler's own
+    /// window is [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit
+    /// UNORM byte orders — so an unsampled `rgba16_float` binding is refused by
+    /// name rather than sampled with a module no review covered.
     Rgba16Float,
 }
 
 impl TextureFormat {
+    /// The formats the render sampler admits as a sampled texture source
+    /// (`research/docs/23` §3.3, §107), in the canonical order the rails'
+    /// capability lists name them: the two four-byte 8-bit UNORM byte orders.
+    ///
+    /// Both name one texel the fragment stage reads as four normalised
+    /// components; which byte holds which channel is the *format's* fact, not
+    /// the module's statement, exactly as the colour-attachment table's
+    /// `rgba8_unorm`/`bgra8_unorm` pair is (`research/docs/23` §15/§78). The
+    /// guest's own BGRA8 views are the census's dominant shape
+    /// (`evidence/gate3-census-v13-2026-09-17/`), so the Vulkan rail's
+    /// capability snapshot advertises both; the native rail's reviewed table
+    /// stays narrower because its Apple-side reading is the increment that
+    /// would widen it (`metal-api-native/src/render.rs`,
+    /// `SUPPORTED_RENDER_TEXTURE_FORMATS`).
+    pub const RENDER_SAMPLED: [Self; 2] = [Self::Rgba8Unorm, Self::Bgra8Unorm];
+
     /// Tightly packed bytes one texel occupies in this format. Sampling and
     /// row padding are provider concerns; this is the byte extent the contract
     /// validates a source against.
@@ -8758,8 +8774,10 @@ pub struct ProviderCapabilities {
     /// checking the bit cannot read one as an admission.
     pub max_render_textures: u32,
     /// Texture formats this snapshot admits as render-pass sampling sources.
-    /// Empty means none; the first render-sampler increment admits
-    /// [`TextureFormat::Rgba8Unorm`]. Compared by value rather than by wire
+    /// Empty means none; the render sampler admits
+    /// [`TextureFormat::RENDER_SAMPLED`] — the two four-byte 8-bit UNORM byte
+    /// orders (`research/docs/23` §107) — and a snapshot that executes only
+    /// one of them names only that one. Compared by value rather than by wire
     /// code so the contract's own enum is the single vocabulary, exactly as
     /// [`Self::supported_color_formats`] is.
     pub supported_render_texture_formats: Vec<TextureFormat>,
@@ -21056,6 +21074,32 @@ mod tests {
             refusal.fields.get("format"),
             Some(&FieldValue::Text("Rgba8Unorm".to_owned()))
         );
+
+        // The widened window (`research/docs/23` §107): the census's BGRA8
+        // binds are the same three bits' question once the snapshot names both
+        // byte orders. The pass's view and the pipeline's declaration agree on
+        // `Bgra8Unorm` here, exactly as they agree on `Rgba8Unorm` above, so
+        // the snapshot's own format list is what decides — the narrow snapshot
+        // refuses the pair by name and [`TextureFormat::RENDER_SAMPLED`]'s
+        // snapshot admits it.
+        let mut bgra = render_texture_trace();
+        render_entry(&mut bgra).textures[0].format = TextureFormat::Bgra8Unorm;
+        bgra.pipelines[0].render.as_mut().unwrap().textures[0].format = TextureFormat::Bgra8Unorm;
+        bgra.validate()
+            .expect("the BGRA8 pair is structurally valid");
+        let refusal = render_texture_capabilities()
+            .admit(&bgra, &landing_resources())
+            .unwrap_err();
+        assert_eq!(refusal.slug, "render_texture_format_unsupported");
+        assert_eq!(
+            refusal.fields.get("format"),
+            Some(&FieldValue::Text("Bgra8Unorm".to_owned()))
+        );
+        let mut widened = render_texture_capabilities();
+        widened.supported_render_texture_formats = TextureFormat::RENDER_SAMPLED.to_vec();
+        widened
+            .admit(&bgra, &landing_resources())
+            .expect("a snapshot that names both byte orders admits the BGRA8 bind");
 
         // A pass that binds no texture never enters the walk, so every pre-v70
         // trace keeps the admission path it had.

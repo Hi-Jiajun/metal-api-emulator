@@ -107,8 +107,11 @@ class RenderSamplerSuiteTests(unittest.TestCase):
 
     def test_a_texture_of_another_format_is_refused(self):
         def mutate(case):
-            case["fragment_textures"][0]["format"] = "bgra8_unorm"
-        self.refused(mutate, "rgba8_unorm surface")
+            # `bgra8_unorm` is the widened window's second layout
+            # (`research/docs/23` §107, `test_suite_v33.py`); the format outside
+            # it is the eight-byte `rgba16_float` texel.
+            case["fragment_textures"][0]["format"] = "rgba16_float"
+        self.refused(mutate, "four-component unorm surface")
 
     def test_the_shape_carries_no_other_state(self):
         def mutate(case):
