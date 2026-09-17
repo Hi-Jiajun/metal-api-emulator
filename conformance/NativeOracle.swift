@@ -1418,6 +1418,7 @@ private func parseOptions(_ arguments: [String]) throws -> Options {
     var depthResolveSelfTest = false
     var stencilResolveSelfTest = false
     var stageBufferSelfTest = false
+    var stageBufferWriteSelfTest = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
@@ -5571,6 +5572,8 @@ private func renderSelfTest() throws -> CaseResult {
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
+        stage_buffers: nil,
+        translated_stages: nil,
         vertices: 3,
         viewport: [0, 0, 2, 2],
         scissor: nil,
@@ -5651,6 +5654,8 @@ private func presentSelfTest() throws -> CaseResult {
         vertex_entry: reviewed.vertex_entry,
         fragment_entry: reviewed.fragment_entry,
         metal: reviewed.metal,
+        stage_buffers: nil,
+        translated_stages: nil,
         vertices: 3,
         viewport: [0, 0, 2, 2],
         scissor: nil,

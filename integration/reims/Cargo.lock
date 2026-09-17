@@ -348,6 +348,7 @@ dependencies = [
  "metal-api-ipc",
  "metal-api-native",
  "metal-api-vulkan",
+ "metal2vulkan 0.1.0 (git+https://github.com/steelbrain/metal2vulkan.git?rev=43c46ac8a24adf1a6e872b8a52c706ec9614fad0)",
  "serde",
  "serde_json",
  "sha2",
