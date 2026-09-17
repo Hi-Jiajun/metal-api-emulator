@@ -201,7 +201,11 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // `sampled_texel_4x4` case on Lavapipe and on the RTX 5060 (the
         // attachment reads back the uploaded texels exactly), and the rail's
         // own `render_e2e` sampling test. The bits name the reviewed window —
-        // one `rgba8_unorm` format and one texture of the render area's own
+        // the two 8-bit four-component UNORM byte orders
+        // (`TextureFormat::RENDER_SAMPLED`, `research/docs/23` §107: the
+        // census's BGRA8 guest views are the same texel in the other byte
+        // order, and which byte holds which channel is the `VkFormat`'s own
+        // fact, not the module's) and one texture of the render area's own
         // extent — so a wider request is refused by core admission or by the
         // rail's shape gates rather than silently narrowed. The binding count
         // is the contract's own ceiling (`research/docs/23` §3.3, v102): a
@@ -212,7 +216,7 @@ pub(crate) fn capabilities_from_limits(limits: &vk::PhysicalDeviceLimits) -> Pro
         // execution by name (`render_texture_stage_unsupported`).
         supports_render_texture_sampling: true,
         max_render_textures: MAX_RENDER_TEXTURES as u32,
-        supported_render_texture_formats: vec![TextureFormat::Rgba8Unorm],
+        supported_render_texture_formats: TextureFormat::RENDER_SAMPLED.to_vec(),
         // Stage buffer bindings are executed (`research/docs/23` §3.3, v83):
         // `render.rs` uploads each bound view into a host-visible
         // `STORAGE_BUFFER` and binds the two stages' descriptor sets — set 1

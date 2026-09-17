@@ -1731,6 +1731,49 @@ private func sha256(_ bytes: Data) -> String {
     hex(Data(SHA256.hash(data: bytes)))
 }
 
+/// The byte slot each channel occupies in one 8-bit four-component layout
+/// (`research/docs/23` §3.3, §107): the render sampler's two admitted layouts
+/// differ in the red and blue halves alone. A name outside the pair is refused
+/// by the caller, so this table is total over the layouts the sampled shape
+/// reaches it with.
+private let sampledChannelSlots: [String: [Int]] = [
+    "rgba8_unorm": [0, 1, 2, 3],
+    "bgra8_unorm": [2, 1, 0, 3],
+]
+
+/// The sampled-shape expectation (`research/docs/23` §3.3, §107): the uploaded
+/// texel hex spelled in the attachment's own byte order.
+///
+/// A texel-centre sample is an identity copy, so the attachment holds the same
+/// *colours* the upload's own layout states; across the two admitted layouts
+/// every texel is the red/blue swap of the other, which is all this
+/// permutation does.
+private func sampledExpectationHex(texture: String, attachment: String,
+                                   hex value: String) throws -> String {
+    guard let source = sampledChannelSlots[texture],
+          let target = sampledChannelSlots[attachment] else {
+        throw OracleError("the sampled shape's layouts are the two 8-bit "
+                          + "four-component byte orders")
+    }
+    var slots = [0, 0, 0, 0]
+    for channel in 0..<4 {
+        slots[target[channel]] = source[channel]
+    }
+    let characters = Array(value)
+    try require(characters.count % 8 == 0,
+                "the uploaded texels do not match the extent")
+    var wanted = String()
+    wanted.reserveCapacity(characters.count)
+    for offset in stride(from: 0, to: characters.count, by: 8) {
+        for index in 0..<4 {
+            let from = offset + 2 * slots[index]
+            wanted.append(characters[from])
+            wanted.append(characters[from + 1])
+        }
+    }
+    return wanted
+}
+
 @available(macOS 11.0, *)
 private func validateSource(_ definition: SourceDefinition, root: URL,
                             path: String, digest: String) throws -> Data {
@@ -2381,8 +2424,16 @@ private func loadSuite(_ url: URL) throws -> ValidatedSuite {
     case "compute-buffer-v32":
         expectedIDs = ["render_declaring_stage_buffer_sink",
                        "render_declaring_stage_buffer_lease"]
+    // The render sampler's second byte order (`research/docs/23` §3.3, §107):
+    // the declaring pass of the BGRA8 sampled case. The render case itself is
+    // marked for the Vulkan rails alone — this rail's reviewed table names one
+    // layout, and the Apple-side reading that would widen it has not landed —
+    // so this oracle validates only the declaring pass's metadata and executes
+    // it as an ordinary compute case.
+    case "compute-buffer-v33":
+        expectedIDs = ["render_declaring_quad_extent"]
     default:
-        throw OracleError("Only compute-buffer-v1 through compute-buffer-v32 are supported")
+        throw OracleError("Only compute-buffer-v1 through compute-buffer-v33 are supported")
     }
     try require(suite.cases.count == expectedIDs.count && Set(suite.cases.map { $0.id }) == expectedIDs,
                 "\(suite.suite): the suite must contain exactly the supported case IDs")
@@ -3443,13 +3494,15 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
                     "\(definition.id): the reviewed sampling shape carries no other state")
         try require(attachments.count == 1,
                     "\(definition.id): the reviewed sampling shape stores one attachment")
-        try require(attachments[0].format == "rgba8_unorm" && attachments[0].store == "store",
-                    "\(definition.id): the reviewed sampling shape stores one rgba8_unorm "
-                    + "attachment")
+        try require(sampledChannelSlots[attachments[0].format] != nil
+                    && attachments[0].store == "store",
+                    "\(definition.id): the reviewed sampling shape stores one 8-bit "
+                    + "four-component unorm attachment, in either byte order")
         let texture = textures[0]
-        try require(texture.format == "rgba8_unorm",
-                    "\(definition.id): the reviewed sampling stage reads one rgba8_unorm "
-                    + "surface")
+        try require(sampledChannelSlots[texture.format] != nil,
+                    "\(definition.id): the reviewed sampling stage reads one 8-bit "
+                    + "four-component unorm surface, in either byte order "
+                    + "(rgba8_unorm/bgra8_unorm)")
         try require(texture.width == attachments[0].width
                     && texture.height == attachments[0].height,
                     "\(definition.id): the sampled texture has to share the attachment's "
@@ -3463,7 +3516,12 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             // centre is an identity copy. The rule has to stay injective over
             // the extent it addresses and the clear colour has to stay outside
             // its reach — the closed-form siblings of the distinctness rules
-            // the hex form is held to below.
+            // the hex form is held to below. It states one layout's plane, so
+            // the sampled texture and the attachment have to name that layout
+            // together (`§107`).
+            try require(texture.format == attachments[0].format,
+                        "\(definition.id): a rule expectation states one layout's plane, so "
+                        + "the sampled texture and the attachment have to name it together")
             try require(rule == reviewedTexelRule,
                         "\(definition.id): unknown texel rule \"\(rule)\"")
             try require(definition.expected_rule == rule,
@@ -3492,9 +3550,13 @@ private func validateRenderCase(_ definition: RenderCaseDefinition,
             try require(definition.readback_windows == nil,
                         "\(definition.id): readback windows travel with the texture's own "
                         + "texel rule")
-            try require(expectedHexes == [texture.initial_hex as String?],
-                        "\(definition.id): the expectation has to be the uploaded texels: the "
-                        + "sampling stage's sample at a texel centre is an identity copy")
+            let wanted = try sampledExpectationHex(texture: texture.format,
+                                                   attachment: attachments[0].format,
+                                                   hex: texture.initial_hex ?? "")
+            try require(expectedHexes == [wanted],
+                        "\(definition.id): the expectation has to be the uploaded texels in "
+                        + "the attachment's own byte order: the sampling stage's sample at a "
+                        + "texel centre is an identity copy")
             let texels = try texture.texels(
                 context: "\(definition.id).fragment_textures[0]")
             let chunks = stride(from: 0, to: texels.count, by: 4).map { offset in

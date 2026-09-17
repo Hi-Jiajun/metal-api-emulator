@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "suite": "compute-buffer-v33",
+  "guard_byte": 0,
+  "cases": [
+    {
+      "id": "render_declaring_quad_extent",
+      "entry": "copy_word",
+      "grid": [1, 1, 1],
+      "local": [1, 1, 1],
+      "air": {
+        "path": "../examples/metal-smoke/shaders/kernel_copy_word.ll",
+        "sha256": "292c3e1ff300fd08bf5e39aaa9abe352842eced807138f863e05056f39c56d99"
+      },
+      "metal": {
+        "path": "shaders/copy_word.metal",
+        "sha256": "7bfa419aef6eb0abcbec045c1bc15651b2d8f0a7591e07448edc6de6522141bc"
+      },
+      "buffers": [
+        {
+          "binding": 0,
+          "allocation": 900,
+          "view": 910,
+          "offset": 0,
+          "length": 64,
+          "allocation_size": 64,
+          "access": "read",
+          "initial_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "binding": 1,
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "length": 4,
+          "allocation_size": 16,
+          "access": "write",
+          "initial_hex": "fefefefe"
+        }
+      ],
+      "expected_writebacks": [
+        {
+          "allocation": 920,
+          "view": 930,
+          "offset": 4,
+          "bytes_hex": "cdcdcdcd"
+        }
+      ]
+    }
+  ],
+  "render_cases": [
+    {
+      "id": "sampled_texel_bgra_4x4",
+      "declaring_case": "render_declaring_quad_extent",
+      "vertex_entry": "render_sampled_quad_vertex",
+      "fragment_entry": "render_sampled_texel",
+      "metal": {
+        "path": "shaders/render_sampled_4x4.metal",
+        "sha256": "4c5216ce5af3e1184f7dfd9f989aaf0de9f1ce1ffaad43906d23e6a92aae8813"
+      },
+      "vertices": 3,
+      "viewport": [0, 0, 4, 4],
+      "fragment_textures": [
+        {
+          "allocation": 1060,
+          "view": 1070,
+          "format": "bgra8_unorm",
+          "width": 4,
+          "height": 4,
+          "initial_hex": "905010c0905020d0905030e0905040f0906010d0906020e0906030f090604000907010e0907020f09070300090704010908010f0908020009080301090804020"
+        }
+      ],
+      "attachment": {
+        "allocation": 900,
+        "view": 910,
+        "format": "rgba8_unorm",
+        "width": 4,
+        "height": 4,
+        "load": "clear",
+        "clear_hex": "11223344",
+        "store": "store"
+      },
+      "expected_hex": "105090c0205090d0305090e0405090f0106090d0206090e0306090f040609000107090e0207090f03070900040709010108090f0208090003080901040809020",
+      "capture_rails": ["vulkan", "vulkan-objects"]
+    }
+  ]
+}

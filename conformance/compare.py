@@ -117,6 +117,40 @@ RULE_ADDRESS_CEILING = 65_536
 MAX_READBACK_WINDOWS = 8
 MAX_READBACK_WINDOW_DIMENSION = 64
 
+# The sampled textures the render sampler admits (`research/docs/23` §3.3,
+# §107), in the order the rails' capability lists name them: the two four-byte
+# 8-bit UNORM byte orders. A case's sampled texture and its colour attachment
+# may name either one, and the case's hex expectation is the sampled *colours*
+# spelled in the attachment's own order — which is what the slot table below
+# computes. The rule form stays the same-format pair's, because its closed-form
+# expectation is stated over one layout.
+SAMPLED_TEXTURE_FORMATS = ("rgba8_unorm", "bgra8_unorm")
+# The byte slot each channel occupies in one 8-bit four-component layout: the
+# two layouts differ in the red and blue halves alone.
+SAMPLED_CHANNEL_SLOTS = {
+    "rgba8_unorm": {"red": 0, "green": 1, "blue": 2, "alpha": 3},
+    "bgra8_unorm": {"red": 2, "green": 1, "blue": 0, "alpha": 3},
+}
+
+
+def _sampled_expectation(texture_format, attachment_format, texels):
+    """The sampled colours of `texels`, spelled in the attachment's own order.
+
+    `texels` are the texture's memory bytes as the fixture declares them; a
+    texel-centre sample is an identity copy, so the attachment holds the same
+    colours. When the two sides name the same layout the bytes are the same
+    byte for byte; across the two layouts every texel is the red/blue swap of
+    the other (`research/docs/23` §107).
+    """
+    source = SAMPLED_CHANNEL_SLOTS[texture_format]
+    target = SAMPLED_CHANNEL_SLOTS[attachment_format]
+    slots = [0, 0, 0, 0]
+    for channel in ("red", "green", "blue", "alpha"):
+        slots[target[channel]] = source[channel]
+    return bytes(texels[offset + slots[index]]
+                 for offset in range(0, len(texels), 4)
+                 for index in range(4))
+
 
 def _rule_texel(rule, x, y):
     """The four bytes the reviewed rule stores at texel `(x, y)`."""
@@ -2369,10 +2403,17 @@ def _render_plan(plan, suite):
             _require(_integer(texture.get("allocation"), f"{texture_where}.allocation") > 0
                      and _integer(texture.get("view"), f"{texture_where}.view") > 0,
                      f"{texture_where}: zero texture identity")
-            _require(texture.get("format") == "rgba8_unorm",
-                     f"{texture_where}: the reviewed sampling stage reads one "
-                     "rgba8_unorm surface")
             attachment = case["attachment"]
+            texture_format = _string(texture.get("format"), f"{texture_where}.format")
+            _require(texture_format in SAMPLED_TEXTURE_FORMATS,
+                     f"{texture_where}: the reviewed sampling stage reads one 8-bit "
+                     "four-component unorm surface, in either byte order "
+                     "(rgba8_unorm/bgra8_unorm)")
+            attachment_format = _string(attachment.get("format"),
+                                        f"{where}.attachment.format")
+            _require(attachment_format in SAMPLED_TEXTURE_FORMATS,
+                     f"{where}.attachment: the sampled shape's colour attachment is one "
+                     "8-bit four-component unorm surface, in either byte order")
             _require(texture.get("width") == attachment.get("width")
                      and texture.get("height") == attachment.get("height"),
                      f"{texture_where}: the sampled texture has to share the "
@@ -2395,6 +2436,9 @@ def _render_plan(plan, suite):
                 # to stay outside its reach — the closed-form siblings of the
                 # distinctness rules the hex form is held to below.
                 rule = _string(texture["texel_rule"], f"{texture_where}.texel_rule")
+                _require(texture_format == attachment_format,
+                         f"{texture_where}: a rule expectation states one layout's plane, so "
+                         "the sampled texture and the attachment have to name it together")
                 _require(rule == XY_U16LE_V1,
                          f"{texture_where}: unknown texel rule {rule!r}")
                 _require(case.get("expected_rule") == rule,
@@ -2423,9 +2467,11 @@ def _render_plan(plan, suite):
                          f"{where}: readback windows travel with the texture's own texel rule")
                 texels = _hex(texture.get("initial_hex"), f"{texture_where}.initial_hex")
                 expected = _hex(case.get("expected_hex"), f"{where}.expected_hex")
-                _require(expected == texels,
-                         f"{where}: the expectation has to be the uploaded texels: the "
-                         "sampling stage's sample at a texel centre is an identity copy")
+                _require(expected == _sampled_expectation(texture_format, attachment_format,
+                                                          texels),
+                         f"{where}: the expectation has to be the uploaded texels in the "
+                         "attachment's own byte order: the sampling stage's sample at a "
+                         "texel centre is an identity copy")
                 chunks = [texels[offset:offset + 4] for offset in range(0, len(texels), 4)]
                 _require(len(chunks) == texture_width * texture_height,
                          f"{texture_where}: the uploaded texels do not match the extent")

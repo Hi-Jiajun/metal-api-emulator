@@ -1357,6 +1357,23 @@ fn create_provider(
     }
 }
 
+/// The sampled texture format one render case declares (`research/docs/23`
+/// §3.3, §107): the case's one-entry `fragment_textures` list names the layout
+/// the registration's declaration and the pass's view have to share.
+fn sampled_case_texture_format(case: &RenderCase) -> Result<TextureFormat> {
+    case.fragment_textures
+        .as_deref()
+        .and_then(<[FragmentTextureDefinition]>::first)
+        .ok_or_else(|| {
+            format!(
+                "render case {}: the reviewed sampling case declares its one sampled texture",
+                case.id
+            )
+            .into()
+        })
+        .and_then(FragmentTextureDefinition::format)
+}
+
 /// Register the reviewed render pipeline on one trace rail's concrete context.
 ///
 /// The render rail is a concrete-context entry point (`register_render_pipeline`
@@ -1521,11 +1538,14 @@ fn register_render_pipeline(
     // The sampled case's declaration (`research/docs/23` §3.3, v100): the
     // fragment stage reads the pass's one texture at binding 0, and the state
     // is the one the reviewed pair's own MSL sibling carries — the state both
-    // rails execute, and the one a declaration has to repeat.
+    // rails execute, and the one a declaration has to repeat. The format is the
+    // case's own (`§107`): the declaration and the pass's view have to name one
+    // layout, so the registration reads it off the fixture rather than pinning
+    // the older byte order.
     let textures = match geometry {
         RenderGeometry::SampledTexture => vec![TextureBindingContract::sampled(
             0,
-            TextureFormat::Rgba8Unorm,
+            sampled_case_texture_format(case)?,
             SamplerPolicy::reviewed_render_sampler(),
         )],
         _ => Vec::new(),
@@ -3907,6 +3927,13 @@ fn validate_suite(suite: &Suite) -> Result<()> {
             "render_declaring_stage_buffer_sink",
             "render_declaring_stage_buffer_lease",
         ],
+        // The render sampler's second byte order (`research/docs/23` §3.3,
+        // §107): the census's BGRA8 binds, whose sampled texture and colour
+        // attachment may name either 8-bit four-component layout. The render
+        // case is marked for the Vulkan rails alone — the native rail's
+        // reviewed table names one layout — so the declaring pass is the one
+        // this table pins.
+        (1, "compute-buffer-v33") => &["render_declaring_quad_extent"],
         _ => return Err("unsupported suite identity/version".into()),
     };
     if suite.cases.len() != case_ids.len()
@@ -4141,6 +4168,23 @@ struct FragmentTextureDefinition {
 }
 
 impl FragmentTextureDefinition {
+    /// The `TextureFormat` this declaration names (`research/docs/23` §3.3,
+    /// §107): the two four-byte 8-bit UNORM byte orders the render sampler
+    /// admits. Which byte holds which channel is the format's own fact, so the
+    /// declared name travels into the trace and the object rail's texture
+    /// handle rather than being normalised to one of them.
+    fn format(&self) -> Result<TextureFormat> {
+        match self.format.as_str() {
+            "rgba8_unorm" => Ok(TextureFormat::Rgba8Unorm),
+            "bgra8_unorm" => Ok(TextureFormat::Bgra8Unorm),
+            other => Err(format!(
+                "the reviewed sampling stage reads one 8-bit four-component unorm surface, in \
+                 either byte order (rgba8_unorm/bgra8_unorm), not {other:?}"
+            )
+            .into()),
+        }
+    }
+
     /// The texels this texture is uploaded with.
     fn texels(&self) -> Result<Vec<u8>> {
         match (&self.initial_hex, &self.texel_rule) {
@@ -4219,6 +4263,38 @@ fn attachment_format(name: &str) -> Result<AttachmentFormat> {
         "r32float" => Ok(AttachmentFormat::R32Float),
         other => Err(format!("unsupported attachment format {other:?}").into()),
     }
+}
+
+/// The sampled-shape expectation (`research/docs/23` §3.3, §107): the uploaded
+/// texels' *colours*, spelled in the attachment's own byte order.
+///
+/// The two admitted layouts are the same eight-bit four-component texel, so a
+/// different pair of names is the red/blue half swap of the uploaded bytes and
+/// nothing else. The rule form's `xy_u16le_v1` plane is stated for one layout,
+/// which is why the caller refuses a differing pair there instead.
+fn sampled_expectation(
+    texture: TextureFormat,
+    attachment: AttachmentFormat,
+    texels: &[u8],
+) -> Vec<u8> {
+    let slots = |format: TextureFormat| -> [u8; 4] {
+        match format {
+            TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
+            _ => [0, 1, 2, 3],
+        }
+    };
+    let source = slots(texture);
+    let target = slots(attachment.as_texture_format());
+    let mut wanted = Vec::with_capacity(texels.len());
+    for offset in (0..texels.len()).step_by(4) {
+        let texel = &texels[offset..offset + 4];
+        let mut out = [0_u8; 4];
+        for channel in 0..4 {
+            out[usize::from(target[channel])] = texel[usize::from(source[channel])];
+        }
+        wanted.extend_from_slice(&out);
+    }
+    wanted
 }
 
 fn render_attachment_shapes(
@@ -5395,17 +5471,17 @@ fn reviewed_sampled_geometry(
     let attachment = case.attachment.as_ref().ok_or_else(|| {
         format!("{where_}: the reviewed render-sampler shape needs its stored attachment")
     })?;
-    if attachment.format != "rgba8_unorm" || attachment.store != "store" {
-        return Err(format!(
-            "{where_}: the reviewed render-sampler shape stores one rgba8_unorm attachment"
-        )
-        .into());
-    }
     let texture = &textures[0];
-    if texture.format != "rgba8_unorm" {
+    let texture_format = texture.format()?;
+    let attachment_layout = attachment_format(&attachment.format)?;
+    if !matches!(
+        attachment_layout,
+        AttachmentFormat::Rgba8Unorm | AttachmentFormat::Bgra8Unorm
+    ) || attachment.store != "store"
+    {
         return Err(format!(
-            "{where_}.fragment_textures[0]: the reviewed sampling stage reads one rgba8_unorm \
-             surface"
+            "{where_}: the reviewed render-sampler shape stores one 8-bit four-component \
+             unorm attachment, in either byte order"
         )
         .into());
     }
@@ -5436,6 +5512,17 @@ fn reviewed_sampled_geometry(
     // sibling of the pairwise-distinctness scan below, which is exactly what
     // the rule form cannot run on a 2048² plane.
     if let Some(rule) = texture.rule() {
+        // The rule states one layout's plane, so the sampled texture and the
+        // attachment have to name that layout together (`research/docs/23`
+        // §107): across the two admitted layouts every texel is the other's
+        // red/blue swap.
+        if texture_format != attachment_layout.as_texture_format() {
+            return Err(format!(
+                "{where_}.fragment_textures[0]: a rule expectation states one layout's plane, \
+                 so the sampled texture and the attachment have to name it together"
+            )
+            .into());
+        }
         if texture.width < RULE_MIN_DIMENSION || texture.height < RULE_MIN_DIMENSION {
             return Err(format!(
                 "{where_}.fragment_textures[0]: a texel rule is the megapixel form; {}×{} \
@@ -5511,10 +5598,10 @@ fn reviewed_sampled_geometry(
     let expected = unhex(case.expected_hex.as_deref().ok_or_else(|| {
         format!("{where_}: the reviewed render-sampler shape needs its expectation")
     })?)?;
-    if expected != texels {
+    if expected != sampled_expectation(texture_format, attachment_layout, &texels) {
         return Err(format!(
-            "{where_}: the expectation has to be the uploaded texels: the sampling stage's \
-             sample at a texel centre is an identity copy"
+            "{where_}: the expectation has to be the uploaded texels in the attachment's own \
+             byte order: the sampling stage's sample at a texel centre is an identity copy"
         )
         .into());
     }
@@ -9909,7 +9996,7 @@ fn run_render_case(
                         metal_binding: u32::try_from(binding)?,
                         allocation_id: AllocationId::new(definition.allocation),
                         texture_type: TextureType::D2,
-                        format: TextureFormat::Rgba8Unorm,
+                        format: definition.format()?,
                         width: definition.width,
                         height: definition.height,
                         depth: 1,
@@ -10864,7 +10951,7 @@ fn run_object_render_case(
     if let Some(definitions) = &case.fragment_textures {
         for (index, definition) in definitions.iter().enumerate() {
             let texture = device.new_texture_with_bytes(
-                TextureFormat::Rgba8Unorm,
+                definition.format()?,
                 definition.width,
                 definition.height,
                 definition.texels()?,

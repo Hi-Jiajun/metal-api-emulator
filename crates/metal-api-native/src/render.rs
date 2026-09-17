@@ -1130,8 +1130,19 @@ pub(crate) struct RenderTextureCapabilityBits {
 /// declares what its reviewed modules execute.
 pub(crate) const MAX_RENDER_TEXTURES: u32 = metal_api_core::provider::MAX_RENDER_TEXTURES as u32;
 
-/// The texture formats the first render-sampler increment samples: the
-/// reviewed fragment stage reads one `rgba8_unorm` texel.
+/// The texture formats this rail's reviewed sampling table names: one
+/// `rgba8_unorm` texel.
+///
+/// The Vulkan rail widened the same table to the two 8-bit four-component
+/// byte orders the contract's [`TextureFormat::RENDER_SAMPLED`] names
+/// (`research/docs/23` §107, the census's BGRA8 binds). This rail's table stays
+/// at the one format its review covers, so a `bgra8_unorm` sampled texture is
+/// refused here by name at admission (`render_texture_format_unsupported`)
+/// instead of being executed as an unmeasured claim. The reviewed MSL sibling
+/// samples a `texture2d<float>` — the pixel format is the plan's own fact — so
+/// an `MTLPixelFormat::BGRA8Unorm` texture would be the mechanical widening,
+/// and the Apple-side self-test reading is what would have to land with it,
+/// exactly as the present/stage-buffer flips state.
 pub(crate) const SUPPORTED_RENDER_TEXTURE_FORMATS: [TextureFormat; 1] = [TextureFormat::Rgba8Unorm];
 
 /// The present bits this provider declares as of the present-track flip.
@@ -4527,7 +4538,12 @@ fn resolve_render_textures<'a>(
             return Err(capability_refusal("render_texture_format_unsupported")
                 .with_field("binding", FieldValue::Unsigned(u64::from(binding)))
                 .with_field("format", FieldValue::Text(format!("{:?}", view.format)))
-                .with_detail("the reviewed sampling module reads one rgba8_unorm surface"));
+                .with_detail(
+                    "the reviewed sampling module reads one rgba8_unorm surface; this rail's \
+                     table names that one format, and the other 8-bit byte order is the Vulkan \
+                     rail's widened arm (`research/docs/23` §107) pending the Apple-side \
+                     reading its own flip would owe",
+                ));
         }
         if view.texture_type != TextureType::D2
             || view.sample_count != 1
