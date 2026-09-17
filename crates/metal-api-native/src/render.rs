@@ -59,14 +59,15 @@
 use crate::icb;
 use crate::refusal;
 use metal_api_core::provider::{
-    AttachmentFormat, BorrowedLeaseRegistry, BorrowedView, BufferSource, BufferView,
+    AttachmentFormat, BorrowedLeaseRegistry, BorrowedView, BufferAccess, BufferSource, BufferView,
     BufferWriteback, ClearColor, ComputeTrace, ContractError, DepthResolveFilter, DepthStoreOp,
-    DepthTest, DeviceEpoch, FieldValue, IndexBufferBinding, IndexFormat, IndirectCommandDescriptor,
-    LeaseId, LeaseRegistry, LoadOp, PipelineId, PresentDescriptor, PresentMode, ProviderError,
-    ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull, RenderPassDescriptor,
-    RenderPipelineContract, ResourceTableSnapshot, SampleCount, StencilResolveFilter, StencilTest,
-    StoreOp, TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexFormat,
-    VertexLayout, VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES,
+    DepthTest, DeviceEpoch, FieldValue, FootprintProof, IndexBufferBinding, IndexFormat,
+    IndirectCommandDescriptor, LeaseId, LeaseRegistry, LoadOp, PipelineId, PresentDescriptor,
+    PresentMode, ProviderError, ProviderErrorClass, ProviderPhase, RenderPassBlend, RenderPassCull,
+    RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage, ResourceTableSnapshot,
+    SampleCount, StencilResolveFilter, StencilTest, StoreOp, TextureFormat, TextureSource,
+    TextureType, TextureView, TracePass, VertexFormat, VertexLayout, VertexStep, ViewId,
+    FULL_SCREEN_TRIANGLE_VERTICES,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -227,6 +228,63 @@ pub(crate) const SAMPLED_VERTEX_ENTRY: &str = "render_sampled_quad_vertex";
 /// Fragment entry of the reviewed render-sampler module.
 pub(crate) const SAMPLED_FRAGMENT_ENTRY: &str = "render_sampled_texel";
 
+/// The reviewed stage-buffer module (`research/docs/23` §83, R9g): the
+/// native rail's sibling of the Vulkan pair the R9/R9c increments execute —
+/// a vertex stage that reads its three positions from its own `[[buffer(0)]]`
+/// argument (so the pipeline binds no `MTLVertexDescriptor`), and a fragment
+/// stage whose one `[[buffer(0)]]` argument is the whole stored texel.
+///
+/// The module shares the milestone's shape — `VertexLayout::None`, one
+/// `Rgba8Unorm` location — so it is selected by its entry pair, exactly as the
+/// render sampler's pair is: a registration has no pass to look at, and the
+/// pass that binds the two slots is exactly the one that names these entries.
+pub(crate) const REVIEWED_STAGE_BUFFER_SOURCE: &str =
+    include_str!("../../../conformance/shaders/render_stage_buffer_2x2.metal");
+
+/// Vertex entry of the reviewed stage-buffer module.
+pub(crate) const STAGE_BUFFER_VERTEX_ENTRY: &str = "render_stage_buffer_vertex";
+
+/// Fragment entry of the reviewed stage-buffer module.
+pub(crate) const STAGE_BUFFER_FRAGMENT_ENTRY: &str = "render_stage_buffer_tint";
+
+/// The vertex stage's binding inside its own `[[buffer(N)]]` index space
+/// (`setVertexBuffer(_:offset:index:)`), spelled by the reviewed module.
+pub(crate) const STAGE_BUFFER_VERTEX_BINDING: u32 = 0;
+
+/// The fragment stage's binding inside its own `[[buffer(N)]]` index space
+/// (`setFragmentBuffer(_:offset:index:)`). The two stages' index spaces are
+/// independent — the same fact `research/docs/23` §83.2 states for the
+/// contract — so vertex `0` and fragment `0` are two different slots.
+pub(crate) const STAGE_BUFFER_FRAGMENT_BINDING: u32 = 0;
+
+/// Bytes the reviewed vertex stage reads: three `float2` positions.
+pub(crate) const STAGE_BUFFER_VERTEX_BYTES: u64 = 24;
+
+/// Bytes the reviewed fragment stage reads: one `float4` tint.
+pub(crate) const STAGE_BUFFER_FRAGMENT_BYTES: u64 = 16;
+
+/// One `[[buffer(N)]]` argument a reviewed module reads, as the registration
+/// gate pairs it with the contract's declaration (`research/docs/23` §83,
+/// R9g).
+///
+/// The reviewed module is the native rail's half of the reflection a
+/// translated stage carries: its argument list is fixed by the pinned source
+/// bytes, so this table is what the registration pairs the contract's
+/// `StageBufferBinding` list against — stage, index, access and the byte
+/// extent the module's own read reaches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewedStageBufferSlot {
+    /// Which stage reads the argument.
+    pub(crate) stage: RenderPipelineStage,
+    /// The `[[buffer(index)]]` number inside that stage's own index space.
+    pub(crate) index: u32,
+    /// How the stage uses the bytes. Every reviewed argument is read-only.
+    pub(crate) access: BufferAccess,
+    /// Bytes the module's own read reaches; the contract's declared static
+    /// footprint has to cover it.
+    pub(crate) max_bytes: u64,
+}
+
 /// One reviewed render module and the (vertex-input shape, colour-format
 /// shape) pair it was written for.
 ///
@@ -252,17 +310,23 @@ pub(crate) struct ReviewedModule {
     pub(crate) fragment_entry: &'static str,
     /// Whether the module's vertex stage reads a caller-held stream.
     pub(crate) binds_buffers: bool,
+    /// The `[[buffer(N)]]` arguments the module's stages read, in canonical
+    /// order (vertex bindings before fragment ones, ascending inside each
+    /// stage), which is the order the contract states them in too. Empty for
+    /// every module that reads none — the whole pre-R9g set.
+    pub(crate) stage_buffers: &'static [ReviewedStageBufferSlot],
 }
 
 /// The reviewed modules, one per (vertex-input shape, colour-format shape)
 /// pair this rail executes.
-pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
+pub(crate) const REVIEWED_MODULES: [ReviewedModule; 11] = [
     ReviewedModule {
         source: REVIEWED_SOURCE,
         path: "conformance/shaders/render_offscreen_2x2.metal",
         vertex_entry: VERTEX_ENTRY,
         fragment_entry: FRAGMENT_ENTRY,
         binds_buffers: false,
+        stage_buffers: &[],
     },
     ReviewedModule {
         source: REVIEWED_VERTEX_SOURCE,
@@ -270,6 +334,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     ReviewedModule {
         source: REVIEWED_DUAL_SOURCE,
@@ -277,6 +342,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: DUAL_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     ReviewedModule {
         source: REVIEWED_R32F_SOURCE,
@@ -284,6 +350,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: R32F_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     ReviewedModule {
         source: REVIEWED_QUAD_SOURCE,
@@ -291,6 +358,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: QUAD_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     ReviewedModule {
         source: REVIEWED_TRIPLE_SOURCE,
@@ -298,6 +366,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: QUAD_VERTEX_ENTRY,
         fragment_entry: TRIPLE_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     // The reviewed instanced fixture (`research/docs/23` §3.3, v31): the one
     // module whose vertex stage reads `instance_id` and a per-instance stream,
@@ -308,6 +377,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: INSTANCED_VERTEX_ENTRY,
         fragment_entry: INSTANCED_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     // The reviewed depth fixture (`research/docs/23` §3.3, v36): the module
     // whose vertex stage reads a position whose z the caller chose, so the
@@ -318,6 +388,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: DEPTH_VERTEX_ENTRY,
         fragment_entry: DEPTH_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     // The reviewed zero-colour-attachment depth fixture (`research/docs/23`
     // §3.3, v46): the same vertex stage with a fragment stage that generates no
@@ -328,6 +399,7 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: DEPTH_ONLY_VERTEX_ENTRY,
         fragment_entry: DEPTH_ONLY_FRAGMENT_ENTRY,
         binds_buffers: true,
+        stage_buffers: &[],
     },
     // The reviewed render-sampler fixture (`research/docs/23` §3.3, v70): the
     // milestone's shape with its own entry pair, selected by the registration's
@@ -338,6 +410,33 @@ pub(crate) const REVIEWED_MODULES: [ReviewedModule; 10] = [
         vertex_entry: SAMPLED_VERTEX_ENTRY,
         fragment_entry: SAMPLED_FRAGMENT_ENTRY,
         binds_buffers: false,
+        stage_buffers: &[],
+    },
+    // The reviewed stage-buffer fixture (`research/docs/23` §83, R9g): the one
+    // module whose stages read `[[buffer(N)]]` arguments, and the only module
+    // whose `stage_buffers` table is non-empty. It shares the milestone's
+    // `vertex_id` + one-`Rgba8Unorm`-location shape, so its entry pair is what
+    // selects it — exactly as the render sampler's pair is selected.
+    ReviewedModule {
+        source: REVIEWED_STAGE_BUFFER_SOURCE,
+        path: "conformance/shaders/render_stage_buffer_2x2.metal",
+        vertex_entry: STAGE_BUFFER_VERTEX_ENTRY,
+        fragment_entry: STAGE_BUFFER_FRAGMENT_ENTRY,
+        binds_buffers: false,
+        stage_buffers: &[
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Vertex,
+                index: STAGE_BUFFER_VERTEX_BINDING,
+                access: BufferAccess::Read,
+                max_bytes: STAGE_BUFFER_VERTEX_BYTES,
+            },
+            ReviewedStageBufferSlot {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_FRAGMENT_BINDING,
+                access: BufferAccess::Read,
+                max_bytes: STAGE_BUFFER_FRAGMENT_BYTES,
+            },
+        ],
     },
 ];
 
@@ -444,11 +543,12 @@ pub(crate) fn reviewed_module(
 /// [`reviewed_module`] answers the *shape* question — which module a
 /// (vertex-input layout, colour-format list) pair compiles — and that answer is
 /// unique for every shape except the render sampler's, which shares the
-/// milestone's `vertex_id` + one-`Rgba8Unorm`-location shape. Its own entry
-/// pair is what tells the two apart, so this is the question the registration
-/// gate and the plan both ask: a registration names entries, and entries are
-/// the only thing that distinguishes a sampling pipeline from a solid one
-/// before a pass exists to look at.
+/// milestone's `vertex_id` + one-`Rgba8Unorm`-location shape, and the
+/// stage-buffer module's, which shares it too (`research/docs/23` §83, R9g).
+/// Their own entry pairs are what tell the three apart, so this is the question
+/// the registration gate and the plan both ask: a registration names entries,
+/// and entries are the only thing that distinguishes a sampling or a
+/// stage-buffer pipeline from a solid one before a pass exists to look at.
 pub(crate) fn reviewed_module_for(
     contract: &RenderPipelineContract,
 ) -> Option<&'static ReviewedModule> {
@@ -464,6 +564,13 @@ pub(crate) fn reviewed_module_for(
         && contract.color_formats == [AttachmentFormat::Rgba8Unorm]
     {
         return Some(&REVIEWED_MODULES[9]);
+    }
+    if contract.vertex_entry == STAGE_BUFFER_VERTEX_ENTRY
+        && contract.fragment_entry == STAGE_BUFFER_FRAGMENT_ENTRY
+        && matches!(contract.vertex_layout, VertexLayout::None)
+        && contract.color_formats == [AttachmentFormat::Rgba8Unorm]
+    {
+        return Some(&REVIEWED_MODULES[10]);
     }
     None
 }
@@ -521,6 +628,39 @@ pub(crate) fn attachment_dimension_window(device_2d_texture_limit: u64) -> [u64;
 /// answers no legacy macOS feature set still declares the documented ceiling
 /// rather than 0.
 pub(crate) const APPLE_2D_TEXTURE_CEILING: u64 = 16_384;
+
+/// The stage-buffer bits the provider declares (`research/docs/23` §83, R9g).
+///
+/// The bits name this rail's own window: the reviewed
+/// `conformance/shaders/render_stage_buffer_2x2.metal` module, whose vertex
+/// stage reads its three positions and whose fragment stage its one `float4`
+/// from their own `[[buffer(0)]]` arguments — the slots the encoder fills with
+/// `setVertexBuffer(_:offset:index:)` and `setFragmentBuffer(_:offset:index:)`.
+///
+/// Flip evidence (pending): the increment after this one reads the Apple
+/// device's own frame — the `native-oracle-build` job's "Run native
+/// stage-buffer self-test when a Metal device is eligible" step reporting the
+/// covered texel's bytes instead of the `fefefefe` clear sentinel. Until that
+/// run lands, both fields stay at their defaults, so core admission refuses a
+/// stage-buffer pass with `render_stage_buffer_unsupported` instead of
+/// executing it through a path no device reading has confirmed. A green job
+/// whose log said `SKIP` is not that evidence: `SKIP` means the probe found no
+/// eligible device, which is exactly the state the bit stays closed for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StageBufferCapabilityBits {
+    pub(crate) supports_render_stage_buffers: bool,
+    pub(crate) max_render_stage_buffers: u32,
+}
+
+/// The one spelling of the stage-buffer bits, so the macOS snapshot and the
+/// flip condition cannot drift apart — the shape `crate::heap` and
+/// `crate::icb` state their own pending bits in.
+pub(crate) fn stage_buffer_capability_bits() -> StageBufferCapabilityBits {
+    StageBufferCapabilityBits {
+        supports_render_stage_buffers: false,
+        max_render_stage_buffers: 0,
+    }
+}
 
 /// Colour formats this rail can build an `MTLTexture` and a pipeline state from
 /// — the core contract's admitted set, without `R32Uint` ([`pixel_format`]
@@ -1413,6 +1553,39 @@ impl PlannedIndexStream<'_> {
     }
 }
 
+/// One stage buffer the pass binds, resolved before any Metal object exists
+/// (`research/docs/23` §83, R9g).
+///
+/// The entry names its stage explicitly: the two stages' `[[buffer(N)]]` index
+/// spaces are independent, so the index alone cannot say which namespace it
+/// fills. `bytes` is the reviewed module's own read extent — the fact the
+/// registration paired the declaration against — and the encoder binds the
+/// resolved buffer at `index` in the stage's own namespace.
+#[derive(Debug)]
+pub(crate) struct PlannedStageBuffer<'a> {
+    /// Which stage reads the binding.
+    pub(crate) stage: RenderPipelineStage,
+    /// The `[[buffer(index)]]` number inside that stage's namespace, i.e. the
+    /// `setVertexBuffer(_:offset:index:)` / `setFragmentBuffer(_:offset:index:)`
+    /// index the encoder binds.
+    pub(crate) index: u32,
+    /// Bytes the reviewed module's read reaches.
+    pub(crate) bytes: u64,
+    /// Where this binding's bytes come from, through the same three-armed
+    /// channel every other render input uses.
+    pub(crate) source: PlannedInputSource<'a>,
+    /// The view's offset inside its allocation.
+    pub(crate) offset: u64,
+}
+
+impl PlannedStageBuffer<'_> {
+    /// The offset the encoder binds this binding at, by the same rule the
+    /// vertex streams use.
+    pub(crate) fn binding_offset(&self) -> u64 {
+        source_binding_offset(&self.source, self.offset)
+    }
+}
+
 /// Resolve a pass's vertex streams and index buffer from the pass itself.
 ///
 /// A render input declares its own bytes (`research/docs/23` §3.6): entry `i` of
@@ -1662,6 +1835,83 @@ fn render_input_refusal(
         .with_detail(detail)
 }
 
+/// Resolve a pass's stage buffer bindings from the pass itself
+/// (`research/docs/23` §83, R9g).
+///
+/// Both halves of the pairing are answered before this runs: the registration
+/// gate paired the contract's declarations with the reviewed module's own
+/// `[[buffer(N)]]` arguments ([`validate_reviewed_stage_buffers`]), and
+/// `validate_against` paired the pass's views with the declarations — so every
+/// view here is one the module reads, at its own slot, with the declared
+/// extent covering the module's read. What this walk adds is the rail's own
+/// three-armed source channel ([`resolve_render_input`]): a binding declares
+/// its bytes, names a staged lease, or names an owner window to map, exactly as
+/// a vertex stream does, and the proof repeats the vertex rule that the
+/// *resolved* input covers the module's read — a footprint proved over a copy
+/// could pass while the device reads different bytes.
+fn plan_stage_buffers<'a>(
+    pass: &'a RenderPassDescriptor,
+    module: &ReviewedModule,
+    leases: Option<&RenderLeaseContext<'_>>,
+) -> Result<Vec<PlannedStageBuffer<'a>>, ProviderError> {
+    let mut bindings = Vec::with_capacity(pass.stage_buffers.len());
+    for binding in &pass.stage_buffers {
+        // The slot the registration paired this declaration with. Both walks
+        // run before any plan exists (`validate_against` pairs the pass with
+        // the declarations, `review_contract` pairs the declarations with the
+        // module), so a missing slot is refused rather than unwrapped — a rail
+        // that cannot name the module's own read never binds the slot.
+        let slot = module
+            .stage_buffers
+            .iter()
+            .find(|slot| slot.stage == binding.stage && slot.index == binding.view.metal_binding)
+            .ok_or_else(|| {
+                capability_refusal("render_stage_reflection_mismatch")
+                    .with_field("stage", FieldValue::Text(binding.stage.name().to_owned()))
+                    .with_field(
+                        "index",
+                        FieldValue::Unsigned(u64::from(binding.view.metal_binding)),
+                    )
+                    .with_field("field", FieldValue::Text("bindings".to_owned()))
+                    .with_detail(
+                        "the reviewed module reads no `[[buffer(N)]]` argument at this stage's \
+                         slot, so the rail has no read extent the binding's bytes were proven \
+                         against",
+                    )
+            })?;
+        let source = resolve_render_input(&binding.view, leases, RenderInputRole::StageBuffer)?;
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) < slot.max_bytes {
+            return Err(
+                capability_refusal("render_stage_buffer_footprint_unsupported")
+                    .with_field("stage", FieldValue::Text(binding.stage.name().to_owned()))
+                    .with_field(
+                        "binding",
+                        FieldValue::Unsigned(u64::from(binding.view.metal_binding)),
+                    )
+                    .with_field("view", FieldValue::Unsigned(binding.view.view_id.get()))
+                    .with_field("required_bytes", FieldValue::Unsigned(slot.max_bytes))
+                    .with_field(
+                        "resolved_bytes",
+                        FieldValue::Unsigned(u64::try_from(source.len()).unwrap_or(u64::MAX)),
+                    )
+                    .with_detail(
+                        "the reviewed module's read reaches past the bytes this rail resolved for \
+                     the binding, and the device reads the resolved mapping rather than a copy \
+                     of it",
+                    ),
+            );
+        }
+        bindings.push(PlannedStageBuffer {
+            stage: binding.stage,
+            index: binding.view.metal_binding,
+            bytes: slot.max_bytes,
+            source,
+            offset: binding.view.offset,
+        });
+    }
+    Ok(bindings)
+}
+
 /// Which of a pass's render inputs a refusal is about.
 #[derive(Clone, Copy)]
 enum RenderInputRole {
@@ -1675,6 +1925,9 @@ enum RenderInputRole {
     /// A sampled texture the pass's fragment stage reads
     /// (`research/docs/23` §75, R5c).
     Texture,
+    /// A stage buffer the pipeline declares and the pass binds
+    /// (`research/docs/23` §83, R9g).
+    StageBuffer,
 }
 
 impl RenderInputRole {
@@ -1691,6 +1944,7 @@ impl RenderInputRole {
             Self::Index => INDEX_SLUG,
             Self::Attachment => ATTACHMENT_LOAD_SLUG,
             Self::Texture => TEXTURE_SLUG,
+            Self::StageBuffer => STAGE_BUFFER_SLUG,
         }
     }
 }
@@ -2088,6 +2342,12 @@ const ATTACHMENT_LOAD_SLUG: &str = "render_attachment_load_source_unsupported";
 /// are refused under their own.
 const TEXTURE_SLUG: &str = "render_texture_source_unsupported";
 
+/// Slug of a stage buffer this rail cannot read (`research/docs/23` §83, R9g).
+///
+/// The name the Vulkan rail publishes for the same fact, so both rails answer
+/// a capture whose stage buffer's bytes could not be resolved with one slug.
+const STAGE_BUFFER_SLUG: &str = "render_stage_buffer_source_unsupported";
+
 /// One offscreen render pass to execute.
 ///
 /// The pass and the pipeline are the core values themselves, so this rail cannot
@@ -2201,6 +2461,12 @@ pub(crate) struct RenderPlan<'a> {
     pub(crate) vertex_streams: Vec<PlannedVertexStream<'a>>,
     /// The index buffer of an indexed draw, resolved from the pass's own view.
     pub(crate) indices: Option<PlannedIndexStream<'a>>,
+    /// The pass's stage buffers, in the contract's canonical order
+    /// (`research/docs/23` §83, R9g): one entry per `[[buffer(N)]]` argument
+    /// the reviewed module reads, naming its stage, the slot the encoder binds
+    /// and the bytes the module reaches there. Empty for every pass that
+    /// declares none, which is every pre-R9g plan.
+    pub(crate) stage_buffers: Vec<PlannedStageBuffer<'a>>,
     /// The flat byte shape of the **depth** surface this plan reads back, if
     /// any: `depth32float` is four bytes per texel over the pass extent
     /// (`metal_api_core::provider::DEPTH_BYTES_PER_TEXEL`).
@@ -2234,6 +2500,11 @@ impl RenderPlan<'_> {
         }
         if let Some(index) = &self.indices {
             if let Some(lease) = index.source.borrowed_lease() {
+                leases.push(lease);
+            }
+        }
+        for stage in &self.stage_buffers {
+            if let Some(lease) = stage.source.borrowed_lease() {
                 leases.push(lease);
             }
         }
@@ -3049,6 +3320,13 @@ pub(crate) fn plan_with_leases<'a>(
         }
     }
     let module = module.expect("the source check above refused a shape without a module");
+    // The pass's stage buffers (`research/docs/23` §83, R9g): the registration
+    // gate paired every declaration with one of the module's own
+    // `[[buffer(N)]]` arguments, so this walk resolves the pass's views through
+    // the same three-armed source channel the vertex and index streams use and
+    // proves the module's reach against the bytes it resolved. Empty for every
+    // pass that declares none, which is every pre-R9g plan.
+    let stage_buffers = plan_stage_buffers(request.pass, module, leases)?;
     Ok(RenderPlan {
         source: module.source,
         module_path: module.path,
@@ -3231,6 +3509,7 @@ pub(crate) fn plan_with_leases<'a>(
         instance_count: request.pass.instance_count,
         vertex_streams,
         indices,
+        stage_buffers,
         depth_texel,
     })
 }
@@ -3255,25 +3534,19 @@ pub(crate) fn layout_name(layout: &VertexLayout) -> &'static str {
 /// an unreviewed kernel (`lib.rs::bounded_contract`,
 /// `native_shader_not_allowlisted`): a matching file name, an edited module or
 /// a recompiled one must not be enough to run different source
-/// (`research/docs/23` §6 Step 7). Registration
+/// (`research/docs/23` §6 Step 7).
+///
+/// A registration that declares stage buffer bindings is answered by the
+/// module's own `[[buffer(N)]]` table instead (`research/docs/23` §83, R9g):
+/// the declaration half is paired field by field with the arguments the
+/// reviewed module actually reads ([`validate_reviewed_stage_buffers`]), so a
+/// contract can no longer be refused merely for carrying the face — but a
+/// declaration no reviewed module accounts for still is, by name. Registration
 /// (`NativeMetalProvider::register_render_pipeline`) and [`plan`] both run it,
 /// so the refusal is reachable before a submission as well as inside one.
 pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), ProviderError> {
-    // A pipeline that declares stage buffer bindings is refused by name before
-    // the reviewed-module lookup (`research/docs/23` §3.3, v83): the reviewed
-    // MSL modules carry no `[[buffer(N)]]` argument, so accepting the contract
-    // would execute a pass whose bindings this rail silently ignores. The
-    // Vulkan rail executes the shape; this one records the boundary.
-    if !contract.stage_buffers.is_empty() {
-        return Err(
-            capability_refusal("render_stage_buffer_unsupported").with_detail(
-                "the reviewed native modules carry no stage buffer argument, so a pipeline that \
-                 declares one cannot be reviewed on this rail",
-            ),
-        );
-    }
-    if reviewed_module_for(contract).is_some() {
-        return Ok(());
+    if let Some(module) = reviewed_module_for(contract) {
+        return validate_reviewed_stage_buffers(contract, module);
     }
     // The refusal names the entry pair the shape carries, so a caller can fix
     // the registration without reading the rail: the shape's own module is the
@@ -3299,6 +3572,121 @@ pub(crate) fn review_contract(contract: &RenderPipelineContract) -> Result<(), P
             module.fragment_entry,
         )),
     )
+}
+
+/// Pair a registration's stage-buffer declarations with the reviewed module's
+/// own `[[buffer(N)]]` arguments (`research/docs/23` §83, R9g).
+///
+/// The reviewed module is this rail's half of the pairing a translated stage
+/// states through its reflection: its argument list is fixed by the pinned
+/// source bytes ([`ReviewedStageBufferSlot`]), and the contract declares what
+/// each stage reaches there. The two halves have to agree field by field, and
+/// each disagreement keeps the vocabulary the Vulkan rails established:
+///
+/// * a declaration at a slot the reviewed module never reads would be a
+///   binding silently dropped — `render_stage_buffer_stage_unsupported`, the
+///   same slug and arm the Vulkan rail's reviewed-versus-translated gate uses;
+/// * a declaration whose access or byte extent disagrees with the module's own
+///   argument is a reflection mismatch — `render_stage_reflection_mismatch`,
+///   with the module's read extent in the `reflected_bytes` field the R9c arm
+///   fills, because the pass's view is proven against the declaration and the
+///   module reads the pinned bytes;
+/// * a module argument no declaration covers would leave a descriptor the
+///   stage reads undefined — `render_stage_buffer_binding_required`, the
+///   reviewed pair's own refusal on the Vulkan rail.
+///
+/// A registration that declares no stage buffers and names a module that reads
+/// none keeps the exact pre-R9g answer: there is nothing to pair, and the walk
+/// has no state to report.
+fn validate_reviewed_stage_buffers(
+    contract: &RenderPipelineContract,
+    module: &ReviewedModule,
+) -> Result<(), ProviderError> {
+    let entry = |stage: RenderPipelineStage| match stage {
+        RenderPipelineStage::Vertex => contract.vertex_entry.as_str(),
+        RenderPipelineStage::Fragment => contract.fragment_entry.as_str(),
+    };
+    let access_name = |access: BufferAccess| match access {
+        BufferAccess::Read => "read",
+        BufferAccess::Write => "write",
+        BufferAccess::ReadWrite => "read_write",
+        BufferAccess::Unused => "unused",
+    };
+    let mismatch = |declared: &metal_api_core::provider::StageBufferBinding| {
+        capability_refusal("render_stage_reflection_mismatch")
+            .with_field("stage", FieldValue::Text(declared.stage.name().to_owned()))
+            .with_field("entry", FieldValue::Text(entry(declared.stage).to_owned()))
+            .with_field("field", FieldValue::Text("bindings".to_owned()))
+            .with_field("index", FieldValue::Unsigned(u64::from(declared.index)))
+    };
+    for declared in &contract.stage_buffers {
+        let Some(slot) = module
+            .stage_buffers
+            .iter()
+            .find(|slot| slot.stage == declared.stage && slot.index == declared.index)
+        else {
+            return Err(capability_refusal("render_stage_buffer_stage_unsupported")
+                .with_field("stage", FieldValue::Text(declared.stage.name().to_owned()))
+                .with_field("binding", FieldValue::Unsigned(u64::from(declared.index)))
+                .with_detail(format!(
+                    "the reviewed module `{}` reads no `[[buffer({})]]` argument in its {} \
+                         stage, so this declaration would bind a slot the shader never reads",
+                    module.path,
+                    declared.index,
+                    declared.stage.name(),
+                )));
+        };
+        if declared.access != slot.access {
+            return Err(mismatch(declared)
+                .with_field(
+                    "declared_access",
+                    FieldValue::Text(access_name(declared.access).to_owned()),
+                )
+                .with_field(
+                    "reflected_access",
+                    FieldValue::Text(access_name(slot.access).to_owned()),
+                )
+                .with_detail(
+                    "the reviewed module's argument and the contract's declaration classify this \
+                     binding's access differently, so the bytes the pass binds are not the \
+                     interface the module states",
+                ));
+        }
+        let FootprintProof::Static { max_bytes } = declared.footprint else {
+            return Err(mismatch(declared).with_detail(
+                "the reviewed module's read is a static byte extent, and this rail executes stage \
+                 buffers whose declared reach is one too",
+            ));
+        };
+        if max_bytes < slot.max_bytes {
+            return Err(mismatch(declared)
+                .with_field("declared_bytes", FieldValue::Unsigned(max_bytes))
+                .with_field("reflected_bytes", FieldValue::Unsigned(slot.max_bytes))
+                .with_detail(
+                    "the reviewed module reads past the declared extent, and the pass's view is \
+                     proven against the declaration rather than the module",
+                ));
+        }
+    }
+    for slot in module.stage_buffers {
+        let declared = contract
+            .stage_buffers
+            .iter()
+            .any(|declared| declared.stage == slot.stage && declared.index == slot.index);
+        if !declared {
+            return Err(capability_refusal("render_stage_buffer_binding_required")
+                .with_field("stage", FieldValue::Text(slot.stage.name().to_owned()))
+                .with_field("binding", FieldValue::Unsigned(u64::from(slot.index)))
+                .with_detail(format!(
+                    "the reviewed module `{}` reads its {} stage's `[[buffer({})]]` argument, \
+                         so a registration that names this module has to declare the slot",
+                    module.path,
+                    slot.stage.name(),
+                    slot.index,
+                )));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one pass's sampled textures into the rail's own plan shape
@@ -3835,18 +4223,22 @@ pub(crate) fn plan_trace_with_leases<'a>(
         // An indirect draw replays its pass through `MTLIndirectRenderCommand`
         // state, and the first indirect increment builds a command that carries
         // the pipeline state and the draw counts — not the vertex streams a
-        // caller-held layout reads. A pass that binds one is refused here
-        // rather than replayed from buffers nothing bound (`research/docs/25`
-        // §6 Step 7b; the same slug the ICB rail uses for a shape it cannot
-        // replay).
+        // caller-held layout reads, and not the stage buffers a pass binds
+        // beside them (`research/docs/23` §83, R9g). A pass that binds either
+        // is refused here rather than replayed from buffers nothing bound
+        // (`research/docs/25` §6 Step 7b; the same slug the ICB rail uses for
+        // a shape it cannot replay).
         if matches!(
             trace.indirect.as_ref().map(|indirect| indirect.command),
             Some(IndirectCommandDescriptor::Draw { .. })
-        ) && (!pass.vertex_buffers.is_empty() || pass.indices.is_some())
+        ) && (!pass.vertex_buffers.is_empty()
+            || pass.indices.is_some()
+            || !pass.stage_buffers.is_empty())
         {
             return Err(capability_refusal("icb_command_unsupported").with_detail(
                 "an indirect draw replays the vertex_id shape; a pass that binds caller-held \
-                 vertex or index streams is not part of the first indirect increment",
+                 vertex, index or stage buffer streams is not part of the first indirect \
+                 increment",
             ));
         }
         // An attachment that no buffer view covers has no landing rail: the
@@ -4294,10 +4686,13 @@ pub(crate) fn encode_indirect_offscreen_render(
     // counts rather than the streams a caller-held layout reads. This is the
     // same rule one level down, for a caller that reaches the encoder without a
     // trace plan.
-    if !planned.vertex_streams.is_empty() || planned.indices.is_some() {
+    if !planned.vertex_streams.is_empty()
+        || planned.indices.is_some()
+        || !planned.stage_buffers.is_empty()
+    {
         return Err(capability_refusal("icb_command_unsupported").with_detail(
-            "an indirect draw replays the vertex_id shape; a pass that binds caller-held \
-             vertex or index streams is not part of the first indirect increment",
+            "an indirect draw replays the vertex_id shape; a pass that binds caller-held vertex, \
+             index or stage buffer streams is not part of the first indirect increment",
         ));
     }
     // The replay renders into the same textures the direct draw does, so the
@@ -4694,6 +5089,33 @@ fn encode_into_and_readback(
             Some(buffer.as_ref()),
             offset,
         );
+        stream_buffers.push(buffer);
+    }
+    // The pass's stage buffers (`research/docs/23` §83, R9g), bound at the
+    // slot each stage's own `[[buffer(N)]]` namespace names: a vertex binding
+    // is a `setVertexBuffer(_:offset:index:)` and a fragment binding a
+    // `setFragmentBuffer(_:offset:index:)`, so a vertex `0` and a fragment `0`
+    // fill two different slots. Every binding in the plan is read-only — the
+    // contract admits `BufferAccess::Read` alone, and the write-back landing a
+    // writable binding would need is a separate increment — so the encoder
+    // hands Metal the buffer and nothing else. The MTLBuffers are kept for the
+    // whole call beside the streams' own, for the same reason: they have to
+    // outlive the encoder that reads them.
+    for stage in &planned.stage_buffers {
+        let offset = NSUInteger::try_from(stage.binding_offset()).unwrap_or(NSUInteger::MAX);
+        let buffer = stream_buffer(device, &stage.source, stage.binding_offset())?;
+        match stage.stage {
+            RenderPipelineStage::Vertex => encoder.set_vertex_buffer(
+                NSUInteger::from(stage.index),
+                Some(buffer.as_ref()),
+                offset,
+            ),
+            RenderPipelineStage::Fragment => encoder.set_fragment_buffer(
+                NSUInteger::from(stage.index),
+                Some(buffer.as_ref()),
+                offset,
+            ),
+        }
         stream_buffers.push(buffer);
     }
     // The viewport is explicit because the contract carries it, even though
@@ -5672,75 +6094,364 @@ mod tests {
         }
     }
 
-    /// The stage-buffer face is the Vulkan rail's (`research/docs/23` §3.3,
-    /// v83): this rail's reviewed MSL modules carry no `[[buffer(N)]]`
-    /// argument, so a registration that declares one and a pass that binds one
-    /// are both refused by name instead of executed with the binding silently
-    /// dropped.
+    /// The three positions the reviewed stage-buffer fixture reads, as the
+    /// vertex stage's own `[[buffer(0)]]` bytes: (-1,1), (0.25,1), (-1,-0.25)
+    /// in Metal's clip space, little-endian `float32x2`.
+    fn stage_buffer_positions() -> Vec<u8> {
+        let positions: [[f32; 2]; 3] = [[-1.0, 1.0], [0.25, 1.0], [-1.0, -0.25]];
+        positions
+            .iter()
+            .flatten()
+            .flat_map(|component| component.to_le_bytes())
+            .collect()
+    }
+
+    /// The fragment stage's own `[[buffer(0)]]` bytes: one `float4` holding the
+    /// same texel the reviewed solids store (`40 80 c0 ff` after the UNORM
+    /// quantisation, byte/255 on purpose — `research/docs/23` §3.5).
+    fn stage_buffer_tint() -> Vec<u8> {
+        EXPECTED_TEXEL_COMPONENTS
+            .iter()
+            .flat_map(|component| (*component as f32).to_le_bytes())
+            .collect()
+    }
+
+    /// The reviewed stage-buffer pair as a registration (`research/docs/23`
+    /// §83, R9g): both `[[buffer(0)]]` arguments declared, each with the static
+    /// extent the module's own read reaches (24 bytes of positions, 16 of
+    /// tint).
+    fn stage_buffer_declarations() -> Vec<StageBufferBinding> {
+        vec![
+            StageBufferBinding {
+                stage: RenderPipelineStage::Vertex,
+                index: STAGE_BUFFER_VERTEX_BINDING,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static {
+                    max_bytes: STAGE_BUFFER_VERTEX_BYTES,
+                },
+            },
+            StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: STAGE_BUFFER_FRAGMENT_BINDING,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static {
+                    max_bytes: STAGE_BUFFER_FRAGMENT_BYTES,
+                },
+            },
+        ]
+    }
+
+    fn stage_buffer_pipeline() -> RenderPipelineContract {
+        RenderPipelineContract {
+            stage_buffers: stage_buffer_declarations(),
+            vertex_entry: STAGE_BUFFER_VERTEX_ENTRY.to_owned(),
+            fragment_entry: STAGE_BUFFER_FRAGMENT_ENTRY.to_owned(),
+            color_formats: vec![AttachmentFormat::Rgba8Unorm],
+            vertex_layout: VertexLayout::None,
+        }
+    }
+
+    /// The milestone's 2x2 attachment with the stage-buffer pair's two views
+    /// bound, the way a trace hands them over.
+    fn stage_buffer_pass(load: LoadOp) -> RenderPassDescriptor {
+        let mut pass = milestone_pass(load);
+        pass.stage_buffers = vec![
+            StageBufferView {
+                stage: RenderPipelineStage::Vertex,
+                view: BufferView {
+                    view_id: ViewId::new(61),
+                    metal_binding: STAGE_BUFFER_VERTEX_BINDING,
+                    allocation_id: AllocationId::new(63),
+                    offset: 0,
+                    length: STAGE_BUFFER_VERTEX_BYTES,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(stage_buffer_positions()),
+                },
+            },
+            StageBufferView {
+                stage: RenderPipelineStage::Fragment,
+                view: BufferView {
+                    view_id: ViewId::new(62),
+                    metal_binding: STAGE_BUFFER_FRAGMENT_BINDING,
+                    allocation_id: AllocationId::new(64),
+                    offset: 0,
+                    length: STAGE_BUFFER_FRAGMENT_BYTES,
+                    access: BufferAccess::Read,
+                    attribute_stride: None,
+                    source: BufferSource::OwnedBytes(stage_buffer_tint()),
+                },
+            },
+        ];
+        pass
+    }
+
+    fn stage_buffer_request<'a>(
+        pass: &'a RenderPassDescriptor,
+        pipeline: &'a RenderPipelineContract,
+    ) -> OffscreenRenderRequest<'a> {
+        OffscreenRenderRequest {
+            pass,
+            pipeline,
+            source: REVIEWED_STAGE_BUFFER_SOURCE,
+            initial: vec![None],
+            resident: Vec::new(),
+        }
+    }
+
+    /// One plan's stage-buffer binding table, as the evidence line spells it
+    /// (`research/docs/23` §83, R9g): the slot each binding fills in its own
+    /// stage's `[[buffer(N)]]` namespace, the offset the encoder binds it at,
+    /// the bytes the reviewed module reads there and which of the three source
+    /// arms the bytes came from.
+    fn stage_buffer_table(plan: &RenderPlan<'_>) -> String {
+        plan.stage_buffers
+            .iter()
+            .map(|stage| {
+                let source = match &stage.source {
+                    PlannedInputSource::Declared(bytes) => {
+                        format!("declared({} bytes)", bytes.len())
+                    }
+                    PlannedInputSource::Staged(bytes) => {
+                        format!("staged_lease({} bytes)", bytes.len())
+                    }
+                    PlannedInputSource::NoCopy { lease, window } => format!(
+                        "borrowed_no_copy(lease={} window={} len={})",
+                        lease.get(),
+                        window.offset,
+                        window.len,
+                    ),
+                };
+                format!(
+                    "{} [[buffer({})]] offset={} bytes={} source={}",
+                    stage.stage.name(),
+                    stage.index,
+                    stage.binding_offset(),
+                    stage.bytes,
+                    source,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The reviewed stage-buffer pair executes end to end on the planning half
+    /// (`research/docs/23` §83, R9g): the registration pairs both declarations
+    /// with the module's own `[[buffer(0)]]` arguments, and the plan resolves
+    /// both views into a binding table naming each stage's own slot. The
+    /// encoder half is behind `cfg(target_os = "macos")`, so the table is what
+    /// this host can read — the same split every other render fixture uses.
     #[test]
-    fn the_stage_buffer_face_is_refused_by_name_on_the_native_rail() {
-        let declaration = StageBufferBinding {
+    fn the_stage_buffer_pair_is_reviewed_and_plans_its_bindings() {
+        let contract = stage_buffer_pipeline();
+        let selected = reviewed_module_for(&contract).expect("the stage-buffer pair is reviewed");
+        assert_eq!(selected.source, REVIEWED_STAGE_BUFFER_SOURCE);
+        assert_eq!(
+            selected.path,
+            "conformance/shaders/render_stage_buffer_2x2.metal"
+        );
+        review_contract(&contract).expect("the registration pairs with the module's arguments");
+
+        let pass = stage_buffer_pass(LoadOp::Clear(sentinel()));
+        let request = stage_buffer_request(&pass, &contract);
+        let planned = plan_pass(&request).expect("the reviewed pair plans its two bindings");
+        let [vertex, fragment] = planned.stage_buffers.as_slice() else {
+            panic!("the reviewed module reads one argument per stage");
+        };
+        assert_eq!(vertex.stage, RenderPipelineStage::Vertex);
+        assert_eq!(vertex.index, STAGE_BUFFER_VERTEX_BINDING);
+        assert_eq!(vertex.bytes, STAGE_BUFFER_VERTEX_BYTES);
+        assert_eq!(vertex.binding_offset(), 0);
+        assert_eq!(vertex.source.proof_bytes(), stage_buffer_positions());
+        assert_eq!(fragment.stage, RenderPipelineStage::Fragment);
+        assert_eq!(fragment.index, STAGE_BUFFER_FRAGMENT_BINDING);
+        assert_eq!(fragment.bytes, STAGE_BUFFER_FRAGMENT_BYTES);
+        assert_eq!(fragment.source.proof_bytes(), stage_buffer_tint());
+        // Both halves declare their own bytes, so the plan maps nothing.
+        assert!(planned.borrowed_leases().is_empty());
+        eprintln!(
+            "native stage-buffer plan bindings: {}",
+            stage_buffer_table(&planned)
+        );
+    }
+
+    /// Every disagreement between a declaration and the reviewed module's own
+    /// argument list is refused by name (`research/docs/23` §83, R9g), in the
+    /// vocabulary the Vulkan rails established rather than a new slug — and the
+    /// capability snapshot keeps the bit off until an Apple device run lands.
+    #[test]
+    fn the_stage_buffer_registration_refuses_every_disagreement_by_name() {
+        // A declaration at a slot the module never reads: the binding would be
+        // silently dropped, which is the arm the Vulkan rail refuses under the
+        // same slug.
+        let mut declared = stage_buffer_pipeline();
+        declared.stage_buffers.push(StageBufferBinding {
             stage: RenderPipelineStage::Fragment,
-            index: 0,
+            index: 4,
             access: BufferAccess::Read,
             footprint: FootprintProof::Static { max_bytes: 16 },
-        };
+        });
+        let refused = review_contract(&declared).expect_err("a slot the module never reads");
+        eprintln!("native stage-buffer slot the module never reads refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_stage_unsupported");
+        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("fragment".to_owned()))
+        );
+        assert_eq!(
+            refused.fields.get("binding"),
+            Some(&FieldValue::Unsigned(4))
+        );
+
+        // The declaration half of the pairing: an extent under the module's own
+        // read would let the shader read past the bytes the pass proved.
+        let mut short = stage_buffer_pipeline();
+        short.stage_buffers[1].footprint = FootprintProof::Static { max_bytes: 8 };
+        let refused = review_contract(&short).expect_err("an extent under the module's read");
+        eprintln!("native stage-buffer short extent refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_reflection_mismatch");
+        assert_eq!(
+            refused.fields.get("declared_bytes"),
+            Some(&FieldValue::Unsigned(8))
+        );
+        assert_eq!(
+            refused.fields.get("reflected_bytes"),
+            Some(&FieldValue::Unsigned(STAGE_BUFFER_FRAGMENT_BYTES))
+        );
+
+        // The other direction: naming the module but declaring none of its
+        // arguments leaves descriptors the stages read undefined.
+        let mut undeclared = stage_buffer_pipeline();
+        undeclared.stage_buffers.clear();
+        let refused =
+            review_contract(&undeclared).expect_err("the module's arguments must be declared");
+        eprintln!("native stage-buffer binding required refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_binding_required");
+        assert_eq!(
+            refused.fields.get("stage"),
+            Some(&FieldValue::Text("vertex".to_owned()))
+        );
+
+        // The bufferless modules keep the pre-R9g answer for a declaration they
+        // cannot read: the milestone's own pair has no `[[buffer(N)]]`
+        // argument, so a registration that declares one is refused rather than
+        // executed with the binding dropped.
         let declared = RenderPipelineContract {
-            stage_buffers: vec![declaration],
+            stage_buffers: vec![StageBufferBinding {
+                stage: RenderPipelineStage::Fragment,
+                index: 0,
+                access: BufferAccess::Read,
+                footprint: FootprintProof::Static { max_bytes: 16 },
+            }],
             ..milestone_pipeline()
         };
-        let refused = review_contract(&declared).expect_err("a stage-buffer declaration");
-        eprintln!("native stage-buffer registration refused: {refused:?}");
-        assert_eq!(refused.slug, "render_stage_buffer_unsupported");
-        assert_eq!(refused.class, ProviderErrorClass::Capability);
+        let refused =
+            review_contract(&declared).expect_err("a declaration under a bufferless module");
+        eprintln!("native bufferless declaration refused: {refused:?}");
+        assert_eq!(refused.slug, "render_stage_buffer_stage_unsupported");
 
-        // The binding half: a pass that binds a stage buffer under a reviewed
-        // contract never reaches this rail's own gates — `review_contract` is
-        // the first thing `plan_with_leases` calls, and a contract that
-        // declares the slot is exactly what it refuses. The pair rules refuse
-        // the complementary shape (bound but undeclared) with the contract
-        // family's own slug before that, so no ordering reaches an executed
-        // draw with the bindings dropped.
-        let mut pass = milestone_pass(LoadOp::Clear(sentinel()));
-        pass.stage_buffers = vec![StageBufferView {
-            stage: RenderPipelineStage::Fragment,
-            view: BufferView {
-                view_id: ViewId::new(61),
-                metal_binding: 0,
-                allocation_id: AllocationId::new(63),
-                offset: 0,
-                length: 16,
-                access: BufferAccess::Read,
-                attribute_stride: None,
-                source: BufferSource::OwnedBytes(vec![0; 16]),
-            },
-        }];
+        // The pass half stays the contract's own pair rule: a view the
+        // registration never declared is refused before this rail is asked —
+        // the same `trace_contract_invalid` the pre-R9g test pinned.
         let milestone = milestone_pipeline();
+        let mut pass = stage_buffer_pass(LoadOp::Clear(sentinel()));
+        pass.stage_buffers.truncate(1);
         let request = milestone_request(&pass, &milestone, None);
         let refused = plan_pass(&request).expect_err("a pass that binds an undeclared slot");
         eprintln!("native undeclared stage-buffer binding refused: {refused:?}");
         assert_eq!(refused.slug, "trace_contract_invalid");
         assert_eq!(refused.class, ProviderErrorClass::Args);
 
-        // The declaring contract beside a pass that binds its slot is what
-        // the rail itself refuses, so the two shapes together cover both
-        // orders: undeclared binding (pair rules) and declaring contract
-        // (`review_contract`, which `plan_with_leases` asks first for every
-        // contract that reaches it).
-        let request = milestone_request(&pass, &declared, None);
-        let refused = plan_pass(&request).expect_err("a declaring contract");
-        eprintln!("native declaring contract refused: {refused:?}");
-        assert_eq!(refused.slug, "render_stage_buffer_unsupported");
-        assert_eq!(refused.class, ProviderErrorClass::Capability);
-
         // The snapshot keeps the fail-closed default: the bit is off and the
         // limit is zero, so core admission refuses the shape before this rail
-        // is even asked.
+        // is even asked. Flipping it is the increment after an Apple device
+        // reading, not part of this one.
         let bits = capability_bits(2048);
         assert!(!bits.supports_render_passes || bits.max_color_attachments > 0);
         let capabilities = capabilities(&bits);
         assert!(!capabilities.supports_render_stage_buffers);
         assert_eq!(capabilities.max_render_stage_buffers, 0);
+    }
+
+    /// A stage buffer resolves through the same three-armed source channel a
+    /// vertex stream does (`research/docs/23` §83, R9g): a staged lease becomes
+    /// the provider's own copy and retains nothing, because only the no-copy
+    /// arm has an owner mapping to hold.
+    #[test]
+    fn a_stage_buffer_reads_its_staged_lease() {
+        let epoch = DeviceEpoch::new(3);
+        let lease_id = LeaseId::new(41);
+        let reservation = lease_registration(
+            lease_id,
+            AllocationId::new(63),
+            STAGE_BUFFER_VERTEX_BYTES,
+            epoch,
+        );
+        let staging = LeaseRegistry::new();
+        staging
+            .import(
+                StagedLease::new(reservation, stage_buffer_positions())
+                    .expect("the staged window matches its reservation"),
+            )
+            .expect("the fixture import is accepted");
+        let borrowed = Arc::new(BorrowedLeaseRegistry::new());
+        let mut resources = ResourceTableSnapshot::new();
+        resources
+            .insert_allocation(AllocationRecord {
+                allocation_id: AllocationId::new(63),
+                owner_epoch: epoch,
+                size: STAGE_BUFFER_VERTEX_BYTES,
+            })
+            .expect("the fixture allocation is well formed");
+        resources
+            .insert_lease(reservation)
+            .expect("the reservation covers its view");
+        let leases = RenderLeaseContext {
+            staging: &staging,
+            borrowed: &borrowed,
+            resources: &resources,
+            device_epoch: epoch,
+            host_import_alignment: OWNER_ALIGNMENT,
+        };
+
+        let mut pass = stage_buffer_pass(LoadOp::Clear(sentinel()));
+        pass.stage_buffers[0].view.source = BufferSource::StagedLease(lease_id);
+        let contract = stage_buffer_pipeline();
+        let request = stage_buffer_request(&pass, &contract);
+        let planned = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect("the staged window holds the reviewed positions");
+        assert!(
+            matches!(
+                planned.stage_buffers[0].source,
+                PlannedInputSource::Staged(_)
+            ),
+            "a staged lease resolves into the provider's own copy: {:?}",
+            planned.stage_buffers[0].source
+        );
+        assert_eq!(
+            planned.stage_buffers[0].source.proof_bytes(),
+            stage_buffer_positions()
+        );
+        assert!(
+            planned.borrowed_leases().is_empty(),
+            "a staged arm has no owner mapping to retain"
+        );
+        eprintln!(
+            "native stage-buffer staged-lease plan bindings: {}",
+            stage_buffer_table(&planned)
+        );
+
+        // The staged copy is the provider's: releasing it is the owner's
+        // decision, and the same declaration is refused by name until it is
+        // imported again — under the stage buffer's own source slug.
+        staging
+            .release(lease_id)
+            .expect("the fixture import is released");
+        let refused = plan_with_leases(&request, Some(&leases), 0, 0)
+            .expect_err("a released staged lease cannot be read");
+        eprintln!("native released stage-buffer lease refused: {refused:?}");
+        assert_eq!(refused.slug, "lease_not_imported");
     }
 
     fn milestone_pipeline() -> RenderPipelineContract {

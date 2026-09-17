@@ -415,6 +415,79 @@ jobs:
               raise SystemExit(1)
           print('vertex_selftest: PASS (' + report['id'] + ' ' + observed + ')')
           PY
+      # The one-device stage-buffer check (`research/docs/23` §83, R9g). It
+      # mirrors the vertex-input self-test above: the same `--probe` eligibility
+      # gate, the same SKIP-not-PASS discipline for an ineligible host, and a
+      # report whose three runs bind the reviewed module's two `[[buffer(0)]]`
+      # arguments with `setVertexBuffer`/`setFragmentBuffer` and read the
+      # attachment back. The byte comparison is
+      # `conformance/run_native.py::validate_stage_buffer_selftest`, exercised by
+      # `conformance/test_run_native.py`, not an inline re-write.
+      - name: Run native stage-buffer self-test when a Metal device is eligible
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/native-evidence
+          log=/tmp/native-evidence/stage-buffer-selftest.log
+          : > "$log"
+          probe_rc=0
+          /tmp/native-oracle --probe > /tmp/native-evidence/stage-buffer-selftest-probe.json \
+            2>> "$log" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "stage-buffer selftest: FAIL (probe exited $probe_rc)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$probe_rc"
+          fi
+          eligibility=0
+          python3 - <<'PY' >> "$log" 2>&1 || eligibility=$?
+          import json
+          from pathlib import Path
+          path = Path('/tmp/native-evidence/stage-buffer-selftest-probe.json')
+          try:
+              probe = json.loads(path.read_text())
+          except Exception as error:
+              print('stage-buffer selftest: probe unreadable: ' + str(error))
+              raise SystemExit(2)
+          if probe.get('kind') != 'metal-device-probe':
+              print('stage-buffer selftest: unexpected probe kind: ' + repr(probe.get('kind')))
+              raise SystemExit(2)
+          print('stage-buffer selftest probe: ' + json.dumps(probe, sort_keys=True))
+          raise SystemExit(0 if probe['eligible'] else 1)
+          PY
+          if [ "$eligibility" -eq 1 ]; then
+            echo "stage-buffer selftest: SKIP (no Metal device)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit 0
+          fi
+          if [ "$eligibility" -ne 0 ]; then
+            echo "stage-buffer selftest: FAIL (unusable probe, exit $eligibility)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            cat "$log"
+            exit "$eligibility"
+          fi
+          echo "stage-buffer selftest: device eligible; running the reviewed stage-buffer pair" >> "$log"
+          status=0
+          (cd conformance && /tmp/native-oracle --stage-buffer-selftest) \
+            > /tmp/native-evidence/stage-buffer-selftest.json \
+            2>> "$log" || status=$?
+          cat /tmp/native-evidence/stage-buffer-selftest.json >> "$log"
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "stage-buffer selftest: FAIL (oracle exited $status)" | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          python3 - <<'PY' 2>&1 | tee -a "$log" -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'conformance')
+          from run_native import NativeRunError, validate_stage_buffer_selftest
+          report = json.loads(Path('/tmp/native-evidence/stage-buffer-selftest.json').read_text())
+          try:
+              observed = validate_stage_buffer_selftest(report)
+          except NativeRunError as error:
+              print('stage_buffer_selftest: FAIL (' + str(error) + ')')
+              raise SystemExit(1)
+          print('stage_buffer_selftest: PASS (' + report['id'] + ' ' + observed + ')')
+          PY
       # The one-device present check (`research/docs/24` §6 Step 7). It mirrors
       # the render self-test above: the same `--probe` eligibility gate, the same
       # SKIP-not-PASS discipline for an ineligible host, and a report whose one
